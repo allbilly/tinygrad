@@ -8,7 +8,7 @@ from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, float_
 from tinygrad.helpers import all_same, getenv, flatten, get_single_element, EMULATE, mv_address, to_mv
 from tinygrad.device import Compiled, Compiler, Allocator, CompilerSet, CompilerPair, BufferSpec
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
@@ -350,7 +350,13 @@ class RockchipProgram:
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
-  code_for_op = {k:v for k,v in python_alu.items() if k is not Ops.MULACC}
+  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC]}
+  extra_matcher = PatternMatcher([
+    (UPat(Ops.MUL, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.ADD, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+  ])
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
     lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
