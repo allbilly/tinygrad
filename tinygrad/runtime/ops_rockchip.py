@@ -97,7 +97,7 @@ class RockchipProgram:
     
   def submit(self, uop):
     # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
-    if uop == Ops.MUL: 
+    if uop in [Ops.MUL, Ops.ADD, Ops.SUB]: 
       self.q.append(0x2001000178495044), # 63
     self.q.append(0x0081000000180008), # EMIT(REG_PC_OPERATION_ENABLE, PC_OPERATION_ENABLE_RESERVED_0(12));
     tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
