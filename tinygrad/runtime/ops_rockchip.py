@@ -73,9 +73,9 @@ class RockchipProgram:
         self.reg(op in [Ops.MUL, Ops.FDIV], rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
-    # need gated by op, even setting 0 make result wrong
+    # need gated by Ops.FDIV, even setting 0 make test_add wrong
     if op == Ops.FDIV: 
-      # setting 0 or 1 both works, remove line does not
+      # setting 0 or 1 both passed test_div, remove line does not
       self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
         self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
 
@@ -318,16 +318,16 @@ class RockchipProgram:
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
-          if len(src_values) >= 2 and uop in self.ops_map and dtype.scalar() == dtypes.float16:
+          if len(src_values) >= 2 and uop in self.ops_map and dtype.scalar() in [dtypes.float16]:
             self.boilerplate(op=uop, size=len(src_values[0]))
 
             src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
             src2 = memoryview(bytearray(np.asarray(src_values[1], dtype=np.float16).tobytes()))
+            self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+            self.cmd_buf = self.device._gpu_alloc(1024, 0, name="cmd_buf")
             self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
             self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
             self.output_buf = self.device._gpu_alloc(src.nbytes, 0, name="output")
-            self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
-            self.cmd_buf = self.device._gpu_alloc(1024, 0, name="cmd_buf")
             try:
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
               ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
@@ -349,19 +349,21 @@ class RockchipProgram:
 
               dst = memoryview(bytearray(self.output_buf.size))
               ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
+              print(dst.tobytes().hex())
               # fp16 2B, self.output_buf.size//2
               dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
-              # print('dst', list(dst))
-              # print('src', list(src))
-              # print('src2', list(src2))
+              print('src', list(src))
+              print('src2', list(src2))
+              print('dst', list(dst))
+              print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) if uop in python_alu else None
 
               values[i] = list(dst)
             finally:
+              self.device._gpu_free(self.task_buf)
+              self.device._gpu_free(self.cmd_buf)
               self.device._gpu_free(self.input_buf)
               self.device._gpu_free(self.weight_buf)
               self.device._gpu_free(self.output_buf)
-              self.device._gpu_free(self.task_buf)
-              self.device._gpu_free(self.cmd_buf)
           else:
             # Only allow fallback for simple logical ops.
             allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC)
@@ -376,6 +378,7 @@ class RockchipProgram:
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
+  has_threads = False
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL]}
   code_for_op.update({Ops.FDIV: 0})
   extra_matcher = PatternMatcher([
