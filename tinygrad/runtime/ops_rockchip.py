@@ -59,7 +59,7 @@ class RockchipProgram:
         self.reg(precision_float16, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
-        # self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+        self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
         self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
         self.reg(dataout_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
@@ -73,8 +73,10 @@ class RockchipProgram:
         self.reg(op in [Ops.MUL, Ops.FDIV], rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
-    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
-        self.reg(op == Ops.FDIV, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    # need gated by op, even setting 0 make result wrong
+    if op == Ops.FDIV: 
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+        self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
         self.reg(dataout_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
@@ -93,7 +95,10 @@ class RockchipProgram:
         self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
         self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK))
     
-  def submit(self):
+  def submit(self, uop):
+    # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
+    if uop == Ops.MUL: 
+      self.q.append(0x2001000178495044), # 63
     self.q.append(0x0081000000180008), # EMIT(REG_PC_OPERATION_ENABLE, PC_OPERATION_ENABLE_RESERVED_0(12));
     tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
     regcmd = ctypes.cast(self.device.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
@@ -110,6 +115,7 @@ class RockchipProgram:
     tasks[0].regcfg_offset = 0;
     tasks[0].regcmd_addr = self.device.cmd_buf.meta.dma_addr
 
+    # TODO: update parameter name as driver updated
     submit_res = rk.struct_rknpu_submit(
             flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
             timeout=6000,
@@ -129,9 +135,7 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
-    res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,
-            __payload=submit_res
-    )
+    res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     print(res)
 
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
@@ -332,7 +336,7 @@ class RockchipProgram:
               self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
                        rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
 
-            self.submit()
+            self.submit(uop)
 
             dst = memoryview(bytearray(self.output_buf.size))
             ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
