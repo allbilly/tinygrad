@@ -98,8 +98,9 @@ class RockchipProgram:
     
   def submit(self, uop):
     # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
-    if uop in [Ops.MUL, Ops.ADD, Ops.SUB]: 
-      self.q.append(0x2001000178495044), # 63
+    if uop != Ops.FDIV: 
+      # EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION(2) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION(2) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN(1) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE(1));
+      self.q.append(0x2001000178495044), 
     self.q.append(0x0081000000180008), # EMIT(REG_PC_OPERATION_ENABLE, PC_OPERATION_ENABLE_RESERVED_0(12))
     tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task* 128)).contents
     regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
@@ -143,7 +144,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
-    self.ops_map = {Ops.MUL: 0, Ops.NEG:0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
+    self.ops_map = {Ops.MUL: 0, Ops.NEG:0, Ops.MAX:0, Ops.ADD: 2, Ops.FDIV:3, Ops.SUB: 4}
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     self.device.reset_npu()
@@ -385,11 +386,18 @@ class RockchipRenderer(Renderer):
   has_threads = False
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL]}
   code_for_op.update({Ops.FDIV: 0})
+  # hacks turn unsupported dtype to half, result might not accurate
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.ADD, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MAX, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
+    (UPat(Ops.NEG, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
   ])
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
