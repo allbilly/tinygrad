@@ -16,6 +16,17 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar, _load, load, _store, generic_wmma_helper
 
 class RockchipProgram:
+  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
+    self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
+    self.device = dev
+    self.q = []
+    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.cmd_buf_size = 16384
+    self.exp2_use_fp16_lut = False
+    self.exp2_inv_scale = 1.0
+    self.lut_size = 1026
+    self.lut_ops = [Ops.EXP2, Ops.CUSTOM]
+
   def reg(self, val, shift, mask):
     return ((val) << shift) & mask
   def emit_raw(self, target, reg, value):
@@ -24,40 +35,64 @@ class RockchipProgram:
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
     self.q.append(packed_value)
   def emit_lut_q015_tables(self, lut):
-    for table_id, base in ((0, 0), (1, 513)):
+    for table_id, base in ((0, 0), (1, self.lut_size//2)):
       self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG,
           self.reg(1, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__MASK) |
           self.reg(table_id, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__MASK) |
           self.reg(0, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__MASK))
-      for i in range(513):
-        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA,
-          self.reg(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK))
+      for i in range(self.lut_size//2):
+        data = self.reg(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK)
+        if (lut[base + i]<0): 
+          data |= self.reg(0xFFFF, rk.DPU_LUT_ACCESS_DATA_RESERVED_0__SHIFT, rk.DPU_LUT_ACCESS_DATA_RESERVED_0__MASK)
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA, data)
 
-  def boilerplate(self, op, size):
+  def boilerplate(self, op, size, arg):
     self.q = []
-    if op in [Ops.EXP2]:
-      lut = [0] * 1026
-      index_scale = 5216.0
-      step = 32.0 / index_scale
-      max_x = 512.0 * step
-      max_pos = math.exp2(max_x)
-      max_neg = math.exp2(-max_x)
-      max_abs = max(abs(max_pos), abs(max_neg))
-      inv_scale = 1.0 / max_abs if max_abs > 1.0 else 1.0
-      for i in range(513):
-        x = (512 - i) * step
-        y = math.exp2(-x)
-        q = int(math.floor((y * inv_scale + 1.0) * 16384.0 + 0.5))
-        if q < 0: q = 0
-        if q > 32767: q = 32767
-        lut[i] = q
-      for i in range(513):
-        x = i * step
-        y = math.exp2(x)
-        q = int(math.floor((y * inv_scale + 1.0) * 16384.0 + 0.5))
-        if q < 0: q = 0
-        if q > 32767: q = 32767
-        lut[513 + i] = q
+    lut = [0] * self.lut_size
+    if op in self.lut_ops:
+      if op is Ops.EXP2:
+        x_min = -2.0
+        x_max = 2.0
+        index_shift = 5
+        exp2_index_scale = (1 << index_shift) * (len(lut) - 1) / (x_max - x_min)
+        exp2_bias = -x_min
+        step = (x_max - x_min) / (len(lut) - 1)
+        self.exp2_use_fp16_lut = False
+        if self.exp2_use_fp16_lut:
+          self.exp2_inv_scale = 1.0
+          for i in range(len(lut)):
+            x = x_min + i * step
+            lut[i] = int(np.float16(math.exp2(x)).view(np.uint16))
+        else:
+          max_val = max(math.exp2(x_min), math.exp2(x_max))
+          self.exp2_inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
+          for i in range(len(lut)):
+            x = x_min + i * step
+            y = math.exp2(x) * self.exp2_inv_scale
+            q = int(math.floor((y + 1.0) * 16384.0 + 0.5))
+            if q < 0: q = 0
+            if q > 32767: q = 32767
+            lut[i] = q
+      elif op is Ops.CUSTOM :
+        if arg == "silu":
+          lut_entries = self.lut_size // 2
+          index_scale = 2824.0
+          step = 32.0 / index_scale
+          output_scale = 5664.8
+          for i in range(lut_entries):
+            x = (lut_entries - 1 - i) * step
+            y = -x / (1.0 + math.exp(x))
+            q = int(math.floor(y * output_scale + 0.5)) if y >= 0.0 else int(math.ceil(y * output_scale - 0.5))
+            if q < -32768: q = -32768
+            if q > 32767: q = 32767
+            lut[i] = q
+          for i in range(lut_entries):
+            x = i * step
+            y = x / (1.0 + math.exp(-x))
+            q = int(math.floor(y * output_scale + 0.5)) if y >= 0.0 else int(math.ceil(y * output_scale - 0.5))
+            if q < -32768: q = -32768
+            if q > 32767: q = 32767
+            lut[lut_entries + i] = q
 
       self.emit_lut_q015_tables(lut)
       self.emit_raw(rk.DPU, rk.REG_DPU_LUT_CFG,
@@ -96,7 +131,7 @@ class RockchipProgram:
     ew_op_src = 1
     erdma_data_size_16bit=2
 
-    if op in [Ops.EXP2]: ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0; 
+    if op in self.lut_ops: ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0; 
 
     # self.emit_raw(rk.DPU, rk.REG_DPU_S_POINTER,
     #     self.reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
@@ -125,7 +160,7 @@ class RockchipProgram:
         self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
         self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
         self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
-        self.reg(op in [Ops.MUL, Ops.FDIV, Ops.EXP2], rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+        self.reg(op in [Ops.MUL, Ops.FDIV] or op in self.lut_ops, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK))
     # need gated by Ops.FDIV, even setting 0 make test_add wrong
@@ -141,15 +176,24 @@ class RockchipProgram:
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
         self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
 
-    if op in [Ops.EXP2]:
+    if op in self.lut_ops:
       # BN_ALU_ALGO 2: add, 4:minus
       # BN_ALU_OPERAND default 0 , so added 0 now
       self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
         self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
         self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
-      # index_scale = 5216 = 0x6D18   
+      bn_alu_operand, bn_mul_operand = 0x0, 0x3C00
+      if op is Ops.EXP2:
+        bn_alu_operand = int(np.float32(exp2_bias).view(np.uint32)) 
+        bn_mul_operand = int(np.float16(exp2_index_scale).view(np.uint16))
+      elif op is Ops.CUSTOM:
+        if arg == "silu":
+          bn_mul_operand = 0x6984
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_ALU_CFG,
+        self.reg(bn_alu_operand, rk.DPU_BN_ALU_CFG_BN_ALU_OPERAND__SHIFT,
+                 rk.DPU_BN_ALU_CFG_BN_ALU_OPERAND__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
-        self.reg(0x6D18, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
         self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
         self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
@@ -202,19 +246,14 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
+    # os.system("cd ~/npu/ops_reg/ && python dump.py 2")
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
     print(res)
 
-  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
-    self.device = dev
-    self.q = []
-    self.ops_map = {Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
-    self.cmd_buf_size = 16384
+
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     self.device.reset_npu()
-
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -382,7 +421,7 @@ class RockchipProgram:
             def c_map(lane, elem): return (elem%16, elem//16)
             values[i] = wmma_helper(1, 1, 16, 16, 256, elem, elem, c_map)
           else: raise NotImplementedError(f"unimplemented tensor core {arg}")
-        elif uop in GroupOp.ALU:
+        elif uop is Ops.CUSTOM or uop in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
           if uop in self.ops_map and dtype.scalar() in [dtypes.float16]:
@@ -390,9 +429,9 @@ class RockchipProgram:
               if uop == Ops.NEG:
                 src_values.append([-1]*len(src_values[0]))
                 uop = Ops.MUL
-              if uop in [Ops.EXP2]:
+              if uop in self.lut_ops:
                 src_values.append(src_values[0])
-            self.boilerplate(op=uop, size=len(src_values[0]))
+            self.boilerplate(op=uop, size=len(src_values[0]), arg=arg)
 
             src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
             src2 = memoryview(bytearray(np.asarray(src_values[1], dtype=np.float16).tobytes()))
@@ -422,16 +461,20 @@ class RockchipProgram:
 
               dst = memoryview(bytearray(self.output_buf.size))
               ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
-              print(dst.tobytes().hex())
+              dst_bytes = dst.tobytes()
+              print(dst_bytes.hex())
               # fp16 2B, self.output_buf.size//2
-              dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
-              if uop in [Ops.EXP2]:
-                # q15 decode
-                index_scale = 5216.0
-                step = 32.0 / index_scale
-                max_x = 512.0 * step
-                inv_scale = 1.0 / max(abs(2**max_x), abs(2**(-max_x)))
-                dst = [ (x-16384)/16384 / inv_scale for x in dst]
+              dst = struct.unpack(f'<{self.output_buf.size//2}e', dst_bytes)
+              if uop in self.lut_ops:
+                if uop is Ops.EXP2:
+                  raw = np.rint(np.array(dst, dtype=np.float32)).astype(np.uint16)
+                  if self.exp2_use_fp16_lut:
+                    dst = raw.view(np.float16).astype(np.float32)
+                  else:
+                    dst = (raw / 16384.0 - 1.0) / self.exp2_inv_scale
+                elif arg == "silu":
+                  raw = np.rint(np.array(dst, dtype=np.float32)).astype(np.uint16)
+                  dst = raw * 0.0001766241 
               print('src', list(src))
               print('src2', list(src2))
               print('dst', list(dst))
@@ -457,6 +500,12 @@ class RockchipProgram:
         i += 1
     return time.perf_counter() - st
 
+def silu_custom(x:UOp, c:UOp):
+  target = -1/math.log(2)
+  tol = 1e-3 if c.dtype == dtypes.half else 1e-6
+  if abs(c.arg - target) > tol: return None
+  return UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")
+
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
   has_threads = False
@@ -476,6 +525,13 @@ class RockchipRenderer(Renderer):
      lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
     (UPat(Ops.EXP2, dtypes.float, name="x"),
      lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+    # is this a hacks on Ops.CUSTOM?
+    (UPat.var("x", dtypes.floats).alu(Ops.FDIV,
+      UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
+     silu_custom),
+    (UPat.var("x", dtypes.floats) * UPat.const(dtypes.floats, 1).alu(Ops.FDIV,
+      UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
+     silu_custom),
   ])
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
