@@ -16,6 +16,15 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar, _load, load, _store, generic_wmma_helper
 
 class RockchipProgram:
+  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
+    self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
+    self.device = dev
+    self.q = []
+    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.cmd_buf_size = 16384
+    self.exp2_inv_scale = 1.0
+    self.lut_size = 513
+    self.lut_ops = [Ops.EXP2, Ops.CUSTOM]
   def reg(self, val, shift, mask):
     return ((val) << shift) & mask
   def emit_raw(self, target, reg, value):
@@ -102,13 +111,7 @@ class RockchipProgram:
     ew_op_src = 1
     ew_op_bypass = op in self.lut_ops
     erdma_data_size_16bit=2
-
     if op in self.lut_ops: ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0; 
-
-    # self.emit_raw(rk.DPU, rk.REG_DPU_S_POINTER,
-    #     self.reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
-    #     self.reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
-    #     self.reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
 
     self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
         self.reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
@@ -137,11 +140,9 @@ class RockchipProgram:
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
         self.reg(ew_op_bypass, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK)
       )
-    # need gated by Ops.FDIV, even setting 0 make test_add wrong
-    if op == Ops.FDIV: 
-      # setting 0 or 1 both passed test_div, remove line does not
-      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
-        self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    # 0 or 1 both passed test_div, do not emit OUT_CVT_SCALE for other ops
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK)) if op == Ops.FDIV else None
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
         self.reg(dataout_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
@@ -151,8 +152,6 @@ class RockchipProgram:
         self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
 
     if op in self.lut_ops:
-      # BN_ALU_ALGO 2: add, 4:minus
-      # BN_ALU_OPERAND default 0 , so added 0 now
       self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
         self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
         self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
@@ -161,12 +160,6 @@ class RockchipProgram:
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
         self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
         self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
-    # self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 
-    #     self.reg(2, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__MASK) | 
-    #     self.reg(15, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__MASK) | 
-    #     self.reg(2, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__MASK) |
-    #     self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
-    #     self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK))
 
   def submit(self, uop):
     # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
@@ -214,15 +207,6 @@ class RockchipProgram:
     # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
     print(res)
 
-  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes):
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
-    self.device = dev
-    self.q = []
-    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
-    self.cmd_buf_size = 16384
-    self.inv_scale = 1.0
-    self.lut_size = 513
-    self.lut_ops = [Ops.EXP2, Ops.CUSTOM]
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     self.device.reset_npu()
 
@@ -246,7 +230,6 @@ class RockchipProgram:
         global_iters = [tuple(0 for _ in global_size)]
         vectorize_global = True
 
-    # for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
     for idxs in global_iters:
       values: dict[int, Any] = {}
       pbufs: list[memoryview] = list(bufs)
@@ -473,7 +456,7 @@ class RockchipRenderer(Renderer):
   has_threads = False
   code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL]}
   code_for_op.update({Ops.FDIV: 0})
-  # hacks turn unsupported dtype to half, result might not accurate
+  # hacks, turned unsupported dtype to half and lut function to Ops.CUSTOM
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
@@ -523,6 +506,11 @@ class RockchipAllocator(Allocator['RockchipDevice']):
   def _copyout(self, dest:memoryview, src): dest[:] = src
 
 class RockchipDevice(Compiled):
+  def __init__(self, device:str):
+    self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
+
+    compilers = CompilerSet([CompilerPair(RockchipRenderer, RockchipCompiler)])
+    super().__init__(device, RockchipAllocator(self), compilers, functools.partial(RockchipProgram, self))
   def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
     flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
     result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
@@ -545,9 +533,3 @@ class RockchipDevice(Compiled):
       handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr))
   def reset_npu(self):
     rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, __payload=rk.struct_rknpu_action(flags=rk.RKNPU_ACT_RESET, value=0))
-
-  def __init__(self, device:str):
-    self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
-
-    compilers = CompilerSet([CompilerPair(RockchipRenderer, RockchipCompiler)])
-    super().__init__(device, RockchipAllocator(self), compilers, functools.partial(RockchipProgram, self))
