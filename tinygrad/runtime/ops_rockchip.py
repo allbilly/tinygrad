@@ -20,11 +20,12 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
-    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.hardware_ops = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.exp2_inv_scale = 1.0
     self.lut_size = 513
-    self.lut_ops = [Ops.EXP2, Ops.CUSTOM]
+  def check_lut_enable(self, op, arg):
+    return bool({op, arg} & {Ops.EXP2, "silu"})
   def reg(self, val, shift, mask):
     return ((val) << shift) & mask
   def emit_raw(self, target, reg, value):
@@ -43,8 +44,7 @@ class RockchipProgram:
           self.reg(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK))
 
   def boilerplate(self, op, size, arg):
-    self.q = []
-    if op in self.lut_ops:
+    if self.lut_enable:
       lut = [0] * self.lut_size * 2
       index_shift = 5
       if op is Ops.EXP2:
@@ -105,14 +105,19 @@ class RockchipProgram:
     ew_cvt_type = 0
     ew_data_mode = 1
     ew_data_size = 2
-    ew_relu_bypass = 1
+    ew_relu_bypass = arg != "relu"
     ew_lut_bypass = 1
-    ew_alu_algo = self.ops_map.get(op, 0)
+    ew_alu_algo = self.hardware_ops.get(op, 0)
     ew_op_src = 1
-    ew_op_bypass = op in self.lut_ops
     erdma_data_size_16bit=2
-    if op in self.lut_ops: ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0; 
-
+    if self.lut_enable: 
+      ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0; 
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+    
     self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
         self.reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
         self.reg(output_mode, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK) |
@@ -135,10 +140,10 @@ class RockchipProgram:
         self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
         self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
         self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
-        self.reg(op in [Ops.MUL, Ops.FDIV] or op in self.lut_ops, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+        self.reg(op in [Ops.MUL, Ops.FDIV] or self.lut_enable, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
-        self.reg(ew_op_bypass, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK)
+        self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK)
       )
     # 0 or 1 both passed test_div, do not emit OUT_CVT_SCALE for other ops
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
@@ -150,13 +155,6 @@ class RockchipProgram:
         self.reg(dataout_height, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__MASK))
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
         self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
-
-    if op in self.lut_ops:
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
-        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
-        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
-        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
         self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
         self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
@@ -379,12 +377,14 @@ class RockchipProgram:
         elif uop is Ops.CUSTOM or uop in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
-          if uop in self.ops_map and dtype.scalar() in [dtypes.float16]:
+          if uop in self.hardware_ops and dtype.scalar() in [dtypes.float16]:
+            self.q = []
+            self.lut_enable = self.check_lut_enable(uop, arg)
             if len(src_values)==1: 
-              if uop == Ops.NEG:
+              if uop is Ops.NEG:
                 src_values.append([-1]*len(src_values[0]))
                 uop = Ops.MUL
-              if uop in self.lut_ops:
+              else:
                 src_values.append(src_values[0])
             self.boilerplate(op=uop, size=len(src_values[0]), arg=arg)
 
@@ -419,7 +419,7 @@ class RockchipProgram:
               print(dst.tobytes().hex())
               # fp16 2B, self.output_buf.size//2
               dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
-              if uop in self.lut_ops:
+              if self.lut_enable:
                 raw = np.rint(np.array(dst, dtype=np.float32))
                 # q14 decode
                 if uop is Ops.EXP2:
@@ -475,6 +475,8 @@ class RockchipRenderer(Renderer):
     (UPat.var("x", dtypes.floats) * UPat.const(dtypes.floats, 1).alu(Ops.FDIV,
       UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
      lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
+    (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
+     lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
   ])
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
