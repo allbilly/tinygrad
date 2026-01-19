@@ -20,7 +20,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
-    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.ops_map = {Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.ADD:2, Ops.FDIV:3, Ops.RECIPROCAL:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.exp2_inv_scale = 1.0
     self.lut_size = 513
@@ -381,10 +381,14 @@ class RockchipProgram:
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
           if uop in self.ops_map and dtype.scalar() in [dtypes.float16]:
             if len(src_values)==1: 
-              if uop == Ops.NEG:
+              if uop is Ops.NEG:
                 src_values.append([-1]*len(src_values[0]))
                 uop = Ops.MUL
-              if uop in self.lut_ops:
+              elif uop is Ops.RECIPROCAL:
+                src_values.append([1]*len(src_values[0]))
+                src_values[0], src_values[1] = src_values[1], src_values[0]
+                uop = Ops.FDIV  
+              elif uop in self.lut_ops:
                 src_values.append(src_values[0])
             self.boilerplate(op=uop, size=len(src_values[0]), arg=arg)
 
@@ -454,8 +458,8 @@ class RockchipProgram:
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
   has_threads = False
-  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL]}
-  code_for_op.update({Ops.FDIV: 0})
+  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC]}
+  # code_for_op.update({Ops.FDIV: 0})
   # hacks, turned unsupported dtype to half and lut function to Ops.CUSTOM
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"),
