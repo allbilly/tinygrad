@@ -93,6 +93,13 @@ class RockchipProgram:
           self.reg(22, rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__SHIFT,
                   rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__MASK))
 
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+      
+
     burst_len = 15
     output_mode  = 2
     flying_mode = 1
@@ -106,17 +113,11 @@ class RockchipProgram:
     ew_data_mode = 1
     ew_data_size = 2
     ew_relu_bypass = arg != "relu"
-    ew_lut_bypass = 1
     ew_alu_algo = self.hardware_ops.get(op, 0)
     ew_op_src = 1
     erdma_data_size_16bit=2
     if self.lut_enable: 
       ew_data_mode = 0; ew_data_size = 0; ew_lut_bypass = 0; ew_op_src = 0; 
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
-        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
-        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
-      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
-        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
     
     self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
         self.reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
@@ -141,7 +142,7 @@ class RockchipProgram:
         self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
         self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
         self.reg(op in [Ops.MUL, Ops.FDIV] or self.lut_enable, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
-        self.reg(ew_lut_bypass, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+        self.reg(self.lut_enable == False, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
         self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK)
       )
@@ -426,16 +427,15 @@ class RockchipProgram:
                   dst = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
                 elif arg == "silu":
                   dst = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
+              values[i] = list(dst)
               print('src', list(src))
               print('src2', list(src2))
-              print('dst', list(dst))
+              print('dst', values[i])
               try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) 
               except: pass
-              values[i] = list(dst)
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
-            # Only allow fallback for simple logical ops.
             allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC)
             if allow_fallback:
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
