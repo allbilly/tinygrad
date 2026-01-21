@@ -115,22 +115,22 @@ class RockchipProgram:
         self.reg(0x7C00, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE,
         self.reg(0x3F800000, rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__SHIFT, rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__MASK))
-    elif op is Ops.CUSTOM and arg == "cmpeq_diff_zero_to_1.001":
+    elif op is Ops.CUSTOM and arg == "cmpeq_diff_zero_to_nan_to_32800":
       self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
         self.reg(2, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
         self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
         self.reg(0x7C00, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
-        self.reg(16, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
-    elif op is Ops.CUSTOM and arg == "cmpeq_1.001_to_bool":
+        self.reg(1, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+    elif op is Ops.CUSTOM and arg == "cmpeq_32800_to_bool":
       self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
         self.reg(4, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
         self.reg(0, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_BS_ALU_CFG,
-        self.reg(0x3F800000, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__SHIFT, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__MASK))
+        self.reg(0x47001F00, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__SHIFT, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__MASK))
       self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
-        self.reg(0x63D0, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
+        self.reg(0x3C00, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
       # REG_DPU_OUT_CVT_SHIFT need manual reset to 0
       self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
         self.reg(0, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
@@ -180,7 +180,7 @@ class RockchipProgram:
         self.reg(self.lut_enable == False, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
         self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
-        self.reg(arg in ["cmplt_diff2bool", "cmpeq_diff_zero_to_1.001", "cmpeq_1.001_to_bool"], rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK) 
+        self.reg(arg in ["cmplt_diff2bool", "cmpeq_diff_zero_to_nan_to_32800", "cmpeq_32800_to_bool"], rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK) 
       )
     # 0 or 1 both passed test_div, do not emit OUT_CVT_SCALE for other ops
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
@@ -244,7 +244,6 @@ class RockchipProgram:
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     self.device.reset_npu()
-
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -273,7 +272,7 @@ class RockchipProgram:
       while i < len(self.uops):
         uop, dtype, srcs, arg = self.uops[i]
         src_values = [values[v] for v in srcs if self.uops[v][0] not in void_ops]
-        print(i, uop, src_values)
+        print(i, uop, arg, src_values)
         src_dtypes = [self.uops[v][1] for v in srcs if self.uops[v][0] not in void_ops]
         if getenv("TRACE"): print(i, uop, dtype, arg, src_values, src_dtypes)
         if uop is Ops.END:
@@ -416,6 +415,7 @@ class RockchipProgram:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
           assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {uop}"
           if uop is Ops.CMPLT or (uop in self.hardware_ops and dtype.scalar() in [dtypes.float16]):
+            self.device.reset_npu()
             self.q = []
             self.lut_enable = self.check_lut_enable(uop, arg)
             if len(src_values)==1: 
@@ -456,23 +456,20 @@ class RockchipProgram:
               ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
               print(dst.tobytes().hex())
               # fp16 2B, self.output_buf.size//2
-              dst = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
+              result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
               if self.lut_enable:
                 raw = np.rint(np.array(dst, dtype=np.float32))
                 # q14 decode
                 if uop is Ops.EXP2:
-                  dst = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
+                  result = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
                 elif arg == "silu":
-                  dst = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
-              # elif uop is Ops.CMPLT:
-                # dst = [ x==1 for x in dst ]
-              values[i] = list(dst)
+                  result = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
+              values[i] = list(result)
               print('src', src_values[0])
               print('src2', src_values[1])
-              print('dst', values[i])
+              print('result', values[i])
               try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) 
               except: pass
-              
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
@@ -494,10 +491,6 @@ class RockchipRenderer(Renderer):
   pre_matcher = PatternMatcher([
     (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
      lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
-    # CMPNE = 1 - CMPEQ
-    (UPat(Ops.CMPNE, name="x"),
-     lambda x: UOp.const(dtypes.float16, 1).alu(Ops.SUB,
-       x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16))),
   ])
   extra_matcher = PatternMatcher([
     (UPat(Ops.MUL, dtypes.int, name="x"),
@@ -521,9 +514,15 @@ class RockchipRenderer(Renderer):
     (UPat(Ops.CMPLT, name="x"),
      lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),), arg="cmplt_diff2bool")),
     (UPat(Ops.CMPEQ, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_1.001_to_bool", src=
-                   (UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_1.001", src=
+     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=
+                   (UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=
                         (x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),)),))),
+    # CMPNE(x) = 1 - CMPEQ(x)
+    (UPat(Ops.CMPNE, name="x"),
+      lambda x: UOp.const(dtypes.float16, 1).alu(
+        Ops.SUB,
+        x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16)
+      ).cast(dtypes.bool)),
   ])
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
@@ -562,7 +561,7 @@ class RockchipDevice(Compiled):
   def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
     flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
     result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
-    print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name}")
+    # print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name}")
     return flink_req.name
   def _gpu_alloc(self, size:int, flags, name:str) -> HCQBuffer:
     mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
