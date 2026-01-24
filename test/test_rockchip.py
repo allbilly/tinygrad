@@ -102,6 +102,54 @@ class TestOps(unittest.TestCase):
     if exact: self.assertEqual(str(torch_cm.exception), str(tinygrad_cm.exception))
     if not CI: print("\ntesting %40r   torch/tinygrad exception: %s / %s" % (shps, torch_cm.exception, tinygrad_cm.exception), end="")
 
+  def test_full_like(self):
+    a = Tensor([[1,2,3],[4,5,6]], dtype=dtypes.float32)
+    b = torch.tensor([[1,2,3],[4,5,6]], dtype=torch.float32)
+    helper_test_op([], lambda: torch.full_like(b, 4), lambda: Tensor.full_like(a, 4), forward_only=True)
+
+    a = Tensor([[1,2,3],[4,5,6]], dtype=dtypes.int32)
+    b = torch.tensor([[1,2,3],[4,5,6]], dtype=torch.int32)
+    helper_test_op([], lambda: torch.full_like(b, 4), lambda: Tensor.full_like(a, 4), forward_only=True)
+
+  def test_full(self):
+    helper_test_op([], lambda: torch.full((45,65), 4, dtype=torch.int32), lambda: Tensor.full((45,65), 4), forward_only=True)
+
+  def test_negative_dims(self):
+    creation_methods: List[Callable[..., Tensor]] = [
+      Tensor.empty,
+      Tensor.rand,
+      Tensor.zeros,
+      Tensor.ones,
+      Tensor.randn,
+      Tensor.randint,
+      Tensor.normal,
+      Tensor.uniform,
+      Tensor.scaled_uniform,
+      Tensor.glorot_uniform
+    ]
+
+    for method in creation_methods:
+      with self.assertRaises(ValueError): method(-3, 2)
+      with self.assertRaises(ValueError): method((2, -3))
+      with self.assertRaises(ValueError): method((2, -3, 0))
+
+  def test_negative_dims_full(self):
+    with self.assertRaises(ValueError): Tensor.full((-3,), 2)
+    with self.assertRaises(ValueError): Tensor.full((2, -3), 4)
+    with self.assertRaises(ValueError): Tensor.full((2, -3, 0), 4)
+
+  def test_negative_dims_eye(self):
+    with self.assertRaises(ValueError): Tensor.eye(-3, 3)
+    with self.assertRaises(ValueError): Tensor.eye(3, -3)
+    with self.assertRaises(ValueError): Tensor.eye(-3, -3)
+
+  def test_negative_dims_kaiming(self):
+    creation_methods = [Tensor.kaiming_uniform, Tensor.kaiming_normal]
+    for method in creation_methods:
+      with self.assertRaises(ValueError): method(-3, 3)
+      with self.assertRaises(ValueError): method((-3, 3), 3)
+      with self.assertRaises(ValueError): method((-3, -3), 3)
+
   def test_tiny_add(self):
     helper_test_op([(3), (3)], lambda x,y: x+y, Tensor.add, forward_only=True)
   def test_tiny_mul(self):
@@ -274,6 +322,20 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, lambda x: x.half().trunc(), lambda x: x.cast(dtypes.float16).trunc(),
                    vals=[[1.499, 1.5, 1.501, 1.0, 2.1, 0.0, -5.0, -2.499, -2.5, -2.501]],
                    forward_only=True)
+  def test_abs(self):
+    helper_test_op([(45,65)], torch.abs, Tensor.abs)
+    helper_test_op([()], torch.abs, Tensor.abs)
+  def test_abs_exact(self):
+    helper_test_op(None, torch.abs, Tensor.abs, vals=[[-1.,0,1]])
+
+  # @slow_test
+  # def test_max_pool2d(self):
+  #   for ksz in [(2,2)]: # , (3,3), 2, 3, (3,2), (5,5), (5,1)]:
+  #     with self.subTest(kernel_size=ksz):
+  #       helper_test_op([(32,2,11,28)],
+  #         lambda x: torch.nn.functional.max_pool2d(x, kernel_size=ksz),
+  #         lambda x: Tensor.max_pool2d(x, kernel_size=ksz))
+
 
 if __name__ == '__main__':
   np.random.seed(1337)

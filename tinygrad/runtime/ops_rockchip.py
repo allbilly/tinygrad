@@ -20,7 +20,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
-    self.hardware_ops = {Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.hardware_ops = {Ops.SHL:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.exp2_inv_scale = 1.0
     self.lut_size = 513
@@ -151,7 +151,10 @@ class RockchipProgram:
       # REG_DPU_OUT_CVT_SHIFT need manual reset to 0
       self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
         self.reg(0, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
-    
+    elif op is Ops.SHL:
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+        self.reg(-2, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+
     burst_len = 15
     output_mode  = 2
     flying_mode = 1
@@ -257,7 +260,7 @@ class RockchipProgram:
     )
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
     # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
-    print(res)
+    # print(res)
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     self.device.reset_npu()
@@ -289,9 +292,8 @@ class RockchipProgram:
       while i < len(self.uops):
         uop, dtype, srcs, arg = self.uops[i]
         src_values = [values[v] for v in srcs if self.uops[v][0] not in void_ops]
-        print()
-        print(i, uop, arg, src_values)
         src_dtypes = [self.uops[v][1] for v in srcs if self.uops[v][0] not in void_ops]
+        if getenv("TRACE"):  print()
         if getenv("TRACE"): print(i, uop, dtype, arg, src_values, src_dtypes)
         if uop is Ops.END:
           i = srcs[1]
@@ -472,7 +474,7 @@ class RockchipProgram:
 
               dst = memoryview(bytearray(self.output_buf.size))
               ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
-              print(dst.tobytes().hex())
+              if getenv("TRACE"):  print(dst.tobytes().hex())
               # fp16 2B, self.output_buf.size//2
               result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
               if self.lut_enable:
@@ -483,23 +485,37 @@ class RockchipProgram:
                 elif arg == "silu":
                   result = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
               values[i] = list(result)
-              print('src', src_values[0])
-              print('src2', src_values[1])
-              print('result', values[i])
-              try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) 
+              if getenv("TRACE"):  print('src', src_values[0])
+              if getenv("TRACE"):  print('src2', src_values[1])
+              if getenv("TRACE"):  print('result', values[i])
+              try: 
+                if getenv("TRACE"): print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) 
               except: pass
             finally:
               self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
           else:
-            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR)
+            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR)#, Ops.SHL, Ops.SHR)
             if allow_fallback:
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
               values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
             else:
               print('<!> EXIT OPERATION NOT SUPPORTED', uop, dtype, src_values)
+              if getenv("TRACE"): print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)]) 
         assert i in values, (uop, dtype, srcs, arg)
         i += 1
     return time.perf_counter() - st
+
+def _rk_shift_to_muldiv(x, op):
+  vmax = max(abs(x.src[0].vmin), abs(x.src[0].vmax))
+  smin, smax = x.src[1].vmin, x.src[1].vmax
+  if not all(math.isfinite(v) for v in (vmax, smin, smax)): return None
+  if smin < 0: return None
+  smax_i = int(smax)
+  if smax_i != smax or smax_i > 15: return None
+  if vmax > 65504: return None
+  if x.op is Ops.SHL and vmax * (1 << smax_i) > 65504: return None
+  pow2 = x.src[1].cast(dtypes.float16).exp2()
+  return x.src[0].cast(dtypes.float16).alu(op, pow2).cast(x.dtype)
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
@@ -527,6 +543,14 @@ class RockchipRenderer(Renderer):
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
     (UPat(Ops.MAX, dtypes.int, name="x"),
      lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MAX, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.SHL, dtypes.uint, name="x"),
+     lambda x: _rk_shift_to_muldiv(x, Ops.MUL)),
+    (UPat(Ops.SHR, dtypes.uint, name="x"),
+     lambda x: _rk_shift_to_muldiv(x, Ops.FDIV)),
+    (UPat(Ops.ADD, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
+    (UPat(Ops.MUL, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MUL, x.src[1].cast(dtypes.half))),
     (UPat(Ops.MAX, dtypes.float, name="x"),
      lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
     (UPat(Ops.NEG, dtypes.float, name="x"),
