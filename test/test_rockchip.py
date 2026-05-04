@@ -1,4 +1,5 @@
-import os, time, math, unittest, functools, platform, warnings
+import os, sys, time, math, unittest, functools, platform, warnings, subprocess, pickle, ctypes
+from pathlib import Path
 import numpy as np
 import torch
 
@@ -8,6 +9,12 @@ from tinygrad.helpers import getenv, CI, DEBUG, DEV, IMAGE
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.uop.ops import Ops
+from tinygrad.runtime.support.rockchip import (
+  RKPatch, RKTaskTemplate, RKTemplatePackage, build_conv1x1_template, build_elementwise_template, build_lut, conv_params,
+  decode_template, encode_template, apply_patches, lut_enabled, pack_conv_input, pack_conv_weights, patch_regcmd, rkcmd, unpack_conv_output,
+  validate_template, submit_plan, submit_template, wmma_params,
+)
+from tinygrad.runtime.autogen import rockchip as rk
 
 if getenv("TINY_BACKEND"):
   import tinygrad.nn.torch # noqa: F401 # pylint: disable=unused-import
@@ -18,6 +25,7 @@ warnings.filterwarnings("ignore", message="Non-empty compiler output encountered
 FORWARD_ONLY = getenv("FORWARD_ONLY", 0)
 PRINT_TENSORS = getenv("PRINT_TENSORS", 0)
 COMPILE_ONLY = Device.DEFAULT == "NULL"
+RK3588_REF = Path.home() / "rk3588"
 
 def slow_test(test_func):
   return unittest.skipIf(getenv("SKIP_SLOW_TEST"), "Skipping slow test")(test_func)
@@ -90,6 +98,285 @@ def prepare_test_op(low, high, shps, vals, forward_only=False):
   tst = [Tensor(x.detach().cpu().numpy(), requires_grad=(not forward_only and not FORWARD_ONLY)) for x in ts]
   return ts, tst
 
+class TestRockchipSupport(unittest.TestCase):
+  def test_rkcmd_pack(self):
+    self.assertEqual(rkcmd(0x12, 0x3456, 0x89abcdef), ((0x13 & 0xffff) << 48) | ((0x89abcdef & 0xffffffff) << 16) | 0x3456)
+
+  def test_conv_packers(self):
+    p = conv_params(3, 4, 5)
+    src = memoryview(np.arange(15, dtype=np.float16).tobytes())
+    packed_in = pack_conv_input(src, p)
+    self.assertEqual(packed_in.dtype, np.float16)
+    self.assertEqual(packed_in.size, p["width_stride"] * (p["in_channels"] if p["use_nhwc"] else p["align_c"]))
+    packed_wt = pack_conv_weights(memoryview(np.arange(12, dtype=np.float16).tobytes()), p)
+    self.assertEqual(packed_wt.dtype, np.float16)
+    self.assertEqual(packed_wt.size, p["out_channels"] * p["align_c"])
+    out_p = {**p, "out_channels":4}
+    packed_out = np.arange(p["out_width_stride"] * 8, dtype=np.float16)
+    unpacked = unpack_conv_output(memoryview(packed_out.tobytes()), out_p)
+    self.assertEqual(unpacked.dtype, np.float16)
+    self.assertEqual(unpacked.size, 4 * 5)
+
+  def test_wmma_params(self):
+    p = wmma_params(64, 64, 64)
+    self.assertEqual(p["align_in"], 64)
+    self.assertEqual(p["align_out"], 64)
+    self.assertEqual(p["notch_val"], 0)
+
+  def test_lut_builder(self):
+    lut, index_scale, inv_scale = build_lut(Ops.EXP2, None, 513)
+    self.assertEqual(len(lut), 1026)
+    self.assertGreater(index_scale, 0)
+    self.assertGreater(inv_scale, 0)
+    trunc_lut, trunc_scale, trunc_inv_scale = build_lut(Ops.TRUNC, None, 513)
+    self.assertEqual(trunc_lut[:4], [0, 1 << 14, 0, 1 << 14])
+    self.assertEqual(trunc_scale, 0)
+    self.assertIsNone(trunc_inv_scale)
+    self.assertTrue(lut_enabled(Ops.EXP2, None))
+    self.assertTrue(lut_enabled(Ops.TRUNC, None))
+    self.assertTrue(lut_enabled(Ops.CUSTOM, "silu"))
+    self.assertFalse(lut_enabled(Ops.ADD, None))
+
+  def test_template_roundtrip(self):
+    pkg = RKTemplatePackage(
+      version=1, target="rk3588-rknpu2", family="elementwise", regcmd=(rkcmd(1, 2, 0),),
+      patches=(RKPatch("regcmd", 0, "dma32", 1, "input"),),
+      tasks=(RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=1),),
+    )
+    self.assertEqual(decode_template(encode_template(pkg)), pkg)
+    with self.assertRaisesRegex(RuntimeError, "unsupported Rockchip template package"):
+      decode_template(b"not-a-template")
+
+  def test_template_patch_dma32(self):
+    regcmd = [rkcmd(1, 2, 0)]
+    patch_regcmd(regcmd, RKPatch("regcmd", 0, "dma32", 0, "input"), 0x12345678)
+    self.assertEqual(regcmd[0], rkcmd(1, 2, 0x12345678))
+
+  def test_template_patch_regfield_overflow(self):
+    regcmd = [rkcmd(1, 2, 0)]
+    patch_regcmd(regcmd, RKPatch("regcmd", 0, "regfield", None, "scalar", shift=4, mask=0xf0), 0xf)
+    self.assertEqual(regcmd[0], rkcmd(1, 2, 0xf0))
+    with self.assertRaisesRegex(RuntimeError, "overflow"):
+      patch_regcmd(regcmd, RKPatch("regcmd", 0, "regfield", None, "scalar", shift=4, mask=0xf0), 0x10)
+
+  def test_template_apply_patches_requires_roles(self):
+    regcmd = [rkcmd(1, 2, 0), rkcmd(1, 3, 0)]
+    patches = (RKPatch("regcmd", 0, "dma32", None, "input"), RKPatch("regcmd", 1, "dma32", None, "output"))
+    apply_patches(regcmd, patches, {"input":0x1000, "output":0x2000})
+    self.assertEqual((regcmd[0] >> 16) & 0xffffffff, 0x1000)
+    self.assertEqual((regcmd[1] >> 16) & 0xffffffff, 0x2000)
+    with self.assertRaisesRegex(RuntimeError, "missing Rockchip patch role output"):
+      apply_patches(regcmd, patches, {"input":0x1000})
+
+  def test_template_validate_task_bounds(self):
+    pkg = RKTemplatePackage(
+      version=1, target="rk3588-rknpu2", family="elementwise", regcmd=(rkcmd(1, 2, 0),),
+      tasks=(RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=1, regcfg_amount=1),),
+    )
+    with self.assertRaisesRegex(RuntimeError, "out of bounds"):
+      validate_template(pkg)
+    validate_template(RKTemplatePackage(
+      version=1, target="rk3588-rknpu2", family="pcchain", regcmd=tuple(range(64)),
+      tasks=(RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=32 * 8, regcfg_amount=32),),
+    ))
+
+  def test_elementwise_template_patches(self):
+    pkg = build_elementwise_template(Ops.ADD, 64, 3, 4, 5)
+    self.assertEqual(pkg.family, "elementwise")
+    self.assertEqual(pkg.op, Ops.ADD)
+    self.assertEqual(pkg.size, 64)
+    self.assertEqual([p.role for p in pkg.patches], ["output", "input", "weight"])
+    self.assertEqual([p.arg_index for p in pkg.patches], [3, 4, 5])
+    regcmd = list(pkg.regcmd)
+    for patch, value in zip(pkg.patches, [0x1000, 0x2000, 0x3000]):
+      patch_regcmd(regcmd, patch, value)
+    self.assertEqual((regcmd[pkg.patches[0].offset] >> 16) & 0xffffffff, 0x1000)
+    self.assertEqual((regcmd[pkg.patches[1].offset] >> 16) & 0xffffffff, 0x2000)
+    self.assertEqual((regcmd[pkg.patches[2].offset] >> 16) & 0xffffffff, 0x3000)
+
+  def test_elementwise_compile_shape(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.device import Target
+    from tinygrad.runtime.ops_rockchip import RockchipRenderer
+    ast = (Tensor.empty(64, dtype=dtypes.half) + Tensor.empty(64, dtype=dtypes.half)).schedule_linear().src[0].src[0]
+    pkg = decode_template(to_program(ast, RockchipRenderer(Target("ROCKCHIP"))).src[-1].arg)
+    self.assertEqual(pkg.family, "elementwise")
+    self.assertEqual(pkg.op, Ops.ADD)
+    self.assertEqual(pkg.size, 64)
+    self.assertEqual([p.role for p in pkg.patches], ["output", "input", "weight"])
+
+  def test_unsupported_compile_requires_template(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.device import Target
+    from tinygrad.runtime.ops_rockchip import RockchipRenderer
+    old = os.environ.get("ROCKCHIP_REQUIRE_TEMPLATE")
+    try:
+      os.environ["ROCKCHIP_REQUIRE_TEMPLATE"] = "1"
+      getenv.cache_clear()
+      ast = Tensor.empty(64, dtype=dtypes.half).exp2().schedule_linear().src[0].src[0]
+      with self.assertRaisesRegex(RuntimeError, "no RKTemplatePackage match"):
+        to_program(ast, RockchipRenderer(Target("ROCKCHIP")))
+    finally:
+      if old is None: os.environ.pop("ROCKCHIP_REQUIRE_TEMPLATE", None)
+      else: os.environ["ROCKCHIP_REQUIRE_TEMPLATE"] = old
+      getenv.cache_clear()
+
+  def test_runtime_boundary_smoke(self):
+    runtime = Path(__file__).parents[1] / "tinygrad" / "runtime" / "ops_rockchip.py"
+    old_runtime = runtime.with_name("ops_rockchip_old.py")
+    src = runtime.read_text()
+    if old_runtime.exists(): self.assertLess(len(src.splitlines()), len(old_runtime.read_text().splitlines()))
+    for symbol in ("def _conv_params", "def _pack_conv_input", "def _pack_conv_weights", "def _unpack_conv_output",
+                   "def _wmma_params", "def _parse_fused_matmul_name"):
+      self.assertNotIn(symbol, src)
+
+  def test_emit_runtime_boilerplate_lut_path(self):
+    from tinygrad.runtime.support.rockchip import emit_runtime_boilerplate
+    mock = type("MockRockchipProgram", (), {})()
+    mock.lut_enable = True
+    mock.lut_size = 513
+    mock.inv_scale = 1.0
+    mock.q = []
+    mock.hardware_ops = {}
+    mock.reg = rk_field = lambda v, s, m: (v << s) & m
+    mock.emit_raw = lambda target, reg, value: mock.q.append(rkcmd(target, reg, value))
+    def fill_lut(lut):
+      mock.q.append(len(lut))
+    mock.fill_lut = fill_lut
+    emit_runtime_boilerplate(mock, Ops.TRUNC, 64, None)
+    self.assertGreater(len(mock.q), 0)
+    self.assertIn(1026, mock.q)
+
+  def test_conv_template_patches(self):
+    pkg = build_conv1x1_template(conv_params(3, 4, 5), 6, 7, 8)
+    self.assertEqual(pkg.family, "conv1x1")
+    self.assertEqual(pkg.meta["in_channels"], 3)
+    self.assertEqual([p.role for p in pkg.patches], ["input", "weight", "output"])
+    self.assertEqual([p.arg_index for p in pkg.patches], [7, 8, 6])
+    self.assertEqual(pkg.patches[1].addend, 16384)
+    regcmd = list(pkg.regcmd)
+    for patch, value in zip(pkg.patches, [0x1000, 0x2000, 0x3000]):
+      patch_regcmd(regcmd, patch, value)
+    self.assertEqual((regcmd[18] >> 16) & 0xffffffff, 0x1000)
+    self.assertEqual((regcmd[24] >> 16) & 0xffffffff, 0x2000 + 16384)
+    self.assertEqual((regcmd[32] >> 16) & 0xffffffff, 0x3000)
+
+  def test_pcchain_multitask_submit_plan(self):
+    tasks = tuple(RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff,
+                                 regcfg_offset=i * 64, regcfg_amount=16) for i in range(3))
+    pkg = RKTemplatePackage(version=1, target="rk3588-rknpu2", family="pcchain", regcmd=tuple(range(48)), tasks=tasks)
+    plan = submit_plan(pkg, flags=0x7)
+    self.assertEqual(plan.task_number, 3)
+    self.assertEqual(plan.core_mask, 1)
+    self.assertEqual(plan.subcore_task, ((0, 3), (3, 0), (4, 0), (0, 0), (0, 0)))
+    official = submit_plan(pkg, flags=0x5, official=True)
+    self.assertEqual(official.task_number, 9)
+    self.assertEqual(official.core_mask, 0)
+    self.assertEqual(official.subcore_task[:3], ((0, 3), (0, 3), (0, 3)))
+
+  def test_reject_old_pickle_when_templates_required(self):
+    from tinygrad.runtime.ops_rockchip import RockchipProgram
+    old = os.environ.get("ROCKCHIP_REQUIRE_TEMPLATE")
+    try:
+      os.environ["ROCKCHIP_REQUIRE_TEMPLATE"] = "1"
+      getenv.cache_clear()
+      with self.assertRaisesRegex(RuntimeError, "missing RKTemplatePackage magic"):
+        RockchipProgram(object(), "old_pickle", pickle.dumps([]))
+    finally:
+      if old is None: os.environ.pop("ROCKCHIP_REQUIRE_TEMPLATE", None)
+      else: os.environ["ROCKCHIP_REQUIRE_TEMPLATE"] = old
+      getenv.cache_clear()
+
+  def test_program_rejects_wrong_template_target(self):
+    from tinygrad.runtime.ops_rockchip import RockchipProgram
+    pkg = RKTemplatePackage(
+      version=1, target="rk9999-rknpu", family="noop", regcmd=(rkcmd(1, 2, 0),),
+      tasks=(RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=1),),
+    )
+    dev = type("FakeRockchipDevice", (), {"target":"rk3588-rknpu2"})()
+    with self.assertRaisesRegex(RuntimeError, "compiled for rk9999-rknpu"):
+      RockchipProgram(dev, "wrong_target", encode_template(pkg))
+
+class TestRockchipHardware(unittest.TestCase):
+  @staticmethod
+  def _pcchain_add_segment(input_dma, weight_dma, output_dma, next_dma, elements):
+    width = (elements + 7) // 8 - 1
+    body = [
+      rkcmd(rk.DPU, rk.REG_DPU_S_POINTER, 0x0000000E),
+      rkcmd(rk.DPU, rk.REG_DPU_DATA_FORMAT, 0x000001E5),
+      rkcmd(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x48000002),
+      rkcmd(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0x00070007),
+      rkcmd(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, width),
+      rkcmd(rk.DPU, rk.REG_DPU_EW_CFG, 0x108202C0),
+      rkcmd(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x00010001),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x0000000E),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008),
+      rkcmd(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, output_dma),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, input_dma),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, weight_dma),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x00017849),
+    ]
+    return body + [
+      rkcmd(0x100, rk.REG_PC_BASE_ADDRESS, next_dma & 0xFFFFFFF0) if next_dma else 0,
+      rkcmd(0x100, rk.REG_PC_REGISTER_AMOUNTS, len(body)) if next_dma else 0,
+      rkcmd(0x40, 0, 0),
+      rkcmd(0x80, rk.REG_PC_OPERATION_ENABLE, 0x18),
+    ]
+
+  @staticmethod
+  def _run_ref_script(args, timeout=30):
+    if not (RK3588_REF / args[0]).exists(): raise unittest.SkipTest(f"missing {RK3588_REF / args[0]}")
+    env = {**os.environ, "PYTHONPATH":str(RK3588_REF)}
+    ret = subprocess.run([sys.executable, *args], cwd=RK3588_REF, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+    if ret.returncode != 0: raise AssertionError(f"{' '.join(args)} failed\nstdout:\n{ret.stdout}\nstderr:\n{ret.stderr}")
+    return ret.stdout
+
+  @unittest.skipUnless(getenv("ROCKCHIP_HW_TESTS"), "set ROCKCHIP_HW_TESTS=1 to run Rockchip NPU hardware tests")
+  def test_pcchain_add_hardware(self):
+    out = self._run_ref_script(["experimental/add_pcchain.py", "--segment-elements", "4096"])
+    self.assertIn("PASS", out)
+
+  @unittest.skipUnless(getenv("ROCKCHIP_HW_TESTS"), "set ROCKCHIP_HW_TESTS=1 to run Rockchip NPU hardware tests")
+  def test_pcchain_submit_template_hardware(self):
+    tasks_n, elements, block_qwords = 3, 4096, 32
+    dev = Device["ROCKCHIP"]
+    task_buf = cmd_buf = input_buf = weight_buf = output_buf = None
+    try:
+      task_buf = dev._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, "pcchain_tasks")
+      cmd_buf = dev._gpu_alloc(tasks_n * block_qwords * ctypes.sizeof(ctypes.c_uint64), 0, "pcchain_cmd")
+      input_buf = dev._gpu_alloc(tasks_n * elements * ctypes.sizeof(ctypes.c_uint16), 0, "pcchain_input")
+      weight_buf = dev._gpu_alloc(tasks_n * elements * ctypes.sizeof(ctypes.c_uint16), 0, "pcchain_weight")
+      output_buf = dev._gpu_alloc(tasks_n * elements * ctypes.sizeof(ctypes.c_uint16), 0, "pcchain_output")
+      inp = np.repeat(np.array([3, 7, 13], dtype=np.uint16), elements)
+      weight = np.repeat(np.array([5, 11, 17], dtype=np.uint16), elements)
+      ctypes.memmove(input_buf.va_addr, inp.ctypes.data, inp.nbytes)
+      ctypes.memmove(weight_buf.va_addr, weight.ctypes.data, weight.nbytes)
+      ctypes.memset(output_buf.va_addr, 0, output_buf.size)
+      q = []
+      for task_idx in range(tasks_n):
+        next_dma = cmd_buf.meta.dma_addr + (task_idx + 1) * block_qwords * 8 if task_idx + 1 < tasks_n else 0
+        seg = self._pcchain_add_segment(input_buf.meta.dma_addr + task_idx * elements * 2, weight_buf.meta.dma_addr + task_idx * elements * 2,
+                                        output_buf.meta.dma_addr + task_idx * elements * 2, next_dma, elements)
+        q += seg + [0] * (block_qwords - len(seg))
+      tasks = tuple(RKTaskTemplate(4, 0x18, 0x300, 0x1ffff, i * block_qwords * 8, 20) for i in range(tasks_n))
+      dev.reset_npu()
+      submit_template(dev.fd_ctl, RKTemplatePackage(1, "rk3588-rknpu2", "pcchain", tuple(q), tasks=tasks), q, task_buf, cmd_buf, len(q))
+      got = np.frombuffer(ctypes.string_at(output_buf.va_addr, output_buf.size), dtype=np.uint16).reshape(tasks_n, elements)
+      np.testing.assert_equal(got, np.array([[8], [18], [30]], dtype=np.uint16).repeat(elements, axis=1))
+    finally:
+      dev._gpu_free_multiple([b for b in [task_buf, cmd_buf, input_buf, weight_buf, output_buf] if b is not None])
+
+  @unittest.skipUnless(getenv("ROCKCHIP_HW_MULTICORE"), "set ROCKCHIP_HW_MULTICORE=1 to run risky Rockchip multicore hardware tests")
+  def test_multicore_split3_hardware(self):
+    out = self._run_ref_script([
+      "experimental/multicore_elementwise.py", "--tile-flat", "--ops", "ADD", "--n", "12288", "--tiles", "3",
+      "--execution", "unsafe-split3", "--allow-unsafe-submit", "--timeout", "10000",
+    ], timeout=40)
+    self.assertIn("PASS", out)
+
 class TestOps(unittest.TestCase):
   @staticmethod
   def _matmul_data(ash, bsh):
@@ -97,16 +384,16 @@ class TestOps(unittest.TestCase):
     return np.random.uniform(-2, 2, size=ash).astype(np.float32), np.random.uniform(-2, 2, size=bsh).astype(np.float32)
 
   def _matmul_runner(self, out:Tensor):
-    sink_asts = [ei.ast for ei in out.schedule() if ei.ast.op is Ops.SINK]
-    self.assertTrue(sink_asts)
-    return Device[Device.DEFAULT].get_runner(*sink_asts[-1])
+    from tinygrad.codegen import to_program
+    from tinygrad.engine.realize import get_runtime
+    ast = out.schedule_linear().src[0].src[0]
+    return get_runtime(Device.DEFAULT, to_program(ast, Device[Device.DEFAULT].renderer))
 
   def _run_fused_case(self, ash, bsh):
     a_np, b_np = self._matmul_data(ash, bsh)
     expected = torch.tensor(a_np).half().matmul(torch.tensor(b_np).half()).cpu().numpy()
     probe = Tensor(a_np).half().matmul(Tensor(b_np).half())
-    runner = self._matmul_runner(probe)
-    prg = runner._prg
+    prg = self._matmul_runner(probe)
     self.assertIsNotNone(getattr(prg, "fused_matmul_meta", None))
     hits_before = prg.fused_matmul_hits
     fallbacks_before = prg.fused_matmul_fallbacks
@@ -199,9 +486,9 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
     helper_test_op(None, torch.maximum, Tensor.maximum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.max(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
     helper_test_op(None, torch.maximum, Tensor.maximum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.min(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], [True, True, False]], forward_only=True)
 
@@ -216,9 +503,9 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1., 0., 3., -4.], 3.])
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
     helper_test_op(None, torch.minimum, Tensor.minimum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.max(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum,
-                   vals=[[-1234, 0, 1234, dtypes.max(dtypes.int), dtypes.min(dtypes.int)], dtypes.min(dtypes.int)], forward_only=True)
+                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], True], forward_only=True)
     helper_test_op(None, torch.minimum, Tensor.minimum, vals=[[True, False, False], [True, True, False]], forward_only=True)
 
