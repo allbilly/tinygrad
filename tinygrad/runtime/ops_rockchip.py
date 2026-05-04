@@ -29,7 +29,7 @@ class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     self.template = decode_template(lib) if lib.startswith(RK_TEMPLATE_MAGIC) else None
     if self.template is not None: validate_template(self.template, getattr(dev, "target", "rk3588-rknpu2"))
-    if self.template is None and getenv("ROCKCHIP_REQUIRE_TEMPLATE", 0):
+    if self.template is None and not getenv("ROCKCHIP_LEGACY_UOPS", 0):
       raise RuntimeError("unsupported Rockchip program: missing RKTemplatePackage magic")
     prg = self.template if self.template is not None else pickle.loads(lib)
     self.ew_meta = None
@@ -647,7 +647,7 @@ class RockchipRenderer(Renderer):
       out_slot, in_slot, weight_slot, in_channels, out_channels, spatial = conv_meta
       return base64.b64encode(encode_template(build_conv1x1_template(
         conv_params(in_channels, out_channels, spatial), out_slot, in_slot, weight_slot))).decode()
-    if getenv("ROCKCHIP_REQUIRE_TEMPLATE", 0): raise RuntimeError("unsupported Rockchip program: no RKTemplatePackage match")
+    if not getenv("ROCKCHIP_LEGACY_UOPS", 0): raise RuntimeError("unsupported Rockchip program: no RKTemplatePackage match")
     # the value of SPECIAL comes from local/global_size, not form its source
     uop_to_idx = {u:i for i,u in enumerate(uops)}
     lops = [(u.op, u.dtype, ([] if u.op is Ops.SPECIAL else [uop_to_idx[v] for v in u.src]), u.arg) for u in uops]
