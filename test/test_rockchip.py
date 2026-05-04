@@ -205,6 +205,17 @@ class TestRockchipSupport(unittest.TestCase):
     self.assertEqual(pkg.size, 64)
     self.assertEqual([p.role for p in pkg.patches], ["output", "input", "weight"])
 
+  def test_lut_elementwise_compile_shape(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.device import Target
+    from tinygrad.runtime.ops_rockchip import RockchipRenderer
+    ast = Tensor.empty(64, dtype=dtypes.half).exp2().schedule_linear().src[0].src[0]
+    pkg = decode_template(to_program(ast, RockchipRenderer(Target("ROCKCHIP"))).src[-1].arg)
+    self.assertEqual(pkg.family, "elementwise")
+    self.assertEqual(pkg.op, Ops.EXP2)
+    self.assertEqual(pkg.size, 64)
+    self.assertEqual([p.arg_index for p in pkg.patches], [0, 1, 1])
+
   def test_unsupported_compile_requires_template(self):
     from tinygrad.codegen import to_program
     from tinygrad.device import Target
@@ -213,7 +224,7 @@ class TestRockchipSupport(unittest.TestCase):
     try:
       os.environ["ROCKCHIP_REQUIRE_TEMPLATE"] = "1"
       getenv.cache_clear()
-      ast = Tensor.empty(64, dtype=dtypes.half).exp2().schedule_linear().src[0].src[0]
+      ast = Tensor.empty(64, dtype=dtypes.half).reciprocal().schedule_linear().src[0].src[0]
       with self.assertRaisesRegex(RuntimeError, "no RKTemplatePackage match"):
         to_program(ast, RockchipRenderer(Target("ROCKCHIP")))
     finally:

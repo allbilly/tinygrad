@@ -34,9 +34,11 @@ class RockchipProgram:
     prg = self.template if self.template is not None else pickle.loads(lib)
     self.ew_meta = None
     self.conv_meta = None
+    self.ew_arg = None
     if self.template is not None and self.template.family == "elementwise":
       slots = {p.role:p.arg_index for p in self.template.patches}
       self.ew_meta = (self.template.op, self.template.size, slots["output"], slots["input"], slots["weight"])
+      self.ew_arg = self.template.meta.get("arg") if self.template.meta is not None else None
     elif self.template is not None and self.template.family == "conv1x1":
       slots = {p.role:p.arg_index for p in self.template.patches}
       assert self.template.meta is not None
@@ -186,7 +188,7 @@ class RockchipProgram:
       if self.fused_matmul_meta["c_dt"] == 0: c_block[:] = out_matrix.astype(np.float16).reshape(-1)
       else: c_block[:] = out_matrix.reshape(-1)
 
-  def _run_elementwise(self, op, size:int, out_slot:int, lhs_slot:int, rhs_slot:int, bufs:tuple[Any, ...]) -> None:
+  def _run_elementwise(self, op, size:int, out_slot:int, lhs_slot:int, rhs_slot:int, bufs:tuple[Any, ...], arg=None) -> None:
     src, src2 = memoryview(bufs[lhs_slot])[:size*2], memoryview(bufs[rhs_slot])[:size*2]
     self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
     self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
@@ -203,7 +205,13 @@ class RockchipProgram:
       apply_patches(self.q, self.ew_template.patches, addrs)
       submit_template(self.device.fd_ctl, self.ew_template, self.q, self.task_buf, self.cmd_buf, self.cmd_buf_size)
       self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
+      if op is Ops.EXP2 or (op is Ops.CUSTOM and arg == "silu"):
+        raw = np.rint(np.array(struct.unpack(f'<{src.nbytes//2}e', ctypes.string_at(self.output_buf.va_addr, src.nbytes)), dtype=np.float32))
+        _, _, inv_scale = build_lut(op, arg, self.lut_size)
+        out = ((raw.astype(np.uint16) / 2**14) - 1) / inv_scale if op is Ops.EXP2 else raw.astype(np.int16) / (2**15 - 1) / inv_scale
+        ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:src.nbytes]), mv_address(memoryview(out.astype(np.float16))), src.nbytes)
+      else:
+        ctypes.memmove(mv_address(memoryview(bufs[out_slot])[:src.nbytes]), self.output_buf.va_addr, src.nbytes)
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
 
@@ -272,7 +280,7 @@ class RockchipProgram:
     st = time.perf_counter()
     if self.ew_meta is not None:
       op, size, out_slot, lhs_slot, rhs_slot = self.ew_meta
-      self._run_elementwise(op, size, out_slot, lhs_slot, rhs_slot, bufs)
+      self._run_elementwise(op, size, out_slot, lhs_slot, rhs_slot, bufs, self.ew_arg)
       return time.perf_counter() - st
     if self.fused_matmul_meta is not None:
       try:
@@ -633,8 +641,8 @@ class RockchipRenderer(Renderer):
   ])
   def render(self, uops:list[UOp]) -> str:
     if (ew_meta:=elementwise_meta(uops, self.hardware_ops)) is not None:
-      op, size, out_slot, lhs_slot, rhs_slot = ew_meta
-      return base64.b64encode(encode_template(build_elementwise_template(op, size, out_slot, lhs_slot, rhs_slot))).decode()
+      op, size, out_slot, lhs_slot, rhs_slot, arg = ew_meta
+      return base64.b64encode(encode_template(build_elementwise_template(op, size, out_slot, lhs_slot, rhs_slot, arg))).decode()
     if (conv_meta:=conv1x1_meta(uops)) is not None:
       out_slot, in_slot, weight_slot, in_channels, out_channels, spatial = conv_meta
       return base64.b64encode(encode_template(build_conv1x1_template(

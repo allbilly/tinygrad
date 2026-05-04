@@ -538,7 +538,39 @@ def emit_runtime_boilerplate(prg, op, size, arg, feature_addr=0, weight_addr=0, 
 
 def build_elementwise_template(op:Ops, size:int, out_arg:int=0, input_arg:int=1, weight_arg:int=2, arg=None,
                                target:str="rk3588-rknpu2") -> RKTemplatePackage:
-  if op not in EW_ALU_OPS: raise RuntimeError(f"unsupported Rockchip elementwise op {op}")
+  if op not in EW_ALU_OPS:
+    if not (lut_enabled(op, arg) or op is Ops.CUSTOM): raise RuntimeError(f"unsupported Rockchip elementwise op {op}")
+    mock = type("RockchipTemplateEmitter", (), {})()
+    mock.q, mock.lut_enable, mock.lut_size, mock.inv_scale, mock.hardware_ops = [], lut_enabled(op, arg), 513, 1.0, EW_ALU_OPS
+    mock.reg = rk_field
+    mock.emit_raw = lambda target, reg, value: mock.q.append(rkcmd(target, reg, value))
+    def fill_lut(lut):
+      for table_id, base in ((0, 0), (1, mock.lut_size)):
+        mock.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG,
+          rk_field(1, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__MASK) |
+          rk_field(table_id, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__MASK) |
+          rk_field(0, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__MASK))
+        for i in range(mock.lut_size):
+          mock.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA,
+            rk_field(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK))
+    mock.fill_lut = fill_lut
+    emit_runtime_boilerplate(mock, op, size, arg)
+    regcmd = mock.q
+    output_patch, input_patch, weight_patch = len(regcmd), len(regcmd)+1, len(regcmd)+2
+    regcmd += [
+      rkcmd(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0),
+      0x2001000178495044,
+      0x0081000000180008,
+    ]
+    patches = (
+      RKPatch("regcmd", output_patch, "dma32", out_arg, "output", mask=rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK),
+      RKPatch("regcmd", input_patch, "dma32", input_arg, "input", mask=rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK),
+      RKPatch("regcmd", weight_patch, "dma32", weight_arg, "weight", mask=rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK),
+    )
+    tasks = (RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=len(regcmd)),)
+    return RKTemplatePackage(RK_TEMPLATE_VERSION, target, "elementwise", tuple(regcmd), patches, tasks, op=op, size=size, meta={"arg":arg})
   channel, dataout_height = 7, 0
   dataout_width = math.ceil(size / ((dataout_height + 1) * (channel + 1))) - 1
   regcmd = [
@@ -656,9 +688,9 @@ def build_conv1x1_template(p:dict[str, int|bool], out_arg:int=0, input_arg:int=1
   tasks = (RKTaskTemplate(op_idx=1, enable_mask=0xd, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=len(regcmd)),)
   return RKTemplatePackage(RK_TEMPLATE_VERSION, target, "conv1x1", tuple(regcmd), patches, tasks, meta=dict(p))
 
-def elementwise_meta(uops:list[UOp], hardware_ops:set[Ops]) -> tuple[Ops, int, int, int, int]|None:
+def elementwise_meta(uops:list[UOp], hardware_ops:set[Ops]) -> tuple[Ops, int, int, int, int, object]|None:
   params = [(i,u) for i,u in enumerate(uops) if u.op is Ops.PARAM]
-  if len(params) != 3 or any(not isinstance(u.dtype, PtrDType) or u.dtype.base.scalar() is not dtypes.half for _,u in params): return None
+  if len(params) not in (2, 3) or any(not isinstance(u.dtype, PtrDType) or u.dtype.base.scalar() is not dtypes.half for _,u in params): return None
   size = params[0][1].dtype.size
   if any(u.dtype.size != size for _,u in params): return None
 
@@ -671,7 +703,7 @@ def elementwise_meta(uops:list[UOp], hardware_ops:set[Ops]) -> tuple[Ops, int, i
     if idx.op is not Ops.INDEX: return None
     return (uops.index(idx.src[0]), idx.src[1], gep)
 
-  flat_op = None
+  flat_op, flat_arg = None, None
   for u in uops:
     if u.op is not Ops.STORE: continue
     dst = u.src[0]
@@ -679,14 +711,23 @@ def elementwise_meta(uops:list[UOp], hardware_ops:set[Ops]) -> tuple[Ops, int, i
     if dst.op is not Ops.INDEX or uops.index(dst.src[0]) != params[0][0]: return None
     vals = u.src[1].src if u.src[1].op is Ops.STACK else (u.src[1],)
     for j,v in enumerate(vals):
-      if v.op not in hardware_ops or v.dtype.scalar() is not dtypes.half or len(v.src) != 2: return None
-      if flat_op is None: flat_op = v.op
-      if flat_op is not v.op: return None
-      lhs, rhs = load_info(v.src[0]), load_info(v.src[1])
-      if lhs is None or rhs is None or lhs[0] != params[1][0] or rhs[0] != params[2][0]: return None
-      if lhs[1] is not dst.src[1] or rhs[1] is not dst.src[1] or lhs[2] != rhs[2]: return None
-      if lhs[2] is not None and lhs[2] != (j,): return None
-  return (flat_op, size, 0, 1, 2) if flat_op is not None else None
+      if v.dtype.scalar() is not dtypes.half: return None
+      if len(params) == 2:
+        if not (lut_enabled(v.op, v.arg) or v.op is Ops.CUSTOM): return None
+        if flat_op is None: flat_op, flat_arg = v.op, v.arg
+        if flat_op is not v.op or flat_arg != v.arg: return None
+        src = load_info(v.src[0]) if len(v.src) == 1 else None
+        if src is None or src[0] != params[1][0] or src[1] is not dst.src[1]: return None
+        if src[2] is not None and src[2] != (j,): return None
+      else:
+        if v.op not in hardware_ops or len(v.src) != 2: return None
+        if flat_op is None: flat_op = v.op
+        if flat_op is not v.op: return None
+        lhs, rhs = load_info(v.src[0]), load_info(v.src[1])
+        if lhs is None or rhs is None or lhs[0] != params[1][0] or rhs[0] != params[2][0]: return None
+        if lhs[1] is not dst.src[1] or rhs[1] is not dst.src[1] or lhs[2] != rhs[2]: return None
+        if lhs[2] is not None and lhs[2] != (j,): return None
+  return (flat_op, size, 0, 1, 1 if len(params) == 2 else 2, flat_arg) if flat_op is not None else None
 
 def conv1x1_meta(uops:list[UOp]) -> tuple[int, int, int, int, int, int]|None:
   if os.getenv("ROCKCHIP_NATIVE_CONV", "1") == "0": return None
