@@ -234,7 +234,9 @@ class TestRockchipSupport(unittest.TestCase):
     from tinygrad.device import Target
     from tinygrad.runtime.ops_rockchip import RockchipRenderer
     ast = Tensor.empty(4, 4).half().matmul(Tensor.empty(4, 4).half()).schedule_linear().src[0].src[0]
-    pkg = decode_template(to_program(ast, RockchipRenderer(Target("ROCKCHIP"))).src[-1].arg)
+    prg = to_program(ast, RockchipRenderer(Target("ROCKCHIP")))
+    pkg = decode_template(prg.src[-1].arg)
+    self.assertFalse(prg.arg.name.startswith("rkmm_v1_"))
     self.assertEqual(pkg.family, "fused_matmul")
     self.assertEqual((pkg.meta["m"], pkg.meta["n"], pkg.meta["k"]), (4, 4, 4))
     self.assertEqual((pkg.meta["a_slot"], pkg.meta["b_slot"], pkg.meta["c_slot"]), (1, 2, 0))

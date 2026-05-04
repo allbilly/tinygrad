@@ -442,7 +442,7 @@ class Scheduler:
 
     fields = [m, n, k, batch, a_bs, b_bs, c_bs, a_m_stride, a_k_stride, b_k_stride, b_n_stride, c_m_stride, c_n_stride,
               int(lhs.src[0].arg), int(rhs.src[0].arg), int(out_idx.src[0].arg), ta, tb, a_dt, b_dt, c_dt]
-    self._name_override = "rkmm_v1_" + "_".join(str(x) for x in fields)
+    self.applied_opts.append(("ROCKCHIP_FUSED_MATMUL", tuple(fields)))
     if os.getenv("ROCKCHIP_FUSED_MATMUL_DEBUG", "0") != "0":
       print(f"FUSED_MATMUL_MATCH:m={m},n={n},k={k},batch={batch},slots={fields[13:16]}")
     return True, None

@@ -774,15 +774,15 @@ def conv1x1_meta(uops:list[UOp]) -> tuple[int, int, int, int, int, int]|None:
   if not any(u.op is Ops.WMMA for u in uops): return None
   return (params[0][1].arg, params[1][1].arg, params[2][1].arg, in_channels, out_channels, spatial)
 
-def parse_fused_matmul_name(name:str) -> dict[str, int]|None:
-  if not name.startswith("rkmm_v1_"): return None
-  toks = name.split("_")
-  if len(toks) != 23: return None
-  try:
-    vals = [int(x) for x in toks[2:]]
-  except ValueError:
-    return None
-  keys = ["m", "n", "k", "batch", "a_bs", "b_bs", "c_bs", "a_ms", "a_ks", "b_ks", "b_ns", "c_ms", "c_ns",
-          "a_slot", "b_slot", "c_slot", "ta", "tb", "a_dt", "b_dt", "c_dt"]
-  if any(v < 0 for v in vals): return None
-  return dict(zip(keys, vals))
+FUSED_MATMUL_KEYS = ("m", "n", "k", "batch", "a_bs", "b_bs", "c_bs", "a_ms", "a_ks", "b_ks", "b_ns", "c_ms", "c_ns",
+                     "a_slot", "b_slot", "c_slot", "ta", "tb", "a_dt", "b_dt", "c_dt")
+
+def fused_matmul_meta(uops:list[UOp]) -> dict[str, int]|None:
+  for u in uops:
+    if u.op is not Ops.SINK or not hasattr(u.arg, "applied_opts"): continue
+    for opt in u.arg.applied_opts:
+      if isinstance(opt, tuple) and len(opt) == 2 and opt[0] == "ROCKCHIP_FUSED_MATMUL":
+        vals = opt[1]
+        if isinstance(vals, tuple) and len(vals) == len(FUSED_MATMUL_KEYS) and all(isinstance(x, int) and x >= 0 for x in vals):
+          return dict(zip(FUSED_MATMUL_KEYS, vals))
+  return None

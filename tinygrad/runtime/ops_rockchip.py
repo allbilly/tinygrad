@@ -11,7 +11,7 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.support.rockchip import (
   REGCMD_RESERVED, RK_TEMPLATE_MAGIC, build_conv1x1_template,
   build_elementwise_template, build_fused_matmul_template, build_lut, build_wmma_template, conv_params, decode_template, encode_template,
-  lut_enabled, pack_conv_input, pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, parse_fused_matmul_name, submit_template,
+  lut_enabled, pack_conv_input, pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, fused_matmul_meta, submit_template,
   unpack_conv_output, validate_template, wmma_params,
 )
 from tinygrad.runtime.autogen import rockchip as rk
@@ -332,8 +332,7 @@ class RockchipRenderer(Renderer):
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
   def render(self, uops:list[UOp]) -> str:
-    name = next((u.arg.name for u in uops if u.op is Ops.SINK and hasattr(u.arg, "name")), "")
-    if (mm_meta:=parse_fused_matmul_name(name)) is not None:
+    if (mm_meta:=fused_matmul_meta(uops)) is not None:
       return base64.b64encode(encode_template(build_fused_matmul_template(mm_meta))).decode()
     if (ew_meta:=elementwise_meta(uops, self.hardware_ops)) is not None:
       op, size, out_slot, lhs_slot, rhs_slot, arg = ew_meta
