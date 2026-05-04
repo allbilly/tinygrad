@@ -10,8 +10,8 @@ from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.support.rockchip import (
   REGCMD_RESERVED, RK_TEMPLATE_MAGIC, build_conv1x1_template,
-  build_elementwise_template, build_lut, build_wmma_template, conv_params, decode_template, encode_template, lut_enabled, pack_conv_input,
-  pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, parse_fused_matmul_name, submit_template,
+  build_elementwise_template, build_fused_matmul_template, build_lut, build_wmma_template, conv_params, decode_template, encode_template,
+  lut_enabled, pack_conv_input, pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, parse_fused_matmul_name, submit_template,
   unpack_conv_output, validate_template, wmma_params,
 )
 from tinygrad.runtime.autogen import rockchip as rk
@@ -37,6 +37,9 @@ class RockchipProgram:
       assert self.template.meta is not None
       self.conv_meta = (slots["output"], slots["input"], slots["weight"], self.template.meta["in_channels"],
                         self.template.meta["out_channels"], self.template.meta["spatial"])
+    elif self.template is not None and self.template.family == "fused_matmul":
+      assert self.template.meta is not None
+      self.fused_matmul_meta = self.template.meta
     self.ew_template = self.template if self.template.family == "elementwise" else None
     self.conv_template = self.template if self.template.family == "conv1x1" else None
     self.device = dev
@@ -48,7 +51,7 @@ class RockchipProgram:
     self.cmd_buf_size = 16384
     self.exp2_inv_scale = 1.0
     self.lut_size = 513
-    self.fused_matmul_meta = parse_fused_matmul_name(name)
+    if not hasattr(self, "fused_matmul_meta"): self.fused_matmul_meta = None
     self.fused_matmul_hits = 0
     self.fused_matmul_fallbacks = 0
 
@@ -329,6 +332,9 @@ class RockchipRenderer(Renderer):
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
   def render(self, uops:list[UOp]) -> str:
+    name = next((u.arg.name for u in uops if u.op is Ops.SINK and hasattr(u.arg, "name")), "")
+    if (mm_meta:=parse_fused_matmul_name(name)) is not None:
+      return base64.b64encode(encode_template(build_fused_matmul_template(mm_meta))).decode()
     if (ew_meta:=elementwise_meta(uops, self.hardware_ops)) is not None:
       op, size, out_slot, lhs_slot, rhs_slot, arg = ew_meta
       return base64.b64encode(encode_template(build_elementwise_template(op, size, out_slot, lhs_slot, rhs_slot, arg))).decode()

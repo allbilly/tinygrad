@@ -651,6 +651,9 @@ def build_wmma_template(p:dict[str, int], out_arg:int=0, input_arg:int=1, weight
   tasks = (RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=len(regcmd)),)
   return RKTemplatePackage(RK_TEMPLATE_VERSION, target, "wmma", tuple(regcmd), patches, tasks, op=Ops.WMMA, size=int(p["m"]) * int(p["k"]), meta=dict(p))
 
+def build_fused_matmul_template(meta:dict[str, int], target:str="rk3588-rknpu2") -> RKTemplatePackage:
+  return RKTemplatePackage(RK_TEMPLATE_VERSION, target, "fused_matmul", (), meta=meta)
+
 def build_conv1x1_template(p:dict[str, int|bool], out_arg:int=0, input_arg:int=1, weight_arg:int=2,
                            target:str="rk3588-rknpu2") -> RKTemplatePackage:
   out_channels, in_channels, spatial = (int(p[x]) for x in ("out_channels", "in_channels", "spatial"))

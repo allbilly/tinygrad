@@ -229,6 +229,16 @@ class TestRockchipSupport(unittest.TestCase):
     self.assertEqual(pkg.size, 64)
     self.assertEqual([p.arg_index for p in pkg.patches], [0, 1, 1])
 
+  def test_fused_matmul_compile_metadata_package(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.device import Target
+    from tinygrad.runtime.ops_rockchip import RockchipRenderer
+    ast = Tensor.empty(4, 4).half().matmul(Tensor.empty(4, 4).half()).schedule_linear().src[0].src[0]
+    pkg = decode_template(to_program(ast, RockchipRenderer(Target("ROCKCHIP"))).src[-1].arg)
+    self.assertEqual(pkg.family, "fused_matmul")
+    self.assertEqual((pkg.meta["m"], pkg.meta["n"], pkg.meta["k"]), (4, 4, 4))
+    self.assertEqual((pkg.meta["a_slot"], pkg.meta["b_slot"], pkg.meta["c_slot"]), (1, 2, 0))
+
   def test_unsupported_compile_requires_template(self):
     from tinygrad.codegen import to_program
     from tinygrad.device import Target
