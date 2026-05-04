@@ -1,4 +1,4 @@
-import os, sys, time, math, unittest, functools, platform, warnings, subprocess, pickle, ctypes
+import os, sys, time, math, unittest, functools, platform, warnings, subprocess, pickle, ctypes, tempfile
 from pathlib import Path
 import numpy as np
 import torch
@@ -257,6 +257,22 @@ class TestRockchipSupport(unittest.TestCase):
     for symbol in ("def _conv_params", "def _pack_conv_input", "def _pack_conv_weights", "def _unpack_conv_output",
                    "def _wmma_params", "def _parse_fused_matmul_name", "def boilerplate"):
       self.assertNotIn(symbol, src)
+
+  def test_drm_discovery_prefers_rknpu(self):
+    from tinygrad.runtime.ops_rockchip import _discover_rockchip_drm
+    old = os.environ.get("ROCKCHIP_DRM")
+    try:
+      os.environ.pop("ROCKCHIP_DRM", None)
+      with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        sysfs, devfs = root / "sys", root / "dev"
+        for card, driver in (("card0", "rockchip-drm"), ("card1", "RKNPU")):
+          (sysfs / card / "device").mkdir(parents=True)
+          (sysfs / card / "device" / "driver").symlink_to(root / driver)
+        self.assertEqual(_discover_rockchip_drm(str(sysfs), str(devfs)), str(devfs / "card1"))
+    finally:
+      if old is None: os.environ.pop("ROCKCHIP_DRM", None)
+      else: os.environ["ROCKCHIP_DRM"] = old
 
   def test_emit_runtime_boilerplate_lut_path(self):
     from tinygrad.runtime.support.rockchip import emit_runtime_boilerplate

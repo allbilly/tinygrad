@@ -1,5 +1,6 @@
 from typing import Any
 import base64, time, struct, functools, ctypes, mmap, os, numpy as np
+from pathlib import Path
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv, mv_address, to_mv
 from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
@@ -19,6 +20,17 @@ from tinygrad.runtime.autogen import rockchip as rk
 def _rk_env(name:str, default:int) -> int:
   try: return int(os.getenv(name, str(default)))
   except ValueError: return default
+
+def _discover_rockchip_drm(sysfs:str="/sys/class/drm", devfs:str="/dev/dri") -> str:
+  if override:=os.getenv("ROCKCHIP_DRM"): return override
+  probed = []
+  for card in sorted(Path(sysfs).glob("card[0-9]*")):
+    if not card.name[4:].isdigit(): continue
+    driver = Path(os.path.realpath(card / "device" / "driver")).name
+    path = str(Path(devfs) / card.name)
+    probed.append(f"{path}:{driver or 'unknown'}")
+    if driver.lower() == "rknpu": return path
+  raise RuntimeError("failed to find Rockchip RKNPU DRM node; probed " + ", ".join(probed or [str(Path(sysfs) / "card*")]))
 
 class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
@@ -371,7 +383,7 @@ class RockchipAllocator(Allocator['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.target = os.getenv("ROCKCHIP_TARGET", "rk3588-rknpu2")
-    self.drm_path = os.getenv("ROCKCHIP_DRM", "/dev/dri/card1")
+    self.drm_path = _discover_rockchip_drm()
     self.fd_ctl = FileIOInterface(self.drm_path, os.O_RDWR)
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], functools.partial(RockchipProgram, self))
   def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
