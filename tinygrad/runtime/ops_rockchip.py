@@ -15,7 +15,8 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.support.rockchip import (
   REGCMD_RESERVED, RK_TEMPLATE_MAGIC, RK_TEMPLATE_VERSION, RKTaskTemplate, RKTemplatePackage, rk_field, rkcmd, build_conv1x1_template,
   build_elementwise_template, build_lut, conv_params, decode_template, encode_template, lut_enabled, pack_conv_input, pack_conv_weights,
-  apply_patches, conv1x1_meta, elementwise_meta, parse_fused_matmul_name, submit_template, unpack_conv_output, validate_template, wmma_params,
+  apply_patches, conv1x1_meta, elementwise_meta, emit_runtime_boilerplate, parse_fused_matmul_name, submit_template, unpack_conv_output,
+  validate_template, wmma_params,
 )
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, load, _store, generic_wmma_helper
@@ -255,9 +256,6 @@ class RockchipProgram:
       for i in range(self.lut_size):
         self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA,
           rk_field(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK))
-  def boilerplate(self, op, size, arg, feature_addr=0, weight_addr=0, dst_addr=0, wmma_meta:dict[str, int]|None=None):
-    return emit_runtime_boilerplate(self, op, size, arg, feature_addr, weight_addr, dst_addr, wmma_meta)
-
   def submit(self, uop):
     # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
     if uop not in (Ops.FDIV, Ops.WMMA):
@@ -505,13 +503,13 @@ class RockchipProgram:
               self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
               self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
               if uop is Ops.WMMA:
-                self.boilerplate(op=uop, size=len(src_values[0]), arg=arg,
+                emit_runtime_boilerplate(self, op=uop, size=len(src_values[0]), arg=arg,
                   feature_addr=self.input_buf.meta.dma_addr,
                   weight_addr=self.weight_buf.meta.dma_addr,
                   dst_addr=self.output_buf.meta.dma_addr,
                   wmma_meta=wmma_meta)
               else:
-                self.boilerplate(op=uop, size=len(src_values[0]), arg=arg)
+                emit_runtime_boilerplate(self, op=uop, size=len(src_values[0]), arg=arg)
                 self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
                   self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT,
                             rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))

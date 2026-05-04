@@ -227,7 +227,7 @@ class TestRockchipSupport(unittest.TestCase):
     src = runtime.read_text()
     if old_runtime.exists(): self.assertLess(len(src.splitlines()), len(old_runtime.read_text().splitlines()))
     for symbol in ("def _conv_params", "def _pack_conv_input", "def _pack_conv_weights", "def _unpack_conv_output",
-                   "def _wmma_params", "def _parse_fused_matmul_name"):
+                   "def _wmma_params", "def _parse_fused_matmul_name", "def boilerplate"):
       self.assertNotIn(symbol, src)
 
   def test_emit_runtime_boilerplate_lut_path(self):
