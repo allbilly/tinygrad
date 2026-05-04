@@ -1,25 +1,20 @@
-# pylint: disable=cell-var-from-loop
-# a python uops emulator
-# works to test the tensor cores, and all the uops in general
-# this is the (living) definition of uops
-from typing import Any, TYPE_CHECKING
-import pickle, base64, itertools, time, struct, sys, functools, ctypes, mmap, os, math, numpy as np
-from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv, DEBUG
+from typing import Any
+import base64, time, struct, functools, ctypes, mmap, os, numpy as np
+from tinygrad.dtype import dtypes
+from tinygrad.helpers import getenv, mv_address, to_mv
 from tinygrad.device import Compiled, Compiler, Allocator, BufferSpec
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat, bitcast
+from tinygrad.uop.ops import python_alu, Ops, UOp, PatternMatcher, UPat
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.support.rockchip import (
-  REGCMD_RESERVED, RK_TEMPLATE_MAGIC, RK_TEMPLATE_VERSION, RKTaskTemplate, RKTemplatePackage, rk_field, rkcmd, build_conv1x1_template,
+  REGCMD_RESERVED, RK_TEMPLATE_MAGIC, build_conv1x1_template,
   build_elementwise_template, build_lut, build_wmma_template, conv_params, decode_template, encode_template, lut_enabled, pack_conv_input,
-  pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, emit_runtime_boilerplate, parse_fused_matmul_name, submit_template,
+  pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, parse_fused_matmul_name, submit_template,
   unpack_conv_output, validate_template, wmma_params,
 )
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.ops_python import storage_fmt_for_dtype, load, _store, generic_wmma_helper
 
 def _rk_env(name:str, default:int) -> int:
   try: return int(os.getenv(name, str(default)))
@@ -29,9 +24,7 @@ class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes, **kwargs):
     self.template = decode_template(lib) if lib.startswith(RK_TEMPLATE_MAGIC) else None
     if self.template is not None: validate_template(self.template, getattr(dev, "target", "rk3588-rknpu2"))
-    if self.template is None and not getenv("ROCKCHIP_LEGACY_UOPS", 0):
-      raise RuntimeError("unsupported Rockchip program: missing RKTemplatePackage magic")
-    prg = self.template if self.template is not None else pickle.loads(lib)
+    if self.template is None: raise RuntimeError("unsupported Rockchip program: missing RKTemplatePackage magic")
     self.ew_meta = None
     self.conv_meta = None
     self.ew_arg = None
@@ -44,17 +37,8 @@ class RockchipProgram:
       assert self.template.meta is not None
       self.conv_meta = (slots["output"], slots["input"], slots["weight"], self.template.meta["in_channels"],
                         self.template.meta["out_channels"], self.template.meta["spatial"])
-    elif isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "elementwise":
-      self.ew_meta = prg[1:]
-    if self.conv_meta is None and isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "conv1x1" and not name.startswith("rkmm_v1_"):
-      self.conv_meta = prg[1:]
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if self.ew_meta is not None or self.conv_meta is not None else prg
-    self.ew_template = self.template if self.template is not None else (
-      build_elementwise_template(self.ew_meta[0], self.ew_meta[1], self.ew_meta[2], self.ew_meta[3], self.ew_meta[4])
-      if self.ew_meta is not None else None)
-    self.conv_template = self.template if self.template is not None and self.template.family == "conv1x1" else (
-      build_conv1x1_template(conv_params(self.conv_meta[3], self.conv_meta[4], self.conv_meta[5]),
-                             self.conv_meta[0], self.conv_meta[1], self.conv_meta[2]) if self.conv_meta is not None else None)
+    self.ew_template = self.template if self.template.family == "elementwise" else None
+    self.conv_template = self.template if self.template.family == "conv1x1" else None
     self.device = dev
     self.q = []
     self.hardware_ops = {
@@ -253,28 +237,6 @@ class RockchipProgram:
     finally:
       self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
 
-  def reg(self, val, shift, mask): return rk_field(val, shift, mask)
-  def emit_raw(self, target, reg, value): self.q.append(rkcmd(target, reg, value))
-  def fill_lut(self, lut):
-    for table_id, base in ((0, 0), (1, self.lut_size)):
-      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG,
-          rk_field(1, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__MASK) |
-          rk_field(table_id, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__MASK) |
-          rk_field(0, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__MASK))
-      for i in range(self.lut_size):
-        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA,
-          rk_field(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK))
-  def submit(self, uop):
-    # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
-    if uop not in (Ops.FDIV, Ops.WMMA):
-      # EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, ...)
-      self.q.append(0x2001000178495044),
-    # self.q.append(0x0081000000180008), # EMIT(REG_PC_OPERATION_ENABLE, PC_OPERATION_ENABLE_RESERVED_0(12))
-    self.q.append(0x00810000000d0008 if uop is Ops.WMMA else 0x0081000000180008)
-    task = RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=len(self.q))
-    template = RKTemplatePackage(RK_TEMPLATE_VERSION, "rk3588-rknpu2", "runtime", tuple(self.q), tasks=(task,))
-    submit_template(self.device.fd_ctl, template, self.q, self.task_buf, self.cmd_buf, self.cmd_buf_size)
-
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     self.device.reset_npu()
     st = time.perf_counter()
@@ -294,280 +256,7 @@ class RockchipProgram:
       out_slot, in_slot, weight_slot, in_channels, out_channels, spatial = self.conv_meta
       self._run_conv1x1(out_slot, in_slot, weight_slot, in_channels, out_channels, spatial, bufs)
       return time.perf_counter() - st
-
-    warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
-    warp_size = len(warp)
-    void_ops = {Ops.END, Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.STORE}
-    loop_ends: dict[int, int] = {srcs[1]:i for i, (uop, _, srcs, _) in enumerate(self.uops) if uop == Ops.END}
-    for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
-      values: dict[int, Any] = {}
-      pbufs: list[memoryview] = list(bufs)
-      pvals: list[int] = list(vals)
-      i = 0
-      while i < len(self.uops):
-        uop, dtype, srcs, arg = self.uops[i]
-        src_values = [values[v] for v in srcs if self.uops[v][0] not in void_ops]
-        if DEBUG >= 7:
-          print()
-          print(i, uop, arg, src_values)
-        src_dtypes = [self.uops[v][1] for v in srcs if self.uops[v][0] not in void_ops]
-        if DEBUG >= 7: print(i, uop, dtype, arg, src_values, src_dtypes)
-        if uop is Ops.END:
-          i = srcs[1]
-          continue
-        if uop in (Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP):
-          # in the python emulator, the warp is always in sync
-          i += 1
-          continue
-        assert dtype is not None, f"{uop} is missing a dtype"
-        if uop is Ops.STORE:
-          for j,val in enumerate(src_values[1] if src_dtypes[1].count > 1 else [src_values[1]]):
-            for (m,o,g),v in zip(src_values[0], val):
-              if g: _store(m, o+j, v, src_dtypes[1].scalar())
-          i += 1
-          continue
-        if uop is Ops.AFTER: values[i] = src_values[0]
-        elif uop in {Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
-          assert isinstance(dtype, PtrDType), dtype
-          storage_fmt = storage_fmt_for_dtype(dtype.base.scalar())
-          if storage_fmt is None: raise RuntimeError(f"{dtype=} is not supported")
-          if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
-          if uop is Ops.DEFINE_REG:
-            # REGs are per thread
-            values[i] = [memoryview(bytearray(dtype.size*dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
-          else:
-            buf = memoryview(bytearray(dtype.size*dtype.itemsize)) if uop is not Ops.PARAM else pbufs.pop(0)
-            values[i] = [buf.cast(storage_fmt)] * warp_size
-        elif uop is Ops.DEFINE_VAR:
-          values[i] = [pvals.pop(0)] * warp_size
-        elif uop is Ops.SPECIAL:
-          if arg[0] == 'g': values[i] = [idxs[2-int(arg[-1])]] * warp_size
-          elif arg[0] == 'l': values[i] = [x[2-int(arg[-1])] for x in warp]
-        elif uop is Ops.CONST: values[i] = [arg] * warp_size
-        elif uop is Ops.INDEX:
-          ret:list = []
-          if isinstance(src_dtypes[0], ImageDType):
-            for m,ox,oy in zip(src_values[0], src_values[1][0], src_values[1][1]):
-              if ox < 0 or ox >= src_dtypes[0].shape[1] or oy < 0 or oy >= src_dtypes[0].shape[0]: ret.append((m, None))
-              else: ret.append((m, ox*4 + oy*src_dtypes[0].shape[1]*4))
-          else:
-            for m,o in zip(src_values[0], src_values[1]): ret.append((m,o))
-          values[i] = [(m,o,g) for (m,o),g in zip(ret, src_values[2] if len(src_values) == 3 else [True]*len(ret))] # set the gate last
-        elif uop is Ops.CAST and isinstance(dtype, PtrDType):
-          values[i] = src_values[0]
-        elif uop is Ops.RANGE:
-          if i not in values: values[i] = [0] * warp_size
-          else:
-            for j in range(len(values[i])):
-              values[i][j] += 1
-          if values[i][0] == src_values[0][0]:
-            del values[i]
-            i = loop_ends[i] + 1
-            continue
-        elif uop is Ops.STACK: values[i] = src_values
-        elif uop is Ops.BITCAST: values[i] = [bitcast(x, src_dtypes[0], dtype) for x in src_values[0]]
-        elif uop is Ops.CAST:
-          if dtype.count > 1 and len(src_values[0]) == dtype.count and all(isinstance(x, list) for x in src_values[0]):
-            values[i] = [[truncate.get(dtype.scalar(), lambda dt: dt)(dtype.scalar().const(x)) for x in comp] for comp in src_values[0]]
-          else:
-            values[i] = [truncate.get(dtype, lambda dt: dt)(dtype.const(x)) for x in src_values[0]]
-        elif uop is Ops.LOAD:
-          if dtype.count > 1:
-            values[i] = [load([src_values[i][j] if i != 0 and src_dtypes[i].count > 1 else src_values[i] \
-                               for i in range(len(src_values))], j, dtype.scalar()) for j in range(dtype.count)]
-          else:
-            values[i] = load(src_values, 0, dtype)
-        elif uop is Ops.GEP: values[i] = src_values[0][get_single_element(arg)]
-        elif uop is Ops.WMMA and False:
-          first_src_dtype = self.uops[srcs[0]][1]
-          assert isinstance(first_src_dtype, DType) # mypy
-          dims, dtype_in, device, threads = arg[1], first_src_dtype.scalar(), arg[4], arg[5]
-          wmma_helper = functools.partial(generic_wmma_helper, src_values, warp_size)
-          # TODO: refactor these to a shared TensorCoreLayout
-          if device == "METAL":
-            # A (2 elements on 32 threads): row major
-            def a_b_elem(x, i, j, goff): return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
-            # (i, j), C, D (2 elements on 32 threads): row major same as A/B
-            def c_map(lane, elem): return (elem + ((lane%2)*2) + ((lane//8)%2)*4, ((lane//2)%4) + (lane//16)*4)
-            values[i] = wmma_helper(32, 8, 2, 2, 2, a_b_elem, a_b_elem, c_map)
-          elif device == "AMD" and threads == 64:
-            def a_elem(x, k, row, goff): return x[k%(dims[2]//4)][goff + (k//(dims[2]//4))*16 + row]
-            def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)  # pylint: disable=arguments-out-of-order
-            def c_map(lane, elem): return (lane%16, (lane//16)*4 + elem)
-            values[i] = wmma_helper(64, dims[2], len(src_values[0]), len(src_values[1]), len(src_values[2]), a_elem, b_elem, c_map)
-          elif device == "AMD" and len(src_values[0]) == 8: # RDNA4
-            def a_elem(x, k, row, goff): return x[k - [0, 4, 4, 8][k//4]][goff + row + [0, 16, 0, 16][k//4]]
-            def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)
-            def c_map(lane, elem): return (lane%16, (lane//16)*8 + elem)
-            values[i] = wmma_helper(32, 16, 8, 8, 8, a_elem, b_elem, c_map)
-          elif device == "AMD":
-            # A (16 elements on 32 threads): col major, lane 16-32 == lane 0-15
-            def a_elem(x, k, row, goff):
-              assert x[k][goff+row] == x[k][goff+row+16], "warp elements not duplicated properly across lanes"
-              return x[k][goff+row]
-            # B (16 elements on 32 threads): row major, lane 16-32 == lane 0-15
-            def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)  # pylint: disable=arguments-out-of-order
-            def c_map(lane, elem): return (lane%16, lane//16+elem*2) # (i, j), C, D (8 elements on 32 threads): row major
-            values[i] = wmma_helper(32, 16, 16, 16, 8, a_elem, b_elem, c_map)
-          elif device == "CUDA":
-            # (col, row) given (lane, elem) for C & D (4 elements on 32 threads); shared by all tc shapes with M=16 N=8
-            def c_map(lane, elem): return (elem%2 + (lane%4)*2, lane//4 + (elem//2)*8)
-
-            if dims == (8,16,16):
-              def a_elem(x, k, row, goff): return x[k%2 + (row//8)*2 + (k//8)*4][goff + (k//2)%4 + (row%8)*4]
-              def b_elem(x, col, k, goff): return x[k%2 + (k//8)*2][goff + (k//2)%4 + col*4]
-              values[i] = wmma_helper(32, 16, 8, 4, 4, a_elem, b_elem, c_map)
-
-            elif dims == (8,16,32):
-              def a_elem(x, k, row, goff): return x[k%4 + (row//8)*4 + (k//16)*8][goff + (k//4)%4 + (row%8)*4]
-              def b_elem(x, col, k, goff): return x[k%4 + (k//16)*4][goff + (k//4)%4  + col*4]
-              values[i] = wmma_helper(32, 32, 16, 8, 4, a_elem, b_elem, c_map)
-
-            elif dims == (8,16,8) and dtype_in == dtypes.half:
-              def a_elem(x, k, row, goff): return x[k%2 + (row//8)*2][goff + k//2 + (row%8)*4]
-              def b_elem(x, col, k, goff): return x[k%2][goff + k//2 + col*4]
-              values[i] = wmma_helper(32, 8, 4, 2, 4, a_elem, b_elem, c_map)
-
-            elif dims == (8,16,8) and dtype_in == dtypes.float:
-              def a_elem(x, k, row, goff): return x[(k//4)*2 + row//8][goff + k%4 + (row%8)*4]
-              def b_elem(x, col, k, goff): return x[k//4][goff + k%4 + col*4]
-              values[i] = wmma_helper(32, 8, 4, 2, 4, a_elem, b_elem, c_map)
-
-            else: raise NotImplementedError(f"unimplemented tensor core {arg}")
-          elif device == "INTEL":
-            # A (16 elements on 8 threads)
-            def a_elem(x, k, row, goff): return x[k%2+row*2][goff+k//2]
-            # B (16 elements on 8 threads)
-            def b_elem(x, col, k, goff): return x[k][goff+col]
-            # C, D (8 elements on 8 threads)
-            def c_map(lane, elem): return (lane, elem)
-            values[i] = wmma_helper(8, 16, 16, 16, 8, a_elem, b_elem, c_map)
-          elif device == "CPU":
-            def elem(x, col, row, _): return x[col+row][0] # k is always 0
-            def c_map(lane, elem): return (elem%16, elem//16)
-            values[i] = wmma_helper(1, 1, 16, 16, 256, elem, elem, c_map)
-          else: raise NotImplementedError(f"unimplemented tensor core {arg}")
-        elif uop in [Ops.CUSTOM, Ops.WMMA] or uop in GroupOp.ALU:
-          if uop is not Ops.WMMA: assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {uop}"
-          assert all_same([dtype] + src_dtypes) or uop in {*GroupOp.Comparison, Ops.WHERE, Ops.WMMA}, f"dtype mismatch on {uop}"
-          # Ops.CMPLT seperated out for dtype
-          if uop in [Ops.CMPLT, Ops.WMMA] or (uop in self.hardware_ops and dtype.scalar() in [dtypes.float16]):
-            self.device.reset_npu()
-            self.q = []
-            self.lut_enable = lut_enabled(uop, arg)
-            if len(src_values)==1:
-              if uop is Ops.NEG:
-                src_values.append([-1]*len(src_values[0]))
-                uop = Ops.MUL
-              else:
-                src_values.append(src_values[0])
-            if uop is Ops.WMMA:
-              in_full = np.asarray(src_values[0], dtype=np.float16).reshape(-1)
-              wt_full = np.asarray(src_values[1], dtype=np.float16).reshape(-1)
-              c_full = np.asarray(src_values[2], dtype=np.float32).reshape(-1)
-              wmma_dims = arg[1] if isinstance(arg, tuple) and len(arg) > 1 else (2, 2, 1)
-              wmma_m, wmma_n, wmma_k = int(wmma_dims[0]), int(wmma_dims[1]), int(wmma_dims[2])
-              if wmma_m <= 0 or wmma_n <= 0 or wmma_k <= 0:
-                wmma_m, wmma_n, wmma_k = 2, 2, 1
-              wmma_meta = wmma_params(wmma_m, wmma_n, wmma_k)
-              in_pack = np.zeros(wmma_meta["align_in"] * wmma_meta["m"], dtype=np.float16)
-              wt_pack = np.zeros(wmma_meta["align_in"] * wmma_meta["align_out"], dtype=np.float16)
-              if (wmma_meta["m"], wmma_meta["n"], wmma_meta["k"]) == (2, 2, 1) and len(in_full) == 4 and len(wt_full) == 4:
-                in_pack[0], in_pack[1], in_pack[32], in_pack[33] = in_full[0], in_full[1], in_full[2], in_full[3]
-                wt_pack[0], wt_pack[1], wt_pack[32], wt_pack[33] = wt_full[0], wt_full[2], wt_full[1], wt_full[3]
-              else:
-                in_need = wmma_meta["m"] * wmma_meta["k"]
-                wt_need = wmma_meta["k"] * wmma_meta["n"]
-                in_matrix = np.zeros((wmma_meta["m"], wmma_meta["k"]), dtype=np.float16)
-                wt_matrix = np.zeros((wmma_meta["k"], wmma_meta["n"]), dtype=np.float16)
-                in_take = min(in_need, len(in_full))
-                wt_take = min(wt_need, len(wt_full))
-                if in_take: in_matrix.reshape(-1)[:in_take] = in_full[:in_take]
-                if wt_take: wt_matrix.reshape(-1)[:wt_take] = wt_full[:wt_take]
-                for r in range(wmma_meta["m"]):
-                  dst_off = r * wmma_meta["align_in"]
-                  in_pack[dst_off:dst_off+wmma_meta["k"]] = in_matrix[r, :]
-                for n in range(wmma_meta["n"]):
-                  dst_off = n * wmma_meta["align_in"]
-                  wt_pack[dst_off:dst_off+wmma_meta["k"]] = wt_matrix[:, n]
-              src = memoryview(bytearray(in_pack.tobytes()))
-              src2 = memoryview(bytearray(wt_pack.tobytes()))
-            else:
-              src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
-              src2 = memoryview(bytearray(np.asarray(src_values[1], dtype=np.float16).tobytes()))
-            self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
-            self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
-            self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
-            self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
-            if uop is Ops.WMMA:
-              output_stride = wmma_meta["align_out"] * dtypes.float32.itemsize
-              output_nbytes = max(0x100, (wmma_meta["m"]-1)*output_stride + wmma_meta["n"]*dtypes.float32.itemsize)
-            else:
-              output_nbytes = src.nbytes
-            self.output_buf = self.device._gpu_alloc(output_nbytes, 0, name="output")
-            try:
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-              self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-              if uop is Ops.WMMA:
-                emit_runtime_boilerplate(self, op=uop, size=len(src_values[0]), arg=arg,
-                  feature_addr=self.input_buf.meta.dma_addr,
-                  weight_addr=self.weight_buf.meta.dma_addr,
-                  dst_addr=self.output_buf.meta.dma_addr,
-                  wmma_meta=wmma_meta)
-              else:
-                emit_runtime_boilerplate(self, op=uop, size=len(src_values[0]), arg=arg)
-                self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
-                  self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT,
-                            rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-                self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-                  self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
-                            rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-                self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-                  self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
-                            rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
-
-              self.submit(uop)
-              self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-
-              dst = memoryview(bytearray(self.output_buf.size))
-              ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
-              if DEBUG >= 7: print(dst.tobytes().hex())
-              if uop is Ops.WMMA:
-                raw = np.frombuffer(dst.tobytes(), dtype=np.float32)
-                stride_f32 = wmma_meta["align_out"]
-                result = [float(raw[r*stride_f32 + c]) for r in range(wmma_meta["m"]) for c in range(wmma_meta["n"])]
-                if len(c_full) == len(result): result = [x+y for x,y in zip(result, c_full.tolist())]
-                result = [[x] for x in result]
-              else:
-                result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
-              if self.lut_enable:
-                raw = np.rint(np.array(result, dtype=np.float32))
-                # q14 decode
-                if uop is Ops.EXP2:
-                  result = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
-                elif arg == "silu":
-                  result = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
-              values[i] = list(result)
-              if DEBUG >= 7:
-                print('src', src_values[0])
-                print('src2', src_values[1])
-                print('result', values[i])
-                try: print('expected', [exec_alu(uop, dtype, p) for p in zip(*src_values)])
-                except: pass
-            finally:
-              self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
-          else:
-            allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR)
-            if allow_fallback:
-              print('ALLOWED FALLBACK TO CPU', uop, dtype)
-              values[i] = [exec_alu(uop, dtype, p) for p in zip(*src_values)]
-            else:
-              print('<!> EXIT OPERATION NOT SUPPORTED', uop, dtype, src_values)
-        assert i in values, (uop, dtype, srcs, arg)
-        i += 1
-    return time.perf_counter() - st
+    raise RuntimeError(f"unsupported Rockchip template family {self.template.family if self.template is not None else None}")
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
@@ -647,11 +336,7 @@ class RockchipRenderer(Renderer):
       out_slot, in_slot, weight_slot, in_channels, out_channels, spatial = conv_meta
       return base64.b64encode(encode_template(build_conv1x1_template(
         conv_params(in_channels, out_channels, spatial), out_slot, in_slot, weight_slot))).decode()
-    if not getenv("ROCKCHIP_LEGACY_UOPS", 0): raise RuntimeError("unsupported Rockchip program: no RKTemplatePackage match")
-    # the value of SPECIAL comes from local/global_size, not form its source
-    uop_to_idx = {u:i for i,u in enumerate(uops)}
-    lops = [(u.op, u.dtype, ([] if u.op is Ops.SPECIAL else [uop_to_idx[v] for v in u.src]), u.arg) for u in uops]
-    return base64.b64encode(pickle.dumps(lops)).decode()
+    raise RuntimeError("unsupported Rockchip program: no RKTemplatePackage match")
 
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)

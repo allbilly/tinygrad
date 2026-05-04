@@ -233,17 +233,9 @@ class TestRockchipSupport(unittest.TestCase):
     from tinygrad.codegen import to_program
     from tinygrad.device import Target
     from tinygrad.runtime.ops_rockchip import RockchipRenderer
-    old = os.environ.get("ROCKCHIP_LEGACY_UOPS")
-    try:
-      os.environ.pop("ROCKCHIP_LEGACY_UOPS", None)
-      getenv.cache_clear()
-      ast = Tensor.empty(64, dtype=dtypes.half).reciprocal().schedule_linear().src[0].src[0]
-      with self.assertRaisesRegex(RuntimeError, "no RKTemplatePackage match"):
-        to_program(ast, RockchipRenderer(Target("ROCKCHIP")))
-    finally:
-      if old is None: os.environ.pop("ROCKCHIP_LEGACY_UOPS", None)
-      else: os.environ["ROCKCHIP_LEGACY_UOPS"] = old
-      getenv.cache_clear()
+    ast = Tensor.empty(64, dtype=dtypes.half).reciprocal().schedule_linear().src[0].src[0]
+    with self.assertRaisesRegex(RuntimeError, "no RKTemplatePackage match"):
+      to_program(ast, RockchipRenderer(Target("ROCKCHIP")))
 
   def test_runtime_boundary_smoke(self):
     runtime = Path(__file__).parents[1] / "tinygrad" / "runtime" / "ops_rockchip.py"
@@ -298,31 +290,10 @@ class TestRockchipSupport(unittest.TestCase):
     self.assertEqual(official.core_mask, 0)
     self.assertEqual(official.subcore_task[:3], ((0, 3), (0, 3), (0, 3)))
 
-  def test_reject_old_pickle_by_default(self):
+  def test_reject_old_pickle(self):
     from tinygrad.runtime.ops_rockchip import RockchipProgram
-    old = os.environ.get("ROCKCHIP_LEGACY_UOPS")
-    try:
-      os.environ.pop("ROCKCHIP_LEGACY_UOPS", None)
-      getenv.cache_clear()
-      with self.assertRaisesRegex(RuntimeError, "missing RKTemplatePackage magic"):
-        RockchipProgram(object(), "old_pickle", pickle.dumps([]))
-    finally:
-      if old is None: os.environ.pop("ROCKCHIP_LEGACY_UOPS", None)
-      else: os.environ["ROCKCHIP_LEGACY_UOPS"] = old
-      getenv.cache_clear()
-
-  def test_legacy_pickle_requires_opt_in(self):
-    from tinygrad.runtime.ops_rockchip import RockchipProgram
-    old = os.environ.get("ROCKCHIP_LEGACY_UOPS")
-    try:
-      os.environ["ROCKCHIP_LEGACY_UOPS"] = "1"
-      getenv.cache_clear()
-      prg = RockchipProgram(object(), "old_pickle", pickle.dumps([]))
-      self.assertEqual(prg.uops, [])
-    finally:
-      if old is None: os.environ.pop("ROCKCHIP_LEGACY_UOPS", None)
-      else: os.environ["ROCKCHIP_LEGACY_UOPS"] = old
-      getenv.cache_clear()
+    with self.assertRaisesRegex(RuntimeError, "missing RKTemplatePackage magic"):
+      RockchipProgram(object(), "old_pickle", pickle.dumps([]))
 
   def test_program_rejects_wrong_template_target(self):
     from tinygrad.runtime.ops_rockchip import RockchipProgram
