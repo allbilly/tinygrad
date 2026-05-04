@@ -113,6 +113,7 @@ def submit_plan(template:RKTemplatePackage, flags:int, official:bool=False) -> R
   if task_count <= 0: raise RuntimeError("Rockchip template has no tasks")
   if official:
     return RKSubmitPlan(flags, task_count * 3, 0, ((0, task_count), (0, task_count), (0, task_count), (0, 0), (0, 0)))
+  if template.family == "pcchain": return RKSubmitPlan(flags, task_count, template.tasks[0].core_mask, ((0, task_count), (0, 0), (0, 0), (0, 0), (0, 0)))
   return RKSubmitPlan(flags, task_count, template.tasks[0].core_mask, ((0, task_count), (task_count, 0), (task_count + 1, 0), (0, 0), (0, 0)))
 
 def submit_template(fd_ctl, template:RKTemplatePackage, q:list[int], task_buf, cmd_buf, cmd_buf_size:int, timeout:int=6000) -> None:
@@ -129,8 +130,8 @@ def submit_template(fd_ctl, template:RKTemplatePackage, q:list[int], task_buf, c
     tasks[i].int_clear = task.int_clear
     tasks[i].int_status = 0
     tasks[i].regcfg_amount = task.regcfg_amount
-    tasks[i].regcfg_offset = task.regcfg_offset
-    tasks[i].regcmd_addr = cmd_buf.meta.dma_addr
+    tasks[i].regcfg_offset = 0 if template.family == "pcchain" else task.regcfg_offset
+    tasks[i].regcmd_addr = cmd_buf.meta.dma_addr + task.regcfg_offset if template.family == "pcchain" else cmd_buf.meta.dma_addr
 
   plan = submit_plan(template, rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG)
   submit_res = rk.struct_rknpu_submit(

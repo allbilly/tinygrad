@@ -312,7 +312,7 @@ class TestRockchipSupport(unittest.TestCase):
     plan = submit_plan(pkg, flags=0x7)
     self.assertEqual(plan.task_number, 3)
     self.assertEqual(plan.core_mask, 1)
-    self.assertEqual(plan.subcore_task, ((0, 3), (3, 0), (4, 0), (0, 0), (0, 0)))
+    self.assertEqual(plan.subcore_task, ((0, 3), (0, 0), (0, 0), (0, 0), (0, 0)))
     official = submit_plan(pkg, flags=0x5, official=True)
     self.assertEqual(official.task_number, 9)
     self.assertEqual(official.core_mask, 0)
@@ -339,13 +339,13 @@ class TestRockchipHardware(unittest.TestCase):
     width = (elements + 7) // 8 - 1
     body = [
       rkcmd(rk.DPU, rk.REG_DPU_S_POINTER, 0x0000000E),
-      rkcmd(rk.DPU, rk.REG_DPU_DATA_FORMAT, 0x000001E5),
-      rkcmd(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x48000002),
-      rkcmd(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0x00070007),
-      rkcmd(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, width),
+      rkcmd(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x000001E5),
+      rkcmd(rk.DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002),
+      rkcmd(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x00070007),
+      rkcmd(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width),
       rkcmd(rk.DPU, rk.REG_DPU_EW_CFG, 0x108202C0),
       rkcmd(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x00010001),
-      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x0000000E),
+      rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x0000000E),
       rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
       rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
       rkcmd(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
