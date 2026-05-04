@@ -14,9 +14,9 @@ from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.support.rockchip import (
   REGCMD_RESERVED, RK_TEMPLATE_MAGIC, RK_TEMPLATE_VERSION, RKTaskTemplate, RKTemplatePackage, rk_field, rkcmd, build_conv1x1_template,
-  build_elementwise_template, build_lut, conv_params, decode_template, encode_template, lut_enabled, pack_conv_input, pack_conv_weights,
-  apply_patches, conv1x1_meta, elementwise_meta, emit_runtime_boilerplate, parse_fused_matmul_name, submit_template, unpack_conv_output,
-  validate_template, wmma_params,
+  build_elementwise_template, build_lut, build_wmma_template, conv_params, decode_template, encode_template, lut_enabled, pack_conv_input,
+  pack_conv_weights, apply_patches, conv1x1_meta, elementwise_meta, emit_runtime_boilerplate, parse_fused_matmul_name, submit_template,
+  unpack_conv_output, validate_template, wmma_params,
 )
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, load, _store, generic_wmma_helper
@@ -112,11 +112,11 @@ class RockchipProgram:
       ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
       self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
       self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-      self.q, self.lut_enable = [], False
-      self.boilerplate(op=Ops.WMMA, size=int(m*k), arg=None,
-        feature_addr=self.input_buf.meta.dma_addr, weight_addr=self.weight_buf.meta.dma_addr, dst_addr=self.output_buf.meta.dma_addr,
-        wmma_meta=wmma_meta)
-      self.submit(Ops.WMMA)
+      template = build_wmma_template(wmma_meta)
+      self.q = list(template.regcmd)
+      addrs = {"output":self.output_buf.meta.dma_addr, "input":self.input_buf.meta.dma_addr, "weight":self.weight_buf.meta.dma_addr}
+      apply_patches(self.q, template.patches, addrs)
+      submit_template(self.device.fd_ctl, template, self.q, self.task_buf, self.cmd_buf, self.cmd_buf_size)
       self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       dst = memoryview(bytearray(self.output_buf.size))
       ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)

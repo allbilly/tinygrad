@@ -625,6 +625,32 @@ def build_elementwise_template(op:Ops, size:int, out_arg:int=0, input_arg:int=1,
   tasks = (RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=len(regcmd)),)
   return RKTemplatePackage(RK_TEMPLATE_VERSION, target, "elementwise", tuple(regcmd), patches, tasks, op=op, size=size)
 
+def _regcmd_index(regcmd:list[int], target:int, reg:int) -> int:
+  for i, cmd in enumerate(regcmd):
+    if ((cmd >> 48) & 0xffff) == ((target + 1) & 0xffff) and (cmd & 0xffff) == reg: return i
+  raise RuntimeError(f"missing Rockchip register command target={target:#x} reg={reg:#x}")
+
+def build_wmma_template(p:dict[str, int], out_arg:int=0, input_arg:int=1, weight_arg:int=2,
+                        target:str="rk3588-rknpu2") -> RKTemplatePackage:
+  mock = type("RockchipTemplateEmitter", (), {})()
+  mock.q, mock.lut_enable, mock.lut_size, mock.inv_scale, mock.hardware_ops = [], False, 513, 1.0, EW_ALU_OPS
+  mock.reg = rk_field
+  mock.emit_raw = lambda target, reg, value: mock.q.append(rkcmd(target, reg, value))
+  mock.fill_lut = lambda lut: None
+  emit_runtime_boilerplate(mock, Ops.WMMA, int(p["m"]) * int(p["k"]), None, 0, 0, 0, p)
+  regcmd = mock.q
+  input_patch = _regcmd_index(regcmd, rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR)
+  weight_patch = _regcmd_index(regcmd, rk.CNA, rk.REG_CNA_DCOMP_ADDR0)
+  output_patch = _regcmd_index(regcmd, rk.DPU, rk.REG_DPU_DST_BASE_ADDR)
+  regcmd.append(0x00810000000d0008)
+  patches = (
+    RKPatch("regcmd", input_patch, "dma32", input_arg, "input", mask=rk.CNA_FEATURE_DATA_ADDR_FEATURE_BASE_ADDR__MASK),
+    RKPatch("regcmd", weight_patch, "dma32", weight_arg, "weight", mask=rk.CNA_DCOMP_ADDR0_DECOMPRESS_ADDR0__MASK),
+    RKPatch("regcmd", output_patch, "dma32", out_arg, "output", mask=rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK),
+  )
+  tasks = (RKTaskTemplate(op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff, regcfg_offset=0, regcfg_amount=len(regcmd)),)
+  return RKTemplatePackage(RK_TEMPLATE_VERSION, target, "wmma", tuple(regcmd), patches, tasks, op=Ops.WMMA, size=int(p["m"]) * int(p["k"]), meta=dict(p))
+
 def build_conv1x1_template(p:dict[str, int|bool], out_arg:int=0, input_arg:int=1, weight_arg:int=2,
                            target:str="rk3588-rknpu2") -> RKTemplatePackage:
   out_channels, in_channels, spatial = (int(p[x]) for x in ("out_channels", "in_channels", "spatial"))

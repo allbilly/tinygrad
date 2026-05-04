@@ -10,7 +10,7 @@ from tinygrad import Tensor, Device, dtypes
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.uop.ops import Ops
 from tinygrad.runtime.support.rockchip import (
-  RKPatch, RKTaskTemplate, RKTemplatePackage, build_conv1x1_template, build_elementwise_template, build_lut, conv_params,
+  RKPatch, RKTaskTemplate, RKTemplatePackage, build_conv1x1_template, build_elementwise_template, build_lut, build_wmma_template, conv_params,
   decode_template, encode_template, apply_patches, lut_enabled, pack_conv_input, pack_conv_weights, patch_regcmd, rkcmd, unpack_conv_output,
   validate_template, submit_plan, submit_template, wmma_params,
 )
@@ -122,6 +122,19 @@ class TestRockchipSupport(unittest.TestCase):
     self.assertEqual(p["align_in"], 64)
     self.assertEqual(p["align_out"], 64)
     self.assertEqual(p["notch_val"], 0)
+
+  def test_wmma_template_patches(self):
+    pkg = build_wmma_template(wmma_params(64, 64, 64), 6, 7, 8)
+    self.assertEqual(pkg.family, "wmma")
+    self.assertEqual(pkg.op, Ops.WMMA)
+    self.assertEqual([p.role for p in pkg.patches], ["input", "weight", "output"])
+    self.assertEqual([p.arg_index for p in pkg.patches], [7, 8, 6])
+    regcmd = list(pkg.regcmd)
+    for patch, value in zip(pkg.patches, [0x1000, 0x2000, 0x3000]):
+      patch_regcmd(regcmd, patch, value)
+    self.assertIn(0x1000, [(cmd >> 16) & 0xffffffff for cmd in regcmd])
+    self.assertIn(0x2000, [(cmd >> 16) & 0xffffffff for cmd in regcmd])
+    self.assertIn(0x3000, [(cmd >> 16) & 0xffffffff for cmd in regcmd])
 
   def test_lut_builder(self):
     lut, index_scale, inv_scale = build_lut(Ops.EXP2, None, 513)
