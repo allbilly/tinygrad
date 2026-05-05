@@ -2168,14 +2168,12 @@ class TestOps(unittest.TestCase):
     with self.assertRaises((ValueError, RuntimeError)): Tensor.ones(4,3,1,6).expand(3,1,6)
     with self.assertRaises((ValueError, RuntimeError)): Tensor.ones(4,3,2,6).expand(4,3,0,6)
 
-  @unittest.skip("very slow")
   def test_sd_big_conv(self):
     # internal shape (1, 1, 512, 62, 62, 512, 3, 3) overflows a int
     helper_test_op([(1,256,64,64), (512,256,3,3)],
                     lambda x,w: torch.nn.functional.conv2d(x, w),
                     lambda x,w: x.conv2d(w), atol=1e-3)
 
-  @unittest.skip("slow")
   def test_large_bs_conv(self):
     # large batch size can cause OpenCL image to exceed max image height on macOS
     # (or cause the conv kernel to overflow short sampling coords)
@@ -2183,7 +2181,6 @@ class TestOps(unittest.TestCase):
                     lambda x,w: torch.nn.functional.conv2d(x, w),
                     lambda x,w: x.conv2d(w), atol=1e-3)
 
-  @unittest.skip("slow")
   def test_large_ic_conv(self):
     # large input channel count can cause OpenCL image to exceed max image width on macOS
     helper_test_op([(1,2048,3,3), (1,2048,3,3)],

@@ -771,12 +771,58 @@ def conv1x1_meta(uops:list[UOp]) -> tuple[int, int, int, int, int, int]|None:
   if not candidates: return None
   spatial = max(candidates)
   out_channels, in_channels = out_size // spatial, in_size // spatial
-  if out_channels <= 0 or in_channels <= 0 or spatial <= 0 or in_channels > 4: return None
+  if out_channels <= 0 or in_channels <= 0 or spatial <= 0 or in_channels <= 4: return None
   if not any(u.op is Ops.WMMA for u in uops): return None
   return (params[0][1].arg, params[1][1].arg, params[2][1].arg, in_channels, out_channels, spatial)
 
 FUSED_MATMUL_KEYS = ("m", "n", "k", "batch", "a_bs", "b_bs", "c_bs", "a_ms", "a_ks", "b_ks", "b_ns", "c_ms", "c_ns",
                      "a_slot", "b_slot", "c_slot", "ta", "tb", "a_dt", "b_dt", "c_dt")
+
+POOL2D_KEYS = ("op", "out_slot", "in_slot", "in_h", "in_w", "channels")
+
+def _outer_product_meta(uops:list[UOp]) -> dict[str, int]|None:
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1: return None
+  dst, val = stores[0].src[0], stores[0].src[1]
+  if dst.op is Ops.CAST: dst = dst.src[0]
+  while val.op is Ops.CAST: val = val.src[0]
+  if dst.op is not Ops.INDEX or val.op not in (Ops.MUL, Ops.STACK) or dst.src[0].op is not Ops.PARAM: return None
+
+  def load_param(u:UOp) -> UOp|None:
+    while u.op in (Ops.CAST, Ops.GEP): u = u.src[0]
+    if u.op is not Ops.LOAD: return None
+    idx = u.src[0].src[0] if u.src[0].op is Ops.CAST else u.src[0]
+    if idx.op is not Ops.INDEX: return None
+    ptr = idx.src[0].src[0] if idx.src[0].op is Ops.CAST else idx.src[0]
+    return ptr if ptr.op is Ops.PARAM else None
+
+  vals = val.src if val.op is Ops.STACK else (val,)
+  if not vals or any(v.op is not Ops.MUL for v in vals): return None
+  loads = [tuple(load_param(x) for x in v.src) for v in vals]
+  if any(a is None or b is None or a is b for a,b in loads): return None
+  lhs, rhs = sorted(loads[0], key=lambda x: int(x.arg))
+  if any({a,b} != {lhs,rhs} for a,b in loads): return None
+  dtype_code = {dtypes.half:0, dtypes.float:1}
+  a_dt = dtype_code.get(lhs.dtype.base.scalar()) if isinstance(lhs.dtype, PtrDType) else None
+  b_dt = dtype_code.get(rhs.dtype.base.scalar()) if isinstance(rhs.dtype, PtrDType) else None
+  c_dt = dtype_code.get(dst.src[0].dtype.base.scalar()) if isinstance(dst.src[0].dtype, PtrDType) else None
+  if a_dt is None or b_dt is None or c_dt is None: return None
+  m, n = lhs.dtype.size, rhs.dtype.size
+  if m <= 0 or n <= 0 or dst.src[0].dtype.size != m*n: return None
+  return dict(zip(FUSED_MATMUL_KEYS, [m, n, 1, 1, m, n, m*n, 1, 1, n, 1, n, 1,
+                                      int(lhs.arg), int(rhs.arg), int(dst.src[0].arg), 0, 0, a_dt, b_dt, c_dt]))
+
+def pool2d_meta(uops:list[UOp]) -> dict[str, int|str]|None:
+  for u in uops:
+    if u.op is not Ops.SINK or not hasattr(u.arg, "applied_opts"): continue
+    for opt in u.arg.applied_opts:
+      if isinstance(opt, tuple) and len(opt) == 2 and opt[0] == "ROCKCHIP_POOL2D":
+        vals = opt[1]
+        if isinstance(vals, tuple) and len(vals) == len(POOL2D_KEYS):
+          meta = dict(zip(POOL2D_KEYS, vals))
+          if meta["op"] in {"min", "max", "avg", "globalmin", "globalmax", "globalavg"}:
+            return meta
+  return None
 
 def fused_matmul_meta(uops:list[UOp]) -> dict[str, int]|None:
   for u in uops:
@@ -786,4 +832,4 @@ def fused_matmul_meta(uops:list[UOp]) -> dict[str, int]|None:
         vals = opt[1]
         if isinstance(vals, tuple) and len(vals) == len(FUSED_MATMUL_KEYS) and all(isinstance(x, int) and x >= 0 for x in vals):
           return dict(zip(FUSED_MATMUL_KEYS, vals))
-  return None
+  return _outer_product_meta(uops)
