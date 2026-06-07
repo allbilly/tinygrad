@@ -6,10 +6,10 @@ from typing import Any, TYPE_CHECKING
 import pickle, base64, itertools, time, struct, sys, functools, ctypes, mmap, os, math, numpy as np
 from dataclasses import replace
 from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element
+from tinygrad.helpers import DEBUG, all_same, getenv, flatten, get_single_element
 from tinygrad.device import Compiled, Compiler, Allocator
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, bitcast
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, AxisType, bitcast
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar, _load, load, _store, generic_wmma_helper
 from tinygrad.runtime.support.hcq import HCQBuffer
@@ -48,7 +48,16 @@ def generic_wmma_helper(inp, warp_size, WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_
 class RockchipProgram:
   def __init__(self, dev:'RockchipDevice', name:str, lib:bytes,
                runtimevars:dict[str, int]|None=None, **kwargs):
-    self.uops: list[UOp] = pickle.loads(lib)
+    prg = pickle.loads(lib)
+    self.cna_meta = None
+    self.cna_kind = None
+    self.fallback_uops: list[UOp]|None = None
+    if isinstance(prg, tuple) and len(prg) == 3 and prg[0] in ("rkcna_v1", "rkcna_gemv_v1"):
+      self.cna_kind = prg[0]
+      self.cna_meta, self.fallback_uops = prg[1], prg[2]
+      self.uops = self.fallback_uops
+    else:
+      self.uops: list[UOp] = prg
     self.uop_to_index: dict[UOp, int] = {u:i for i,u in enumerate(self.uops)}
     self.loop_ends: dict[UOp, int] = {u.src[1]:i for i, u in enumerate(self.uops) if u.op == Ops.END}
     self.runtimevars = runtimevars or {}
@@ -273,6 +282,7 @@ class RockchipProgram:
     tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
 
     # TODO: update parameter name as driver updated
+    print("NPU Submit")
     submit_res = rk.struct_rknpu_submit(
             flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
             timeout=6000,
@@ -297,6 +307,8 @@ class RockchipProgram:
     # print(res)
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    if self.cna_meta is not None:
+      return self._run_cna_group(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait, **kw)
     self.device.reset_npu()
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
@@ -308,6 +320,9 @@ class RockchipProgram:
       pvals: list[int] = list(vals)
       exec_masks = [[True] * warp_size]
       i = 0
+      if DEBUG >= 7:
+        for idx, u in enumerate(self.uops):
+          print(idx, u.op, u.dtype, u.arg, [v.op for v in u.src])
       while i < len(self.uops):
         u = self.uops[i]
         src_values = [values[v] for v in u.src if v.op not in void_ops]
@@ -520,6 +535,110 @@ class RockchipProgram:
         assert u in values, (u.op, u.dtype, u.src, u.arg)
         i += 1
     return time.perf_counter() - st
+
+  def _run_cna_group(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    if len(bufs) != 3: raise NotImplementedError(f"rkcna_v1 expected 3 buffers, got {len(bufs)}")
+    st = time.perf_counter()
+    out_buf, a_buf, b_buf = bufs
+    solved = None
+    if self.cna_kind == "rkcna_gemv_v1" and self.cna_meta is not None:
+      m, n, k = (int(self.cna_meta[x]) for x in ("m", "n", "k"))
+      batch = int(self.cna_meta.get("batch", 1))
+      src_itemsize = int(self.cna_meta.get("src_itemsize", 2))
+      out_itemsize = int(self.cna_meta.get("out_itemsize", 2))
+      a_len = m*k*src_itemsize if batch == 1 else m*k*src_itemsize
+      b_len = batch*k*n*src_itemsize
+      out_len = batch*m*n*out_itemsize
+      if len(a_buf) != a_len or len(b_buf) != b_len or len(out_buf) != out_len:
+        raise NotImplementedError(f"rkcna_gemv_v1 buffer sizes do not match meta {self.cna_meta}: {[len(x) for x in bufs]}")
+      solved = (m, n, k, src_itemsize, out_itemsize, batch)
+    else:
+      for out_itemsize in (4, 2):
+        if len(out_buf) % out_itemsize != 0: continue
+        out_elems = len(out_buf) // out_itemsize
+        for src_itemsize in (2, 4):
+          if len(a_buf) % src_itemsize != 0 or len(b_buf) % src_itemsize != 0: continue
+          a_elems, b_elems = len(a_buf) // src_itemsize, len(b_buf) // src_itemsize
+          if a_elems * b_elems % out_elems != 0: continue
+          k = math.isqrt(a_elems * b_elems // out_elems)
+          if k > 0 and k*k*out_elems == a_elems*b_elems and a_elems % k == 0 and b_elems % k == 0:
+            m, n = a_elems // k, b_elems // k
+            if m*n == out_elems: solved = (m, n, k, src_itemsize, out_itemsize, 1); break
+        if solved is not None: break
+    if solved is None: raise NotImplementedError(f"rkcna_v1 cannot infer GEMM shape from sizes {[len(x) for x in bufs]}")
+    m, n, k, src_itemsize, out_itemsize, batch = solved
+    out_fp16 = out_itemsize == 2
+    a_src = np.frombuffer(a_buf, dtype=np.float32 if src_itemsize == 4 else np.float16).astype(np.float16).reshape(m, k)
+    b_src = np.frombuffer(b_buf, dtype=np.float32 if src_itemsize == 4 else np.float16).astype(np.float16).reshape(batch, k, n)
+    align_in, align_out, _ = _rk_gemm_layout(m, n, k)
+    input_packed = np.zeros((m, align_in), dtype=np.float16)
+    input_packed[:, :k] = a_src
+    weight_packed = np.zeros((batch, align_out * align_in), dtype=np.float16)
+    for bi in range(batch):
+      weight = np.zeros((align_out, align_in), dtype=np.float16)
+      weight[:n, :k] = b_src[bi].T
+      weight_packed[bi] = weight.reshape(align_out // 16, 16, align_in // 32, 32).transpose(0, 2, 1, 3).ravel()
+    weight_packed_flat = weight_packed.reshape(-1)
+    row_stride_bytes = align_out * 4
+    out_nbytes_one = max(256, m * row_stride_bytes)
+    out_nbytes = batch * out_nbytes_one
+    task_buf = self.device._gpu_alloc(64*1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="rkcna_task")
+    cmd_buf = self.device._gpu_alloc(512*1024, 0, name="rkcna_cmd")
+    input_buf = self.device._gpu_alloc(input_packed.nbytes, 0, name="rkcna_input")
+    weight_buf = self.device._gpu_alloc(weight_packed_flat.nbytes, 0, name="rkcna_weight")
+    output_buf = self.device._gpu_alloc(out_nbytes, 0, name="rkcna_output")
+    try:
+      ctypes.memmove(input_buf.va_addr, mv_address(memoryview(input_packed.reshape(-1))), input_packed.nbytes)
+      ctypes.memmove(weight_buf.va_addr, mv_address(memoryview(weight_packed_flat)), weight_packed_flat.nbytes)
+      self.device._gpu_sync(input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.device._gpu_sync(weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      regcmd = ctypes.cast(cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * (cmd_buf.size // 8))).contents
+      task_regs = [_rk_make_gemm_regs(m, n, k, input_buf.meta.dma_addr,
+        weight_buf.meta.dma_addr + bi * weight_packed.strides[0], output_buf.meta.dma_addr + bi * out_nbytes_one, out_fp16=out_fp16) for bi in range(batch)]
+      offsets, offset = [], 0
+      for regs in task_regs:
+        offsets.append(offset)
+        offset += _rk_align_up(len(regs) + RK_PC_CHAIN_TAIL_QWORDS, 2)
+      if offset > cmd_buf.size // 8: raise RuntimeError("rkcna command buffer too small")
+      for bi, regs in enumerate(task_regs):
+        base = offsets[bi]
+        for i,qword in enumerate(regs): regcmd[base+i] = qword
+        if bi + 1 < batch:
+          next_addr = cmd_buf.meta.dma_addr + offsets[bi+1] * ctypes.sizeof(ctypes.c_uint64)
+          tail = [_rk_E(0x0101, rk.REG_PC_BASE_ADDRESS, next_addr & 0xFFFFFFF0), _rk_E(0x0101, rk.REG_PC_REGISTER_AMOUNTS, _rk_ceil_div(len(task_regs[bi+1]), 2) + 1), _rk_E(0x0041, 0, 0), _rk_E(0x0081, rk.REG_PC_OPERATION_ENABLE, (6 << 1) | 1)]
+        else:
+          tail = [_rk_E(0x0001, 0, 0), _rk_E(0x0101, rk.REG_PC_REGISTER_AMOUNTS, 0), _rk_E(0x0041, 0, 0), _rk_E(0x0081, rk.REG_PC_OPERATION_ENABLE, (6 << 1) | 1)]
+        for i,qword in enumerate(tail): regcmd[base+len(regs)+i] = qword
+      tasks = ctypes.cast(task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
+      if batch > len(tasks): raise RuntimeError("rkcna task buffer too small")
+      for bi, regs in enumerate(task_regs):
+        tasks[bi].flags = 0; tasks[bi].op_idx = 0; tasks[bi].enable_mask = 0xd; tasks[bi].int_mask = 0x300; tasks[bi].int_clear = 0x1ffff; tasks[bi].int_status = 0
+        tasks[bi].regcfg_amount = len(regs); tasks[bi].regcfg_offset = 0; tasks[bi].regcmd_addr = cmd_buf.meta.dma_addr + offsets[bi] * ctypes.sizeof(ctypes.c_uint64)
+      self.device.reset_npu()
+      submit_res = rk.struct_rknpu_submit(flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG, timeout=6000,
+        task_start=0, task_number=batch, task_counter=0, priority=0, task_obj_addr=task_buf.meta.obj_addr, regcfg_obj_addr=0,
+        task_base_addr=0, user_data=0, core_mask=1, fence_fd=-1,
+        subcore_task=(rk.struct_rknpu_subcore_task * 5)(rk.struct_rknpu_subcore_task(task_start=0, task_number=batch), rk.struct_rknpu_subcore_task(task_start=batch, task_number=0), rk.struct_rknpu_subcore_task(task_start=batch, task_number=0)))
+      rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
+      self.device._gpu_sync(output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      raw = memoryview(bytearray(output_buf.size))
+      ctypes.memmove(mv_address(raw), output_buf.va_addr, output_buf.size)
+      result_batches = []
+      for bi in range(batch):
+        chunk = raw[bi*out_nbytes_one:(bi+1)*out_nbytes_one]
+        if out_fp16:
+          surface = np.frombuffer(chunk, dtype=np.float16, count=len(chunk)//2)
+          result_batches.append(surface[_rk_gemm_output_indices(m, n, align_out, True)].copy().reshape(-1))
+        else:
+          surface = np.frombuffer(chunk, dtype=np.float32, count=len(chunk)//4)
+          result_batches.append(surface[(np.arange(m) * align_out)[:, None] + np.arange(n)].copy().reshape(-1))
+      result = np.concatenate(result_batches)
+      out_buf.cast('B')[:] = memoryview(result).cast('B')
+      if DEBUG >= 3:
+        print(f"{'RKCNA_GEMV_RUN' if self.cna_kind == 'rkcna_gemv_v1' else 'RKCNA_RUN'} m={m} n={n} k={k} batch={batch} out={'fp16' if out_fp16 else 'fp32'}")
+      return time.perf_counter() - st
+    finally:
+      self.device._gpu_free_multiple([task_buf, cmd_buf, input_buf, weight_buf, output_buf])
   
 def _rk_shift_to_muldiv(x, op):
   vmax = max(abs(x.src[0].vmin), abs(x.src[0].vmax))
@@ -533,6 +652,64 @@ def _rk_shift_to_muldiv(x, op):
   pow2 = x.src[1].cast(dtypes.float16).exp2()
   return x.src[0].cast(dtypes.float16).alu(op, pow2).cast(x.dtype)
 
+RK_FP16_BYTES, RK_FP32_BYTES, RK_CBUF_ENTRY_BYTES, RK_CBUF_ENTRIES_PER_BANK = 2, 4, 128, 256
+RK_CBUF_BANKS, RK_MIN_CHANNEL_TILE, RK_LINE_STRIDE_GROUP_CAP = 12, 32, 13
+RK_CBUF_BANK_SIZE = RK_CBUF_ENTRIES_PER_BANK * RK_CBUF_ENTRY_BYTES
+RK_MIN_WIDE_FEATURE_GRAINS, RK_PC_CHAIN_TAIL_QWORDS = 80, 4
+RK_GEMM_INPUT_BANKS, RK_GEMM_MAX_ALIGN_IN = RK_CBUF_BANKS - 2, RK_CBUF_BANKS * RK_MIN_CHANNEL_TILE
+
+def _rk_ceil_div(x, y): return (x + y - 1) // y
+def _rk_align_up(x, align): return _rk_ceil_div(x, align) * align
+def _rk_E(target, reg_addr, value): return (target << 48) | ((value & 0xFFFFFFFF) << 16) | reg_addr
+
+def _rk_gemm_layout(m, n, k):
+  aligned_k = max(RK_MIN_CHANNEL_TILE, _rk_align_up(k, RK_MIN_CHANNEL_TILE))
+  align_out = max(RK_MIN_CHANNEL_TILE, _rk_align_up(n, RK_MIN_CHANNEL_TILE))
+  align_in = max(aligned_k, align_out)
+  eff_k = align_in if align_in != aligned_k else k
+  return align_in, align_out, eff_k
+
+def _rk_gemm_output_indices(m, n, align_out, out_fp16):
+  row_stride = align_out * 2 if out_fp16 else align_out
+  row_start = np.arange(m, dtype=np.int64) * row_stride
+  col_idx = (np.arange(n, dtype=np.int64) // 16) * 32 + (np.arange(n, dtype=np.int64) % 16) if out_fp16 else np.arange(n, dtype=np.int64)
+  return row_start[:, None] + col_idx[None, :]
+
+def _rk_make_gemm_regs(m, n, k, in_dma, wt_dma, out_dma, out_fp16=False):
+  cna, core, dpu = rk.CNA + 1, rk.CORE + 1, rk.DPU + 1
+  align_in, align_out, eff_k = _rk_gemm_layout(m, n, k)
+  input_row_bytes = align_in * RK_FP16_BYTES
+  out_precision, size_e = (2, 1) if out_fp16 else (5, 3)
+  even_rows_per_two_banks = (_rk_ceil_div(2 * RK_CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
+  feature_grains = max(RK_MIN_WIDE_FEATURE_GRAINS, even_rows_per_two_banks)
+  data_banks = int(np.clip(_rk_ceil_div(m * input_row_bytes, RK_CBUF_BANK_SIZE), 1, RK_CBUF_BANKS-1))
+  line_stride = 4 * min(_rk_ceil_div(eff_k, RK_MIN_CHANNEL_TILE), RK_LINE_STRIDE_GROUP_CAP)
+  notch_val = 8 * min(align_out // RK_MIN_CHANNEL_TILE, RK_LINE_STRIDE_GROUP_CAP) - 1
+  return [
+    _rk_E(dpu, rk.REG_DPU_S_POINTER, (1 << 3) | (1 << 2) | (1 << 1)),
+    _rk_E(cna, rk.REG_CNA_CONV_CON1, (2 << 4) | (2 << 7) | (1 << 29)),
+    _rk_E(cna, rk.REG_CNA_CONV_CON2, feature_grains << 4),
+    _rk_E(cna, rk.REG_CNA_CONV_CON3, (1 << 3) | 1),
+    _rk_E(cna, rk.REG_CNA_DATA_SIZE0, (1 << 16) | m),
+    _rk_E(cna, rk.REG_CNA_DATA_SIZE1, ((align_in - 1) << 16) | align_in),
+    _rk_E(cna, rk.REG_CNA_DATA_SIZE2, 1), _rk_E(cna, rk.REG_CNA_DATA_SIZE3, m),
+    _rk_E(cna, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes * align_out), _rk_E(cna, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes),
+    _rk_E(cna, rk.REG_CNA_WEIGHT_SIZE2, (1 << 24) | (1 << 16) | align_out),
+    _rk_E(cna, rk.REG_CNA_CBUF_CON0, ((RK_CBUF_BANKS - data_banks) << 4) | data_banks), _rk_E(cna, rk.REG_CNA_CBUF_CON1, _rk_ceil_div(align_in, RK_MIN_CHANNEL_TILE)),
+    _rk_E(cna, rk.REG_CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1), _rk_E(cna, rk.REG_CNA_CVT_CON1, 1 << 16),
+    _rk_E(cna, rk.REG_CNA_CVT_CON2, 1 << 16), _rk_E(cna, rk.REG_CNA_CVT_CON3, 1 << 16), _rk_E(cna, rk.REG_CNA_CVT_CON4, 1 << 16),
+    _rk_E(cna, rk.REG_CNA_FEATURE_DATA_ADDR, in_dma), _rk_E(cna, rk.REG_CNA_DMA_CON0, (15 << 16) | 15), _rk_E(cna, rk.REG_CNA_DMA_CON1, line_stride), _rk_E(cna, rk.REG_CNA_DMA_CON2, 0),
+    _rk_E(cna, rk.REG_CNA_FC_DATA_SIZE0, (1 << 16) | m), _rk_E(cna, rk.REG_CNA_FC_DATA_SIZE1, align_in), _rk_E(cna, rk.REG_CNA_DCOMP_ADDR0, wt_dma),
+    _rk_E(core, rk.REG_CORE_MISC_CFG, (2 << 8) | 1), _rk_E(core, rk.REG_CORE_DATAOUT_SIZE_0, ((m - 1) << 16) | 0), _rk_E(core, rk.REG_CORE_DATAOUT_SIZE_1, align_out - 1), _rk_E(core, 0x3030, 0),
+    _rk_E(dpu, rk.REG_DPU_FEATURE_MODE_CFG, (15 << 5) | (2 << 1)), _rk_E(dpu, rk.REG_DPU_DATA_FORMAT, (out_precision << 29) | (2 << 26) | 2), _rk_E(dpu, rk.REG_DPU_DST_BASE_ADDR, out_dma),
+    _rk_E(dpu, rk.REG_DPU_DST_SURF_STRIDE, 1 << 4), _rk_E(dpu, rk.REG_DPU_DATA_CUBE_WIDTH, 0), _rk_E(dpu, rk.REG_DPU_DATA_CUBE_HEIGHT, m - 1),
+    _rk_E(dpu, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch_val << 16) | notch_val), _rk_E(dpu, rk.REG_DPU_DATA_CUBE_CHANNEL, ((align_out - 1) << 16) | (align_out - 1)),
+    _rk_E(dpu, rk.REG_DPU_BS_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1), _rk_E(dpu, rk.REG_DPU_BS_OW_CFG, (size_e << 8) | (size_e << 5) | (size_e << 2) | (1 << 1)),
+    _rk_E(dpu, rk.REG_DPU_WDMA_SIZE_0, align_out - 1), _rk_E(dpu, rk.REG_DPU_WDMA_SIZE_1, ((m - 1) << 16) | 0),
+    _rk_E(dpu, rk.REG_DPU_BN_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1), _rk_E(dpu, rk.REG_DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 7) | (1 << 1) | 1),
+    _rk_E(dpu, rk.REG_DPU_OUT_CVT_SCALE, ((1 << 16) | 1) if out_fp16 else 0), _rk_E(dpu, rk.REG_DPU_SURFACE_ADD, (1 * 4) << 4),
+  ]
+
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
@@ -543,6 +720,9 @@ class RockchipRenderer(Renderer):
   # hacks, turned unsupported dtype to half and lut function to Ops.CUSTOM
   compiler = RockchipCompiler()
 
+  def __init__(self, target):
+    super().__init__(target)
+    self.tensor_cores = tc.rockchip_cmac
   def _rk_trunc_fix(x):
     if x.tag == "rk_trunc": return None
     xh = x.src[0].cast(dtypes.half)
@@ -567,19 +747,19 @@ class RockchipRenderer(Renderer):
     (UPat(Ops.SHL, dtypes.uint, name="x"),
      lambda x: _rk_shift_to_muldiv(x, Ops.MUL)),
     (UPat(Ops.SHR, dtypes.uint, name="x"),
-     lambda x: _rk_shift_to_muldiv(x, Ops.FDIV)),
+      lambda x: _rk_shift_to_muldiv(x, Ops.FDIV)),
     (UPat(Ops.ADD, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
+      lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
     (UPat(Ops.MUL, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MUL, x.src[1].cast(dtypes.half))),
+      lambda x: x.src[0].cast(dtypes.half).alu(Ops.MUL, x.src[1].cast(dtypes.half))),
     (UPat(Ops.MAX, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
+      lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
     (UPat(Ops.NEG, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
+      lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
     (UPat(Ops.EXP2, dtypes.float, name="x"),
-     lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+      lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
     (UPat(Ops.TRUNC, dtypes.floats, name="x"),
-     _rk_trunc_fix),
+      _rk_trunc_fix),
     # (UPat.var("x", dtypes.floats).alu(Ops.FDIV,
     #   UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
     #  lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
@@ -609,7 +789,80 @@ class RockchipRenderer(Renderer):
      lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
+  def _coalesce_wmma_to_cna(self, uops:list[UOp]):
+    wmmas = [u for u in uops if u.op is Ops.WMMA and isinstance(u.arg, tuple) and len(u.arg) >= 6 and u.arg[4] == "ROCKCHIP"]
+    if not wmmas: return None
+    first = wmmas[0]
+    dims, dtype_in, dtype_out = first.arg[1], first.arg[2], first.arg[3]
+    if dims != (16, 1, 32):
+      if DEBUG >= 3: print("RKCNA_FALLBACK:unsupported_cmac_dims")
+      return None
+    if not all(w.arg[1] == dims and w.arg[2] == dtype_in and w.arg[3] == dtype_out and w.arg[4] == "ROCKCHIP" for w in wmmas):
+      if DEBUG >= 3: print("RKCNA_FALLBACK:mixed_wmma_atoms")
+      return None
+    meta = {
+      "version": 1, "m": 1, "n": dims[0], "k": dims[2], "batch": 1,
+      "a_dtype": dtype_in, "b_dtype": dtype_in, "c_dtype": dtype_out,
+      "acc_dtype": dtype_out, "out_dtype": dtype_out, "post_op": None,
+      "atoms": len(wmmas), "dims": dims,
+    }
+    if DEBUG >= 3:
+      print(f"RKCNA_MATCH m={meta['m']} n={meta['n']} k={meta['k']} batch={meta['batch']} atoms={meta['atoms']} k_slices=1 c_slices=1 slots=(-1,-1,-1)")
+    return meta
+
+  @staticmethod
+  def _root_params(u:UOp) -> set[UOp]:
+    if u.op is Ops.PARAM: return {u}
+    ret:set[UOp] = set()
+    for s in u.src: ret.update(RockchipRenderer._root_params(s))
+    return ret
+
+  def _match_gemv_to_cna(self, uops:list[UOp]):
+    if any(u.op is Ops.WMMA for u in uops): return None
+    if any(u.op in {Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD} for u in uops): return None
+    params = [u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)]
+    if len(params) != 3: return None
+    out, a, b = params
+    if a.dtype.base.scalar() is not dtypes.half or b.dtype.base.scalar() is not dtypes.half: return None
+    if out.dtype.base.scalar() not in (dtypes.half, dtypes.float): return None
+    out_stores = [u for u in uops if u.op is Ops.STORE and out in self._root_params(u.src[0])]
+    if len(out_stores) != 1: return None
+    loads = [u for u in uops if u.op is Ops.LOAD]
+    load_roots = [self._root_params(u) for u in loads]
+    if any(out in roots for roots in load_roots): return None
+    if {a, b} - set().union(*load_roots) if load_roots else {a, b}: return None
+    if not any(u.op is Ops.MUL and a in self._root_params(u.src[0]) | self._root_params(u.src[1]) and
+               b in self._root_params(u.src[0]) | self._root_params(u.src[1]) for u in uops): return None
+    if not any(u.op is Ops.ADD for u in uops): return None
+    out_elems, a_elems, b_elems = out.dtype.size, a.dtype.size, b.dtype.size
+    if min(out_elems, a_elems, b_elems) <= 0 or a_elems * b_elems % out_elems != 0: return None
+    k = math.isqrt(a_elems * b_elems // out_elems)
+    if k <= 0 or k*k*out_elems != a_elems*b_elems or a_elems % k != 0 or b_elems % k != 0: return None
+    m, n = a_elems // k, b_elems // k
+    if m*n != out_elems or (m != 1 and n != 1): return None
+    out_ranges = [u for u in uops if u.op is Ops.RANGE and isinstance(u.arg, tuple) and len(u.arg) > 1 and u.arg[1] is not AxisType.REDUCE]
+    if len(out_ranges) > 1: return None
+    batch = 1
+    sink = next((u for u in uops if u.op is Ops.SINK), None)
+    local_opts = [x for x in (getattr(sink.arg, "applied_opts", ()) if sink is not None else ()) if getattr(getattr(x, "op", None), "name", None) == "LOCAL"]
+    if n != 1 and len(local_opts) > 1:
+      candidates = sorted([int(x.arg) for x in local_opts if isinstance(x.arg, int) and x.arg > 1], reverse=True)
+      batch = next((x for x in candidates if n % x == 0), 1)
+      if batch == 1: return None
+      n //= batch
+    meta = {
+      "version": 1, "kind": "gemv", "m": m, "n": n, "k": k, "batch": batch,
+      "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+      "src_itemsize": a.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
+    }
+    if DEBUG >= 3: print(f"RKCNA_GEMV_MATCH m={m} n={n} k={k} batch={batch}")
+    return meta
+
   def render(self, uops:list[UOp]) -> str:
+    if (meta := self._coalesce_wmma_to_cna(uops)) is not None:
+      return base64.b64encode(pickle.dumps(("rkcna_v1", meta, uops))).decode()
+    if (meta := self._match_gemv_to_cna(uops)) is not None:
+      return base64.b64encode(pickle.dumps(("rkcna_gemv_v1", meta, uops))).decode()
     return base64.b64encode(pickle.dumps(uops)).decode()
   
 class RockchipAllocator(Allocator['RockchipDevice']):

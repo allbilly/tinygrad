@@ -135,6 +135,16 @@ amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
 
 def get_amd(arch): return {"gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch, amd_rdna3)
 
+# ***** Rockchip *****
+
+# RK3588 CMAC atom marker: AtomicC=16, AtomicK=32, one M row. This is not a
+# register-fed GPU instruction layout; the Rockchip renderer treats WMMA as a
+# coalescing marker for CNA/CBUF submission.
+rockchip_cmac = [TensorCore(dims=(16,1,32), threads=1, elements_per_thread=(32,512,16), dtype_in=dtypes.half, dtype_out=dtypes.float,
+  opts=("u0","u0","u0","u0"),
+  swizzle=(((), ('u0', 'u1', 'u2', 'u3'), ('r0', 'r1', 'r2', 'r3', 'r4')),
+           ((), ('u0', 'u1', 'u2', 'u3'), ('r0', 'r1', 'r2', 'r3', 'r4'))))]
+
 # ***** Apple Metal *****
 
 metal = [TensorCore(dims=(8,8,8), threads=32, elements_per_thread=(2,2,2), dtype_in=di, dtype_out=do,

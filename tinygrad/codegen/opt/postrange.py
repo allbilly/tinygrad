@@ -217,6 +217,7 @@ class Scheduler:
     return ret
 
   def _apply_tc_opt(self, use_tensor_cores:int, axis:int, tc_select:int, opt_level:int) -> None|list[UOp]:
+    if self.ren.target.device == "ROCKCHIP": opt_level = max(opt_level, 2)
     if not (reduceops := self.reduceops): raise KernelOptError("no reduce ops for TensorCore")
     reduceop = reduceops[0]
     if use_tensor_cores and reduceop.arg[0] is Ops.ADD:
