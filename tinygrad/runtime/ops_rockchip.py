@@ -34,14 +34,22 @@ class RockchipProgram:
     prg = pickle.loads(lib)
     self.ew_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "elementwise" else None
     self.conv_meta = prg[1:] if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "conv1x1" and not name.startswith("rkmm_v1_") else None
-    self.uops: list[tuple[Ops, DType, list[int], Any]] = [] if self.ew_meta is not None or self.conv_meta is not None else prg
+    matmul_meta, matmul_uops = None, None
+    if isinstance(prg, tuple) and len(prg) > 0 and prg[0] == "matmul":
+      if len(prg) == 3 and isinstance(prg[1], tuple): matmul_meta, matmul_uops = prg[1], prg[2]
+      else: matmul_meta = prg[1:]
+    wmma_matmul_meta, wmma_fallback_uops = self._parse_wmma_matmul_program(prg)
+    if wmma_matmul_meta is not None: matmul_meta, matmul_uops = wmma_matmul_meta, prg
+    self.fused_matmul_fallback_uops = wmma_fallback_uops
+    self.uops: list[tuple[Ops, DType, list[int], Any]] = matmul_uops if matmul_uops is not None else \
+      ([] if self.ew_meta is not None or self.conv_meta is not None or matmul_meta is not None else prg)
     self.device = dev
     self.q = []
     self.hardware_ops = {Ops.WMMA:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
     self.cmd_buf_size = 16384
     self.exp2_inv_scale = 1.0
     self.lut_size = 513
-    self.fused_matmul_meta = self._parse_fused_matmul_name(name)
+    self.fused_matmul_meta = self._parse_fused_matmul_name(name) or self._parse_fused_matmul_tuple(matmul_meta)
     self.fused_matmul_hits = 0
     self.fused_matmul_fallbacks = 0
 
@@ -58,9 +66,37 @@ class RockchipProgram:
     if any(v < 0 for v in vals): return None
     return dict(zip(keys, vals))
 
+  def _parse_fused_matmul_tuple(self, vals:tuple[int, ...]|None) -> dict[str, int]|None:
+    if vals is None or len(vals) != 21 or any(v < 0 for v in vals): return None
+    keys = ["m", "n", "k", "batch", "a_bs", "b_bs", "c_bs", "a_ms", "a_ks", "b_ks", "b_ns", "c_ms", "c_ns",
+            "a_slot", "b_slot", "c_slot", "ta", "tb", "a_dt", "b_dt", "c_dt"]
+    return dict(zip(keys, vals))
+
+  def _parse_wmma_matmul_program(self, prg) -> tuple[tuple[int, ...]|None, list[tuple[Ops, DType, list[int], Any]]|None]:
+    if not isinstance(prg, list): return None, None
+    wmmas = [u for u in prg if u[0] is Ops.WMMA and isinstance(u[3], tuple) and len(u[3]) >= 2 and u[3][0] == "rockchip_matmul"]
+    if len(wmmas) != 1: return None, None
+    op, _, _, arg = wmmas[0]
+    if op is not Ops.WMMA or not isinstance(arg, tuple) or len(arg) < 2 or arg[0] != "rockchip_matmul": return None, None
+    return arg[1], None
+
+  def _print_uops(self, title:str, uops:list[tuple[Ops, DType, list[int], Any]], indent:str="") -> None:
+    print(f"{indent}{title}")
+    meta_keys = ["m", "n", "k", "batch", "a_bs", "b_bs", "c_bs", "a_ms", "a_ks", "b_ks", "b_ns", "c_ms", "c_ns",
+                 "a_slot", "b_slot", "c_slot", "ta", "tb", "a_dt", "b_dt", "c_dt"]
+    for i,(uop,dtype,srcs,arg) in enumerate(uops):
+      if uop is Ops.WMMA and isinstance(arg, tuple) and len(arg) > 1 and arg[0] == "rockchip_matmul":
+        print(f"{indent}{i} {uop} {dtype} srcs={srcs}")
+        print(f"{indent}  arg: {arg[0]}")
+        print(f"{indent}  meta:")
+        for k,v in zip(meta_keys, arg[1]): print(f"{indent}    {k}: {v}")
+      else:
+        print(f"{indent}{i} {uop} {dtype} arg={arg} srcs={srcs}")
+
   def _dtype_from_code(self, code:int):
     if code == 0: return np.float16
     if code == 1: return np.float32
+    if code == 2: return np.int32
     raise RuntimeError(f"dtype_code_{code}")
 
   def _conv_params(self, in_channels:int, out_channels:int, spatial:int) -> dict[str, int|bool]:
@@ -181,7 +217,8 @@ class RockchipProgram:
       in_pack[:, :wmma_meta["k"]] = a_matrix
       wt_pack[:wmma_meta["n"], :wmma_meta["k"]] = b_matrix.T
       in_pack = in_pack.reshape(-1)
-      wt_pack = wt_pack.reshape(-1)
+      wt_pack = wt_pack.reshape(wmma_meta["align_out"] // 16, 16, wmma_meta["align_in"] // 32, 32)
+      wt_pack = wt_pack.transpose(0, 2, 1, 3).reshape(-1)
     src = memoryview(bytearray(in_pack.tobytes()))
     src2 = memoryview(bytearray(wt_pack.tobytes()))
     self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
@@ -194,6 +231,22 @@ class RockchipProgram:
     try:
       ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
       ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+      if getenv("ROCKCHIP_PRINT_PACKED", 0):
+        def fmt(v):
+          if v == 0: return "      0 "
+          fv = np.frombuffer(np.array([v], dtype=np.uint16).tobytes(), dtype=np.float16)[0]
+          return f"0x{v:04x}={fv:>5.2f}"
+        input_packed = np.frombuffer(ctypes.string_at(self.input_buf.va_addr, src.nbytes), dtype=np.uint16)
+        weight_packed = np.frombuffer(ctypes.string_at(self.weight_buf.va_addr, src2.nbytes), dtype=np.uint16)
+        print(f"{'idx':>4} | {'input':<14} | {'weight':<14}")
+        print(f"{'-'*4}-+-{'-'*14}-+-{'-'*14}")
+        for i in range(max(len(input_packed), len(weight_packed))):
+          iv = input_packed[i] if i < len(input_packed) else 0
+          wv = weight_packed[i] if i < len(weight_packed) else 0
+          if iv == 0 and wv == 0: continue
+          is_ = fmt(iv) if i < len(input_packed) else "-" * 14
+          ws = fmt(wv) if i < len(weight_packed) else "-" * 14
+          print(f"{i:4d} | {is_:<14} | {ws:<14}")
       self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
       self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
       self.q, self.lut_enable = [], False
@@ -817,6 +870,9 @@ class RockchipProgram:
       self._run_elementwise(op, size, out_slot, lhs_slot, rhs_slot, bufs)
       return time.perf_counter() - st
     if self.fused_matmul_meta is not None:
+      if DEBUG >= 7: self._print_uops("ROCKCHIP rewritten uops:", self.uops)
+      if DEBUG >= 7 and self.uops:
+        print("ROCKCHIP_RENDERER_MATMUL executes Ops.WMMA with CNA/CMAC:")
       try:
         self._run_fused_matmul(bufs)
         self.fused_matmul_hits += 1
@@ -824,6 +880,8 @@ class RockchipProgram:
       except Exception as e:
         reason = str(e)
         self.fused_matmul_fallbacks += 1
+        if self.fused_matmul_fallback_uops is not None: self.uops = self.fused_matmul_fallback_uops
+        elif any(uop is Ops.WMMA for uop,_,_,_ in self.uops): raise
     if self.conv_meta is not None:
       out_slot, in_slot, weight_slot, in_channels, out_channels, spatial = self.conv_meta
       self._run_conv1x1(out_slot, in_slot, weight_slot, in_channels, out_channels, spatial, bufs)
@@ -1173,6 +1231,223 @@ class RockchipRenderer(Renderer):
      lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
+  matmul_store_matcher = PatternMatcher([
+    (UPat(Ops.STORE, name="st", src=(UPat(Ops.INDEX, name="out_idx"), UPat(Ops.ADD, name="add"))),
+     lambda st,out_idx,add: (st, out_idx, add)),
+    (UPat(Ops.STORE, name="st", src=(UPat(Ops.INDEX, name="out_idx"), UPat(Ops.CAST, src=(UPat(Ops.ADD, name="add"),)))),
+     lambda st,out_idx,add: (st, out_idx, add)),
+    (UPat(Ops.STORE, name="st", src=(UPat(Ops.INDEX, name="out_idx"), UPat(Ops.CAST, src=(UPat(Ops.CAST, src=(UPat(Ops.ADD, name="add"),)))))),
+     lambda st,out_idx,add: (st, out_idx, add)),
+  ])
+  def _matmul_meta(self, uops:list[UOp]):
+    if os.getenv("ROCKCHIP_RENDERER_MATMUL", "1") == "0": return None
+    def strip_cast(x:UOp) -> UOp:
+      while x.op is Ops.CAST: x = x.src[0]
+      return x
+
+    dtype_code = {dtypes.half:0, dtypes.float:1, dtypes.int:2}
+    params = {u.arg:u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+
+    def valid_from_buffer_sizes() -> tuple[int, ...]|None:
+      if len(params) != 3 or not any(u.op is Ops.MUL for u in uops) or not any(u.op is Ops.ADD for u in uops): return None
+      store_slots = set()
+      out_store_count = 0
+      for u in uops:
+        if u.op is not Ops.STORE: continue
+        idx = strip_cast(u.src[0])
+        if idx.op is Ops.INDEX and len(idx.src) == 2 and idx.src[0].op is Ops.PARAM:
+          store_slots.add(int(idx.src[0].arg))
+          out_store_count += 1
+      if out_store_count <= 1: return None
+      if len(store_slots) != 1: return None
+      c_slot = next(iter(store_slots))
+      in_slots = sorted(x for x in params if x != c_slot)
+      if len(in_slots) != 2: return None
+      a_slot, b_slot = in_slots
+      a_param, b_param, c_param = params[a_slot], params[b_slot], params[c_slot]
+      a_dt, b_dt, c_dt = (dtype_code.get(x.dtype.base.scalar()) for x in (a_param, b_param, c_param))
+      if a_dt is None or b_dt is None or c_dt is None: return None
+      a_size, b_size, c_size = a_param.dtype.size, b_param.dtype.size, c_param.dtype.size
+      if min(a_size, b_size, c_size) <= 0 or (a_size*c_size) % b_size or (a_size*b_size) % c_size or (b_size*c_size) % a_size: return None
+      m2, k2, n2 = (a_size*c_size)//b_size, (a_size*b_size)//c_size, (b_size*c_size)//a_size
+      m, k, n = math.isqrt(m2), math.isqrt(k2), math.isqrt(n2)
+      if m*m != m2 or k*k != k2 or n*n != n2 or (a_size, b_size, c_size) != (m*k, k*n, m*n): return None
+      return (m, n, k, 1, m*k, k*n, m*n, k, 1, n, 1, n, 1, a_slot, b_slot, c_slot, 0, 0, a_dt, b_dt, c_dt)
+
+    if (size_meta:=valid_from_buffer_sizes()) is not None: return size_meta
+
+    def valid_from_stack(stk:UOp, c_slot:int) -> tuple[int, ...]|None:
+      # BEAM vec(N) STACK output: e.g. 32x32 with K=2 produces STACK(4) of CAST(ADD).
+      if stk.op is not Ops.STACK or not stk.src: return None
+      vec_width = len(stk.src)
+      if vec_width not in (2, 4, 8): return None
+      elems = [strip_cast(s) for s in stk.src]
+      if any(e.op is not Ops.ADD for e in elems): return None
+      def fa(x):
+        while x.op is Ops.CAST: x = x.src[0]
+        if x.op is Ops.ADD:
+          out = []
+          for s in x.src: out.extend(fa(s))
+          return out
+        return [x]
+      term_lists = [fa(e) for e in elems]
+      if any(not tl or any(strip_cast(t).op is not Ops.MUL for t in tl) for tl in term_lists): return None
+      Ks = [len(tl) for tl in term_lists]
+      if len(set(Ks)) != 1: return None
+      K = Ks[0]
+      c_param = params.get(c_slot)
+      if c_param is None: return None
+      c_size = c_param.dtype.size
+      slot_set: set[int] = set()
+      for tl in term_lists:
+        for term in tl:
+          mul = strip_cast(term)
+          for src in mul.src:
+            x = src
+            while x.op is Ops.CAST: x = x.src[0]
+            if x.op is Ops.GEP and isinstance(x.arg, tuple) and len(x.arg) == 1: x = x.src[0]
+            while x.op is Ops.CAST: x = x.src[0]
+            if x.op is not Ops.LOAD: return None
+            idx = x.src[0]
+            while idx.op is Ops.CAST: idx = idx.src[0]
+            if idx.op is not Ops.INDEX or len(idx.src) != 2 or idx.src[0].op is not Ops.PARAM: return None
+            slot_set.add(int(idx.src[0].arg))
+      if len(slot_set) != 2: return None
+      a_slot, b_slot = sorted(slot_set)
+      a_param, b_param = params.get(a_slot), params.get(b_slot)
+      if a_param is None or b_param is None: return None
+      a_dt = dtype_code.get(a_param.dtype.base.scalar())
+      b_dt = dtype_code.get(b_param.dtype.base.scalar())
+      c_dt = dtype_code.get(c_param.dtype.base.scalar())
+      if a_dt is None or b_dt is None or c_dt is None: return None
+      a_size, b_size = a_param.dtype.size, b_param.dtype.size
+      if a_size % K or b_size % K: return None
+      M, N = a_size // K, b_size // K
+      if M <= 0 or N <= 0 or M * N != c_size: return None
+      return (M, N, K, 1, M*K, K*N, M*N, K, 1, N, 1, N, 1, a_slot, b_slot, c_slot, 0, 0, a_dt, b_dt, c_dt)
+
+    store_matches: list[tuple[UOp, UOp, UOp]] = []
+    for u in uops:
+      if u.op is not Ops.STORE: continue
+      idx, val = u.src
+      while idx.op is Ops.CAST and idx.src: idx = idx.src[0]
+      if val.op is Ops.STACK and val.src and idx.op is Ops.INDEX and len(idx.src) == 2 and idx.src[0].op is Ops.PARAM:
+        if (sm := valid_from_stack(val, int(idx.src[0].arg))) is not None: return sm
+      while val.op in (Ops.CAST, Ops.STACK) and val.src: val = val.src[0]
+      m = self.matmul_store_matcher.rewrite(u.replace(src=(idx, val)))
+      if m is not None: store_matches.append(m)
+    if len(store_matches) != 1: return valid_from_buffer_sizes()
+
+    def flatten_add(x:UOp) -> list[UOp]:
+      x = strip_cast(x)
+      return flatten([flatten_add(y) for y in x.src]) if x.op is Ops.ADD else [x]
+
+    def idx_expr(x:UOp) -> UOp:
+      try: return x.get_idx()
+      except Exception: return x
+
+    def merge_coeff(a:dict[UOp, int], b:dict[UOp, int], scale:int=1) -> dict[UOp, int]:
+      ret = dict(a)
+      for k,v in b.items(): ret[k] = ret.get(k, 0) + v * scale
+      return {k:v for k,v in ret.items() if v != 0}
+
+    def affine(x:UOp) -> tuple[dict[UOp, int], int]|None:
+      x = strip_cast(x)
+      if x.op is Ops.CONST: return {}, int(x.arg)
+      if x.op in (Ops.SPECIAL, Ops.RANGE): return {x:1}, 0
+      if x.op is Ops.ADD:
+        a, b = affine(x.src[0]), affine(x.src[1])
+        if a is None or b is None: return None
+        return merge_coeff(a[0], b[0]), a[1] + b[1]
+      if x.op is Ops.MUL:
+        lhs, rhs = strip_cast(x.src[0]), strip_cast(x.src[1])
+        if lhs.op is Ops.CONST and (r:=affine(rhs)) is not None:
+          return {k:v*int(lhs.arg) for k,v in r[0].items()}, r[1]*int(lhs.arg)
+        if rhs.op is Ops.CONST and (l:=affine(lhs)) is not None:
+          return {k:v*int(rhs.arg) for k,v in l[0].items()}, l[1]*int(rhs.arg)
+      if x.op is Ops.SHL and strip_cast(x.src[1]).op is Ops.CONST and (l:=affine(x.src[0])) is not None:
+        scale = 1 << int(strip_cast(x.src[1]).arg)
+        return {k:v*scale for k,v in l[0].items()}, l[1]*scale
+      return None
+
+    def load_index(x:UOp) -> tuple[UOp, UOp]|None:
+      x = strip_cast(x)
+      lane = 0
+      if x.op is Ops.GEP and isinstance(x.arg, tuple) and len(x.arg) == 1:
+        lane, x = int(x.arg[0]), strip_cast(x.src[0])
+      if x.op is not Ops.LOAD: return None
+      idx = strip_cast(x.src[0])
+      if idx.op is not Ops.INDEX or len(idx.src) != 2 or idx.src[0].op is not Ops.PARAM: return None
+      return (idx.src[0], idx.src[1] if lane == 0 else idx.src[1].alu(Ops.ADD, UOp.const(idx.src[1].dtype, lane)))
+
+    store, out_idx, store_val = store_matches[0]
+    out_idx = strip_cast(out_idx)
+    if out_idx.op is not Ops.INDEX or len(out_idx.src) != 2 or out_idx.src[0].op is not Ops.PARAM: return None
+    terms = flatten_add(store_val)
+    if not terms or any(strip_cast(t).op is not Ops.MUL for t in terms): return None
+
+    loads:list[tuple[tuple[UOp, UOp], tuple[UOp, UOp]]] = []
+    for term in terms:
+      mul = strip_cast(term)
+      lhs, rhs = load_index(mul.src[0]), load_index(mul.src[1])
+      if lhs is None or rhs is None: return None
+      loads.append((lhs, rhs))
+
+    c_param = out_idx.src[0]
+    input_slots = sorted({int(p.arg) for pair in loads for p,_ in pair if p is not c_param})
+    if len(input_slots) != 2 or int(c_param.arg) not in params: return None
+    c_dt = dtype_code.get(c_param.dtype.base.scalar())
+    if c_dt is None: return None
+    K = len(terms)
+
+    c_aff = affine(idx_expr(out_idx.src[1]))
+    if c_aff is None or c_aff[1] != 0: return None
+    c_coeff = c_aff[0]
+
+    def coeff_eq(got:dict[UOp, int], want:dict[UOp|None, int]) -> bool:
+      return got == {k:v for k,v in want.items() if k is not None and v != 0}
+
+    def valid_for(a_slot:int, b_slot:int) -> tuple[int, ...]|None:
+      a_param, b_param = params.get(a_slot), params.get(b_slot)
+      if a_param is None or b_param is None: return None
+      a_dt, b_dt = dtype_code.get(a_param.dtype.base.scalar()), dtype_code.get(b_param.dtype.base.scalar())
+      if a_dt is None or b_dt is None or a_param.dtype.size % K or b_param.dtype.size % K: return None
+      M, N = a_param.dtype.size // K, b_param.dtype.size // K
+      if M <= 0 or N <= 0 or c_param.dtype.size != M*N: return None
+
+      m_var = n_var = None
+      if M > 1:
+        m_vars = [v for v,c in c_coeff.items() if c == N]
+        if len(m_vars) != 1: return None
+        m_var = m_vars[0]
+      if N > 1:
+        n_vars = [v for v,c in c_coeff.items() if c == 1 and v is not m_var]
+        if len(n_vars) != 1: return None
+        n_var = n_vars[0]
+      if not coeff_eq(c_coeff, {m_var:N, n_var:1}): return None
+
+      for ta, tb in itertools.product((0, 1), repeat=2):
+        seen:set[int] = set()
+        for pair in loads:
+          by_slot = {int(p.arg):(p, ix) for p,ix in pair}
+          if set(by_slot) != {a_slot, b_slot}: break
+          a_aff, b_aff = affine(idx_expr(by_slot[a_slot][1])), affine(idx_expr(by_slot[b_slot][1]))
+          if a_aff is None or b_aff is None: break
+          matches = []
+          for kk in range(K):
+            a_coeff, a_const = ({m_var:K}, kk) if ta == 0 else ({m_var:1}, kk*M)
+            b_coeff, b_const = ({n_var:1}, kk*N) if tb == 0 else ({n_var:K}, kk)
+            if coeff_eq(a_aff[0], a_coeff) and a_aff[1] == a_const and coeff_eq(b_aff[0], b_coeff) and b_aff[1] == b_const:
+              matches.append(kk)
+          if len(matches) != 1 or matches[0] in seen: break
+          seen.add(matches[0])
+        if len(seen) == K:
+          return (M, N, K, 1, M*K, K*N, M*N, (1 if ta else K), (M if ta else 1), (1 if tb else N),
+                  (K if tb else 1), N, 1, a_slot, b_slot, int(c_param.arg), ta, tb, a_dt, b_dt, c_dt)
+      return None
+
+    return valid_for(input_slots[0], input_slots[1]) or valid_for(input_slots[1], input_slots[0]) or valid_from_buffer_sizes()
+
   def _elementwise_meta(self, uops:list[UOp]):
     params = [(i,u) for i,u in enumerate(uops) if u.op is Ops.PARAM]
     if len(params) != 3 or any(not isinstance(u.dtype, PtrDType) or u.dtype.base.scalar() is not dtypes.half for _,u in params): return None
@@ -1223,11 +1498,27 @@ class RockchipRenderer(Renderer):
     return (params[0][1].arg, params[1][1].arg, params[2][1].arg, in_channels, out_channels, spatial)
 
   def render(self, uops:list[UOp]) -> str:
-    if (ew_meta:=self._elementwise_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("elementwise", *ew_meta))).decode()
-    if (conv_meta:=self._conv1x1_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("conv1x1", *conv_meta))).decode()
     # the value of SPECIAL comes from local/global_size, not form its source
     uop_to_idx = {u:i for i,u in enumerate(uops)}
     lops = [(u.op, u.dtype, ([] if u.op is Ops.SPECIAL else [uop_to_idx[v] for v in u.src]), u.arg) for u in uops]
+    if (matmul_meta:=self._matmul_meta(uops)) is not None:
+      params = {u.arg:u for u in uops if u.op is Ops.PARAM}
+      a_slot, b_slot, c_slot = matmul_meta[13], matmul_meta[14], matmul_meta[15]
+      param_slots = sorted({a_slot, b_slot, c_slot})
+      wlops:list[tuple[Ops, DType, list[int], Any]] = []
+      slot_to_idx:dict[int, int] = {}
+      for slot in param_slots:
+        if slot not in params: return base64.b64encode(pickle.dumps(lops)).decode()
+        slot_to_idx[slot] = len(wlops)
+        wlops.append((Ops.PARAM, params[slot].dtype, [], slot))
+      wmma_idx = len(wlops)
+      wmma_srcs = [slot_to_idx[a_slot], slot_to_idx[b_slot], slot_to_idx[c_slot]]
+      wlops.append((Ops.WMMA, dtypes.void, wmma_srcs, ("rockchip_matmul", matmul_meta)))
+      sink_arg = next((u.arg for u in uops if u.op is Ops.SINK), None)
+      wlops.append((Ops.SINK, dtypes.void, [wmma_idx], sink_arg))
+      return base64.b64encode(pickle.dumps(wlops)).decode()
+    if (ew_meta:=self._elementwise_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("elementwise", *ew_meta))).decode()
+    if (conv_meta:=self._conv1x1_meta(uops)) is not None: return base64.b64encode(pickle.dumps(("conv1x1", *conv_meta))).decode()
     return base64.b64encode(pickle.dumps(lops)).decode()
 
 class RockchipCompiler(Compiler):
