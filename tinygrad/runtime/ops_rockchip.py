@@ -1,0 +1,647 @@
+# pylint: disable=cell-var-from-loop
+# a python uops emulator
+# works to test the tensor cores, and all the uops in general
+# this is the (living) definition of uops
+from typing import Any, TYPE_CHECKING
+import pickle, base64, itertools, time, struct, sys, functools, ctypes, mmap, os, math, numpy as np
+from dataclasses import replace
+from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
+from tinygrad.helpers import all_same, getenv, flatten, get_single_element
+from tinygrad.device import Compiled, Compiler, Allocator
+from tinygrad.codegen.opt import tc
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, bitcast
+from tinygrad.renderer import Renderer
+from tinygrad.runtime.ops_python import storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar, _load, load, _store, generic_wmma_helper
+from tinygrad.runtime.support.hcq import HCQBuffer
+from tinygrad.runtime.support.hcq import FileIOInterface
+from tinygrad.runtime.autogen import rockchip as rk
+from tinygrad.uop.ops import PatternMatcher, UPat
+from tinygrad.helpers import mv_address, getenv
+
+def _load(m, i, dtype: DType):
+  if i is None: return 0.0
+  if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
+  return from_storage_scalar(m[i], dtype)
+
+def load(inp, j, dtype: DType):
+  if len(inp) >= 3: return [_load(m, x+j if x is not None else None, dtype) if gate else default for (m,x),default,gate in zip(*inp[:3])]
+  return [_load(m, x+j if x is not None else None, dtype) for m,x in inp[0]]
+
+def _store(m, i, v, dtype: DType):
+  if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
+  m[i] = to_storage_scalar(v, dtype)
+
+# here are the models for the WMMA instruction on the different hardware
+def generic_wmma_helper(inp, warp_size, WARP_THREADS, K, NUM_A, NUM_B, NUM_C, a_elem, b_elem, c_map):
+  for cc, tinp, num in zip(("A", "B", "C"), inp, (NUM_A, NUM_B, NUM_C)):
+    assert len(tinp) == num, f"{cc} must have {num} elements per thread, it has {len(tinp)}"
+    assert len(flatten(tinp)) == num * warp_size, f"WMMA must have {num * warp_size} total elements for {cc} in WMMA"
+  assert warp_size > 0 and warp_size % WARP_THREADS == 0, f"must have multiples of {WARP_THREADS} warp threads"
+  out = [inp[2][elem_idx][:] for elem_idx in range(NUM_C)]
+  for goff in range(0, warp_size, WARP_THREADS):
+    for lane_id in range(WARP_THREADS):
+      for elem_idx in range(NUM_C): # calculate new muls and add to acc
+        (c_i, c_j) = c_map(lane_id, elem_idx)
+        out[elem_idx][goff+lane_id] += sum(a_elem(inp[0], _k, c_j, goff) * b_elem(inp[1], c_i, _k, goff) for _k in range(K))
+  return out
+
+class RockchipProgram:
+  def __init__(self, dev:'RockchipDevice', name:str, lib:bytes,
+               runtimevars:dict[str, int]|None=None, **kwargs):
+    self.uops: list[UOp] = pickle.loads(lib)
+    self.uop_to_index: dict[UOp, int] = {u:i for i,u in enumerate(self.uops)}
+    self.loop_ends: dict[UOp, int] = {u.src[1]:i for i, u in enumerate(self.uops) if u.op == Ops.END}
+    self.runtimevars = runtimevars or {}
+    self.device = dev
+    self.q = []
+    self.hardware_ops = {Ops.SHL:0, Ops.TRUNC:0, Ops.CUSTOM:0, Ops.MUL:0, Ops.NEG:0, Ops.MAX:0, Ops.EXP2:0, Ops.CMPLT:0, Ops.CMPEQ:0, Ops.ADD:2, Ops.FDIV:3, Ops.SUB:4}
+    self.cmd_buf_size = 16384
+    self.exp2_inv_scale = 1.0
+    self.lut_size = 513
+  def check_lut_enable(self, op, arg):
+    return op in (Ops.EXP2, Ops.TRUNC) or (op is Ops.CUSTOM and arg == "silu")
+  def reg(self, val, shift, mask):
+    return ((val) << shift) & mask
+  def emit_raw(self, target, reg, value):
+    # Pack the values into a 64-bit integer as per hardware spec
+    target = target + 0x1
+    packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
+    self.q.append(packed_value)
+  def fill_lut(self, lut):
+    for table_id, base in ((0, 0), (1, self.lut_size)):
+      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG,
+          self.reg(1, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ACCESS_TYPE__MASK) |
+          self.reg(table_id, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_TABLE_ID__MASK) |
+          self.reg(0, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__SHIFT, rk.DPU_LUT_ACCESS_CFG_LUT_ADDR__MASK))
+      for i in range(self.lut_size):
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA,
+          self.reg(lut[base + i], rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__SHIFT, rk.DPU_LUT_ACCESS_DATA_LUT_ACCESS_DATA__MASK))
+
+  def boilerplate(self, op, size, arg):
+    if self.lut_enable:
+      lut = [0] * self.lut_size * 2
+      index_shift = 5
+      index_scale = 0.0
+      if op is Ops.EXP2:
+        x_min, x_max = -2.0, 2.0
+        step = (x_max - x_min) / (len(lut) - 1)
+        index_scale = (1 << index_shift) / step
+        
+        max_val = max(math.exp2(x_min), math.exp2(x_max))
+        self.inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
+        for i in range(len(lut)):
+          x = x_min + i * step
+          y = math.exp2(x) * self.inv_scale
+          q = int(math.floor((y + 1.0) * 2**14 + 0.5))
+          lut[i] = np.clip(q, 0, 32767)
+      elif op is Ops.CUSTOM and arg == "silu":
+        x_min, x_max = 0, 5.8
+        step = (x_max - x_min) / (self.lut_size - 1)
+        index_scale = (1 << index_shift) / step
+
+        max_val = max(x_min / (1.0 + math.exp(-x_min)), x_max / (1.0 + math.exp(-x_max)))
+        self.inv_scale = 1.0 / max_val if max_val > 1.0 else 1.0
+        for i in range(self.lut_size * 2):
+          x = (i - self.lut_size + (i < self.lut_size)) * step
+          y = x / (1.0 + math.exp(-x)) * self.inv_scale 
+          q = int(math.floor(y * (2**15 - 1) + 0.5)) if y >= 0.0 else int(math.ceil(y * (2**15 - 1) - 0.5))
+          lut[i] = np.clip(q, -32768, 32767)
+      elif op is Ops.TRUNC:
+        max_val = 1 << 14
+        for table_id in range(2):
+          base = table_id * self.lut_size
+          for i in range(self.lut_size):
+            lut[base + i] = 0 if (i % 2 == 0) else max_val
+      bn_mul_operand = int(np.float16(index_scale).view(np.int16)) if index_scale!=0 else 0x3C00
+
+      self.fill_lut(lut)
+      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_CFG,
+          self.reg(1, rk.DPU_LUT_CFG_LUT_HYBRID_PRIORITY__SHIFT, rk.DPU_LUT_CFG_LUT_HYBRID_PRIORITY__MASK) |
+          self.reg(1, rk.DPU_LUT_CFG_LUT_OFLOW_PRIORITY__SHIFT, rk.DPU_LUT_CFG_LUT_OFLOW_PRIORITY__MASK) |
+          self.reg(2, rk.DPU_LUT_CFG_LUT_LO_LE_MUX__SHIFT, rk.DPU_LUT_CFG_LUT_LO_LE_MUX__MASK))
+      index_select = 14 if op is Ops.TRUNC else 5
+      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_INFO,
+          self.reg(index_select, rk.DPU_LUT_INFO_LUT_LO_INDEX_SELECT__SHIFT, rk.DPU_LUT_INFO_LUT_LO_INDEX_SELECT__MASK) |
+          self.reg(index_select, rk.DPU_LUT_INFO_LUT_LE_INDEX_SELECT__SHIFT, rk.DPU_LUT_INFO_LUT_LE_INDEX_SELECT__MASK))
+      if op is Ops.TRUNC:
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_START,
+            self.reg(0x00000000, rk.DPU_LUT_LE_START_LUT_LE_START__SHIFT, rk.DPU_LUT_LE_START_LUT_LE_START__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_END,
+            self.reg(0x44000000, rk.DPU_LUT_LE_END_LUT_LE_END__SHIFT, rk.DPU_LUT_LE_END_LUT_LE_END__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_START,
+            self.reg(0x44000000, rk.DPU_LUT_LO_START_LUT_LO_START__SHIFT, rk.DPU_LUT_LO_START_LUT_LO_START__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_END,
+            self.reg(0x44800000, rk.DPU_LUT_LO_END_LUT_LO_END__SHIFT, rk.DPU_LUT_LO_END_LUT_LO_END__MASK))
+      else:
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_START,
+            self.reg(0xffffc000, rk.DPU_LUT_LE_START_LUT_LE_START__SHIFT, rk.DPU_LUT_LE_START_LUT_LE_START__MASK))
+        self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LO_END,
+            self.reg(0x00004000, rk.DPU_LUT_LO_END_LUT_LO_END__SHIFT, rk.DPU_LUT_LO_END_LUT_LO_END__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE,
+          self.reg(23107, rk.DPU_LUT_LE_SLOPE_SCALE_LUT_LE_SLOPE_UFLOW_SCALE__SHIFT,
+                  rk.DPU_LUT_LE_SLOPE_SCALE_LUT_LE_SLOPE_UFLOW_SCALE__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT,
+          self.reg(22, rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__SHIFT,
+                  rk.DPU_LUT_LE_SLOPE_SHIFT_LUT_LE_SLOPE_UFLOW_SHIFT__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(2, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+        self.reg(bn_mul_operand, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+      
+    elif op is Ops.CUSTOM and arg == "cmplt_diff2bool":
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+        self.reg(4, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK))
+      # DPU_BS perform ALU first then MUL
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_ALU_CFG,
+        self.reg(0x33800000, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__SHIFT, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
+        self.reg(0x4000, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_CFG,
+        self.reg(4, rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT, rk.DPU_BN_CFG_BN_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_RELUX_EN__SHIFT, rk.DPU_BN_CFG_BN_RELUX_EN__MASK) |
+        self.reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_MUL_CFG,
+        self.reg(0x7C00, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__SHIFT, rk.DPU_BN_MUL_CFG_BN_MUL_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE,
+        self.reg(0x3F800000, rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__SHIFT, rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__MASK))
+    elif op is Ops.CUSTOM and arg == "cmpeq_diff_zero_to_nan_to_32800":
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+        self.reg(2, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
+        self.reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
+        self.reg(0x7C00, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+        self.reg(1, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+    elif op is Ops.CUSTOM and arg == "cmpeq_32800_to_bool":
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
+        self.reg(4, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
+        self.reg(0, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_ALU_CFG,
+        self.reg(0x47001F00, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__SHIFT, rk.DPU_BS_ALU_CFG_BS_ALU_OPERAND__MASK))
+      self.emit_raw(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
+        self.reg(0x3C00, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT, rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__MASK))
+      # REG_DPU_OUT_CVT_SHIFT need manual reset to 0
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+        self.reg(0, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+    elif op is Ops.SHL:
+      self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
+        self.reg(-2, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT, rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__MASK))
+
+    burst_len = 15
+    output_mode  = 2
+    flying_mode = 1
+    channel = 7
+    dataout_height = 0
+    dataout_width = math.ceil(size / ((dataout_height+1) * (channel+1))) - 1
+
+    precision_float16 = 2
+
+    ew_cvt_type = 0
+    ew_data_mode = 1
+    ew_data_size = 2
+    ew_relu_bypass = arg != "relu"
+    ew_alu_algo = self.hardware_ops.get(op, 0)
+    ew_op_src = 1
+    erdma_data_size_16bit=2
+    if self.lut_enable: 
+      ew_data_mode = 0; ew_data_size = 0; ew_op_src = 0; 
+    
+    self.emit_raw(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
+        self.reg(burst_len, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+        self.reg(output_mode, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK) |
+        self.reg(flying_mode, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__MASK))
+
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+        self.reg(precision_float16, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+        self.reg(precision_float16, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+        self.reg(precision_float16, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+        self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+        self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+        self.reg(dataout_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+    self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
+        self.reg(ew_cvt_type, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
+        self.reg(ew_data_mode, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
+        self.reg(ew_data_size, rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+        self.reg(ew_alu_algo, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+        self.reg(op == Ops.MUL, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
+        self.reg(ew_relu_bypass, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+        self.reg(op in [Ops.MUL, Ops.FDIV] or self.lut_enable, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+        self.reg(self.lut_enable == False, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+        self.reg(ew_op_src, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
+        self.reg(self.lut_enable == True, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+        self.reg(arg in ["cmplt_diff2bool", "cmpeq_diff_zero_to_nan_to_32800", "cmpeq_32800_to_bool"], rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK) 
+      )
+    # 0 or 1 both passed test_div, do not emit OUT_CVT_SCALE for other ops
+    self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK)) if op == Ops.FDIV else None
+
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
+        self.reg(dataout_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,
+        self.reg(dataout_height, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
+        self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
+        self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
+        self.reg(erdma_data_size_16bit, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
+
+  def submit(self, uop):
+    # TODO fix special if, maybe MUL output defaulted as fp32 amd need FP16TOFP32
+    if uop != Ops.FDIV: 
+      # EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION(2) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION(2) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN(1) | DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE(1));
+      self.q.append(0x2001000178495044), 
+    self.q.append(0x0081000000180008), # EMIT(REG_PC_OPERATION_ENABLE, PC_OPERATION_ENABLE_RESERVED_0(12))
+    tasks = ctypes.cast(self.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
+    assert len(self.q) <= self.cmd_buf_size
+    regcmd = ctypes.cast(self.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * self.cmd_buf_size)).contents
+    for i in range(len(self.q)):
+      regcmd[i] = self.q[i]
+
+    tasks[0].flags  = 0
+    tasks[0].op_idx = 4
+    tasks[0].enable_mask = 0x18
+    tasks[0].int_mask = 0x300
+    tasks[0].int_clear = 0x1ffff
+    tasks[0].int_status = 0
+    tasks[0].regcfg_amount = len(self.q)
+    tasks[0].regcfg_offset = 0
+    tasks[0].regcmd_addr = self.cmd_buf.meta.dma_addr
+
+    # TODO: update parameter name as driver updated
+    submit_res = rk.struct_rknpu_submit(
+            flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
+            timeout=6000,
+            task_start=0,
+            task_number=1,
+            task_counter=0,
+            priority=0,
+            task_obj_addr=self.task_buf.meta.obj_addr,   # Placeholder, would be actual address in real code
+            regcfg_obj_addr=0,
+            task_base_addr=0,
+            user_data=0,
+            core_mask=1,
+            fence_fd=-1,
+            subcore_task=(rk.struct_rknpu_subcore_task * 5)(
+                rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+                rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
+                rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
+            )
+    )
+    res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,__payload=submit_res)
+    # os.system("cd ~/npu/ops_reg/ && python dump.py 5")
+    # print(res)
+
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    self.device.reset_npu()
+    st = time.perf_counter()
+    warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
+    warp_size = len(warp)
+    void_ops = {Ops.END, Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.STORE}
+    for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
+      values: dict[UOp, Any] = {}
+      pbufs: list[memoryview] = list(bufs)
+      pvals: list[int] = list(vals)
+      exec_masks = [[True] * warp_size]
+      i = 0
+      while i < len(self.uops):
+        u = self.uops[i]
+        src_values = [values[v] for v in u.src if v.op not in void_ops]
+        src_dtypes = [v.dtype for v in u.src if v.op not in void_ops]
+        if getenv("TRACE"): print(i, u.op, u.dtype, u.arg, src_values, src_dtypes)
+        if u.op is Ops.END:
+          i = self.uop_to_index[u.src[1]]
+          continue
+        if u.op is Ops.IF:
+          exec_masks.append([x and y for x,y in zip(exec_masks[-1], src_values[0])])
+          i += 1
+          continue
+        if u.op is Ops.ENDIF:
+          exec_masks.pop()
+          i += 1
+          continue
+        if u.op in (Ops.BARRIER, Ops.SINK, Ops.NOOP, Ops.GROUP):
+          # in the python emulator, the warp is always in sync
+          i += 1
+          continue
+        assert u.dtype is not None, f"{u.op} is missing a dtype"
+        if u.op is Ops.STORE:
+          assert len(src_values) == 2, f"STORE must be lowered to 2 srcs, got {len(src_values)}"
+          store_gate = exec_masks[-1]
+          for j,val in enumerate(src_values[1] if u.max_numel() > 1 else [src_values[1]]):
+            for (m,o),v,g in zip(src_values[0], val, store_gate):
+              if g: _store(m, o+j, v, src_dtypes[1].scalar())
+          i += 1
+          continue
+        if u.op is Ops.AFTER: values[u] = src_values[0]
+        elif u.op in {Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
+          storage_fmt = storage_fmt_for_dtype(u.dtype.base.scalar())
+          if storage_fmt is None: raise RuntimeError(f"dtype={u.dtype} is not supported")
+          if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
+          if u.op is Ops.DEFINE_REG:
+            # REGs are per thread
+            values[u] = [memoryview(bytearray(u.max_numel()*u.dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
+          else:
+            buf = memoryview(bytearray(u.max_numel()*u.dtype.itemsize)) if u.op is not Ops.PARAM else pbufs.pop(0)
+            values[u] = [buf.cast(storage_fmt)] * warp_size
+        elif u.op is Ops.DEFINE_VAR:
+          values[u] = [pvals.pop(0)] * warp_size
+        elif u.op is Ops.SPECIAL:
+          if u.arg[0] == 'g': values[u] = [idxs[2-int(u.arg[-1])]] * warp_size
+          elif u.arg[0] == 'l': values[u] = [x[2-int(u.arg[-1])] for x in warp]
+        elif u.op is Ops.CONST: values[u] = [u.arg] * warp_size
+        elif u.op is Ops.INDEX:
+          ret:list = []
+          if isinstance(src_dtypes[0], ImageDType):
+            assert len(src_values) == 3, "image index must be 3 srcs"
+            for m,oy,ox in zip(*src_values):
+              if ox < 0 or ox >= src_dtypes[0].shape[1] or oy < 0 or oy >= src_dtypes[0].shape[0]: ret.append((m, None))
+              else: ret.append((m, ox*4 + oy*src_dtypes[0].shape[1]*4))
+          else:
+            assert len(src_values) == 2, "non-image index must be 2 srcs"
+            for m,o in zip(*src_values): ret.append((m,o))
+          values[u] = ret
+        elif u.op is Ops.CAST and isinstance(u.dtype, PtrDType):
+          values[u] = src_values[0]
+        elif u.op is Ops.RANGE:
+          if u not in values: values[u] = [0] * warp_size
+          else:
+            for j in range(len(values[u])):
+              values[u][j] += 1
+          if values[u][0] == src_values[0][0]:
+            del values[u]
+            i = self.loop_ends[u] + 1
+            continue
+        elif u.op is Ops.STACK: values[u] = src_values
+        elif u.op is Ops.BITCAST: values[u] = [bitcast(x, src_dtypes[0], u.dtype) for x in src_values[0]]
+        elif u.op is Ops.CAST:
+          values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+        elif u.op is Ops.LOAD:
+          if (load_sz := u.max_numel()) > 1:
+            # buf and gate are not vecs
+            values[u] = [load([src_values[k] if k in [0,2] else src_values[k][j] \
+                               for k in range(len(src_values))], j, u.dtype.scalar()) for j in range(load_sz)]
+          else:
+            values[u] = load(src_values, 0, u.dtype)
+        elif u.op is Ops.GEP: values[u] = src_values[0][get_single_element(u.arg)]
+        elif u.op is Ops.WMMA:
+          first_src_dtype = u.src[0].dtype
+          assert isinstance(first_src_dtype, DType) # mypy
+          dims, dtype_in, device, threads = u.arg[1], first_src_dtype.scalar(), u.arg[4], u.arg[5]
+          wmma_helper = functools.partial(generic_wmma_helper, src_values, warp_size)
+          # TODO: refactor these to a shared TensorCoreLayout
+          if device == "METAL":
+            # A (2 elements on 32 threads): row major
+            def a_b_elem(x, i, j, goff): return x[(i%2)][goff+(i//2)%2+(j%4)*2+(i//4)*8+(j//4)*16]
+            # (i, j), C, D (2 elements on 32 threads): row major same as A/B
+            def c_map(lane, elem): return (elem + ((lane%2)*2) + ((lane//8)%2)*4, ((lane//2)%4) + (lane//16)*4)
+            values[u] = wmma_helper(32, 8, 2, 2, 2, a_b_elem, a_b_elem, c_map)
+          elif device == "AMD" and threads == 64:
+            def a_elem(x, k, row, goff): return x[k%(dims[2]//4)][goff + (k//(dims[2]//4))*16 + row]
+            def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)  # pylint: disable=arguments-out-of-order
+            def c_map(lane, elem): return (lane%16, (lane//16)*4 + elem)
+            values[u] = wmma_helper(64, dims[2], len(src_values[0]), len(src_values[1]), len(src_values[2]), a_elem, b_elem, c_map)
+          elif device == "AMD" and len(src_values[0]) == 8: # RDNA4
+            def a_elem(x, k, row, goff): return x[k - [0, 4, 4, 8][k//4]][goff + row + [0, 16, 0, 16][k//4]]
+            def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)
+            def c_map(lane, elem): return (lane%16, (lane//16)*8 + elem)
+            values[u] = wmma_helper(32, 16, 8, 8, 8, a_elem, b_elem, c_map)
+          elif device == "AMD":
+            # A (16 elements on 32 threads): col major, lane 16-32 == lane 0-15
+            def a_elem(x, k, row, goff):
+              assert x[k][goff+row] == x[k][goff+row+16], "warp elements not duplicated properly across lanes"
+              return x[k][goff+row]
+            # B (16 elements on 32 threads): row major, lane 16-32 == lane 0-15
+            def b_elem(x, col, k, goff): return a_elem(x, k, col, goff)  # pylint: disable=arguments-out-of-order
+            def c_map(lane, elem): return (lane%16, lane//16+elem*2) # (i, j), C, D (8 elements on 32 threads): row major
+            values[u] = wmma_helper(32, 16, 16, 16, 8, a_elem, b_elem, c_map)
+          elif device == "CUDA":
+            # (col, row) given (lane, elem) for C & D (4 elements on 32 threads); shared by all tc shapes with M=16 N=8
+            def c_map(lane, elem): return (elem%2 + (lane%4)*2, lane//4 + (elem//2)*8)
+
+            if dims == (8,16,16):
+              def a_elem(x, k, row, goff): return x[k%2 + (row//8)*2 + (k//8)*4][goff + (k//2)%4 + (row%8)*4]
+              def b_elem(x, col, k, goff): return x[k%2 + (k//8)*2][goff + (k//2)%4 + col*4]
+              values[u] = wmma_helper(32, 16, 8, 4, 4, a_elem, b_elem, c_map)
+
+            elif dims == (8,16,32):
+              def a_elem(x, k, row, goff): return x[k%4 + (row//8)*4 + (k//16)*8][goff + (k//4)%4 + (row%8)*4]
+              def b_elem(x, col, k, goff): return x[k%4 + (k//16)*4][goff + (k//4)%4  + col*4]
+              values[u] = wmma_helper(32, 32, 16, 8, 4, a_elem, b_elem, c_map)
+
+            elif dims == (8,16,8) and dtype_in == dtypes.half:
+              def a_elem(x, k, row, goff): return x[k%2 + (row//8)*2][goff + k//2 + (row%8)*4]
+              def b_elem(x, col, k, goff): return x[k%2][goff + k//2 + col*4]
+              values[u] = wmma_helper(32, 8, 4, 2, 4, a_elem, b_elem, c_map)
+
+            elif dims == (8,16,8) and dtype_in == dtypes.float:
+              def a_elem(x, k, row, goff): return x[(k//4)*2 + row//8][goff + k%4 + (row%8)*4]
+              def b_elem(x, col, k, goff): return x[k//4][goff + k%4 + col*4]
+              values[u] = wmma_helper(32, 8, 4, 2, 4, a_elem, b_elem, c_map)
+
+            else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
+          else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
+        elif u.op is Ops.CUSTOM or u.op in GroupOp.ALU:
+          assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
+          assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {u.op}"
+          eff_op = u.op
+          if u.op is Ops.CMPLT or (u.op in self.hardware_ops and u.dtype.scalar() in [dtypes.float16]):
+            self.device.reset_npu()
+            self.q = []
+            self.lut_enable = self.check_lut_enable(eff_op, u.arg)
+            if len(src_values)==1:
+              if u.op is Ops.NEG:
+                src_values.append([-1]*len(src_values[0]))
+                eff_op = Ops.MUL
+              else:
+                src_values.append(src_values[0])
+                eff_op = u.op
+            self.boilerplate(op=eff_op, size=len(src_values[0]), arg=u.arg)
+
+            src = memoryview(bytearray(np.asarray(src_values[0], dtype=np.float16).tobytes()))
+            src2 = memoryview(bytearray(np.asarray(src_values[1], dtype=np.float16).tobytes()))
+            self.task_buf = self.device._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task_buf")
+            self.cmd_buf = self.device._gpu_alloc(self.cmd_buf_size, 0, name="cmd_buf")
+            self.input_buf = self.device._gpu_alloc(src.nbytes, 0, name="input")
+            self.weight_buf = self.device._gpu_alloc(src2.nbytes, 0, name="weight")
+            self.output_buf = self.device._gpu_alloc(src.nbytes, 0, name="output")
+            try:
+              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              self.device._gpu_sync(self.input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+              self.device._gpu_sync(self.weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+
+              self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+                  self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT,
+                            rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+                self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT,
+                          rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+                self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT,
+                          rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+
+              self.submit(eff_op)
+              self.device._gpu_sync(self.output_buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+
+              dst = memoryview(bytearray(self.output_buf.size))
+              ctypes.memmove(mv_address(dst), self.output_buf.va_addr, self.output_buf.size)
+              if getenv("TRACE"):  print(dst.tobytes().hex())
+              # fp16 2B, self.output_buf.size//2
+              result = struct.unpack(f'<{self.output_buf.size//2}e', dst.tobytes())
+              if self.lut_enable:
+                raw = np.rint(np.array(result, dtype=np.float32))
+                # q14 decode
+                if eff_op is Ops.EXP2:
+                  result = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
+                elif u.arg == "silu":
+                  result = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
+              values[u] = list(result)
+              if getenv("TRACE"):  print('src', src_values[0])
+              if getenv("TRACE"):  print('src2', src_values[1])
+              if getenv("TRACE"):  print('result', values[u])
+              try:
+                if getenv("TRACE"): print('expected', [exec_alu(eff_op, u.dtype, p) for p in zip(*src_values)])
+              except: pass
+            finally:
+              self.device._gpu_free_multiple([self.task_buf, self.cmd_buf, self.input_buf, self.weight_buf, self.output_buf])
+          else:
+            allow_fallback = u.op in (Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR)
+            if allow_fallback:
+              print('ALLOWED FALLBACK TO CPU', u.op, u.dtype)
+              values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
+            else:
+              print('<!> EXIT OPERATION NOT SUPPORTED', u.op, u.dtype, src_values)
+              if getenv("TRACE"): print('expected', [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)])
+        assert u in values, (u.op, u.dtype, u.src, u.arg)
+        i += 1
+    return time.perf_counter() - st
+  
+def _rk_shift_to_muldiv(x, op):
+  vmax = max(abs(x.src[0].vmin), abs(x.src[0].vmax))
+  smin, smax = x.src[1].vmin, x.src[1].vmax
+  if not all(math.isfinite(v) for v in (vmax, smin, smax)): return None
+  if smin < 0: return None
+  smax_i = int(smax)
+  if smax_i != smax or smax_i > 15: return None
+  if vmax > 65504: return None
+  if x.op is Ops.SHL and vmax * (1 << smax_i) > 65504: return None
+  pow2 = x.src[1].cast(dtypes.float16).exp2()
+  return x.src[0].cast(dtypes.float16).alu(op, pow2).cast(x.dtype)
+
+class RockchipCompiler(Compiler):
+  def compile(self, src:str) -> bytes: return base64.b64decode(src)
+
+class RockchipRenderer(Renderer):
+  device = "ROCKCHIP"
+  has_threads = False
+  code_for_op = {k:v for k,v in python_alu.items() if k not in [Ops.MULACC, Ops.RECIPROCAL, Ops.CMPNE]} | {Ops.FDIV: 0}
+  # hacks, turned unsupported dtype to half and lut function to Ops.CUSTOM
+  compiler = RockchipCompiler()
+
+  def _rk_trunc_fix(x):
+    if x.tag == "rk_trunc": return None
+    xh = x.src[0].cast(dtypes.half)
+    zero = UOp.const(dtypes.half, 0)
+    neg = xh.alu(Ops.CMPLT, zero)
+    shifted = xh.alu(Ops.SUB, UOp.const(dtypes.half, 0.49951171875))
+    absx = UOp(Ops.WHERE, dtypes.half, src=(shifted.alu(Ops.CMPLT, zero), shifted.alu(Ops.NEG), shifted))
+    mag = absx.alu(Ops.TRUNC).rtag("rk_trunc")
+    signed = UOp(Ops.WHERE, dtypes.half, src=(neg, mag.alu(Ops.NEG).alu(Ops.ADD, UOp.const(dtypes.half, 1)), mag))
+    return signed.cast(x.dtype)
+  pre_matcher = PatternMatcher([
+    (UPat.const(dtypes.floats, 0).alu(Ops.CMPLT, UPat.var("x", dtypes.floats)).where(UPat.var("x", dtypes.floats), UPat.const(dtypes.floats, 0)),
+     lambda x: UOp(Ops.CUSTOM, dtypes.half, src=(x.cast(dtypes.half),), arg="relu")),
+  ])
+  extra_matcher = PatternMatcher([
+    (UPat(Ops.MUL, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.ADD, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.MAX, dtypes.int, name="x"),
+     lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MAX, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+    (UPat(Ops.SHL, dtypes.uint, name="x"),
+     lambda x: _rk_shift_to_muldiv(x, Ops.MUL)),
+    (UPat(Ops.SHR, dtypes.uint, name="x"),
+     lambda x: _rk_shift_to_muldiv(x, Ops.FDIV)),
+    (UPat(Ops.ADD, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
+    (UPat(Ops.MUL, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MUL, x.src[1].cast(dtypes.half))),
+    (UPat(Ops.MAX, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
+    (UPat(Ops.NEG, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
+    (UPat(Ops.EXP2, dtypes.float, name="x"),
+     lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+    (UPat(Ops.TRUNC, dtypes.floats, name="x"),
+     _rk_trunc_fix),
+    # (UPat.var("x", dtypes.floats).alu(Ops.FDIV,
+    #   UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
+    #  lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
+    # (UPat.var("x", dtypes.floats) * UPat.const(dtypes.floats, 1).alu(Ops.FDIV,
+    #   UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
+    #  lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
+    (UPat(Ops.CMPLT, name="x"),
+     lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
+                   arg="cmplt_diff2bool").cast(dtypes.bool)),
+    (UPat(Ops.CMPEQ, name="x"),
+     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=(
+       UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=(
+         x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
+       ),
+     )).cast(dtypes.bool)),
+    # CMPNE(x) = 1 - CMPEQ(x)
+    (UPat(Ops.CMPNE, name="x"),
+      lambda x: UOp.const(dtypes.float16, 1).alu(
+        Ops.SUB,
+        x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16)
+      ).cast(dtypes.bool)),
+    # ax + b(1-x) 
+    (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
+     lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
+       b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
+    (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.ints), UPat.var("b", dtypes.ints))),
+     lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
+       b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
+  ])
+  def render(self, uops:list[UOp]) -> str:
+    return base64.b64encode(pickle.dumps(uops)).decode()
+  
+class RockchipAllocator(Allocator['RockchipDevice']):
+  def _alloc(self, size, options): return memoryview(bytearray(size))
+  def _copyin(self, dest, src:memoryview): dest[:] = src
+  def _copyout(self, dest:memoryview, src): dest[:] = src
+
+class RockchipDevice(Compiled):
+  def __init__(self, device:str):
+    self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
+    super().__init__(device, RockchipAllocator(self), [RockchipRenderer], functools.partial(RockchipProgram, self))
+  def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
+    flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
+    result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
+    # print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name} {hex(dma_address)}")
+    return flink_req.name
+  def _gpu_alloc(self, size:int, flags, name:str) -> HCQBuffer:
+    mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
+    mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem_create.handle, offset=0)
+    va_addr = self.fd_ctl.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mem_map.offset)
+    mem_create.flink_name = self.create_flink_name(mem_create.handle, name, virt_address=va_addr, obj_addr=mem_create.obj_addr, dma_address=mem_create.dma_addr)
+
+    return HCQBuffer(va_addr=va_addr, size=size, meta=mem_create)
+  def _gpu_sync(self, buf:HCQBuffer, flags:int) -> None:
+    if not getenv("ROCKCHIP_MEM_SYNC", 0): return
+    rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, __payload=rk.struct_rknpu_mem_sync(
+      flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.size))
+  def _gpu_free(self, buf:HCQBuffer) -> None:
+    FileIOInterface.munmap(buf.va_addr, buf.size)
+    rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, __payload=rk.struct_rknpu_mem_destroy(
+      handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr))
+  def _gpu_free_multiple(self, buf_list) -> None:
+    for buf in buf_list: self._gpu_free(buf)
+  def reset_npu(self):
+    rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, __payload=rk.struct_rknpu_action(flags=rk.RKNPU_ACT_RESET, value=0))
