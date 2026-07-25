@@ -108,6 +108,8 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3), (3)], lambda x,y: x+y, Tensor.add, forward_only=True)
   def test_tiny_mul(self):
     helper_test_op([(64), (64)], lambda x,y: x*y, Tensor.mul, forward_only=True)
+  def test_gemm_fp16(self):
+    helper_test_op([(2,2), (2,2)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
 
 if __name__ == '__main__':
   np.random.seed(1337)

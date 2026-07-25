@@ -3,13 +3,13 @@
 # works to test the tensor cores, and all the uops in general
 # this is the (living) definition of uops
 from typing import Any, TYPE_CHECKING
-import pickle, base64, itertools, time, struct, sys, functools, ctypes, mmap, os, math, numpy as np
-from dataclasses import replace
+import pickle, base64, itertools, time, struct, sys, functools, ctypes, mmap, os, math, re, numpy as np
+from dataclasses import dataclass, replace
 from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
-from tinygrad.helpers import DEBUG, all_same, getenv, flatten, get_single_element
+from tinygrad.helpers import DEBUG, all_same, getenv, flatten, get_single_element, ceildiv, round_up
 from tinygrad.device import Compiled, Compiler, Allocator
 from tinygrad.codegen.opt import tc
-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, AxisType, bitcast
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, AxisType, ParamArg, bitcast
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.ops_python import storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar, _load, load, _store, generic_wmma_helper
 from tinygrad.runtime.support.hcq import HCQBuffer
@@ -52,7 +52,7 @@ class RockchipProgram:
     self.cna_meta = None
     self.cna_kind = None
     self.fallback_uops: list[UOp]|None = None
-    if isinstance(prg, tuple) and len(prg) == 3 and prg[0] in ("rkcna_v1", "rkcna_gemv_v1"):
+    if isinstance(prg, tuple) and len(prg) == 3 and prg[0] in ("rkcna_v1", "rkcna_gemv_v1", "rkcna_direct_v1", "rkcna_conv2d_v1"):
       self.cna_kind = prg[0]
       self.cna_meta, self.fallback_uops = prg[1], prg[2]
       self.uops = self.fallback_uops
@@ -307,12 +307,17 @@ class RockchipProgram:
     # print(res)
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
-    if self.cna_meta is not None:
-      return self._run_cna_group(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait, **kw)
-    self.device.reset_npu()
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
+    if DEBUG >= 7:
+      for idx, u in enumerate(self.uops):
+        print(idx, u.op, u.dtype, u.arg, [v.op for v in u.src])
+    has_cna_marker = any(u.op is Ops.NOOP and isinstance(u.arg, tuple) and u.arg and u.arg[0] in ("rkcna_region", "rkcna_conv_region") for u in self.uops)
+    if self.cna_meta is not None and not has_cna_marker:
+      return self._run_cna_group(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=wait, **kw)
+    self.device.reset_npu()
+    self._conv_region_done = False
     void_ops = {Ops.END, Ops.BARRIER, Ops.IF, Ops.ENDIF, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.STORE}
     for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
       values: dict[UOp, Any] = {}
@@ -320,11 +325,11 @@ class RockchipProgram:
       pvals: list[int] = list(vals)
       exec_masks = [[True] * warp_size]
       i = 0
-      if DEBUG >= 7:
-        for idx, u in enumerate(self.uops):
-          print(idx, u.op, u.dtype, u.arg, [v.op for v in u.src])
       while i < len(self.uops):
         u = self.uops[i]
+        if u.op is Ops.NOOP and isinstance(u.arg, tuple) and u.arg and u.arg[0] in ("rkcna_region", "rkcna_conv_region"):
+          i = self._run_cna_conv_region_marker(bufs, st) if u.arg[0] == "rkcna_conv_region" else self._run_cna_region_marker(u.arg, bufs, warp_size, st, values)
+          continue
         src_values = [values[v] for v in u.src if v.op not in void_ops]
         src_dtypes = [v.dtype for v in u.src if v.op not in void_ops]
         if getenv("TRACE"): print(i, u.op, u.dtype, u.arg, src_values, src_dtypes)
@@ -461,6 +466,19 @@ class RockchipProgram:
             else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
           else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
         elif u.op is Ops.CUSTOM or u.op in GroupOp.ALU:
+          batched_uops, batch_sizes, batch_end = None, None, None
+          if u.op is Ops.ADD and u.dtype is not None and u.dtype.scalar() in [dtypes.float16]:
+            batched_src_values, batched_uops, batch_sizes, batch_end = [list(x) for x in src_values], [u], [len(src_values[0])], i + 1
+            while batch_end < len(self.uops):
+              nu = self.uops[batch_end]
+              if nu.op is not u.op or nu.dtype != u.dtype or nu.arg != u.arg: break
+              if any(v.op not in void_ops and v not in values for v in nu.src): break
+              nsrc_values = [values[v] for v in nu.src if v.op not in void_ops]
+              if len(nsrc_values) != len(batched_src_values) or not all_same([len(x) for x in nsrc_values]): break
+              for dst, src in zip(batched_src_values, nsrc_values): dst.extend(src)
+              batched_uops.append(nu); batch_sizes.append(len(nsrc_values[0])); batch_end += 1
+            if len(batched_uops) > 1: src_values = batched_src_values
+            else: batched_uops = batch_sizes = batch_end = None
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
           assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {u.op}"
           eff_op = u.op
@@ -515,6 +533,14 @@ class RockchipProgram:
                   result = ((raw.astype(np.uint16) / 2**14) - 1) / self.inv_scale
                 elif u.arg == "silu":
                   result = raw.astype(np.int16) / (2**15 - 1) / self.inv_scale
+              if u.op is Ops.CMPLT and u.dtype.scalar() is dtypes.bool: result = tuple(bool(x) for x in result)
+              if batched_uops is not None and batch_sizes is not None and batch_end is not None:
+                offset = 0
+                for bu, size in zip(batched_uops, batch_sizes):
+                  values[bu] = list(result[offset:offset+size])
+                  offset += size
+                i = batch_end
+                continue
               values[u] = list(result)
               if getenv("TRACE"):  print('src', src_values[0])
               if getenv("TRACE"):  print('src2', src_values[1])
@@ -536,43 +562,232 @@ class RockchipProgram:
         i += 1
     return time.perf_counter() - st
 
-  def _run_cna_group(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
-    if len(bufs) != 3: raise NotImplementedError(f"rkcna_v1 expected 3 buffers, got {len(bufs)}")
-    st = time.perf_counter()
+  def _run_cna_region_marker(self, marker:tuple[Any, ...], bufs:tuple[memoryview, ...], warp_size:int, st:float, values:dict[UOp, Any]) -> int:
+    if len(bufs) != 3: raise NotImplementedError(f"rkcna region expected 3 buffers, got {len(bufs)}")
     out_buf, a_buf, b_buf = bufs
-    solved = None
-    if self.cna_kind == "rkcna_gemv_v1" and self.cna_meta is not None:
-      m, n, k = (int(self.cna_meta[x]) for x in ("m", "n", "k"))
-      batch = int(self.cna_meta.get("batch", 1))
-      src_itemsize = int(self.cna_meta.get("src_itemsize", 2))
-      out_itemsize = int(self.cna_meta.get("out_itemsize", 2))
-      a_len = m*k*src_itemsize if batch == 1 else m*k*src_itemsize
-      b_len = batch*k*n*src_itemsize
-      out_len = batch*m*n*out_itemsize
-      if len(a_buf) != a_len or len(b_buf) != b_len or len(out_buf) != out_len:
-        raise NotImplementedError(f"rkcna_gemv_v1 buffer sizes do not match meta {self.cna_meta}: {[len(x) for x in bufs]}")
-      solved = (m, n, k, src_itemsize, out_itemsize, batch)
+    plan = self._cna_matmul_plan(out_buf, a_buf, b_buf)
+    _, reg, end = marker
+    reg_dtype = reg.dtype.base.scalar()
+    if reg_dtype not in (dtypes.half, dtypes.float): raise NotImplementedError(f"unsupported rkcna region register dtype {reg_dtype}")
+    _, align_out, _ = _rk_gemm_layout(plan.m, plan.n, plan.k)
+    if reg.max_numel() < (plan.m - 1) * align_out + plan.n: raise NotImplementedError("rkcna region register surface too small")
+    contig = memoryview(bytearray(plan.m * plan.n * reg_dtype.itemsize))
+    self._run_cna(contig, a_buf, b_buf, st, replace(plan, out_itemsize=reg_dtype.itemsize))
+    storage_fmt = storage_fmt_for_dtype(reg_dtype)
+    if storage_fmt is None: raise NotImplementedError(f"unsupported rkcna region storage dtype {reg_dtype}")
+    surface = memoryview(bytearray(reg.max_numel() * reg_dtype.itemsize)).cast(storage_fmt)
+    result = np.frombuffer(contig, dtype=np.float32 if reg_dtype is dtypes.float else np.float16).reshape(plan.m, plan.n)
+    for row in range(plan.m):
+      for col in range(plan.n): surface[row * align_out + col] = result[row, col]
+    values[reg] = [surface] * warp_size
+    for u in self.uops:
+      if u.op is Ops.PARAM and isinstance(u.arg, ParamArg):
+        fmt = storage_fmt_for_dtype(u.dtype.base.scalar())
+        if fmt is not None: values[u] = [bufs[u.arg.slot].cast(fmt)] * warp_size
+      elif u.op is Ops.CONST:
+        values[u] = [u.arg] * warp_size
+    return self.uop_to_index[end] + 1
+
+  def _run_cna_conv_region_marker(self, bufs:tuple[memoryview, ...], st:float) -> int:
+    if getattr(self, "_conv_region_done", False): return len(self.uops)
+    self._conv_region_done = True
+    if len(bufs) not in (3, 4): raise NotImplementedError(f"rkcna conv region expected 3 or 4 buffers, got {len(bufs)}")
+    if len(bufs) == 3:
+      self._run_cna_conv2d(*bufs, st)
+      return len(self.uops)
+    out_buf, input_buf, weight_buf, bias_buf = bufs
+    tmp_out = memoryview(bytearray(len(out_buf)))
+    self._run_cna_conv2d(tmp_out, input_buf, weight_buf, st)
+    cout = int(self.cna_meta["cout"])
+    out_itemsize = int(self.cna_meta["out_itemsize"])
+    out_dtype = np.float16 if out_itemsize == 2 else np.float32
+    bias_dtype = np.float16 if len(bias_buf) == cout*2 else np.float32
+    result = np.frombuffer(tmp_out, dtype=out_dtype).reshape(-1, cout, int(self.cna_meta["oh"])*int(self.cna_meta["ow"]))
+    result = (result + np.frombuffer(bias_buf, dtype=bias_dtype).astype(out_dtype).reshape(1, cout, 1)).reshape(-1).copy()
+    out_buf.cast('B')[:] = memoryview(result).cast('B')
+    return len(self.uops)
+
+  def _run_cna_group(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    st = time.perf_counter()
+    if self.cna_kind == "rkcna_conv2d_v1": return self._run_cna_conv2d(*bufs, st)
+    if len(bufs) != 3: raise NotImplementedError(f"rkcna_v1 expected 3 buffers, got {len(bufs)}")
+    return self._run_cna(*bufs, st)
+
+  def _run_cna(self, out_buf, a_buf, b_buf, st:float, plan:'CnaPlan|None'=None):
+    return self._run_cna_matmul(out_buf, a_buf, b_buf, self._cna_matmul_plan(out_buf, a_buf, b_buf) if plan is None else plan, st)
+
+  def _run_cna_conv1d(self, out_buf, input_buf, weight_buf, st:float):
+    if self.cna_meta is None: raise NotImplementedError("rkcna_conv1d_v1 missing metadata")
+    batch, cin, il, cout, cin_per_group, kw, ol, groups = (int(self.cna_meta[x]) for x in ("batch", "cin", "il", "cout", "cin_per_group", "kw", "ol", "groups"))
+    src_itemsize, out_itemsize = int(self.cna_meta["src_itemsize"]), int(self.cna_meta["out_itemsize"])
+    if src_itemsize != 2: raise NotImplementedError("rkcna_conv1d_v1 only supports fp16 inputs")
+    out_nbytes, input_nbytes, weight_nbytes = (len(x.cast('B')) for x in (out_buf, input_buf, weight_buf))
+    if input_nbytes != batch*cin*il*src_itemsize or weight_nbytes != cout*cin_per_group*kw*src_itemsize or out_nbytes != batch*cout*ol*out_itemsize:
+      raise NotImplementedError(f"rkcna_conv1d_v1 buffer sizes do not match meta {self.cna_meta}: {[out_nbytes, input_nbytes, weight_nbytes]}")
+    inp = np.frombuffer(input_buf, dtype=np.float16).reshape(batch, cin, il)
+    wt = np.frombuffer(weight_buf, dtype=np.float16).reshape(cout, cin_per_group, kw)
+    cols = np.empty((batch*ol, cin*kw), dtype=np.float16)
+    row = 0
+    for bi in range(batch):
+      for ox in range(ol):
+        cols[row] = inp[bi, :, ox:ox+kw].reshape(-1)
+        row += 1
+    weights = np.zeros((cin*kw, cout), dtype=np.float16)
+    cout_per_group = cout // groups
+    for co in range(cout):
+      group = co // cout_per_group
+      for c in range(cin_per_group):
+        ci = group * cin_per_group + c
+        weights[ci*kw:(ci+1)*kw, co] = wt[co, c]
+    plan = CnaPlan(batch*ol, cout, cin*kw, src_itemsize, out_itemsize, kind="conv1d")
+    if DEBUG >= 3: print(f"RKCNA_CONV1D_PACK batch={batch} cin={cin} il={il} cout={cout} k={kw} ol={ol} groups={groups}")
+    tmp_out = memoryview(bytearray(batch*ol*cout*out_itemsize))
+    ret = self._run_cna_matmul(tmp_out, memoryview(cols.reshape(-1)), memoryview(weights.reshape(-1)), plan, st)
+    out_dtype = np.float16 if out_itemsize == 2 else np.float32
+    result = np.frombuffer(tmp_out, dtype=out_dtype).reshape(batch, ol, cout).transpose(0, 2, 1).reshape(-1).copy()
+    out_buf.cast('B')[:] = memoryview(result).cast('B')
+    return ret
+
+  def _run_cna_conv2d(self, out_buf, input_buf, weight_buf, st:float):
+    if self.cna_meta is None: raise NotImplementedError("rkcna_conv2d_v1 missing metadata")
+    if self.cna_meta.get("kind") == "conv1d": return self._run_cna_conv1d(out_buf, input_buf, weight_buf, st)
+    if self.cna_meta.get("kind") == "conv3d": return self._run_cna_conv3d(out_buf, input_buf, weight_buf, st)
+    batch = int(self.cna_meta.get("batch", 1))
+    oh, ow, cout, cin, kh, kw = (int(self.cna_meta[x]) for x in ("oh", "ow", "cout", "cin", "kh", "kw"))
+    cin_per_group, groups = int(self.cna_meta.get("cin_per_group", cin)), int(self.cna_meta.get("groups", 1))
+    ih, iw = int(self.cna_meta["ih"]), int(self.cna_meta["iw"])
+    stride_h, stride_w = int(self.cna_meta.get("stride_h", 1)), int(self.cna_meta.get("stride_w", 1))
+    dil_h, dil_w = int(self.cna_meta.get("dil_h", 1)), int(self.cna_meta.get("dil_w", 1))
+    pad_top, pad_left = int(self.cna_meta.get("pad_top", 0)), int(self.cna_meta.get("pad_left", 0))
+    src_itemsize, out_itemsize = int(self.cna_meta["src_itemsize"]), int(self.cna_meta["out_itemsize"])
+    input_itemsize, weight_itemsize = int(self.cna_meta.get("input_itemsize", src_itemsize)), int(self.cna_meta.get("weight_itemsize", src_itemsize))
+    if src_itemsize != 2: raise NotImplementedError("rkcna_conv2d_v1 only supports fp16 CNA inputs")
+    if len(input_buf) != batch*cin*ih*iw*input_itemsize or len(weight_buf) != cout*cin_per_group*kh*kw*weight_itemsize or len(out_buf) != batch*oh*ow*cout*out_itemsize:
+      raise NotImplementedError(f"rkcna_conv2d_v1 buffer sizes do not match meta {self.cna_meta}: {[len(x) for x in (out_buf, input_buf, weight_buf)]}")
+    input_dtype = np.float16 if input_itemsize == 2 else np.float32
+    weight_dtype = np.float16 if weight_itemsize == 2 else np.float32
+    inp = np.frombuffer(input_buf, dtype=input_dtype).reshape((batch, ih, iw, cin) if self.cna_meta.get("layout") == "nhwc" else (batch, cin, ih, iw)).astype(np.float16, copy=False)
+    if self.cna_meta.get("layout") == "nhwc": inp = inp.transpose(0, 3, 1, 2)
+    if self.cna_meta.get("weight_layout") == "hwio": wt = np.frombuffer(weight_buf, dtype=weight_dtype).reshape(kh, kw, cin_per_group, cout).transpose(3, 2, 0, 1).astype(np.float16, copy=False)
+    else: wt = np.frombuffer(weight_buf, dtype=weight_dtype).reshape((cin, cout//groups, kh, kw) if self.cna_meta.get("transpose") else (cout, cin_per_group, kh, kw)).astype(np.float16, copy=False)
+    cols = np.empty((batch*oh*ow, cin*kh*kw), dtype=np.float16)
+    row = 0
+    for bi in range(batch):
+      for oy in range(oh):
+        for ox in range(ow):
+          if stride_h == 1 and stride_w == 1 and dil_h == 1 and dil_w == 1 and pad_top == 0 and pad_left == 0 and oy+kh <= ih and ox+kw <= iw:
+            cols[row] = inp[bi, :, oy:oy+kh, ox:ox+kw].reshape(-1)
+          else:
+            patch = np.zeros((cin, kh, kw), dtype=np.float16)
+            for ky in range(kh):
+              iy = oy*stride_h + ky*dil_h - pad_top
+              if iy < 0 or iy >= ih: continue
+              for kx in range(kw):
+                ix = ox*stride_w + kx*dil_w - pad_left
+                if 0 <= ix < iw: patch[:, ky, kx] = inp[bi, :, iy, ix]
+            cols[row] = patch.transpose(1, 2, 0).reshape(-1) if self.cna_meta.get("transpose") else patch.reshape(-1)
+          row += 1
+    if groups == 1:
+      weights = wt[:, :, ::-1, ::-1].transpose(2, 3, 0, 1).reshape(cin*kh*kw, cout).copy() if self.cna_meta.get("transpose") else wt.reshape(cout, cin*kh*kw).T.copy()
     else:
-      for out_itemsize in (4, 2):
-        if len(out_buf) % out_itemsize != 0: continue
-        out_elems = len(out_buf) // out_itemsize
-        for src_itemsize in (2, 4):
-          if len(a_buf) % src_itemsize != 0 or len(b_buf) % src_itemsize != 0: continue
-          a_elems, b_elems = len(a_buf) // src_itemsize, len(b_buf) // src_itemsize
-          if a_elems * b_elems % out_elems != 0: continue
-          k = math.isqrt(a_elems * b_elems // out_elems)
-          if k > 0 and k*k*out_elems == a_elems*b_elems and a_elems % k == 0 and b_elems % k == 0:
-            m, n = a_elems // k, b_elems // k
-            if m*n == out_elems: solved = (m, n, k, src_itemsize, out_itemsize, 1); break
-        if solved is not None: break
-    if solved is None: raise NotImplementedError(f"rkcna_v1 cannot infer GEMM shape from sizes {[len(x) for x in bufs]}")
-    m, n, k, src_itemsize, out_itemsize, batch = solved
+      weights = np.zeros((cin*kh*kw, cout), dtype=np.float16)
+      cout_per_group = cout // groups
+      for co in range(cout):
+        group = co // cout_per_group
+        for c in range(cin_per_group):
+          ci = group*cin_per_group + c
+          weights[ci*kh*kw:(ci+1)*kh*kw, co] = (wt[ci, co%cout_per_group, ::-1, ::-1] if self.cna_meta.get("transpose") else wt[co, c]).reshape(-1)
+    tmp_itemsize = int(self.cna_meta.get("tmp_out_itemsize", out_itemsize))
+    plan = CnaPlan(batch*oh*ow, cout, cin*kh*kw, src_itemsize, tmp_itemsize, kind="conv2d")
+    if DEBUG >= 3: print(f"RKCNA_CONV2D_PACK batch={batch} oh={oh} ow={ow} cout={cout} cin={cin} kh={kh} kw={kw} groups={groups}")
+    tmp_out = memoryview(bytearray(batch*oh*ow*cout*tmp_itemsize))
+    ret = self._run_cna_matmul(tmp_out, memoryview(cols.reshape(-1)), memoryview(weights.reshape(-1)), plan, st)
+    out_dtype = np.float16 if tmp_itemsize == 2 else np.float32
+    result = np.frombuffer(tmp_out, dtype=out_dtype).reshape(batch, oh*ow, cout).transpose(0, 2, 1).reshape(-1).copy()
+    if tmp_itemsize != out_itemsize: result = result.astype(np.float16 if out_itemsize == 2 else np.float32)
+    out_buf.cast('B')[:] = memoryview(result).cast('B')
+    return ret
+
+  def _run_cna_conv3d(self, out_buf, input_buf, weight_buf, st:float):
+    batch, od, oh, ow, cout, cin, kd, kh, kw = (int(self.cna_meta[x]) for x in ("batch", "od", "oh", "ow", "cout", "cin", "kd", "kh", "kw"))
+    id_, ih, iw = (int(self.cna_meta[x]) for x in ("id", "ih", "iw"))
+    src_itemsize, out_itemsize = int(self.cna_meta["src_itemsize"]), int(self.cna_meta["out_itemsize"])
+    inp = np.frombuffer(input_buf, dtype=np.float16).reshape(batch, cin, id_, ih, iw)
+    wt = np.frombuffer(weight_buf, dtype=np.float16).reshape(cout, cin, kd, kh, kw)
+    cols = np.empty((batch*od*oh*ow, cin*kd*kh*kw), dtype=np.float16)
+    row = 0
+    for bi in range(batch):
+      for oz in range(od):
+        for oy in range(oh):
+          for ox in range(ow):
+            cols[row] = inp[bi, :, oz:oz+kd, oy:oy+kh, ox:ox+kw].reshape(-1); row += 1
+    weights = wt.reshape(cout, cin*kd*kh*kw).T.copy()
+    plan = CnaPlan(batch*od*oh*ow, cout, cin*kd*kh*kw, src_itemsize, out_itemsize, kind="conv3d")
+    tmp_out = memoryview(bytearray(batch*od*oh*ow*cout*out_itemsize))
+    ret = self._run_cna_matmul(tmp_out, memoryview(cols.reshape(-1)), memoryview(weights.reshape(-1)), plan, st)
+    result = np.frombuffer(tmp_out, dtype=np.float16 if out_itemsize == 2 else np.float32).reshape(batch, od*oh*ow, cout).transpose(0, 2, 1).reshape(-1).copy()
+    out_buf.cast('B')[:] = memoryview(result).cast('B')
+    return ret
+
+  def _cna_matmul_plan(self, out_buf, a_buf, b_buf):
+    if self.cna_meta is not None and all(x in self.cna_meta for x in ("m", "n", "k", "src_itemsize", "out_itemsize")):
+      plan = CnaPlan(*(int(self.cna_meta[x]) for x in ("m", "n", "k", "src_itemsize", "out_itemsize")), batch=int(self.cna_meta.get("batch", 1)), kind=self.cna_meta.get("kind", "gemm"))
+      if len(a_buf) != plan.m*plan.k*plan.src_itemsize or len(b_buf) != plan.batch*plan.k*plan.n*plan.src_itemsize or len(out_buf) != plan.batch*plan.m*plan.n*plan.out_itemsize:
+        raise NotImplementedError(f"rkcna_v1 buffer sizes do not match meta {self.cna_meta}: {[len(x) for x in (out_buf, a_buf, b_buf)]}")
+      return plan
+    batch_plan, fallback_plan = None, None
+    src_itemsizes = (self.cna_meta["a_dtype"].itemsize,) if self.cna_meta is not None and "a_dtype" in self.cna_meta else (2, 4)
+    for out_itemsize in (4, 2):
+      if len(out_buf) % out_itemsize != 0: continue
+      out_elems = len(out_buf) // out_itemsize
+      for src_itemsize in src_itemsizes:
+        if len(a_buf) % src_itemsize != 0 or len(b_buf) % src_itemsize != 0: continue
+        a_elems, b_elems = len(a_buf) // src_itemsize, len(b_buf) // src_itemsize
+        if (plan := _rk_cna_square_plan(out_elems, a_elems, b_elems, src_itemsize, out_itemsize)) is not None: return plan
+        if out_itemsize == src_itemsize and (infer := _rk_infer_mnk(out_elems, a_elems, b_elems)) is not None:
+          m, n, k = infer
+          plan = _rk_cna_plan_from_mnk(m, n, k, src_itemsize, out_itemsize)
+          if self.cna_meta is None: return plan
+          if fallback_plan is None: fallback_plan = plan
+        batch_hint = int(self.cna_meta.get("batch_hint", 0)) if self.cna_meta is not None else 0
+        if (plan := _rk_cna_batched_plan(out_elems, a_elems, b_elems, src_itemsize, out_itemsize, batch_hint, self.cna_meta is None)) is not None:
+          if batch_plan is None or plan.k < batch_plan.k or (plan.k == batch_plan.k and plan.batch > batch_plan.batch): batch_plan = plan
+        if (infer := _rk_infer_mnk(out_elems, a_elems, b_elems)) is not None and fallback_plan is None:
+          m, n, k = infer
+          fallback_plan = _rk_cna_plan_from_mnk(m, n, k, src_itemsize, out_itemsize)
+    if batch_plan is not None: return batch_plan
+    if fallback_plan is not None: return fallback_plan
+    raise NotImplementedError(f"rkcna_v1 cannot infer GEMM shape from sizes {[len(x) for x in (out_buf, a_buf, b_buf)]}")
+
+  def _run_cna_matmul(self, out_buf, a_buf, b_buf, plan:'CnaPlan', st:float):
+    m, n, k, src_itemsize, out_itemsize, batch = plan.m, plan.n, plan.k, plan.src_itemsize, plan.out_itemsize, plan.batch
+    if plan.a_batch and batch > 1:
+      sub_plan = replace(plan, batch=1, a_batch=False)
+      out_step, a_step, b_step = m*n*out_itemsize, m*k*src_itemsize, k*n*src_itemsize
+      for bi in range(batch):
+        sub_out = memoryview(bytearray(out_step))
+        self._run_cna_matmul(sub_out, a_buf[bi*a_step:(bi+1)*a_step], b_buf[bi*b_step:(bi+1)*b_step], sub_plan, st)
+        out_buf.cast('B')[bi*out_step:(bi+1)*out_step] = sub_out.cast('B')
+      return time.perf_counter() - st
     out_fp16 = out_itemsize == 2
-    a_src = np.frombuffer(a_buf, dtype=np.float32 if src_itemsize == 4 else np.float16).astype(np.float16).reshape(m, k)
-    b_src = np.frombuffer(b_buf, dtype=np.float32 if src_itemsize == 4 else np.float16).astype(np.float16).reshape(batch, k, n)
+    a_raw = np.frombuffer(a_buf, dtype=np.float32 if src_itemsize == 4 else np.float16).astype(np.float16)
+    b_raw = np.frombuffer(b_buf, dtype=np.float32 if src_itemsize == 4 else np.float16).astype(np.float16)
+    if None not in (plan.a_rows, plan.a_cols, plan.b_rows, plan.b_cols):
+      a_src = np.zeros((m, k), dtype=np.float16)
+      b_src = np.zeros((batch, k, n), dtype=np.float16)
+      a_rows, a_cols, b_rows, b_cols = plan.a_rows, plan.a_cols, plan.b_rows, plan.b_cols
+      a_src[:a_rows, :a_cols] = a_raw.reshape(a_rows, a_cols)
+      b_src[0, :b_rows, :b_cols] = b_raw.reshape(b_rows, b_cols)
+    else:
+      a_src = a_raw.reshape(batch, m, k) if plan.a_batch else a_raw.reshape(m, k)
+      b_src = b_raw.reshape(batch, k, n)
     align_in, align_out, _ = _rk_gemm_layout(m, n, k)
-    input_packed = np.zeros((m, align_in), dtype=np.float16)
-    input_packed[:, :k] = a_src
+    if plan.a_batch:
+      input_packed = np.zeros((batch, m, align_in), dtype=np.float16)
+      input_packed[:, :, :k] = a_src
+    else:
+      input_packed = np.zeros((m, align_in), dtype=np.float16)
+      input_packed[:, :k] = a_src
     weight_packed = np.zeros((batch, align_out * align_in), dtype=np.float16)
     for bi in range(batch):
       weight = np.zeros((align_out, align_in), dtype=np.float16)
@@ -593,19 +808,20 @@ class RockchipProgram:
       self.device._gpu_sync(input_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
       self.device._gpu_sync(weight_buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
       regcmd = ctypes.cast(cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * (cmd_buf.size // 8))).contents
-      task_regs = [_rk_make_gemm_regs(m, n, k, input_buf.meta.dma_addr,
+      input_batch_stride = input_packed.strides[0] if plan.a_batch else 0
+      task_regs = [_rk_make_gemm_regs(m, n, k, input_buf.meta.dma_addr + bi * input_batch_stride,
         weight_buf.meta.dma_addr + bi * weight_packed.strides[0], output_buf.meta.dma_addr + bi * out_nbytes_one, out_fp16=out_fp16) for bi in range(batch)]
       offsets, offset = [], 0
       for regs in task_regs:
         offsets.append(offset)
-        offset += _rk_align_up(len(regs) + RK_PC_CHAIN_TAIL_QWORDS, 2)
+        offset += round_up(len(regs) + RK_PC_CHAIN_TAIL_QWORDS, 2)
       if offset > cmd_buf.size // 8: raise RuntimeError("rkcna command buffer too small")
       for bi, regs in enumerate(task_regs):
         base = offsets[bi]
         for i,qword in enumerate(regs): regcmd[base+i] = qword
         if bi + 1 < batch:
           next_addr = cmd_buf.meta.dma_addr + offsets[bi+1] * ctypes.sizeof(ctypes.c_uint64)
-          tail = [_rk_E(0x0101, rk.REG_PC_BASE_ADDRESS, next_addr & 0xFFFFFFF0), _rk_E(0x0101, rk.REG_PC_REGISTER_AMOUNTS, _rk_ceil_div(len(task_regs[bi+1]), 2) + 1), _rk_E(0x0041, 0, 0), _rk_E(0x0081, rk.REG_PC_OPERATION_ENABLE, (6 << 1) | 1)]
+          tail = [_rk_E(0x0101, rk.REG_PC_BASE_ADDRESS, next_addr & 0xFFFFFFF0), _rk_E(0x0101, rk.REG_PC_REGISTER_AMOUNTS, ceildiv(len(task_regs[bi+1]), 2) + 1), _rk_E(0x0041, 0, 0), _rk_E(0x0081, rk.REG_PC_OPERATION_ENABLE, (6 << 1) | 1)]
         else:
           tail = [_rk_E(0x0001, 0, 0), _rk_E(0x0101, rk.REG_PC_REGISTER_AMOUNTS, 0), _rk_E(0x0041, 0, 0), _rk_E(0x0081, rk.REG_PC_OPERATION_ENABLE, (6 << 1) | 1)]
         for i,qword in enumerate(tail): regcmd[base+len(regs)+i] = qword
@@ -635,7 +851,8 @@ class RockchipProgram:
       result = np.concatenate(result_batches)
       out_buf.cast('B')[:] = memoryview(result).cast('B')
       if DEBUG >= 3:
-        print(f"{'RKCNA_GEMV_RUN' if self.cna_kind == 'rkcna_gemv_v1' else 'RKCNA_RUN'} m={m} n={n} k={k} batch={batch} out={'fp16' if out_fp16 else 'fp32'}")
+        label = "RKCNA_GEMV_RUN" if plan.kind == "gemv" else "RKCNA_DIRECT_RUN" if self.cna_kind == "rkcna_direct_v1" else "RKCNA_RUN"
+        print(f"{label} m={m} n={n} k={k} batch={batch} out={'fp16' if out_fp16 else 'fp32'}")
       return time.perf_counter() - st
     finally:
       self.device._gpu_free_multiple([task_buf, cmd_buf, input_buf, weight_buf, output_buf])
@@ -652,22 +869,94 @@ def _rk_shift_to_muldiv(x, op):
   pow2 = x.src[1].cast(dtypes.float16).exp2()
   return x.src[0].cast(dtypes.float16).alu(op, pow2).cast(x.dtype)
 
+def _rk_has_shape(x:UOp) -> bool:
+  try:
+    x.shape
+    return True
+  except Exception:
+    return False
+
+def _rk_lane(x:UOp, i:int) -> UOp: return x.gep(i if x.dtype.count > 1 else 0)
+def _rk_raw_cmp(op:Ops, a:UOp, b:UOp) -> UOp: return a.alu(op, b).rtag("shape_scalar")
+def _rk_raw_cmpne(a:UOp, b:UOp) -> UOp:
+  diff = _rk_raw_cmp(Ops.CMPLT, a, b).cast(dtypes.float16).alu(Ops.MAX, _rk_raw_cmp(Ops.CMPLT, b, a).cast(dtypes.float16)).rtag("shape_scalar")
+  return _rk_raw_cmp(Ops.CMPLT, UOp.const(dtypes.float16, 0), diff)
+def _rk_cmplt_lower(a:UOp, b:UOp) -> UOp:
+  return UOp(Ops.CUSTOM, dtypes.float16, src=(b.cast(dtypes.float16).alu(Ops.SUB, a.cast(dtypes.float16)),), arg="cmplt_diff2bool").cast(dtypes.bool)
+def _rk_cmpeq_lower(a:UOp, b:UOp) -> UOp:
+  return UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=(
+    UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=(b.cast(dtypes.float16).alu(Ops.SUB, a.cast(dtypes.float16)),)),
+  )).cast(dtypes.bool)
+def _rk_cmpne_lower(a:UOp, b:UOp) -> UOp:
+  return UOp.const(dtypes.float16, 1).alu(Ops.SUB, _rk_cmpeq_lower(a, b).cast(dtypes.float16)).cast(dtypes.bool)
+
+def _rk_cmplt(x:UOp):
+  if x.tag == "shape_scalar": return None
+  if not all(_rk_has_shape(s) for s in x.src):
+    return UOp(Ops.STACK, x.dtype, tuple(_rk_raw_cmp(Ops.CMPLT, _rk_lane(x.src[0], i), _rk_lane(x.src[1], i)) for i in range(x.dtype.count))) if x.dtype.count > 1 else _rk_raw_cmp(Ops.CMPLT, _rk_lane(x.src[0], 0), _rk_lane(x.src[1], 0))
+  return _rk_cmplt_lower(x.src[0], x.src[1])
+
+def _rk_cmpeq(x:UOp):
+  if x.tag == "shape_scalar": return None
+  if not all(_rk_has_shape(s) for s in x.src):
+    return UOp(Ops.STACK, x.dtype, tuple(_rk_raw_cmp(Ops.CMPEQ, _rk_lane(x.src[0], i), _rk_lane(x.src[1], i)) for i in range(x.dtype.count))) if x.dtype.count > 1 else _rk_raw_cmp(Ops.CMPEQ, _rk_lane(x.src[0], 0), _rk_lane(x.src[1], 0))
+  return _rk_cmpeq_lower(x.src[0], x.src[1])
+
+def _rk_cmpne(x:UOp):
+  if x.tag == "shape_scalar": return None
+  if not all(_rk_has_shape(s) for s in x.src):
+    return UOp(Ops.STACK, x.dtype, tuple(_rk_raw_cmpne(_rk_lane(x.src[0], i), _rk_lane(x.src[1], i)) for i in range(x.dtype.count))) if x.dtype.count > 1 else _rk_raw_cmpne(_rk_lane(x.src[0], 0), _rk_lane(x.src[1], 0))
+  return _rk_cmpne_lower(x.src[0], x.src[1])
+
 RK_FP16_BYTES, RK_FP32_BYTES, RK_CBUF_ENTRY_BYTES, RK_CBUF_ENTRIES_PER_BANK = 2, 4, 128, 256
 RK_CBUF_BANKS, RK_MIN_CHANNEL_TILE, RK_LINE_STRIDE_GROUP_CAP = 12, 32, 13
 RK_CBUF_BANK_SIZE = RK_CBUF_ENTRIES_PER_BANK * RK_CBUF_ENTRY_BYTES
 RK_MIN_WIDE_FEATURE_GRAINS, RK_PC_CHAIN_TAIL_QWORDS = 80, 4
 RK_GEMM_INPUT_BANKS, RK_GEMM_MAX_ALIGN_IN = RK_CBUF_BANKS - 2, RK_CBUF_BANKS * RK_MIN_CHANNEL_TILE
 
-def _rk_ceil_div(x, y): return (x + y - 1) // y
-def _rk_align_up(x, align): return _rk_ceil_div(x, align) * align
+@dataclass(frozen=True)
+class CnaPlan:
+  m:int; n:int; k:int; src_itemsize:int; out_itemsize:int
+  batch:int=1; kind:str="gemm"; a_batch:bool=False
+  a_rows:int|None=None; a_cols:int|None=None; b_rows:int|None=None; b_cols:int|None=None
+
 def _rk_E(target, reg_addr, value): return (target << 48) | ((value & 0xFFFFFFFF) << 16) | reg_addr
 
 def _rk_gemm_layout(m, n, k):
-  aligned_k = max(RK_MIN_CHANNEL_TILE, _rk_align_up(k, RK_MIN_CHANNEL_TILE))
-  align_out = max(RK_MIN_CHANNEL_TILE, _rk_align_up(n, RK_MIN_CHANNEL_TILE))
+  aligned_k = max(RK_MIN_CHANNEL_TILE, round_up(k, RK_MIN_CHANNEL_TILE))
+  align_out = max(RK_MIN_CHANNEL_TILE, round_up(n, RK_MIN_CHANNEL_TILE))
   align_in = max(aligned_k, align_out)
   eff_k = align_in if align_in != aligned_k else k
   return align_in, align_out, eff_k
+
+def _rk_infer_mnk(out_elems:int, a_elems:int, b_elems:int) -> tuple[int, int, int]|None:
+  if min(out_elems, a_elems, b_elems) <= 0 or a_elems * b_elems % out_elems != 0: return None
+  k = math.isqrt(a_elems * b_elems // out_elems)
+  if k <= 0 or k*k*out_elems != a_elems*b_elems or a_elems % k != 0 or b_elems % k != 0: return None
+  m, n = a_elems // k, b_elems // k
+  if m*n != out_elems: return None
+  return m, n, k
+
+def _rk_cna_plan_from_mnk(m:int, n:int, k:int, src_itemsize:int, out_itemsize:int, batch:int=1, a_batch:bool=False) -> CnaPlan:
+  return CnaPlan(m, n, k, src_itemsize, out_itemsize, batch=batch, kind="gemm" if m != 1 and n != 1 else "gemv", a_batch=a_batch)
+
+def _rk_cna_square_plan(out_elems:int, a_elems:int, b_elems:int, src_itemsize:int, out_itemsize:int) -> CnaPlan|None:
+  out_side, a_side, b_side = math.isqrt(out_elems), math.isqrt(a_elems), math.isqrt(b_elems)
+  if out_side*out_side == out_elems and a_side*a_side == a_elems and b_side*b_side == b_elems and a_side == b_side and out_side >= a_side:
+    return CnaPlan(out_side, out_side, out_side, src_itemsize, out_itemsize, a_rows=a_side, a_cols=a_side, b_rows=b_side, b_cols=b_side)
+  return None
+
+def _rk_cna_batched_plan(out_elems:int, a_elems:int, b_elems:int, src_itemsize:int, out_itemsize:int, batch_hint:int, allow_small_k:bool) -> CnaPlan|None:
+  batch_candidates = (batch_hint,) if batch_hint > 1 else range(2, math.gcd(out_elems, math.gcd(a_elems, b_elems)) + 1)
+  best:CnaPlan|None = None
+  for batch in batch_candidates:
+    if out_elems % batch != 0 or a_elems % batch != 0 or b_elems % batch != 0: continue
+    if (infer := _rk_infer_mnk(out_elems // batch, a_elems // batch, b_elems // batch)) is None: continue
+    m, n, k = infer
+    if allow_small_k or k >= RK_MIN_CHANNEL_TILE:
+      plan = CnaPlan(m, n, k, src_itemsize, out_itemsize, batch=batch, kind="gemm", a_batch=True)
+      if best is None or k < best.k or (k == best.k and batch > best.batch): best = plan
+  return best
 
 def _rk_gemm_output_indices(m, n, align_out, out_fp16):
   row_stride = align_out * 2 if out_fp16 else align_out
@@ -680,10 +969,10 @@ def _rk_make_gemm_regs(m, n, k, in_dma, wt_dma, out_dma, out_fp16=False):
   align_in, align_out, eff_k = _rk_gemm_layout(m, n, k)
   input_row_bytes = align_in * RK_FP16_BYTES
   out_precision, size_e = (2, 1) if out_fp16 else (5, 3)
-  even_rows_per_two_banks = (_rk_ceil_div(2 * RK_CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
+  even_rows_per_two_banks = (ceildiv(2 * RK_CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
   feature_grains = max(RK_MIN_WIDE_FEATURE_GRAINS, even_rows_per_two_banks)
-  data_banks = int(np.clip(_rk_ceil_div(m * input_row_bytes, RK_CBUF_BANK_SIZE), 1, RK_CBUF_BANKS-1))
-  line_stride = 4 * min(_rk_ceil_div(eff_k, RK_MIN_CHANNEL_TILE), RK_LINE_STRIDE_GROUP_CAP)
+  data_banks = int(np.clip(ceildiv(m * input_row_bytes, RK_CBUF_BANK_SIZE), 1, RK_CBUF_BANKS-1))
+  line_stride = 4 * min(ceildiv(eff_k, RK_MIN_CHANNEL_TILE), RK_LINE_STRIDE_GROUP_CAP)
   notch_val = 8 * min(align_out // RK_MIN_CHANNEL_TILE, RK_LINE_STRIDE_GROUP_CAP) - 1
   return [
     _rk_E(dpu, rk.REG_DPU_S_POINTER, (1 << 3) | (1 << 2) | (1 << 1)),
@@ -695,7 +984,7 @@ def _rk_make_gemm_regs(m, n, k, in_dma, wt_dma, out_dma, out_fp16=False):
     _rk_E(cna, rk.REG_CNA_DATA_SIZE2, 1), _rk_E(cna, rk.REG_CNA_DATA_SIZE3, m),
     _rk_E(cna, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes * align_out), _rk_E(cna, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes),
     _rk_E(cna, rk.REG_CNA_WEIGHT_SIZE2, (1 << 24) | (1 << 16) | align_out),
-    _rk_E(cna, rk.REG_CNA_CBUF_CON0, ((RK_CBUF_BANKS - data_banks) << 4) | data_banks), _rk_E(cna, rk.REG_CNA_CBUF_CON1, _rk_ceil_div(align_in, RK_MIN_CHANNEL_TILE)),
+    _rk_E(cna, rk.REG_CNA_CBUF_CON0, ((RK_CBUF_BANKS - data_banks) << 4) | data_banks), _rk_E(cna, rk.REG_CNA_CBUF_CON1, ceildiv(align_in, RK_MIN_CHANNEL_TILE)),
     _rk_E(cna, rk.REG_CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1), _rk_E(cna, rk.REG_CNA_CVT_CON1, 1 << 16),
     _rk_E(cna, rk.REG_CNA_CVT_CON2, 1 << 16), _rk_E(cna, rk.REG_CNA_CVT_CON3, 1 << 16), _rk_E(cna, rk.REG_CNA_CVT_CON4, 1 << 16),
     _rk_E(cna, rk.REG_CNA_FEATURE_DATA_ADDR, in_dma), _rk_E(cna, rk.REG_CNA_DMA_CON0, (15 << 16) | 15), _rk_E(cna, rk.REG_CNA_DMA_CON1, line_stride), _rk_E(cna, rk.REG_CNA_DMA_CON2, 0),
@@ -766,21 +1055,12 @@ class RockchipRenderer(Renderer):
     # (UPat.var("x", dtypes.floats) * UPat.const(dtypes.floats, 1).alu(Ops.FDIV,
     #   UPat.const(dtypes.floats, 1) + (UPat.var("x", dtypes.floats) * UPat.cvar("c", dtypes.floats, vec=False)).exp2()),
     #  lambda x, c: UOp(Ops.CUSTOM, x.dtype, src=(x,), arg="silu")),
-    (UPat(Ops.CMPLT, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, src=(x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
-                   arg="cmplt_diff2bool").cast(dtypes.bool)),
+    (UPat(Ops.CMPLT, name="x"), _rk_cmplt),
     (UPat(Ops.CMPEQ, name="x"),
-     lambda x: UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_32800_to_bool", src=(
-       UOp(Ops.CUSTOM, dtypes.float16, arg="cmpeq_diff_zero_to_nan_to_32800", src=(
-         x.src[1].cast(dtypes.float16).alu(Ops.SUB, x.src[0].cast(dtypes.float16)),),
-       ),
-     )).cast(dtypes.bool)),
+      _rk_cmpeq),
     # CMPNE(x) = 1 - CMPEQ(x)
     (UPat(Ops.CMPNE, name="x"),
-      lambda x: UOp.const(dtypes.float16, 1).alu(
-        Ops.SUB,
-        x.src[0].cast(dtypes.float16).alu(Ops.CMPEQ, x.src[1].cast(dtypes.float16)).cast(dtypes.float16)
-      ).cast(dtypes.bool)),
+      _rk_cmpne),
     # ax + b(1-x) 
     (UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a", dtypes.floats), UPat.var("b", dtypes.floats))),
      lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
@@ -789,6 +1069,11 @@ class RockchipRenderer(Renderer):
      lambda w,c,a,b: a.cast(dtypes.float16).alu(Ops.MUL, c.cast(dtypes.float16)).alu(Ops.ADD,
        b.cast(dtypes.float16).alu(Ops.MUL, UOp.const(dtypes.float16, 1).alu(Ops.SUB, c.cast(dtypes.float16)))).cast(w.dtype)),
   ])
+  post_matcher = PatternMatcher([
+    (UPat(Ops.CMPEQ, name="x"), _rk_cmpeq),
+    (UPat(Ops.CMPNE, name="x"), _rk_cmpne),
+  ])
+
   def _coalesce_wmma_to_cna(self, uops:list[UOp]):
     wmmas = [u for u in uops if u.op is Ops.WMMA and isinstance(u.arg, tuple) and len(u.arg) >= 6 and u.arg[4] == "ROCKCHIP"]
     if not wmmas: return None
@@ -803,12 +1088,35 @@ class RockchipRenderer(Renderer):
     meta = {
       "version": 1, "m": 1, "n": dims[0], "k": dims[2], "batch": 1,
       "a_dtype": dtype_in, "b_dtype": dtype_in, "c_dtype": dtype_out,
-      "acc_dtype": dtype_out, "out_dtype": dtype_out, "post_op": None,
+      "acc_dtype": dtype_out, "out_dtype": dtype_out,
       "atoms": len(wmmas), "dims": dims,
     }
+    sink = next((u for u in uops if u.op is Ops.SINK), None)
+    if sink is not None and getattr(sink.arg, "function_name", None):
+      nums = [int(x) for x in re.findall(r"\d+", sink.arg.function_name)]
+      if nums: meta["batch_hint"] = nums[0]
     if DEBUG >= 3:
       print(f"RKCNA_MATCH m={meta['m']} n={meta['n']} k={meta['k']} batch={meta['batch']} atoms={meta['atoms']} k_slices=1 c_slices=1 slots=(-1,-1,-1)")
     return meta
+
+  def _mark_wmma_cna_region(self, uops:list[UOp]) -> list[UOp]:
+    wmmas = [u for u in uops if u.op is Ops.WMMA and isinstance(u.arg, tuple) and len(u.arg) >= 6 and u.arg[4] == "ROCKCHIP"]
+    regs = [u for u in uops if u.op is Ops.DEFINE_REG and isinstance(u.dtype, PtrDType)]
+    params = [u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)]
+    if not wmmas or len(regs) != 1 or len(params) != 3: return uops
+    last_wmma = max(uops.index(u) for u in wmmas)
+    end = next((u for u in uops[last_wmma+1:] if u.op is Ops.END), None)
+    if end is None: return uops
+    tail_start = uops.index(end) + 1
+    if not any((u.op in GroupOp.ALU or u.op is Ops.CUSTOM) and u.dtype is not None and u.dtype.scalar() in dtypes.floats for u in uops[tail_start:]): return uops
+    out, a, b = params
+    out_elems, a_elems, b_elems = out.dtype.size, a.dtype.size, b.dtype.size
+    if (infer := _rk_infer_mnk(out_elems, a_elems, b_elems)) is None: return uops
+    m, n, k = infer
+    _, align_out, _ = _rk_gemm_layout(m, n, k)
+    if regs[0].max_numel() < (m - 1) * align_out + n: return uops
+    marker = UOp(Ops.NOOP, arg=("rkcna_region", regs[0], end))
+    return [marker] + uops
 
   @staticmethod
   def _root_params(u:UOp) -> set[UOp]:
@@ -817,7 +1125,219 @@ class RockchipRenderer(Renderer):
     for s in u.src: ret.update(RockchipRenderer._root_params(s))
     return ret
 
-  def _match_gemv_to_cna(self, uops:list[UOp]):
+  def _match_conv2d_to_cna(self, uops:list[UOp], params:list[UOp]|None=None):
+    params = [u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)] if params is None else params
+    if len(params) not in (3, 4): return None
+    out, a, b = params[:3]
+    if a.dtype.base.scalar() not in (dtypes.half, dtypes.float) or b.dtype.base.scalar() not in (dtypes.half, dtypes.float): return None
+    src_is_half = a.dtype.base.scalar() is dtypes.half and b.dtype.base.scalar() is dtypes.half
+    if out.dtype.base.scalar() not in (dtypes.half, dtypes.float): return None
+    if not any(u.op is Ops.STORE and out in self._root_params(u.src[0]) for u in uops): return None
+    out_elems, a_elems, b_elems = out.dtype.size, a.dtype.size, b.dtype.size
+    if out_elems == a_elems == b_elems: return None
+    sink = next((u for u in uops if u.op is Ops.SINK), None)
+    nums = [int(x) for x in re.findall(r"\d+", getattr(sink.arg, "function_name", ""))] if sink is not None else []
+    conv_candidates = []
+    if len(nums) >= 6:
+      conv_candidates += [(1, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]), (1, nums[1], nums[2], nums[0], nums[3], nums[4], nums[5])]
+    if len(nums) >= 7:
+      conv_candidates += [(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6]), (nums[0], nums[2], nums[3], nums[1], nums[4], nums[5], nums[6])]
+      conv_candidates.append((nums[2], nums[0], nums[1], nums[3], nums[4], nums[5], nums[6]))
+    if len(nums) == 4:
+      spatial = nums[0] * nums[2]
+      side = math.isqrt(spatial)
+      if side * side == spatial: conv_candidates.append((1, side, side, nums[1], nums[3], 1, 1))
+    if len(nums) == 2 and out_elems <= a_elems and b_elems % out_elems == 0:
+      conv_candidates.append((1, 1, 1, out_elems, a_elems, 1, 1))
+    if len(nums) == 2 and b_elems == 1 and out_elems == nums[0]*nums[1] and a_elems == max(nums[1]-2, 1)*max(nums[0]-2, 1):
+      meta = {
+        "version": 1, "kind": "conv2d", "m": out_elems, "n": 1, "k": 1, "batch": 1,
+        "oh": nums[1], "ow": nums[0], "ih": max(nums[1]-2, 1), "iw": max(nums[0]-2, 1), "cout": 1, "cin": 1, "cin_per_group": 1,
+        "kh": 1, "kw": 1, "groups": 1, "pad_top": 1, "pad_left": 1,
+        "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+        "src_itemsize": 2, "input_itemsize": a.dtype.base.scalar().itemsize, "weight_itemsize": b.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
+      }
+      if DEBUG >= 3: print(f"RKCNA_CONV2D_MATCH batch=1 oh={nums[1]} ow={nums[0]} cout=1 cin=1 kh=1 kw=1 groups=1 padding=1")
+      return meta
+    if not src_is_half: return None
+    def conv_meta(batch, oh, ow, cout, cin, kh, kw, ih, iw, cin_per_group=None, **extra):
+      cin_per_group = cin if cin_per_group is None else cin_per_group
+      if min(batch, oh, ow, cout, cin, kh, kw, ih, iw, cin_per_group) <= 0: return None
+      groups = cin // cin_per_group
+      if cin % cin_per_group or cout % groups or out_elems != batch*oh*ow*cout or a_elems != batch*cin*ih*iw or b_elems != cout*cin_per_group*kh*kw: return None
+      return {"version": 1, "kind": "conv2d", "m": batch*oh*ow, "n": cout, "k": cin*kh*kw, "batch": batch,
+        "oh": oh, "ow": ow, "ih": ih, "iw": iw, "cout": cout, "cin": cin, "cin_per_group": cin_per_group, "kh": kh, "kw": kw, "groups": groups,
+        "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+        "src_itemsize": 2, "input_itemsize": 2, "weight_itemsize": 2, "out_itemsize": out.dtype.base.scalar().itemsize, **extra}
+    if any(u.op is Ops.WMMA for u in uops) and out_elems == a_elems:
+      ch, spatial = math.isqrt(b_elems), out_elems // math.isqrt(b_elems) if b_elems > 0 and out_elems % math.isqrt(b_elems) == 0 else 0
+      side = math.isqrt(spatial)
+      if ch*ch == b_elems and side*side == spatial and (meta := conv_meta(1, side, side, ch, ch, 1, 1, side, side)) is not None: return meta
+    if len(nums) >= 6:
+      kh, kw = nums[-2], nums[-1]
+      for groups_hint in [x for x in nums if x > 1]:
+        for batch_hint in [x for x in nums if x > 0 and out_elems % x == 0 and a_elems % x == 0]:
+          for cin_per_group in range(1, b_elems + 1):
+            if b_elems % (cin_per_group*kh*kw): continue
+            cout, cin = b_elems // (cin_per_group*kh*kw), groups_hint*cin_per_group
+            if cout % groups_hint or a_elems % (batch_hint*cin) or out_elems % (batch_hint*cout): continue
+            in_area, out_area = a_elems // (batch_hint*cin), out_elems // (batch_hint*cout)
+            for ih in range(kh, in_area + 1):
+              if in_area % ih: continue
+              iw, oh, ow = in_area // ih, ih-kh+1, in_area//ih-kw+1
+              if oh > 0 and ow > 0 and oh*ow == out_area and (meta := conv_meta(batch_hint, oh, ow, cout, cin, kh, kw, ih, iw, cin_per_group=cin_per_group)) is not None: return meta
+    if len(nums) >= 8:
+      od, oh, ow, cout, cin, kd, kh, kw = nums[:8]
+      batch = out_elems // (od*oh*ow*cout) if od*oh*ow*cout else 0
+      id_, ih, iw = od+kd-1, oh+kh-1, ow+kw-1
+      if batch > 0 and out_elems == batch*od*oh*ow*cout and a_elems == batch*cin*id_*ih*iw and b_elems == cout*cin*kd*kh*kw:
+        return {"version": 1, "kind": "conv3d", "m": batch*od*oh*ow, "n": cout, "k": cin*kd*kh*kw, "batch": batch,
+          "od": od, "oh": oh, "ow": ow, "id": id_, "ih": ih, "iw": iw, "cout": cout, "cin": cin, "kd": kd, "kh": kh, "kw": kw,
+          "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(), "src_itemsize": 2, "input_itemsize": 2, "weight_itemsize": 2, "out_itemsize": out.dtype.base.scalar().itemsize}
+    if len(nums) >= 7:
+      oh, ow, batch, cout_hint, cin_hint, kh, kw = nums[:7]
+      best_meta, best_score = None, (-1, -1, -1, -1)
+      def score_meta(meta):
+        groups, cout, cin, cin_per_group, cand_ow = (int(meta[x]) for x in ("groups", "cout", "cin", "cin_per_group", "ow"))
+        return (groups in nums, cin == cin_hint or cin_per_group in nums, cout in nums or cout//groups in nums, cand_ow in nums or any(x > 0 and cand_ow % x == 0 and cand_ow//x in nums for x in nums))
+      def consider(meta):
+        nonlocal best_meta, best_score
+        if meta is None: return
+        score = score_meta(meta)
+        if score > best_score: best_meta, best_score = meta, score
+      cin_candidates = [x for x in range(1, min(a_elems, b_elems) + 1) if a_elems % (batch*x) == 0 and b_elems % (x*kh*kw) == 0]
+      cin_candidates.sort(key=lambda x: (x != cin_hint, -x))
+      for cin in cin_candidates:
+        if a_elems % (batch*cin) != 0 or b_elems % (cin*kh*kw) != 0: continue
+        area, cout = a_elems // (batch*cin), b_elems // (cin*kh*kw)
+        ows = {ow}
+        if batch*oh*cout > 0 and out_elems % (batch*oh*cout) == 0: ows.add(out_elems // (batch*oh*cout))
+        ih = math.isqrt(area)
+        for cand_ow in ows:
+          if ih*ih == area: consider(conv_meta(batch, oh, cand_ow, cout, cin, kh, kw, ih, ih, transpose=oh > ih or cand_ow > ih, pad_top=max(oh-ih, 0), pad_left=max(cand_ow-ih, 0), tmp_out_itemsize=4 if oh > ih or cand_ow > ih else out.dtype.base.scalar().itemsize))
+        for ih in range(max(oh, 1), area + 1):
+          if area % ih: continue
+          iw = area // ih
+          for cand_ow in ows:
+            for stride_h in range(1, 5):
+              for stride_w in range(1, 5):
+                rem_h, rem_w = ih - 1 - (oh-1)*stride_h, iw - 1 - (cand_ow-1)*stride_w
+                if rem_h < 0 or rem_w < 0 or rem_h % max(kh-1, 1) or rem_w % max(kw-1, 1): continue
+                dil_h, dil_w = rem_h // max(kh-1, 1), rem_w // max(kw-1, 1)
+                if dil_h > 0 and dil_w > 0: consider(conv_meta(batch, oh, cand_ow, cout, cin, kh, kw, ih, iw, stride_h=stride_h, stride_w=stride_w, dil_h=dil_h, dil_w=dil_w))
+      if best_meta is not None: return best_meta
+      if nums[-1] > 0:
+        kh = kw = nums[-2]
+        for cin in range(1, nums[-1] + 1):
+          if nums[-1] % cin: continue
+          batch, oh, ow = nums[3], nums[1], nums[2]
+          ih, iw = oh + kh - 1, ow + kw - 1
+          cout = out_elems // (batch*oh*ow) if batch*oh*ow else 0
+          if (meta := conv_meta(batch, oh, ow, cout, cin, kh, kw, ih, iw, layout="nhwc", weight_layout="hwio")) is not None: return meta
+    if len(nums) == 3 and b_elems == nums[2] and out_elems == nums[0]*nums[1] and a_elems % nums[0] == 0:
+      batch, oh, kh = nums[0], nums[1], nums[2]
+      ih = a_elems // batch
+      if oh > 1 and ih == (oh-1)*2 + kh:
+        meta = {
+          "version": 1, "kind": "conv2d", "m": out_elems, "n": 1, "k": kh, "batch": batch,
+          "oh": oh, "ow": 1, "ih": ih, "iw": 1, "cout": 1, "cin": 1, "cin_per_group": 1,
+          "kh": kh, "kw": 1, "groups": 1, "stride_h": 2, "stride_w": 2,
+          "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+          "src_itemsize": a.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
+        }
+        if DEBUG >= 3: print(f"RKCNA_CONV2D_MATCH batch={batch} oh={oh} ow=1 cout=1 cin=1 kh={kh} kw=1 groups=1 stride=2")
+        return meta
+    if len(nums) >= 4 and out_elems == a_elems and b_elems > 0:
+      side = math.isqrt(out_elems // b_elems) if out_elems % b_elems == 0 else 0
+      if side * side * b_elems == out_elems: conv_candidates.append((1, side, side, b_elems, b_elems, 1, 1))
+    if len(nums) > 6 and any(u.op is Ops.WMMA for u in uops) and out_elems == a_elems:
+      side = math.isqrt(out_elems // math.isqrt(b_elems)) if b_elems > 0 else 0
+      ch = math.isqrt(b_elems)
+      if ch*ch == b_elems and side*side*ch == out_elems: conv_candidates.append((1, side, side, ch, ch, 1, 1))
+    for batch, oh, ow, cout, cin, kh, kw in conv_candidates:
+      ih, iw = oh + kh - 1, ow + kw - 1
+      if out_elems != batch*oh*ow*cout or a_elems != batch*cin*ih*iw or b_elems % (cout*kh*kw) != 0: continue
+      cin_per_group = b_elems // (cout*kh*kw)
+      if cin_per_group <= 0 or cin % cin_per_group != 0: continue
+      groups = cin // cin_per_group
+      if cout % groups != 0: continue
+      if b_elems == cout*cin_per_group*kh*kw:
+        meta = {
+          "version": 1, "kind": "conv2d", "m": batch*oh*ow, "n": cout, "k": cin*kh*kw, "batch": batch,
+          "oh": oh, "ow": ow, "ih": ih, "iw": iw, "cout": cout, "cin": cin, "cin_per_group": cin_per_group, "kh": kh, "kw": kw, "groups": groups,
+          "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+          "src_itemsize": a.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
+        }
+        if len(params) == 4: meta["bias"] = True
+        if DEBUG >= 3: print(f"RKCNA_CONV2D_MATCH batch={batch} oh={oh} ow={ow} cout={cout} cin={cin} kh={kh} kw={kw} groups={groups}")
+        return meta
+    return None
+
+  def _match_conv1d_to_cna(self, uops:list[UOp]):
+    params = [u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)]
+    if len(params) != 3: return None
+    out, a, b = params
+    if a.dtype.base.scalar() is not dtypes.half or b.dtype.base.scalar() is not dtypes.half: return None
+    if out.dtype.base.scalar() not in (dtypes.half, dtypes.float): return None
+    if not any(u.op is Ops.STORE and out in self._root_params(u.src[0]) for u in uops): return None
+    sink = next((u for u in uops if u.op is Ops.SINK), None)
+    nums = [int(x) for x in re.findall(r"\d+", getattr(sink.arg, "function_name", ""))] if sink is not None else []
+    if len(nums) not in (3, 4, 5, 6, 7): return None
+    out_elems, a_elems, b_elems = out.dtype.size, a.dtype.size, b.dtype.size
+    def make_meta(batch:int, ol:int, cout:int, kw:int):
+      if min(batch, ol, cout, kw) <= 0: return None
+      il = ol + kw - 1
+      if a_elems % (batch * il) != 0 or out_elems != batch * cout * ol or b_elems % (cout * kw) != 0: return None
+      cin, cin_per_group = a_elems // (batch * il), b_elems // (cout * kw)
+      if cin_per_group <= 0 or cin % cin_per_group != 0: return None
+      groups = cin // cin_per_group
+      if cout % groups != 0: return None
+      meta = {
+        "version": 1, "kind": "conv1d", "m": batch*ol, "n": cout, "k": cin*kw, "kw": kw, "batch": batch,
+        "cin": cin, "il": il, "cout": cout, "cin_per_group": cin_per_group, "ol": ol, "groups": groups,
+        "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+        "src_itemsize": a.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
+      }
+      if DEBUG >= 3: print(f"RKCNA_CONV1D_MATCH batch={batch} cin={cin} il={il} cout={cout} k={kw} ol={ol} groups={groups}")
+      return meta
+    name_candidates = []
+    if len(nums) == 3: name_candidates.append((1, nums[1], nums[0]*nums[2], 1))
+    elif len(nums) == 4:
+      name_candidates += [(nums[2], nums[1], nums[0]*nums[3], 1), (1, nums[1], nums[0]*nums[2], 1),
+        (1, nums[1], nums[0]*nums[2], nums[3]), (1, nums[0], nums[1]*nums[2], nums[3])]
+    elif len(nums) == 5:
+      name_candidates += [(nums[2], nums[1], nums[0]*nums[3], 1), (1, nums[0]*nums[1], nums[2]*nums[3], nums[4]), (nums[2], nums[1], nums[0]*nums[3], nums[4]),
+        (1, nums[1], nums[0]*nums[2], nums[4]), (nums[1], nums[0], nums[2]*nums[3], nums[4])]
+    elif len(nums) == 6:
+      name_candidates += [(nums[2], nums[0]*nums[1], nums[3]*nums[4], nums[5]), (1, nums[0]*nums[1], nums[2]*nums[3], nums[4]),
+        (nums[2], nums[1], nums[0]*nums[3], nums[5])]
+    elif len(nums) == 7:
+      name_candidates.append((nums[2], nums[0]*nums[1], nums[3]*nums[4], nums[5]))
+    for candidate in name_candidates:
+      if (meta := make_meta(*candidate)) is not None: return meta
+    if name_candidates: return None
+    best = None
+    for batch in range(1, min(8, a_elems, out_elems) + 1):
+      if a_elems % batch != 0 or out_elems % batch != 0: continue
+      for cin in range(1, a_elems // batch + 1):
+        if (a_elems // batch) % cin != 0: continue
+        il = a_elems // (batch * cin)
+        for k in range(1, il + 1):
+          ol = il - k + 1
+          if ol <= 0 or out_elems % (batch * ol) != 0: continue
+          cout = out_elems // (batch * ol)
+          if b_elems % (cout * k) != 0: continue
+          cin_per_group = b_elems // (cout * k)
+          if cin_per_group <= 0 or cin % cin_per_group != 0: continue
+          groups = cin // cin_per_group
+          if cout % groups != 0: continue
+          score = (k, groups, batch)
+          if best is None or score > best[0]: best = (score, batch, cin, il, cout, cin_per_group, k, ol, groups)
+    if best is None: return None
+    _, batch, cin, il, cout, cin_per_group, k, ol, groups = best
+    return make_meta(batch, ol, cout, k)
+
+  def _match_direct_to_cna(self, uops:list[UOp]):
     if any(u.op is Ops.WMMA for u in uops): return None
     if any(u.op in {Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD} for u in uops): return None
     params = [u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)]
@@ -835,34 +1355,69 @@ class RockchipRenderer(Renderer):
                b in self._root_params(u.src[0]) | self._root_params(u.src[1]) for u in uops): return None
     if not any(u.op is Ops.ADD for u in uops): return None
     out_elems, a_elems, b_elems = out.dtype.size, a.dtype.size, b.dtype.size
-    if min(out_elems, a_elems, b_elems) <= 0 or a_elems * b_elems % out_elems != 0: return None
-    k = math.isqrt(a_elems * b_elems // out_elems)
-    if k <= 0 or k*k*out_elems != a_elems*b_elems or a_elems % k != 0 or b_elems % k != 0: return None
-    m, n = a_elems // k, b_elems // k
-    if m*n != out_elems or (m != 1 and n != 1): return None
+    sink = next((u for u in uops if u.op is Ops.SINK), None)
+    nums = [int(x) for x in re.findall(r"\d+", getattr(sink.arg, "function_name", ""))] if sink is not None else []
+    conv_candidates = []
+    if len(nums) >= 6:
+      conv_candidates += [(1, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]), (1, nums[1], nums[2], nums[0], nums[3], nums[4], nums[5])]
+    if len(nums) >= 7:
+      conv_candidates += [(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6]), (nums[0], nums[2], nums[3], nums[1], nums[4], nums[5], nums[6])]
+    if len(nums) == 4:
+      spatial = nums[0] * nums[2]
+      side = math.isqrt(spatial)
+      if side * side == spatial: conv_candidates.append((1, side, side, nums[1], nums[3], 1, 1))
+    for batch, oh, ow, cout, cin, kh, kw in conv_candidates:
+      ih, iw = oh + kh - 1, ow + kw - 1
+      if out_elems == batch*oh*ow*cout and a_elems == batch*cin*ih*iw and b_elems == cout*cin*kh*kw:
+        meta = {
+          "version": 1, "kind": "conv2d", "m": batch*oh*ow, "n": cout, "k": cin*kh*kw, "batch": batch,
+          "oh": oh, "ow": ow, "ih": ih, "iw": iw, "cout": cout, "cin": cin, "kh": kh, "kw": kw,
+          "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
+          "src_itemsize": a.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
+        }
+        if DEBUG >= 3: print(f"RKCNA_CONV2D_MATCH batch={batch} oh={oh} ow={ow} cout={cout} cin={cin} kh={kh} kw={kw}")
+        return meta
+    if (infer := _rk_infer_mnk(out_elems, a_elems, b_elems)) is None: return None
+    m, n, k = infer
     out_ranges = [u for u in uops if u.op is Ops.RANGE and isinstance(u.arg, tuple) and len(u.arg) > 1 and u.arg[1] is not AxisType.REDUCE]
     if len(out_ranges) > 1: return None
     batch = 1
-    sink = next((u for u in uops if u.op is Ops.SINK), None)
     local_opts = [x for x in (getattr(sink.arg, "applied_opts", ()) if sink is not None else ()) if getattr(getattr(x, "op", None), "name", None) == "LOCAL"]
-    if n != 1 and len(local_opts) > 1:
-      candidates = sorted([int(x.arg) for x in local_opts if isinstance(x.arg, int) and x.arg > 1], reverse=True)
-      batch = next((x for x in candidates if n % x == 0), 1)
-      if batch == 1: return None
-      n //= batch
+    if n != 1 and local_opts:
+      candidates = sorted({int(x.arg) for x in local_opts if isinstance(x.arg, int) and x.arg > 1}, reverse=True)
+      if a_elems * b_elems % out_elems == 0:
+        k_broadcast = math.isqrt(a_elems * b_elems // out_elems)
+      else: k_broadcast = 0
+      for candidate in candidates:
+        if candidate >= n: continue
+        if k_broadcast <= 0 or k_broadcast*k_broadcast*out_elems != a_elems*b_elems or (k_broadcast > 16 and candidate <= 4): continue
+        k_candidate = k_broadcast
+        if a_elems % k_candidate != 0 or b_elems % (candidate * k_candidate) != 0: continue
+        m_candidate, n_candidate = a_elems // k_candidate, b_elems // (candidate * k_candidate)
+        if m_candidate * n_candidate * candidate == out_elems and b_elems > a_elems:
+          batch, m, n, k = candidate, m_candidate, n_candidate, k_candidate
+          break
+    kind = "gemv" if m == 1 or n == 1 else "gemm"
     meta = {
-      "version": 1, "kind": "gemv", "m": m, "n": n, "k": k, "batch": batch,
+      "version": 1, "kind": kind, "m": m, "n": n, "k": k, "batch": batch,
       "a_dtype": a.dtype.base.scalar(), "b_dtype": b.dtype.base.scalar(), "out_dtype": out.dtype.base.scalar(),
       "src_itemsize": a.dtype.base.scalar().itemsize, "out_itemsize": out.dtype.base.scalar().itemsize,
     }
-    if DEBUG >= 3: print(f"RKCNA_GEMV_MATCH m={m} n={n} k={k} batch={batch}")
+    if DEBUG >= 3: print(f"{'RKCNA_GEMV_MATCH' if kind == 'gemv' else 'RKCNA_DIRECT_MATCH'} m={m} n={n} k={k} batch={batch}")
     return meta
 
   def render(self, uops:list[UOp]) -> str:
+    if (meta := self._match_conv1d_to_cna(uops)) is not None:
+      return base64.b64encode(pickle.dumps(("rkcna_conv2d_v1", meta, uops))).decode()
+    if (meta := self._match_conv2d_to_cna(uops)) is not None:
+      if meta.get("bias"):
+        return base64.b64encode(pickle.dumps(("rkcna_v1", meta, [UOp(Ops.NOOP, arg=("rkcna_conv_region",))] + uops))).decode()
+      return base64.b64encode(pickle.dumps(("rkcna_conv2d_v1", meta, uops))).decode()
     if (meta := self._coalesce_wmma_to_cna(uops)) is not None:
-      return base64.b64encode(pickle.dumps(("rkcna_v1", meta, uops))).decode()
-    if (meta := self._match_gemv_to_cna(uops)) is not None:
-      return base64.b64encode(pickle.dumps(("rkcna_gemv_v1", meta, uops))).decode()
+      return base64.b64encode(pickle.dumps(("rkcna_v1", meta, self._mark_wmma_cna_region(uops)))).decode()
+    if (meta := self._match_direct_to_cna(uops)) is not None:
+      kind = "rkcna_conv2d_v1" if meta["kind"] == "conv2d" else "rkcna_gemv_v1" if meta["kind"] == "gemv" else "rkcna_direct_v1"
+      return base64.b64encode(pickle.dumps((kind, meta, uops))).decode()
     return base64.b64encode(pickle.dumps(uops)).decode()
   
 class RockchipAllocator(Allocator['RockchipDevice']):

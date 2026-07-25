@@ -595,3 +595,113 @@ Rockchip runtime submits one CNA job for the whole coalesced region.
 ```
 
 This uses the existing tensor-core machinery for readability, while still respecting how RK3588 actually executes through CNA/CBUF/CMAC/DPU.
+
+## Current Bring-Up Status
+
+Implemented so far:
+
+1. Rockchip has a default tensor-core marker in `tinygrad/codegen/opt/tc.py` with `dims=(16,1,32)` for `AtomicC=16` and `AtomicK=32`.
+2. `RockchipRenderer` enables this marker by default; generic `TC=0` still disables the tensor-core path.
+3. `RockchipRenderer.render` coalesces Rockchip `Ops.WMMA` atoms by default and serializes `("rkcna_v1", meta, fallback_uops)`.
+4. `RockchipProgram` recognizes `rkcna_v1` and routes execution through `_run_cna_group` instead of executing individual `Ops.WMMA` atoms.
+5. `_run_cna_group` currently supports the dense square GEMM layout used by `test_gemm_fp16` and writes the output buffer directly.
+
+Recent test sweep with `DEV=ROCKCHIP FORWARD_ONLY=1` over GEMM/matmul/dot-related `test/backend/test_ops.py` cases:
+
+```text
+PASS: test_gemm_fp16
+PASS: test_gemm_with_zeros_shape
+PASS: test_scaled_dot_product_attention_gqa_errors
+PASS: test_small_gemm_eye
+PASS: test_small_gemm_range
+
+FAIL numeric precision on old non-WMMA path:
+  test_9_gemm
+  test_small_gemm
+  test_dot_1d
+  test_matmul
+  test_matmul_batched
+  test_matmul_batched_vector
+  test_matmul_simple
+
+TIMEOUT on old non-WMMA path:
+  test_big_gemm
+  test_broadcastdot
+  test_dot
+  test_gemm
+  test_multidot
+
+FAIL existing Rockchip CMPEQ/shape rewrite issue:
+  test_small_gemm_padded
+  test_scaled_dot_product_attention
+  test_scaled_dot_product_attention_causal
+  test_scaled_dot_product_attention_gqa
+  test_scaled_dot_product_attention_mismatch_ls
+```
+
+Next debug/fix order:
+
+1. Route regular dense float GEMM tests through RKCNA instead of the old scalar half-precision Rockchip path.
+2. Extend `_run_cna_group` shape inference beyond square `M=N=K` to vector, matvec, batched, and rectangular GEMM layouts.
+3. Fix or bypass the existing Rockchip `Ops.CMPEQ` rewrite shape assertion for padded and attention cases.
+4. Re-run each GEMM-related `test_ops.py` case one by one and update this status table.
+
+Latest correction after review:
+
+The temporary CPU-compute shortcuts used during test triage were removed. In particular:
+
+1. `_run_cna_group` no longer computes GEMM with NumPy.
+2. The temporary float-input and `8x8x8` Rockchip WMMA markers were removed.
+3. Broad Python ALU fallback was removed; the previous narrow fallback behavior was restored.
+4. The original float-to-half Rockchip ALU rewrites were restored.
+
+Current honest state:
+
+1. `Ops.WMMA` detection and `rkcna_v1` dispatch are wired.
+2. `_run_cna_group` now uses the RK3588 GEMM register path ported from `~/rk3588/examples/gemm.py`.
+3. The runtime packs fp16 input and weight buffers, emits CNA/CORE/DPU register qwords, submits one blocking RKNPU job, syncs the DPU output surface, and unpacks the logical output into the tinygrad output buffer.
+4. `test_gemm_fp16` now passes through the hardware RKCNA path.
+
+Previous CPU-shortcut rerun status, no longer valid as hardware verification:
+
+```text
+PASS: test_9_gemm
+PASS: test_small_gemm
+PASS: test_matmul_simple
+PASS: test_matmul_batched
+PASS: test_gemm_fp16
+
+STILL FAILS / NOT YET COVERED: test_dot_1d
+  failing subcase: (65) @ (65,45)
+  current category: vector/matvec and non-square RKCNA shape inference
+```
+
+Hardware verification command:
+
+```bash
+DEV=ROCKCHIP FORWARD_ONLY=1 DEBUG=3 uv run pytest -q test/backend/test_ops.py::TestOps::test_gemm_fp16
+```
+
+Latest result: pass.
+
+Additional shape coverage after hardware `_run_cna_group`:
+
+```text
+PASS: M=16 N=16 K=16 fp16
+PASS: M=32 N=32 K=32 fp16
+PASS: M=64 N=64 K=32 fp16
+PASS: M=16 N=16 K=64 fp16
+PASS: M=16 N=8  K=32 fp16
+PASS: M=8  N=16 K=32 fp16
+
+FAIL before RKCNA: M=4 N=17 K=33
+  reason: existing Rockchip Ops.CMPEQ shape rewrite assertion
+
+FAIL old scalar path: test_dot_1d first scalar-dot subcase (65) @ (65)
+  reason: does not emit Ops.WMMA/RKCNA; old scalar path is slow and fp16-imprecise
+```
+
+For vector/matvec, `NOOP=1` is not a correctness fix. The right fix is either:
+
+1. Make TC scheduling emit the Rockchip marker for scalar dot/matvec shapes, then run them as RKCNA with logical `M=1` and/or `N=1`.
+2. Add a Rockchip-specific pattern/coalescer for dense `REDUCE_ADD(MUL(load, load))` that emits `rkcna_v1` directly for scalar dot and matvec when generic TC does not choose WMMA.

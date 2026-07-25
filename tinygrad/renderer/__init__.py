@@ -76,6 +76,7 @@ class Renderer:
   tensor_cores: list[TensorCore] = []
   pre_matcher: PatternMatcher|None = None
   extra_matcher: PatternMatcher|None = None
+  post_matcher: PatternMatcher|None = None
   code_for_op: dict[Ops, Callable] = {}
   new_style: bool = False
 
