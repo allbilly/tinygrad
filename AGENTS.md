@@ -4,3 +4,10 @@
 - Run `python -m mypy tinygrad/` to typecheck
 - Run `python -m ruff check .` to lint
 - Read `./tinygrad/viz/README` for profiling
+
+# NPU
+u can clone any needed reference repo into ref/ with git clone --depth=1
+
+- allbilly/npu
+- allbilly/rk3588
+- other branches in this repo

@@ -79,6 +79,7 @@ class Renderer:
   def __reduce__(self): return self.__class__, (self.target,)
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
+  def native_program(self, ast:UOp) -> UOp|None: return None
   def supported_dtypes(self) -> set[DType]:
     # double can't be bitcast to anything without long support
     return set(dtypes.all) - ({dtypes.double} if dtypes.long in EMULATED_DTYPES.tolist(dtypes) else set())

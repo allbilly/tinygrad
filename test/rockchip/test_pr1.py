@@ -1,0 +1,331 @@
+# PR 1 hardware-free tests: classifier, emitter, codec, determinism.
+# These tests do not require an NPU and run under DEV=NULL.
+import unittest, struct
+from tinygrad import Tensor, dtypes
+from tinygrad.codegen import early_simplify
+from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
+from tinygrad.codegen import pm_to_program
+from tinygrad.runtime.support.rockchip import plan_rk, emit_rk, encode_rk, decode_rk, build_native_program, RKPlan
+from tinygrad.runtime.ops_rockchip import RockchipRenderer
+from tinygrad.helpers import Target
+
+def _get_sink(expr):
+  lin = expr.schedule_linear()
+  ks = [c.src[0] for c in lin.src if c.src[0].op is Ops.SINK]
+  return early_simplify(ks[0])
+
+def _classify(sink):
+  result = plan_rk(sink)
+  return result.kind if isinstance(result, RKPlan) else result
+
+def _emit(sink):
+  plan = plan_rk(sink)
+  assert isinstance(plan, RKPlan), f"plan_rk returned reject: {plan}"
+  return emit_rk(plan)
+
+class TestClassifier(unittest.TestCase):
+  def test_dpu_add(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
+
+  def test_dpu_mul_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a*b)))
+
+  def test_dpu_sub_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a-b)))
+
+  def test_dpu_neg_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(-a)))
+
+  def test_dpu_copy_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a+0)))
+
+  def test_dpu_scalar_add_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a+1)))
+
+  def test_dpu_scalar_mul_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a*2)))
+
+  def test_dpu_scalar_max_rejected(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.maximum(1))))
+
+  def test_dpu_single_element(self):
+    a = Tensor.rand(1,1,dtype=dtypes.half).realize()
+    b = Tensor.rand(1,1,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
+
+  def test_cmac_matmul(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a@b)), "cmac")
+
+  def test_ppu_max(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
+
+  def test_reject_int(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize().cast(dtypes.int)
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize().cast(dtypes.int)
+    self.assertTrue(_classify(_get_sink(a+b)).startswith("RKPLAN_REJECT"))
+
+  def test_reject_float32(self):
+    a = Tensor.rand(4,4,dtype=dtypes.float).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.float).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a+b)))
+
+  def test_reject_r2_sum(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.sum())))
+
+  def test_reject_broadcast(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a+b)))
+
+  def test_reject_transpose(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.T+b)))
+
+  def test_reject_ppu_wrong_channels(self):
+    a = Tensor.rand(8,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.max(axis=1))))
+
+  def test_reject_cmac_transposed_b(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a@b.T)))
+
+  def test_reject_cmac_transposed_a(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.T@b)))
+
+  def test_reject_cmac_gemv(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    v = Tensor.rand(4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a@v)))
+
+  def test_reject_ppu_k_too_large(self):
+    a = Tensor.rand(64,8,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.max(axis=0))))
+
+  def test_reject_cmac_strided_a(self):
+    a = Tensor.rand(8,4,dtype=dtypes.half).realize()
+    b = Tensor.eye(4, dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a[::2]@b)))
+
+  def test_cmac_same_buffer(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a@a)), "cmac")
+
+  def test_reject_raises_runtime_error(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,dtype=dtypes.half).realize()
+    sink = _get_sink(a+b)
+    with self.assertRaises(RuntimeError) as cm:
+      build_native_program(sink)
+    self.assertIn("RKPLAN_REJECT", str(cm.exception))
+
+  def test_reject_cmac_exceeds_cbuf(self):
+    # M=6000 with K=4: align_in=32, input_row_bytes=64, data_banks=ceil(6000*64/32768)=12 > 11
+    a = Tensor.rand(6000,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    sink = _get_sink(a@b)
+    with self.assertRaises(RuntimeError) as cm:
+      build_native_program(sink)
+    self.assertIn("RKPLAN_REJECT", str(cm.exception))
+
+class TestEmitter(unittest.TestCase):
+  def test_dpu_emits_commands(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    cmds, task, relocs = _emit(_get_sink(a+b))
+    self.assertGreater(len(cmds), 0)
+    self.assertEqual(len(relocs), 3)
+    self.assertEqual(task.enable_mask, 0x18)
+
+  def test_dpu_inplace_add_emits(self):
+    # a.assign(a+b) — in-place ADD where output slot == input slot A
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    c = a.assign(a+b)
+    cmds, task, relocs = _emit(_get_sink(c))
+    self.assertGreater(len(cmds), 0)
+    self.assertEqual(len(relocs), 3)
+    # relocs[0]=out, relocs[1]=a, relocs[2]=b; out==a for in-place
+    self.assertEqual(relocs[0].globals_slot, relocs[1].globals_slot)
+
+  def test_cmac_emits_commands(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    cmds, task, relocs = _emit(_get_sink(a@b))
+    self.assertGreater(len(cmds), 0)
+    self.assertEqual(len(relocs), 3)
+    self.assertEqual(task.enable_mask, 0xd)
+
+  def test_cmac_same_buffer_emits(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    cmds, task, relocs = _emit(_get_sink(a@a))
+    self.assertGreater(len(cmds), 0)
+    self.assertEqual(len(relocs), 3)
+    self.assertEqual(relocs[0].globals_slot, relocs[1].globals_slot)
+    self.assertEqual(task.enable_mask, 0xd)
+
+  def test_ppu_emits_commands(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    cmds, task, relocs = _emit(_get_sink(a.max(axis=0)))
+    self.assertGreater(len(cmds), 0)
+    self.assertEqual(len(relocs), 2)
+    self.assertEqual(task.enable_mask, 0x60)
+
+  def test_relocs_reference_valid_cmds(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    sink = _get_sink(a+b)
+    pi = ProgramInfo.from_sink(sink)
+    cmds, task, relocs = _emit(sink)
+    for r in relocs:
+      self.assertLess(r.word_index, len(cmds))
+      self.assertIn(r.globals_slot, pi.globals)
+
+class TestCodec(unittest.TestCase):
+  def test_roundtrip_dpu(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    cmds, task, relocs = _emit(_get_sink(a+b))
+    packed = encode_rk(cmds, task, relocs)
+    dec_cmds, dec_task, dec_relocs = decode_rk(packed)
+    self.assertEqual(len(dec_cmds), len(cmds))
+    self.assertEqual(len(dec_relocs), len(relocs))
+    self.assertEqual(dec_task.enable_mask, task.enable_mask)
+    self.assertEqual(dec_task.int_mask, task.int_mask)
+    for c1, c2 in zip(cmds, dec_cmds):
+      self.assertEqual(c1, c2)
+
+  def test_determinism(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    cmds, task, relocs = _emit(_get_sink(a+b))
+    self.assertEqual(encode_rk(cmds, task, relocs), encode_rk(cmds, task, relocs))
+
+  def test_determinism_across_compiles(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    def compile_once():
+      sink = _get_sink(a+b)
+      prg = build_native_program(sink)
+      r = RockchipRenderer(Target())
+      final = graph_rewrite(prg, pm_to_program, ctx=r, name='linearize/render')
+      for s in final.src:
+        if s.op == Ops.BINARY: return s.arg
+      return None
+    self.assertEqual(compile_once(), compile_once())
+
+  def test_no_pickle_in_binary(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    sink = _get_sink(a+b)
+    prg = build_native_program(sink)
+    r = RockchipRenderer(Target())
+    final = graph_rewrite(prg, pm_to_program, ctx=r, name='linearize/render')
+    for s in final.src:
+      if s.op == Ops.BINARY:
+        binary = s.arg
+        self.assertNotEqual(binary[0], 0x80)
+        magic = struct.unpack_from("<I", binary, 0)[0]
+        self.assertEqual(magic, 0x524b494d)
+        break
+
+  def test_decode_bad_magic(self):
+    header = struct.pack("<IIIIIIIIi", 0xDEAD, 2, 0, 0, 0, 0, 0, 0, 0)
+    with self.assertRaises(RuntimeError) as cm: decode_rk(header)
+    self.assertIn("bad magic", str(cm.exception))
+
+  def test_decode_truncated_header(self):
+    with self.assertRaises(RuntimeError) as cm: decode_rk(b'\x00' * 10)
+    self.assertIn("truncated header", str(cm.exception))
+
+  def test_decode_truncated_commands(self):
+    header = struct.pack("<IIIIIIIIi", 0x524b494d, 2, 100, 0, 0, 0, 0, 0, 0)
+    with self.assertRaises(RuntimeError) as cm: decode_rk(header)
+    self.assertIn("truncated commands", str(cm.exception))
+
+  def test_decode_out_of_range_reloc(self):
+    header = struct.pack("<IIIIIIIIi", 0x524b494d, 2, 1, 1, 0, 0, 0, 0, 0)
+    cmd = struct.pack("<Q", 0)
+    reloc = struct.pack("<IIIIII", 99, 0, 0, 0, 0, 0)
+    with self.assertRaises(RuntimeError) as cm: decode_rk(header + cmd + reloc)
+    self.assertIn("out of range", str(cm.exception))
+
+  def test_decode_bad_version(self):
+    header = struct.pack("<IIIIIIIIi", 0x524b494d, 99, 0, 0, 0, 0, 0, 0, 0)
+    with self.assertRaises(RuntimeError) as cm: decode_rk(header)
+    self.assertIn("version", str(cm.exception))
+
+  def test_decode_invalid_kind(self):
+    header = struct.pack("<IIIIIIIIi", 0x524b494d, 2, 0, 0, 0, 0, 0, (99 << 24), 0)
+    with self.assertRaises(RuntimeError) as cm: decode_rk(header)
+    self.assertIn("kind", str(cm.exception))
+
+  def test_decode_truncated_layout(self):
+    header = struct.pack("<IIIIIIIIi", 0x524b494d, 2, 0, 0, 0, 0, 0, (0 << 24) | 5, 0)
+    with self.assertRaises(RuntimeError) as cm: decode_rk(header)
+    self.assertIn("truncated layout", str(cm.exception))
+
+class TestPipeline(unittest.TestCase):
+  def _compile(self, expr):
+    sink = _get_sink(expr)
+    try: prg = build_native_program(sink)
+    except RuntimeError as e:
+      if "RKPLAN_REJECT" in str(e): return None
+      raise
+    r = RockchipRenderer(Target())
+    final = graph_rewrite(prg, pm_to_program, ctx=r, name='linearize/render')
+    for s in final.src:
+      if s.op == Ops.BINARY: return s.arg
+    return None
+
+  def test_add_produces_binary(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    binary = self._compile(a+b)
+    self.assertIsNotNone(binary)
+    self.assertGreater(len(binary), 24)
+
+  def test_matmul_produces_binary(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    binary = self._compile(a@b)
+    self.assertIsNotNone(binary)
+    self.assertGreater(len(binary), 24)
+
+  def test_max_produces_binary(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    binary = self._compile(a.max(axis=0))
+    self.assertIsNotNone(binary)
+    self.assertGreater(len(binary), 24)
+
+  def test_command_words_match_known_patterns(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    binary = self._compile(a+b)
+    dec_cmds, _, _ = decode_rk(binary)
+    pc_cmd = dec_cmds[-1]
+    target = (pc_cmd >> 48) & 0xFFFF
+    reg = pc_cmd & 0xFFFF
+    self.assertEqual(target, 0x81)
+    self.assertEqual(reg, 0x8)
+
+if __name__ == '__main__':
+  unittest.main()

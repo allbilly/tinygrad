@@ -255,28 +255,26 @@ pm_cast_float_alu = PatternMatcher([
    lambda u,x: u.replace(src=(x.cast(u.dtype),)) if x.dtype != u.dtype else None),
 ])
 
-def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
-  if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
-  if DEBUG >= 5: print(pyrender(ast))
-  if SPEC: type_verify(ast, spec_tensor)
-
-  # preprocess
+def early_simplify(ast:UOp, optimize:bool=True) -> UOp:
+  """Early simplification: movement ops, load collapse, range splitting, symbolic, simplify ranges.
+  This is the semantic interception point for fixed-function accelerators (called by do_to_program)."""
   sink = graph_rewrite(ast, pm_mops, name="early movement ops", bottom_up=True)
+  if optimize:
+    sink = graph_rewrite(sink, pm_load_collapse, name="load collapse")
+    sink = graph_rewrite(sink, pm_split_ranges+pm_flatten_range, ctx={}, name="split ranges")
+    sink = graph_rewrite(sink, sym+pm_flatten_range, name="initial symbolic")
+    sink = graph_rewrite(sink, pm_flatten_range+pm_simplify_ranges, ctx={}, name="simplify ranges")
+  return sink
+
+def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True, _early_sink:UOp|None=None) -> UOp:
+  if DEBUG >= 5: print(pyrender(ast))
+  # VIZ/SPEC are handled by the caller (do_to_program) before early_simplify
+
+  # preprocess + early simplification
+  sink = _early_sink if _early_sink is not None else early_simplify(ast, optimize)
 
   # first we optimize
   if optimize:
-    # collapse loads reduce (indexing by a tensor)
-    sink = graph_rewrite(sink, pm_load_collapse, name="load collapse")
-
-    # split ranges
-    sink = graph_rewrite(sink, pm_split_ranges+pm_flatten_range, ctx={}, name="split ranges")
-
-    # symbolic (NOTE: this is a requirement for pm_simplify_ranges to be correct)
-    sink = graph_rewrite(sink, sym+pm_flatten_range, name="initial symbolic")
-
-    # optimize (schedule) the AST
-    sink = graph_rewrite(sink, pm_flatten_range+pm_simplify_ranges, ctx={}, name="simplify ranges")
-
     # do postrange optimization, BEAM or hand_coded_optimizations
     sink = apply_opts(sink, ren, beam=ast.arg.beam)
 
@@ -435,15 +433,22 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   if ast.op is Ops.PROGRAM: prg = ast
   elif ast.op is Ops.SINK:
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
-    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
-    prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
-    # instruction selection
-    if isinstance(renderer, ISARenderer):
-      full_sink = graph_rewrite(full_sink, renderer.pre_isel_matcher, ctx=itertools.count(-1, -1), name="pre instruction selection", bottom_up=True)
-      full_sink = graph_rewrite(full_sink, renderer.isel_matcher, ctx=IselContext(full_sink), name="instruction selection", bottom_up=True)
-    prg = UOp(Ops.PROGRAM, src=(full_sink,), arg=prog_info)
+    if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
+    if SPEC: type_verify(ast, spec_tensor)
+    early_sink = early_simplify(ast, ast.tag is None)
+    if (native_prg := renderer.native_program(early_sink)) is not None:
+      prg = native_prg
+    else:
+      full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None, _early_sink=early_sink)
+      prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
+      # instruction selection
+      if isinstance(renderer, ISARenderer):
+        full_sink = graph_rewrite(full_sink, renderer.pre_isel_matcher, ctx=itertools.count(-1, -1), name="pre instruction selection", bottom_up=True)
+        full_sink = graph_rewrite(full_sink, renderer.isel_matcher, ctx=IselContext(full_sink), name="instruction selection", bottom_up=True)
+      prg = UOp(Ops.PROGRAM, src=(full_sink,), arg=prog_info)
   else: raise RuntimeError(f"can't call to_program on {ast.op}")
   if not isinstance(prg.arg, ProgramInfo): prg = prg.replace(arg=ProgramInfo.from_sink(prg.src[0], renderer.target))
+  elif prg.arg.target != renderer.target: prg = prg.replace(arg=replace(prg.arg, target=renderer.target))
   prg = graph_rewrite(prg, pm_to_program, ctx=renderer, name="linearize/render")
   if VIZ: graph_rewrite(prg, PatternMatcher([]), name="View Program")
   return prg
