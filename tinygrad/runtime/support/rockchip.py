@@ -3,9 +3,10 @@
 # PR 1 native contract: DPU binary EW/copy, CMAC matmul/sum, PPU global max (fp16 only).
 # Fill, broadcast, mean, and all other ops are rejected — no host-side tensor arithmetic.
 from __future__ import annotations
-import struct
+import struct, math, numpy as np
 from dataclasses import dataclass
 from tinygrad.dtype import dtypes
+from tinygrad.helpers import ceildiv, round_up, prod
 from tinygrad.uop.ops import Ops, UOp, ProgramInfo, GroupOp, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.upat import UPat
@@ -80,16 +81,15 @@ def _is_flat_contiguous(idx: UOp) -> bool:
   """Single flat RANGE or CONST(0) — rejects broadcast, transpose, strided access."""
   return idx.op is Ops.RANGE or (idx.op is Ops.CONST and int(idx.arg) == 0)
 
-def _is_2d_row_major(idx: UOp) -> tuple[int, int, int]|None:
-  """ADD(MUL(RANGE(0,LOOP), CONST(inner)), RANGE(1,LOOP)) → (outer, inner, stride) or None."""
+def _is_2d_index(idx: UOp, outer_kind: str = "LOOP", inner_kind: str = "LOOP", stride: int = -1) -> tuple[int, int, int]|None:
+  """ADD(MUL(RANGE(outer_kind), CONST(stride)), RANGE(inner_kind)) → (outer, inner, stride) or None."""
   if idx.op is not Ops.ADD: return None
   ms, rs = idx.src
   if ms.op is not Ops.MUL or rs.op is not Ops.RANGE: return None
   mr, mc = ms.src
   if mr.op is not Ops.RANGE or mc.op is not Ops.CONST: return None
-  if mr.arg[1].name != "LOOP" or rs.arg[1].name != "LOOP" or mr.arg[0] != 0 or rs.arg[0] != 1: return None
-  inner = int(mc.arg)
-  return (int(mr.src[0].arg) if mr.src and mr.src[0].op is Ops.CONST else 0, inner, inner)
+  if mr.arg[1].name != outer_kind or rs.arg[1].name != inner_kind or (stride >= 0 and int(mc.arg) != stride) or (stride < 0 and mr.arg[0] != 0): return None
+  return (int(mr.src[0].arg) if mr.src and mr.src[0].op is Ops.CONST else 0, int(mc.arg), int(mc.arg))
 
 def _try_sub(val: UOp) -> tuple[int, int]|None:
   """ADD(INDEX, MUL(INDEX, CONST(-1))) → (src_slot, ew_slot) for DPU SUB, or None."""
@@ -121,6 +121,38 @@ def _try_reciprocal(val: UOp) -> tuple[int, float]|None:
   inner = _unwrap(val.src[0])
   if inner.op is not Ops.INDEX: return None
   return inner.src[0].buf_uop.arg.slot, 1.0
+
+# LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
+_LUT_OPS = {Ops.EXP2}
+_LUT_SIZE = 513
+
+def _build_exp2_lut() -> tuple[list[int], int, float, float]:
+  """Build 1026-entry LUT for EXP2 over x∈[-2,2]. Returns (lut, bn_mul_operand, output_scale, index_scale).
+  - index_scale: BN_MUL operand that maps x∈[-2,2] to int16 range [-16384,16384]
+  - output_scale: converts exp2(x) to int16 range; OUT_CVT_SCALE=1 gives raw int16 as fp16."""
+  lut = [0] * _LUT_SIZE * 2
+  index_scale = 8192.0
+  step = 32.0 / index_scale  # = 1/256
+  output_scale = 8192.0  # exp2(x) * 8192 → int16 range
+  # Table 0 (LE): covers negative x. Entry i: x = -(512-i)*step (from -2.0 to 0)
+  for i in range(_LUT_SIZE):
+    x = -(512 - i) * step
+    y = math.exp2(x)
+    lut[i] = max(-32768, min(32767, int(round(y * output_scale))))
+  # Table 1 (LO): covers positive x. Entry i: x = i*step (from 0 to 2.0)
+  for i in range(_LUT_SIZE):
+    x = i * step
+    y = math.exp2(x)
+    lut[_LUT_SIZE + i] = max(-32768, min(32767, int(round(y * output_scale))))
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, output_scale, index_scale
+
+def _try_lut(val: UOp) -> int|None:
+  """EXP2(INDEX) → index_slot for DPU LUT op, or None."""
+  if val.op not in _LUT_OPS: return None
+  inner = _unwrap(val.src[0])
+  if inner.op is not Ops.INDEX: return None
+  return inner.src[0].buf_uop.arg.slot
 
 def _try_where_max(val: UOp) -> UOp|None:
   """WHERE(CMPLT(a,b), b, a) or WHERE(CMPLT(b,a), a, b) → synthetic MAX(a,b), or None."""
@@ -184,14 +216,6 @@ def _is_cmac_matmul_layout(sink: UOp, reduce: UOp) -> bool:
            (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) and _is_1d_index(b_idx.src[1], "REDUCE"))
   return False
 
-def _is_2d_index(idx: UOp, outer_kind: str, inner_kind: str, stride: int) -> bool:
-  """Check idx is ADD(MUL(RANGE(outer_kind), CONST=stride), RANGE(inner_kind))."""
-  if idx.op is not Ops.ADD: return False
-  ms, rs = idx.src
-  if ms.op is not Ops.MUL or rs.op is not Ops.RANGE: return False
-  mr, mc = ms.src
-  return mr.op is Ops.RANGE and mc.op is Ops.CONST and int(mc.arg) == stride and mr.arg[1].name == outer_kind and rs.arg[1].name == inner_kind
-
 def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
   """REDUCE(ADD, INDEX) or REDUCE(ADD, MUL(INDEX, CONST(c))) → (input_slot, M, N, K, const_val) for CMAC, or None.
   A-pattern (axis=1): a@ones(K,1), M=out[0], N=1, ones=B.
@@ -226,10 +250,10 @@ def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
 def _check_dpu_layout(sink: UOp, allow_2d: bool, require_uniform: bool) -> str|None:
   """Check all INDEX nodes in sink have compatible layouts. Returns reject reason or None."""
   idx_nodes = _all_indexes(sink)
-  has_2d = allow_2d and any(_is_2d_row_major(n.src[1]) is not None for n in idx_nodes)
+  has_2d = allow_2d and any(_is_2d_index(n.src[1]) is not None for n in idx_nodes)
   for n in idx_nodes:
-    if not (_is_flat_contiguous(n.src[1]) or (allow_2d and _is_2d_row_major(n.src[1]) is not None)) or \
-       (require_uniform and has_2d and _is_2d_row_major(n.src[1]) is None):
+    if not (_is_flat_contiguous(n.src[1]) or (allow_2d and _is_2d_index(n.src[1]) is not None)) or \
+       (require_uniform and has_2d and _is_2d_index(n.src[1]) is None):
       return f"RKPLAN_REJECT:unsupported_layout:{n.src[1].op}"
   return None
 
@@ -247,24 +271,17 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     val = _unwrap(val)  # strip no-op CASTs (half→half) so EW ops are recognized
     sub_slots, scalar = _try_sub(val), _try_scalar(val)
     reciprocal = _try_reciprocal(val)
+    lut_slot = _try_lut(val)
     # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
     # Broadcast and mean are rejected — no host-side tensor arithmetic.
-    if sub_slots is not None:
-      if (r := _check_dpu_layout(sink, False, False)): return r
-      kind = "dpu"
-    elif reciprocal is not None:
-      if (r := _check_dpu_layout(sink, True, True)): return r
-      kind = "dpu"
-    elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)):
-      if (r := _check_dpu_layout(sink, True, True)): return r
-      kind = "dpu"
-    elif _unwrap(val).op is Ops.INDEX:
-      if (r := _check_dpu_layout(sink, False, False)): return r
-      kind = "dpu"
-    elif _unwrap(val).op is Ops.CONST:
-      if (r := _check_dpu_layout(sink, True, False)): return r
-      kind = "dpu"
+    if lut_slot is not None: kind, a2d, ru = "dpu_lut", False, False
+    elif sub_slots is not None: kind, a2d, ru = "dpu", False, False
+    elif reciprocal is not None: kind, a2d, ru = "dpu", True, True
+    elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)): kind, a2d, ru = "dpu", True, True
+    elif _unwrap(val).op is Ops.INDEX: kind, a2d, ru = "dpu", False, False
+    elif _unwrap(val).op is Ops.CONST: kind, a2d, ru = "dpu", True, False
     else: return f"RKPLAN_REJECT:unsupported_op:{val.op if val.op not in _DPU_EW_CFGS else 'non_index_operand'}"
+    if (r := _check_dpu_layout(sink, a2d, ru)): return r
   # R1 CMAC: REDUCE(ADD, MUL(INDEX, INDEX)) or REDUCE(ADD, INDEX) [sum via ones]
   elif reduce.arg[0] is Ops.ADD:
     body = _reduce_body(reduce)
@@ -344,14 +361,14 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   where_max = _try_where_max(val)
   if where_max is not None: val = where_max
   val = _unwrap(val)  # strip no-op CASTs (half→half) so EW ops are recognized
-  total = 1
-  for s in _shape_of_store(sink): total *= s
+  total = prod(_shape_of_store(sink))
   dw = (total + 7) // 8 - 1
   vu = _unwrap(val)
   is_copy = vu.op is Ops.INDEX
   is_fill = vu.op is Ops.CONST
-  sub_slots, scalar = (None, None) if (is_copy or is_fill) else (_try_sub(val), _try_scalar(val))
-  reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None) else _try_reciprocal(val)
+  lut_slot = _try_lut(val)
+  sub_slots, scalar = (None, None) if (is_copy or is_fill or lut_slot is not None) else (_try_sub(val), _try_scalar(val))
+  reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None or lut_slot is not None) else _try_reciprocal(val)
   layout = (total,)
   # track the EW op for FDIV-specific register emissions (OUT_CVT_SCALE, FP16TOFP32_EN=0)
   ew_op = Ops.SUB if sub_slots else (Ops.FDIV if reciprocal else (val.op if scalar else (Ops.ADD if is_fill else (None if is_copy else val.op))))
@@ -412,6 +429,98 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   emitter_pc_op_en(cmds, 12)
   return tuple(c.pack() for c in cmds), RKTask(0x18, 0x300, 4, "dpu", layout, plan.out_slot, is_copy=is_copy, is_fill=is_fill), tuple(relocs)
 
+def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
+  """DPU LUT op (EXP2). Register sequence from ref/rk3588/experimental/kernel_6_18/silu.py.
+  Uses LUT table lookup with BN_MUL index scaling and OUT_CVT FP32→FP16 conversion.
+  The DPU LUT always processes a full 16x8 tile (128 elements) regardless of logical size."""
+  cmds, relocs = [], []
+  sink = plan.sink
+  store = _store_node(sink)
+  assert store is not None, "dpu_lut: no STORE node"
+  val = _unwrap(store.src[1])
+  total = 1
+  for s in _shape_of_store(sink): total *= s
+  lut_slot = _try_lut(val)
+  assert lut_slot is not None, "dpu_lut: no LUT slot"
+  layout = (total,)
+  # DPU LUT: use dw for width (like regular DPU), channel=7 (8 channels)
+  dw = (total + 7) // 8 - 1
+  width = dw
+  # DST_SURF_STRIDE = (width+1) * (channel+1) * 2 bytes
+  surf_stride = (width + 1) * 8 * 2
+  # --- LUT table fill (513 entries × 2 tables) ---
+  lut, bn_mul_operand, output_scale, index_scale = _build_exp2_lut()
+  for table_id, base in ((0, 0), (1, _LUT_SIZE)):
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_ACCESS_CFG,
+      (1 << 17) | (table_id << 16))  # LUT_ACCESS_TYPE=1, TABLE_ID, ADDR=0
+    for i in range(_LUT_SIZE):
+      v = int(lut[base + i])
+      data = v & 0xFFFF
+      if v < 0: data |= 0xFFFF0000  # sign-extend negative values in RESERVED_0
+      emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_ACCESS_DATA, data)
+  # --- S_POINTER (PP_CLEAR) — EXECUTER_PP_CLEAR=bit5, POINTER_PP_CLEAR=bit4 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_S_POINTER, (1 << 5) | (1 << 4))
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, (1 << 5) | (1 << 4))
+  # --- FEATURE_MODE_CFG: burst_len=15, output_mode=2, flying_mode=1 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, (15 << 5) | (2 << 1) | 1)
+  # --- DATA_FORMAT: fp16 in/out/proc ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_FORMAT, (2 << 26) | (2 << 29) | 2)
+  # --- DST_BASE_ADDR (relocated) ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DST_BASE_ADDR, 0)
+  emitter_reloc(cmds, relocs, plan.out_slot)
+  # --- DST_SURF_STRIDE = (width+1) * 8 * 2 bytes per surface ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DST_SURF_STRIDE, surf_stride)
+  # --- DATA_CUBE_WIDTH/CHANNEL — always 16x8 tile ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, (7 << 16) | 7)
+  # --- BS_CFG: all bypassed ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1 << 6) | (1 << 4) | (1 << 1) | 1)
+  # --- BS_OW_CFG: OD_BYPASS=1 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_OW_CFG, (1 << 1))
+  # --- WDMA_SIZE_0/1 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_0, 7)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_1, width)
+  # --- BN_CFG: BN_ALU_ALGO=2, BN_RELU_BYPASS=1 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, (2 << 16) | (1 << 6))
+  # --- BN_ALU_CFG ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000)
+  # --- BN_MUL_CFG: fp16(index_scale) ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_MUL_CFG, (bn_mul_operand & 0xFFFF) << 16)
+  # --- EW_CFG: relu_bypass=1, op_cvt_bypass=1, op_bypass=1 (LUT mode) ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 1))
+  # --- EW_CVT_SCALE_VALUE: EW_OP_CVT_SCALE=1 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)
+  # --- OUT_CVT_SCALE: FP32TOFP16_EN=1, scale=1 ---
+  # --- OUT_CVT_SHIFT: MINUS_EXP=13 (FP16 float division by 2^13) ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, (13 << 12))
+  # --- SURFACE_ADD=512 ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, 0x200)
+  # --- unknown reg 0x40c4 = 0 (from silu.py) ---
+  emitter_emit(cmds, _T_DPU, 0x40c4, 0)
+  # --- LUT config registers ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_CFG, (1 << 6) | (1 << 5) | (2 << 2))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_INFO, (5 << 16) | (5 << 8))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_START, 0xffffc000)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_END, 0x00004000)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 16434 << 16)  # OFLOW_SCALE=16434
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5)  # OFLOW_SHIFT=13
+  # --- RDMA config ---
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width)
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7)
+  # --- RDMA SRC_BASE_ADDR (relocated — input) ---
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0)
+  emitter_reloc(cmds, relocs, lut_slot)
+  # --- ERDMA_CFG: ERDMA_DISABLE=1 ---
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 1)
+  # --- RDMA FEATURE_MODE_CFG: IN_PRECISION=2, BURST_LEN=15, PROC_PRECISION=2, MRDMA_FP16TOFP32_EN=1, FLYING_MODE=1 ---
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
+  # --- RDMA_WEIGHT: all weights=1 ---
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_WEIGHT, 0x01010101)
+  # --- PC_OPERATION_ENABLE ---
+  emitter_pc_op_en(cmds, 12)
+  return tuple(c.pack() for c in cmds), RKTask(0x18, 0x300, 4, "dpu_lut", layout, plan.out_slot), tuple(relocs)
+
 def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """CNA+CORE matmul or sum. A=(M,K), B=(K,N), output=(M,N) FP32→FP16. Transforms in __call__."""
   cmds, relocs = [], []
@@ -447,19 +556,17 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   MIN_CHANNEL_TILE = 32
   RK_LINE_STRIDE_GROUP_CAP = 13
   # layout: align K and N to 32
-  def _ceil_div(x, y): return (x + y - 1) // y
-  def _align_up(x, a): return _ceil_div(x, a) * a
-  aligned_k = max(MIN_CHANNEL_TILE, _align_up(K, MIN_CHANNEL_TILE))
-  align_out = max(MIN_CHANNEL_TILE, _align_up(N, MIN_CHANNEL_TILE))
+  aligned_k = max(MIN_CHANNEL_TILE, round_up(K, MIN_CHANNEL_TILE))
+  align_out = max(MIN_CHANNEL_TILE, round_up(N, MIN_CHANNEL_TILE))
   align_in = max(aligned_k, align_out)
   eff_k = align_in if align_in != aligned_k else K
   input_row_bytes = align_in * 2
   # feature grains and line stride from gemm.py
-  even_rows_per_two_banks = (_ceil_div(2 * CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
+  even_rows_per_two_banks = (ceildiv(2 * CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
   feature_grains = max(80, even_rows_per_two_banks)
-  line_stride = 4 * min(_ceil_div(eff_k, MIN_CHANNEL_TILE), RK_LINE_STRIDE_GROUP_CAP)
+  line_stride = 4 * min(ceildiv(eff_k, MIN_CHANNEL_TILE), RK_LINE_STRIDE_GROUP_CAP)
   notch_val = 8 * min(align_out // MIN_CHANNEL_TILE, RK_LINE_STRIDE_GROUP_CAP) - 1
-  data_banks = max(1, _ceil_div(M * input_row_bytes, CBUF_BANK_SIZE))
+  data_banks = max(1, ceildiv(M * input_row_bytes, CBUF_BANK_SIZE))
   wt_banks = RK_CBUF_BANKS - data_banks
   if data_banks > RK_CBUF_BANKS-1 or input_row_bytes*align_out > wt_banks*CBUF_BANK_SIZE:
     raise RuntimeError("RKPLAN_REJECT:cmac_exceeds_cbuf")
@@ -483,7 +590,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_WEIGHT_SIZE2, (1<<24)|(1<<16)|align_out)
   # 12-13. CNA CBUF config
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_CBUF_CON0, ((RK_CBUF_BANKS-data_banks)<<4)|data_banks)
-  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CBUF_CON1, _ceil_div(align_in, MIN_CHANNEL_TILE))
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CBUF_CON1, ceildiv(align_in, MIN_CHANNEL_TILE))
   # 14-18. CNA CVT config
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_CVT_CON0, (1<<3)|(1<<1)|1)
   for r in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4): emitter_emit(cmds, _T_CNA, r, 1<<16)
@@ -596,11 +703,11 @@ def _emit_ppu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
 # ---- emit_rk dispatcher (§2.3 API) ----
 def emit_rk(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """Dispatch emission by plan.kind. Returns (cmds, task, relocs)."""
-  return {"dpu":_emit_dpu, "cmac":_emit_cmac, "ppu":_emit_ppu}[plan.kind](plan)
+  return {"dpu":_emit_dpu, "dpu_lut":_emit_dpu_lut, "cmac":_emit_cmac, "ppu":_emit_ppu}[plan.kind](plan)
 
 # ---- codec ----
 _RK_MAGIC = 0x524b494d  # "RKIM"
-_RK_KINDS = ("dpu", "cmac", "ppu")
+_RK_KINDS = ("dpu", "dpu_lut", "cmac", "ppu")
 
 def encode_rk(cmds: tuple[int,...], task: RKTask, relocs: tuple[RKReloc,...]) -> bytes:
   """Pack commands, task metadata, and relocations into deterministic bytes (§2.3)."""

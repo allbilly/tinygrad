@@ -31,16 +31,8 @@ def _swizzle_b(src, dst, K, N, align_out, align_in):
     for n in range(N): d[(((n//16)*(align_in//32)+(k//32))*16+(n%16))*32+(k%32)] = s[k*N+n]
 
 def _fp32_to_fp16(b):
-  si, e, mt = (b>>31)&1, (b>>23)&0xFF, b&0x7FFFFF
-  if e == 0: return si<<15
-  if e == 0xFF: return (si<<15)|0x7C00 if mt == 0 else (si<<15)|0x7E00|((mt>>13)&0x1FF)
-  ne = e - 112
-  if ne >= 0x1F: return (si<<15)|0x7C00
-  if ne >= 1:
-    mant = (mt >> 13) + (1 if (mt & 0x1FFF) > 0x1000 or (mt & 0x1FFF == 0x1000 and (mt >> 13) & 1) else 0)
-    return (si<<15)|0x7C00 if ne + (mant >= 0x400) >= 0x1F else (si<<15)|((ne + (mant >= 0x400))<<10)|(mant & 0x3FF)
-  sh, fm = 14-ne, (1<<23)|mt
-  return (si<<15)|min((fm >> sh) + (1 if (fm & ((1<<sh)-1)) + ((fm >> sh) & 1) > (1<<(sh-1)) else 0), 1<<10)
+  try: return struct.unpack('<H', struct.pack('<e', struct.unpack('<f', struct.pack('<I', b))[0]))[0]
+  except OverflowError: return 0xFC00 if b>>31 else 0x7C00
 
 def _unpack_cmac_out(src, dst, M, N, align_out):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))

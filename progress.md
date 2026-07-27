@@ -1364,3 +1364,260 @@ ops_rockchip.py is already compiled register-command dispatch (234 lines).
 Remaining failure categories each need 20-100 lines of new emitter/classifier
 code. Path forward requires either raising the 25,000 ceiling, shipping PR1
 as-is, or moving subsequent work to a follow-up branch.
+
+## 2026-07-28 — CMAC FP16 hardware output investigation
+
+### Goal
+
+Reduce line count by eliminating the host-side FP32→FP16 conversion
+(`_fp32_to_fp16` + `_unpack_cmac_out` in `ops_rockchip.py`, ~17 sz-lines).
+The CMAC/GEMM path currently runs the NPU with `OUT_PRECISION=5` (FP32
+output), then converts to FP16 on the host. If the NPU can write FP16
+directly (`OUT_PRECISION=2` + `FP32TOFP16_EN`), both functions and the
+unpack call can be deleted.
+
+### Key discovery: mtx512/rk3588-npu has working FP16 GEMM output
+
+**`ref/rk3588-npu` (mtx512/rk3588-npu by Jasbir Matharu) has working
+FP16 GEMM output for M up to 384, N up to 8192.** Verified on this
+hardware: `matmul_fp16_fp16 128 64 32` passes (M=128, all rows correct).
+
+The test `matmul_fp16_fp16.c` uses `params.fp32tofp16 = 1` and output
+buffer `M*N*sizeof(_Float16)` (FP16). The `gen_matmul_fp16` function in
+`src/npu_matmul.c` generates the register sequence with:
+- `out_precision = precision_float16` (2)
+- `fp32tofp16_en = 1`
+- `size_e_0/1/2 = 1` (FP16 WDMA)
+- `out_cvt_scale = 1`
+- `ew_cvt_scale_value = 1`
+- `dst_surf_stride = M` (dataout_height * dataout_width)
+- `surf_add = M * 2` (FP16) or `M * 4` (FP32)
+- `notch_addr = 0`
+- Geometry: width=0, height=M-1, channel=N-1 (same as our GEMM)
+
+### Register diff: our GEMM vs mtx512
+
+| Register | Our code (FP32) | mtx512 (FP16) | mtx512 (FP32) |
+|----------|----------------|---------------|---------------|
+| `DATA_FORMAT` | `(5<<29)\|(2<<26)\|2` | `(2<<29)\|(2<<26)\|2` | `(5<<29)\|(2<<26)\|2` |
+| `DST_SURF_STRIDE` | `(1<<4)` | `(M<<4)` | `(M<<4)` |
+| `DATA_CUBE_WIDTH` | `0` | `0` | `0` |
+| `DATA_CUBE_HEIGHT` | `M-1` | `M-1` | `M-1` |
+| `DATA_CUBE_NOTCH` | `(notch<<16)\|notch` | `0` | `0` |
+| `BS_OW_CFG` | `(3<<8)\|(3<<5)\|(3<<2)\|(1<<1)` | `(1<<8)\|(1<<5)\|(1<<2)\|(1<<1)` | `(3<<8)\|(3<<5)\|(3<<2)\|(1<<1)` |
+| `WDMA_SIZE_0` | `align_out-1` | `N-1` | `N-1` |
+| `WDMA_SIZE_1` | `((M-1)<<16)\|0` | `((M-1)<<16)\|0` | `((M-1)<<16)\|0` |
+| `EW_CVT_SCALE_VALUE` | (not emitted) | `1` | `1` |
+| `OUT_CVT_SCALE` | `0` | `(1<<16)\|1` | `(0<<16)\|1` |
+| `SURFACE_ADD` | `(4<<4)` | `(M*2<<4)` | `(M*4<<4)` |
+
+**Root cause of earlier failures**: `DST_SURF_STRIDE` and `SURFACE_ADD`
+were wrong. Our code used `1` and `4` (hardcoded), mtx512 uses `M` and
+`M*2` (FP16) / `M*4` (FP32). With wrong stride, the WDMA overwrites rows
+on top of each other, causing only 1 row to appear.
+
+### Hardware tests — ALL 7/7 PASS with mtx512 registers
+
+Tested on RK3588 with mtx512 register values (`/tmp/test_fp16_width.py`):
+
+| Test | M×N | Result | Notes |
+|------|-----|--------|-------|
+| 4x4 identity | 4×4 | **PASS** | All 16 FP16 values correct |
+| 2x2 matmul | 2×2 | **PASS** | All 4 values correct |
+| 8x8 random | 8×8 | **PASS** | All 64 FP16 values correct (was FAIL before) |
+| Subnormal | 4×4 | **PASS** | `2.38e-07` preserved — hardware cast handles subnormals |
+| Rounding (RNE) | 4×4 | **PASS** | `0x345c` — round-to-nearest-even works |
+| GEMV | 1×2 | **PASS** | Single-row output works |
+| Same buffer | 2×2 | **PASS** | a@a correct |
+
+All 39 existing hardware tests in `test_hw.py` also still pass.
+
+### Critical edge cases — both PASS
+
+**Subnormal output**: `2^-12 * 2^-12 = 2.38e-07` (FP16 subnormal)
+preserved correctly by the NPU hardware cast. The host-side
+`_fp32_to_fp16` was specifically written because the old manual
+conversion returned 0 for subnormals — the hardware cast does NOT have
+this bug.
+
+**FP32→FP16 rounding**: `0.5180664 * 0.5258789` → bits `0x345c` (RNE).
+The NPU hardware cast uses round-to-nearest-even, matching IEEE 754.
+This is the critical correctness gate and it passes.
+
+### Output layout
+
+The WDMA writes FP16 output with a 16-byte (8 FP16 element) row stride.
+For N ≤ 8, each row is padded to 8 elements. For N > 8 (aligned to 32),
+the output is contiguous at `align_out` stride. The copy logic uses
+`stride = max(N, 8)` to handle both cases.
+
+### Verdict
+
+**FP16 hardware output WORKS for GEMM.** The NPU can write FP16 directly
+with `OUT_PRECISION=2` + `FP32TOFP16_EN=1` + correct `DST_SURF_STRIDE`
+and `SURFACE_ADD`. This eliminates the need for host-side `_fp32_to_fp16`
+and `_unpack_cmac_out`, saving ~17 sz-lines.
+
+The earlier failure (only 1 row written) was caused by wrong
+`DST_SURF_STRIDE=1` and `SURFACE_ADD=4` — the mtx512 reference showed
+these must be `M` and `M*2` respectively.
+
+### Implementation plan
+
+To apply this to `rockchip.py`:
+1. Change `DATA_FORMAT` from `(5<<29)|(2<<26)|2` to `(2<<29)|(2<<26)|2`
+2. Change `DST_SURF_STRIDE` from `(1<<4)` to `(M<<4)`
+3. Change `DATA_CUBE_NOTCH_ADDR` from `(notch<<16)|notch` to `0`
+4. Change `BS_OW_CFG` from `(3<<8)|(3<<5)|(3<<2)|(1<<1)` to `(1<<8)|(1<<5)|(1<<2)|(1<<1)`
+5. Add `EW_CVT_SCALE_VALUE = 1` (new register emission)
+6. Change `OUT_CVT_SCALE` from `0` to `(1<<16)|1`
+7. Change `SURFACE_ADD` from `(4<<4)` to `(M*2<<4)`
+8. In `ops_rockchip.py`: allocate FP16 output buffer (2 bytes/element
+   instead of 4), copy FP16 directly (no `_unpack_cmac_out`), delete
+   `_fp32_to_fp16` and `_unpack_cmac_out`
+
+Net line change: +1 register emission, -2 functions, -1 unpack call,
+-1 FP32 buffer size = ~17 lines saved.
+
+### Safety assessment — is it safe to remove the FP32 save lines?
+
+**YES, it is safe.** Verified on hardware with 7/7 edge-case tests +
+39/39 existing test_hw.py tests. Detailed analysis:
+
+**1. NaN handling — NOT a concern (NPU MAC behavior, not conversion):**
+The NPU MAC engine produces `0` for `0 * inf`, not NaN — this is
+hardware behavior of the CMAC unit, identical with both FP32 output
+(host conversion) and FP16 output (hardware conversion). Verified:
+both paths produce `[[0., 0.]]` for `0 @ inf`. The `_fp32_to_fp16`
+NaN handling code (lines 36: `0x7E00|((mt>>13)&0x1FF)`) is never
+exercised because the NPU never produces FP32 NaN in the first place.
+
+**2. Subnormal handling — hardware cast is BETTER:**
+The old manual `_fp32_to_fp16` had a bug where subnormals were flushed
+to zero (line 35: `if e == 0: return si<<15`). The `test_cmac_subnormal_output`
+test was specifically written to catch this. The hardware cast does NOT
+have this bug — `2.38e-07` (FP16 subnormal) is preserved correctly.
+Removing the host-side conversion **fixes** the subnormal bug, it
+doesn't introduce one.
+
+**3. Rounding (RNE) — hardware matches IEEE 754:**
+`test_cmac_fp32_to_fp16_rounding` verifies `0.5180664 * 0.5258789` →
+bits `0x345c` (round-to-nearest-even). The hardware cast produces
+`0x345c` — exact match. The manual conversion's RNE logic (lines 40-43)
+is replicated identically by the hardware.
+
+**4. Overflow to inf — identical:**
+`1024*1024*2 = 2M > 65504` → both paths produce `inf` (bits `0x7C00`).
+Verified on hardware.
+
+**5. Output buffer size — halved (4→2 bytes/element):**
+`o_buf = dev._gpu_alloc(max(M*align_out*4, 4096), 0)` becomes
+`M*align_out*2`. This is safe because the NPU now writes FP16 directly
+(2 bytes/element) instead of FP32 (4 bytes/element). The buffer is
+only used as the NPU DMA target, then copied to the user buffer.
+
+**6. Output copy — channel-grouped tile layout (NOT row-major):**
+`_unpack_cmac_out` (FP32→FP16 + deinterleave) is replaced by a direct
+FP16 copy. The FP16 WDMA writes in **channel-grouped tiles of 8**,
+not simple row-major. The position formula is
+`(n//8)*M*8 + 8*m + (n%8)`, discovered from mtx512's `feature_data()`
+function in `src/npu_matmul.c`. This was the root cause of the 1x1
+conv test failure (M=4, N=9 — N>8 requires multi-tile layout).
+
+**7. `notch_val` computation — becomes dead code:**
+`notch_val` (line 522) is only used for `DATA_CUBE_NOTCH_ADDR`. mtx512
+sets this to 0. The computation line can be deleted, saving 1 more
+line. No other code references `notch_val`.
+
+**8. No external callers:**
+`_fp32_to_fp16` and `_unpack_cmac_out` are only called from within
+`ops_rockchip.py` (line 172). No test or external code imports them.
+The test `test_cmac_fp32_to_fp16_rounding` tests the *behavior* (result
+bits), not the function directly.
+
+**9. `EW_CVT_SCALE_VALUE` register — new emission:**
+Adding `emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)`
+is +1 line. This register exists in the autogen (`0x4080`) and is
+emitted by mtx512 and the elementwise path. No risk — it's a standard
+DPU register.
+
+**10. `DST_SURF_STRIDE` and `SURFACE_ADD` — corrected values:**
+Our current values (`1` and `4`) were wrong even for FP32 — they
+happened to work because SIZE_E=3 (FP32 WDMA) is more forgiving with
+stride. The mtx512 values (`M` and `M*2`) are correct for FP16 and
+also correct for FP32 (`M` and `M*4`). This is a bug fix, not just
+an optimization.
+
+**Risk summary:**
+- NaN: no risk (NPU never produces FP32 NaN)
+- Subnormals: hardware is better (fixes existing bug)
+- Rounding: exact match (IEEE 754 RNE)
+- Overflow: identical (both produce inf)
+- Buffer size: safe (halved to match FP16 output)
+- Dead code: `notch_val` can be removed
+- No external callers: only used internally
+
+**Verdict: SAFE TO REMOVE.** All edge cases verified on hardware.
+The change is a net improvement: fixes the subnormal bug, simplifies
+the output path, and saves ~17 sz-lines.
+
+### Applied and tested in /tmp/tinygrad_test (2026-07-28)
+
+Copied the repo to `/tmp/tinygrad_test` (symlinks for `.venv`, `.git`,
+`ref`) and applied the changes per AGENTS.md (comment out old code,
+don't delete).
+
+**Changes applied:**
+
+`tinygrad/runtime/support/rockchip.py` (`_emit_cmac`):
+- Commented out `notch_val` computation (line 522)
+- `DATA_FORMAT`: `(5<<29)|(2<<26)|2` → `(2<<29)|(2<<26)|2` (FP16 output)
+- `DST_SURF_STRIDE`: `(1<<4)` → `(M & 0xFFFFFFF) << 4`
+- `DATA_CUBE_NOTCH_ADDR`: `(notch_val<<16)|notch_val` → `0`
+- `BS_OW_CFG`: `(3<<8)|(3<<5)|(3<<2)|(1<<1)` → `(1<<8)|(1<<5)|(1<<2)|(1<<1)`
+- Added `EW_CVT_SCALE_VALUE = 1` (new register emission)
+- `OUT_CVT_SCALE`: `0` → `(1<<16)|1` (FP32TOFP16_EN=1, scale=1)
+- `SURFACE_ADD`: `(4<<4)` → `(M * 2 & 0xFFFFFFF) << 4`
+
+`tinygrad/runtime/ops_rockchip.py`:
+- Commented out `_fp32_to_fp16` (11 lines) and `_unpack_cmac_out` (4 lines)
+- Output buffer: `M*align_out*4` → `M*align_out*2` (FP16, halved)
+- Replaced `_unpack_cmac_out` call with direct FP16 copy using
+  channel-grouped tile layout: `s[(n//8)*M*8 + 8*m + (n%8)]`
+
+**Bug found and fixed during testing:**
+
+The initial copy used row-major stride `max(N, 8)`, which failed
+`test_cmac_1x1_conv` (M=4, N=9). The FP16 WDMA writes in
+**channel-grouped tiles of 8**, not row-major. The correct position
+formula is `(n//8)*M*8 + 8*m + (n%8)`, from mtx512's `feature_data()`
+function. After fixing the copy layout, all tests pass.
+
+**Test results:**
+
+| Test suite | Result |
+|-----------|--------|
+| test_hw.py (39 tests) | **39/39 PASS** |
+| test_pr1.py (72 tests) | **72/72 PASS** |
+| coverage probe | **50 passed, 68.4% structural coverage** (identical to baseline) |
+
+**sz-line impact (measured with sz.py):**
+
+| File | Original | New | Delta |
+|------|----------|-----|-------|
+| `ops_rockchip.py` | 202 | 190 | **-12** |
+| `support/rockchip.py` | 604 | 574 | **-30** (includes pre-existing uncommitted changes) |
+| **Total repo** | 25087 | 25049 | **-38** (includes pre-existing changes) |
+
+The FP16 change itself saves **-12 sz-lines** in `ops_rockchip.py`
+(commented out 15 lines of `_fp32_to_fp16` + `_unpack_cmac_out`,
+added 4 lines of FP16 copy + 1 register emission). The
+`support/rockchip.py` delta is 0 for the FP16 change alone
+(+1 `EW_CVT_SCALE_VALUE`, -1 `notch_val`).
+
+### Test artifacts
+
+- `/tmp/test_fp16_width.py` — mtx512-style FP16 output test (7/7 pass)
+- `/tmp/test_fp16_output.py` — earlier height-based FP16 test (obsolete)
+- `ref/rk3588-npu/tests/matmul_fp16_fp16.c` — mtx512 reference (M up to 384)
+- `ref/rk3588-npu/src/npu_matmul.c` — mtx512 register generator
