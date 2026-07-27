@@ -123,7 +123,7 @@ def _try_reciprocal(val: UOp) -> tuple[int, float]|None:
   return inner.src[0].buf_uop.arg.slot, 1.0
 
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
-_LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN}
+_LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT}
 _LUT_SIZE = 513
 
 def _build_exp2_lut() -> tuple[list[int], int, float, float]:
@@ -191,6 +191,28 @@ def _build_sin_lut() -> tuple[list[int], int, float, float]:
   for i in range(_LUT_SIZE):
     x = i * step  # i=0: x=0, i=512: x=π
     y = math.sin(x)
+    v = int(round(y * output_scale))
+    if v == 0: v = 1  # avoid exact 0
+    lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, output_scale, index_scale
+
+def _build_sqrt_lut() -> tuple[list[int], int, float, float]:
+  """Build 1026-entry LUT for SQRT over x∈[0,4] → result∈[0,2].
+  Uses LUT_LE_START=-16384 (LE handles underflow), index_scale=4090.
+  LE table: underflow (x<0 → clip to 0). LO table: x from 0 to ~4.01."""
+  lut = [0] * _LUT_SIZE * 2
+  index_scale = 4090.0  # avoid x=4.0 hitting LUT_LO_END=16384 exactly
+  step = 32.0 / index_scale  # ≈ 1/127.8
+  output_scale = 8192.0  # maps [0,2] to [0,16384]
+  # LE table (table 0): underflow (x<0 → clip to 0, but use 1 to avoid exact 0 hardware bug)
+  for i in range(_LUT_SIZE):
+    lut[i] = 1  # sqrt(negative) ≈ 0 (clip, avoid exact 0)
+  # LO table (table 1): covers bn_mul from 0 to 16384 (x from 0 to ~4.01)
+  for i in range(_LUT_SIZE):
+    x = i * step  # i=0: x=0, i=512: x≈4.01
+    y = math.sqrt(x) if x > 0 else 0.0
+    y = min(2.0, y)  # clip to [0, 2]
     v = int(round(y * output_scale))
     if v == 0: v = 1  # avoid exact 0
     lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
@@ -511,6 +533,11 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
   elif val.op is Ops.SIN:
     lut, bn_mul_operand, output_scale, index_scale = _build_sin_lut()
+    lut_le_start = 0xffffc000  # -16384
+    lut_lo_end = 0x00004000    # 16384
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+  elif val.op is Ops.SQRT:
+    lut, bn_mul_operand, output_scale, index_scale = _build_sqrt_lut()
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
