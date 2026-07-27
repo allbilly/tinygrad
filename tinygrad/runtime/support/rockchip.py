@@ -224,6 +224,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     val = store.src[1]
     where_max = _try_where_max(val)
     if where_max is not None: val = where_max
+    val = _unwrap(val)  # strip no-op CASTs (half→half) so EW ops are recognized
     sub_slots, scalar = _try_sub(val), _try_scalar(val)
     # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
     # Broadcast and mean are rejected — no host-side tensor arithmetic.
@@ -320,6 +321,7 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   val = store.src[1]
   where_max = _try_where_max(val)
   if where_max is not None: val = where_max
+  val = _unwrap(val)  # strip no-op CASTs (half→half) so EW ops are recognized
   total = 1
   for s in _shape_of_store(sink): total *= s
   dw = (total + 7) // 8 - 1

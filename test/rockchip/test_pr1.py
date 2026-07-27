@@ -234,6 +234,12 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink((a*3).sum(axis=0))), "cmac")
 
+  def test_dpu_cast_wrapping_ew(self):
+    # CAST(half→half, ADD(INDEX, INDEX)) should be classified as DPU, not rejected as Ops.CAST
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink((a+b).cast(dtypes.half))), "dpu")
+
   def test_reject_raises_runtime_error(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()

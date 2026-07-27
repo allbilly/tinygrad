@@ -307,12 +307,13 @@ result. The FP16 subset grows across PRs:
 2. CMAC GEMV: matrix-vector products (1D output, one vector input) (PR2).
 3. DPU hardware fill: CONST as DPU ADD(zero, const) (PR3).
 4. CMAC scaled sum: REDUCE(ADD, MUL(INDEX, CONST(c))) as ones-vector GEMM with const_val (PR4).
-5. General DPU elementwise: nested ops, WHERE, activations, hardware broadcast (PR5).
-6. General movement and addressing (PR6).
-7. CMAC matmul completeness: batched GEMM, mean, tiling (PR7).
-8. Convolution and complete PPU coverage (PR8).
-9. Dtypes, indexing, and fallback policy (PR9).
-10. Full-suite gradients and qualification (PR10).
+5. DPU no-op CAST handling: strip half→half CASTs wrapping EW ops (PR5).
+6. General DPU elementwise: nested ops, WHERE, activations, hardware broadcast (PR6).
+7. General movement and addressing (PR7).
+8. CMAC matmul completeness: batched GEMM, mean, tiling (PR8).
+9. Convolution and complete PPU coverage (PR9).
+10. Dtypes, indexing, and fallback policy (PR10).
+11. Full-suite gradients and qualification (PR11).
 
 ---
 

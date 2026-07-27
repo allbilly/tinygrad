@@ -126,6 +126,15 @@ class TestDPU(unittest.TestCase):
     c = (a + b).realize()
     np.testing.assert_allclose(c.numpy(), a_np + b_np, rtol=1e-3, atol=1e-3)
 
+  def test_dpu_cast_wrapping_ew(self):
+    # CAST(half→half) wrapping EW op — no-op cast should be stripped
+    a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
+    b_np = np.array([[9,10,11,12],[13,14,15,16]], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    b = Tensor(b_np, device="ROCKCHIP").realize()
+    c = (a + b).cast(dtypes.half).realize()
+    np.testing.assert_allclose(c.numpy(), a_np + b_np, rtol=1e-3, atol=1e-3)
+
 @unittest.skipUnless(_NPU_AVAILABLE, "no /dev/dri/card1 NPU device")
 class TestCMAC(unittest.TestCase):
   def test_cmac_matmul(self):
