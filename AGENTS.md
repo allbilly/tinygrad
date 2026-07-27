@@ -4,9 +4,21 @@
 - Run `python -m mypy tinygrad/` to typecheck
 - Run `python -m ruff check .` to lint
 - Read `./tinygrad/viz/README` for profiling
-
+- NEVER EVER run git stash, git checkout 
+- NEVER change / revert staged files
+- backup code to /tmp with timestamp before any modification or just do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
 
 # NPU
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
 do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
 
 u can clone any needed reference repo into ref/ with git clone --depth=1

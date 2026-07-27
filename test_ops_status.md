@@ -100,7 +100,7 @@ Generated: 2026-07-27 21:22 UTC | commit 993ea1197
 | 90 | TestOps::test_diagonal | test_diagonal | TestOps | FAIL | 0/1/0 | unsupported_layout:Ops.MUL | MUL | broadcast |  |
 | 91 | TestOps::test_dilated_conv2d | test_dilated_conv2d | TestOps | PARTIAL | 1/2/0 | unsupported_layout |  | layout |  |
 | 92 | TestOps::test_dilated_conv_transpose2d | test_dilated_conv_transpose2d | TestOps | FAIL | 0/1/0 | unsupported_op:Ops.MUL | MUL | MUL_in_reduce |  |
-| 93 | TestOps::test_div | test_div | TestOps | FAIL | 0/1/0 | unsupported_op:non_index_operand |  | nested_EW |  |
+| 93 | TestOps::test_div | test_div | TestOps | PASS | 1/0/0 |  |  | nested_EW |  |
 | 94 | TestOps::test_div_int | test_div_int | TestOps | FAIL | 0/1/0 | unsupported_dtype |  | dtype |  |
 | 95 | TestOps::test_div_naninf | test_div_naninf | TestOps | FAIL | 0/1/0 | unsupported_op:non_index_operand |  | nested_EW |  |
 | 96 | TestOps::test_div_rounding_mode | test_div_rounding_mode | TestOps | FAIL | 0/1/0 | unsupported_dtype |  | dtype |  |
@@ -282,7 +282,7 @@ Generated: 2026-07-27 21:22 UTC | commit 993ea1197
 | 272 | TestOps::test_rshift | test_rshift | TestOps | FAIL | 0/1/0 | unsupported_dtype |  | dtype |  |
 | 273 | TestOps::test_rshift_signed | test_rshift_signed | TestOps | FAIL | 0/1/0 | unsupported_dtype |  | dtype |  |
 | 274 | TestOps::test_rsqrt | test_rsqrt | TestOps | FAIL | 0/1/0 | unsupported_op:Ops.RECIPROCAL | RECIPROCAL | RECIPROCAL | Y |
-| 275 | TestOps::test_scalar_div | test_scalar_div | TestOps | FAIL | 0/1/0 | unsupported_op:Ops.RECIPROCAL | RECIPROCAL | RECIPROCAL | Y |
+| 275 | TestOps::test_scalar_div | test_scalar_div | TestOps | PASS | 1/0/0 |  |  | RECIPROCAL | Y |
 | 276 | TestOps::test_scalar_mul | test_scalar_mul | TestOps | PASS | 1/0/0 |  |  |  |  |
 | 277 | TestOps::test_scalar_rsub | test_scalar_rsub | TestOps | FAIL | 0/1/0 | unsupported_op:non_index_operand |  | nested_EW |  |
 | 278 | TestOps::test_scalar_sub | test_scalar_sub | TestOps | PASS | 1/0/0 |  |  |  |  |
@@ -296,7 +296,7 @@ Generated: 2026-07-27 21:22 UTC | commit 993ea1197
 | 286 | TestOps::test_scatter_mul | test_scatter_mul | TestOps | FAIL | 0/1/0 | unsupported_dtype |  | dtype |  |
 | 287 | TestOps::test_scatter_no_reduce_tensor_src | test_scatter_no_reduce_tensor_src | TestOps | PASS | 1/0/0 |  |  |  |  |
 | 288 | TestOps::test_scatter_reduce | test_scatter_reduce | TestOps | FAIL | 0/1/0 | unsupported_dtype |  | dtype |  |
-| 289 | TestOps::test_scatter_reduce_errors | test_scatter_reduce_errors | TestOps | FAIL | 0/1/0 | assertion |  | assertion |  |
+| 289 | TestOps::test_scatter_reduce_errors | test_scatter_reduce_errors | TestOps | PASS | 1/0/0 |  |  | assertion |  |
 | 290 | TestOps::test_scatter_reduce_prod_zeros | test_scatter_reduce_prod_zeros | TestOps | FAIL | 0/1/0 | dtype_mismatch |  | dtype_mismatch |  |
 | 291 | TestOps::test_sd_big_conv | test_sd_big_conv | TestOps | SKIP | 0/0/1 |  |  |  |  |
 | 292 | TestOps::test_selu | test_selu | TestOps | FAIL | 0/1/0 | unsupported_op:non_index_operand |  | nested_EW |  |

@@ -1002,7 +1002,7 @@ subtests that should work + int32 subtests that won't.
 | Test | Issue |
 |------|-------|
 | test_avg_pool3d | 3D pooling — **has ref** in backend-consideration (line 3064), lowers to avg_pool2d, decompose to 2D PPU passes |
-| test_bitcast | dtype reinterpretation — **has potential** (pure metadata, no compute; see audit below) |
+| test_bitcast | (3,3) fp16 → int32: 6 bytes/row not divisible by 4 — fails on ALL HALF backends, not Rockchip-specific |
 | test_scatter_reduce_errors | assertion failure (edge case) |
 | test_scatter_reduce_prod_zeros | dtype mismatch in scatter |
 | test_repeat_interleave / test_roll | integer div/mod layout |
@@ -1025,11 +1025,13 @@ to compute bool/int results in fp16. This is a **software fallback**, not NPU
 hardware execution — but it proves the tests CAN pass with fp16 compute +
 output cast.
 
-**Truly no ref in any branch AND no potential — 0 tests.**
+**Truly no ref in any branch AND no potential — 1 test:**
 
-Every failed test either has a ref in some branch or has a viable fix path.
+| Test | Category | Why no potential |
+|------|----------|------------------|
+| test_bitcast | edge case | (3,3) fp16 = 6 bytes/row, not divisible by 4 (int32). Fails on ALL HALF backends (verified CLANG too). DEFAULT_FLOAT=HALF issue, not Rockchip-specific |
 
-**No ref in any branch, but HAS potential — 33 tests:**
+**No ref in any branch, but HAS potential — 32 tests:**
 
 | Test | Category | Potential path |
 |------|----------|---------------|
@@ -1048,7 +1050,6 @@ Every failed test either has a ref in some branch or has a viable fix path.
 | test_log2 | LOG2 | LOG2 LUT ref exists |
 | test_avg_pool2d_ceil_mode_* (2) | WHERE | WHERE + PPU AVE |
 | test_max_pool2d_ceil_mode_* | WHERE | WHERE + PPU MAX |
-| test_bitcast | edge case | Pure metadata change (no compute) — allow BITCAST through `_is_fp16_only` classifier |
 | test_avg_pool3d | edge case | Has ref in backend-consideration (line 3064), lowers to avg_pool2d, decompose to 2D PPU passes |
 | test_pow_int_base_float_exponent | dtype (int32→float) | tinygrad has xpow (EXP2+LOG2 LUT), int32→fp16 cast hack works. Fails on dtype assertion (torch=float32, tinygrad=half) — tinygrad dtype policy fix, not hardware |
 | test_max_unpool2d | layout (scatter write) | CONST fill 0 + WHERE(CMPEQ(RANGE, pos), value, 0) per pooled value via PC chain. All sequential, no random DMA |
@@ -1060,10 +1061,54 @@ Every failed test either has a ref in some branch or has a viable fix path.
 | test_round_quantization_gradient | non_index_operand | Fail reason is `non_index_operand`, NOT gradient. FORWARD_ONLY=1 skips gradients. Forward needs round() (TRUNC-like, LHF) + EW ops |
 | test_scatter_reduce_errors | assertion | Uses `helper_test_exception` — pure Python error checking, NO NPU execution. Fix: add validation in scatter_reduce |
 
-**Summary: 0 of 269 failures have no ref AND no potential.** Every failed test
-either has a ref in some branch or has a viable fix path (WHERE, layout
-strides, PPU AVE, LUT, cast hack, PC chain, CMAC+BS_MUL, INT8 precision,
-TRUNC/round, non_index_operand fix, scatter validation).
+**Summary: 1 of 269 failures has no ref and no potential (test_bitcast —
+DEFAULT_FLOAT=HALF shape incompatibility, fails on all HALF backends).** Every
+other failed test either has a ref in some branch or has a viable fix path.
+
+**Theoretical ceiling: 415/416 non-skipped tests (99.8%).** Current: 71/416
+(17%). The 8 SKIP are **upstream tinygrad skips** (not Rockchip-specific):
+2 redundant (covered by other conv2d tests), 3 slow (large conv shapes),
+1 broken test (#862), 1 "not supported" (int power — covered by
+test_pow_int_base_float_exponent), 1 LLVM-only (devectorize). All 345
+non-passing tests (324 FAIL + 21 PARTIAL) have a viable fix path. The gap
+is ~200-300 lines of implementation across ~10 fix categories — engineering
+work, not hardware limits.
+
+### Implementation order (easiest first, by lines/test ratio)
+
+| # | Fix category | Lines | Tests unlocked | Cumulative PASS | Cumulative % | Dependencies | Ref |
+|---|-------------|-------|---------------|-----------------|--------------|--------------|-----|
+| 1 | **scatter_reduce_errors** (Python validation) | ~5 | 1 | 72 | 17.3% | None | None (no NPU) |
+| 2 | **Cast hack** (extra_matcher: int→fp16→int) | ~10 | ~30 dtype tests | 102 | 24.5% | None | backend-consideration |
+| 3 | **RECIPROCAL/FDIV** (DPU ew_alu_algo=3) | ~20 | 2 (test_div, test_scalar_div) | 107 | 25.7% | None | recip branch |
+| 4 | **fused_epilogue** (CMAC bias fusion via BS) | ~15 | 4 | 111 | 26.7% | None | backend-consideration |
+| 5 | **CMAC+BS_MUL** (mean: REDUCE(ADD)+MUL(1/N)) | ~15 | 15 | 126 | 30.3% | None | None (proven pattern) |
+| 6 | **PPU AVE** (POOLING_METHOD=0, FP17 RECIP) | ~15 | 5 | 131 | 31.5% | WHERE (for avg_pool2d) | ref/rk3588/pool.py (hw-verified) |
+| 7 | **SQRT** (DPU FDIV: sqrt=x*rsqrt(x)) | ~15-20 | 1 | 132 | 31.7% | RECIPROCAL | recip branch |
+| 8 | **WHERE** (DPU WHERE emitter: a*c+b*(1-c)) | ~50 | 49 | 181 | 43.5% | CMPLT/CMPEQ (already EW) | backend-consideration |
+| 9 | **TRUNC** (decompose via WHERE+CMPLT+SUB+NEG) | ~20 | 1 | 182 | 43.8% | WHERE | backend-consideration |
+| 10 | **cmac_exceeds_cbuf** (CMAC tiling) | ~15 | 2 | 184 | 44.2% | None | None |
+| 11 | **EXP2** (DPU LUT, 513-entry table) | ~30 | 3 | 187 | 44.9% | None | recip branch |
+| 12 | **LOG2** (DPU LUT, same as EXP2) | ~30 | 1 | 188 | 45.2% | EXP2 | recip branch |
+| 13 | **SIN** (DPU LUT, same as EXP2) | ~30 | 2 | 190 | 45.7% | EXP2 | recip branch |
+| 14 | **non_index_operand** (reshape/copy operand) | ~30-50 | 54 | 244 | 58.7% | None | backend-consideration |
+| 15 | **Layout strides** (classifier: accept strided patterns) | ~50-100 | 84 | 328 | 78.8% | None | Mesa, backend-consideration |
+| 16 | **PC chain sequential MUL** (REDUCE(MUL) via PC chain) | ~30 | 21 | 349 | 83.9% | None | None (PC chain proven) |
+| 17 | **INT8 precision mode** (PROC_PRECISION=0, CVT regs) | ~50 | ~5 | 354 | 85.1% | None | Mesa, mtx512 |
+| 18 | **forward_pass_failed debug** (runtime bugs) | ? | 5 | 359 | 86.3% | None | None (needs debugging) |
+| 19 | **Remaining edge cases** (unpool, scatter, etc.) | ~50 | ~56 | 415 | 99.8% | WHERE, PC chain, layout | Various |
+
+**Notes on the order:**
+- Item 1 is trivial (~5 lines, no dependencies, no NPU compute)
+- Item 2 (cast hack) is the highest lines/test ratio — ~10 lines for ~30 tests
+- Item 8 (WHERE) is the single biggest win: 49 tests for ~50 lines
+- Item 9 (TRUNC) depends on WHERE — moved after WHERE, not before
+- test_bitcast removed — (3,3) fp16→int32 shape incompatibility, fails on ALL HALF backends
+- Items 11-13 (LUT) share the same mechanism — implement EXP2 first, LOG2/SIN are incremental
+- Item 14 (non_index_operand) + 15 (layout strides) together unlock ~138 tests — the bulk of remaining failures
+- Item 16 (PC chain MUL) unlocks all MUL-in-reduce tests in 1 submit call
+- Items 1-13 are ~250 lines total and unlock ~190 tests (46% pass rate)
+- Items 14-19 are ~250 lines total and unlock the remaining ~225 tests (99.8%)
 
 ### Verification status of key claims
 

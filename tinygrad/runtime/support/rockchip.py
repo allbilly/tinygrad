@@ -6,8 +6,16 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import Ops, UOp, ProgramInfo
+from tinygrad.uop.ops import Ops, UOp, ProgramInfo, GroupOp, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
+from tinygrad.uop.upat import UPat
+
+# Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b) and MUL(RECIPROCAL(b), a) → FDIV(a, b)
+# This lets the classifier see FDIV directly instead of nested MUL+RECIPROCAL
+_pm_fdiv = PatternMatcher([
+  (UPat.var("a") * UPat(Ops.RECIPROCAL, src=(UPat.var("b"),), name="r"), lambda a, b, r: UOp(Ops.FDIV, r.dtype, (a, b))),
+  (UPat(Ops.RECIPROCAL, src=(UPat.var("b"),), name="r") * UPat.var("a"), lambda a, b, r: UOp(Ops.FDIV, r.dtype, (a, b))),
+])
 
 # target ids for emit_raw (rkt_get_target(reg) + 1, from rkt_registers.h)
 # PC=0x80 is the value used by the working allbilly reference (autogen has 0x100, which is wrong for PC)
@@ -96,13 +104,23 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
 _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
 _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
 
-def _try_scalar(val: UOp) -> tuple[int, float]|None:
-  """ADD/MUL/MAX(INDEX, CONST(c)) → (index_slot, const_val) for DPU scalar op, or None."""
+def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
+  """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
+  swap=True when CONST is the first operand of FDIV (CONST/INDEX needs swapped DMA: CONST=input, INDEX=weight)."""
   if val.op not in _DPU_EW_CFGS: return None
-  for s, c in (val.src[0], val.src[1]), (val.src[1], val.src[0]):
+  for i, (s, c) in enumerate(((val.src[0], val.src[1]), (val.src[1], val.src[0]))):
     if _unwrap(s).op is Ops.INDEX and c.op is Ops.CONST:
-      return _unwrap(s).src[0].buf_uop.arg.slot, float(c.arg)
+      # i=0: INDEX first (normal order). i=1: CONST first (swapped — only matters for non-commutative FDIV)
+      swap = (i == 1 and val.op is Ops.FDIV)
+      return _unwrap(s).src[0].buf_uop.arg.slot, float(c.arg), swap
   return None
+
+def _try_reciprocal(val: UOp) -> tuple[int, float]|None:
+  """RECIPROCAL(INDEX) → (index_slot, 1.0) for DPU scalar FDIV with swapped operands (1/x), or None."""
+  if val.op is not Ops.RECIPROCAL: return None
+  inner = _unwrap(val.src[0])
+  if inner.op is not Ops.INDEX: return None
+  return inner.src[0].buf_uop.arg.slot, 1.0
 
 def _try_where_max(val: UOp) -> UOp|None:
   """WHERE(CMPLT(a,b), b, a) or WHERE(CMPLT(b,a), a, b) → synthetic MAX(a,b), or None."""
@@ -228,10 +246,14 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     if where_max is not None: val = where_max
     val = _unwrap(val)  # strip no-op CASTs (half→half) so EW ops are recognized
     sub_slots, scalar = _try_sub(val), _try_scalar(val)
+    reciprocal = _try_reciprocal(val)
     # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
     # Broadcast and mean are rejected — no host-side tensor arithmetic.
     if sub_slots is not None:
       if (r := _check_dpu_layout(sink, False, False)): return r
+      kind = "dpu"
+    elif reciprocal is not None:
+      if (r := _check_dpu_layout(sink, True, True)): return r
       kind = "dpu"
     elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)):
       if (r := _check_dpu_layout(sink, True, True)): return r
@@ -299,24 +321,22 @@ def _reduce_extent(reduce: UOp) -> int:
   return int(rng.src[0].arg) if rng.op is Ops.RANGE and rng.src[0].op is Ops.CONST else -1
 
 # ---- emitter ----
-class _Emitter:
-  def __init__(self):
-    self.cmds: list[RKCmd] = []
-    self.relocs: list[RKReloc] = []
-  def emit(self, target, reg, value): self.cmds.append(RKCmd(target, reg, value))
-  def reloc(self, globals_slot, addend=0, shift=0, mask=0xFFFFFFFF, field_shift=0):
-    self.relocs.append(RKReloc(len(self.cmds)-1, globals_slot, addend, shift, mask, field_shift))
-  def pc_op_en(self, reserved_0): self.emit(_T_PC, rk.REG_PC_OPERATION_ENABLE, (reserved_0 << 1))
+def emitter_emit(cmds, target, reg, value): cmds.append(RKCmd(target, reg, value))
+def emitter_reloc(cmds, relocs, globals_slot, addend=0, shift=0, mask=0xFFFFFFFF, field_shift=0):
+  relocs.append(RKReloc(len(cmds)-1, globals_slot, addend, shift, mask, field_shift))
+def emitter_pc_op_en(cmds, reserved_0): emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (reserved_0 << 1))
 
 # DPU EW_CFG values for each op (from ref/rk3588/examples/elementwise.py)
 # Base: data_mode=1, data_size=2, relu_bypass=1, lut_bypass=1, op_src=1
 _EW_BASE = 0x108002c0
+# FDIV: ew_alu_algo=3, EW_OP_CVT_BYPASS=1 (bit 8) — output is fp16, needs OUT_CVT_SCALE=1
 _DPU_EW_CFGS = {Ops.ADD: _EW_BASE | (2 << 16), Ops.SUB: _EW_BASE | (4 << 16),
-                 Ops.MUL: _EW_BASE | (1 << 2) | (1 << 8), Ops.MAX: _EW_BASE}
+                 Ops.MUL: _EW_BASE | (1 << 2) | (1 << 8), Ops.MAX: _EW_BASE,
+                 Ops.FDIV: _EW_BASE | (3 << 16) | (1 << 8)}
 
 def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """DPU elementwise op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy. Register sequence from elementwise.py."""
-  e = _Emitter()
+  cmds, relocs = [], []
   sink = plan.sink
   store = _store_node(sink)
   assert store is not None, "dpu: no STORE node"
@@ -331,48 +351,70 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   is_copy = vu.op is Ops.INDEX
   is_fill = vu.op is Ops.CONST
   sub_slots, scalar = (None, None) if (is_copy or is_fill) else (_try_sub(val), _try_scalar(val))
+  reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None) else _try_reciprocal(val)
   layout = (total,)
-  e.emit(_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
-  e.emit(_T_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002)
-  e.emit(_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007)
-  e.emit(_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, dw)
-  e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, dw)
-  e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0)
-  e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 0x70007)
-  e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008)
-  e.emit(_T_DPU, rk.REG_DPU_DST_BASE_ADDR, 0)
-  e.reloc(plan.out_slot)
-  e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0)
+  # track the EW op for FDIV-specific register emissions (OUT_CVT_SCALE, FP16TOFP32_EN=0)
+  ew_op = Ops.SUB if sub_slots else (Ops.FDIV if reciprocal else (val.op if scalar else (Ops.ADD if is_fill else (None if is_copy else val.op))))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, dw)
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, dw)
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0)
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 0x70007)
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DST_BASE_ADDR, 0)
+  emitter_reloc(cmds, relocs, plan.out_slot)
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0)
   if sub_slots:
-    e.reloc(sub_slots[0])
-    e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
-    e.reloc(sub_slots[1])
-    e.emit(_T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.SUB])
+    emitter_reloc(cmds, relocs, sub_slots[0])
+    emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+    emitter_reloc(cmds, relocs, sub_slots[1])
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.SUB])
+  elif reciprocal:
+    # RECIPROCAL(x) = 1/x: swap operands — CONST(1) as input (RDMA_SRC), INDEX as weight (RDMA_EW)
+    emitter_reloc(cmds, relocs, _CONST_SLOT, struct.unpack('<I', struct.pack('<f', reciprocal[1]))[0])
+    emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+    emitter_reloc(cmds, relocs, reciprocal[0])
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.FDIV])
   elif scalar:
-    e.reloc(scalar[0])
-    e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
-    e.reloc(_CONST_SLOT, struct.unpack('<I', struct.pack('<f', scalar[1]))[0])
-    e.emit(_T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[val.op])
+    slot, const_val, swap = scalar
+    if swap:
+      # FDIV(CONST, INDEX) = CONST/INDEX: CONST as input (RDMA_SRC), INDEX as weight (RDMA_EW)
+      emitter_reloc(cmds, relocs, _CONST_SLOT, struct.unpack('<I', struct.pack('<f', const_val))[0])
+      emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+      emitter_reloc(cmds, relocs, slot)
+    else:
+      # Normal: INDEX as input (RDMA_SRC), CONST as weight (RDMA_EW)
+      emitter_reloc(cmds, relocs, slot)
+      emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+      emitter_reloc(cmds, relocs, _CONST_SLOT, struct.unpack('<I', struct.pack('<f', const_val))[0])
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[val.op])
   elif is_copy:
-    e.reloc(vu.src[0].buf_uop.arg.slot)
-    e.emit(_T_DPU, rk.REG_DPU_EW_CFG, 0)  # EW disabled — DMA pass-through
+    emitter_reloc(cmds, relocs, vu.src[0].buf_uop.arg.slot)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, 0)  # EW disabled — DMA pass-through
   elif is_fill:
-    e.reloc(_ZERO_SLOT)
-    e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
-    e.reloc(_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(vu.arg)))[0])
-    e.emit(_T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.ADD])  # zero + const = fill
+    emitter_reloc(cmds, relocs, _ZERO_SLOT)
+    emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+    emitter_reloc(cmds, relocs, _CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(vu.arg)))[0])
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.ADD])  # zero + const = fill
   else:
-    e.reloc(_unwrap(val.src[0]).src[0].buf_uop.arg.slot)
-    e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
-    e.reloc(_unwrap(val.src[1]).src[0].buf_uop.arg.slot)
-    e.emit(_T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[val.op])
-  e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
-  e.pc_op_en(12)
-  return tuple(c.pack() for c in e.cmds), RKTask(0x18, 0x300, 4, "dpu", layout, plan.out_slot, is_copy=is_copy, is_fill=is_fill), tuple(e.relocs)
+    emitter_reloc(cmds, relocs, _unwrap(val.src[0]).src[0].buf_uop.arg.slot)
+    emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+    emitter_reloc(cmds, relocs, _unwrap(val.src[1]).src[0].buf_uop.arg.slot)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[val.op])
+  # FDIV: emit OUT_CVT_SCALE=1 (output conversion scale for fp16 division result)
+  if ew_op is Ops.FDIV:
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1)
+  # FDIV: MRDMA_FP16TOFP32_EN=0 (bit 3 clear) — division runs in fp16, no fp32 conversion
+  rdma_fmc = 0x17849 if ew_op is not Ops.FDIV else 0x17841
+  emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_fmc)
+  emitter_pc_op_en(cmds, 12)
+  return tuple(c.pack() for c in cmds), RKTask(0x18, 0x300, 4, "dpu", layout, plan.out_slot, is_copy=is_copy, is_fill=is_fill), tuple(relocs)
 
 def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """CNA+CORE matmul or sum. A=(M,K), B=(K,N), output=(M,N) FP32→FP16. Transforms in __call__."""
-  e = _Emitter()
+  cmds, relocs = [], []
   sink = plan.sink
   reduce = _reduce_node(sink)
   assert reduce is not None, "cmac: no REDUCE node"
@@ -423,72 +465,72 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
     raise RuntimeError("RKPLAN_REJECT:cmac_exceeds_cbuf")
   # --- exact register sequence from gemm.py make_gemm_regs ---
   # 1. DPU S_POINTER
-  e.emit(_T_DPU, rk.REG_DPU_S_POINTER, (1<<3)|(1<<2)|(1<<1))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_S_POINTER, (1<<3)|(1<<2)|(1<<1))
   # 2. CNA CONV_CON1: IN_PRECISION=2, PROC_PRECISION=2, GROUP_LINE_OFF=1
-  e.emit(_T_CNA, rk.REG_CNA_CONV_CON1, (2<<4)|(2<<7)|(1<<29))
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CONV_CON1, (2<<4)|(2<<7)|(1<<29))
   # 3. CNA CONV_CON2: FEATURE_GRAINS
-  e.emit(_T_CNA, rk.REG_CNA_CONV_CON2, (feature_grains << 4))
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CONV_CON2, (feature_grains << 4))
   # 4. CNA CONV_CON3: CONV_Y_STRIDE=1, CONV_X_STRIDE=1
-  e.emit(_T_CNA, rk.REG_CNA_CONV_CON3, (1<<3)|1)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CONV_CON3, (1<<3)|1)
   # 5-8. CNA data sizes
-  e.emit(_T_CNA, rk.REG_CNA_DATA_SIZE0, (1<<16)|M)
-  e.emit(_T_CNA, rk.REG_CNA_DATA_SIZE1, ((align_in-1)<<16)|align_in)
-  e.emit(_T_CNA, rk.REG_CNA_DATA_SIZE2, 1)
-  e.emit(_T_CNA, rk.REG_CNA_DATA_SIZE3, M)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE0, (1<<16)|M)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE1, ((align_in-1)<<16)|align_in)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE2, 1)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE3, M)
   # 9-11. CNA weight sizes
-  e.emit(_T_CNA, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes * align_out)
-  e.emit(_T_CNA, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes)
-  e.emit(_T_CNA, rk.REG_CNA_WEIGHT_SIZE2, (1<<24)|(1<<16)|align_out)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes * align_out)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_WEIGHT_SIZE2, (1<<24)|(1<<16)|align_out)
   # 12-13. CNA CBUF config
-  e.emit(_T_CNA, rk.REG_CNA_CBUF_CON0, ((RK_CBUF_BANKS-data_banks)<<4)|data_banks)
-  e.emit(_T_CNA, rk.REG_CNA_CBUF_CON1, _ceil_div(align_in, MIN_CHANNEL_TILE))
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CBUF_CON0, ((RK_CBUF_BANKS-data_banks)<<4)|data_banks)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CBUF_CON1, _ceil_div(align_in, MIN_CHANNEL_TILE))
   # 14-18. CNA CVT config
-  e.emit(_T_CNA, rk.REG_CNA_CVT_CON0, (1<<3)|(1<<1)|1)
-  for r in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4): e.emit(_T_CNA, r, 1<<16)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_CVT_CON0, (1<<3)|(1<<1)|1)
+  for r in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4): emitter_emit(cmds, _T_CNA, r, 1<<16)
   # 19. CNA FEATURE_DATA_ADDR (relocated — input A)
-  e.emit(_T_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0)
-  e.reloc(a_slot)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0)
+  emitter_reloc(cmds, relocs, a_slot)
   # 20-24. CNA DMA config
-  e.emit(_T_CNA, rk.REG_CNA_DMA_CON0, (15<<16)|15)
-  e.emit(_T_CNA, rk.REG_CNA_DMA_CON1, line_stride)
-  e.emit(_T_CNA, rk.REG_CNA_DMA_CON2, 0)
-  e.emit(_T_CNA, rk.REG_CNA_FC_DATA_SIZE0, (1<<16)|M)
-  e.emit(_T_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_in)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DMA_CON0, (15<<16)|15)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DMA_CON1, line_stride)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DMA_CON2, 0)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_FC_DATA_SIZE0, (1<<16)|M)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_in)
   # 25. CNA DCOMP_ADDR0 (relocated — weight B, NO 0x4000 offset)
-  e.emit(_T_CNA, rk.REG_CNA_DCOMP_ADDR0, 0)
-  e.reloc(b_slot)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DCOMP_ADDR0, 0)
+  emitter_reloc(cmds, relocs, b_slot)
   # 26-29. CORE config
-  e.emit(_T_CORE, rk.REG_CORE_MISC_CFG, (2<<8)|1)
-  e.emit(_T_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((M-1)<<16)|0)
-  e.emit(_T_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out-1)
-  e.emit(_T_CORE, 0x3030, 0)  # CORE_RESERVED_3030
+  emitter_emit(cmds, _T_CORE, rk.REG_CORE_MISC_CFG, (2<<8)|1)
+  emitter_emit(cmds, _T_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((M-1)<<16)|0)
+  emitter_emit(cmds, _T_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out-1)
+  emitter_emit(cmds, _T_CORE, 0x3030, 0)  # CORE_RESERVED_3030
   # 30-45. DPU output config (FP32 output: OUT_PRECISION=5, size_e=3)
-  e.emit(_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, (15<<5)|(2<<1))
-  e.emit(_T_DPU, rk.REG_DPU_DATA_FORMAT, (5<<29)|(2<<26)|2)
-  e.emit(_T_DPU, rk.REG_DPU_DST_BASE_ADDR, 0)
-  e.reloc(plan.out_slot)
-  e.emit(_T_DPU, rk.REG_DPU_DST_SURF_STRIDE, (1<<4))
-  e.emit(_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0)
-  e.emit(_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, M-1)
-  e.emit(_T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch_val<<16)|notch_val)
-  e.emit(_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((align_out-1)<<16)|(align_out-1))
-  e.emit(_T_DPU, rk.REG_DPU_BS_CFG, (1<<6)|(1<<4)|(1<<1)|1)
-  e.emit(_T_DPU, rk.REG_DPU_BS_OW_CFG, (3<<8)|(3<<5)|(3<<2)|(1<<1))
-  e.emit(_T_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1)
-  e.emit(_T_DPU, rk.REG_DPU_WDMA_SIZE_1, ((M-1)<<16)|0)
-  e.emit(_T_DPU, rk.REG_DPU_BN_CFG, (1<<6)|(1<<4)|(1<<1)|1)
-  e.emit(_T_DPU, rk.REG_DPU_EW_CFG, (1<<9)|(1<<8)|(1<<7)|(1<<1)|1)
-  e.emit(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0)  # FP32 output, no conversion
-  e.emit(_T_DPU, rk.REG_DPU_SURFACE_ADD, (4<<4))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, (15<<5)|(2<<1))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_FORMAT, (5<<29)|(2<<26)|2)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DST_BASE_ADDR, 0)
+  emitter_reloc(cmds, relocs, plan.out_slot)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DST_SURF_STRIDE, (1<<4))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, M-1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch_val<<16)|notch_val)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((align_out-1)<<16)|(align_out-1))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1<<6)|(1<<4)|(1<<1)|1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_OW_CFG, (3<<8)|(3<<5)|(3<<2)|(1<<1))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_1, ((M-1)<<16)|0)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, (1<<6)|(1<<4)|(1<<1)|1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1<<9)|(1<<8)|(1<<7)|(1<<1)|1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0)  # FP32 output, no conversion
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, (4<<4))
   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
-  e.emit(_T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
+  emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
   layout = (M, N, K, align_in, align_out)
-  return tuple(c.pack() for c in e.cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot, const_val=cv), tuple(e.relocs)
+  return tuple(c.pack() for c in cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot, const_val=cv), tuple(relocs)
 
 def _emit_ppu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """PPU globalmax. Input (H,W,C) fp16 → (C,) fp16. Raw register values per pool.py.
   PPU processes channels in groups of 8 for FP16; C is padded to a multiple of 8."""
-  e = _Emitter()
+  cmds, relocs = [], []
   sink = plan.sink
   reduce = _reduce_node(sink)
   assert reduce is not None, "ppu: no REDUCE node"
@@ -505,51 +547,51 @@ def _emit_ppu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   # --- exact register sequence from pool.py pooling_regs("globalmax") ---
   # All values are raw 32-bit, written directly (no _f field shifting)
   # 1-2. S_POINTER
-  e.emit(_T_PPU, rk.REG_PPU_S_POINTER, (1<<3)|(1<<2)|(1<<1))
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_S_POINTER, (1<<3)|(1<<2)|(1<<1))
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_S_POINTER, (1<<3)|(1<<2)|(1<<1))
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_S_POINTER, (1<<3)|(1<<2)|(1<<1))
   # 3-5. PPU input cube (zero-based)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_CUBE_IN_WIDTH, in_w_field)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_CUBE_IN_HEIGHT, in_h_field)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_CUBE_IN_CHANNEL, channel_field)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_CUBE_IN_WIDTH, in_w_field)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_CUBE_IN_HEIGHT, in_h_field)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_CUBE_IN_CHANNEL, channel_field)
   # 6-8. PPU output cube (global: 0,0,7)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_CUBE_OUT_WIDTH, 0)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_CUBE_OUT_HEIGHT, 0)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_CUBE_OUT_CHANNEL, channel_field)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_CUBE_OUT_WIDTH, 0)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_CUBE_OUT_HEIGHT, 0)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_CUBE_OUT_CHANNEL, channel_field)
   # 9. OPERATION_MODE_CFG: flying=1, pooling_method=1 (MAX)
-  e.emit(_T_PPU, rk.REG_PPU_OPERATION_MODE_CFG, (1<<4)|1)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_OPERATION_MODE_CFG, (1<<4)|1)
   # 10. POOLING_KERNEL_CFG: (s_h<<20)|(s_w<<16)|(k_h<<8)|k_w — global: kernel=stride=full input
-  e.emit(_T_PPU, rk.REG_PPU_POOLING_KERNEL_CFG, (in_h_field<<20)|(in_w_field<<16)|(in_h_field<<8)|in_w_field)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_POOLING_KERNEL_CFG, (in_h_field<<20)|(in_w_field<<16)|(in_h_field<<8)|in_w_field)
   # 11. DST_BASE_ADDR (relocated — pool.py writes (output_dma // 16) << 4)
-  e.emit(_T_PPU, rk.REG_PPU_DST_BASE_ADDR, 0)
-  e.reloc(plan.out_slot, shift=4, mask=0xFFFFFFF, field_shift=4)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DST_BASE_ADDR, 0)
+  emitter_reloc(cmds, relocs, plan.out_slot, shift=4, mask=0xFFFFFFF, field_shift=4)
   # 12. DST_SURF_STRIDE (raw value — pool.py writes dst_surf_stride directly)
-  e.emit(_T_PPU, rk.REG_PPU_DST_SURF_STRIDE, 1)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DST_SURF_STRIDE, 1)
   # 13. DATA_FORMAT (raw — pool.py writes (index_add << 16) | 2; autogen INDEX_ADD shift=4 is WRONG)
-  e.emit(_T_PPU, rk.REG_PPU_DATA_FORMAT, (1 << 16) | 2)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_DATA_FORMAT, (1 << 16) | 2)
   # 14. MISC_CTRL (raw — pool.py writes 3 for burst_len)
-  e.emit(_T_PPU, rk.REG_PPU_MISC_CTRL, 3)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_MISC_CTRL, 3)
   # 15-17. RDMA input cube (zero-based)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH, in_w_field)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT, in_h_field)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL, channel_field)
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH, in_w_field)
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT, in_h_field)
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL, channel_field)
   # 18. RDMA SRC_BASE_ADDR (relocated — pool.py writes raw input_dma)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_BASE_ADDR, 0)
-  e.reloc(plan.in_slots[0])
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_BASE_ADDR, 0)
+  emitter_reloc(cmds, relocs, plan.in_slots[0])
   # 19-20. RDMA strides (raw bytes — pool.py writes width_stride/src_surf_stride directly;
   #   hardware field at shift=4 divides by 16 to get 16-byte units)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE, width_stride)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE, width_stride * in_h)
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE, width_stride)
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE, width_stride * in_h)
   # 21. RDMA DATA_FORMAT (raw — pool.py writes 2 for fp16)
-  e.emit(_T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_DATA_FORMAT, 2)
+  emitter_emit(cmds, _T_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_DATA_FORMAT, 2)
   # 22. RDMA OPERATION_ENABLE (raw — pool.py writes 1)
   # NOTE: autogen has wrong address 0x7008; correct is 0x7038 (see ref/rk3588/experimental/pool.py)
-  e.emit(_T_PPU_RDMA, 0x7038, 1)
+  emitter_emit(cmds, _T_PPU_RDMA, 0x7038, 1)
   # 23-24. RECIP_KERNEL_WIDTH/HEIGHT (raw — pool.py writes 0 for max pool, 30720 for avg)
-  e.emit(_T_PPU, rk.REG_PPU_RECIP_KERNEL_WIDTH, 0)
-  e.emit(_T_PPU, rk.REG_PPU_RECIP_KERNEL_HEIGHT, 0)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_RECIP_KERNEL_WIDTH, 0)
+  emitter_emit(cmds, _T_PPU, rk.REG_PPU_RECIP_KERNEL_HEIGHT, 0)
   # 25. PC_OPERATION_ENABLE: PPU-only mode (reserved_0=48, op_en=0 — pool.py uses <<1 without |1)
-  e.pc_op_en(48)
-  return tuple(c.pack() for c in e.cmds), RKTask(0x60, 0xc00, 1, "ppu", (in_h, in_w, channels, chan_padded), plan.out_slot), tuple(e.relocs)
+  emitter_pc_op_en(cmds, 48)
+  return tuple(c.pack() for c in cmds), RKTask(0x60, 0xc00, 1, "ppu", (in_h, in_w, channels, chan_padded), plan.out_slot), tuple(relocs)
 
 # ---- emit_rk dispatcher (§2.3 API) ----
 def emit_rk(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
@@ -602,6 +644,8 @@ def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
 def build_native_program(sink: UOp) -> UOp|None:
   """Classify and build a PROGRAM(SINK, LINEAR(INS...)). Raises RKPLAN_REJECT:<reason>
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
+  # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
+  sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   plan = plan_rk(sink)
   if isinstance(plan, str): raise RuntimeError(plan)  # reject — preserve reason, no fallback
   cmds, task, relocs = emit_rk(plan)
