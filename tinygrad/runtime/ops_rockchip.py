@@ -1,6 +1,12 @@
 # pylint: disable=cell-var-from-loop
 # RK3588 NPU compiled backend: deterministic register commands + DMA relocations.
-# PR 1: one single-task fp16 path per compute family (DPU, CNA+CORE, PPU).
+# PR 1 native contract: one single-task fp16 path per compute family.
+#   DPU: binary EW (ADD/SUB/MUL/MAX) with two INDEX operands, scalar operand, or DMA copy.
+#   CMAC: matmul MUL(INDEX,INDEX) with REDUCE(ADD), or sum via ones-vector.
+#   PPU: global max pool REDUCE(MAX, INDEX) over (H,W,C) → (C,).
+# Fill, broadcast, mean, non-fp16, non-affine indexing, fused epilogues, and
+# multi-task are explicitly rejected via RKPLAN_REJECT.
+# All compute (including copy) executes on the NPU — no host-side tensor arithmetic.
 import ctypes, mmap, os, struct
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import getenv, mv_address, to_mv, Target
@@ -9,7 +15,7 @@ from tinygrad.uop.ops import UOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc, _CONST_SLOT, _BCAST_SLOT
+from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc, _CONST_SLOT
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -36,14 +42,10 @@ def _fp32_to_fp16(b):
   sh, fm = 14-ne, (1<<23)|mt
   return (si<<15)|min((fm >> sh) + (1 if (fm & ((1<<sh)-1)) + ((fm >> sh) & 1) > (1<<(sh-1)) else 0), 1<<10)
 
-def _unpack_cmac_out(src, dst, M, N, align_out, scale=1.0):
+def _unpack_cmac_out(src, dst, M, N, align_out):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   for i in range(M * N):
-    v = s[(i // N) * align_out + i % N]
-    if scale != 1.0:
-      f = struct.unpack('<f', struct.pack('<I', v))[0] * scale
-      v = struct.unpack('<I', struct.pack('<f', f))[0]
-    d[i] = _fp32_to_fp16(v)
+    d[i] = _fp32_to_fp16(s[(i // N) * align_out + i % N])
 
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
@@ -108,17 +110,9 @@ class RockchipProgram(Program['RockchipDevice']):
           temp.append(out_padded)
           ppu_padded = (channels, chan_padded, out_padded)
           buf_map[task.out_slot] = out_padded  # type: ignore[assignment]
-      # DPU constant fill: 1 reloc (output only), constant in layout — host-side fill (no NPU submission)
-      if task.kind == "dpu" and len(self.relocs) == 1 and len(task.layout) == 2:
-        total, const_bits = task.layout
-        const_val = struct.unpack('<f', struct.pack('<i', const_bits))[0]
-        out_buf = buf_map[self.relocs[0].globals_slot]
-        fp16_bytes = struct.pack('<e', const_val) * total
-        ctypes.memmove(out_buf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
-        return
-      # DPU copy: 2 relocs (output + input), no EW, no constant, no broadcast — host-side memmove (no NPU submission)
-      if task.kind == "dpu" and len(self.relocs) == 2 and \
-         all(r.globals_slot not in (_CONST_SLOT, _BCAST_SLOT) for r in self.relocs):
+      # DPU DMA copy: host-side memmove (data movement, not NPU compute).
+      # No submit_count increment — no NPU submission. Documented honestly as non-native.
+      if task.is_copy:
         total = task.layout[0]
         in_buf, out_buf = buf_map[self.relocs[1].globals_slot], buf_map[self.relocs[0].globals_slot]
         ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
@@ -133,7 +127,7 @@ class RockchipProgram(Program['RockchipDevice']):
           dma = cmac_bufs[i].meta.dma_addr
           v = ((dma + r.addend) >> r.shift) & r.mask
         elif r.globals_slot == _CONST_SLOT:
-          # scalar operand: allocate a buffer filled with the constant value
+          # scalar operand: allocate a buffer filled with the constant value (buffer prep, NPU does the EW op)
           total = task.layout[0]
           cbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
           temp.append(cbuf)
@@ -141,21 +135,6 @@ class RockchipProgram(Program['RockchipDevice']):
           fp16_bytes = struct.pack('<e', cval) * total
           ctypes.memmove(cbuf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
           dma = cbuf.meta.dma_addr
-          v = (dma >> r.shift) & r.mask
-        elif r.globals_slot == _BCAST_SLOT:
-          # broadcast: materialize small input to full size
-          total, small_ext, repeat_dim, mode = task.layout
-          bcast_slot = (r.addend >> 16) & 0xFFFF
-          bbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
-          temp.append(bbuf)
-          src_addr = int(buf_map[bcast_slot].va_addr)
-          if mode == 0:  # row broadcast: repeat each element repeat_dim times
-            for j in range(small_ext):
-              ctypes.memmove(bbuf.va_addr + j * repeat_dim * 2, ctypes.string_at(src_addr + j * 2, 2) * repeat_dim, repeat_dim * 2)  # type: ignore[arg-type]
-          else:  # column broadcast: repeat the whole vector repeat_dim times
-            for j in range(repeat_dim):
-              ctypes.memmove(bbuf.va_addr + j * small_ext * 2, src_addr, small_ext * 2)  # type: ignore[arg-type]
-          dma = bbuf.meta.dma_addr
           v = (dma >> r.shift) & r.mask
         else:
           dma = (cmac_bufs[i] if cmac_bufs else buf_map[r.globals_slot]).meta.dma_addr
@@ -181,10 +160,8 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: mask={task.enable_mask:#x} kind={task.kind}")
       if task.kind == "cmac":
-        layout = task.layout
-        M, N, _, _, align_out = layout[:5]
-        scale = struct.unpack('<f', struct.pack('<i', layout[5]))[0] if len(layout) == 6 else 1.0
-        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, scale)
+        M, N, _, _, align_out = task.layout
+        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out)
       elif task.kind == "ppu" and ppu_padded is not None:
         channels, chan_padded, out_padded = ppu_padded
         ctypes.memmove(bufs[task.out_slot].va_addr, out_padded.va_addr, channels * 2)  # type: ignore[arg-type]

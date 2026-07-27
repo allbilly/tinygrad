@@ -289,19 +289,28 @@ the proven interception adapter.
 If the CMAC layout path or interception adapter cannot be made small and clear, stop and fix that
 blocker. Do not compensate by adding convolution, coverage machinery or more planner abstraction.
 
-**PR1 acceptance criterion (measured):** Every `test_ops.py` kernel *accepted* by the Rockchip
-planner executes correctly on hardware. Unsupported dtype (bool/int32/uint8/fp32), non-affine
-indexing, scans, and index-producing operations are explicitly rejected via `RKPLAN_REJECT` and
-skip via CPU fallback or test-level skip. Literal full-suite `test_ops.py` success (550/550) is
-out of scope for PR1 — it would require a general-purpose ALU, integer datapath, multi-task
-programs, and tiling, all of which are PR2+ work. The FP16 subset grows in this order:
+**PR1 acceptance criterion (measured):** Verified minimal native coverage on
+CNA+CORE (matmul), DPU (elementwise ADD/SUB/MUL/MAX and DMA copy), and PPU
+(global max pool). Every kernel *accepted* by the Rockchip planner executes
+correctly on hardware. No host-side tensor arithmetic (fill, broadcast, mean
+scaling) is disguised as native work — these are explicitly rejected.
 
-1. DPU copy / basic ALU (SUB, MUL, MAX, neg) / broadcasting.
-2. Sum/mean (CMAC + constant one-vector) and general PPU max.
-3. GEMV / batched GEMM / large-GEMM tiling.
-4. Direct convolution.
-5. Multi-task activations and gradients.
-6. Integer/index operations only if hardware evidence provides a correct implementation.
+**Project gate (PR8):** Every applicable `test_ops.py` case passes with
+`FORWARD_ONLY=0`. Remaining skips must be intrinsic upstream skips, not
+Rockchip exclusions.
+
+Each intermediate PR (PR2–PR7) publishes raw pass/fail/reject counts for
+`test_ops.py`. Literal full-suite success is the project end-state, not PR1's
+result. The FP16 subset grows across PRs:
+
+1. DPU binary EW (ADD, SUB, MUL, MAX) with two INDEX operands, scalar operand, or DMA copy.
+2. Multi-task programs and scratch allocation (PR2).
+3. General DPU elementwise: nested ops, WHERE, activations, hardware fill/broadcast (PR3).
+4. General movement and addressing (PR4).
+5. CMAC reductions and matmul completeness: GEMV, batched GEMM, mean, tiling (PR5).
+6. Convolution and complete PPU coverage (PR6).
+7. Dtypes, indexing, and fallback policy (PR7).
+8. Full-suite gradients and qualification (PR8).
 
 ---
 

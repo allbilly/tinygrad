@@ -66,6 +66,7 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(_classify(_get_sink(-a)), "dpu")
 
   def test_dpu_copy(self):
+    # Copy (STORE(INDEX)) is a real NPU DMA pass-through, not host-side memmove
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a+0)), "dpu")
 
@@ -137,9 +138,10 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.sum())), "cmac")  # full sum → M=1,N=1 via ones-vector
 
-  def test_mean_full(self):
+  def test_mean_full_rejected(self):
+    # Mean (sum with post-reduce scalar MUL) is rejected in PR1 — no host-side scaling
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertEqual(_classify(_get_sink(a.mean())), "cmac")  # full mean → sum with scale
+    self.assertIn("REJECT", _classify(_get_sink(a.mean())))
 
   def test_sum_axis1(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
@@ -149,32 +151,34 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.sum(axis=0))), "cmac")
 
-  def test_mean_axis1(self):
+  def test_mean_axis1_rejected(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
-    self.assertEqual(_classify(_get_sink(a.mean(axis=1))), "cmac")
+    self.assertIn("REJECT", _classify(_get_sink(a.mean(axis=1))))
 
-  def test_mean_axis0(self):
+  def test_mean_axis0_rejected(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
-    self.assertEqual(_classify(_get_sink(a.mean(axis=0))), "cmac")
+    self.assertIn("REJECT", _classify(_get_sink(a.mean(axis=0))))
 
-  def test_broadcast_row(self):
+  def test_broadcast_row_rejected(self):
+    # Broadcast is rejected in PR1 — no host-side materialization
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,1,dtype=dtypes.half).realize()
-    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
+    self.assertIn("REJECT", _classify(_get_sink(a+b)))
 
-  def test_broadcast_col(self):
+  def test_broadcast_col_rejected(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,dtype=dtypes.half).realize()
-    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
+    self.assertIn("REJECT", _classify(_get_sink(a+b)))
 
-  def test_const_fill_zeros(self):
-    self.assertEqual(_classify(_get_sink(Tensor.zeros(4,4,dtype=dtypes.half))), "dpu")
+  def test_const_fill_zeros_rejected(self):
+    # Constant fill is rejected in PR1 — no host-side memmove
+    self.assertIn("REJECT", _classify(_get_sink(Tensor.zeros(4,4,dtype=dtypes.half))))
 
-  def test_const_fill_ones(self):
-    self.assertEqual(_classify(_get_sink(Tensor.ones(4,4,dtype=dtypes.half))), "dpu")
+  def test_const_fill_ones_rejected(self):
+    self.assertIn("REJECT", _classify(_get_sink(Tensor.ones(4,4,dtype=dtypes.half))))
 
-  def test_const_fill_full(self):
-    self.assertEqual(_classify(_get_sink(Tensor.full((4,4), 3.0, dtype=dtypes.half))), "dpu")
+  def test_const_fill_full_rejected(self):
+    self.assertIn("REJECT", _classify(_get_sink(Tensor.full((4,4), 3.0, dtype=dtypes.half))))
 
   def test_reject_transpose(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()

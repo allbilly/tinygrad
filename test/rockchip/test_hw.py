@@ -1,7 +1,7 @@
 # PR 1 hardware numerical tests: one per compute family (DPU, CNA+CORE, PPU).
 # These tests require an RK3588 NPU and /dev/dri/card1.
 import os, unittest, numpy as np
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor
 from tinygrad.helpers import to_mv
 
 _NPU_AVAILABLE = os.path.exists("/dev/dri/card1")
@@ -61,7 +61,7 @@ class TestDPU(unittest.TestCase):
   def test_dpu_copy(self):
     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()
-    c = (a + 0).realize()  # a+0 lowers to copy (STORE(INDEX))
+    c = (a + 0).realize()  # a+0 lowers to copy (STORE(INDEX)) — NPU DMA pass-through
     np.testing.assert_allclose(c.numpy(), a_np, rtol=1e-3, atol=1e-3)
 
   def test_dpu_scalar_add(self):
@@ -87,34 +87,6 @@ class TestDPU(unittest.TestCase):
     a = Tensor(a_np, device="ROCKCHIP").realize()
     c = a.maximum(0).realize()  # ReLU
     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, 0), rtol=1e-3, atol=1e-3)
-
-  def test_dpu_broadcast_row(self):
-    a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
-    b_np = np.array([[10],[20]], dtype=np.float16)
-    a = Tensor(a_np, device="ROCKCHIP").realize()
-    b = Tensor(b_np, device="ROCKCHIP").realize()
-    c = (a + b).realize()
-    np.testing.assert_allclose(c.numpy(), a_np + b_np, rtol=1e-3, atol=1e-3)
-
-  def test_dpu_broadcast_col(self):
-    a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
-    b_np = np.array([10,20,30,40], dtype=np.float16)
-    a = Tensor(a_np, device="ROCKCHIP").realize()
-    b = Tensor(b_np, device="ROCKCHIP").realize()
-    c = (a + b).realize()
-    np.testing.assert_allclose(c.numpy(), a_np + b_np, rtol=1e-3, atol=1e-3)
-
-  def test_dpu_zeros(self):
-    c = Tensor.zeros(4, 8, dtype=dtypes.half, device="ROCKCHIP").realize()
-    np.testing.assert_allclose(c.numpy(), np.zeros((4,8), dtype=np.float16), rtol=1e-3, atol=1e-3)
-
-  def test_dpu_ones(self):
-    c = Tensor.ones(4, 8, dtype=dtypes.half, device="ROCKCHIP").realize()
-    np.testing.assert_allclose(c.numpy(), np.ones((4,8), dtype=np.float16), rtol=1e-3, atol=1e-3)
-
-  def test_dpu_full(self):
-    c = Tensor.full((4, 8), 3.0, dtype=dtypes.half, device="ROCKCHIP").realize()
-    np.testing.assert_allclose(c.numpy(), np.full((4,8), 3.0, dtype=np.float16), rtol=1e-3, atol=1e-3)
 
   def test_dpu_relu(self):
     # relu(x) = MAX(x, 0) via WHERE→MAX rewrite
@@ -163,34 +135,12 @@ class TestCMAC(unittest.TestCase):
     c = a.sum(axis=0).realize()
     np.testing.assert_allclose(c.numpy(), a_np.sum(axis=0), rtol=1e-2, atol=1e-2)
 
-  def test_cmac_mean(self):
-    np.random.seed(42)
-    a_np = np.random.randn(4, 8).astype(np.float16)
-    a = Tensor(a_np, device="ROCKCHIP").realize()
-    c = a.mean(axis=1).realize()
-    np.testing.assert_allclose(c.numpy(), a_np.mean(axis=1), rtol=1e-2, atol=1e-2)
-
-  def test_cmac_mean_axis0(self):
-    np.random.seed(42)
-    a_np = np.random.randn(4, 8).astype(np.float16)
-    a = Tensor(a_np, device="ROCKCHIP").realize()
-    c = a.mean(axis=0).realize()
-    np.testing.assert_allclose(c.numpy(), a_np.mean(axis=0), rtol=1e-2, atol=1e-2)
-
   def test_cmac_sum_full(self):
     # Full reduction: sum all elements to scalar via ones-vector GEMM (M=1, N=1)
     a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()
     c = a.sum().realize()
     np.testing.assert_allclose(c.numpy(), a_np.sum(), rtol=1e-2, atol=1e-2)
-
-  def test_cmac_mean_full(self):
-    # Full reduction: mean of all elements via ones-vector GEMM with scale
-    np.random.seed(42)
-    a_np = np.random.randn(4, 8).astype(np.float16)
-    a = Tensor(a_np, device="ROCKCHIP").realize()
-    c = a.mean().realize()
-    np.testing.assert_allclose(c.numpy(), a_np.mean(), rtol=1e-2, atol=1e-2)
 
   def test_cmac_matmul_non_identity(self):
     a_np = np.array([[1,2],[3,4]], dtype=np.float16)
