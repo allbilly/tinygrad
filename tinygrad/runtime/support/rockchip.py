@@ -494,8 +494,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   # --- OUT_CVT_SHIFT: MINUS_EXP=13 (FP16 float division by 2^13) ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, (13 << 12))
-  # --- SURFACE_ADD=512 ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, 0x200)
+  # --- SURFACE_ADD = 2 * surf_stride ---
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, 2 * surf_stride)
   # --- unknown reg 0x40c4 = 0 (from silu.py) ---
   emitter_emit(cmds, _T_DPU, 0x40c4, 0)
   # --- LUT config registers ---

@@ -1621,3 +1621,48 @@ added 4 lines of FP16 copy + 1 register emission). The
 - `/tmp/test_fp16_output.py` — earlier height-based FP16 test (obsolete)
 - `ref/rk3588-npu/tests/matmul_fp16_fp16.c` — mtx512 reference (M up to 384)
 - `ref/rk3588-npu/src/npu_matmul.c` — mtx512 register generator
+
+## 2026-07-28 — sz-line reduction pass
+
+Goal: bring total sz-lines below 25000 (was 25058 at start of this session).
+
+### Applied changes
+
+| # | Change | File | Saved | Verified |
+|---|--------|------|-------|----------|
+| 1 | Replaced `_ceil_div`/`_align_up` with `ceildiv`/`round_up` from `tinygrad.helpers`; replaced `total` loop with `prod` | `support/rockchip.py` | 9 | 72/72 pass |
+| 2 | Replaced `_fp32_to_fp16` (10-line manual bit manipulation) with 3-line `struct.pack/unpack` version; removed `numpy` import from `support/rockchip.py` (replaced `np.float16().view()` with `struct.pack/unpack`) | `ops_rockchip.py` + `support/rockchip.py` | 10 (8+2) | 72/72 pass |
+| 3 | Consolidated `plan_rk` DPU branch: 6 branches × 2 lines (`check_layout + kind=`) → 6 one-line assignments + 1 shared `_check_dpu_layout` call | `support/rockchip.py` | 12 | 72/72 pass |
+
+**Total applied: 31 sz-lines saved.** Current total: 25071.
+
+### Tested in /tmp, not yet applied
+
+| # | Change | File | Saved | Status |
+|---|--------|------|-------|--------|
+| 4 | Extract `_dpu_preamble()` helper shared by `_emit_dpu` and `_emit_dpu_lut` (cmds/relocs/sink/store/val/total/dw/layout) | `support/rockchip.py` | 8 | 72/72 pass in /tmp, clean diff |
+| 5 | Extract `_emit_ew_pair()` helper: 5 of 7 `_emit_dpu` branches repeat 4-line `reloc→emit(EW_BASE_ADDR)→reloc→emit(EW_CFG)` pattern; scalar swap/no-swap sub-branches collapse from 10→3 lines | `support/rockchip.py` | 12 | 72/72 pass in /tmp, clean diff |
+
+**Pending: 20 sz-lines available** from changes #4 and #5.
+
+### Current sz-line counts
+
+| File | sz-lines |
+|------|----------|
+| `support/rockchip.py` | 571 |
+| `ops_rockchip.py` | 193 |
+| **Total repo** | **25071** |
+
+### Remaining opportunities (not yet tested)
+
+| # | Area | Est. saves | Risk | Notes |
+|---|------|-----------|------|-------|
+| 6 | `_emit_cmac` geometry constants inline (`CBUF_BANK_SIZE`, `RK_CBUF_BANKS`, etc.) | ~2 | Trivial | Hurts readability |
+| 7 | `ops_rockchip.py` PPU padding loop (lines 103-106) | ~2 | Medium | Strided layout makes ctypes bulk copy tricky |
+| 8 | `_f2u` helper for `struct.unpack('<I', struct.pack('<f', X))[0]` (4 occurrences) | 0 | Low | Calls already 1 line each; no sz-line savings |
+
+### Scratch files
+
+- `/tmp/rockchip_prelude_test.py` — change #4 (dpu preamble helper)
+- `/tmp/rockchip_ewpair_test2.py` — change #5 (EW pair helper)
+- `/tmp/rockchip_branch_test.py` — change #3 (applied)
