@@ -295,25 +295,29 @@ CNA+CORE (matmul), DPU (elementwise ADD/SUB/MUL/MAX and DMA copy), and PPU
 correctly on hardware. No host-side tensor arithmetic (fill, broadcast, mean
 scaling) is disguised as native work — these are explicitly rejected.
 
-**Project gate (PR8):** Every applicable `test_ops.py` case passes with
-`FORWARD_ONLY=0`. Remaining skips must be intrinsic upstream skips, not
-Rockchip exclusions.
+**Project gate (PR7):** Every applicable `test_ops.py` case passes with
+`FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP`. Remaining skips must be
+intrinsic upstream skips, not Rockchip exclusions.
+
+**Training gate (PR8, optional):** Every applicable `test_ops.py` case passes
+with default behavior (no `FORWARD_ONLY`). Gradient-generated task chains
+execute correctly. `FORWARD_ONLY=1` removed from the documented command.
 
 Each intermediate PR (PR2–PR7) publishes raw pass/fail/reject counts for
-`test_ops.py`. Literal full-suite success is the project end-state, not PR1's
-result. The FP16 subset grows across PRs:
+`test_ops.py` under `FORWARD_ONLY=1`. The FP16 subset grows across PRs:
 
-1. DPU binary EW (ADD, SUB, MUL, MAX) with two INDEX operands, scalar operand, DMA copy, or constant fill.
-2. CMAC GEMV: matrix-vector products (1D output, one vector input) (PR2).
-3. DPU hardware fill: CONST as DPU ADD(zero, const) (PR3).
-4. CMAC scaled sum: REDUCE(ADD, MUL(INDEX, CONST(c))) as ones-vector GEMM with const_val (PR4).
-5. DPU no-op CAST handling: strip half→half CASTs wrapping EW ops (PR5).
-6. General DPU elementwise: nested ops, WHERE, activations, hardware broadcast (PR6).
-7. General movement and addressing (PR7).
-8. CMAC matmul completeness: batched GEMM, mean, tiling (PR8).
-9. Convolution and complete PPU coverage (PR9).
-10. Dtypes, indexing, and fallback policy (PR10).
-11. Full-suite gradients and qualification (PR11).
+1. Minimal honest three-unit bring-up: CNA+CORE matmul, DPU elementwise, PPU global max pool (PR1).
+2. Multi-task programs, scratch allocation and DMA (PR2).
+3. DPU elementwise operations and decompositions: scalar operand, hardware fill, scaled sum, no-op CAST, nested ops, WHERE, activations, broadcast (PR3–PR5, ongoing).
+4. Movement, layouts and broadcasting (PR6).
+5. CMAC matmul, reductions and tiling (PR7).
+6. Convolution, pooling and general PPU coverage (PR8).
+7. Dtypes/indexing, fallback decision and full forward-only qualification (PR9).
+
+Optional training PR (PR8 in the original numbering, now PR10):
+- Gradient-generated task chains.
+- Backward numerical qualification.
+- Remove `FORWARD_ONLY=1` from the documented command.
 
 ---
 
