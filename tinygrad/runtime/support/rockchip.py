@@ -123,7 +123,7 @@ def _try_reciprocal(val: UOp) -> tuple[int, float]|None:
   return inner.src[0].buf_uop.arg.slot, 1.0
 
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
-_LUT_OPS = {Ops.EXP2}
+_LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN}
 _LUT_SIZE = 513
 
 def _build_exp2_lut() -> tuple[list[int], int, float, float]:
@@ -144,6 +144,56 @@ def _build_exp2_lut() -> tuple[list[int], int, float, float]:
     x = i * step
     y = math.exp2(x)
     lut[_LUT_SIZE + i] = max(-32768, min(32767, int(round(y * output_scale))))
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, output_scale, index_scale
+
+def _build_log2_lut() -> tuple[list[int], int, float, float]:
+  """Build 1026-entry LUT for LOG2 over x∈[0.25,4.0] → result∈[-2,2].
+  Uses LUT_LE_START=-16384 (same as EXP2), index_scale=4096.
+  LE table: underflow (x<0 → clip to log2(0+)=-2). LO table: x from 0 to 4.0.
+  LO index = (bn_mul - 0) >> 5 = (x * 4096) >> 5. Entry i: x = i/128."""
+  lut = [0] * _LUT_SIZE * 2
+  index_scale = 4090.0  # avoid x=4.0 hitting LUT_LO_END=16384 exactly
+  step = 32.0 / index_scale  # ≈ 1/127.8
+  output_scale = 8192.0
+  # LE table (table 0): underflow (bn_mul < 0, impossible for positive x → all clip to -2)
+  for i in range(_LUT_SIZE):
+    lut[i] = max(-32768, min(32767, int(round(-2.0 * output_scale))))
+  # LO table (table 1): covers bn_mul from 0 to 16384 (x from 0 to ~4.01)
+  for i in range(_LUT_SIZE):
+    x = i * step  # i=0: x=0, i=128: x≈1.0, i=512: x≈4.01
+    if x <= 0: y = -2.0  # clip log2(0) = -inf
+    else: y = math.log2(x)
+    y = max(-2.0, min(2.0, y))  # clip to [-2, 2]
+    v = int(round(y * output_scale))
+    # Avoid exact 0 in LUT — hardware produces wrong output for LUT result of 0
+    if v == 0: v = 1
+    lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, output_scale, index_scale
+
+def _build_sin_lut() -> tuple[list[int], int, float, float]:
+  """Build 1026-entry LUT for SIN over x∈[-π,π] → result∈[-1,1].
+  Uses LUT_LE_START=-16384, index_scale=16384/π≈5215.2.
+  LE table: x∈[-π,0], LO table: x∈[0,π]."""
+  lut = [0] * _LUT_SIZE * 2
+  index_scale = 16384.0 / math.pi  # ≈5215.2, maps x∈[-π,π] to [-16384,16384]
+  step = 32.0 / index_scale  # step in x per LUT entry
+  output_scale = 8192.0  # maps [-1,1] to [-8192,8192]
+  # LE table (table 0): covers bn_mul from -16384 to 0, i.e., x from -π to 0
+  for i in range(_LUT_SIZE):
+    x = -i * step  # i=0: x=0, i=512: x=-π
+    y = math.sin(x)
+    v = int(round(y * output_scale))
+    if v == 0: v = 1  # avoid exact 0
+    lut[i] = max(-32768, min(32767, v))
+  # LO table (table 1): covers bn_mul from 0 to 16384, i.e., x from 0 to π
+  for i in range(_LUT_SIZE):
+    x = i * step  # i=0: x=0, i=512: x=π
+    y = math.sin(x)
+    v = int(round(y * output_scale))
+    if v == 0: v = 1  # avoid exact 0
+    lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, output_scale, index_scale
 
@@ -449,7 +499,23 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   # DST_SURF_STRIDE = (width+1) * (channel+1) * 2 bytes
   surf_stride = (width + 1) * 8 * 2
   # --- LUT table fill (513 entries × 2 tables) ---
-  lut, bn_mul_operand, output_scale, index_scale = _build_exp2_lut()
+  if val.op is Ops.EXP2:
+    lut, bn_mul_operand, output_scale, index_scale = _build_exp2_lut()
+    lut_le_start = 0xffffc000  # -16384
+    lut_lo_end = 0x00004000    # 16384
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
+  elif val.op is Ops.LOG2:
+    lut, bn_mul_operand, output_scale, index_scale = _build_log2_lut()
+    lut_le_start = 0xffffc000  # -16384
+    lut_lo_end = 0x00004000    # 16384
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+  elif val.op is Ops.SIN:
+    lut, bn_mul_operand, output_scale, index_scale = _build_sin_lut()
+    lut_le_start = 0xffffc000  # -16384
+    lut_lo_end = 0x00004000    # 16384
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+  else:
+    raise AssertionError(f"dpu_lut: no builder for {val.op}")
   for table_id, base in ((0, 0), (1, _LUT_SIZE)):
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_ACCESS_CFG,
       (1 << 17) | (table_id << 16))  # LUT_ACCESS_TYPE=1, TABLE_ID, ADDR=0
@@ -499,10 +565,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   # --- unknown reg 0x40c4 = 0 (from silu.py) ---
   emitter_emit(cmds, _T_DPU, 0x40c4, 0)
   # --- LUT config registers ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_CFG, (1 << 6) | (1 << 5) | (2 << 2))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_CFG, lut_cfg)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_INFO, (5 << 16) | (5 << 8))
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_START, 0xffffc000)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_END, 0x00004000)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_START, lut_le_start)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_END, lut_lo_end)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 16434 << 16)  # OFLOW_SCALE=16434
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5)  # OFLOW_SHIFT=13
   # --- RDMA config ---

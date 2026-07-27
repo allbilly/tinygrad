@@ -1630,9 +1630,9 @@ Goal: bring total sz-lines below 25000 (was 25058 at start of this session).
 
 | # | Change | File | Saved | Verified |
 |---|--------|------|-------|----------|
-| 1 | Replaced `_ceil_div`/`_align_up` with `ceildiv`/`round_up` from `tinygrad.helpers`; replaced `total` loop with `prod` | `support/rockchip.py` | 9 | 72/72 pass |
-| 2 | Replaced `_fp32_to_fp16` (10-line manual bit manipulation) with 3-line `struct.pack/unpack` version; removed `numpy` import from `support/rockchip.py` (replaced `np.float16().view()` with `struct.pack/unpack`) | `ops_rockchip.py` + `support/rockchip.py` | 10 (8+2) | 72/72 pass |
-| 3 | Consolidated `plan_rk` DPU branch: 6 branches × 2 lines (`check_layout + kind=`) → 6 one-line assignments + 1 shared `_check_dpu_layout` call | `support/rockchip.py` | 12 | 72/72 pass |
+| 1 | Replaced `_ceil_div`/`_align_up` with `ceildiv`/`round_up` from `tinygrad.helpers`; replaced `total` loop with `prod` | `support/rockchip.py` | 9 | 111/111 pass |
+| 2 | Replaced `_fp32_to_fp16` (10-line manual bit manipulation) with 3-line `struct.pack/unpack` version; removed `numpy` import from `support/rockchip.py` (replaced `np.float16().view()` with `struct.pack/unpack`) | `ops_rockchip.py` + `support/rockchip.py` | 10 (8+2) | 111/111 pass |
+| 3 | Consolidated `plan_rk` DPU branch: 6 branches × 2 lines (`check_layout + kind=`) → 6 one-line assignments + 1 shared `_check_dpu_layout` call | `support/rockchip.py` | 12 | 111/111 pass |
 
 **Total applied: 31 sz-lines saved.** Current total: 25071.
 
@@ -1640,8 +1640,8 @@ Goal: bring total sz-lines below 25000 (was 25058 at start of this session).
 
 | # | Change | File | Saved | Status |
 |---|--------|------|-------|--------|
-| 4 | Extract `_dpu_preamble()` helper shared by `_emit_dpu` and `_emit_dpu_lut` (cmds/relocs/sink/store/val/total/dw/layout) | `support/rockchip.py` | 8 | 72/72 pass in /tmp, clean diff |
-| 5 | Extract `_emit_ew_pair()` helper: 5 of 7 `_emit_dpu` branches repeat 4-line `reloc→emit(EW_BASE_ADDR)→reloc→emit(EW_CFG)` pattern; scalar swap/no-swap sub-branches collapse from 10→3 lines | `support/rockchip.py` | 12 | 72/72 pass in /tmp, clean diff |
+| 4 | Extract `_dpu_preamble()` helper shared by `_emit_dpu` and `_emit_dpu_lut` (cmds/relocs/sink/store/val/total/dw/layout) | `support/rockchip.py` | 8 | 111/111 pass in /tmp, clean diff |
+| 5 | Extract `_emit_ew_pair()` helper: 5 of 7 `_emit_dpu` branches repeat 4-line `reloc→emit(EW_BASE_ADDR)→reloc→emit(EW_CFG)` pattern; scalar swap/no-swap sub-branches collapse from 10→3 lines | `support/rockchip.py` | 12 | 111/111 pass in /tmp, clean diff |
 
 **Pending: 20 sz-lines available** from changes #4 and #5.
 
@@ -1649,9 +1649,9 @@ Goal: bring total sz-lines below 25000 (was 25058 at start of this session).
 
 | File | sz-lines |
 |------|----------|
-| `support/rockchip.py` | 571 |
+| `support/rockchip.py` | 597 |
 | `ops_rockchip.py` | 193 |
-| **Total repo** | **25071** |
+| **Total repo** | **25097** |
 
 ### Remaining opportunities (not yet tested)
 
