@@ -492,9 +492,12 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
     emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
     emitter_reloc(cmds, relocs, _unwrap(val.src[1]).src[0].buf_uop.arg.slot)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[val.op])
-  # FDIV: emit OUT_CVT_SCALE=1 (output conversion scale for fp16 division result)
+  # OUT_CVT_SCALE: always emit (reference elementwise.py emits for all ops)
+  # FDIV: scale=1 (no FP32TOFP16), others: (1<<16)|1 (FP32TOFP16_EN=1, scale=1)
   if ew_op is Ops.FDIV:
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1)
+  else:
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
   # FDIV: MRDMA_FP16TOFP32_EN=0 (bit 3 clear) — division runs in fp16, no fp32 conversion
   rdma_fmc = 0x17849 if ew_op is not Ops.FDIV else 0x17841
   emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_fmc)
