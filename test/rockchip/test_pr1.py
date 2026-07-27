@@ -224,6 +224,16 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a@a)), "cmac")
 
+  def test_cmac_scaled_sum_full(self):
+    # REDUCE(ADD, MUL(INDEX, CONST(c))) — scaled full sum
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink((a*2).sum())), "cmac")
+
+  def test_cmac_scaled_sum_axis0(self):
+    # Scaled sum over axis=0: ones(1,K) @ (a*c)
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink((a*3).sum(axis=0))), "cmac")
+
   def test_reject_raises_runtime_error(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
@@ -316,6 +326,14 @@ class TestCodec(unittest.TestCase):
     dec_cmds, dec_task, dec_relocs = decode_rk(packed)
     self.assertTrue(dec_task.is_fill)
     self.assertEqual(len(dec_cmds), len(cmds))
+
+  def test_roundtrip_cmac_scaled_sum(self):
+    # Scaled sum roundtrip: verify const_val survives codec
+    cmds, task, relocs = _emit(_get_sink((Tensor.rand(4,4,dtype=dtypes.half).realize()*2).sum()))
+    self.assertAlmostEqual(task.const_val, 2.0)
+    packed = encode_rk(cmds, task, relocs)
+    dec_cmds, dec_task, dec_relocs = decode_rk(packed)
+    self.assertAlmostEqual(dec_task.const_val, 2.0)
 
   def test_determinism(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()

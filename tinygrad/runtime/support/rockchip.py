@@ -52,6 +52,7 @@ class RKTask:
   out_slot: int
   is_copy: bool = False
   is_fill: bool = False
+  const_val: float = 1.0
 
 # ---- classifier ----
 def _is_fp16_only(sink: UOp) -> bool:
@@ -62,7 +63,9 @@ def _is_fp16_only(sink: UOp) -> bool:
 def _find_op(sink: UOp, op: Ops) -> UOp|None: return next((u for u in sink.toposort() if u.op is op), None)
 def _reduce_node(sink: UOp) -> UOp|None: return _find_op(sink, Ops.REDUCE)
 def _store_node(sink: UOp) -> UOp|None: return _find_op(sink, Ops.STORE)
-def _unwrap(u: UOp) -> UOp: return u.src[0] if u.op is Ops.CAST else u
+def _unwrap(u: UOp) -> UOp:
+  while u.op is Ops.CAST: u = u.src[0]
+  return u
 def _reduce_body(reduce: UOp) -> UOp: return _unwrap(reduce.src[0])
 def _all_indexes(sink: UOp) -> list[UOp]: return [u for u in sink.toposort() if u.op is Ops.INDEX]
 def _is_flat_contiguous(idx: UOp) -> bool:
@@ -169,13 +172,20 @@ def _is_2d_index(idx: UOp, outer_kind: str, inner_kind: str, stride: int) -> boo
   mr, mc = ms.src
   return mr.op is Ops.RANGE and mc.op is Ops.CONST and int(mc.arg) == stride and mr.arg[1].name == outer_kind and rs.arg[1].name == inner_kind
 
-def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int]|None:
-  """REDUCE(ADD, INDEX) → (input_slot, M, N, K) for CMAC sum, or None.
+def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
+  """REDUCE(ADD, INDEX) or REDUCE(ADD, MUL(INDEX, CONST(c))) → (input_slot, M, N, K, const_val) for CMAC, or None.
   A-pattern (axis=1): a@ones(K,1), M=out[0], N=1, ones=B.
   B-pattern (axis=0): ones(1,K)@a, M=1, N=out[0], ones=A.
   C-pattern (full):   RANGE(REDUCE) only, M=1, N=1, ones=A or B.
+  Scaled sum (MUL(INDEX, CONST(c))): same patterns, const_val=c instead of 1.0.
   Mean (post-reduce scalar MUL) is rejected — no host-side scaling in PR1."""
   body = _reduce_body(reduce)
+  cv = 1.0
+  if body.op is Ops.MUL:
+    ws = [_unwrap(s) for s in body.src]
+    if not any(w.op is Ops.CONST for w in ws) or not any(w.op is Ops.INDEX for w in ws): return None
+    cv = float(next(w.arg for w in ws if w.op is Ops.CONST))
+    body = next(w for w in ws if w.op is Ops.INDEX)
   if body.op is not Ops.INDEX: return None
   out_shape = _shape_of_store(sink)
   if len(out_shape) != 1: return None  # only 1D output
@@ -188,9 +198,9 @@ def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int]|None:
   inner = _unwrap(store.src[1])
   if inner is not reduce: return None
   M = int(out_shape[0])
-  if _is_2d_index(body.src[1], "LOOP", "REDUCE", K): return (input_slot, M, 1, K)  # A-pattern
-  if _is_2d_index(body.src[1], "REDUCE", "LOOP", M): return (input_slot, 1, M, K)  # B-pattern
-  if body.src[1].op is Ops.RANGE and body.src[1].arg[1].name == "REDUCE": return (input_slot, 1, 1, K)  # C-pattern
+  if _is_2d_index(body.src[1], "LOOP", "REDUCE", K): return (input_slot, M, 1, K, cv)  # A-pattern
+  if _is_2d_index(body.src[1], "REDUCE", "LOOP", M): return (input_slot, 1, M, K, cv)  # B-pattern
+  if body.src[1].op is Ops.RANGE and body.src[1].arg[1].name == "REDUCE": return (input_slot, 1, 1, K, cv)  # C-pattern
   return None
 
 def _check_dpu_layout(sink: UOp, allow_2d: bool, require_uniform: bool) -> str|None:
@@ -244,6 +254,8 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     elif body.op is Ops.INDEX:
       if _try_sum(sink, reduce) is not None: kind = "cmac"
       else: return "RKPLAN_REJECT:no_add_mul_reduction"
+    elif body.op is Ops.MUL and _try_sum(sink, reduce) is not None:
+      kind = "cmac"  # scaled sum: REDUCE(ADD, MUL(INDEX, CONST(c)))
     else:
       return f"RKPLAN_REJECT:unsupported_op:{body.op}"
   # R4 PPU: REDUCE(MAX, INDEX) — global max pool over (H,W,C) → (C,)
@@ -361,11 +373,12 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   reduce = _reduce_node(sink)
   assert reduce is not None, "cmac: no REDUCE node"
   body = _reduce_body(reduce)
-  is_sum = body.op is Ops.INDEX  # sum: REDUCE(ADD, INDEX) → matmul with ones
+  is_sum = body.op is Ops.INDEX or (body.op is Ops.MUL and _try_sum(sink, reduce) is not None)  # sum or scaled sum
+  cv = 1.0
   if is_sum:
     sum_info = _try_sum(sink, reduce)
     assert sum_info is not None, "cmac: sum classification failed"
-    input_slot, M_sum, N_sum, _ = sum_info
+    input_slot, M_sum, N_sum, _, cv = sum_info
     a_slot, b_slot = (_CONST_SLOT, input_slot) if M_sum == 1 else (input_slot, _CONST_SLOT)
   else:
     a_idx_node, b_idx_node = _unwrap(body.src[0]), _unwrap(body.src[1])
@@ -466,7 +479,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
   e.emit(_T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
   layout = (M, N, K, align_in, align_out)
-  return tuple(c.pack() for c in e.cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot), tuple(e.relocs)
+  return tuple(c.pack() for c in e.cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot, const_val=cv), tuple(e.relocs)
 
 def _emit_ppu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """PPU globalmax. Input (H,W,C) fp16 → (C,) fp16. Raw register values per pool.py.
@@ -550,7 +563,8 @@ def encode_rk(cmds: tuple[int,...], task: RKTask, relocs: tuple[RKReloc,...]) ->
   header = struct.pack("<IIIIIIIIi", _RK_MAGIC, 2, n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout, task.out_slot)
   reloc_bytes = struct.pack(f"<{n_relocs*6}I", *[v for r in relocs for v in (r.word_index, r.globals_slot, r.addend, r.shift, r.mask, r.field_shift)])
   layout = struct.pack(f"<{n_layout}i", *task.layout) if task.layout else b""
-  return header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout
+  const_bytes = struct.pack("<f", task.const_val) if task.const_val != 1.0 else b""
+  return header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes
 
 def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
   """Decode bytes into (cmds, task, relocs). Raises on bad magic, version, truncated tables, or out-of-range relocations."""
@@ -576,7 +590,9 @@ def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
   off += n_relocs * 24
   if n_layout and off + n_layout * 4 > len(data): raise RuntimeError("RKImage: truncated layout")
   layout = struct.unpack_from(f"<{n_layout}i", data, off) if n_layout else ()
-  return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill), relocs
+  off += n_layout * 4
+  const_val = struct.unpack_from("<f", data, off)[0] if off + 4 <= len(data) else 1.0
+  return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill, const_val=const_val), relocs
 
 # ---- the native_program hook ----
 def build_native_program(sink: UOp) -> UOp|None:

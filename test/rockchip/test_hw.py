@@ -155,6 +155,20 @@ class TestCMAC(unittest.TestCase):
     c = a.sum().realize()
     np.testing.assert_allclose(c.numpy(), a_np.sum(), rtol=1e-2, atol=1e-2)
 
+  def test_cmac_scaled_sum_full(self):
+    # Scaled full sum: (a * 2).sum() → ones @ (a*2)
+    a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    c = (a * 2).sum().realize()
+    np.testing.assert_allclose(c.numpy(), (a_np * 2).sum(), rtol=1e-2, atol=1e-2)
+
+  def test_cmac_scaled_sum_axis0(self):
+    # Scaled sum over axis=0: (a * 3).sum(axis=0)
+    a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    c = (a * 3).sum(axis=0).realize()
+    np.testing.assert_allclose(c.numpy(), (a_np * 3).sum(axis=0), rtol=1e-2, atol=1e-2)
+
   def test_cmac_matmul_non_identity(self):
     a_np = np.array([[1,2],[3,4]], dtype=np.float16)
     b_np = np.array([[5,6],[7,8]], dtype=np.float16)

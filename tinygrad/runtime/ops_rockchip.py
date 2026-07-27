@@ -73,13 +73,13 @@ class RockchipProgram(Program['RockchipDevice']):
         a_buf = dev._gpu_alloc(max(M*align_in*2, 4096), 0)
         temp.append(a_buf)
         if a_s == _CONST_SLOT:
-          ctypes.memmove(a_buf.va_addr, struct.pack('<e', 1.0) * align_in, align_in * 2)  # type: ignore[arg-type]
+          ctypes.memmove(a_buf.va_addr, struct.pack('<e', task.const_val) * align_in, align_in * 2)  # type: ignore[arg-type]
         else:
           _pad_a(bufs[a_s].va_addr, a_buf.va_addr, M, K, align_in)
         b_buf = dev._gpu_alloc(max(align_out*align_in*2, 4096), 0)
         temp.append(b_buf)
         if b_s == _CONST_SLOT:
-          ctypes.memmove(b_buf.va_addr, struct.pack('<e', 1.0) * (align_out * align_in), align_out * align_in * 2)  # type: ignore[arg-type]
+          ctypes.memmove(b_buf.va_addr, struct.pack('<e', task.const_val) * (align_out * align_in), align_out * align_in * 2)  # type: ignore[arg-type]
         else:
           _swizzle_b(bufs[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
         o_buf = dev._gpu_alloc(max(M*align_out*4, 4096), 0)

@@ -306,7 +306,7 @@ result. The FP16 subset grows across PRs:
 1. DPU binary EW (ADD, SUB, MUL, MAX) with two INDEX operands, scalar operand, DMA copy, or constant fill.
 2. CMAC GEMV: matrix-vector products (1D output, one vector input) (PR2).
 3. DPU hardware fill: CONST as DPU ADD(zero, const) (PR3).
-4. Multi-task programs and scratch allocation (PR4).
+4. CMAC scaled sum: REDUCE(ADD, MUL(INDEX, CONST(c))) as ones-vector GEMM with const_val (PR4).
 5. General DPU elementwise: nested ops, WHERE, activations, hardware broadcast (PR5).
 6. General movement and addressing (PR6).
 7. CMAC matmul completeness: batched GEMM, mean, tiling (PR7).
