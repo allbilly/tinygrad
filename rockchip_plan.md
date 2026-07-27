@@ -304,13 +304,14 @@ Each intermediate PR (PR2–PR7) publishes raw pass/fail/reject counts for
 result. The FP16 subset grows across PRs:
 
 1. DPU binary EW (ADD, SUB, MUL, MAX) with two INDEX operands, scalar operand, or DMA copy.
-2. Multi-task programs and scratch allocation (PR2).
-3. General DPU elementwise: nested ops, WHERE, activations, hardware fill/broadcast (PR3).
-4. General movement and addressing (PR4).
-5. CMAC reductions and matmul completeness: GEMV, batched GEMM, mean, tiling (PR5).
-6. Convolution and complete PPU coverage (PR6).
-7. Dtypes, indexing, and fallback policy (PR7).
-8. Full-suite gradients and qualification (PR8).
+2. CMAC GEMV: matrix-vector products (1D output, one vector input) (PR2).
+3. Multi-task programs and scratch allocation (PR3).
+4. General DPU elementwise: nested ops, WHERE, activations, hardware fill/broadcast (PR4).
+5. General movement and addressing (PR5).
+6. CMAC matmul completeness: batched GEMM, mean, tiling (PR6).
+7. Convolution and complete PPU coverage (PR7).
+8. Dtypes, indexing, and fallback policy (PR8).
+9. Full-suite gradients and qualification (PR9).
 
 ---
 

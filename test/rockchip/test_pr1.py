@@ -199,10 +199,17 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertIn("REJECT", _classify(_get_sink(a.T@b)))
 
-  def test_reject_cmac_gemv(self):
+  def test_cmac_gemv_vector_a(self):
+    # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
+    a = Tensor.rand(4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a@b)), "cmac")
+
+  def test_cmac_gemv_vector_b(self):
+    # GEMV: (M,K) @ (K,) → (M,) — vector is B, N=1
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     v = Tensor.rand(4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a@v)))
+    self.assertEqual(_classify(_get_sink(a@v)), "cmac")
 
   def test_reject_ppu_k_too_large(self):
     a = Tensor.rand(17,8,dtype=dtypes.half).realize()

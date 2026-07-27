@@ -130,21 +130,34 @@ def _ppu_split_k(K: int) -> tuple[int, int]|None:
     if 2 <= in_w <= 16 and in_h != 9 and in_w != 9 and (in_h, in_w) not in _PPU_BAD_SPLITS: return (in_h, in_w)
   return None
 
+def _is_1d_index(idx: UOp, kind: str) -> bool:
+  """Check idx is RANGE(axis_kind) — 1D vector access."""
+  return idx.op is Ops.RANGE and idx.arg[1].name == kind
+
 def _is_cmac_matmul_layout(sink: UOp, reduce: UOp) -> bool:
   """Validate INDEX patterns match row-major matmul: out=(i,j), A=(i,k), B=(k,j).
-  Also accepts transposed (1x1 conv): A=(k,j), B=(i,k) — A and B swapped."""
+  Also accepts transposed (1x1 conv): A=(k,j), B=(i,k) — A and B swapped.
+  GEMV: 1D output, one vector input (1D RANGE over REDUCE), one matrix input (2D)."""
   body = _reduce_body(reduce)
   if body.op is not Ops.MUL: return False
   a_idx, b_idx = _unwrap(body.src[0]), _unwrap(body.src[1])
   if a_idx.op is not Ops.INDEX or b_idx.op is not Ops.INDEX: return False
   out_shape = _shape_of_store(sink)
-  if len(out_shape) != 2: return False
-  N, K = int(out_shape[1]), _reduce_extent(reduce)
+  K = _reduce_extent(reduce)
   if K < 0: return False
   store = _store_node(sink)
-  if store is None or store.src[0].op is not Ops.INDEX or not _is_2d_index(store.src[0].src[1], "LOOP", "LOOP", N): return False
-  return (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", N)) or \
-         (_is_2d_index(a_idx.src[1], "REDUCE", "LOOP", N) and _is_2d_index(b_idx.src[1], "LOOP", "REDUCE", K))
+  if store is None or store.src[0].op is not Ops.INDEX: return False
+  if len(out_shape) == 2:  # GEMM
+    N = int(out_shape[1])
+    if not _is_2d_index(store.src[0].src[1], "LOOP", "LOOP", N): return False
+    return (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", N)) or \
+           (_is_2d_index(a_idx.src[1], "REDUCE", "LOOP", N) and _is_2d_index(b_idx.src[1], "LOOP", "REDUCE", K))
+  if len(out_shape) == 1:  # GEMV: (K,)@(K,D)→(D,) or (D,K)@(K,)→(D,)
+    D = int(out_shape[0])
+    if not _is_1d_index(store.src[0].src[1], "LOOP"): return False
+    return (_is_1d_index(a_idx.src[1], "REDUCE") and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", D)) or \
+           (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) and _is_1d_index(b_idx.src[1], "REDUCE"))
+  return False
 
 def _is_2d_index(idx: UOp, outer_kind: str, inner_kind: str, stride: int) -> bool:
   """Check idx is ADD(MUL(RANGE(outer_kind), CONST=stride), RANGE(inner_kind))."""
@@ -347,12 +360,15 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
     a_idx_node, b_idx_node = _unwrap(body.src[0]), _unwrap(body.src[1])
     a_slot, b_slot = a_idx_node.src[0].buf_uop.arg.slot, b_idx_node.src[0].buf_uop.arg.slot
   out_shape = _shape_of_store(sink)
-  M, N = (M_sum if is_sum else int(out_shape[0])), (N_sum if is_sum else int(out_shape[1]))
+  if is_sum: M, N = M_sum, N_sum
+  elif len(out_shape) == 2: M, N = int(out_shape[0]), int(out_shape[1])
+  else:  # GEMV: vector is A (M=1) or B (N=1)
+    M, N = (1, int(out_shape[0])) if _is_1d_index(a_idx_node.src[1], "REDUCE") else (int(out_shape[0]), 1)  # type: ignore[union-attr]
   K = _reduce_extent(reduce)
   if K < 0: raise RuntimeError("cmac: K must be compile-time constant")
   if not is_sum:
     # Detect transposed pattern (1x1 conv): A has REDUCE outer, B has LOOP outer
-    if _is_2d_index(a_idx_node.src[1], "REDUCE", "LOOP", N) and \
+    if len(out_shape) == 2 and _is_2d_index(a_idx_node.src[1], "REDUCE", "LOOP", N) and \
        _is_2d_index(b_idx_node.src[1], "LOOP", "REDUCE", K):
       a_slot, b_slot = b_slot, a_slot  # swap: hardware expects A=(M,K), B=(K,N)
   # NPU geometry constants from gemm.py

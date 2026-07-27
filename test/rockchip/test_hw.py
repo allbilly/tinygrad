@@ -150,6 +150,24 @@ class TestCMAC(unittest.TestCase):
     c = (a @ b).realize()
     np.testing.assert_allclose(c.numpy(), a_np @ b_np, rtol=1e-2, atol=1e-1)
 
+  def test_cmac_gemv_vector_a(self):
+    # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
+    a_np = np.array([1,2,3,4], dtype=np.float16)
+    b_np = np.array([[1,2],[3,4],[5,6],[7,8]], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    b = Tensor(b_np, device="ROCKCHIP").realize()
+    c = (a @ b).realize()
+    np.testing.assert_allclose(c.numpy(), a_np @ b_np, rtol=1e-2, atol=1e-1)
+
+  def test_cmac_gemv_vector_b(self):
+    # GEMV: (M,K) @ (K,) → (M,) — vector is B, N=1
+    a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
+    b_np = np.array([1,2,3,4], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    b = Tensor(b_np, device="ROCKCHIP").realize()
+    c = (a @ b).realize()
+    np.testing.assert_allclose(c.numpy(), a_np @ b_np, rtol=1e-2, atol=1e-1)
+
   def test_cmac_same_buffer(self):
     a_np = np.array([[1,2],[3,4]], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()
