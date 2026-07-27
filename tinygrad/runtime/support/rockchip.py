@@ -51,6 +51,7 @@ class RKTask:
   layout: tuple
   out_slot: int
   is_copy: bool = False
+  is_fill: bool = False
 
 # ---- classifier ----
 def _is_fp16_only(sink: UOp) -> bool:
@@ -90,6 +91,7 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
         return _unwrap(s).src[0].buf_uop.arg.slot, _unwrap(ma).src[0].buf_uop.arg.slot
   return None
 _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
+_ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
 
 def _try_scalar(val: UOp) -> tuple[int, float]|None:
   """ADD/MUL/MAX(INDEX, CONST(c)) → (index_slot, const_val) for DPU scalar op, or None."""
@@ -213,8 +215,8 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     where_max = _try_where_max(val)
     if where_max is not None: val = where_max
     sub_slots, scalar = _try_sub(val), _try_scalar(val)
-    # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, or DMA copy (STORE(INDEX)).
-    # Fill (CONST), broadcast, and mean are rejected — no host-side tensor arithmetic.
+    # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
+    # Broadcast and mean are rejected — no host-side tensor arithmetic.
     if sub_slots is not None:
       if (r := _check_dpu_layout(sink, False, False)): return r
       kind = "dpu"
@@ -223,6 +225,9 @@ def plan_rk(sink: UOp) -> RKPlan|str:
       kind = "dpu"
     elif _unwrap(val).op is Ops.INDEX:
       if (r := _check_dpu_layout(sink, False, False)): return r
+      kind = "dpu"
+    elif _unwrap(val).op is Ops.CONST:
+      if (r := _check_dpu_layout(sink, True, False)): return r
       kind = "dpu"
     else: return f"RKPLAN_REJECT:unsupported_op:{val.op if val.op not in _DPU_EW_CFGS else 'non_index_operand'}"
   # R1 CMAC: REDUCE(ADD, MUL(INDEX, INDEX)) or REDUCE(ADD, INDEX) [sum via ones]
@@ -308,7 +313,8 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   dw = (total + 7) // 8 - 1
   vu = _unwrap(val)
   is_copy = vu.op is Ops.INDEX
-  sub_slots, scalar = (None, None) if is_copy else (_try_sub(val), _try_scalar(val))
+  is_fill = vu.op is Ops.CONST
+  sub_slots, scalar = (None, None) if (is_copy or is_fill) else (_try_sub(val), _try_scalar(val))
   layout = (total,)
   e.emit(_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
   e.emit(_T_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002)
@@ -334,6 +340,11 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   elif is_copy:
     e.reloc(vu.src[0].buf_uop.arg.slot)
     e.emit(_T_DPU, rk.REG_DPU_EW_CFG, 0)  # EW disabled — DMA pass-through
+  elif is_fill:
+    e.reloc(_ZERO_SLOT)
+    e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+    e.reloc(_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(vu.arg)))[0])
+    e.emit(_T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.ADD])  # zero + const = fill
   else:
     e.reloc(_unwrap(val.src[0]).src[0].buf_uop.arg.slot)
     e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
@@ -341,7 +352,7 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
     e.emit(_T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[val.op])
   e.emit(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
   e.pc_op_en(12)
-  return tuple(c.pack() for c in e.cmds), RKTask(0x18, 0x300, 4, "dpu", layout, plan.out_slot, is_copy=is_copy), tuple(e.relocs)
+  return tuple(c.pack() for c in e.cmds), RKTask(0x18, 0x300, 4, "dpu", layout, plan.out_slot, is_copy=is_copy, is_fill=is_fill), tuple(e.relocs)
 
 def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """CNA+CORE matmul or sum. A=(M,K), B=(K,N), output=(M,N) FP32→FP16. Transforms in __call__."""
@@ -535,7 +546,7 @@ _RK_KINDS = ("dpu", "cmac", "ppu")
 def encode_rk(cmds: tuple[int,...], task: RKTask, relocs: tuple[RKReloc,...]) -> bytes:
   """Pack commands, task metadata, and relocations into deterministic bytes (§2.3)."""
   n_cmds, n_relocs, n_layout = len(cmds), len(relocs), len(task.layout)
-  kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | n_layout
+  kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
   header = struct.pack("<IIIIIIIIi", _RK_MAGIC, 2, n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout, task.out_slot)
   reloc_bytes = struct.pack(f"<{n_relocs*6}I", *[v for r in relocs for v in (r.word_index, r.globals_slot, r.addend, r.shift, r.mask, r.field_shift)])
   layout = struct.pack(f"<{n_layout}i", *task.layout) if task.layout else b""
@@ -550,7 +561,8 @@ def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
   ki = (kl >> 24) & 0xFF
   if ki >= len(_RK_KINDS): raise RuntimeError(f"RKImage: invalid kind index {ki}")
   is_copy = bool((kl >> 23) & 1)
-  n_layout = kl & 0x7FFFFF
+  is_fill = bool((kl >> 22) & 1)
+  n_layout = kl & 0x3FFFFF
   off = 36
   if off + n_cmds * 8 > len(data): raise RuntimeError("RKImage: truncated commands")
   cmds = list(struct.unpack_from(f"<{n_cmds}Q", data, off))
@@ -564,7 +576,7 @@ def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
   off += n_relocs * 24
   if n_layout and off + n_layout * 4 > len(data): raise RuntimeError("RKImage: truncated layout")
   layout = struct.unpack_from(f"<{n_layout}i", data, off) if n_layout else ()
-  return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy), relocs
+  return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill), relocs
 
 # ---- the native_program hook ----
 def build_native_program(sink: UOp) -> UOp|None:

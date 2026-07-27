@@ -303,15 +303,16 @@ Each intermediate PR (PR2–PR7) publishes raw pass/fail/reject counts for
 `test_ops.py`. Literal full-suite success is the project end-state, not PR1's
 result. The FP16 subset grows across PRs:
 
-1. DPU binary EW (ADD, SUB, MUL, MAX) with two INDEX operands, scalar operand, or DMA copy.
+1. DPU binary EW (ADD, SUB, MUL, MAX) with two INDEX operands, scalar operand, DMA copy, or constant fill.
 2. CMAC GEMV: matrix-vector products (1D output, one vector input) (PR2).
-3. Multi-task programs and scratch allocation (PR3).
-4. General DPU elementwise: nested ops, WHERE, activations, hardware fill/broadcast (PR4).
-5. General movement and addressing (PR5).
-6. CMAC matmul completeness: batched GEMM, mean, tiling (PR6).
-7. Convolution and complete PPU coverage (PR7).
-8. Dtypes, indexing, and fallback policy (PR8).
-9. Full-suite gradients and qualification (PR9).
+3. DPU hardware fill: CONST as DPU ADD(zero, const) (PR3).
+4. Multi-task programs and scratch allocation (PR4).
+5. General DPU elementwise: nested ops, WHERE, activations, hardware broadcast (PR5).
+6. General movement and addressing (PR6).
+7. CMAC matmul completeness: batched GEMM, mean, tiling (PR7).
+8. Convolution and complete PPU coverage (PR8).
+9. Dtypes, indexing, and fallback policy (PR9).
+10. Full-suite gradients and qualification (PR10).
 
 ---
 

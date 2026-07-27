@@ -15,7 +15,7 @@ from tinygrad.uop.ops import UOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc, _CONST_SLOT
+from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc, _CONST_SLOT, _ZERO_SLOT
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -135,6 +135,14 @@ class RockchipProgram(Program['RockchipDevice']):
           fp16_bytes = struct.pack('<e', cval) * total
           ctypes.memmove(cbuf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
           dma = cbuf.meta.dma_addr
+          v = (dma >> r.shift) & r.mask
+        elif r.globals_slot == _ZERO_SLOT:
+          # fill: allocate a zero-filled input buffer (buffer prep, NPU does ADD(zero, const) = fill)
+          total = task.layout[0]
+          zbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
+          temp.append(zbuf)
+          ctypes.memset(zbuf.va_addr, 0, total * 2)  # type: ignore[arg-type]
+          dma = zbuf.meta.dma_addr
           v = (dma >> r.shift) & r.mask
         else:
           dma = (cmac_bufs[i] if cmac_bufs else buf_map[r.globals_slot]).meta.dma_addr

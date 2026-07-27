@@ -1,7 +1,7 @@
 # PR 1 hardware numerical tests: one per compute family (DPU, CNA+CORE, PPU).
 # These tests require an RK3588 NPU and /dev/dri/card1.
 import os, unittest, numpy as np
-from tinygrad import Tensor
+from tinygrad import Tensor, dtypes
 from tinygrad.helpers import to_mv
 
 _NPU_AVAILABLE = os.path.exists("/dev/dri/card1")
@@ -63,6 +63,19 @@ class TestDPU(unittest.TestCase):
     a = Tensor(a_np, device="ROCKCHIP").realize()
     c = (a + 0).realize()  # a+0 lowers to copy (STORE(INDEX)) — NPU DMA pass-through
     np.testing.assert_allclose(c.numpy(), a_np, rtol=1e-3, atol=1e-3)
+
+  def test_dpu_fill_zeros(self):
+    # Fill via DPU ADD(zero, const) — zero buffer is prep, DPU does the fill
+    c = Tensor.zeros(2,4, dtype=dtypes.half, device="ROCKCHIP").realize()
+    np.testing.assert_allclose(c.numpy(), np.zeros((2,4), dtype=np.float16), rtol=1e-3, atol=1e-3)
+
+  def test_dpu_fill_ones(self):
+    c = Tensor.ones(2,4, dtype=dtypes.half, device="ROCKCHIP").realize()
+    np.testing.assert_allclose(c.numpy(), np.ones((2,4), dtype=np.float16), rtol=1e-3, atol=1e-3)
+
+  def test_dpu_fill_full(self):
+    c = Tensor.full((2,4), 3.5, dtype=dtypes.half, device="ROCKCHIP").realize()
+    np.testing.assert_allclose(c.numpy(), np.full((2,4), 3.5, dtype=np.float16), rtol=1e-3, atol=1e-3)
 
   def test_dpu_scalar_add(self):
     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)

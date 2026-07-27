@@ -170,15 +170,15 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,dtype=dtypes.half).realize()
     self.assertIn("REJECT", _classify(_get_sink(a+b)))
 
-  def test_const_fill_zeros_rejected(self):
-    # Constant fill is rejected in PR1 — no host-side memmove
-    self.assertIn("REJECT", _classify(_get_sink(Tensor.zeros(4,4,dtype=dtypes.half))))
+  def test_const_fill_zeros(self):
+    # Constant fill is a DPU ADD(zero, const) — zero buffer is prep, DPU does the fill
+    self.assertEqual(_classify(_get_sink(Tensor.zeros(4,4,dtype=dtypes.half))), "dpu")
 
-  def test_const_fill_ones_rejected(self):
-    self.assertIn("REJECT", _classify(_get_sink(Tensor.ones(4,4,dtype=dtypes.half))))
+  def test_const_fill_ones(self):
+    self.assertEqual(_classify(_get_sink(Tensor.ones(4,4,dtype=dtypes.half))), "dpu")
 
-  def test_const_fill_full_rejected(self):
-    self.assertIn("REJECT", _classify(_get_sink(Tensor.full((4,4), 3.0, dtype=dtypes.half))))
+  def test_const_fill_full(self):
+    self.assertEqual(_classify(_get_sink(Tensor.full((4,4), 3.0, dtype=dtypes.half))), "dpu")
 
   def test_reject_transpose(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
@@ -307,6 +307,15 @@ class TestCodec(unittest.TestCase):
     self.assertEqual(dec_task.int_mask, task.int_mask)
     for c1, c2 in zip(cmds, dec_cmds):
       self.assertEqual(c1, c2)
+
+  def test_roundtrip_dpu_fill(self):
+    # Fill roundtrip: verify is_fill survives codec
+    cmds, task, relocs = _emit(_get_sink(Tensor.zeros(4,4,dtype=dtypes.half)))
+    self.assertTrue(task.is_fill)
+    packed = encode_rk(cmds, task, relocs)
+    dec_cmds, dec_task, dec_relocs = decode_rk(packed)
+    self.assertTrue(dec_task.is_fill)
+    self.assertEqual(len(dec_cmds), len(cmds))
 
   def test_determinism(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
