@@ -289,6 +289,20 @@ the proven interception adapter.
 If the CMAC layout path or interception adapter cannot be made small and clear, stop and fix that
 blocker. Do not compensate by adding convolution, coverage machinery or more planner abstraction.
 
+**PR1 acceptance criterion (measured):** Every `test_ops.py` kernel *accepted* by the Rockchip
+planner executes correctly on hardware. Unsupported dtype (bool/int32/uint8/fp32), non-affine
+indexing, scans, and index-producing operations are explicitly rejected via `RKPLAN_REJECT` and
+skip via CPU fallback or test-level skip. Literal full-suite `test_ops.py` success (550/550) is
+out of scope for PR1 — it would require a general-purpose ALU, integer datapath, multi-task
+programs, and tiling, all of which are PR2+ work. The FP16 subset grows in this order:
+
+1. DPU copy / basic ALU (SUB, MUL, MAX, neg) / broadcasting.
+2. Sum/mean (CMAC + constant one-vector) and general PPU max.
+3. GEMV / batched GEMM / large-GEMM tiling.
+4. Direct convolution.
+5. Multi-task activations and gradients.
+6. Integer/index operations only if hardware evidence provides a correct implementation.
+
 ---
 
 ## 1. Stable decision

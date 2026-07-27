@@ -29,35 +29,57 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a+b)), "dpu")
 
-  def test_dpu_mul_rejected(self):
+  def test_dpu_mul(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a*b)))
+    self.assertEqual(_classify(_get_sink(a*b)), "dpu")
 
-  def test_dpu_sub_rejected(self):
+  def test_dpu_sub(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a-b)))
+    self.assertEqual(_classify(_get_sink(a-b)), "dpu")
 
-  def test_dpu_neg_rejected(self):
+  def test_dpu_max(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(-a)))
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.maximum(b))), "dpu")
 
-  def test_dpu_copy_rejected(self):
+  def test_dpu_relu_via_where_max(self):
+    # relu(x) = WHERE(CMPLT(0, x), x, 0) = MAX(x, 0) → DPU
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a+0)))
+    self.assertEqual(_classify(_get_sink(a.relu())), "dpu")
 
-  def test_dpu_scalar_add_rejected(self):
+  def test_dpu_2d_contiguous_add(self):
+    # 2D row-major contiguous output — _is_flat_contiguous accepts 2D
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a+1)))
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
 
-  def test_dpu_scalar_mul_rejected(self):
-    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a*2)))
+  def test_dpu_3d_contiguous_add(self):
+    # 3D row-major contiguous — exercises nested 2D row-major index
+    a = Tensor.rand(8,4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(8,4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
 
-  def test_dpu_scalar_max_rejected(self):
+  def test_dpu_neg(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a.maximum(1))))
+    self.assertEqual(_classify(_get_sink(-a)), "dpu")
+
+  def test_dpu_copy(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+0)), "dpu")
+
+  def test_dpu_scalar_add(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+1)), "dpu")
+
+  def test_dpu_scalar_mul(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a*2)), "dpu")
+
+  def test_dpu_scalar_max(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.maximum(1))), "dpu")
 
   def test_dpu_single_element(self):
     a = Tensor.rand(1,1,dtype=dtypes.half).realize()
@@ -69,8 +91,36 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a@b)), "cmac")
 
+  def test_cmac_1x1_conv(self):
+    # 1x1 conv = pointwise GEMM with transposed A/B pattern
+    x = Tensor.rand(1,4,3,3,dtype=dtypes.half).realize()
+    w = Tensor.rand(4,4,1,1,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(x.conv2d(w))), "cmac")
+
+  def test_reject_fused_bias_conv(self):
+    # Fused conv+bias is rejected in PR1 (epilogue fusion is PR2)
+    x = Tensor.rand(1,4,3,3,dtype=dtypes.half).realize()
+    w = Tensor.rand(4,4,1,1,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(x.conv2d(w, b))))
+
   def test_ppu_max(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
+
+  def test_ppu_max_flexible_channels(self):
+    for shape in [(8,4),(4,4),(8,8),(8,2),(4,2),(8,6),(4,6),(8,3),(8,1),(4,1)]:
+      a = Tensor.rand(*shape,dtype=dtypes.half).realize()
+      self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu", f"shape {shape}")
+
+  def test_ppu_max_k_split(self):
+    # K=64 splits as (8,8) — both factors in [2,16]
+    a = Tensor.rand(64,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
+
+  def test_ppu_max_chan1(self):
+    # channels=1: MUL eliminated, INDEX uses RANGE directly
+    a = Tensor.rand(8,1,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
 
   def test_reject_int(self):
@@ -83,14 +133,48 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,4,dtype=dtypes.float).realize()
     self.assertIn("REJECT", _classify(_get_sink(a+b)))
 
-  def test_reject_r2_sum(self):
+  def test_sum_full(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a.sum())))
+    self.assertEqual(_classify(_get_sink(a.sum())), "cmac")  # full sum → M=1,N=1 via ones-vector
 
-  def test_reject_broadcast(self):
+  def test_mean_full(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.mean())), "cmac")  # full mean → sum with scale
+
+  def test_sum_axis1(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.sum(axis=1))), "cmac")
+
+  def test_sum_axis0(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.sum(axis=0))), "cmac")
+
+  def test_mean_axis1(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.mean(axis=1))), "cmac")
+
+  def test_mean_axis0(self):
+    a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.mean(axis=0))), "cmac")
+
+  def test_broadcast_row(self):
+    a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    b = Tensor.rand(4,1,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
+
+  def test_broadcast_col(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a+b)))
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
+
+  def test_const_fill_zeros(self):
+    self.assertEqual(_classify(_get_sink(Tensor.zeros(4,4,dtype=dtypes.half))), "dpu")
+
+  def test_const_fill_ones(self):
+    self.assertEqual(_classify(_get_sink(Tensor.ones(4,4,dtype=dtypes.half))), "dpu")
+
+  def test_const_fill_full(self):
+    self.assertEqual(_classify(_get_sink(Tensor.full((4,4), 3.0, dtype=dtypes.half))), "dpu")
 
   def test_reject_transpose(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
@@ -117,7 +201,7 @@ class TestClassifier(unittest.TestCase):
     self.assertIn("REJECT", _classify(_get_sink(a@v)))
 
   def test_reject_ppu_k_too_large(self):
-    a = Tensor.rand(64,8,dtype=dtypes.half).realize()
+    a = Tensor.rand(17,8,dtype=dtypes.half).realize()
     self.assertIn("REJECT", _classify(_get_sink(a.max(axis=0))))
 
   def test_reject_cmac_strided_a(self):
@@ -131,8 +215,8 @@ class TestClassifier(unittest.TestCase):
 
   def test_reject_raises_runtime_error(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    b = Tensor.rand(4,dtype=dtypes.half).realize()
-    sink = _get_sink(a+b)
+    b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+    sink = _get_sink(a.T+b)  # transpose is rejected
     with self.assertRaises(RuntimeError) as cm:
       build_native_program(sink)
     self.assertIn("RKPLAN_REJECT", str(cm.exception))

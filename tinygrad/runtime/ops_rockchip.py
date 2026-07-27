@@ -9,7 +9,7 @@ from tinygrad.uop.ops import UOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc
+from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc, _CONST_SLOT, _BCAST_SLOT
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -22,8 +22,7 @@ def _swizzle_b(src, dst, K, N, align_out, align_in):
   ctypes.memset(dst, 0, align_out * align_in * 2)
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint16)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   for k in range(K):
-    for n in range(N):
-      d[(((n//16)*(align_in//32)+(k//32))*16+(n%16))*32+(k%32)] = s[k*N+n]
+    for n in range(N): d[(((n//16)*(align_in//32)+(k//32))*16+(n%16))*32+(k%32)] = s[k*N+n]
 
 def _fp32_to_fp16(b):
   si, e, mt = (b>>31)&1, (b>>23)&0xFF, b&0x7FFFFF
@@ -37,20 +36,21 @@ def _fp32_to_fp16(b):
   sh, fm = 14-ne, (1<<23)|mt
   return (si<<15)|min((fm >> sh) + (1 if (fm & ((1<<sh)-1)) + ((fm >> sh) & 1) > (1<<(sh-1)) else 0), 1<<10)
 
-def _unpack_cmac_out(src, dst, M, N, align_out):
+def _unpack_cmac_out(src, dst, M, N, align_out, scale=1.0):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
-  for m in range(M):
-    for n in range(N): d[m*N+n] = _fp32_to_fp16(s[m*align_out+n])
+  for i in range(M * N):
+    v = s[(i // N) * align_out + i % N]
+    if scale != 1.0:
+      f = struct.unpack('<f', struct.pack('<I', v))[0] * scale
+      v = struct.unpack('<I', struct.pack('<f', f))[0]
+    d[i] = _fp32_to_fp16(v)
 
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
   task: RKTask
   relocs: list[RKReloc]
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
-    self.device = dev
-    self.name = obj.name
-    self.submit_count = 0
-    self.last_enable_mask = 0
+    self.device, self.name, self.submit_count, self.last_enable_mask = dev, obj.name, 0, 0
     if len(obj.lib) >= 4 and struct.unpack_from("<I", obj.lib, 0)[0] == 0x524b494d:
       self.cmds, self.task, self.relocs = decode_rk(obj.lib)
     else:
@@ -65,26 +65,101 @@ class RockchipProgram(Program['RockchipDevice']):
       buf_map:dict[int, HCQBuffer] = {}
       cmac_bufs: list[HCQBuffer] = []
       if task.kind == "cmac":
-        M, N, K, align_in, align_out = task.layout
+        layout = task.layout
+        M, N, K, align_in, align_out = layout[0], layout[1], layout[2], layout[3], layout[4]
         a_s, b_s = self.relocs[0].globals_slot, self.relocs[1].globals_slot
         a_buf = dev._gpu_alloc(max(M*align_in*2, 4096), 0)
         temp.append(a_buf)
-        _pad_a(bufs[a_s].va_addr, a_buf.va_addr, M, K, align_in)
+        if a_s == _CONST_SLOT:
+          ctypes.memmove(a_buf.va_addr, struct.pack('<e', 1.0) * align_in, align_in * 2)  # type: ignore[arg-type]
+        else:
+          _pad_a(bufs[a_s].va_addr, a_buf.va_addr, M, K, align_in)
         b_buf = dev._gpu_alloc(max(align_out*align_in*2, 4096), 0)
         temp.append(b_buf)
-        _swizzle_b(bufs[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
+        if b_s == _CONST_SLOT:
+          ctypes.memmove(b_buf.va_addr, struct.pack('<e', 1.0) * (align_out * align_in), align_out * align_in * 2)  # type: ignore[arg-type]
+        else:
+          _swizzle_b(bufs[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
         o_buf = dev._gpu_alloc(max(M*align_out*4, 4096), 0)
         temp.append(o_buf)
         cmac_bufs = [a_buf, b_buf, o_buf]  # ordered by reloc emission: A, B, output
       else:
         for i, b in enumerate(bufs): buf_map[i] = b  # type: ignore[assignment]
+      # PPU: pad input to chan_padded (multiple of 8) and prepare padded output buffer
+      ppu_padded = None
+      if task.kind == "ppu":
+        in_h, in_w, channels, chan_padded = task.layout
+        in_slot = self.relocs[1].globals_slot  # reloc 0=output, reloc 1=input
+        in_buf = buf_map[in_slot]
+        K = in_h * in_w
+        if chan_padded != channels:
+          # Pad input: (K, channels) → (K, chan_padded) with -inf for max pooling
+          padded_size = max(K * chan_padded * 2, 4096)
+          pbuf = dev._gpu_alloc(padded_size, 0)
+          temp.append(pbuf)
+          pad = struct.pack('<e', -65504.0) * (chan_padded - channels)  # -inf padding
+          for k in range(K):
+            dst = pbuf.va_addr + k * chan_padded * 2
+            ctypes.memmove(dst, in_buf.va_addr + k * channels * 2, channels * 2)  # type: ignore[arg-type]
+            ctypes.memmove(dst + channels * 2, pad, (chan_padded - channels) * 2)  # type: ignore[arg-type]
+          buf_map[in_slot] = pbuf  # type: ignore[assignment]
+          # Allocate padded output buffer and redirect output; copy back after submission
+          out_padded = dev._gpu_alloc(max(chan_padded * 2, 4096), 0)
+          temp.append(out_padded)
+          ppu_padded = (channels, chan_padded, out_padded)
+          buf_map[task.out_slot] = out_padded  # type: ignore[assignment]
+      # DPU constant fill: 1 reloc (output only), constant in layout — host-side fill (no NPU submission)
+      if task.kind == "dpu" and len(self.relocs) == 1 and len(task.layout) == 2:
+        total, const_bits = task.layout
+        const_val = struct.unpack('<f', struct.pack('<i', const_bits))[0]
+        out_buf = buf_map[self.relocs[0].globals_slot]
+        fp16_bytes = struct.pack('<e', const_val) * total
+        ctypes.memmove(out_buf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
+        return
+      # DPU copy: 2 relocs (output + input), no EW, no constant, no broadcast — host-side memmove (no NPU submission)
+      if task.kind == "dpu" and len(self.relocs) == 2 and \
+         all(r.globals_slot not in (_CONST_SLOT, _BCAST_SLOT) for r in self.relocs):
+        total = task.layout[0]
+        in_buf, out_buf = buf_map[self.relocs[1].globals_slot], buf_map[self.relocs[0].globals_slot]
+        ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
+        return
       n_cmds = len(self.cmds)
       assert n_cmds <= dev.cmd_buf_size
       regcmd = ctypes.cast(dev.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * dev.cmd_buf_size)).contents  # type: ignore[arg-type]
       for i, cmd in enumerate(self.cmds): regcmd[i] = cmd
       for i, r in enumerate(self.relocs):
-        dma = (cmac_bufs[i] if cmac_bufs else buf_map[r.globals_slot]).meta.dma_addr
-        v = ((dma + r.addend) >> r.shift) & r.mask
+        if task.kind == "cmac" and cmac_bufs:
+          # CMAC: A/B/output buffers already prepared in cmac_bufs (ordered by reloc index)
+          dma = cmac_bufs[i].meta.dma_addr
+          v = ((dma + r.addend) >> r.shift) & r.mask
+        elif r.globals_slot == _CONST_SLOT:
+          # scalar operand: allocate a buffer filled with the constant value
+          total = task.layout[0]
+          cbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
+          temp.append(cbuf)
+          cval = struct.unpack('<f', struct.pack('<I', r.addend))[0]
+          fp16_bytes = struct.pack('<e', cval) * total
+          ctypes.memmove(cbuf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
+          dma = cbuf.meta.dma_addr
+          v = (dma >> r.shift) & r.mask
+        elif r.globals_slot == _BCAST_SLOT:
+          # broadcast: materialize small input to full size
+          total, small_ext, repeat_dim, mode = task.layout
+          bcast_slot = (r.addend >> 16) & 0xFFFF
+          bbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
+          temp.append(bbuf)
+          src_addr = int(buf_map[bcast_slot].va_addr)
+          if mode == 0:  # row broadcast: repeat each element repeat_dim times
+            for j in range(small_ext):
+              ctypes.memmove(bbuf.va_addr + j * repeat_dim * 2, ctypes.string_at(src_addr + j * 2, 2) * repeat_dim, repeat_dim * 2)  # type: ignore[arg-type]
+          else:  # column broadcast: repeat the whole vector repeat_dim times
+            for j in range(repeat_dim):
+              ctypes.memmove(bbuf.va_addr + j * small_ext * 2, src_addr, small_ext * 2)  # type: ignore[arg-type]
+          dma = bbuf.meta.dma_addr
+          v = (dma >> r.shift) & r.mask
+        else:
+          dma = (cmac_bufs[i] if cmac_bufs else buf_map[r.globals_slot]).meta.dma_addr
+          v = ((dma + r.addend) >> r.shift) & r.mask
         if r.field_shift:
           v = (v << r.field_shift) & 0xFFFFFFFF
           fm = (r.mask << r.field_shift) & 0xFFFFFFFF
@@ -106,8 +181,13 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: mask={task.enable_mask:#x} kind={task.kind}")
       if task.kind == "cmac":
-        M, N, K, align_in, align_out = task.layout
-        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out)
+        layout = task.layout
+        M, N, _, _, align_out = layout[:5]
+        scale = struct.unpack('<f', struct.pack('<i', layout[5]))[0] if len(layout) == 6 else 1.0
+        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, scale)
+      elif task.kind == "ppu" and ppu_padded is not None:
+        channels, chan_padded, out_padded = ppu_padded
+        ctypes.memmove(bufs[task.out_slot].va_addr, out_padded.va_addr, channels * 2)  # type: ignore[arg-type]
     finally:
       for b in temp: dev._gpu_free(b)
     self.submit_count += 1
@@ -119,21 +199,17 @@ class RockchipRenderer(Renderer):
   has_threads = False
   has_local = False
   code_for_op = {}  # no Python fallback — all compute goes through native_program
-  def __init__(self, target:Target):
-    self.target = target
-    self.tensor_cores = []
-  def native_program(self, ast:UOp) -> UOp|None:
-    return build_native_program(ast)
+  def __init__(self, target:Target): self.target, self.tensor_cores = target, []
+  def native_program(self, ast:UOp) -> UOp|None: return build_native_program(ast)
   def asm(self, prg:UOp, lin:UOp) -> bytes:
     task, cmds, relocs = None, [], []
     for u in lin.src:
       if isinstance(u.arg, RKTask): task = u.arg
       elif isinstance(u.arg, RKReloc): relocs.append(u.arg)
       elif isinstance(u.arg, int): cmds.append(u.arg)
-    if task is not None: return encode_rk(tuple(cmds), task, tuple(relocs))
-    raise RuntimeError("rk: no RKTask metadata — non-NPU kernel with no Python fallback")
-  def supported_dtypes(self) -> set[DType]:
-    return {dtypes.half}
+    if task is None: raise RuntimeError("rk: no RKTask metadata — non-NPU kernel with no Python fallback")
+    return encode_rk(tuple(cmds), task, tuple(relocs))
+  def supported_dtypes(self) -> set[DType]: return {dtypes.half}
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
   """DMA-backed allocator: buffers are NPU GEM objects with va_addr (CPU mmap) and dma_addr (NPU)."""
@@ -153,7 +229,6 @@ class RockchipDevice(Compiled):
     self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, "task_buf")
     self.submitted_masks: set[int] = set()
     super().__init__(device, RockchipRegisterAllocator(self), [RockchipRenderer], RockchipProgram)
-
   def create_flink_name(self, handle:int, name:str="", **kw) -> int:
     fr = rk.struct_drm_gem_flink(handle=handle, name=0)
     rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=fr)
