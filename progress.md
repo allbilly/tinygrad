@@ -1,5 +1,33 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 02:50 UTC — DPU LUT ops + MUL fix
+
+### New work
+- EXP2, LOG2, SIN, SQRT via DPU LUT mechanism (all working for fp16)
+- Key finding: OUT_CVT_SHIFT MINUS_EXP field (bits 12-23) enables FP16 float division
+- Key finding: LUT output of exactly 0 produces wrong results; offset by 1
+- Fixed MUL EW op: was missing OUT_CVT_SCALE emission (EINVAL)
+- LOG2 uses index_scale=4090 to avoid x=4.0 hitting LUT_LO_END boundary
+- SIN uses index_scale=16384/π to map x∈[-π,π] to LUT range
+
+### test_ops.py results
+
+| Mode               | Passed | Failed | Skipped |
+|--------------------|--------|--------|---------|
+| FORWARD_ONLY=1     | 84     | 457    | 8       |
+
+### Top rejection reasons
+| Reason                          | Count |
+|---------------------------------|-------|
+| unsupported_dtype (float32)     | 198   |
+| unsupported_op:Ops.WHERE        | 170   |
+| unsupported_layout              | 136   |
+| unsupported_op:non_index_operand| 90    |
+| unsupported_layout:Ops.ADD      | 58    |
+| unsupported_op:Ops.MUL          | 48    |
+| no_add_mul_reduction            | 40    |
+| unsupported_layout:Ops.RANGE    | 28    |
+
 ## 2026-07-27 13:00 UTC — commit 993ea1197
 
 ### Line budget
@@ -1666,3 +1694,89 @@ Goal: bring total sz-lines below 25000 (was 25058 at start of this session).
 - `/tmp/rockchip_prelude_test.py` — change #4 (dpu preamble helper)
 - `/tmp/rockchip_ewpair_test2.py` — change #5 (EW pair helper)
 - `/tmp/rockchip_branch_test.py` — change #3 (applied)
+
+## 2026-07-28 — Refactoring suggestions A–K: /tmp test results
+
+Tested 11 refactoring suggestions (A–K) in `/tmp/tinygrad_test` against
+`test_hw.py` (39 tests) + `test_pr1.py` (72 tests) on the NPU hardware.
+Baseline at time of testing: support=646, ops=193, total=25146.
+
+### Results table
+
+| # | Suggestion | File | Tests | sz-line delta | Verdict |
+|---|-----------|------|-------|---------------|---------|
+| A | `_build_exp2_lut` two-loop → single comprehension (Table 0: x=(i-512)*step, Table 1: x=(i-513)*step) | `support/rockchip.py` | 111/111 PASS | **-8** | Apply |
+| B | Factor `_check_dpu_layout` in `plan_rk` | `support/rockchip.py` | — | 0 | Already done |
+| C | `_ppu_channel_count` merge MUL branch with walrus | `support/rockchip.py` | 111/111 PASS | 0 | No gain |
+| D | `decode_rk` reloc loop → comprehension | `support/rockchip.py` | 111/111 PASS | 0 | No gain |
+| E | `_emit_dpu` scalar swap merge (if/else → ternary tuple) | `support/rockchip.py` | 111/111 PASS | **-1** | Apply (subsumed by F) |
+| F | `_emit_ew_pair()` helper: 6 call sites share 4-line reloc+emit pattern | `support/rockchip.py` | 111/111 PASS | **-11** | Apply |
+| G | PPU padding bulk memmove (pre-fill -inf then overwrite data) | `ops_rockchip.py` | 111/111 PASS | 0 | No gain |
+| H | `_emit_cmac` inline `eff_k` into `line_stride` expression | `support/rockchip.py` | 1 FAIL | — | Reject |
+| I | `notch_val` dead code removal | `support/rockchip.py` | N/A | N/A | Needs FP16 HW output change first |
+| J | `_try_sum` dedup: hoist `sum_info = _try_sum(sink, reduce)` before if/elif chain | `support/rockchip.py` | 111/111 PASS | **-2** | Apply |
+| K | `_CONST_SLOT`/`_ZERO_SLOT` alloc merge: two elif branches → one with if/else for fill logic | `ops_rockchip.py` | 111/111 PASS | **-7** | Apply |
+
+### Stacked result (A+E+F+J+K applied together)
+
+Tested 7 times across multiple code revisions (original code kept changing).
+Consistent result every time:
+
+| File | Baseline | Stacked | Delta |
+|------|----------|---------|-------|
+| `support/rockchip.py` | 646 | 623 | **-23** |
+| `ops_rockchip.py` | 193 | 186 | **-7** |
+| **Total repo** | 25146 | 25116 | **-30** |
+
+All 111 hardware tests pass (39 `test_hw.py` + 72 `test_pr1.py`).
+**Not applied to the real repo yet** — pending user approval.
+
+### Details per change
+
+**A — `_build_exp2_lut` two-loop merge (-8 sz-lines):**
+The two `for i in range(_LUT_SIZE)` loops (Table 0 LE: negative x, Table 1 LO:
+positive x) merge into a single list comprehension. The key insight: both tables
+use the same formula `exp2((i - offset) * step) * output_scale` where offset is
+`_LUT_SIZE - 1` (512) for Table 0 and `_LUT_SIZE` (513) for Table 1. The
+conditional `(_LUT_SIZE - 1 if i < _LUT_SIZE else _LUT_SIZE)` selects the offset.
+14 lines → 5 lines.
+
+**F — `_emit_ew_pair()` helper (-11 sz-lines, subsumes E):**
+6 of 7 `_emit_dpu` branches repeat the 4-line pattern:
+`emitter_reloc(slot) → emitter_emit(EW_BASE_ADDR, 0) → emitter_reloc(ew_slot) → emitter_emit(EW_CFG, cfg)`.
+Extracted as `_emit_ew_pair(cmds, relocs, src_slot, ew_slot, ew_cfg, src_addend=0, ew_addend=0)`.
+The scalar swap/no-swap sub-branches (10 lines) collapse to 3 lines each via
+the helper. Helper is 5 lines; 6 call sites save 3-4 lines each. Net: -11.
+(E alone was -1; F subsumes and extends it.)
+
+**J — `_try_sum` dedup (-2 sz-lines):**
+Lines 359-365 had two separate `elif` branches both calling `_try_sum(sink, reduce)`.
+Hoisted `sum_info = _try_sum(sink, reduce)` before the if/elif chain, then
+changed the branches to test `sum_info is not None` instead of re-calling.
+8 lines → 6 lines.
+
+**K — `_CONST_SLOT`/`_ZERO_SLOT` alloc merge (-7 sz-lines):**
+Two separate `elif` branches (9 lines for CONST, 8 lines for ZERO) share the
+same alloc+append+dma+v pattern. Merged into one `elif r.globals_slot in (_CONST_SLOT, _ZERO_SLOT)`
+branch (9 lines) with an if/else for the fill logic (memmove for CONST, memset
+for ZERO). 17 lines → 9 lines.
+
+### Rejected changes
+
+**H — `_emit_cmac` inline `eff_k`:** Inlining `eff_k = align_in if align_in != aligned_k else K`
+into the `line_stride` expression caused `test_cmac_same_buffer` to fail with
+OSError. The conditional expression in that context appears to cause a subtle
+evaluation issue. Reverted.
+
+**C, D, G — zero gain:** These passed tests but produced 0 sz-line reduction.
+The compressed form (walrus assignments, list comprehension, pre-fill+overwrite)
+had the same token count as the original. Not worth applying for readability loss.
+
+### NPU flakiness note
+
+During testing, the NPU occasionally produced transient OSError failures
+(different test each time: `test_ppu_globalmax_flexible_channels`,
+`test_dpu_2d_add`, `test_cmac_matmul`). Running `python examples/simple_add.py`
+from `ref/rk3588` (which calls `reset_npu`) restores the device. These failures
+are not caused by the code changes — the baseline also fails when the NPU is in
+a bad state, and all tests pass on retry after reset.
