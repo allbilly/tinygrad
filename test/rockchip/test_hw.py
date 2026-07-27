@@ -289,6 +289,16 @@ class TestPPU(unittest.TestCase):
       np.testing.assert_allclose(c.numpy(), np.max(a_np, axis=0), rtol=1e-3, atol=1e-3,
                                  err_msg=f"shape {shape}")
 
+  def test_ppu_globalmax_prime_k(self):
+    # K=5 (prime ≤ 16) uses in_h=1 fallback — verified on hardware
+    np.random.seed(42)
+    for K in [5, 7, 11, 13]:
+      a_np = np.random.uniform(-2, 2, (1, K, 8)).astype(np.float16)
+      a = Tensor(a_np, device="ROCKCHIP").realize()
+      c = a.max(axis=(0,1)).realize()
+      np.testing.assert_allclose(c.numpy(), np.max(a_np, axis=(0,1)), rtol=1e-2, atol=1e-2,
+                                 err_msg=f"K={K}")
+
 @unittest.skipUnless(_NPU_AVAILABLE, "no /dev/dri/card1 NPU device")
 class TestCounters(unittest.TestCase):
   def test_all_units_submit(self):

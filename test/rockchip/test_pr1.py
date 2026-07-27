@@ -119,6 +119,16 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(64,8,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
 
+  def test_ppu_max_k_prime_fallback(self):
+    # K=5 (prime ≤ 16) uses in_h=1 fallback
+    a = Tensor.rand(5,8,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
+
+  def test_ppu_max_k_prime_rejected(self):
+    # K=17 (prime > 16) cannot be split — rejected
+    a = Tensor.rand(17,8,dtype=dtypes.half).realize()
+    self.assertIn("REJECT", _classify(_get_sink(a.max(axis=0))))
+
   def test_ppu_max_chan1(self):
     # channels=1: MUL eliminated, INDEX uses RANGE directly
     a = Tensor.rand(8,1,dtype=dtypes.half).realize()

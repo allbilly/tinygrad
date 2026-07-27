@@ -126,13 +126,15 @@ def _ppu_channel_count(idx: UOp) -> int|None:
 
 _PPU_BAD_SPLITS = frozenset({(3, 6), (6, 3), (12, 12)})
 def _ppu_split_k(K: int) -> tuple[int, int]|None:
-  """Split K into (in_h, in_w) where both are 2-16 (PPU field is 4 bits, min 2).
-  Avoids in_h=9/in_w=9 and known-bad combinations (hardware bug on RK3588 PPU)."""
+  """Split K into (in_h, in_w) for PPU global pooling. Kernel fields are 4 bits
+  (max 16), so both in_h and in_w must be 1-16. Avoids in_h=9/in_w=9 and known-bad
+  combinations (hardware bug on RK3588 PPU). Falls back to in_h=1 for primes ≤ 16."""
   if K < 4: return None
   for in_h in range(2, min(K, 16) + 1):
     if K % in_h: continue
     in_w = K // in_h
     if 2 <= in_w <= 16 and in_h != 9 and in_w != 9 and (in_h, in_w) not in _PPU_BAD_SPLITS: return (in_h, in_w)
+  if K <= 16: return (1, K)  # in_h=1 fallback for primes/odd K ≤ 16
   return None
 
 def _is_1d_index(idx: UOp, kind: str) -> bool:
