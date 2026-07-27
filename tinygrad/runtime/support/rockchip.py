@@ -49,6 +49,7 @@ class RKPlan:
   sink: UOp
   out_slot: int
   in_slots: tuple[int, ...]
+  input_scale: float = 1.0  # LUT input scale (for EXP2(MUL(x, CONST)) etc.)
 
 @dataclass(frozen=True)
 class RKTask:
@@ -126,28 +127,41 @@ def _try_reciprocal(val: UOp) -> tuple[int, float]|None:
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIZE = 513
 
-def _build_exp2_lut() -> tuple[list[int], int, float, float]:
-  """Build 1026-entry LUT for EXP2 over x∈[-2,2]. Returns (lut, bn_mul_operand, output_scale, index_scale).
+def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
+  """Build 1026-entry LUT for EXP2 over x∈[-2,2] (scaled by input_scale).
+  Returns (lut, bn_mul_operand, output_scale, index_scale, minus_exp).
   - index_scale: BN_MUL operand that maps x∈[-2,2] to int16 range [-16384,16384]
-  - output_scale: converts exp2(x) to int16 range; OUT_CVT_SCALE=1 gives raw int16 as fp16."""
+  - When input_scale != 1.0, index_scale is reduced so x*index_scale*input_scale stays in range.
+  - output_scale: converts exp2(x*input_scale) to int16 range
+  - minus_exp: OUT_CVT_SHIFT MINUS_EXP field (output is divided by 2^minus_exp)."""
   lut = [0] * _LUT_SIZE * 2
-  index_scale = 8192.0
-  step = 32.0 / index_scale  # = 1/256
-  output_scale = 8192.0  # exp2(x) * 8192 → int16 range
+  # Adjust index_scale so x*index_scale*input_scale covers [-16384, 16384] for x∈[-2,2]
+  index_scale = 8192.0 / input_scale if input_scale != 1.0 else 8192.0
+  step = 32.0 / index_scale  # step in x domain
+  # Determine output_scale and minus_exp based on max output value
+  max_val = math.exp2(2.0 * input_scale)  # max output at x=2
+  if max_val <= 4.0:
+    output_scale, minus_exp = 8192.0, 13
+  elif max_val <= 8.0:
+    output_scale, minus_exp = 4096.0, 12
+  elif max_val <= 16.0:
+    output_scale, minus_exp = 2048.0, 11
+  else:
+    output_scale, minus_exp = 1024.0, 10
   # Table 0 (LE): covers negative x. Entry i: x = -(512-i)*step (from -2.0 to 0)
   for i in range(_LUT_SIZE):
     x = -(512 - i) * step
-    y = math.exp2(x)
+    y = math.exp2(x * input_scale)
     lut[i] = max(-32768, min(32767, int(round(y * output_scale))))
   # Table 1 (LO): covers positive x. Entry i: x = i*step (from 0 to 2.0)
   for i in range(_LUT_SIZE):
     x = i * step
-    y = math.exp2(x)
+    y = math.exp2(x * input_scale)
     lut[_LUT_SIZE + i] = max(-32768, min(32767, int(round(y * output_scale))))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
-  return lut, bn_mul_operand, output_scale, index_scale
+  return lut, bn_mul_operand, output_scale, index_scale, minus_exp
 
-def _build_log2_lut() -> tuple[list[int], int, float, float]:
+def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for LOG2 over x∈[0.25,4.0] → result∈[-2,2].
   Uses LUT_LE_START=-16384 (same as EXP2), index_scale=4096.
   LE table: underflow (x<0 → clip to log2(0+)=-2). LO table: x from 0 to 4.0.
@@ -170,9 +184,9 @@ def _build_log2_lut() -> tuple[list[int], int, float, float]:
     if v == 0: v = 1
     lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
-  return lut, bn_mul_operand, output_scale, index_scale
+  return lut, bn_mul_operand, output_scale, index_scale, 13
 
-def _build_sin_lut() -> tuple[list[int], int, float, float]:
+def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for SIN over x∈[-π,π] → result∈[-1,1].
   Uses LUT_LE_START=-16384, index_scale=16384/π≈5215.2.
   LE table: x∈[-π,0], LO table: x∈[0,π]."""
@@ -195,9 +209,9 @@ def _build_sin_lut() -> tuple[list[int], int, float, float]:
     if v == 0: v = 1  # avoid exact 0
     lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
-  return lut, bn_mul_operand, output_scale, index_scale
+  return lut, bn_mul_operand, output_scale, index_scale, 13
 
-def _build_sqrt_lut() -> tuple[list[int], int, float, float]:
+def _build_sqrt_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for SQRT over x∈[0,4] → result∈[0,2].
   Uses LUT_LE_START=-16384 (LE handles underflow), index_scale=4090.
   LE table: underflow (x<0 → clip to 0). LO table: x from 0 to ~4.01."""
@@ -217,9 +231,9 @@ def _build_sqrt_lut() -> tuple[list[int], int, float, float]:
     if v == 0: v = 1  # avoid exact 0
     lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
-  return lut, bn_mul_operand, output_scale, index_scale
+  return lut, bn_mul_operand, output_scale, index_scale, 13
 
-def _build_rsqrt_lut() -> tuple[list[int], int, float, float]:
+def _build_rsqrt_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for RSQRT over x∈[0.0625,4] → result∈[0.5,4].
   Uses LUT_LE_START=-16384, index_scale=4090.
   LE table: underflow (x<0 → clip to 4). LO table: x from 0 to ~4.01."""
@@ -240,20 +254,37 @@ def _build_rsqrt_lut() -> tuple[list[int], int, float, float]:
     if v == 0: v = 1
     lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
-  return lut, bn_mul_operand, output_scale, index_scale
+  return lut, bn_mul_operand, output_scale, index_scale, 13
 
-def _try_lut(val: UOp) -> int|None:
-  """EXP2/LOG2/SIN/SQRT(INDEX) or RECIPROCAL(SQRT(INDEX)) → index_slot for DPU LUT op, or None."""
+def _try_lut(val: UOp) -> tuple[int, float]|None:
+  """EXP2/LOG2/SIN/SQRT(INDEX) or RECIPROCAL(SQRT(INDEX)) → (index_slot, input_scale) for DPU LUT op.
+  Also handles EXP2(MUL(INDEX, CONST)) for exp(x) = exp2(x*log2(e)) pattern.
+  Returns None if not a LUT pattern."""
   if val.op not in _LUT_OPS: return None
   inner = _unwrap(val.src[0])
+  input_scale = 1.0
   # RECIPROCAL(SQRT(INDEX)) → RSQRT LUT
   if val.op is Ops.RECIPROCAL:
     if inner.op is not Ops.SQRT: return None
     inner = _unwrap(inner.src[0])
+    # Check for MUL(INDEX, CONST) scaling
+    if inner.op is Ops.MUL:
+      a, b = inner.src
+      if a.op is Ops.CONST and _unwrap(b).op is Ops.INDEX:
+        input_scale = float(a.arg); inner = _unwrap(b)
+      elif b.op is Ops.CONST and _unwrap(a).op is Ops.INDEX:
+        input_scale = float(b.arg); inner = _unwrap(a)
     if inner.op is not Ops.INDEX: return None
-    return inner.src[0].buf_uop.arg.slot
+    return (inner.src[0].buf_uop.arg.slot, input_scale)
+  # Check for MUL(INDEX, CONST) scaling (e.g., exp(x) = exp2(x * log2(e)))
+  if inner.op is Ops.MUL:
+    a, b = inner.src
+    if a.op is Ops.CONST and _unwrap(b).op is Ops.INDEX:
+      input_scale = float(a.arg); inner = _unwrap(b)
+    elif b.op is Ops.CONST and _unwrap(a).op is Ops.INDEX:
+      input_scale = float(b.arg); inner = _unwrap(a)
   if inner.op is not Ops.INDEX: return None
-  return inner.src[0].buf_uop.arg.slot
+  return (inner.src[0].buf_uop.arg.slot, input_scale)
 
 def _try_where_max(val: UOp) -> UOp|None:
   """WHERE(CMPLT(a,b), b, a) or WHERE(CMPLT(b,a), a, b) → synthetic MAX(a,b), or None."""
@@ -372,10 +403,10 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     val = _unwrap(val)  # strip no-op CASTs (half→half) so EW ops are recognized
     sub_slots, scalar = _try_sub(val), _try_scalar(val)
     reciprocal = _try_reciprocal(val)
-    lut_slot = _try_lut(val)
+    lut_result = _try_lut(val)
     # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
     # Broadcast and mean are rejected — no host-side tensor arithmetic.
-    if lut_slot is not None: kind, a2d, ru = "dpu_lut", False, False
+    if lut_result is not None: kind, a2d, ru = "dpu_lut", False, False
     elif sub_slots is not None: kind, a2d, ru = "dpu", False, False
     elif reciprocal is not None: kind, a2d, ru = "dpu", True, True
     elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)): kind, a2d, ru = "dpu", True, True
@@ -422,7 +453,8 @@ def plan_rk(sink: UOp) -> RKPlan|str:
   out_slots = list(prog_info.outs)
   if len(out_slots) != 1: return f"RKPLAN_REJECT:unsupported_layout:{len(out_slots)}-outputs"
   in_slots = tuple(s for s in prog_info.globals if s != out_slots[0])
-  return RKPlan(kind, sink, out_slots[0], in_slots)
+  input_scale = lut_result[1] if lut_result is not None else 1.0
+  return RKPlan(kind, sink, out_slots[0], in_slots, input_scale=input_scale)
 
 # ---- geometry extraction ----
 def _loop_extents(sink: UOp) -> list[int]:
@@ -467,9 +499,10 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   vu = _unwrap(val)
   is_copy = vu.op is Ops.INDEX
   is_fill = vu.op is Ops.CONST
-  lut_slot = _try_lut(val)
-  sub_slots, scalar = (None, None) if (is_copy or is_fill or lut_slot is not None) else (_try_sub(val), _try_scalar(val))
-  reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None or lut_slot is not None) else _try_reciprocal(val)
+  lut_result = _try_lut(val)
+  lut_slot = lut_result[0] if lut_result is not None else None
+  sub_slots, scalar = (None, None) if (is_copy or is_fill or lut_result is not None) else (_try_sub(val), _try_scalar(val))
+  reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None or lut_result is not None) else _try_reciprocal(val)
   layout = (total,)
   # track the EW op for FDIV-specific register emissions (OUT_CVT_SCALE, FP16TOFP32_EN=0)
   ew_op = Ops.SUB if sub_slots else (Ops.FDIV if reciprocal else (val.op if scalar else (Ops.ADD if is_fill else (None if is_copy else val.op))))
@@ -544,8 +577,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   val = _unwrap(store.src[1])
   total = 1
   for s in _shape_of_store(sink): total *= s
-  lut_slot = _try_lut(val)
-  assert lut_slot is not None, "dpu_lut: no LUT slot"
+  lut_result = _try_lut(val)
+  assert lut_result is not None, "dpu_lut: no LUT slot"
+  lut_slot = lut_result[0]
+  input_scale = plan.input_scale  # from classifier (for EXP2(MUL(x, CONST)) etc.)
   layout = (total,)
   # DPU LUT: use dw for width (like regular DPU), channel=7 (8 channels)
   dw = (total + 7) // 8 - 1
@@ -554,28 +589,28 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   surf_stride = (width + 1) * 8 * 2
   # --- LUT table fill (513 entries × 2 tables) ---
   if val.op is Ops.EXP2:
-    lut, bn_mul_operand, output_scale, index_scale = _build_exp2_lut()
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_lut(input_scale)
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
   elif val.op is Ops.LOG2:
-    lut, bn_mul_operand, output_scale, index_scale = _build_log2_lut()
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
   elif val.op is Ops.SIN:
-    lut, bn_mul_operand, output_scale, index_scale = _build_sin_lut()
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sin_lut()
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
   elif val.op is Ops.SQRT:
-    lut, bn_mul_operand, output_scale, index_scale = _build_sqrt_lut()
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sqrt_lut()
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
   elif val.op is Ops.RECIPROCAL:
     # RECIPROCAL(SQRT(x)) → RSQRT LUT
-    lut, bn_mul_operand, output_scale, index_scale = _build_rsqrt_lut()
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_rsqrt_lut()
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
@@ -615,16 +650,16 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, (2 << 16) | (1 << 6))
   # --- BN_ALU_CFG ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000)
-  # --- BN_MUL_CFG: fp16(index_scale) ---
+  # --- BN_MUL_CFG: fp16(index_scale) — LUT builder already accounts for input_scale ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_MUL_CFG, (bn_mul_operand & 0xFFFF) << 16)
   # --- EW_CFG: relu_bypass=1, op_cvt_bypass=1, op_bypass=1 (LUT mode) ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 1))
   # --- EW_CVT_SCALE_VALUE: EW_OP_CVT_SCALE=1 ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)
   # --- OUT_CVT_SCALE: FP32TOFP16_EN=1, scale=1 ---
-  # --- OUT_CVT_SHIFT: MINUS_EXP=13 (FP16 float division by 2^13) ---
+  # --- OUT_CVT_SHIFT: MINUS_EXP (FP16 float division by 2^minus_exp) ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, (13 << 12))
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, (minus_exp << 12))
   # --- SURFACE_ADD = 2 * surf_stride ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, 2 * surf_stride)
   # --- unknown reg 0x40c4 = 0 (from silu.py) ---
