@@ -5,9 +5,15 @@
 - Run `python -m ruff check .` to lint
 - Read `./tinygrad/viz/README` for profiling
 
-# NPU
-u can clone any needed reference repo into ref/ with git clone --depth=1
 
+# NPU
+do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+
+u can clone any needed reference repo into ref/ with git clone --depth=1
 - allbilly/npu
 - allbilly/rk3588
 - other branches in this repo
+- nvdla/sw
+- nvdla/hw
+- https://gitlab.freedesktop.org/mesa/mesa
+- https://github.com/mtx512/rk3588-npu
