@@ -1,0 +1,131 @@
+diff --git a/lut.md b/lut.md
+index c0b46c01a..0ff2f56f7 100644
+--- a/lut.md
++++ b/lut.md
+@@ -244,0 +245,6 @@ arithmetic selection stages.
++QuickGELU, `x*sigmoid(1.702*x)`, uses asymmetric tails: the positive asymptote
++is `x`, while the negative asymptote is zero. Its NPU epilogue therefore keeps
++the staged interior, selects `x` above 5, and selects zero below -10. Do not use
++a symmetric threshold here: at `x=-5.5` the true result is still about
++`-4.7e-4`, well outside the absolute tolerance for a zero replacement.
++
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index fb539faee..5e107477d 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -228,0 +229,7 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_quick_gelu_extreme_saturation(self):
++    a_np = np.array([-400, -300, -10.5, 5.5, 300, 400], dtype=np.float16)
++    with np.errstate(over="ignore"):
++      expected = (a_np.astype(np.float32) / (1 + np.exp(-1.702*a_np.astype(np.float32)))).astype(np.float16)
++    actual = Tensor(a_np, device="ROCKCHIP").quick_gelu().realize().numpy()
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
++
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 7bc9a787a..9ca2ecf78 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -11 +11 @@ segfaulted, so those methods were rerun individually.
+-**Current summary: 141 PASS, 275 FAIL, 8 SKIP (424 unique tests).**
++**Current summary: 142 PASS, 274 FAIL, 8 SKIP (424 unique tests).**
+@@ -14 +14,2 @@ This is the previous complete hardware census plus independently rerun LUT
+-milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, and extreme tanh moved to PASS.
++milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, extreme tanh,
++and extreme QuickGELU moved to PASS.
+@@ -29 +30 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| PASS | 141 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
++| PASS | 142 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+@@ -33 +34 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| FAIL: numeric mismatch | 22 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
++| FAIL: numeric mismatch | 21 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+@@ -41 +42 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-The 141 passing methods are:
++The 142 passing methods are:
+@@ -61 +62 @@ The 141 passing methods are:
+-`test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,
++`test_prod_dtype_arg`, `test_quick_gelu_extreme`, `test_relu`, `test_relu6`, `test_relu_exact`,
+@@ -83 +84 @@ The 141 passing methods are:
+-Current regression: all **59 hardware tests pass in isolated sequential
++Current regression: all **60 hardware tests pass in isolated sequential
+@@ -85 +86,2 @@ subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
+-infinity-division, hardsigmoid saturation, two-LUT hardswish, and extreme-tanh assertions. A single-process run retains
++infinity-division, hardsigmoid saturation, two-LUT hardswish, extreme tanh, and
++extreme-QuickGELU assertions. A single-process run retains
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b44b1422c..07b1cf7ed 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -301,0 +302,24 @@ def _try_tanh(val:UOp) -> UOp|None:
++def _try_quick_gelu(val:UOp) -> UOp|None:
++  """Recognize x*sigmoid(1.702*x) before or after reciprocal-to-FDIV rewriting."""
++  val = _unwrap(val)
++  if val.op is Ops.MUL:
++    source, reciprocal = val.src
++    if _unwrap(source).op is not Ops.INDEX: source, reciprocal = reciprocal, source
++    source, reciprocal = _unwrap(source), _unwrap(reciprocal)
++    if source.op is not Ops.INDEX or reciprocal.op is not Ops.RECIPROCAL: return None
++    denominator = _unwrap(reciprocal.src[0])
++  elif val.op is Ops.FDIV:
++    source, denominator = _unwrap(val.src[0]), _unwrap(val.src[1])
++    if source.op is not Ops.INDEX: return None
++  else: return None
++  if denominator.op is not Ops.ADD: return None
++  one, exponential = denominator.src
++  if one.op is not Ops.CONST: one, exponential = exponential, one
++  exponential = _unwrap(exponential)
++  if one.op is not Ops.CONST or float(one.arg) != 1.0 or exponential.op is not Ops.EXP2: return None
++  scaled = _unwrap(exponential.src[0])
++  if scaled.op is not Ops.MUL: return None
++  scaled_source = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.INDEX), None)
++  factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
++  return source if scaled_source is source and factor is not None and abs(factor + 1.702*math.log2(math.e)) < 1e-3 else None
++
+@@ -1230,0 +1255,46 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Keep the staged QuickGELU interior and use its exact zero/x asymptotes."""
++  store = _store_node(sink)
++  if store is None or (source := _try_quick_gelu(store.src[1])) is None: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++  def temp_index(slot:int) -> UOp:
++    out_idx = store.src[0]
++    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++
++  base_slot = alloc()
++  base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
++  base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
++  if base_tasks is None: return None
++  tasks.extend(base_tasks)
++  used_slots = [st.task.out_slot for st in base_tasks] + \
++    [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  next_slot = max(next_slot, max(used_slots, default=-1)+1)
++
++  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
++  low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, low_diff, scalar(-10.0), source_arg, Ops.SUB),
++                _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, high_diff, source_arg, scalar(5.0), Ops.SUB),
++                _emit_where_stage(total, high_mask, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True)))
++  outside_scratch, outside, inside_scratch, inside = alloc(), alloc(), alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, outside_scratch, (high_mask, 0), (low_mask, 0), Ops.MAX),
++                _emit_where_stage(total, outside, (high_mask, 0), (low_mask, 0), Ops.MAX),
++                _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
++                _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
++  base_selected_scratch, base_selected, high_selected_scratch, high_selected = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, base_selected_scratch, (base_slot, 0), (inside, 0), Ops.MUL),
++                _emit_where_stage(total, base_selected, (base_slot, 0), (inside, 0), Ops.MUL),
++                _emit_where_stage(total, high_selected_scratch, source_arg, (high_mask, 0), Ops.MUL),
++                _emit_where_stage(total, high_selected, source_arg, (high_mask, 0), Ops.MUL),
++                _emit_where_stage(total, alloc(), (base_selected, 0), (high_selected, 0), Ops.ADD),
++                _emit_where_stage(total, info.outs[0], (base_selected, 0), (high_selected, 0), Ops.ADD)))
++  return tuple(tasks)
++
+@@ -2758,0 +2829 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (quick_gelu_tasks := _try_quick_gelu_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)

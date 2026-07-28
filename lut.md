@@ -242,6 +242,12 @@ saturation boundary meets the forward tolerance without changing the separate
 interior-precision problem. A final `isnan` denominator restores NaN after the
 arithmetic selection stages.
 
+QuickGELU, `x*sigmoid(1.702*x)`, uses asymmetric tails: the positive asymptote
+is `x`, while the negative asymptote is zero. Its NPU epilogue therefore keeps
+the staged interior, selects `x` above 5, and selects zero below -10. Do not use
+a symmetric threshold here: at `x=-5.5` the true result is still about
+`-4.7e-4`, well outside the absolute tolerance for a zero replacement.
+
 ### Two-task EXP LUT correction
 
 The direct `exp(x) = exp2(x*log2(e))` table must cover values through `e**2`.

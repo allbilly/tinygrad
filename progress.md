@@ -1,5 +1,28 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — extreme QuickGELU asymptote milestone
+
+### Implementation
+- The backend recognizes `x*sigmoid(1.702*x)` both before and after the
+  reciprocal-to-FDIV rewrite.
+- The staged interior remains unchanged. NPU masks select `x` above 5 and zero
+  below -10, matching QuickGELU's asymmetric positive and negative asymptotes.
+- The negative threshold is intentionally farther out: at `x=-5.5`, the true
+  result is about `-4.7e-4` and cannot be replaced by zero under TestOps'
+  absolute tolerance.
+
+### Verification
+- `TestOps.test_quick_gelu_extreme` — **PASS** with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Focused ±300/±400 and finite tail boundaries — **PASS** on hardware.
+- Sigmoid, SiLU, and swish regressions — **PASS**.
+- Ordinary `TestOps.test_quick_gelu` retains its pre-existing 120-value
+  interior rounding mismatch and remains a separate milestone.
+- All **60** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- `lut.md` documents why composite asymptote thresholds can be asymmetric.
+- Incremental census: **142 PASS, 274 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — extreme tanh saturation milestone
 
 ### Implementation

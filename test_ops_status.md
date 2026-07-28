@@ -8,10 +8,11 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 141 PASS, 275 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 142 PASS, 274 FAIL, 8 SKIP (424 unique tests).**
 
 This is the previous complete hardware census plus independently rerun LUT
-milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, and extreme tanh moved to PASS.
+milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, extreme tanh,
+and extreme QuickGELU moved to PASS.
 
 Forward-only follow-up: both forward ranges in `test_sigmoid_extreme` now pass,
 but the method has two explicit gradient assertions that run even with
@@ -26,11 +27,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 141 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+| PASS | 142 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 72 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 33 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
-| FAIL: numeric mismatch | 22 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: numeric mismatch | 21 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 12 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
@@ -38,7 +39,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 141 passing methods are:
+The 142 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`, `test_all_zero_axis`, `test_any_zero_axis`,
 `test_arange_4096`, `test_arange_big`,
@@ -58,7 +59,7 @@ The 141 passing methods are:
 `test_masked_fill`, `test_maximum`, `test_minimum`, `test_mul`, `test_mul_naninf`, `test_neg`, `test_negative_dims`,
 `test_negative_dims_eye`, `test_negative_dims_full`,
 `test_negative_dims_kaiming`, `test_ones`, `test_ones_like`, `test_permute`,
-`test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,
+`test_prod_dtype_arg`, `test_quick_gelu_extreme`, `test_relu`, `test_relu6`, `test_relu_exact`,
 `test_relu_maximum_exact`, `test_reshape`, `test_round`, `test_rsqrt`, `test_scalar_div`,
 `test_scalar_mul`, `test_scalar_rsub`, `test_scalar_sub`,
 `test_scaled_dot_product_attention_gqa_errors`,
@@ -80,9 +81,10 @@ The 141 passing methods are:
 `test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Current regression: all **59 hardware tests pass in isolated sequential
+Current regression: all **60 hardware tests pass in isolated sequential
 subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
-infinity-division, hardsigmoid saturation, two-LUT hardswish, and extreme-tanh assertions. A single-process run retains
+infinity-division, hardsigmoid saturation, two-LUT hardswish, extreme tanh, and
+extreme-QuickGELU assertions. A single-process run retains
 the sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
 records the LUT tuning, range reduction, Newton refinement, and special-value
 procedures plus the remaining SiLU one-ULP dense-grid diagnostic.

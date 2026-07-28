@@ -299,6 +299,30 @@ def _try_tanh(val:UOp) -> UOp|None:
   factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
   return source if source is not None and factor is not None and abs(factor + 2*math.log2(math.e)) < 1e-3 else None
 
+def _try_quick_gelu(val:UOp) -> UOp|None:
+  """Recognize x*sigmoid(1.702*x) before or after reciprocal-to-FDIV rewriting."""
+  val = _unwrap(val)
+  if val.op is Ops.MUL:
+    source, reciprocal = val.src
+    if _unwrap(source).op is not Ops.INDEX: source, reciprocal = reciprocal, source
+    source, reciprocal = _unwrap(source), _unwrap(reciprocal)
+    if source.op is not Ops.INDEX or reciprocal.op is not Ops.RECIPROCAL: return None
+    denominator = _unwrap(reciprocal.src[0])
+  elif val.op is Ops.FDIV:
+    source, denominator = _unwrap(val.src[0]), _unwrap(val.src[1])
+    if source.op is not Ops.INDEX: return None
+  else: return None
+  if denominator.op is not Ops.ADD: return None
+  one, exponential = denominator.src
+  if one.op is not Ops.CONST: one, exponential = exponential, one
+  exponential = _unwrap(exponential)
+  if one.op is not Ops.CONST or float(one.arg) != 1.0 or exponential.op is not Ops.EXP2: return None
+  scaled = _unwrap(exponential.src[0])
+  if scaled.op is not Ops.MUL: return None
+  scaled_source = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.INDEX), None)
+  factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
+  return source if scaled_source is source and factor is not None and abs(factor + 1.702*math.log2(math.e)) < 1e-3 else None
+
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
@@ -1226,6 +1250,52 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, nan_numerator, (finite, 0), (nan_denom, 0), Ops.MUL),
                 _emit_where_stage(total, alloc(), (nan_numerator, 0), (nan_denom, 0), Ops.FDIV),
                 _emit_where_stage(total, info.outs[0], (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)))
+  return tuple(tasks)
+
+def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Keep the staged QuickGELU interior and use its exact zero/x asymptotes."""
+  store = _store_node(sink)
+  if store is None or (source := _try_quick_gelu(store.src[1])) is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+  def temp_index(slot:int) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  base_slot = alloc()
+  base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
+  base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
+  if base_tasks is None: return None
+  tasks.extend(base_tasks)
+  used_slots = [st.task.out_slot for st in base_tasks] + \
+    [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+  next_slot = max(next_slot, max(used_slots, default=-1)+1)
+
+  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, low_diff, scalar(-10.0), source_arg, Ops.SUB),
+                _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, high_diff, source_arg, scalar(5.0), Ops.SUB),
+                _emit_where_stage(total, high_mask, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True)))
+  outside_scratch, outside, inside_scratch, inside = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, outside_scratch, (high_mask, 0), (low_mask, 0), Ops.MAX),
+                _emit_where_stage(total, outside, (high_mask, 0), (low_mask, 0), Ops.MAX),
+                _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
+                _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
+  base_selected_scratch, base_selected, high_selected_scratch, high_selected = (alloc() for _ in range(4))
+  tasks.extend((_emit_where_stage(total, base_selected_scratch, (base_slot, 0), (inside, 0), Ops.MUL),
+                _emit_where_stage(total, base_selected, (base_slot, 0), (inside, 0), Ops.MUL),
+                _emit_where_stage(total, high_selected_scratch, source_arg, (high_mask, 0), Ops.MUL),
+                _emit_where_stage(total, high_selected, source_arg, (high_mask, 0), Ops.MUL),
+                _emit_where_stage(total, alloc(), (base_selected, 0), (high_selected, 0), Ops.ADD),
+                _emit_where_stage(total, info.outs[0], (base_selected, 0), (high_selected, 0), Ops.ADD)))
   return tuple(tasks)
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
@@ -2756,6 +2826,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
   if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
   if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)
+  if (quick_gelu_tasks := _try_quick_gelu_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)
