@@ -194,6 +194,45 @@ automatically reproduce IEEE behavior for:
 TestOps methods often contain a normal random subcase followed by an explicit
 special-value subcase. Passing the first subcase does not make the method pass.
 
+### NPU-side special-value epilogues
+
+The bounded EXP2 table cannot encode all IEEE inputs by itself: before the
+special-value milestone it returned `[8, 0.25, 8]` for
+`[+inf, -inf, NaN]`. Do not repair this with host-side inspection of tensor
+contents. The stable direct-EXP2 path materializes the LUT output, creates fp16
+comparison masks, and applies these identities on the NPU:
+
+```text
+positive_denom = 1 - is_positive_overflow
+result = lut_result / positive_denom
+result = result * (1 - is_negative_underflow)
+nan_denom = 1 - isnan(x)
+result = (result * nan_denom) / nan_denom
+```
+
+The last expression produces NaN as `0/0` only in NaN lanes. This avoids the
+usual arithmetic-WHERE problem where an unselected `inf * 0` contaminates
+ordinary lanes.
+
+Intermediate comparison outputs must stay as fp16 0/1 scratch buffers. Setting
+`bool_output` on an intermediate stage packs it to byte-wide storage and makes
+it invalid as input to the next DPU task.
+
+Staged FDIV has different precision registers from ADD/MUL/MAX:
+
+```text
+REG_DPU_OUT_CVT_SCALE = 1
+MRDMA_FP16TOFP32_EN   = 0
+```
+
+Using the ordinary elementwise settings silently produced zero for every
+staged quotient. Always validate intermediate scratch values when adding a
+special-value epilogue.
+
+This technique only repairs special inputs that reach the recognized LUT.
+For example, `EXP2(LOG2(0) * negative)` still requires LOG2-zero handling
+because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
+
 ### Mixed task stability
 
 A direct mixed LUT/DPU PC chain can time out on RK3588. The backend uses the

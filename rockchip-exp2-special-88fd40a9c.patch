@@ -1,0 +1,286 @@
+diff --git a/lut.md b/lut.md
+index d77b3fb93..272a60768 100644
+--- a/lut.md
++++ b/lut.md
+@@ -194,6 +194,45 @@ automatically reproduce IEEE behavior for:
+ TestOps methods often contain a normal random subcase followed by an explicit
+ special-value subcase. Passing the first subcase does not make the method pass.
+ 
++### NPU-side special-value epilogues
++
++The bounded EXP2 table cannot encode all IEEE inputs by itself: before the
++special-value milestone it returned `[8, 0.25, 8]` for
++`[+inf, -inf, NaN]`. Do not repair this with host-side inspection of tensor
++contents. The stable direct-EXP2 path materializes the LUT output, creates fp16
++comparison masks, and applies these identities on the NPU:
++
++```text
++positive_denom = 1 - is_positive_overflow
++result = lut_result / positive_denom
++result = result * (1 - is_negative_underflow)
++nan_denom = 1 - isnan(x)
++result = (result * nan_denom) / nan_denom
++```
++
++The last expression produces NaN as `0/0` only in NaN lanes. This avoids the
++usual arithmetic-WHERE problem where an unselected `inf * 0` contaminates
++ordinary lanes.
++
++Intermediate comparison outputs must stay as fp16 0/1 scratch buffers. Setting
++`bool_output` on an intermediate stage packs it to byte-wide storage and makes
++it invalid as input to the next DPU task.
++
++Staged FDIV has different precision registers from ADD/MUL/MAX:
++
++```text
++REG_DPU_OUT_CVT_SCALE = 1
++MRDMA_FP16TOFP32_EN   = 0
++```
++
++Using the ordinary elementwise settings silently produced zero for every
++staged quotient. Always validate intermediate scratch values when adding a
++special-value epilogue.
++
++This technique only repairs special inputs that reach the recognized LUT.
++For example, `EXP2(LOG2(0) * negative)` still requires LOG2-zero handling
++because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
++
+ ### Mixed task stability
+ 
+ A direct mixed LUT/DPU PC chain can time out on RK3588. The backend uses the
+diff --git a/progress.md b/progress.md
+index ff89a59d0..26fe2df78 100644
+--- a/progress.md
++++ b/progress.md
+@@ -1,5 +1,32 @@
+ # Rockchip NPU backend — test_ops.py progress
+ 
++## 2026-07-28 — EXP2 IEEE special-value milestone
++
++### Implementation
++- Direct EXP2 now keeps the bounded LUT result for ordinary fp16 inputs and
++  adds an NPU-only epilogue for `+inf`, `-inf`, and NaN.
++- Comparison masks identify positive overflow, negative underflow, and
++  `x != x`. Intermediate masks remain fp16 scratch values rather than being
++  packed as user-visible bool buffers.
++- Arithmetic selection avoids `inf * 0` contamination:
++  `base / (1-positive)` creates positive infinity,
++  multiplication by `(1-negative)` creates zero, and
++  `base*(1-nan)/(1-nan)` creates NaN through `0/0`.
++- Fixed staged FDIV emission to use `OUT_CVT_SCALE=1` and disable
++  `MRDMA_FP16TOFP32_EN`, matching the working direct FDIV stream. The previous
++  ordinary elementwise settings forced staged quotients to zero.
++
++### Verification
++- `TestOps.test_exp2` — **PASS** for random tensors, scalar input, positive and
++  negative infinity, and NaN at unchanged upstream tolerances.
++- Direct/scalar division and the strict SiLU/swish methods — **PASS** in
++  isolated regression runs.
++- All **49** Rockchip hardware methods — **PASS** in isolated sequential
++  subprocesses.
++- `python -m mypy tinygrad/` and Ruff on the changed files — **PASS**.
++- `test_exp2_log2_zero_times_negative` remains separate: LOG2(0) saturates
++  before the EXP2 stage, so its required `+inf` never reaches this epilogue.
++
+ ## 2026-07-28 — typed boolean maximum milestone
+ 
+ ### Implementation
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index e8ae7cc4d..face8f82a 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -140,6 +140,11 @@ class TestDPU(unittest.TestCase):
+     expected = (a_np.astype(np.float32) / (1.0 + np.exp(-a_np.astype(np.float32)))).astype(np.float16)
+     np.testing.assert_allclose(a.silu().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
+ 
++  def test_dpu_exp2_special_values(self):
++    a_np = np.array([np.inf, -np.inf, np.nan, -2, 0, 2], dtype=np.float16)
++    actual = Tensor(a_np, device="ROCKCHIP").exp2().realize().numpy()
++    np.testing.assert_allclose(actual, np.exp2(a_np), rtol=1e-3, atol=1e-6)
++
+   def test_dpu_comparison_outputs(self):
+     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
+     b_np = np.array([-1,0,0,2,2], dtype=np.float16)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 03a564f40..d760b6413 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
+ safely serve 12 concurrent pytest workers. The batch containing methods 400–419
+ segfaulted, so those methods were rerun individually.
+ 
+-**Current summary: 128 PASS, 288 FAIL, 8 SKIP (424 unique tests).**
++**Current summary: 129 PASS, 287 FAIL, 8 SKIP (424 unique tests).**
+ 
+ The census originally found one reproducible crash in
+ `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
+@@ -17,11 +17,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+ 
+ | Result group | Count | Main current causes |
+ |---|---:|---|
+-| PASS | 128 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations, and uint8 ReLU cast |
++| PASS | 129 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+ | FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
+ | FAIL: unsupported dtype | 35 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
+ | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
+-| FAIL: numeric mismatch | 30 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
++| FAIL: numeric mismatch | 29 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+ | FAIL: non-index operand | 13 | Elementwise graphs still outside the staged planner |
+ | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
+ | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
+@@ -29,7 +29,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+ | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
+ | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
+ 
+-The 128 passing methods are:
++The 129 passing methods are:
+ 
+ `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
+ `test_arange_4096`, `test_arange_big`,
+@@ -39,7 +39,7 @@ The 128 passing methods are:
+ `test_cumprod_zero_axis`, `test_cumsum_zero_axis`, `test_detach`,
+ `test_diagonal`, `test_div`, `test_double_slice`, `test_einsum_arity_check1`,
+ `test_einsum_arity_check2`, `test_einsum_shape_check`, `test_empty_0`,
+-`test_expand`, `test_eye`, `test_flatten`, `test_flip`, `test_flip_eye_crash`, `test_floor`,
++`test_expand`, `test_exp2`, `test_eye`, `test_flatten`, `test_flip`, `test_flip_eye_crash`, `test_floor`,
+ `test_full`, `test_full_like`,
+ `test_gemm`, `test_gemm_fp16`, `test_gemm_with_zeros_shape`,
+ `test_hardsigmoid`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
+@@ -70,11 +70,11 @@ The 128 passing methods are:
+ `test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
+ `TestOpsUint8::test_cast_relu`.
+ 
+-Current typed-maximum milestone regression: all **48 hardware tests pass in
+-isolated sequential subprocesses**, including the new bool maximum assertion,
+-and the official `TestOps.test_maximum` passes. A single-process run retains
+-the pre-existing sequence-sensitive SiLU→SUB timeout; both tests pass in
+-isolation. `lut.md` records the LUT tuning procedure and the remaining SiLU
++Current EXP2 milestone regression: all **49 hardware tests pass in isolated
++sequential subprocesses**, including the new EXP2 special-value assertion, and
++the official `TestOps.test_exp2` passes. A single-process run retains the
++sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
++records the LUT tuning and special-value procedure plus the remaining SiLU
+ one-ULP dense-grid diagnostic.
+ 
+ ## Historical detailed baseline — 2026-07-27, commit 993ea1197
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b02e82ca9..213a47085 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4,7 +4,7 @@
+ # Fill, broadcast, mean, and all other ops are rejected — no host-side tensor arithmetic.
+ from __future__ import annotations
+ import struct, math, numpy as np
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from tinygrad.dtype import dtypes
+ from tinygrad.helpers import ceildiv, round_up, prod
+ from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
+@@ -751,7 +751,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+     e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0x7c000000)
+     e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0x3f800000)
+   e(_T_DPU, rk.REG_DPU_EW_CFG, _EW_BASE | 1 if compare else _DPU_EW_CFGS[op])
+-  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001)
++  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if op is Ops.FDIV else 0x10001)
+   e(_T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+   e(_T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe)
+@@ -764,7 +764,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+                            (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, b)):
+     e(target, reg, 0)
+     emitter_reloc(cmds, relocs, arg[0], arg[1])
+-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
++  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if op is Ops.FDIV else 0x17849)
+   emitter_pc_op_en(cmds, 12)
+   task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs, int32_inputs=int32_inputs,
+                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
+@@ -983,6 +983,81 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   dependent(out_slot, result, (_ZERO_SLOT, 0), Ops.ADD, bool_output=True)
+   return tuple(tasks)
+ 
++def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Preserve IEEE EXP2 results for infinities and NaN around the bounded LUT."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  val = _unwrap(store.src[1])
++  if val.op is not Ops.EXP2 or len(val.src) != 1 or (source := _unwrap(val.src[0])).op is not Ops.INDEX: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++
++  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
++    out_idx = store.src[0]
++    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++
++  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
++    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
++    # Repeat the first read of each freshly materialized value. Comparison and
++    # LUT programs run as reset-separated stages and otherwise expose stale lanes.
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
++
++  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
++    nonlocal next_slot
++    mask_slot = alloc()
++    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
++    if cmp_tasks is None: return None
++    # Intermediate masks stay as fp16 0/1 scratch. Only a user-visible boolean
++    # output should be packed to the byte-wide bool representation.
++    last = cmp_tasks[-1]
++    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
++    tasks.extend(cmp_tasks)
++    used_slots = [st.task.out_slot for st in cmp_tasks] + \
++      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
++    return (mask_slot, 0)
++
++  # First materialize the normal bounded-domain LUT result.
++  lut_slot = alloc()
++  lut_plan = plan_rk(stage_sink(val, lut_slot))
++  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(lut_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++
++  # Comparison inputs are normalized from infinities to the fp16 extrema by
++  # the runtime. Values beyond these thresholds already overflow/underflow
++  # EXP2 in fp16, so the masks retain the required result semantics.
++  hi, lo = UOp.const(dtypes.half, 65472.0), UOp.const(dtypes.half, -65472.0)
++  positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
++  negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, lo)))
++  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
++  if positive is None or negative is None or not_number is None: return None
++
++  # +inf: base / (1-positive) -> +inf.
++  positive_denom, positive_result = alloc(), alloc()
++  dependent(positive_denom, one, positive, Ops.SUB)
++  dependent(positive_result, (lut_slot, 0), (positive_denom, 0), Ops.FDIV)
++  # -inf: result * (1-negative) -> 0.
++  negative_denom, finite_result = alloc(), alloc()
++  dependent(negative_denom, one, negative, Ops.SUB)
++  dependent(finite_result, (positive_result, 0), (negative_denom, 0), Ops.MUL)
++  # NaN: first force the numerator to zero, then 0/0 produces NaN.
++  nan_denom, nan_numerator = alloc(), alloc()
++  dependent(nan_denom, one, not_number, Ops.SUB)
++  dependent(nan_numerator, (finite_result, 0), (nan_denom, 0), Ops.MUL)
++  dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
++  return tuple(tasks)
++
+ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
+@@ -1800,6 +1875,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
++  if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
+   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
+   plan = plan_rk(sink)
+   if isinstance(plan, str):

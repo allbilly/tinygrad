@@ -140,6 +140,11 @@ class TestDPU(unittest.TestCase):
     expected = (a_np.astype(np.float32) / (1.0 + np.exp(-a_np.astype(np.float32)))).astype(np.float16)
     np.testing.assert_allclose(a.silu().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_exp2_special_values(self):
+    a_np = np.array([np.inf, -np.inf, np.nan, -2, 0, 2], dtype=np.float16)
+    actual = Tensor(a_np, device="ROCKCHIP").exp2().realize().numpy()
+    np.testing.assert_allclose(actual, np.exp2(a_np), rtol=1e-3, atol=1e-6)
+
   def test_dpu_comparison_outputs(self):
     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
     b_np = np.array([-1,0,0,2,2], dtype=np.float16)

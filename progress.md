@@ -1,5 +1,32 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — EXP2 IEEE special-value milestone
+
+### Implementation
+- Direct EXP2 now keeps the bounded LUT result for ordinary fp16 inputs and
+  adds an NPU-only epilogue for `+inf`, `-inf`, and NaN.
+- Comparison masks identify positive overflow, negative underflow, and
+  `x != x`. Intermediate masks remain fp16 scratch values rather than being
+  packed as user-visible bool buffers.
+- Arithmetic selection avoids `inf * 0` contamination:
+  `base / (1-positive)` creates positive infinity,
+  multiplication by `(1-negative)` creates zero, and
+  `base*(1-nan)/(1-nan)` creates NaN through `0/0`.
+- Fixed staged FDIV emission to use `OUT_CVT_SCALE=1` and disable
+  `MRDMA_FP16TOFP32_EN`, matching the working direct FDIV stream. The previous
+  ordinary elementwise settings forced staged quotients to zero.
+
+### Verification
+- `TestOps.test_exp2` — **PASS** for random tensors, scalar input, positive and
+  negative infinity, and NaN at unchanged upstream tolerances.
+- Direct/scalar division and the strict SiLU/swish methods — **PASS** in
+  isolated regression runs.
+- All **49** Rockchip hardware methods — **PASS** in isolated sequential
+  subprocesses.
+- `python -m mypy tinygrad/` and Ruff on the changed files — **PASS**.
+- `test_exp2_log2_zero_times_negative` remains separate: LOG2(0) saturates
+  before the EXP2 stage, so its required `+inf` never reaches this epilogue.
+
 ## 2026-07-28 — typed boolean maximum milestone
 
 ### Implementation

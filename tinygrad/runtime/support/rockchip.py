@@ -4,7 +4,7 @@
 # Fill, broadcast, mean, and all other ops are rejected — no host-side tensor arithmetic.
 from __future__ import annotations
 import struct, math, numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import ceildiv, round_up, prod
 from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
@@ -751,7 +751,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
     e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0x7c000000)
     e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0x3f800000)
   e(_T_DPU, rk.REG_DPU_EW_CFG, _EW_BASE | 1 if compare else _DPU_EW_CFGS[op])
-  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001)
+  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if op is Ops.FDIV else 0x10001)
   e(_T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
   e(_T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40)
   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe)
@@ -764,7 +764,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
                            (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, b)):
     e(target, reg, 0)
     emitter_reloc(cmds, relocs, arg[0], arg[1])
-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if op is Ops.FDIV else 0x17849)
   emitter_pc_op_en(cmds, 12)
   task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs, int32_inputs=int32_inputs,
                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
@@ -981,6 +981,81 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   if (result := lower(val)) is None: return None
   dependent(out_slot, result, (_ZERO_SLOT, 0), Ops.ADD, bool_output=True)
+  return tuple(tasks)
+
+def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve IEEE EXP2 results for infinities and NaN around the bounded LUT."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.EXP2 or len(val.src) != 1 or (source := _unwrap(val.src[0])).op is not Ops.INDEX: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    # Repeat the first read of each freshly materialized value. Comparison and
+    # LUT programs run as reset-separated stages and otherwise expose stale lanes.
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
+    nonlocal next_slot
+    mask_slot = alloc()
+    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
+    if cmp_tasks is None: return None
+    # Intermediate masks stay as fp16 0/1 scratch. Only a user-visible boolean
+    # output should be packed to the byte-wide bool representation.
+    last = cmp_tasks[-1]
+    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    tasks.extend(cmp_tasks)
+    used_slots = [st.task.out_slot for st in cmp_tasks] + \
+      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+    return (mask_slot, 0)
+
+  # First materialize the normal bounded-domain LUT result.
+  lut_slot = alloc()
+  lut_plan = plan_rk(stage_sink(val, lut_slot))
+  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(lut_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  # Comparison inputs are normalized from infinities to the fp16 extrema by
+  # the runtime. Values beyond these thresholds already overflow/underflow
+  # EXP2 in fp16, so the masks retain the required result semantics.
+  hi, lo = UOp.const(dtypes.half, 65472.0), UOp.const(dtypes.half, -65472.0)
+  positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
+  negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, lo)))
+  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
+  if positive is None or negative is None or not_number is None: return None
+
+  # +inf: base / (1-positive) -> +inf.
+  positive_denom, positive_result = alloc(), alloc()
+  dependent(positive_denom, one, positive, Ops.SUB)
+  dependent(positive_result, (lut_slot, 0), (positive_denom, 0), Ops.FDIV)
+  # -inf: result * (1-negative) -> 0.
+  negative_denom, finite_result = alloc(), alloc()
+  dependent(negative_denom, one, negative, Ops.SUB)
+  dependent(finite_result, (positive_result, 0), (negative_denom, 0), Ops.MUL)
+  # NaN: first force the numerator to zero, then 0/0 produces NaN.
+  nan_denom, nan_numerator = alloc(), alloc()
+  dependent(nan_denom, one, not_number, Ops.SUB)
+  dependent(nan_numerator, (finite_result, 0), (nan_denom, 0), Ops.MUL)
+  dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
   return tuple(tasks)
 
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -1800,6 +1875,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+  if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
