@@ -1,5 +1,64 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — two-NPU-task LogSigmoid milestone
+
+### Failure mechanism and debug method
+
+- The generic nested-elementwise splitter accepted LogSigmoid but expanded its
+  stable LOG2/EXP2 lowering into **169 NPU tasks**: 165 arithmetic tasks and
+  four LUT tasks. The official method timed out.
+- Calling `build_native_program` on the scheduled sink initially showed a
+  four-task experimental path while execution still ran 169 tasks. Two
+  independent effects were involved:
+
+  1. The renderer sees an optimized graph, not necessarily the raw scheduled
+     graph. It reassociates the root from a final multiply by `-1` to
+     `(-ln(2))*LOG2(...) + (-1)*MAX(...)`.
+  2. `CACHELEVEL=0` disables scheduling/search caches, but compiled Rockchip
+     images also require `CCACHE=0` while changing emission for an unchanged
+     AST.
+
+- `RK_TRACE_MATCH=1` now prints the LogSigmoid matcher decision, optimized root
+  shape, key op counts, input slots/dtypes, and complete op set. This is a
+  reusable way to compare raw-schedule recognition with renderer recognition.
+- The semantic fallback remains narrow: one fp16 input INDEX, exactly two
+  EXP2s, one LOG2, one MAX, only the stable-logaddexp op family, and the
+  expected `-ln(2)`/`-1` optimized root scales.
+
+### Implementation and LUT tuning
+
+- Use the stable identity:
+
+  ```text
+  logsigmoid(x) = min(x,0) - log1p(exp(-abs(x)))
+  ```
+
+  The unbounded negative tail is retained exactly by arithmetic; LUT output is
+  only the bounded symmetric correction.
+- The broad signed Q15 LUT covers `[-8,8]`. It is sufficient for the official
+  `[-2,2]` input range and reduced the official graph to four tasks.
+- A 2049-point dense probe found 356 tight-relative-tolerance misses above
+  about `x=3.63`, where one ordinary Q15 step is too coarse.
+- A second NPU LUT stores `32 * -log1p(exp(-abs(x)))` in Q15. It is selected
+  for `x>3.5` and multiplied by exact `1/32`, giving an effective correction
+  quantum of about `9.54e-7`. This is the requested two-NPU-task LUT design.
+- A final `-MAX(-result,0)` clamp preserves the nonpositive codomain and maps
+  positive infinity to negative zero while retaining negative infinity and
+  NaN.
+- Final program: **15 tasks**, including exactly two `dpu_lut` tasks, down from
+  the generic 169-task timeout.
+
+### Verification
+
+- `TestOps.test_logsigmoid`: **PASS**.
+- Dense fp16 hardware regression: all 2049 points in `[-8,8]`, `-inf`, `+inf`,
+  and NaN **PASS** at the official tolerance.
+- Complete serial `test/rockchip/test_hw.py`: **63 passed, 2 failed** in
+  160.37 seconds. Only the unchanged fill-zero/fill-full parent-baseline
+  failures remain.
+- Compileall and `git diff --check` pass. Full mypy and focused Ruff retain
+  only the same 13/five pre-existing findings.
+
 ## 2026-07-29 — normalized natural-log and log10 milestone
 
 ### Implementation
@@ -648,13 +707,11 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
-   staged LOG2/EXP2 interaction before tuning a LUT.
-2. Softplus and Mish: supported paths are numerically inaccurate and likely
+1. Softplus and Mish: supported paths are numerically inaccurate and likely
    depend on improved LOG/EXP range handling.
-3. ELU and SELU: still unsupported composite activation graphs.
-4. Boolean reductions and remaining integer/bool dtype groups.
-5. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
+2. ELU and SELU: still unsupported composite activation graphs.
+3. Boolean reductions and remaining integer/bool dtype groups.
+4. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
    convolution groups. These are larger architectural milestones, not LUT
    quick wins.
 

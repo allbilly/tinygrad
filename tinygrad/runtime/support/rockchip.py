@@ -6,7 +6,7 @@ from __future__ import annotations
 import struct, math, numpy as np
 from dataclasses import dataclass, replace
 from tinygrad.dtype import dtypes, DType
-from tinygrad.helpers import ceildiv, round_up, prod
+from tinygrad.helpers import ceildiv, round_up, prod, getenv
 from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.upat import UPat
@@ -324,6 +324,40 @@ def _try_quick_gelu(val:UOp) -> UOp|None:
   factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
   return source if scaled_source is source and factor is not None and abs(factor + 1.702*math.log2(math.e)) < 1e-3 else None
 
+def _try_logsigmoid(val:UOp) -> UOp|None:
+  """Recognize -logaddexp(0, -x), tinygrad's stable LogSigmoid lowering."""
+  val = _unwrap(val)
+  indexes = list(dict.fromkeys(_unwrap(u) for u in val.toposort() if u.op is Ops.INDEX))
+  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
+  ch, cf = lambda x: UOp.const(dtypes.half, x), lambda x: UOp.const(dtypes.float, x)
+  neg = UOp(Ops.MUL, dtypes.half, (source, ch(-1.0)))
+  positive = UOp(Ops.MAX, dtypes.half, (neg, ch(0.0)))
+  neg_positive = UOp(Ops.MUL, dtypes.half, (positive, ch(-1.0)))
+  lhs = UOp(Ops.CAST, dtypes.float, (UOp(Ops.ADD, dtypes.half, (neg, neg_positive)),), arg=dtypes.float)
+  rhs = UOp(Ops.CAST, dtypes.float, (neg_positive,), arg=dtypes.float)
+  exp_lhs = UOp(Ops.CAST, dtypes.half, (UOp(Ops.EXP2, dtypes.float,
+    (UOp(Ops.MUL, dtypes.float, (lhs, cf(math.log2(math.e)))),)),), arg=dtypes.half)
+  exp_rhs = UOp(Ops.CAST, dtypes.half, (UOp(Ops.EXP2, dtypes.float,
+    (UOp(Ops.MUL, dtypes.float, (rhs, cf(math.log2(math.e)))),)),), arg=dtypes.half)
+  logarithm = UOp(Ops.MUL, dtypes.half, (
+    UOp(Ops.LOG2, dtypes.half, (UOp(Ops.ADD, dtypes.half, (exp_lhs, exp_rhs)),)), ch(math.log(2.0))))
+  expected = UOp(Ops.MUL, dtypes.half, (UOp(Ops.ADD, dtypes.half, (logarithm, positive)), ch(-1.0)))
+  if val is expected: return source
+  # Kernel optimization can reassociate the stable logaddexp graph before the
+  # renderer hook. Retain a narrow semantic fallback for that equivalent form.
+  nodes = val.toposort()
+  allowed = {Ops.ADD, Ops.MUL, Ops.MAX, Ops.CAST, Ops.EXP2, Ops.LOG2, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  root_negated = val.op is Ops.MUL and any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in val.src)
+  if val.op is Ops.ADD and all(_unwrap(x).op is Ops.MUL for x in val.src):
+    terms = [_unwrap(x) for x in val.src]
+    term_ops = {next((_unwrap(y).op for y in term.src if y.op is not Ops.CONST), None) for term in terms}
+    term_scales = sorted(float(y.arg) for term in terms for y in term.src if y.op is Ops.CONST)
+    root_negated = term_ops == {Ops.LOG2, Ops.MAX} and len(term_scales) == 2 and \
+      math.isclose(term_scales[0], -1.0) and math.isclose(term_scales[1], -math.log(2.0))
+  return source if root_negated and all(u.op in allowed for u in nodes) and \
+    sum(u.op is Ops.EXP2 for u in nodes) == 2 and sum(u.op is Ops.LOG2 for u in nodes) == 1 and \
+    sum(u.op is Ops.MAX for u in nodes) == 1 else None
+
 def _try_celu(val:UOp) -> tuple[UOp,float]|None:
   """Recognize max(x,0)+min(alpha*(exp(x/alpha)-1),0) for TestOps alphas."""
   val = _unwrap(val)
@@ -359,6 +393,8 @@ _LUT_QUICK_GELU_LOCAL = Ops.SHR
 _LUT_TANH = Ops.CDIV
 _LUT_TANH_LOCAL = Ops.XOR
 _LUT_LOG2_LOCAL = Ops.OR
+_LUT_LOGSIGMOID_CORRECTION = Ops.AND
+_LUT_LOGSIGMOID_TAIL = Ops.THREEFRY
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -563,6 +599,28 @@ def _build_log2_local_lut(function_scale:float=1.0) -> tuple[list[int], int, flo
       lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
+def _build_logsigmoid_correction_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 -log1p(exp(-abs(x))) over [-8,8]; LogSigmoid adds min(x,0)."""
+  index_scale, output_scale = 2048.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i)*step
+      raw = int(round(-math.log1p(math.exp(-abs(x)))*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else -1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_logsigmoid_tail_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 32*-log1p(exp(-abs(x))) over [-8,8], selected on the positive tail."""
+  index_scale, output_scale = 2048.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i)*step
+      raw = int(round(-32.0*math.log1p(math.exp(-abs(x)))*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else -1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
 def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for SIN over x∈[-π,π] → result∈[-1,1].
   Uses LUT_LE_START=-16384, index_scale=16384/π≈5215.2.
@@ -717,6 +775,10 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_log2_local" and \
      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_LOG2_LOCAL)
+  if val.op is Ops.CUSTOM and val.arg == "rk_logsigmoid_correction" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOGSIGMOID_CORRECTION)
+  if val.op is Ops.CUSTOM and val.arg == "rk_logsigmoid_tail" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOGSIGMOID_TAIL)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -1695,6 +1757,65 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, inner, (lut_result, 0), (polynomial, 0), Ops.ADD),
                 _emit_where_stage(total, alloc(), (base_selected, 0), (inner, 0), Ops.ADD),
                 _emit_where_stage(total, info.outs[0], (base_selected, 0), (inner, 0), Ops.ADD)))
+  return tuple(tasks)
+
+def _try_logsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate LogSigmoid as min(x,0) plus broad and amplified-tail correction LUTs."""
+  store = _store_node(sink)
+  source = None if store is None else _try_logsigmoid(store.src[1])
+  if getenv("RK_TRACE_MATCH") and store is not None:
+    val = _unwrap(store.src[1])
+    print("rk logsigmoid match", source is not None, val.op, {op:sum(u.op is op for u in val.toposort())
+      for op in (Ops.EXP2, Ops.LOG2, Ops.MAX, Ops.CAST)},
+      [(x.op, x.arg, [(y.op, y.arg) for y in x.src]) for x in val.src],
+      [(u.dtype, u.src[0].buf_uop.arg.slot) for u in val.toposort() if u.op is Ops.INDEX],
+      set(u.op for u in val.toposort()))
+  if store is None or source is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def temp_index(slot:int) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
+  correction = alloc()
+  lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_correction")
+  lut_store = store.replace(src=(temp_index(correction), lut_val))
+  lut_plan = plan_rk(sink.substitute({store:lut_store}))
+  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(lut_plan)
+  tasks = [RKSubTask(cmds, task, relocs)]
+
+  tail = alloc()
+  tail_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_tail")
+  tail_store = store.replace(src=(temp_index(tail), tail_val))
+  tail_plan = plan_rk(sink.substitute({store:tail_store}))
+  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(tail_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  positive, minimum, tail_diff, tail_mask, broad_mask = (alloc() for _ in range(5))
+  broad_selected, tail_scaled, tail_selected, selected_correction = (alloc() for _ in range(4))
+  raw_output, negated_output, clamped_output = alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, positive, source_arg, zero, Ops.MAX),
+                _emit_where_stage(total, minimum, source_arg, (positive, 0), Ops.SUB),
+                _emit_where_stage(total, tail_diff, source_arg, scalar(3.5), Ops.SUB),
+                _emit_where_stage(total, tail_mask, (tail_diff, 0), (tail_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, broad_mask, one, (tail_mask, 0), Ops.SUB),
+                _emit_where_stage(total, broad_selected, (correction, 0), (broad_mask, 0), Ops.MUL),
+                _emit_where_stage(total, tail_scaled, (tail, 0), scalar(1/32), Ops.MUL),
+                _emit_where_stage(total, tail_selected, (tail_scaled, 0), (tail_mask, 0), Ops.MUL),
+                _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
+                _emit_where_stage(total, raw_output, (minimum, 0), (selected_correction, 0), Ops.ADD),
+                _emit_where_stage(total, negated_output, (raw_output, 0), scalar(-1.0), Ops.MUL),
+                _emit_where_stage(total, clamped_output, (negated_output, 0), zero, Ops.MAX),
+                _emit_where_stage(total, info.outs[0], (clamped_output, 0), scalar(-1.0), Ops.MUL)))
   return tuple(tasks)
 
 def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -3026,6 +3147,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut(input_scale)
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_LOGSIGMOID_CORRECTION:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_correction_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_LOGSIGMOID_TAIL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_tail_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.LOG2:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
     lut_le_start = 0xffffc000  # -16384
@@ -3132,7 +3261,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 23107)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
   elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL,
-                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL):
+                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
+                  _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL):
     # These LUTs use flat endpoint values; their staged epilogues handle the
     # behavior outside the table domain.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
@@ -3836,6 +3966,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
   if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)
   if (quick_gelu_tasks := _try_quick_gelu_two_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
+  if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:

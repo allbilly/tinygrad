@@ -482,7 +482,7 @@ Run with `DEBUG=1` and compiler caching disabled:
 
 ```bash
 . .venv/bin/activate
-DISKCACHE=0 DEBUG=1 DEV=ROCKCHIP DEFAULT_FLOAT=HALF \
+CACHELEVEL=0 CCACHE=0 DEBUG=1 DEV=ROCKCHIP DEFAULT_FLOAT=HALF \
   python -m pytest -q -s -x -p test.rockchip.conftest_rockchip \
   test/rockchip/test_hw.py::<focused-test>
 ```
@@ -528,7 +528,7 @@ Run the focused test after CMAC and before an ordinary DPU op, then run all of:
 
 ```bash
 . .venv/bin/activate
-DISKCACHE=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+CACHELEVEL=0 CCACHE=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
   python -m pytest -q -x -p test.rockchip.conftest_rockchip \
   test/rockchip/test_hw.py
 ```
@@ -883,6 +883,72 @@ The next relative term is proportional to `d²/3`, below `1.4e-4` at the
 interval boundary. All three official log methods pass with the same 97-task
 graph.
 
+## Case study: LogSigmoid as a bounded correction
+
+Tinygrad lowers LogSigmoid through the stable logaddexp expression, which
+contains two EXP2 operations, one LOG2, MAX, casts, and final arithmetic.
+Letting the generic elementwise materializer split that graph produced 169 NPU
+tasks and timed out. Preserve the stable math while changing its decomposition:
+
+```text
+logsigmoid(x) = min(x,0) + correction(x)
+correction(x) = -log1p(exp(-abs(x)))
+```
+
+`min(x,0)` carries the unbounded negative range. The correction is symmetric
+and bounded to `[-ln(2),0]`, so it fits a signed Q15 LUT without clipping.
+
+### Broad and tail tables
+
+The broad table uses:
+
+```text
+domain       = [-8,8]
+index_scale  = 2048
+stored value = correction(x)
+output       = Q15
+```
+
+This passes the official `[-2,2]` method. On a 2049-point `[-8,8]` grid, the
+ordinary Q15 quantum becomes too large relative to the very small positive
+tail: 356 values above approximately `3.63` miss by one step.
+
+The second NPU task uses the same coordinate grid but stores:
+
+```text
+stored value = 32 * correction(x)
+selection    = x > 3.5
+restore      = stored_value * (1/32)
+```
+
+At the selection boundary, `32*abs(correction(3.5))` remains below one and fits
+signed Q15. The effective restored quantum is `1/(32768*32)`, approximately
+`9.54e-7`. All dense points then satisfy `rtol=1e-3, atol=1e-6`.
+
+The two branches are selected arithmetically and added to `min(x,0)`. A final
+`-MAX(-result,0)` enforces the nonpositive codomain, mapping positive infinity
+to negative zero without disturbing negative infinity or NaN. The completed
+program has 15 tasks, including exactly two `dpu_lut` tasks.
+
+### Recognizer and cache debugging
+
+Always check the graph at the renderer hook. Optimization reassociates the raw
+root multiply by `-1` into:
+
+```text
+(-ln(2))*LOG2(sum_of_exponentials) + (-1)*MAX(...)
+```
+
+`RK_TRACE_MATCH=1` reports whether the optimized form matched, its key op
+counts, input dtypes/slots, and op set. When changing native emission for an
+unchanged AST, use both:
+
+```text
+CACHELEVEL=0 CCACHE=0
+```
+
+`CACHELEVEL=0` alone does not disable compiled-image caching.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of
@@ -992,7 +1058,7 @@ value handling.
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.
-- `DISKCACHE=0` was used while measuring emitter changes.
+- `CACHELEVEL=0 CCACHE=0` was used while measuring emitter changes.
 - Table zero, endpoints, signed zero, NaN, and infinities were considered.
 - Input and output scales are representable by the actual registers.
 - Focused official TestOps methods pass unchanged.

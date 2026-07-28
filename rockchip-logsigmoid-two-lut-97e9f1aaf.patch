@@ -1,0 +1,161 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 1f8a57c39..3e320714a 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -182,0 +183,8 @@ class TestDPU(unittest.TestCase):
++
++  def test_dpu_logsigmoid_two_lut(self):
++    a_np = np.concatenate((np.linspace(-8, 8, 2049, dtype=np.float16),
++                           np.array([-np.inf, np.inf, np.nan], dtype=np.float16)))
++    with np.errstate(over="ignore", invalid="ignore"):
++      expected = (-np.logaddexp(0, -a_np.astype(np.float32))).astype(np.float16)
++    actual = Tensor(a_np, device="ROCKCHIP").logsigmoid().realize().numpy()
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 98ecf9cca..8832ead55 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9 +9 @@ from tinygrad.dtype import dtypes, DType
+-from tinygrad.helpers import ceildiv, round_up, prod
++from tinygrad.helpers import ceildiv, round_up, prod, getenv
+@@ -326,0 +327,34 @@ def _try_quick_gelu(val:UOp) -> UOp|None:
++def _try_logsigmoid(val:UOp) -> UOp|None:
++  """Recognize -logaddexp(0, -x), tinygrad's stable LogSigmoid lowering."""
++  val = _unwrap(val)
++  indexes = list(dict.fromkeys(_unwrap(u) for u in val.toposort() if u.op is Ops.INDEX))
++  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
++  ch, cf = lambda x: UOp.const(dtypes.half, x), lambda x: UOp.const(dtypes.float, x)
++  neg = UOp(Ops.MUL, dtypes.half, (source, ch(-1.0)))
++  positive = UOp(Ops.MAX, dtypes.half, (neg, ch(0.0)))
++  neg_positive = UOp(Ops.MUL, dtypes.half, (positive, ch(-1.0)))
++  lhs = UOp(Ops.CAST, dtypes.float, (UOp(Ops.ADD, dtypes.half, (neg, neg_positive)),), arg=dtypes.float)
++  rhs = UOp(Ops.CAST, dtypes.float, (neg_positive,), arg=dtypes.float)
++  exp_lhs = UOp(Ops.CAST, dtypes.half, (UOp(Ops.EXP2, dtypes.float,
++    (UOp(Ops.MUL, dtypes.float, (lhs, cf(math.log2(math.e)))),)),), arg=dtypes.half)
++  exp_rhs = UOp(Ops.CAST, dtypes.half, (UOp(Ops.EXP2, dtypes.float,
++    (UOp(Ops.MUL, dtypes.float, (rhs, cf(math.log2(math.e)))),)),), arg=dtypes.half)
++  logarithm = UOp(Ops.MUL, dtypes.half, (
++    UOp(Ops.LOG2, dtypes.half, (UOp(Ops.ADD, dtypes.half, (exp_lhs, exp_rhs)),)), ch(math.log(2.0))))
++  expected = UOp(Ops.MUL, dtypes.half, (UOp(Ops.ADD, dtypes.half, (logarithm, positive)), ch(-1.0)))
++  if val is expected: return source
++  # Kernel optimization can reassociate the stable logaddexp graph before the
++  # renderer hook. Retain a narrow semantic fallback for that equivalent form.
++  nodes = val.toposort()
++  allowed = {Ops.ADD, Ops.MUL, Ops.MAX, Ops.CAST, Ops.EXP2, Ops.LOG2, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  root_negated = val.op is Ops.MUL and any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in val.src)
++  if val.op is Ops.ADD and all(_unwrap(x).op is Ops.MUL for x in val.src):
++    terms = [_unwrap(x) for x in val.src]
++    term_ops = {next((_unwrap(y).op for y in term.src if y.op is not Ops.CONST), None) for term in terms}
++    term_scales = sorted(float(y.arg) for term in terms for y in term.src if y.op is Ops.CONST)
++    root_negated = term_ops == {Ops.LOG2, Ops.MAX} and len(term_scales) == 2 and \
++      math.isclose(term_scales[0], -1.0) and math.isclose(term_scales[1], -math.log(2.0))
++  return source if root_negated and all(u.op in allowed for u in nodes) and \
++    sum(u.op is Ops.EXP2 for u in nodes) == 2 and sum(u.op is Ops.LOG2 for u in nodes) == 1 and \
++    sum(u.op is Ops.MAX for u in nodes) == 1 else None
++
+@@ -361,0 +396,2 @@ _LUT_LOG2_LOCAL = Ops.OR
++_LUT_LOGSIGMOID_CORRECTION = Ops.AND
++_LUT_LOGSIGMOID_TAIL = Ops.THREEFRY
+@@ -565,0 +602,22 @@ def _build_log2_local_lut(function_scale:float=1.0) -> tuple[list[int], int, flo
++def _build_logsigmoid_correction_lut() -> tuple[list[int], int, float, float, int]:
++  """Q15 -log1p(exp(-abs(x))) over [-8,8]; LogSigmoid adds min(x,0)."""
++  index_scale, output_scale = 2048.0, 32768.0
++  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      x = (-(512-i) if table == 0 else i)*step
++      raw = int(round(-math.log1p(math.exp(-abs(x)))*output_scale))
++      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else -1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
++def _build_logsigmoid_tail_lut() -> tuple[list[int], int, float, float, int]:
++  """Q15 32*-log1p(exp(-abs(x))) over [-8,8], selected on the positive tail."""
++  index_scale, output_scale = 2048.0, 32768.0
++  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      x = (-(512-i) if table == 0 else i)*step
++      raw = int(round(-32.0*math.log1p(math.exp(-abs(x)))*output_scale))
++      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else -1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
+@@ -719,0 +778,4 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
++  if val.op is Ops.CUSTOM and val.arg == "rk_logsigmoid_correction" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOGSIGMOID_CORRECTION)
++  if val.op is Ops.CUSTOM and val.arg == "rk_logsigmoid_tail" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOGSIGMOID_TAIL)
+@@ -1699,0 +1762,59 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_logsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate LogSigmoid as min(x,0) plus broad and amplified-tail correction LUTs."""
++  store = _store_node(sink)
++  source = None if store is None else _try_logsigmoid(store.src[1])
++  if getenv("RK_TRACE_MATCH") and store is not None:
++    val = _unwrap(store.src[1])
++    print("rk logsigmoid match", source is not None, val.op, {op:sum(u.op is op for u in val.toposort())
++      for op in (Ops.EXP2, Ops.LOG2, Ops.MAX, Ops.CAST)},
++      [(x.op, x.arg, [(y.op, y.arg) for y in x.src]) for x in val.src],
++      [(u.dtype, u.src[0].buf_uop.arg.slot) for u in val.toposort() if u.op is Ops.INDEX],
++      set(u.op for u in val.toposort()))
++  if store is None or source is None: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1) + 1
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++  def temp_index(slot:int) -> UOp:
++    out_idx = store.src[0]
++    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++
++  correction = alloc()
++  lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_correction")
++  lut_store = store.replace(src=(temp_index(correction), lut_val))
++  lut_plan = plan_rk(sink.substitute({store:lut_store}))
++  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(lut_plan)
++  tasks = [RKSubTask(cmds, task, relocs)]
++
++  tail = alloc()
++  tail_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_tail")
++  tail_store = store.replace(src=(temp_index(tail), tail_val))
++  tail_plan = plan_rk(sink.substitute({store:tail_store}))
++  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(tail_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++
++  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
++  positive, minimum, tail_diff, tail_mask, broad_mask = (alloc() for _ in range(5))
++  broad_selected, tail_scaled, tail_selected, selected_correction = (alloc() for _ in range(4))
++  raw_output, negated_output, clamped_output = alloc(), alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, positive, source_arg, zero, Ops.MAX),
++                _emit_where_stage(total, minimum, source_arg, (positive, 0), Ops.SUB),
++                _emit_where_stage(total, tail_diff, source_arg, scalar(3.5), Ops.SUB),
++                _emit_where_stage(total, tail_mask, (tail_diff, 0), (tail_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, broad_mask, one, (tail_mask, 0), Ops.SUB),
++                _emit_where_stage(total, broad_selected, (correction, 0), (broad_mask, 0), Ops.MUL),
++                _emit_where_stage(total, tail_scaled, (tail, 0), scalar(1/32), Ops.MUL),
++                _emit_where_stage(total, tail_selected, (tail_scaled, 0), (tail_mask, 0), Ops.MUL),
++                _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
++                _emit_where_stage(total, raw_output, (minimum, 0), (selected_correction, 0), Ops.ADD),
++                _emit_where_stage(total, negated_output, (raw_output, 0), scalar(-1.0), Ops.MUL),
++                _emit_where_stage(total, clamped_output, (negated_output, 0), zero, Ops.MAX),
++                _emit_where_stage(total, info.outs[0], (clamped_output, 0), scalar(-1.0), Ops.MUL)))
++  return tuple(tasks)
++
+@@ -3028,0 +3150,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
++  elif lut_op is _LUT_LOGSIGMOID_CORRECTION:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_correction_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_LOGSIGMOID_TAIL:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_tail_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+@@ -3135 +3264,2 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+-                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL):
++                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
++                  _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL):
+@@ -3838,0 +3969 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)

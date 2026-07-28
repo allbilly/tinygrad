@@ -14,6 +14,9 @@ including its float32 infinity/NaN subcase. The summary table below remains the
 last complete census rather than mixing an incremental result into it.
 `TestOps.test_log` and `TestOps.test_log10` also pass after folding their
 base-change scales into the normalized two-LUT path.
+`TestOps.test_logsigmoid` now passes through a dedicated 15-task/two-LUT path;
+the complete hardware file is at 63 passed with only the two baseline fill
+failures.
 
 ## Summary
 
@@ -120,6 +123,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - tanh, including ordinary interior precision and extreme/special values
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
+- LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
 - abs, sign, round, inf_div (fp32 inputs)
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)
