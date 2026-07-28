@@ -1,5 +1,27 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — exact hardsigmoid saturation milestone
+
+### Implementation
+- The default hardsigmoid graph is recognized as
+  `relu(alpha*x+beta) - relu(alpha*x+beta-1)`.
+- Subtracting those independently rounded branches returned `0.96875` for a
+  narrow fp16 input band around 381–384 instead of the saturated value `1`.
+- A dedicated NPU lowering now evaluates the affine term once and clamps it via
+  `max(0)`, negate, `max(-1)`, negate. Saturated lanes are exactly zero or one,
+  while the interior retains the expected fp16 affine rounding.
+
+### Verification
+- `TestOps.test_hardsigmoid` and `TestOps.test_hardsigmoid_extreme` — **PASS**
+  with `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Focused hardware coverage includes both clamp boundaries, ±400, and the
+  previously failing fp16 values 381.25, 382, and 383.5.
+- ReLU6 and hardtanh regressions — **PASS**. Hardswish retains its prior small
+  interior rounding mismatch and remains a separate milestone.
+- All **57** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- Incremental census: **139 PASS, 277 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — signed infinity division milestone
 
 ### Implementation

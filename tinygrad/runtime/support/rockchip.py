@@ -219,6 +219,44 @@ def _try_sign(val:UOp) -> int|None:
   if source.op is not Ops.INDEX: return None
   return _try_abs(UOp(Ops.MUL, val.dtype, (source, val)))
 
+def _try_hardsigmoid(val:UOp) -> tuple[int,float,float]|None:
+  """Recognize relu(alpha*x+beta)-relu(alpha*x+beta-1)."""
+  val = _unwrap(val)
+  if val.op is not Ops.ADD: return None
+
+  def relu_inner(u:UOp) -> UOp|None:
+    u = _unwrap(u)
+    if u.op is not Ops.WHERE or _unwrap(u.src[0]).op is not Ops.CMPLT: return None
+    lhs, rhs = (_unwrap(x) for x in _unwrap(u.src[0]).src)
+    true, false = (_unwrap(x) for x in u.src[1:])
+    if lhs.op is Ops.CONST and float(lhs.arg) == 0.0 and rhs is true and \
+       false.op is Ops.CONST and float(false.arg) == 0.0: return true
+    return None
+
+  def negative_relu(u:UOp) -> UOp|None:
+    u = _unwrap(u)
+    if u.op is not Ops.MUL: return None
+    for candidate, constant in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
+      if constant.op is Ops.CONST and float(constant.arg) == -1.0: return relu_inner(candidate)
+    return None
+
+  for positive_term, negative_term in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
+    positive, negative = relu_inner(positive_term), negative_relu(negative_term)
+    if positive is None or negative is None or positive.op is not Ops.ADD or negative.op is not Ops.ADD: continue
+    positive_shared, positive_const = positive.src
+    negative_shared, negative_const = negative.src
+    if positive_const.op is not Ops.CONST: positive_shared, positive_const = positive_const, positive_shared
+    if negative_const.op is not Ops.CONST: negative_shared, negative_const = negative_const, negative_shared
+    if positive_const.op is not Ops.CONST or negative_const.op is not Ops.CONST or positive_shared is not negative_shared: continue
+    if not math.isclose(float(negative_const.arg), float(positive_const.arg)-1.0): continue
+    shared = _unwrap(positive_shared)
+    if shared.op is not Ops.MUL: continue
+    for source, alpha in ((shared.src[0], shared.src[1]), (shared.src[1], shared.src[0])):
+      source = _unwrap(source)
+      if source.op is Ops.INDEX and alpha.op is Ops.CONST:
+        return source.src[0].buf_uop.arg.slot, float(alpha.arg), float(positive_const.arg)
+  return None
+
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
@@ -934,6 +972,29 @@ def _try_inf_div_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, product_scratch, (base, 0), (sign, 0), Ops.MUL),
                 _emit_where_stage(total, info.outs[0], (base, 0), (sign, 0), Ops.MUL)))
   return tuple(tasks)
+
+def _try_hardsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Clamp hardsigmoid through neg/MAX/neg so saturated lanes are exactly 0/1."""
+  store = _store_node(sink)
+  if store is None or (match := _try_hardsigmoid(store.src[1])) is None: return None
+  input_slot, alpha, beta = match
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
+  scaled, shifted, positive, negative, clamped = (alloc() for _ in range(5))
+  source, zero, negative_one = (input_slot, 0), (_ZERO_SLOT, 0), scalar(-1.0)
+  return (_emit_where_stage(total, scaled, source, scalar(alpha), Ops.MUL),
+          _emit_where_stage(total, shifted, (scaled, 0), scalar(beta), Ops.ADD),
+          _emit_where_stage(total, positive, (shifted, 0), zero, Ops.MAX),
+          _emit_where_stage(total, negative, (positive, 0), negative_one, Ops.MUL),
+          _emit_where_stage(total, clamped, (negative, 0), negative_one, Ops.MAX),
+          _emit_where_stage(total, info.outs[0], (clamped, 0), negative_one, Ops.MUL))
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
@@ -2453,6 +2514,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+  if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

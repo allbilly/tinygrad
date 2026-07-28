@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 138 PASS, 278 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 139 PASS, 277 FAIL, 8 SKIP (424 unique tests).**
 
 This is the previous complete hardware census plus independently rerun LUT
 milestones. SQRT, RSQRT, EXP, and special-value division moved to PASS.
@@ -26,11 +26,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 138 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+| PASS | 139 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 72 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 33 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
-| FAIL: numeric mismatch | 25 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: numeric mismatch | 24 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 12 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
@@ -38,7 +38,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 138 passing methods are:
+The 139 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`, `test_all_zero_axis`, `test_any_zero_axis`,
 `test_arange_4096`, `test_arange_big`,
@@ -51,7 +51,7 @@ The 138 passing methods are:
 `test_expand`, `test_exp`, `test_exp2`, `test_exp2_log2_zero_times_negative`, `test_eye`, `test_flatten`, `test_flip`, `test_flip_eye_crash`, `test_floor`,
 `test_full`, `test_full_like`,
 `test_gemm`, `test_gemm_fp16`, `test_gemm_with_zeros_shape`,
-`test_hardsigmoid`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
+`test_hardsigmoid`, `test_hardsigmoid_extreme`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
 `test_inf_where`, `test_isfinite`, `test_isinf`, `test_isnan`, `test_leaky_relu`,
 `test_logical_not`, `test_matmul`, `test_matmul_simple`, `test_matvec`,
 `test_matvecmat`, `test_mean`, `test_mean_zero_axis`, `test_meshgrid`,
@@ -80,9 +80,9 @@ The 138 passing methods are:
 `test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Current regression: all **56 hardware tests pass in isolated sequential
+Current regression: all **57 hardware tests pass in isolated sequential
 subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
-and infinity-division special-value assertions. A single-process run retains
+infinity-division, and hardsigmoid-saturation assertions. A single-process run retains
 the sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
 records the LUT tuning, range reduction, Newton refinement, and special-value
 procedures plus the remaining SiLU one-ULP dense-grid diagnostic.

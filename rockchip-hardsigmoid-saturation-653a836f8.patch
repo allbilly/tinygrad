@@ -1,0 +1,107 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index e875fd97d..80560d86b 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -206,0 +207,8 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_hardsigmoid_saturation(self):
++    a_np = np.array([-400, -3, -2, 0, 2, 3, 381.25, 382, 383.5, 400], dtype=np.float16)
++    a = Tensor(a_np, device="ROCKCHIP").realize()
++    expected = np.clip(a_np.astype(np.float32) / 6 + 0.5, 0, 1).astype(np.float16)
++    actual = a.hardsigmoid().realize().numpy()
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
++    np.testing.assert_array_equal(actual[[0, 1, 5, 6, 7, 8, 9]], expected[[0, 1, 5, 6, 7, 8, 9]])
++
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 744d50443..e76507f2c 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -11 +11 @@ segfaulted, so those methods were rerun individually.
+-**Current summary: 138 PASS, 278 FAIL, 8 SKIP (424 unique tests).**
++**Current summary: 139 PASS, 277 FAIL, 8 SKIP (424 unique tests).**
+@@ -29 +29 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| PASS | 138 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
++| PASS | 139 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+@@ -33 +33 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| FAIL: numeric mismatch | 25 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
++| FAIL: numeric mismatch | 24 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+@@ -41 +41 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-The 138 passing methods are:
++The 139 passing methods are:
+@@ -54 +54 @@ The 138 passing methods are:
+-`test_hardsigmoid`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
++`test_hardsigmoid`, `test_hardsigmoid_extreme`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
+@@ -83 +83 @@ The 138 passing methods are:
+-Current regression: all **56 hardware tests pass in isolated sequential
++Current regression: all **57 hardware tests pass in isolated sequential
+@@ -85 +85 @@ subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
+-and infinity-division special-value assertions. A single-process run retains
++infinity-division, and hardsigmoid-saturation assertions. A single-process run retains
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b4d0fd11d..7e08000a1 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -221,0 +222,38 @@ def _try_sign(val:UOp) -> int|None:
++def _try_hardsigmoid(val:UOp) -> tuple[int,float,float]|None:
++  """Recognize relu(alpha*x+beta)-relu(alpha*x+beta-1)."""
++  val = _unwrap(val)
++  if val.op is not Ops.ADD: return None
++
++  def relu_inner(u:UOp) -> UOp|None:
++    u = _unwrap(u)
++    if u.op is not Ops.WHERE or _unwrap(u.src[0]).op is not Ops.CMPLT: return None
++    lhs, rhs = (_unwrap(x) for x in _unwrap(u.src[0]).src)
++    true, false = (_unwrap(x) for x in u.src[1:])
++    if lhs.op is Ops.CONST and float(lhs.arg) == 0.0 and rhs is true and \
++       false.op is Ops.CONST and float(false.arg) == 0.0: return true
++    return None
++
++  def negative_relu(u:UOp) -> UOp|None:
++    u = _unwrap(u)
++    if u.op is not Ops.MUL: return None
++    for candidate, constant in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
++      if constant.op is Ops.CONST and float(constant.arg) == -1.0: return relu_inner(candidate)
++    return None
++
++  for positive_term, negative_term in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
++    positive, negative = relu_inner(positive_term), negative_relu(negative_term)
++    if positive is None or negative is None or positive.op is not Ops.ADD or negative.op is not Ops.ADD: continue
++    positive_shared, positive_const = positive.src
++    negative_shared, negative_const = negative.src
++    if positive_const.op is not Ops.CONST: positive_shared, positive_const = positive_const, positive_shared
++    if negative_const.op is not Ops.CONST: negative_shared, negative_const = negative_const, negative_shared
++    if positive_const.op is not Ops.CONST or negative_const.op is not Ops.CONST or positive_shared is not negative_shared: continue
++    if not math.isclose(float(negative_const.arg), float(positive_const.arg)-1.0): continue
++    shared = _unwrap(positive_shared)
++    if shared.op is not Ops.MUL: continue
++    for source, alpha in ((shared.src[0], shared.src[1]), (shared.src[1], shared.src[0])):
++      source = _unwrap(source)
++      if source.op is Ops.INDEX and alpha.op is Ops.CONST:
++        return source.src[0].buf_uop.arg.slot, float(alpha.arg), float(positive_const.arg)
++  return None
++
+@@ -937,0 +976,23 @@ def _try_inf_div_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_hardsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Clamp hardsigmoid through neg/MAX/neg so saturated lanes are exactly 0/1."""
++  store = _store_node(sink)
++  if store is None or (match := _try_hardsigmoid(store.src[1])) is None: return None
++  input_slot, alpha, beta = match
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1) + 1
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++
++  scaled, shifted, positive, negative, clamped = (alloc() for _ in range(5))
++  source, zero, negative_one = (input_slot, 0), (_ZERO_SLOT, 0), scalar(-1.0)
++  return (_emit_where_stage(total, scaled, source, scalar(alpha), Ops.MUL),
++          _emit_where_stage(total, shifted, (scaled, 0), scalar(beta), Ops.ADD),
++          _emit_where_stage(total, positive, (shifted, 0), zero, Ops.MAX),
++          _emit_where_stage(total, negative, (positive, 0), negative_one, Ops.MUL),
++          _emit_where_stage(total, clamped, (negative, 0), negative_one, Ops.MAX),
++          _emit_where_stage(total, info.outs[0], (clamped, 0), negative_one, Ops.MUL))
++
+@@ -2455,0 +2517 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)

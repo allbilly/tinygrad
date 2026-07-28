@@ -204,6 +204,14 @@ class TestDPU(unittest.TestCase):
         expected = numerator / a_np
       np.testing.assert_array_equal((numerator / a).realize().numpy(), expected)
 
+  def test_dpu_hardsigmoid_saturation(self):
+    a_np = np.array([-400, -3, -2, 0, 2, 3, 381.25, 382, 383.5, 400], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    expected = np.clip(a_np.astype(np.float32) / 6 + 0.5, 0, 1).astype(np.float16)
+    actual = a.hardsigmoid().realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    np.testing.assert_array_equal(actual[[0, 1, 5, 6, 7, 8, 9]], expected[[0, 1, 5, 6, 7, 8, 9]])
+
   def test_dpu_direct_casts(self):
     half_np = np.array([-2.5,0,1.75,255], dtype=np.float16)
     half = Tensor(half_np, device="ROCKCHIP").realize()
