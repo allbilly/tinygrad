@@ -1,5 +1,38 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — `rknnops.h` algorithm inventory
+
+Reviewed every dispatch ID in `ref/npu/include/rknnops.h`. IDs 5–8 and 21 are
+unused; all other IDs from 0 through 55 have an implementation:
+
+| IDs | Reference algorithms | Backend value |
+|---|---|---|
+| 0–4, 9 | min/max, add, div, sub, mul | Core DPU arithmetic is already implemented; native MIN remains useful for simplifying minimum graphs |
+| 10–11 | ReLU, matmul | Already covered by DPU MAX and CMAC |
+| 12–13 | conv1d, conv2d | Useful register/packing reference for the many remaining convolution layouts and epilogues |
+| 14–15 | sigmoid, SiLU | Sigmoid is already native; the dedicated SiLU LUT may replace the current numerically marginal staged form |
+| 16–20 | CMPLT, two-part CMPEQ, neg, CMPLE | Comparison and negation lowering already cover these semantics; the CMPEQ stages remain useful register references |
+| 22–23 | abs, roundoff | Abs is staged; roundoff algorithm 23 was ported for root `round()` |
+| 24–27 | max pool, global max pool, average pool, global average pool | High-value references for current pooling/reduction failures, but 24–26 are hard-coded to one 4×4 geometry and must be parameterized |
+| 28–39 | sin, cos, tan/tanh, asin/acos/atan, asinh/acosh/atanh, sinh/cosh | Direct LUT templates can replace unsupported nested transcendental graphs and reduce staged rounding error |
+| 40–55 | CELU, SELU, swish, softsign, logsigmoid, hardsigmoid, softplus, GELU, quick GELU, ELU, ReLU6, hardswish, mish, hardtanh, exp, exp2 | Broadest source of near-term TestOps wins; most share one biased Q0.15 LUT emitter |
+
+### Conclusions
+- Prioritize a reusable direct-activation recognizer plus the biased Q0.15 LUT
+  emitter used by algorithms 40–55. It can address both unsupported graphs and
+  known fp16 stage-rounding failures (`silu`/`swish`, `hardswish`, `celu`,
+  `gelu`, `elu`, `softplus`, and related tests).
+- Treat the generic activation tables as bounded-domain templates, not blind
+  drop-ins: their common scale covers roughly `[-3.14, 3.14]`, so extreme-value
+  behavior and saturation need explicit hardware tests.
+- Parameterize and validate algorithms 24–27 before using them; the local pool
+  examples have fixed dimensions/strides, while global average uses fixed
+  reciprocal constants.
+- Nested arithmetic around native roundoff is mathematically correct but leaves
+  the RK3588 DPU sequence-dependent and can time out the following kernel. The
+  uncommitted experiment is preserved as
+  `rockchip-nested-roundoff-wip-3de0b1992.patch`; no timing workaround was kept.
+
 ## 2026-07-28 — native round-to-even milestone
 
 ### Implementation

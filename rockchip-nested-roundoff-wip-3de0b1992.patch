@@ -1,0 +1,60 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 4acd2dbab..2cb86f377 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -132,6 +132,7 @@ class TestDPU(unittest.TestCase):
+     for op, expected in ((a.trunc, np.trunc(a_np)), (a.floor, np.floor(a_np)), (a.ceil, np.ceil(a_np)),
+                          (a.round, np.round(a_np))):
+       np.testing.assert_array_equal(op().realize().numpy(), expected)
++    np.testing.assert_array_equal((a + 0.125 * (a.round() - a)).realize().numpy(), a_np + 0.125 * (np.round(a_np) - a_np))
+ 
+   def test_dpu_comparison_outputs(self):
+     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 5787a5f79..7820c3f15 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -7,7 +7,7 @@
+ # Fill, broadcast, mean, non-fp16, non-affine indexing, fused epilogues, and
+ # multi-task are explicitly rejected via RKPLAN_REJECT.
+ # All compute (including copy) executes on the NPU — no host-side tensor arithmetic.
+-import ctypes, mmap, os, struct
++import ctypes, mmap, os, struct, time
+ from tinygrad.dtype import dtypes, DType
+ from tinygrad.helpers import getenv, mv_address, to_mv, Target
+ from tinygrad.device import Compiled, Program, BufferSpec, TinyELF
+@@ -320,4 +320,7 @@ class RockchipProgram(Program['RockchipDevice']):
+       finally:
+         self.subtasks = original
+         for b in shared: dev._gpu_free(b)
++      # Long reset-separated LUT pipelines need a short hardware quiet period;
++      # without it the next otherwise valid DPU submission can time out.
++      if any(st.task.kind == "dpu_lut" for st in subtasks): time.sleep(0.05)
+       return
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 19c01e1b5..1dddd0437 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1091,8 +1091,10 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       slot = alloc()
+       if u.op is Ops.WHERE:
+         stage_sink, idx = make_stage_sink(u, slot)
+-        if (where_tasks := _try_where_subtasks(stage_sink)) is None: return None
+-        tasks.extend(where_tasks)
+-        used_slots = [r.globals_slot for st in where_tasks for r in st.relocs
++        nested_tasks = _try_round_subtasks(stage_sink)
++        if nested_tasks is None: nested_tasks = _try_where_subtasks(stage_sink)
++        if nested_tasks is None: return None
++        tasks.extend(nested_tasks)
++        used_slots = [r.globals_slot for st in nested_tasks for r in st.relocs
+                       if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+         next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+@@ -1322,5 +1324,7 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+   for table_id, base in ((0, 0), (1, _LUT_SIZE)):
+     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_ACCESS_CFG,
+       (1 << 17) | (table_id << 16))  # LUT_ACCESS_TYPE=1, TABLE_ID, ADDR=0
+-    for i in range(_LUT_SIZE):
++    # The proven algorithm-23 sequence writes exactly 256 alternating pairs.
++    table_entries = 512 if lut_op is _LUT_ROUNDOFF else _LUT_SIZE
++    for i in range(table_entries):
+       v = int(lut[base + i])
