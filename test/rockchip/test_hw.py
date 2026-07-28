@@ -228,6 +228,18 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").erf().realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_gelu_two_lut(self):
+    a_np = np.concatenate((np.linspace(-2, 2, 2049, dtype=np.float16),
+                           np.array([-400, 400, np.inf, np.nan, -0.0, 0.0], dtype=np.float16)))
+    for approximate in ("tanh", "none"):
+      x = a_np.astype(np.float32)
+      if approximate == "tanh":
+        expected = (0.5*x*(1+np.tanh(np.sqrt(2/np.pi)*(x+0.044715*x**3)))).astype(np.float16)
+      else:
+        expected = np.array([0.5*v*(1+math.erf(v/math.sqrt(2))) for v in x], dtype=np.float16)
+      actual = Tensor(a_np, device="ROCKCHIP").gelu(approximate=approximate).realize().numpy()
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_sqrt_special_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -2, -0.0, 0, 0.25, 4], dtype=np.float16)
     actual = Tensor(a_np, device="ROCKCHIP").sqrt().realize().numpy()

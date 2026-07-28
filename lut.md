@@ -1191,6 +1191,39 @@ The final graph is exactly 64 tasks with two LUT tasks. All 4097 fp16 points on
 positive zero, which satisfies the current numerical contract but remains a
 bit-level sign detail if an exact-sign test is added later.
 
+## Case study: exact and tanh GELU with one table design
+
+Exact and tanh GELU have different composite graphs but the same useful shape:
+a small bounded negative lobe, approximately linear positive tail, and the same
+first two near-zero terms. Encode both with variant-specific table values and
+shared staging:
+
+```text
+broad negative = Q15 GELU(x)
+broad positive = Q15 GELU(x)/4
+local          = Q15 2*GELU(x), addressed by z=8*x
+center         = 0.5*x + x²/sqrt(2*pi)
+tails          = max(x,0)
+```
+
+The broad table covers `[-4,4]`. Its positive half is multiplied by four after
+lookup; the negative half remains direct Q15. The local table covers
+`[-0.5,0.5]` and is restored by one half. Use the polynomial only inside
+`[-0.04,0.04]`.
+
+Recognizer ordering matters. Exact GELU contains the same five-term Erf
+approximation as standalone Erf, but with a scaled input. An op-count-only Erf
+fingerprint matched exact GELU and returned `erf(x)` as the entire activation.
+Require standalone Erf's `0.3275911` coefficient; exact GELU uses
+`0.3275911/sqrt(2)≈0.231641888`.
+
+The accepted graph has 53 tasks and two LUT tasks. Official ordinary and
+extreme methods pass for both variants. A wider `[-4,4]` diagnostic retains
+roughly 600 relative-tolerance misses per variant in the very small negative
+tail. A future three-region negative table can store a larger gain below about
+`-2.5`; the current broad/local split prioritizes the official `[-2,2]`
+contract and exact finite extreme asymptotes.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of

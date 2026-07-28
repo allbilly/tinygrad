@@ -1,5 +1,45 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — shared exact/tanh GELU milestone
+
+- `_try_gelu` recognizes both optimized roots:
+
+  ```text
+  tanh GELU  -> one FDIV, one EXP2, 0.044715 cubic coefficient
+  exact GELU -> embedded scaled-Erf polynomial, five FDIVs, two WHEREs
+  ```
+
+- The first exact run returned Erf itself for 2923/2925 lanes. Exact GELU's
+  embedded polynomial had collided with the standalone `_try_erf` fingerprint.
+  Standalone Erf now additionally requires its unique `0.3275911` coefficient;
+  exact GELU contains the scaled `0.231641888...` coefficient instead.
+- Both variants use the same two-level decomposition:
+
+  ```text
+  broad negative = Q15 GELU(x)
+  broad positive = Q15 GELU(x)/4              # x in [-4,4]
+  local          = Q15 2*GELU(x), z=8*x       # x in [-0.5,0.5]
+  center         = 0.5*x + x²/sqrt(2*pi)      # |x|<=0.04
+  outside        = max(x,0)                    # |x|>4
+  ```
+
+- Inputs are symmetrically bounded before both LUTs and the polynomial, so the
+  official ±300–400 extremes do not contaminate unselected branches.
+- Final raw schedule: **53 NPU tasks**, exactly **two LUT tasks**, for either
+  approximation.
+- `TestOps.test_gelu` and `TestOps.test_gelu_extreme`: **PASS**, covering both
+  approximation modes and all four extreme subcases.
+- Hardware regression: dense `[-2,2]`, ±400, positive infinity, NaN, and zero
+  pass for both modes.
+- A wider 4097-point `[-4,4]` diagnostic retains 620 tanh and 610 exact
+  strict-relative misses in the tiny negative tail. Maximum absolute error is
+  `0.001953125`; segmented negative-table gain is the future tuning direction.
+  Exact GELU at negative infinity also follows the zero asymptote rather than
+  PyTorch's composite NaN.
+- Complete serial hardware file: **68 passed, 2 failed** in 207.94 seconds;
+  only fill-zero/fill-full remain. Compileall and `git diff --check` pass;
+  mypy retains the same 13 pre-existing findings.
+
 ## 2026-07-29 — saturated two-LUT Erf milestone
 
 - `_try_erf` recognizes tinygrad's Abramowitz-Stegun lowering after the
