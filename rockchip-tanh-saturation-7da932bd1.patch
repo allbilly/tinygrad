@@ -1,0 +1,163 @@
+diff --git a/lut.md b/lut.md
+index c72259c5a..c0b46c01a 100644
+--- a/lut.md
++++ b/lut.md
+@@ -235,0 +236,9 @@ because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
++Composite tanh has the same issue even though it does not appear as a primitive
++LUT op: `2*sigmoid(2*x)-1` inherits the bounded nested sigmoid result and used
++to flatten at approximately `±0.969`. The Rockchip recognizer preserves the
++existing staged interior, reconstructs sign and an `abs(x)>4` mask on the NPU,
++and selects exact `±1` only in the tails. Since `|1-tanh(4)|<1e-3`, this
++saturation boundary meets the forward tolerance without changing the separate
++interior-precision problem. A final `isnan` denominator restores NaN after the
++arithmetic selection stages.
++
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index c9be57d23..fb539faee 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -223,0 +224,5 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_tanh_extreme_saturation(self):
++    a_np = np.array([-np.inf, -300, -5, 5, 300, np.inf, np.nan], dtype=np.float16)
++    actual = Tensor(a_np, device="ROCKCHIP").tanh().realize().numpy()
++    np.testing.assert_allclose(actual, np.tanh(a_np), rtol=1e-3, atol=1e-6)
++
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 78c2faee0..7bc9a787a 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -11 +11 @@ segfaulted, so those methods were rerun individually.
+-**Current summary: 140 PASS, 276 FAIL, 8 SKIP (424 unique tests).**
++**Current summary: 141 PASS, 275 FAIL, 8 SKIP (424 unique tests).**
+@@ -14 +14 @@ This is the previous complete hardware census plus independently rerun LUT
+-milestones. SQRT, RSQRT, EXP, special-value division, and HardSwish moved to PASS.
++milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, and extreme tanh moved to PASS.
+@@ -29 +29 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| PASS | 140 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
++| PASS | 141 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+@@ -33 +33 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| FAIL: numeric mismatch | 23 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
++| FAIL: numeric mismatch | 22 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+@@ -41 +41 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-The 140 passing methods are:
++The 141 passing methods are:
+@@ -78 +78 @@ The 140 passing methods are:
+-`test_topo_sort`, `test_transpose`, `test_trunc`, `test_unflatten`, `test_unfold`,
++`test_tanh_extreme`, `test_topo_sort`, `test_transpose`, `test_trunc`, `test_unflatten`, `test_unfold`,
+@@ -83 +83 @@ The 140 passing methods are:
+-Current regression: all **58 hardware tests pass in isolated sequential
++Current regression: all **59 hardware tests pass in isolated sequential
+@@ -85 +85 @@ subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
+-infinity-division, hardsigmoid saturation, and two-LUT hardswish assertions. A single-process run retains
++infinity-division, hardsigmoid saturation, two-LUT hardswish, and extreme-tanh assertions. A single-process run retains
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 54f2654fa..b44b1422c 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -273,0 +274,28 @@ def _try_hardswish(val:UOp) -> UOp|None:
++def _try_tanh(val:UOp) -> UOp|None:
++  """Recognize 2*sigmoid(2*x)-1 before or after the reciprocal-to-FDIV rewrite."""
++  val = _unwrap(val)
++  if val.op is not Ops.ADD: return None
++  term, offset = val.src
++  if offset.op is not Ops.CONST: term, offset = offset, term
++  if offset.op is not Ops.CONST or float(offset.arg) != -1.0: return None
++  term = _unwrap(term)
++  if term.op is Ops.MUL:
++    scale, reciprocal = term.src
++    if scale.op is not Ops.CONST: scale, reciprocal = reciprocal, scale
++    reciprocal = _unwrap(reciprocal)
++    if scale.op is not Ops.CONST or float(scale.arg) != 2.0 or reciprocal.op is not Ops.RECIPROCAL: return None
++    denominator = _unwrap(reciprocal.src[0])
++  elif term.op is Ops.FDIV and term.src[0].op is Ops.CONST and float(term.src[0].arg) == 2.0:
++    denominator = _unwrap(term.src[1])
++  else: return None
++  if denominator.op is not Ops.ADD: return None
++  one, exponential = denominator.src
++  if one.op is not Ops.CONST: one, exponential = exponential, one
++  exponential = _unwrap(exponential)
++  if one.op is not Ops.CONST or float(one.arg) != 1.0 or exponential.op is not Ops.EXP2: return None
++  scaled = _unwrap(exponential.src[0])
++  if scaled.op is not Ops.MUL: return None
++  source = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.INDEX), None)
++  factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
++  return source if source is not None and factor is not None and abs(factor + 2*math.log2(math.e)) < 1e-3 else None
++
+@@ -934 +962 @@ def _try_round_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  def temp_index(slot:int) -> UOp:
++  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+@@ -936 +964 @@ def _try_round_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+@@ -1058 +1086 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  def temp_index(slot:int) -> UOp:
++  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+@@ -1060 +1088 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+@@ -1139,0 +1168,63 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Keep the staged tanh interior and replace bounded-LUT tails with sign(x)."""
++  store = _store_node(sink)
++  if store is None or (source := _try_tanh(store.src[1])) is None: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
++    out_idx = store.src[0]
++    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++
++  base_slot = alloc()
++  base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
++  base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
++  if base_tasks is None: return None
++  tasks.extend(base_tasks)
++  used_slots = [st.task.out_slot for st in base_tasks] + \
++    [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  next_slot = max(next_slot, max(used_slots, default=-1)+1)
++
++  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
++  low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, low_diff, scalar(-4.0), source_arg, Ops.SUB),
++                _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, high_diff, source_arg, scalar(4.0), Ops.SUB),
++                _emit_where_stage(total, high_mask, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True)))
++  sign_scratch, sign, outside_scratch, outside, inside_scratch, inside = (alloc() for _ in range(6))
++  tasks.extend((_emit_where_stage(total, sign_scratch, (high_mask, 0), (low_mask, 0), Ops.SUB),
++                _emit_where_stage(total, sign, (high_mask, 0), (low_mask, 0), Ops.SUB),
++                _emit_where_stage(total, outside_scratch, (high_mask, 0), (low_mask, 0), Ops.MAX),
++                _emit_where_stage(total, outside, (high_mask, 0), (low_mask, 0), Ops.MAX),
++                _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
++                _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
++  base_selected_scratch, base_selected, sign_selected_scratch, sign_selected, finite = (alloc() for _ in range(5))
++  tasks.extend((_emit_where_stage(total, base_selected_scratch, (base_slot, 0), (inside, 0), Ops.MUL),
++                _emit_where_stage(total, base_selected, (base_slot, 0), (inside, 0), Ops.MUL),
++                _emit_where_stage(total, sign_selected_scratch, (sign, 0), (outside, 0), Ops.MUL),
++                _emit_where_stage(total, sign_selected, (sign, 0), (outside, 0), Ops.MUL),
++                _emit_where_stage(total, alloc(), (base_selected, 0), (sign_selected, 0), Ops.ADD),
++                _emit_where_stage(total, finite, (base_selected, 0), (sign_selected, 0), Ops.ADD)))
++  not_number = alloc()
++  comparison = UOp(Ops.CMPNE, dtypes.bool, (source, source))
++  comparison_store = store.replace(src=(temp_index(not_number, dtypes.bool), comparison))
++  comparison_tasks = _try_comparison_subtasks(sink.substitute({store:comparison_store}))
++  if comparison_tasks is None: return None
++  last = comparison_tasks[-1]
++  comparison_tasks = (*comparison_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
++  tasks.extend(comparison_tasks)
++  nan_denom_scratch, nan_denom, nan_numerator_scratch, nan_numerator = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, nan_denom_scratch, one, (not_number, 0), Ops.SUB),
++                _emit_where_stage(total, nan_denom, one, (not_number, 0), Ops.SUB),
++                _emit_where_stage(total, nan_numerator_scratch, (finite, 0), (nan_denom, 0), Ops.MUL),
++                _emit_where_stage(total, nan_numerator, (finite, 0), (nan_denom, 0), Ops.MUL),
++                _emit_where_stage(total, alloc(), (nan_numerator, 0), (nan_denom, 0), Ops.FDIV),
++                _emit_where_stage(total, info.outs[0], (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)))
++  return tuple(tasks)
++
+@@ -2666,0 +2758 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)

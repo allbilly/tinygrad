@@ -233,6 +233,15 @@ This technique only repairs special inputs that reach the recognized LUT.
 For example, `EXP2(LOG2(0) * negative)` still requires LOG2-zero handling
 because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
 
+Composite tanh has the same issue even though it does not appear as a primitive
+LUT op: `2*sigmoid(2*x)-1` inherits the bounded nested sigmoid result and used
+to flatten at approximately `±0.969`. The Rockchip recognizer preserves the
+existing staged interior, reconstructs sign and an `abs(x)>4` mask on the NPU,
+and selects exact `±1` only in the tails. Since `|1-tanh(4)|<1e-3`, this
+saturation boundary meets the forward tolerance without changing the separate
+interior-precision problem. A final `isnan` denominator restores NaN after the
+arithmetic selection stages.
+
 ### Two-task EXP LUT correction
 
 The direct `exp(x) = exp2(x*log2(e))` table must cover values through `e**2`.

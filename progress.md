@@ -1,5 +1,30 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — extreme tanh saturation milestone
+
+### Implementation
+- The backend recognizes `2*sigmoid(2*x)-1` both before and after the
+  reciprocal-to-FDIV rewrite.
+- Its existing staged interior is preserved. Beyond `|x|>4`, NPU comparison
+  masks select the reconstructed sign exactly, replacing bounded-LUT
+  saturation near `±0.969` with `±1`.
+- The boundary is mathematically within the forward `1e-3` tolerance because
+  `|1-tanh(4)|<1e-3`.
+- A final NPU `isnan` denominator restores NaN after arithmetic selection;
+  infinities select the correct sign.
+
+### Verification
+- `TestOps.test_tanh_extreme` — **PASS** with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Focused finite tails, ±300, infinities, and NaN — **PASS** on hardware.
+- Sigmoid, SiLU, and swish regressions — **PASS**.
+- Ordinary `TestOps.test_tanh` retains its pre-existing interior precision
+  mismatch and remains a separate milestone.
+- All **59** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- `lut.md` documents bounded-composite saturation and the NaN epilogue.
+- Incremental census: **141 PASS, 275 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — two-LUT HardSwish milestone
 
 ### Implementation

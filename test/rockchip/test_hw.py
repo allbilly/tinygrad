@@ -221,6 +221,11 @@ class TestDPU(unittest.TestCase):
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
     np.testing.assert_array_equal(actual[a_np == 0], expected[a_np == 0])
 
+  def test_dpu_tanh_extreme_saturation(self):
+    a_np = np.array([-np.inf, -300, -5, 5, 300, np.inf, np.nan], dtype=np.float16)
+    actual = Tensor(a_np, device="ROCKCHIP").tanh().realize().numpy()
+    np.testing.assert_allclose(actual, np.tanh(a_np), rtol=1e-3, atol=1e-6)
+
   def test_dpu_direct_casts(self):
     half_np = np.array([-2.5,0,1.75,255], dtype=np.float16)
     half = Tensor(half_np, device="ROCKCHIP").realize()
