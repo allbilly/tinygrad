@@ -1,35 +1,80 @@
 # test_ops.py per-test status (FORWARD_ONLY=1)
 
-## Incremental hardware verification — 2026-07-28, commit 308729494
+## Current hardware census — 2026-07-28, commit c4db99233
 
-The generated table below is the older `993ea1197` baseline. These newer
-results were run with `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1` and the
-Rockchip pytest plugin; aggregate counts will be regenerated after the
-remaining tests have been isolated.
+Run configuration: `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1` with
+`test.rockchip.conftest_rockchip`, on the RK3588 NPU. The 424 collected methods
+were run serially in 20-test subprocess batches because one physical NPU cannot
+safely serve 12 concurrent pytest workers. The batch containing methods 400–419
+segfaulted, so those methods were rerun individually.
 
-| Test/group | Current status | Verification or remaining cause |
-|---|---|---|
-| `test_where` | PASS | Direct comparison, boolean mask, broadcast, and int32-result cases |
-| `test_where_permute` | PASS | WHERE plus affine int32 copy |
-| `test_clip` | PASS | Nested WHERE, equal bounds, and one-sided bounds |
-| `test_flip`, `test_permute`, `test_transpose`, strided slices | PASS | Arbitrary-rank affine copy |
-| `test_abs`, `test_add`, `test_add3`, `test_sub`, `test_mul`, `test_div`, `test_relu` | PASS | Isolated hardware runs |
-| `test_relu_exact`, `test_relu_maximum_exact` | PASS | Single DPU MAX path is selected before general WHERE |
-| `test_sigmoid` | PASS | Direct 513-entry sigmoid LUT |
-| `test_leaky_relu`, `test_relu6`, `test_hardsigmoid`, `test_hardtanh` | PASS | Arithmetic inside/around staged WHERE |
-| `test_exp` | FAIL | LUT precision: 301/2925 elements exceed tolerance |
-| `test_exp2` | FAIL | Finite case passes; inf/-inf/NaN behavior is unsupported |
-| `test_log`, `test_log2`, `test_sqrt`, `test_rsqrt` | FAIL | Negative-input NaN behavior plus LUT precision/range |
-| `test_sin` | FAIL | LUT precision: 68/2925 elements exceed tolerance |
-| `test_tanh`, `test_lerp` | FAIL | Now execute as staged expressions; fp16 rounding exceeds strict tolerance |
-| `test_hardswish` | FAIL | Now executes; 34/2925 fp16 values exceed tolerance |
+**Current summary: 100 PASS, 315 FAIL, 8 SKIP, 1 CRASH (424 unique tests).**
 
-Latest exact/activation/WHERE regression plus `test/rockchip/test_hw.py` —
-**48 passed**; mypy and targeted Ruff — **PASS**.
+The crash is reproducible in
+`TestOpsUint8::test_cast_relu`: `_convert_fp16_to_int32_buf` segfaults while
+converting the output buffer. It is counted separately from ordinary test
+failures.
 
-Generated: 2026-07-27 21:22 UTC | commit 993ea1197
+| Result group | Count | Main current causes |
+|---|---:|---|
+| PASS | 100 | Core fp16 arithmetic, WHERE/clip, affine copies, GEMM subsets, and selected reductions |
+| FAIL: unsupported WHERE | 81 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
+| FAIL: unsupported dtype | 50 | Bool, fp32, int/uint, comparison results, and dtype-changing kernels |
+| FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
+| FAIL: numeric mismatch | 33 | LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: non-index operand | 14 | Elementwise graphs still outside the staged planner |
+| FAIL: fused epilogue | 13 | Convolution/reduction output stages |
+| FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
+| FAIL: CBUF limit | 9 | Large reductions/variance and one convolution |
+| FAIL: other | 56 | Other unsupported ops, assertions, layouts, and framework-side failures |
+| SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
+| CRASH | 1 | uint8 `cast().relu()` output conversion |
 
-**Summary:** 71 PASS, 21 PARTIAL, 324 FAIL, 8 SKIP (out of 424 unique tests)
+The 100 passing methods are:
+
+`test_9_gemm`, `test_add`, `test_add3`, `test_arange_4096`, `test_arange_big`,
+`test_big_gemm`, `test_broadcastdot`, `test_chunk`, `test_clip`,
+`test_conv2d_errors`, `test_cummax_zero_axis`, `test_cummin_zero_axis`,
+`test_cumprod_zero_axis`, `test_cumsum_zero_axis`, `test_detach`,
+`test_diagonal`, `test_div`, `test_double_slice`, `test_einsum_arity_check1`,
+`test_einsum_arity_check2`, `test_einsum_shape_check`, `test_empty_0`,
+`test_expand`, `test_eye`, `test_flatten`, `test_flip`, `test_flip_eye_crash`,
+`test_gemm`, `test_gemm_fp16`, `test_gemm_with_zeros_shape`,
+`test_hardsigmoid`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
+`test_leaky_relu`, `test_matmul`, `test_matmul_simple`, `test_matvec`,
+`test_matvecmat`, `test_mean`, `test_mean_zero_axis`, `test_meshgrid`,
+`test_mul`, `test_mul_naninf`, `test_neg`, `test_negative_dims`,
+`test_negative_dims_eye`, `test_negative_dims_full`,
+`test_negative_dims_kaiming`, `test_ones`, `test_permute`,
+`test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,
+`test_relu_maximum_exact`, `test_reshape`, `test_scalar_div`,
+`test_scalar_mul`, `test_scalar_rsub`, `test_scalar_sub`,
+`test_scaled_dot_product_attention_gqa_errors`,
+`test_scatter_no_reduce_tensor_src`, `test_sigmoid`,
+`test_simple_conv2d_1x1`, `test_slice_both_endpoints_out_of_bounds`,
+`test_slice_ellipsis`, `test_slice_errors`, `test_slice_in_bounds_1dim`,
+`test_slice_in_bounds_multidim`, `test_slice_int_indexing`,
+`test_slice_negative_strides`, `test_slice_on_0dim_tensor`,
+`test_slice_one_endpoint_out_of_bounds`, `test_slice_start_gt_end`,
+`test_slice_stride_gt_one`, `test_slice_with_none`, `test_slice_zero_in_shape`,
+`test_small_gemm`, `test_split`, `test_squeeze`, `test_stack_slice`,
+`test_std_mean_loaded_nan`, `test_std_zero_in_axis`, `test_sub`,
+`test_sum_collapse_neg`, `test_sum_fake`, `test_sum_simple`,
+`test_sum_with_zeros_shape`, `test_tiny_add`, `test_tiny_mul`,
+`test_topo_sort`, `test_transpose`, `test_unflatten`, `test_unfold`,
+`test_unsqueeze`, `test_var_zero_in_axis`, `test_view`, `test_where`,
+`test_where_permute`, and `test_zeros`.
+
+Targeted regression after the PC-chain, WHERE, nested-elementwise, arithmetic
+WHERE, and MAX milestones: **48 passed**. `python -m mypy tinygrad/` and
+targeted Ruff checks pass.
+
+## Historical detailed baseline — 2026-07-27, commit 993ea1197
+
+The per-test table below is retained for failure-shape and subcase reference.
+Its aggregate is the pre-milestone baseline, not the current census.
+
+**Historical summary:** 71 PASS, 21 PARTIAL, 324 FAIL, 8 SKIP.
 
 **Low-hanging fruit:** 67 tests with single fixable reason
 
