@@ -1,5 +1,24 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — native round-to-even milestone
+
+### Implementation
+- Ported RK3588 roundoff algorithm 23 from
+  `ref/npu/include/rknnops.h` and `ref/rk3588/experimental/ops_rockchip.py`:
+  alternating 0/16384 LUT entries, index select 14, and direct fp16 LUT output.
+- Added an exact recognizer for tinygrad's expanded round-to-nearest-even graph,
+  replacing its nested parity/ceil/floor WHERE tree with the native LUT task.
+- The reference LUT is nonnegative-only, so the staged program applies stable
+  DPU `abs`, executes roundoff, then restores the original sign with comparison
+  masks. This preserves negative values and half-to-even ties.
+
+### Verification
+- `test_round` — **PASS**, including random 45×35 input, positive/negative
+  boundary values, and ties `2.5` and `-1.5`.
+- Full hardware plus recent cast/fill/WHERE/predicate/sign/rounding regression —
+  **64 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — fp16 rounding milestone
 
 ### Implementation
@@ -15,8 +34,8 @@
 - Full hardware plus recent cast/fill/WHERE/predicate/sign regression —
   **63 passed**.
 - `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
-- `test_round` remains unsupported because its decomposition contains a deeper
-  nested WHERE graph than floor/ceil.
+- `test_round` was left for the native roundoff milestone above because its
+  decomposition contains a deeper nested WHERE graph than floor/ceil.
 
 ## 2026-07-28 — stable sign lowering milestone
 

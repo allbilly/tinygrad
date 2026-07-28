@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 123 PASS, 293 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 124 PASS, 292 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,8 +17,8 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 123 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
-| FAIL: unsupported WHERE | 75 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
+| PASS | 124 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
+| FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 36 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
 | FAIL: numeric mismatch | 32 | LUT/activation precision, fp16 accumulation/rounding, and special values |
@@ -29,7 +29,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 123 passing methods are:
+The 124 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -50,7 +50,7 @@ The 123 passing methods are:
 `test_negative_dims_eye`, `test_negative_dims_full`,
 `test_negative_dims_kaiming`, `test_ones`, `test_ones_like`, `test_permute`,
 `test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,
-`test_relu_maximum_exact`, `test_reshape`, `test_scalar_div`,
+`test_relu_maximum_exact`, `test_reshape`, `test_round`, `test_scalar_div`,
 `test_scalar_mul`, `test_scalar_rsub`, `test_scalar_sub`,
 `test_scaled_dot_product_attention_gqa_errors`,
 `test_scatter_no_reduce_tensor_src`, `test_sigmoid`,
@@ -70,7 +70,7 @@ The 123 passing methods are:
 `test_where_permute`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Targeted regression through the rounding milestone: **63 passed**.
+Targeted regression through the native roundoff milestone: **64 passed**.
 `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` pass.
 
 ## Historical detailed baseline — 2026-07-27, commit 993ea1197

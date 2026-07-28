@@ -222,6 +222,7 @@ def _try_sign(val:UOp) -> int|None:
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
+_LUT_ROUNDOFF = Ops.CUSTOM  # internal plan marker for the RK3588 round-to-nearest-even LUT
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -379,6 +380,32 @@ def _try_sigmoid(val:UOp) -> int|None:
   scale = next((float(x.arg) for x in mul.src if x.op is Ops.CONST), None)
   return idx.src[0].buf_uop.arg.slot if idx is not None and scale is not None and abs(scale + math.log2(math.e)) < 1e-3 else None
 
+def _try_round(val:UOp) -> UOp|None:
+  """Recognize tinygrad's exact round-to-nearest-even expansion and return its source INDEX."""
+  val = _unwrap(val)
+  indexes = [u for u in val.toposort() if u.op is Ops.INDEX]
+  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
+  def c(value:float) -> UOp: return UOp.const(dtypes.half, value)
+  truncated = UOp(Ops.TRUNC, dtypes.half, (source,))
+  half_truncated = UOp(Ops.MUL, dtypes.half, (truncated, c(0.5)))
+  positive = UOp(Ops.CMPLT, dtypes.bool, (c(0.0), source))
+  even = UOp(Ops.CMPNE, dtypes.bool, (
+    UOp(Ops.CMPNE, dtypes.bool, (UOp(Ops.TRUNC, dtypes.half, (half_truncated,)), half_truncated)),
+    UOp.const(dtypes.bool, True)))
+  condition = UOp(Ops.CMPNE, dtypes.bool, (positive, even))
+  plus_half = UOp(Ops.ADD, dtypes.half, (source, c(0.5)))
+  plus_trunc = UOp(Ops.TRUNC, dtypes.half, (plus_half,))
+  floor_plus = UOp(Ops.WHERE, dtypes.half, (
+    UOp(Ops.CMPLT, dtypes.bool, (plus_half, plus_trunc)),
+    UOp(Ops.ADD, dtypes.half, (plus_trunc, c(-1.0))), plus_trunc))
+  minus_half = UOp(Ops.ADD, dtypes.half, (source, c(-0.5)))
+  minus_trunc = UOp(Ops.TRUNC, dtypes.half, (minus_half,))
+  ceil_minus = UOp(Ops.WHERE, dtypes.half, (
+    UOp(Ops.CMPLT, dtypes.bool, (minus_trunc, minus_half)),
+    UOp(Ops.ADD, dtypes.half, (minus_trunc, c(1.0))), minus_trunc))
+  expected = UOp(Ops.WHERE, dtypes.half, (condition, floor_plus, ceil_minus))
+  return source if val is expected else None
+
 def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   """Recognize LUT patterns and return (index_slot, input_scale, output_scale, lut_op).
   Patterns:
@@ -388,6 +415,8 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   - RECIPROCAL(SQRT(INDEX)) → (slot, 1.0, 1.0, RECIPROCAL)  [rsqrt(x)]
   Returns None if not a LUT pattern."""
   input_scale, output_scale = 1.0, 1.0
+  if val.op is Ops.CUSTOM and val.arg == "rk_roundoff" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ROUNDOFF)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -769,6 +798,45 @@ def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
   return (_emit_where_stage(total, info.outs[0], (_ZERO_SLOT, 0), value, Ops.ADD,
                             fp32_output=output_dtype is dtypes.float, int32_output=output_dtype is dtypes.int,
                             uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool),)
+
+def _try_round_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Replace tinygrad's expanded round graph with abs, RK3588 roundoff LUT, and sign stages."""
+  store = _store_node(sink)
+  if store is None or (source := _try_round(store.src[1])) is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def temp_index(slot:int) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  source_slot = source.src[0].buf_uop.arg.slot
+  negative, magnitude, rounded = alloc(), alloc(), alloc()
+  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+  tasks = [_emit_where_stage(total, negative, (source_slot, 0), negative_one, Ops.MUL),
+           _emit_where_stage(total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX)]
+  roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(magnitude),), arg="rk_roundoff")
+  stage_store = store.replace(src=(temp_index(rounded), roundoff))
+  stage_sink = sink.substitute({store:stage_store})
+  plan = plan_rk(stage_sink)
+  if isinstance(plan, str) or plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  zero = (_ZERO_SLOT, 0)
+  negative_diff, negative_mask, positive_diff, positive_mask, sign = alloc(), alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_diff, zero, (source_slot, 0), Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, positive_diff, (source_slot, 0), zero, Ops.SUB),
+                _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, alloc(), (positive_mask, 0), (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, sign, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, alloc(), (rounded, 0), (sign, 0), Ops.MUL),
+                _emit_where_stage(total, info.outs[0], (rounded, 0), (sign, 0), Ops.MUL)))
+  return tuple(tasks)
 
 def _try_sign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower sign(x) as the difference of positive and negative comparison masks."""
@@ -1243,6 +1311,11 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_ROUNDOFF:
+    lut = [0 if i % 2 == 0 else 1 << 14 for i in range(_LUT_SIZE)] * 2
+    bn_mul_operand, minus_exp = 0, 0
+    lut_le_start, lut_lo_end = 0x00000000, 0x44800000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   else:
     raise AssertionError(f"dpu_lut: no builder for {lut_op}")
   # Apply output_scale_factor via OUT_CVT_SCALE (Q15 fixed-point) — see below
@@ -1276,19 +1349,26 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   # --- WDMA_SIZE_0/1 ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_0, 7)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_1, width)
-  # --- BN_CFG: BN_ALU_ALGO=2, BN_RELU_BYPASS=1 ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, (2 << 16) | (1 << 6))
-  # --- BN_ALU_CFG ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000)
-  # --- BN_MUL_CFG: fp16(index_scale) — LUT builder already accounts for input_scale ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_MUL_CFG, (bn_mul_operand & 0xFFFF) << 16)
-  # --- EW_CFG: relu_bypass=1, op_cvt_bypass=1, op_bypass=1 (LUT mode) ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 1))
-  # --- EW_CVT_SCALE_VALUE: EW_OP_CVT_SCALE=1 ---
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)
+  if lut_op is _LUT_ROUNDOFF:
+    # Algorithm 23: bypass BN and use LUT interpolation directly as fp16 output.
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, 0x53)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 1))
+  else:
+    # --- BN_CFG: BN_ALU_ALGO=2, BN_RELU_BYPASS=1 ---
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, (2 << 16) | (1 << 6))
+    # --- BN_ALU_CFG ---
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000)
+    # --- BN_MUL_CFG: fp16(index_scale) — LUT builder already accounts for input_scale ---
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_MUL_CFG, (bn_mul_operand & 0xFFFF) << 16)
+    # --- EW_CFG: relu_bypass=1, op_cvt_bypass=1, op_bypass=1 (LUT mode) ---
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 1))
+    # --- EW_CVT_SCALE_VALUE: EW_OP_CVT_SCALE=1 ---
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)
   # --- OUT_CVT_SCALE: FP32TOFP16_EN=1, scale=output_scale_factor (as Q15 fixed-point) ---
   # --- OUT_CVT_SHIFT: MINUS_EXP (FP16 float division by 2^minus_exp) + OUT_CVT_SHIFT (integer right shift) ---
-  if output_scale_factor != 1.0:
+  if lut_op is _LUT_ROUNDOFF:
+    pass
+  elif output_scale_factor != 1.0:
     # Use Q15 fixed-point: scale = factor * 32768, shift = 15
     scale_q15 = int(round(output_scale_factor * 32768)) & 0xFFFF
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | scale_q15)
@@ -1302,13 +1382,18 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   emitter_emit(cmds, _T_DPU, 0x40c4, 0)
   # --- LUT config registers ---
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_CFG, lut_cfg)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_INFO, (5 << 16) | (5 << 8))
+  index_select = 14 if lut_op is _LUT_ROUNDOFF else 5
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_INFO, (index_select << 16) | (index_select << 8))
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_START, lut_le_start)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_END, 0)  # LE/LO boundary
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_START, 0)  # LE/LO boundary
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_END, 0x44000000 if lut_op is _LUT_ROUNDOFF else 0)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_START, 0x44000000 if lut_op is _LUT_ROUNDOFF else 0)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_END, lut_lo_end)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 16434 << 16)  # OFLOW_SCALE=16434
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5)  # OFLOW_SHIFT=13
+  if lut_op is _LUT_ROUNDOFF:
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 23107)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
+  else:
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 16434 << 16)  # OFLOW_SCALE=16434
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5)  # OFLOW_SHIFT=13
   # --- RDMA config ---
   emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width)
   emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7)
@@ -1685,6 +1770,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
+  if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
