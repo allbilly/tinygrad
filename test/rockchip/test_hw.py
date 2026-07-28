@@ -135,6 +135,14 @@ class TestDPU(unittest.TestCase):
     c = (a + b).cast(dtypes.half).realize()
     np.testing.assert_allclose(c.numpy(), a_np + b_np, rtol=1e-3, atol=1e-3)
 
+  def test_dpu_relu_cast_uint8(self):
+    # Keep the output larger than one page: an int32-sized write into this uint8
+    # allocation caused the old conversion path to overrun and segfault.
+    a_np = np.linspace(-16, 255, 4097, dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    c = a.relu().cast(dtypes.uint8).realize()
+    np.testing.assert_array_equal(c.numpy(), np.maximum(a_np, 0).astype(np.uint8))
+
 @unittest.skipUnless(_NPU_AVAILABLE, "no /dev/dri/card1 NPU device")
 class TestCMAC(unittest.TestCase):
   def test_cmac_matmul(self):

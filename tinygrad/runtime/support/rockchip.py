@@ -86,6 +86,7 @@ class RKTask:
   bool_inputs: tuple[int, ...] = ()   # boolean mask slots converted to fp16 before multi-task execution
   broadcast_inputs: tuple[int, ...] = () # scalar fp16 input slots expanded to the logical element count
   int32_output: bool = False          # multi-task output converted from fp16 to int32
+  uint8_output: bool = False          # multi-task output converted from fp16 to uint8
 
 @dataclass(frozen=True)
 class RKSubTask:
@@ -674,7 +675,8 @@ def _where_arg(u: UOp) -> tuple[int, int]|None:
   return None
 
 def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
-                      bool_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False) -> RKSubTask:
+                      bool_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
+                      uint8_output=False) -> RKSubTask:
   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
   cmds:list[RKCmd] = []
   relocs:list[RKReloc] = []
@@ -719,7 +721,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
   emitter_pc_op_en(cmds, 12)
   task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs,
-                broadcast_inputs=broadcast_inputs, int32_output=int32_output)
+                broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output)
   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
 
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -760,7 +762,8 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                        if _unwrap(u).op is Ops.INDEX and int(_unwrap(u).src[0].src[0].arg) < total)
     first = alloc(4)
     t0, mask, scratch, selected_false = range(first, first+4)
-    int_out = final and dtypes.is_int(w.dtype)
+    int_out = final and w.dtype is dtypes.int
+    uint8_out = final and w.dtype is dtypes.uint8
     if cond.op is Ops.CMPLT:
       lhs, rhs = (lower_arg(x) for x in cond.src)
       if lhs is None or rhs is None: return False
@@ -772,7 +775,7 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                     _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
-                                      broadcast_inputs=broadcasts, int32_output=int_out)))
+                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
       return True
     if cond.op is Ops.OR and all(_unwrap(x).op is Ops.CMPLT for x in cond.src):
       masks = []
@@ -792,7 +795,7 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                     _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
-                                      broadcast_inputs=broadcasts, int32_output=int_out)))
+                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
       return True
     if cond.op is Ops.INDEX and (mask_arg := _where_arg(cond)) is not None:
       bool_slots = (mask_arg[0],)
@@ -801,7 +804,7 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                     _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL,
                                       bool_inputs=bool_slots, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD, bool_inputs=bool_slots,
-                                      broadcast_inputs=broadcasts, int32_output=int_out)))
+                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
       return True
     return False
 
@@ -1418,7 +1421,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   fp32_mask = (1 << 7 if task.fp32_output else 0) | sum(1 << s for s in task.fp32_inputs if s < 7)
   fp32_bytes = struct.pack("<B", fp32_mask)
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
-  dtype_flags = int(task.int32_output) | sum(1 << (8+s) for s in task.bool_inputs if s < 16)
+  dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | sum(1 << (8+s) for s in task.bool_inputs if s < 16)
   input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16)
   task_header = struct.pack("<IIIIIIIIi", n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout,
                             task.out_slot, input_flags, dtype_flags)
@@ -1453,7 +1456,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
   return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill,
                       const_val=const_val, fp32_inputs=fp32_inputs, fp32_output=fp32_output,
                       bool_inputs=bool_inputs, broadcast_inputs=broadcast_inputs,
-                      int32_output=bool(dtype_flags & 1)), relocs, off
+                      int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2)), relocs, off
 
 def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
   """Pack multiple tasks into one image (version 4 = PC chain).

@@ -61,6 +61,11 @@ def _convert_fp16_to_int32_buf(src, dst, n):
   arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.int32)
   ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
 
+def _convert_fp16_to_uint8_buf(src, dst, n):
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.uint8)
+  ctypes.memmove(dst, arr.ctypes.data, n)  # type: ignore[arg-type]
+
 def _unpack_cmac_out(src, dst, M, N, align_out):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   for i in range(M * N):
@@ -310,13 +315,15 @@ class RockchipProgram(Program['RockchipDevice']):
       temp.append(converted)
       _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, prepared[slot].size // 2, total)
       prepared[slot] = converted
-    int_output = next((st.task.out_slot for st in subtasks if st.task.int32_output), None)
-    int_output_conversion = None
-    if int_output is not None:
+    integer_output = next(((st.task.out_slot, st.task.uint8_output) for st in subtasks
+                           if st.task.int32_output or st.task.uint8_output), None)
+    integer_output_conversion = None
+    if integer_output is not None:
+      output_slot, is_uint8 = integer_output
       converted = dev._gpu_alloc(max(total * 2, 4096), 0)
       temp.append(converted)
-      int_output_conversion = (prepared[int_output], converted, total)
-      prepared[int_output] = converted
+      integer_output_conversion = (prepared[output_slot], converted, total, is_uint8)
+      prepared[output_slot] = converted
     bufs = tuple(prepared)
     try:
       buf_map:dict[int, HCQBuffer] = dict(enumerate(bufs))
@@ -425,9 +432,10 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=n_tasks, task_number=0),
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0))))
-      if int_output_conversion is not None:
-        original_out, converted, n = int_output_conversion
-        _convert_fp16_to_int32_buf(converted.va_addr, original_out.va_addr, n)
+      if integer_output_conversion is not None:
+        original_out, converted, n, is_uint8 = integer_output_conversion
+        if is_uint8: _convert_fp16_to_uint8_buf(converted.va_addr, original_out.va_addr, n)
+        else: _convert_fp16_to_int32_buf(converted.va_addr, original_out.va_addr, n)
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: PC chain {n_tasks} tasks")
     finally:
       for b in temp: dev._gpu_free(b)

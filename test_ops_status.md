@@ -1,6 +1,6 @@
 # test_ops.py per-test status (FORWARD_ONLY=1)
 
-## Current hardware census — 2026-07-28, commit c4db99233
+## Current hardware census — 2026-07-28
 
 Run configuration: `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1` with
 `test.rockchip.conftest_rockchip`, on the RK3588 NPU. The 424 collected methods
@@ -8,16 +8,16 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 100 PASS, 315 FAIL, 8 SKIP, 1 CRASH (424 unique tests).**
+**Current summary: 101 PASS, 315 FAIL, 8 SKIP (424 unique tests).**
 
-The crash is reproducible in
-`TestOpsUint8::test_cast_relu`: `_convert_fp16_to_int32_buf` segfaults while
-converting the output buffer. It is counted separately from ordinary test
-failures.
+The census originally found one reproducible crash in
+`TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
+distinguishes uint8 from int32 output, and the conversion writes one byte per
+uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 100 | Core fp16 arithmetic, WHERE/clip, affine copies, GEMM subsets, and selected reductions |
+| PASS | 101 | Core fp16 arithmetic, WHERE/clip, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 81 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 50 | Bool, fp32, int/uint, comparison results, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
@@ -28,9 +28,8 @@ failures.
 | FAIL: CBUF limit | 9 | Large reductions/variance and one convolution |
 | FAIL: other | 56 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
-| CRASH | 1 | uint8 `cast().relu()` output conversion |
 
-The 100 passing methods are:
+The 101 passing methods are:
 
 `test_9_gemm`, `test_add`, `test_add3`, `test_arange_4096`, `test_arange_big`,
 `test_big_gemm`, `test_broadcastdot`, `test_chunk`, `test_clip`,
@@ -63,7 +62,7 @@ The 100 passing methods are:
 `test_sum_with_zeros_shape`, `test_tiny_add`, `test_tiny_mul`,
 `test_topo_sort`, `test_transpose`, `test_unflatten`, `test_unfold`,
 `test_unsqueeze`, `test_var_zero_in_axis`, `test_view`, `test_where`,
-`test_where_permute`, and `test_zeros`.
+`test_where_permute`, `test_zeros`, and `TestOpsUint8::test_cast_relu`.
 
 Targeted regression after the PC-chain, WHERE, nested-elementwise, arithmetic
 WHERE, and MAX milestones: **48 passed**. `python -m mypy tinygrad/` and

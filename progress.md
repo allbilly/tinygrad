@@ -1,5 +1,23 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — safe uint8 WHERE output milestone
+
+### Implementation
+- Version-4 multi-task metadata now distinguishes fp16→uint8 output conversion
+  from fp16→int32 conversion.
+- Runtime conversion writes the destination dtype's actual byte width. The old
+  path tagged every integer WHERE output as int32 and wrote four bytes per
+  element into a uint8 allocation.
+- Added a 4,097-element hardware regression so an accidental int32-sized write
+  crosses the allocator's 4 KiB minimum and is caught.
+
+### Verification
+- `TestOpsUint8.test_cast_relu` — **PASS**; previously reproducibly segfaulted
+  in `_convert_fp16_to_int32_buf`.
+- Full `test/rockchip/test_hw.py` plus cast/WHERE/clip/ReLU regressions —
+  **47 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — single-stage MAX/ReLU priority milestone
 
 ### Implementation
