@@ -3942,3 +3942,154 @@ Per AGENTS.md: old/WIP code can be commented out (doesn't count in sz.py). No fe
 | **Total** | **~2,042** | **~760** |
 
 Yes, it can be within 25k. Requires near-complete rewrite: table-driven emission, spec-driven multi-task lowering, merged runtime paths. No feature cuts. All tests preserved.
+
+## 2026-07-27 — cat dim=0 + LUT-in-WHERE + arg[-1] fix
+
+### Implementation
+
+- **`_try_cat_subtasks`**: Recognizes cat-like nested
+  `WHERE(CMPNE(RANGE, CONST), INDEX, INDEX)` patterns and emits host-side
+  memmove copy tasks. Each tensor is copied to its offset in the output
+  buffer via `ctypes.memmove`. Works for cat dim=0 (contiguous copies).
+  Cat dim=1+ requires a 3D transpose kernel that the DPU cannot currently
+  handle.
+- **`out_offset` field in `RKTask`**: Added byte offset into the output
+  buffer for cat-like copies. Propagated through `encode_rk`/`decode_rk`
+  and `_encode_one_task`/`_decode_one_task`.
+- **All-copy fast path in `_submit_multi`**: When all subtasks are
+  `is_copy`, skips NPU submission and does host-side memmove directly.
+- **LUT-in-WHERE support in `lower_arg`**: Added handling for LUT ops
+  (EXP2, LOG2, SIN, SQRT, RECIPROCAL) inside WHERE branches. Preserves
+  `MUL(INDEX, CONST)` scaling in LUT inputs so the classifier can extract
+  `input_scale`. Falls back to special subtask handlers (exp_correction,
+  sigmoid, exp2, log2, rsqrt, sqrt) before trying generic `plan_rk`.
+- **`slot_dtypes` tracking**: Added `slot_dtypes` dict to track data types
+  of slots in WHERE subtasks (fp32 for original params, fp16 for DPU
+  outputs). Used to set `fp32_inputs` on WHERE stages.
+- **`arg[-1]` fix**: Changed all `arg[1].name` checks to
+  `getattr(arg[-1], 'name', '')` to handle RANGE nodes with 3-tuple args
+  like `(var_idx, sub_idx, AxisType.LOOP)`. Previously, `arg[1]` was an
+  int for these nodes, causing `AttributeError`.
+- **`_loop_extents` fix**: Filter `axes` to only include keys present in
+  `extents` to avoid `KeyError` when store affine index has non-LOOP
+  RANGE variables.
+
+### Verification
+
+- `test_celu`: PASS (individually)
+- `test_quick_gelu`: PASS (2 tests, individually)
+- `test_stack_slice`: PASS
+- `test_ceil`: PASS (individually)
+- `test_cat`: FAIL (dim=1+ needs 3D transpose)
+- `test_elu`: FAIL (148/2925 precision mismatches, LUT range limitation)
+- `test_tanh`: FAIL (precision, max diff 0.024)
+- `test_pad`: FAIL (WHERE(AND(CMPLT, CMPGT)) pattern not handled)
+- `test_round`: FAIL (WHERE pattern not handled, pre-existing)
+- `test_stack`: FAIL (float16 precision: 3.14 → 3.140625)
+- `test_add`: FAIL (dtype mismatch: float16 vs float32, DEFAULT_FLOAT=HALF)
+
+### Test batch results (39 selected tests)
+- 26 passed, 13 failed
+- Most failures are dtype mismatch (DEFAULT_FLOAT=HALF) or precision issues
+- NPU state corruption causes segfaults when running tests consecutively
+
+
+## 2026-07-27 — Broadcast EW via host-side N-D expansion
+
+### Implementation
+
+- **`_try_broadcast_subtasks`**: Detects binary EW ops (ADD, SUB, MUL, FDIV, MAX)
+  where one or both operands have broadcast dimensions (missing RANGE vars vs the
+  store index). Expands each broadcast/non-flat operand to a flat contiguous
+  scratch buffer via host-side N-D copy with stride 0 on broadcast dimensions.
+  Then emits a flat 1D DPU EW task that operates on the expanded buffers.
+- **SUB pattern handling**: Unwraps `ADD(INDEX, MUL(INDEX, CONST(-1)))` into SUB
+  before checking for broadcast, so sub broadcast works correctly.
+- **FDIV register settings**: Uses `OUT_CVT_SCALE=1` and `FEATURE_MODE_CFG=0x17841`
+  for FDIV (no FP32TOFP16, FP16TOFP32_EN=0), and the standard settings for other ops.
+- **Mixed copy + DPU submission in `_submit_multi`**: Added a path that handles
+  programs with both copy tasks (host-side) and DPU tasks (NPU). Copy tasks are
+  executed first via host-side N-D strided memmove, then DPU tasks are submitted
+  with the expanded buffer set.
+- **2D copy in all-copy path**: Updated the all-copy fast path to handle N-D
+  strided copies (not just flat 1D), using the same per-element memmove logic
+  as the existing DPU copy task handler.
+
+### Verification
+
+- `test_broadcasted_add`: PASS (2 tests)
+- `test_broadcast_full`: 8/10 subtests pass (add, sub, mul, div for both 4D and 5D shapes; only pow fails)
+- `test_broadcast_partial`: 16/20 subtests pass (add, sub, mul, div for all 4 shapes; only pow fails)
+- Manual tests:
+  - `(4,1)+(4,5)`: PASS
+  - `(1,5)+(4,5)`: PASS
+  - `(5,3,14,16)+(5,1,14,1)`: PASS (4D broadcast)
+  - `(1,3,1,7,1)+(2,1,5,1,8)`: PASS (5D broadcast, both operands broadcast)
+  - `(45,65)/(45,1)`: PASS (div broadcast, precision-limited)
+  - `(45,65)-(45,1)`: PASS (sub broadcast)
+- Existing ops (add, mul, sub, cat) still work correctly.
+
+### Caveats
+
+- `pow` broadcast fails because pow uses a WHERE-based code path, not EW.
+- FDIV broadcast has precision limitations (max diff 0.015625) due to NPU's
+  fp16 division accuracy.
+- NPU state corruption still causes segfaults when running tests consecutively.
+
+
+## 2026-07-29 — Pad via fill + scatter copy
+
+### Implementation
+
+- **`_try_pad_subtasks`**: Recognizes pad pattern `WHERE(cond, INDEX, CONST(pad_val))`
+  and emits two host-side tasks:
+  1. **Fill**: Fill the output buffer with the pad value (using `is_fill=True` task)
+  2. **Scatter copy**: Copy input data to the correct position in the output buffer
+     using strided memmove (negative ndim in layout signals scatter mode)
+- **Condition parsing**: Flattens nested ANDs and parses CMPLT/CMPNE leaf conditions
+  to determine valid ranges per axis. Handles both AND (both sides padded) and
+  single CMPLT/CMPNE (one-sided pad).
+- **Swapped branches**: Handles `WHERE(cond, CONST, INDEX)` by negating the condition.
+- **Nested WHERE in true branch**: For non-zero pad values, the true branch may be
+  a nested `WHERE(inner_cond, INDEX, CONST)` — looks through it to find the INDEX.
+- **Guarded INDEX expression**: The INDEX's src[1] may be a `WHERE(cond, affine, Invalid)`
+  — looks through it to extract the affine index.
+- **Size-1 input dims**: Handles input dims with size 1 and stride 0 (broadcast-like),
+  which occur when the input has a size-1 dimension that gets padded.
+- **Fill task in `_submit_multi`**: Added `is_fill` handling in both the all-host-side
+  path and the single-task path, using `ctypes.memset` for zero fill and `ctypes.memmove`
+  for non-zero values.
+- **Scatter copy in `_submit_multi`**: Added negative-ndim scatter copy handling
+  in both paths, using src_strides and dst_strides for each element.
+
+### Verification
+
+- `test_pad_reflect_mode`, `test_pad_replicate_mode`, `test_pad_circular_mode`:
+  Still fail (different WHERE patterns — circular/reflect/replicate use more
+  complex conditions than simple CMPLT/CMPNE)
+- `test_pad`: 4D positive padding works; negative padding fails (negative affine
+  index not supported); inf pad value has fp16 representation issues
+- `test_pad_reshape`: Pad part works but fused pad+reshape fails (different AST shape)
+- `test_pad_slice`: Scalar shape () fails (`non_index_operand` — 0-D output has no
+  RANGE vars)
+- `test_padding_add`: Fused pad+add fails (different code path)
+- Manual tests:
+  - `[[1,2,3],[4,5,6]].pad(((1,1),(0,0)))`: PASS
+  - `[[1,2,3],[4,5,6]].pad(((0,0),(1,1)))`: PASS
+  - `[[1,2,3],[4,5,6]].pad(((1,1),(1,1)))`: PASS
+  - `[[1,2,3],[4,5,6]].pad(((1,0),(0,0)))`: PASS (one-sided)
+  - `[[1,2,3],[4,5,6]].pad(((0,1),(0,0)))`: PASS (one-sided)
+  - `[[1,2,3],[4,5,6]].pad(((1,1),(0,0)), value=9.0)`: PASS (non-zero pad)
+  - `(1,2).pad(((1,0),(0,1)))`: PASS (size-1 input dim)
+  - 3D tensor pad: PASS
+  - 4D tensor pad: PASS
+- All existing ops (add, mul, sub, cat, broadcast) still work correctly.
+
+### Caveats
+
+- Negative padding not supported (affine index has negative values).
+- Fused pad+reshape and pad+add not supported (different AST shapes).
+- Scalar (0-D) pad output not supported (no RANGE vars).
+- Circular/reflect/replicate pad modes use different WHERE patterns not yet parsed.
+- inf/-inf pad values have fp16 representation issues.
+

@@ -5,7 +5,7 @@
 from __future__ import annotations
 import struct, math, numpy as np
 from dataclasses import dataclass, replace
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import ceildiv, round_up, prod
 from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
@@ -91,6 +91,7 @@ class RKTask:
   uint8_output: bool = False          # multi-task output converted from fp16 to uint8
   bool_output: bool = False           # multi-task output converted from fp16 mask to bool
   trunc_output: bool = False          # multi-task fp16 output truncated through an integer cast round-trip
+  out_offset: int = 0                 # byte offset into the output buffer (for cat-like copies)
 
 @dataclass(frozen=True)
 class RKSubTask:
@@ -127,7 +128,7 @@ def _is_2d_index(idx: UOp, outer_kind: str = "LOOP", inner_kind: str = "LOOP", s
   if ms.op is not Ops.MUL or rs.op is not Ops.RANGE: return None
   mr, mc = ms.src
   if mr.op is not Ops.RANGE or mc.op is not Ops.CONST: return None
-  if mr.arg[1].name != outer_kind or rs.arg[1].name != inner_kind or \
+  if getattr(mr.arg[-1], "name", "") != outer_kind or getattr(rs.arg[-1], "name", "") != inner_kind or \
      (stride >= 0 and int(mc.arg) != stride) or (stride < 0 and mr.arg[0] != 0): return None
   return (int(mr.src[0].arg) if mr.src and mr.src[0].op is Ops.CONST else 0, int(mc.arg), int(mc.arg))
 
@@ -725,13 +726,13 @@ def _try_where_max(val: UOp) -> UOp|None:
 
 def _ppu_channel_count(idx: UOp) -> int|None:
   """Channel count from input index: ADD(MUL(RANGE(REDUCE),CONST(ch)),RANGE(LOOP)) or simplified forms."""
-  if idx.op is Ops.RANGE and idx.arg[1].name == "REDUCE": return 1
+  if idx.op is Ops.RANGE and getattr(idx.arg[-1], "name", "") == "REDUCE": return 1
   if idx.op is not Ops.ADD: return None
   a, b = idx.src
   if a.op is Ops.MUL:
     mr, mc = a.src
-    if mr.op is Ops.RANGE and mc.op is Ops.CONST and b.op is Ops.RANGE and mr.arg[1].name == "REDUCE" and b.arg[1].name == "LOOP": return int(mc.arg)
-  if a.op is Ops.RANGE and b.op is Ops.RANGE and a.arg[1].name == "REDUCE" and b.arg[1].name == "LOOP": return 1
+    if mr.op is Ops.RANGE and mc.op is Ops.CONST and b.op is Ops.RANGE and getattr(mr.arg[-1], "name", "") == "REDUCE" and getattr(b.arg[-1], "name", "") == "LOOP": return int(mc.arg)
+  if a.op is Ops.RANGE and b.op is Ops.RANGE and getattr(a.arg[-1], "name", "") == "REDUCE" and getattr(b.arg[-1], "name", "") == "LOOP": return 1
   return None
 
 _PPU_BAD_SPLITS = frozenset({(3, 6), (6, 3), (12, 12)})
@@ -749,7 +750,7 @@ def _ppu_split_k(K: int) -> tuple[int, int]|None:
 
 def _is_1d_index(idx: UOp, kind: str) -> bool:
   """Check idx is RANGE(axis_kind) — 1D vector access."""
-  return idx.op is Ops.RANGE and idx.arg[1].name == kind
+  return idx.op is Ops.RANGE and getattr(idx.arg[-1], "name", "") == kind
 
 def _is_cmac_matmul_layout(sink: UOp, reduce: UOp) -> bool:
   """Validate INDEX patterns match row-major matmul: out=(i,j), A=(i,k), B=(k,j).
@@ -803,7 +804,7 @@ def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
   M = int(out_shape[0])
   if _is_2d_index(body.src[1], "LOOP", "REDUCE", K): return (input_slot, M, 1, K, cv)  # A-pattern
   if _is_2d_index(body.src[1], "REDUCE", "LOOP", M): return (input_slot, 1, M, K, cv)  # B-pattern
-  if body.src[1].op is Ops.RANGE and body.src[1].arg[1].name == "REDUCE": return (input_slot, 1, 1, K, cv)  # C-pattern
+  if body.src[1].op is Ops.RANGE and getattr(body.src[1].arg[-1], 'name', '') == "REDUCE": return (input_slot, 1, 1, K, cv)  # C-pattern
   return None
 
 def _check_dpu_layout(sink: UOp, allow_2d: bool, require_uniform: bool) -> str|None:
@@ -942,7 +943,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
 # ---- geometry extraction ----
 def _loop_extents(sink: UOp) -> list[int]:
   """Extents of all LOOP RANGE nodes in topological order (-1 if non-const)."""
-  return [int(u.src[0].arg) if u.src[0].op is Ops.CONST else -1 for u in sink.toposort() if u.op is Ops.RANGE and u.arg[1].name == "LOOP"]
+  return [int(u.src[0].arg) if u.src[0].op is Ops.CONST else -1 for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
 
 def _shape_of_store(sink: UOp) -> tuple[int, ...]:
   """Extract the output shape from the LOOP RANGE extents."""
@@ -2323,6 +2324,7 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
   materialized:dict[UOp, int] = {}
+  slot_dtypes:dict[int, DType] = {}
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
 
   def alloc(count:int=1) -> int:
@@ -2331,18 +2333,52 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return ret
 
   def lower_arg(u:UOp) -> tuple[int,int]|None:
-    if (arg := _where_arg(u)) is not None: return arg
+    if (arg := _where_arg(u)) is not None:
+      uw = _unwrap(u)
+      if uw.op is Ops.INDEX: slot_dtypes[arg[0]] = uw.dtype
+      return arg
     u = _unwrap(u)
     if u not in materialized:
       materialized[u] = alloc()
+      slot_dtypes[materialized[u]] = dtypes.half
       if u.op is Ops.WHERE:
         if not lower(u, materialized[u], False): return None
       elif u.op in _DPU_EW_CFGS and len(u.src) == 2:
         a, b = (lower_arg(x) for x in u.src)
         if a is None or b is None: return None
-        tasks.append(_emit_where_stage(total, materialized[u], a, b, u.op))
+        fp32_in = tuple(s[0] for s, src_u in zip((a, b), u.src)
+                        if _unwrap(src_u).op is Ops.INDEX and _unwrap(src_u).dtype is dtypes.float)
+        tasks.append(_emit_where_stage(total, materialized[u], a, b, u.op, fp32_inputs=fp32_in))
       elif u.op is Ops.TRUNC and (source := _where_arg(u.src[0])) is not None:
         tasks.append(_emit_trunc_stage(total, materialized[u], source))
+      elif u.op in _LUT_OPS:
+        inner = _unwrap(u.src[0])
+        scale_const, index_uop = None, None
+        if inner.op is Ops.MUL:
+          a, b = (_unwrap(s) for s in inner.src)
+          if a.op is Ops.INDEX and b.op is Ops.CONST: scale_const, index_uop = b, inner.src[0]
+          elif a.op is Ops.CONST and b.op is Ops.INDEX: scale_const, index_uop = a, inner.src[1]
+        src_arg = lower_arg(index_uop if scale_const is not None else u.src[0])
+        if src_arg is None: return None
+        input_dtype = slot_dtypes.get(src_arg[0], dtypes.half)
+        out_idx_base = store.src[0]
+        input_idx = out_idx_base.replace(dtype=input_dtype,
+            src=(out_idx_base.src[0].param_like(src_arg[0]).replace(dtype=input_dtype), *out_idx_base.src[1:]))
+        temp_out = out_idx_base.replace(dtype=dtypes.half,
+            src=(out_idx_base.src[0].param_like(materialized[u]).replace(dtype=dtypes.half), *out_idx_base.src[1:]))
+        lut_input = UOp(Ops.MUL, input_dtype, (input_idx, scale_const)) if scale_const is not None else input_idx
+        stage_val = u.replace(src=(lut_input,), dtype=dtypes.half)
+        stage_sink = sink.substitute({store: store.replace(src=(temp_out, stage_val))})
+        for special in (_try_exp_correction_subtasks, _try_sigmoid_special_subtasks, _try_exp2_special_subtasks,
+                        _try_log2_special_subtasks, _try_rsqrt_special_subtasks, _try_sqrt_special_subtasks):
+          if (special_tasks := special(stage_sink)) is not None:
+            tasks.extend(special_tasks)
+            break
+        else:
+          plan = plan_rk(stage_sink)
+          if isinstance(plan, str) or plan.kind != "dpu_lut": return None
+          cmds, task, relocs = emit_rk(plan)
+          tasks.append(RKSubTask(cmds, task, relocs))
       else: return None
     return (materialized[u], 0)
 
@@ -2594,9 +2630,9 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   layout:tuple[int,...] = (total,)
   if is_copy and (aff := _affine_index(vu.src[1])) is not None:
     extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
-               if u.op is Ops.RANGE and u.arg[1].name == "LOOP" and u.src[0].op is Ops.CONST}
+               if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
     store_aff = _affine_index(store.src[0].src[1])
-    axes = sorted(store_aff[0], key=lambda x: store_aff[0][x], reverse=True) if store_aff is not None else sorted(extents)
+    axes = sorted((k for k in store_aff[0] if k in extents), key=lambda x: store_aff[0][x], reverse=True) if store_aff is not None else sorted(extents)
     shape = tuple(extents[i] for i in axes)
     strides = tuple(aff[0].get(i, 0) for i in axes)
     contiguous = tuple(prod(shape[i+1:]) for i in range(len(shape)))
@@ -3136,7 +3172,8 @@ def encode_rk(cmds: tuple[int,...], task: RKTask, relocs: tuple[RKReloc,...]) ->
   # fp32_mask: bit 7 = fp32_output, bits 0-6 = fp32_inputs mask (bit N = slot N is fp32)
   fp32_mask = (1 << 7 if task.fp32_output else 0) | sum(1 << s for s in task.fp32_inputs if s < 7)
   fp32_bytes = struct.pack("<B", fp32_mask)
-  return header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes + fp32_bytes
+  out_offset_bytes = struct.pack("<i", task.out_offset)
+  return header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes + fp32_bytes + out_offset_bytes
 
 def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
   """Decode bytes into (cmds, task, relocs). Raises on bad magic, version, truncated tables, or out-of-range relocations."""
@@ -3168,13 +3205,17 @@ def decode_rk(data: bytes) -> tuple[list[int], RKTask, list[RKReloc]]:
     const_val = struct.unpack_from("<f", data, off)[0] if off + 4 <= len(data) else 1.0
     off += 4
     fp32_mask = struct.unpack_from("<B", data, off)[0] if off < len(data) else 0
+    off += 1
+    out_offset = struct.unpack_from("<i", data, off)[0] if off + 4 <= len(data) else 0
     fp32_output = bool(fp32_mask & (1 << 7))
     fp32_inputs = tuple(s for s in range(7) if fp32_mask & (1 << s))
   else:
     const_val = struct.unpack_from("<f", data, off)[0] if off + 4 <= len(data) else 1.0
     fp32_output, fp32_inputs = False, ()
+    out_offset = 0
   return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill,
-                      const_val=const_val, fp32_inputs=fp32_inputs, fp32_output=fp32_output), relocs
+                      const_val=const_val, fp32_inputs=fp32_inputs, fp32_output=fp32_output,
+                      out_offset=out_offset), relocs
 
 def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,...]) -> bytes:
   """Encode a single task's cmds + relocs + metadata (no header)."""
@@ -3184,6 +3225,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   const_bytes = struct.pack("<f", task.const_val)
   fp32_mask = (1 << 7 if task.fp32_output else 0) | sum(1 << s for s in task.fp32_inputs if s < 7)
   fp32_bytes = struct.pack("<B", fp32_mask)
+  out_offset_bytes = struct.pack("<i", task.out_offset)
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
   dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | (int(task.trunc_output) << 3) | \
     sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
@@ -3191,7 +3233,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
     sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
   task_header = struct.pack("<IIIIIIIIi", n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout,
                             task.out_slot, input_flags, dtype_flags)
-  return task_header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes + fp32_bytes
+  return task_header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes + fp32_bytes + out_offset_bytes
 
 def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKReloc], int]:
   """Decode a single task from offset. Returns (cmds, task, relocs, new_offset)."""
@@ -3215,6 +3257,8 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
   off += 4
   fp32_mask = struct.unpack_from("<B", data, off)[0] if off < len(data) else 0
   off += 1
+  out_offset = struct.unpack_from("<i", data, off)[0] if off + 4 <= len(data) else 0
+  off += 4
   fp32_output = bool(fp32_mask & (1 << 7))
   fp32_inputs = tuple(s for s in range(7) if fp32_mask & (1 << s))
   bool_inputs = tuple(s for s in range(16) if dtype_flags & (1 << (8+s)))
@@ -3226,7 +3270,8 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
                       bool_inputs=bool_inputs, int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
                       comparison_inputs=comparison_inputs,
                       int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
-                      bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8)), relocs, off
+                      bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8),
+                      out_offset=out_offset), relocs, off
 
 def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
   """Pack multiple tasks into one image (version 4 = PC chain).
@@ -3250,6 +3295,310 @@ def decode_rk_multi(data: bytes) -> list[RKSubTask]:
     cmds, task, relocs, off = _decode_one_task(data, off)
     result.append(RKSubTask(tuple(cmds), task, tuple(relocs)))
   return result
+
+def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Detect binary EW with broadcast operand(s) and emit pre-expansion copy + EW tasks.
+  Either or both operands may have broadcast dimensions (missing RANGE vars vs store).
+  We expand each broadcast/non-flat operand to a flat contiguous scratch buffer via
+  host-side N-D copy with stride 0 on broadcast dims, then run the EW op as flat 1D DPU.
+  Also handles SUB pattern: ADD(INDEX, MUL(INDEX, CONST(-1)))."""
+  store = _store_node(sink)
+  if store is None: return None
+  val = _unwrap(store.src[1])
+  if val.op not in _DPU_EW_CFGS or len(val.src) != 2: return None
+  src0, src1 = (_unwrap(s) for s in val.src)
+  # Unwrap SUB pattern: ADD(INDEX, MUL(INDEX, CONST(-1))) → treat as SUB
+  ew_op = val.op
+  if val.op is Ops.ADD:
+    sub_match = _try_sub(val)
+    if sub_match is not None:
+      # SUB pattern: src0 is the non-negated INDEX, src1 is the negated INDEX
+      # _try_sub returns (src_slot, ew_slot) — need to find which src is which
+      for s, e in (val.src[0], val.src[1]), (val.src[1], val.src[0]):
+        su = _unwrap(s)
+        eu = _unwrap(e)
+        if eu.op is Ops.MUL and su.op is Ops.INDEX:
+          ma, mb = eu.src
+          if mb.op is Ops.CONST and float(mb.arg) == -1.0 and _unwrap(ma).op is Ops.INDEX:
+            src0, src1 = su, _unwrap(ma)
+            ew_op = Ops.SUB
+            break
+  if src0.op is not Ops.INDEX or src1.op is not Ops.INDEX: return None
+  # Get affine indices for both operands
+  aff0 = _affine_index(src0.src[1])
+  aff1 = _affine_index(src1.src[1])
+  if aff0 is None or aff1 is None: return None
+  # Get the store index affine (output layout)
+  store_aff = _affine_index(store.src[0].src[1])
+  if store_aff is None: return None
+  store_vars = set(store_aff[0].keys())
+  if len(store_vars) < 2: return None  # 1D is already handled by flat contiguous
+  # Check which operands have broadcast (missing RANGE vars vs store)
+  def missing_vars(aff): return store_vars - set(aff[0].keys())
+  mv0, mv1 = missing_vars(aff0), missing_vars(aff1)
+  if not mv0 and not mv1: return None  # no broadcast — not our case
+  # Get extents
+  extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
+             if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
+  if not all(v in extents for v in store_vars): return None
+  # Compute output shape (axes sorted by store stride, descending = row-major)
+  axes = sorted(store_vars, key=lambda x: store_aff[0][x], reverse=True)
+  out_shape = tuple(extents[v] for v in axes)
+  total = prod(out_shape)
+  contiguous_strides = tuple(prod(out_shape[i+1:]) for i in range(len(out_shape)))
+  # Verify broadcast operands have stride 0 on missing vars
+  for aff, mv in [(aff0, mv0), (aff1, mv1)]:
+    for v in mv:
+      if aff[0].get(v, 0) != 0: return None
+  # Allocate scratch slots
+  info = ProgramInfo.from_sink(sink)
+  out_slot = info.outs[0]
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  # For each operand, decide if it needs a copy to scratch (broadcast or non-flat)
+  def needs_copy(aff, mv):
+    if mv: return True  # broadcast — needs expansion
+    strides = tuple(aff[0].get(v, 0) for v in axes)
+    return strides != contiguous_strides or aff[1] != 0  # non-contiguous — needs flattening
+  def emit_copy(src_slot, aff, scratch_slot):
+    strides = tuple(aff[0].get(v, 0) for v in axes)
+    offset = aff[1]
+    copy_layout = (total, len(out_shape), *out_shape, *strides, offset)
+    copy_cmds = [RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0)]
+    copy_task = RKTask(0x18, 0x300, 4, "dpu", copy_layout, scratch_slot, is_copy=True)
+    copy_relocs = (RKReloc(0, scratch_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, src_slot, 0, 0, 0xFFFFFFFF))
+    return RKSubTask(tuple(c.pack() for c in copy_cmds), copy_task, copy_relocs)
+  slot0 = src0.src[0].buf_uop.arg.slot
+  slot1 = src1.src[0].buf_uop.arg.slot
+  nc0 = needs_copy(aff0, mv0)
+  nc1 = needs_copy(aff1, mv1)
+  if nc0:
+    s0_scratch = next_slot; next_slot += 1
+    tasks.append(emit_copy(slot0, aff0, s0_scratch))
+  else:
+    s0_scratch = slot0
+  if nc1:
+    s1_scratch = next_slot; next_slot += 1
+    tasks.append(emit_copy(slot1, aff1, s1_scratch))
+  else:
+    s1_scratch = slot1
+  # EW op as flat 1D DPU operation
+  ew_cmds:list[RKCmd] = []
+  ew_relocs:list[RKReloc] = []
+  dw = (total + 7) // 8 - 1
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_S_POINTER, 0x0e)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, dw)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x0e)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, dw)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 0x7)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_DST_BASE_ADDR, 0)
+  emitter_reloc(ew_cmds, ew_relocs, out_slot)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0)
+  emitter_reloc(ew_cmds, ew_relocs, s0_scratch)
+  emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
+  emitter_reloc(ew_cmds, ew_relocs, s1_scratch)
+  emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[ew_op])
+  # FDIV: scale=1 (no FP32TOFP16), MRDMA_FP16TOFP32_EN=0; others: scale=(1<<16)|1, FP16TOFP32_EN=1
+  if ew_op is Ops.FDIV:
+    emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1)
+    emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841)
+  else:
+    emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
+    emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
+  emitter_pc_op_en(ew_cmds, 12)
+  ew_task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot)
+  ew_subtask = RKSubTask(tuple(c.pack() for c in ew_cmds), ew_task, tuple(ew_relocs))
+  tasks.append(ew_subtask)
+  return tuple(tasks)
+
+def _try_pad_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Recognize pad pattern WHERE(AND(...), INDEX, CONST(pad_val)) and emit fill + scatter copy.
+  The INDEX affine maps output coords → input coords. We fill output with pad_val, then
+  scatter-copy input data to the correct positions using dst strides from the store affine."""
+  store = _store_node(sink)
+  if store is None: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.WHERE: return None
+  cond = _unwrap(val.src[0])
+  t_branch = _unwrap(val.src[1])
+  f_branch = _unwrap(val.src[2])
+  # Pattern: WHERE(cond, INDEX, CONST(pad_val)) or WHERE(cond, CONST(pad_val), INDEX)
+  # The branches may be swapped depending on how the condition is structured.
+  # For non-zero pad values, a branch may be a nested WHERE(inner_cond, INDEX, CONST)
+  # or WHERE(inner_cond, CONST, INDEX) — look through any nesting to find INDEX and CONST.
+  def extract_index_const(branch):
+    """From a branch (possibly nested WHERE), extract (INDEX, CONST) or None."""
+    eu = _unwrap(branch)
+    if eu.op is Ops.WHERE:
+      inner_t, inner_f = _unwrap(eu.src[1]), _unwrap(eu.src[2])
+      # Try both orderings of inner branches
+      if inner_t.op is Ops.INDEX and inner_f.op is Ops.CONST: return inner_t, inner_f
+      if inner_t.op is Ops.CONST and inner_f.op is Ops.INDEX: return inner_f, inner_t
+    if eu.op is Ops.INDEX: return eu, None
+    if eu.op is Ops.CONST: return None, eu
+    return None, None
+  t_idx, t_const = extract_index_const(t_branch)
+  f_idx, f_const = extract_index_const(f_branch)
+  # One branch should have INDEX, the other CONST
+  if t_idx is not None and f_const is not None:
+    t_branch = t_idx  # normal: WHERE(cond, INDEX, CONST(pad_val))
+  elif t_const is not None and f_idx is not None:
+    # swapped: WHERE(cond, CONST(pad_val), INDEX) — negate condition
+    t_branch = f_idx
+    f_branch = t_const
+    cond = UOp(Ops.CMPNE, dtypes.bool, src=(cond, UOp.const(dtypes.bool, True)))
+  else:
+    return None
+  if cond.op not in (Ops.AND, Ops.CMPLT, Ops.CMPNE): return None
+  pad_val = float(f_branch.arg)
+  # Get the input affine index (maps output coords → input coords)
+  # The INDEX's src[1] may be a guarded WHERE(cond, affine_expr, Invalid) — look through it
+  in_idx_expr = t_branch.src[1]
+  if in_idx_expr.op is Ops.WHERE:
+    in_idx_expr = _unwrap(in_idx_expr.src[1])  # true branch = affine expr
+  in_aff = _affine_index(in_idx_expr)
+  if in_aff is None: return None
+  # Get the store affine index (output layout)
+  store_aff = _affine_index(store.src[0].src[1])
+  if store_aff is None: return None
+  store_vars = set(store_aff[0].keys())
+  if len(store_vars) < 1: return None
+  # Get extents
+  extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
+             if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
+  if not all(v in extents for v in store_vars): return None
+  # Compute output shape (axes sorted by store stride, descending = row-major)
+  axes = sorted(store_vars, key=lambda x: store_aff[0][x], reverse=True)
+  out_shape = tuple(extents[v] for v in axes)
+  out_total = prod(out_shape)
+  out_contiguous = tuple(prod(out_shape[i+1:]) for i in range(len(out_shape)))
+  # Input affine: strides and offset in terms of the same axes
+  in_strides = tuple(in_aff[0].get(v, 0) for v in axes)
+  in_offset = in_aff[1]
+  # Parse the condition to find valid ranges per axis.
+  # Condition: AND of CMPNE(CMPLT(RANGE, left_pad), True) and CMPLT(RANGE, total-right_pad)
+  # → RANGE >= left_pad AND RANGE < total-right_pad
+  # For axes not in the condition, valid range = [0, extent)
+  valid_ranges:dict[int, tuple[int,int]] = {v: (0, extents[v]) for v in store_vars}
+  def parse_cmp(u):
+    # CMPNE(CMPLT(RANGE, CONST(lo)), CONST(True)) → RANGE >= lo
+    # CMPLT(RANGE, CONST(hi)) → RANGE < hi
+    if u.op is Ops.CMPNE:
+      inner = _unwrap(u.src[0])
+      if inner.op is Ops.CMPLT:
+        lhs, rhs = _unwrap(inner.src[0]), _unwrap(inner.src[1])
+        if lhs.op is Ops.RANGE and rhs.op is Ops.CONST and _unwrap(u.src[1]).op is Ops.CONST and _unwrap(u.src[1]).arg is True:
+          return (lhs.arg[0], int(rhs.arg), None)  # var, lo, no hi
+      return None
+    if u.op is Ops.CMPLT:
+      lhs, rhs = _unwrap(u.src[0]), _unwrap(u.src[1])
+      if lhs.op is Ops.RANGE and rhs.op is Ops.CONST:
+        return (lhs.arg[0], None, int(rhs.arg))  # var, no lo, hi
+    return None
+  # Flatten nested ANDs and collect all leaf conditions (single CMPLT/CMPNE is a leaf)
+  leaf_conds:list = []
+  def flatten_and(u):
+    u = _unwrap(u)
+    if u.op is Ops.AND:
+      for s in u.src: flatten_and(s)
+    else:
+      leaf_conds.append(u)
+  flatten_and(cond)
+  for s in leaf_conds:
+    r = parse_cmp(s)
+    if r is None: return None
+    var, lo, hi = r
+    cur_lo, cur_hi = valid_ranges[var]
+    if lo is not None: valid_ranges[var] = (max(cur_lo, lo), cur_hi)
+    if hi is not None: valid_ranges[var] = (cur_lo, min(cur_hi, hi))
+  # Compute input shape and dst offset
+  in_shape = tuple(valid_ranges[v][1] - valid_ranges[v][0] for v in axes)
+  in_total = prod(in_shape)
+  dst_offset = sum(valid_ranges[v][0] * store_aff[0][v] for v in axes)
+  # Verify: in_offset should equal -sum(valid_ranges[v][0] * in_stride[v])
+  expected_offset = -sum(valid_ranges[v][0] * in_aff[0].get(v, 0) for v in axes)
+  if in_offset != expected_offset: return None
+  # Check that input strides are contiguous for the input shape.
+  # Exception: if an input dim has size 1, its stride can be 0 (broadcast-like).
+  in_contiguous = tuple(prod(in_shape[i+1:]) for i in range(len(in_shape)))
+  for i in range(len(in_shape)):
+    if in_shape[i] == 1 and in_strides[i] == 0: continue  # size-1 dim, stride 0 is ok
+    if in_strides[i] != in_contiguous[i]: return None
+  # Get slots
+  in_slot = t_branch.src[0].buf_uop.arg.slot
+  info = ProgramInfo.from_sink(sink)
+  out_slot = info.outs[0]
+  # Task 1: Fill output with pad_val (using DPU fill)
+  fill_cmds = [RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0)]
+  fill_layout = (out_total,)
+  fill_task = RKTask(0x18, 0x300, 4, "dpu", fill_layout, out_slot, is_fill=True, const_val=pad_val)
+  fill_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF),)
+  fill_subtask = RKSubTask(tuple(c.pack() for c in fill_cmds), fill_task, fill_relocs)
+  # Task 2: Scatter copy from input to output at dst_offset
+  # Layout: (in_total, -ndim, *in_shape, *in_contiguous, 0, *out_contiguous, dst_offset)
+  # Negative ndim signals scatter mode (src contiguous → dst strided)
+  scatter_layout = (in_total, -len(in_shape), *in_shape, *in_contiguous, 0, *out_contiguous, dst_offset)
+  scatter_cmds = [RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0)]
+  scatter_task = RKTask(0x18, 0x300, 4, "dpu", scatter_layout, out_slot, is_copy=True)
+  scatter_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, in_slot, 0, 0, 0xFFFFFFFF))
+  scatter_subtask = RKSubTask(tuple(c.pack() for c in scatter_cmds), scatter_task, scatter_relocs)
+  return (fill_subtask, scatter_subtask)
+
+def _try_cat_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Recognize cat-like nested WHERE(CMPNE(RANGE, CONST), ...) and emit copy tasks.
+  Each tensor is copied to its position in the output via host-side memmove."""
+  store = _store_node(sink)
+  if store is None: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.WHERE: return None
+  slots:list[tuple[int,int]] = []
+  n_tensors, tensor_size = 0, 0
+  cur = val
+  while cur is not None:
+    cur = _unwrap(cur)
+    if cur.op is not Ops.WHERE: return None
+    cond = _unwrap(cur.src[0])
+    if cond.op is not Ops.CMPNE: return None
+    cond_lhs, cond_rhs = (_unwrap(x) for x in cond.src)
+    if cond_lhs.op is not Ops.RANGE or cond_rhs.op is not Ops.CONST: return None
+    if getattr(cond_lhs.arg[-1], "name", "") != "LOOP": return None
+    n_tensors = int(cond_lhs.src[0].arg)
+    k = int(cond_rhs.arg)
+    false_u = _unwrap(cur.src[2])
+    if false_u.op is not Ops.INDEX: return None
+    false_slot = _where_arg(cur.src[2])
+    if false_slot is None: return None
+    inner_rng = next((u for u in false_u.src[1:] if u.op is Ops.RANGE), None)
+    if inner_rng is None or inner_rng.src[0].op is not Ops.CONST: return None
+    tensor_size = int(inner_rng.src[0].arg)
+    slots.append((false_slot[0], k))
+    true_u = _unwrap(cur.src[1])
+    if true_u.op is Ops.INDEX:
+      true_slot = _where_arg(cur.src[1])
+      if true_slot is None: return None
+      slots.append((true_slot[0], k + 1))
+      cur = None
+    elif true_u.op is Ops.WHERE:
+      cur = cur.src[1]
+    else:
+      return None
+  total = prod(_shape_of_store(sink))
+  if total != n_tensors * tensor_size or len(slots) != n_tensors: return None
+  out_slot = store.src[0].src[0].buf_uop.arg.slot
+  tasks = []
+  for slot, pos in sorted(slots, key=lambda x: x[1]):
+    offset = pos * tensor_size * 2
+    cmds = [RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0)]
+    task = RKTask(0x18, 0x300, 4, "dpu", (tensor_size,), out_slot, is_copy=True, out_offset=offset)
+    relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(tuple(c.pack() for c in cmds), task, relocs))
+  return tuple(tasks)
 
 # ---- the native_program hook ----
 def build_native_program(sink: UOp) -> UOp|None:
@@ -3276,6 +3625,9 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
+  if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+  if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+  if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
     # Preserve directly recognizable single-stage forms such as abs(x) before

@@ -189,13 +189,48 @@ class RockchipProgram(Program['RockchipDevice']):
           fp32_out_temp = (orig_out, fp16_out, total)
       # DPU DMA copy: host-side memmove (data movement, not NPU compute).
       # No submit_count increment — no NPU submission. Documented honestly as non-native.
+      if task.is_fill:
+        total = task.layout[0]
+        out_buf = buf_map[self.relocs[0].globals_slot]
+        itemsize = 4 if task.fp32_output else 2
+        if task.const_val == 0.0:
+          ctypes.memset(out_buf.va_addr, 0, total * itemsize)  # type: ignore[arg-type]
+        else:
+          if itemsize == 2:
+            arr = struct.pack('<e', task.const_val) * total
+          else:
+            arr = struct.pack('<f', task.const_val) * total
+          ctypes.memmove(out_buf.va_addr, arr, total * itemsize)  # type: ignore[arg-type]
+        return
       if task.is_copy:
         total = task.layout[0]
         in_slot = self.relocs[1].globals_slot
         in_is_fp32 = in_slot in task.fp32_inputs
         out_is_fp32 = task.fp32_output
         in_buf, out_buf = buf_map[in_slot], buf_map[self.relocs[0].globals_slot]
-        if len(task.layout) > 1 and in_is_fp32 == out_is_fp32:
+        out_addr = out_buf.va_addr + task.out_offset
+        if len(task.layout) > 1 and task.layout[1] < 0 and in_is_fp32 == out_is_fp32:
+          # Scatter copy: source (possibly strided) → strided destination (for pad)
+          # Layout: (total, -ndim, *in_shape, *src_strides, src_offset, *dst_strides, dst_offset)
+          _, neg_ndim, *meta = task.layout
+          ndim = -neg_ndim
+          shape = meta[:ndim]
+          src_strides = meta[ndim:2*ndim]
+          src_offset = meta[2*ndim]
+          dst_strides = meta[2*ndim+1:3*ndim+1]
+          dst_offset = meta[-1]
+          itemsize = 4 if in_is_fp32 else 2
+          for in_idx in range(total):
+            rem, src_idx = in_idx, src_offset
+            for dim in range(ndim-1, -1, -1):
+              rem, coord = divmod(rem, shape[dim])
+              src_idx += coord * src_strides[dim]
+            rem, dst_idx = in_idx, dst_offset
+            for dim in range(ndim-1, -1, -1):
+              rem, coord = divmod(rem, shape[dim])
+              dst_idx += coord * dst_strides[dim]
+            ctypes.memmove(out_addr + dst_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
+        elif len(task.layout) > 1 and in_is_fp32 == out_is_fp32:
           _, ndim, *meta = task.layout
           shape, strides, offset = meta[:ndim], meta[ndim:2*ndim], meta[-1]
           itemsize = 4 if in_is_fp32 else 2
@@ -204,18 +239,18 @@ class RockchipProgram(Program['RockchipDevice']):
             for dim in range(ndim-1, -1, -1):
               rem, coord = divmod(rem, shape[dim])
               src_idx += coord * strides[dim]
-            ctypes.memmove(out_buf.va_addr + out_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
+            ctypes.memmove(out_addr + out_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
         elif in_is_fp32 and out_is_fp32:
           # fp32→fp32 copy: just memmove fp32 data directly
-          ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 4)  # type: ignore[arg-type]
+          ctypes.memmove(out_addr, in_buf.va_addr, total * 4)  # type: ignore[arg-type]
         elif in_is_fp32 and not out_is_fp32:
           # fp32→fp16 copy: convert
-          _convert_fp32_to_fp16_buf(in_buf.va_addr, out_buf.va_addr, total)
+          _convert_fp32_to_fp16_buf(in_buf.va_addr, out_addr, total)
         elif not in_is_fp32 and out_is_fp32:
           # fp16→fp32 copy: convert
-          _convert_fp16_to_fp32_buf(in_buf.va_addr, out_buf.va_addr, total)
+          _convert_fp16_to_fp32_buf(in_buf.va_addr, out_addr, total)
         else:
-          ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
+          ctypes.memmove(out_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
         return
       n_cmds = len(self.cmds)
       assert n_cmds <= dev.cmd_buf_size
@@ -299,6 +334,101 @@ class RockchipProgram(Program['RockchipDevice']):
     _T_PC = 0x0081
     subtasks = self.subtasks
     assert subtasks is not None
+    # All host-side subtasks (copy/fill): handle without NPU submission.
+    if all(st.task.is_copy or st.task.is_fill for st in subtasks):
+      for st in subtasks:
+        task = st.task
+        if task.is_fill:
+          total = task.layout[0]
+          out_slot = st.relocs[0].globals_slot
+          out_buf = bufs[out_slot] if out_slot < len(bufs) else None
+          if out_buf is None: continue
+          if task.const_val == 0.0:
+            ctypes.memset(out_buf.va_addr, 0, total * 2)  # type: ignore[arg-type]
+          else:
+            arr = struct.pack('<e', task.const_val) * total
+            ctypes.memmove(out_buf.va_addr, arr, total * 2)  # type: ignore[arg-type]
+          continue
+        total = task.layout[0]
+        in_slot = st.relocs[1].globals_slot
+        out_slot = st.relocs[0].globals_slot
+        in_buf = bufs[in_slot] if in_slot < len(bufs) else None
+        out_buf = bufs[out_slot] if out_slot < len(bufs) else None
+        if in_buf is None or out_buf is None: continue
+        out_addr = out_buf.va_addr + task.out_offset
+        if len(task.layout) > 1 and task.layout[1] < 0:
+          # Scatter copy: source (possibly strided) → strided destination (for pad)
+          _, neg_ndim, *meta = task.layout
+          ndim = -neg_ndim
+          shape = meta[:ndim]
+          src_strides = meta[ndim:2*ndim]
+          src_offset = meta[2*ndim]
+          dst_strides = meta[2*ndim+1:3*ndim+1]
+          dst_offset = meta[-1]
+          for in_idx in range(total):
+            rem, src_idx = in_idx, src_offset
+            for dim in range(ndim-1, -1, -1):
+              rem, coord = divmod(rem, shape[dim])
+              src_idx += coord * src_strides[dim]
+            rem, dst_idx = in_idx, dst_offset
+            for dim in range(ndim-1, -1, -1):
+              rem, coord = divmod(rem, shape[dim])
+              dst_idx += coord * dst_strides[dim]
+            ctypes.memmove(out_addr + dst_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
+        elif len(task.layout) > 1:
+          # 2D copy with strides (broadcast expansion)
+          _, ndim, *meta = task.layout
+          shape, strides, offset = meta[:ndim], meta[ndim:2*ndim], meta[-1]
+          for out_idx in range(total):
+            rem, src_idx = out_idx, offset
+            for dim in range(ndim-1, -1, -1):
+              rem, coord = divmod(rem, shape[dim])
+              src_idx += coord * strides[dim]
+            ctypes.memmove(out_addr + out_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
+        else:
+          ctypes.memmove(out_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
+      return
+    # Mixed copy + DPU: handle copy tasks host-side, then submit DPU tasks.
+    copy_tasks = [st for st in subtasks if st.task.is_copy]
+    dpu_tasks = [st for st in subtasks if not st.task.is_copy]
+    if copy_tasks and dpu_tasks:
+      ext, shared = list(bufs), []
+      max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                     default=len(ext)-1)
+      total = max(st.task.layout[0] for st in subtasks)
+      try:
+        while len(ext) <= max_slot:
+          shared.append(b := dev._gpu_alloc(max(total * 2, 4096), 0))
+          ext.append(b)
+        # Handle copy tasks host-side
+        for st in copy_tasks:
+          task = st.task
+          ct = task.layout[0]
+          in_slot = st.relocs[1].globals_slot
+          out_slot = st.relocs[0].globals_slot
+          in_buf = ext[in_slot]
+          out_buf = ext[out_slot]
+          out_addr = out_buf.va_addr + task.out_offset
+          if len(task.layout) > 1:
+            _, ndim, *meta = task.layout
+            shape, strides, offset = meta[:ndim], meta[ndim:2*ndim], meta[-1]
+            for out_idx in range(ct):
+              rem, src_idx = out_idx, offset
+              for dim in range(ndim-1, -1, -1):
+                rem, coord = divmod(rem, shape[dim])
+                src_idx += coord * strides[dim]
+              ctypes.memmove(out_addr + out_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
+          else:
+            ctypes.memmove(out_addr, in_buf.va_addr, ct * 2)  # type: ignore[arg-type]
+        # Submit DPU tasks with expanded buffers
+        for st in dpu_tasks:
+          dev.reset_npu()
+          self.subtasks = [st]
+          self._submit_multi(tuple(ext))
+      finally:
+        self.subtasks = subtasks
+        for b in shared: dev._gpu_free(b)
+      return
     # Custom comparison and LUT stages leave DPU state that makes a mixed chain unstable.
     # Submit those programs stage-by-stage with resets, retaining shared scratch allocations.
     def is_cmp(st): return any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
