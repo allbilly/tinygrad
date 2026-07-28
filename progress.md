@@ -1,5 +1,28 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — nested LOG2 special-value milestone
+
+### Implementation
+- Direct LOG2 now preserves zero as `-inf`, `+inf` as infinity, and
+  negative/NaN inputs as NaN around the bounded LUT.
+- The nested elementwise planner now invokes special-value builders before
+  falling back to raw LUT/DPU emission. Special semantics therefore survive
+  inside larger EXP2/LOG2/sigmoid/SQRT/RSQRT expressions.
+- This fixes `exp2(log2(0) * negative)` without host postprocessing:
+  LOG2 creates `-inf`, multiplication flips it to `+inf`, and EXP2 preserves
+  infinity.
+
+### Verification
+- `TestOps.test_exp2_log2_zero_times_negative` — **PASS**.
+- Focused LOG2 vector covers infinities, NaN, negative finite, signed zero,
+  ordinary values, and LUT endpoints — **PASS** at the documented LUT
+  tolerance.
+- All **53** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on the changed source/test — **PASS**.
+- Incremental census: **132 PASS, 284 FAIL, 8 SKIP**.
+- Full `TestOps.test_log2` remains separate: broad positive-range precision
+  still needs exact power-of-four normalization.
+
 ## 2026-07-28 — sigmoid forward saturation milestone
 
 ### Implementation

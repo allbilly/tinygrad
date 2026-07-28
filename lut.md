@@ -331,6 +331,16 @@ needs large-argument reduction.
 
 ### LOG2 range reduction
 
+Before range reduction, preserve the bounded table's IEEE boundary semantics.
+The LUT value at zero is negative, so division by a nonzero mask naturally
+creates `-inf` on zero lanes. A second denominator creates `+inf`, and the
+standard invalid factor repairs negative and NaN lanes.
+
+Special builders must also be called by the nested elementwise materializer.
+Otherwise a root LOG2 works but `EXP2(MUL(LOG2(x), y))` emits an uncorrected
+raw LOG2 substage. With nested dispatch enabled,
+`exp2(log2(0) * negative)` correctly propagates to positive infinity.
+
 The current linear LOG2 table is accurate only over approximately
 `[0.25, 4]`. A tested range-reduction identity was:
 
