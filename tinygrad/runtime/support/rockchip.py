@@ -1074,10 +1074,13 @@ def _try_round_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   source_slot = source.src[0].buf_uop.arg.slot
+  fp32_in = store.src[0].src[0].dtype is dtypes.float
+  fp32_args = {"fp32_inputs": (source_slot,)} if fp32_in else {}
+  fp32_out = {"fp32_output": True} if fp32_in else {}
   negative, magnitude, rounded = alloc(), alloc(), alloc()
   negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
-  tasks = [_emit_where_stage(total, negative, (source_slot, 0), negative_one, Ops.MUL),
-           _emit_where_stage(total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX)]
+  tasks = [_emit_where_stage(total, negative, (source_slot, 0), negative_one, Ops.MUL, **fp32_args),
+           _emit_where_stage(total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX, **fp32_args)]
   roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(magnitude),), arg="rk_roundoff")
   stage_store = store.replace(src=(temp_index(rounded), roundoff))
   stage_sink = sink.substitute({store:stage_store})
@@ -1088,14 +1091,14 @@ def _try_round_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   zero = (_ZERO_SLOT, 0)
   negative_diff, negative_mask, positive_diff, positive_mask, sign = alloc(), alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, negative_diff, zero, (source_slot, 0), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, negative_diff, zero, (source_slot, 0), Ops.SUB, **fp32_args),
                 _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_diff, (source_slot, 0), zero, Ops.SUB),
+                _emit_where_stage(total, positive_diff, (source_slot, 0), zero, Ops.SUB, **fp32_args),
                 _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, alloc(), (positive_mask, 0), (negative_mask, 0), Ops.SUB),
                 _emit_where_stage(total, sign, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
                 _emit_where_stage(total, alloc(), (rounded, 0), (sign, 0), Ops.MUL),
-                _emit_where_stage(total, info.outs[0], (rounded, 0), (sign, 0), Ops.MUL)))
+                _emit_where_stage(total, info.outs[0], (rounded, 0), (sign, 0), Ops.MUL, **fp32_out)))
   return tuple(tasks)
 
 def _try_sign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -1110,13 +1113,16 @@ def _try_sign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot + 1
     return ret
   zero = (_ZERO_SLOT, 0)
+  fp32_in = store.src[0].src[0].dtype is dtypes.float
+  fp32_args = {"fp32_inputs": (input_slot,)} if fp32_in else {}
+  fp32_out = {"fp32_output": True} if fp32_in else {}
   negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, negative_diff, zero, (input_slot, 0), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, negative_diff, zero, (input_slot, 0), Ops.SUB, **fp32_args),
                 _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_diff, (input_slot, 0), zero, Ops.SUB),
+                _emit_where_stage(total, positive_diff, (input_slot, 0), zero, Ops.SUB, **fp32_args),
                 _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, alloc(), (positive_mask, 0), (negative_mask, 0), Ops.SUB),
-                _emit_where_stage(total, info.outs[0], (positive_mask, 0), (negative_mask, 0), Ops.SUB)))
+                _emit_where_stage(total, info.outs[0], (positive_mask, 0), (negative_mask, 0), Ops.SUB, **fp32_out)))
   return tuple(tasks)
 
 def _try_inf_div_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -1142,19 +1148,22 @@ def _try_inf_div_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   denominator_arg = (denominator.src[0].buf_uop.arg.slot, 0)
   numerator_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(val.src[0].arg)))[0])
+  fp32_in = store.src[0].src[0].dtype is dtypes.float
+  fp32_args = {"fp32_inputs": (denominator_arg[0],)} if fp32_in else {}
+  fp32_out = {"fp32_output": True} if fp32_in else {}
   base, negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc(), alloc()
   sign_scratch, sign, product_scratch = alloc(), alloc(), alloc()
   zero = (_ZERO_SLOT, 0)
-  tasks.extend((_emit_where_stage(total, base, numerator_arg, denominator_arg, Ops.FDIV),
-                _emit_where_stage(total, negative_diff, zero, denominator_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, base, numerator_arg, denominator_arg, Ops.FDIV, **fp32_args),
+                _emit_where_stage(total, negative_diff, zero, denominator_arg, Ops.SUB, **fp32_args),
                 _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_diff, denominator_arg, zero, Ops.SUB),
+                _emit_where_stage(total, positive_diff, denominator_arg, zero, Ops.SUB, **fp32_args),
                 _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
                 # Repeat the first dependent reads of freshly materialized comparison masks.
                 _emit_where_stage(total, sign_scratch, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
                 _emit_where_stage(total, sign, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
                 _emit_where_stage(total, product_scratch, (base, 0), (sign, 0), Ops.MUL),
-                _emit_where_stage(total, info.outs[0], (base, 0), (sign, 0), Ops.MUL)))
+                _emit_where_stage(total, info.outs[0], (base, 0), (sign, 0), Ops.MUL, **fp32_out)))
   return tuple(tasks)
 
 def _try_hardsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -1681,8 +1690,11 @@ def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   total, info = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink)
   out_slot, scratch = info.outs[0], max(info.globals, default=-1) + 1
   negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
-  return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL),
-          _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX))
+  fp32_in = store.src[0].src[0].dtype is dtypes.float
+  fp32_args = {"fp32_inputs": (input_slot,)} if fp32_in else {}
+  fp32_out = {"fp32_output": True} if fp32_in else {}
+  return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL, **fp32_args),
+          _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX, **fp32_args, **fp32_out))
 
 def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Materialize CMPLT/CMPNE boolean expressions as fp16 0/1 masks, then pack to bool."""
