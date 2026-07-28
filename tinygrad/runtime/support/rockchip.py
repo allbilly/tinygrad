@@ -724,6 +724,21 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output)
   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
 
+def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
+  """Lower abs(x) as neg=x*-1 followed by max(x,neg).
+
+  The older single-task BS-negate/EW-MAX emitter remains below for reference,
+  but that register combination times out when a CMAC task ran earlier in the
+  process. Two ordinary DPU stages are stable across compute-family changes.
+  """
+  store = _store_node(sink)
+  if store is None or (input_slot := _try_abs(_unwrap(store.src[1]))) is None: return None
+  total, info = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink)
+  out_slot, scratch = info.outs[0], max(info.globals, default=-1) + 1
+  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+  return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL),
+          _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX))
+
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
@@ -960,9 +975,19 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
     emitter_emit(cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0)
     emitter_reloc(cmds, relocs, abs_slot)  # same buffer for EW (weight)
     # BS mul by -1 (output = -x), BN bypassed (output = x), EW MAX (output = max(-x, x) = abs(x))
+    # Initialize the complete BS/BN/WDMA state. PPU submissions leave values that
+    # make the shorter abs stream time out even after a subsequent ordinary DPU task.
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, 0x42)  # BS_RELU_BYPASS|BS_ALU_BYPASS (mul enabled, BS not bypassed)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_ALU_CFG, 0)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_MUL_CFG, 0xBC00 << 16)  # fp16 -1.0 at bits 16-31
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_OW_CFG, 2)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, 0x53)  # BN_RELU_BYPASS|BN_MUL_BYPASS|BN_ALU_BYPASS|BN_BYPASS
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_0, 7)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_1, dw)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, _DPU_EW_CFGS[Ops.MAX])
   else:
     emitter_reloc(cmds, relocs, _unwrap(val.src[0]).src[0].buf_uop.arg.slot)
@@ -983,9 +1008,12 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   # reference, then canonicalize to the sequence proven by multicore_elementwise.py.
   reg_order = {(t, r): i for i, (t, r) in enumerate((
     (_T_DPU, rk.REG_DPU_S_POINTER), (_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG), (_T_DPU, rk.REG_DPU_DATA_FORMAT),
-    (_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH), (_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT), (_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL),
-    (_T_DPU, rk.REG_DPU_BS_CFG), (_T_DPU, rk.REG_DPU_BS_MUL_CFG), (_T_DPU, rk.REG_DPU_BN_CFG),
-    (_T_DPU, rk.REG_DPU_EW_CFG), (_T_DPU, rk.REG_DPU_OUT_CVT_SCALE),
+    (_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH), (_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT), (_T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR),
+    (_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL), (_T_DPU, rk.REG_DPU_BS_CFG), (_T_DPU, rk.REG_DPU_BS_ALU_CFG),
+    (_T_DPU, rk.REG_DPU_BS_MUL_CFG), (_T_DPU, rk.REG_DPU_BS_OW_CFG), (_T_DPU, rk.REG_DPU_WDMA_SIZE_0),
+    (_T_DPU, rk.REG_DPU_WDMA_SIZE_1), (_T_DPU, rk.REG_DPU_BN_CFG), (_T_DPU, rk.REG_DPU_BN_MUL_CFG),
+    (_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE), (_T_DPU, rk.REG_DPU_EW_CFG), (_T_DPU, rk.REG_DPU_OUT_CVT_SCALE),
+    (_T_DPU, rk.REG_DPU_SURFACE_ADD),
     (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER), (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH),
     (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT), (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL),
     (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG), (_T_DPU, rk.REG_DPU_DST_BASE_ADDR),
@@ -1487,8 +1515,13 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
-  sink = graph_rewrite(sink, _pm_where_mul, name="rk distribute where mul")
+  if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)
+  if isinstance(plan, str):
+    # Preserve directly recognizable single-stage forms such as abs(x) before
+    # expanding MUL(WHERE(...)) into the general arithmetic-WHERE representation.
+    sink = graph_rewrite(sink, _pm_where_mul, name="rk distribute where mul")
+    plan = plan_rk(sink)
   if isinstance(plan, str):
     if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)

@@ -1,5 +1,24 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — stable abs lowering milestone
+
+### Implementation
+- Single-stage classification now sees the original graph before the general
+  MUL-through-WHERE rewrite, preserving recognizable specialized forms.
+- `abs(x)` lowers to two ordinary DPU stages, `neg = x * -1` then
+  `max(x, neg)`. The older single-stage BS-negate/EW-MAX implementation remains
+  in the source for reference, but it times out when CMAC ran earlier in the
+  process.
+- The staged form uses the proven PC-chain emitter and remains stable across
+  DPU, CMAC, and PPU transitions.
+
+### Verification
+- `TestOps.test_abs` and `TestOps.test_abs_exact` — **PASS**.
+- Full `test/rockchip/test_hw.py` followed by both abs tests in the same
+  process — **43 passed**.
+- Arithmetic-WHERE/uint8 regression — **7 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — safe uint8 WHERE output milestone
 
 ### Implementation

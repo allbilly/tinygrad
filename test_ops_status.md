@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 101 PASS, 315 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 103 PASS, 313 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,8 +17,8 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 101 | Core fp16 arithmetic, WHERE/clip, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
-| FAIL: unsupported WHERE | 81 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
+| PASS | 103 | Core fp16 arithmetic, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
+| FAIL: unsupported WHERE | 79 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 50 | Bool, fp32, int/uint, comparison results, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
 | FAIL: numeric mismatch | 33 | LUT/activation precision, fp16 accumulation/rounding, and special values |
@@ -29,9 +29,10 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 56 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 101 passing methods are:
+The 103 passing methods are:
 
-`test_9_gemm`, `test_add`, `test_add3`, `test_arange_4096`, `test_arange_big`,
+`test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
+`test_arange_4096`, `test_arange_big`,
 `test_big_gemm`, `test_broadcastdot`, `test_chunk`, `test_clip`,
 `test_conv2d_errors`, `test_cummax_zero_axis`, `test_cummin_zero_axis`,
 `test_cumprod_zero_axis`, `test_cumsum_zero_axis`, `test_detach`,

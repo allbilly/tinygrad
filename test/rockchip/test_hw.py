@@ -108,6 +108,13 @@ class TestDPU(unittest.TestCase):
     c = a.relu().realize()
     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, 0), rtol=1e-3, atol=1e-3)
 
+  def test_dpu_abs(self):
+    # Preserve the sign-WHERE pattern for the stable staged max(x, -x) path.
+    a_np = np.array([[-8,-2,-0.0,4],[5,-6,-7,8]], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    c = a.abs().realize()
+    np.testing.assert_array_equal(c.numpy(), np.abs(a_np))
+
   def test_dpu_2d_add(self):
     # 2D row-major contiguous element-wise add
     a_np = np.random.randn(8,16).astype(np.float16)
