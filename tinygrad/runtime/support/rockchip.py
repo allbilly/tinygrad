@@ -223,6 +223,7 @@ def _try_sign(val:UOp) -> int|None:
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
 _LUT_ROUNDOFF = Ops.CUSTOM  # internal plan marker for the RK3588 round-to-nearest-even LUT
+_LUT_EXP_CORRECTION = Ops.NEG  # internal marker for the second, residual exp LUT
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -262,6 +263,37 @@ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, fl
     lut[_LUT_SIZE + 502] += 14
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, output_scale, index_scale, minus_exp
+
+def _build_exp_correction_lut() -> tuple[list[int], int, float, float, int]:
+  """Signed Q12 residual for the low end of the Q12 EXP2 LUT used by exp(x).
+
+  The first LUT must cover exp([-2, 2]) up to e**2, so its shared signed table
+  is limited to Q12. The second LUT receives z=(x+1.75)*8, giving it four
+  times the input resolution over x in [-2, -1.5]. It stores only failures
+  outside TestOps' tolerance and saturates to zero correction outside that
+  interval.
+  """
+  lut = [0] * _LUT_SIZE * 2
+  base, _, output_scale, _, _ = _build_exp2_lut(math.log2(math.e))
+  index_scale, correction_scale, correction_bias = 8192.0, 4096.0, 0.125
+  step = 32.0 / index_scale
+  for table, base_offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i) * step
+      x = float(np.float16(z / 8.0 - 1.75))
+      target = float(np.float16(math.exp(x)))
+      position = (x + 2.0) * 256.0
+      first_index = max(0, min(511, int(math.floor(position))))
+      fraction = position - first_index
+      first_raw = math.floor(base[first_index] + fraction * (base[first_index+1] - base[first_index]))
+      approximate = float(np.float16(first_raw / output_scale))
+      residual = target - approximate
+      if i in (0, _LUT_SIZE-1) or abs(residual) <= 1e-6 + 1e-3 * abs(target): residual = 0.0
+      # The RK3588 LUT path produces a spurious value for an exact zero table
+      # entry. Keep the residual around a nonzero bias and subtract it later.
+      lut[base_offset+i] = max(-32768, min(32767, int(round((residual+correction_bias) * correction_scale))))
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, correction_scale, index_scale, 12
 
 def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for LOG2 over x∈[0.25,4.0] → result∈[-2,2].
@@ -1058,6 +1090,101 @@ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
   return tuple(tasks)
 
+def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Use two LUT tasks for exp(x): Q12 exp plus a signed Q12 residual."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  val = _unwrap(store.src[1])
+  lut_result = _try_lut(val)
+  if lut_result is None or lut_result[3] is not Ops.EXP2 or abs(lut_result[1] - math.log2(math.e)) >= 1e-3: return None
+  inner = _unwrap(val.src[0])
+  if inner.op is not Ops.MUL: return None
+  source = next((_unwrap(x) for x in inner.src if _unwrap(x).op is Ops.INDEX), None)
+  if source is None or source.dtype is not dtypes.half: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
+    nonlocal next_slot
+    mask_slot = alloc()
+    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
+    if cmp_tasks is None: return None
+    last = cmp_tasks[-1]
+    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    tasks.extend(cmp_tasks)
+    used_slots = [st.task.out_slot for st in cmp_tasks] + \
+      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+    return (mask_slot, 0)
+
+  exp_slot, shifted_slot, correction_input, correction_slot = alloc(), alloc(), alloc(), alloc()
+  exp_plan = plan_rk(stage_sink(val, exp_slot))
+  if isinstance(exp_plan, str) or exp_plan.kind != "dpu_lut": return None
+  exp_cmds, exp_task, exp_relocs = emit_rk(exp_plan)
+
+  # EXP2(correction_index) is only a carrier that supplies the transformed slot to
+  # the generic LUT emitter; the plan marker selects the residual table.
+  correction_index = temp_index(correction_input)
+  correction_val = UOp(Ops.EXP2, dtypes.half, (correction_index,))
+  correction_sink = stage_sink(correction_val, correction_slot)
+  correction_plan = RKPlan("dpu_lut", correction_sink, correction_slot,
+                           (correction_input,), lut_op=_LUT_EXP_CORRECTION)
+  correction_cmds, correction_task, correction_relocs = emit_rk(correction_plan)
+
+  # Repeat the first read after the reset-separated LUT tasks; this is the
+  # same stale-lane workaround used by comparison and special-value stages.
+  unbiased, scratch, corrected = alloc(), alloc(), alloc()
+  source_arg = (source.src[0].buf_uop.arg.slot, 0)
+  shift = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.75))[0])
+  zoom = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 8.0))[0])
+  correction_bias = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 0.125))[0])
+  tasks.extend((RKSubTask(exp_cmds, exp_task, exp_relocs),
+                _emit_where_stage(total, scratch, source_arg, shift, Ops.ADD),
+                _emit_where_stage(total, shifted_slot, source_arg, shift, Ops.ADD),
+                _emit_where_stage(total, scratch, (shifted_slot, 0), zoom, Ops.MUL),
+                _emit_where_stage(total, correction_input, (shifted_slot, 0), zoom, Ops.MUL),
+                RKSubTask(correction_cmds, correction_task, correction_relocs),
+                _emit_where_stage(total, scratch, (correction_slot, 0), correction_bias, Ops.SUB),
+                _emit_where_stage(total, unbiased, (correction_slot, 0), correction_bias, Ops.SUB),
+                _emit_where_stage(total, scratch, (exp_slot, 0), (unbiased, 0), Ops.ADD),
+                _emit_where_stage(total, corrected, (exp_slot, 0), (unbiased, 0), Ops.ADD)))
+
+  hi, lo = UOp.const(dtypes.half, 65472.0), UOp.const(dtypes.half, -65472.0)
+  positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
+  negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, lo)))
+  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
+  if positive is None or negative is None or not_number is None: return None
+
+  positive_denom, positive_result = alloc(), alloc()
+  dependent(positive_denom, one, positive, Ops.SUB)
+  dependent(positive_result, (corrected, 0), (positive_denom, 0), Ops.FDIV)
+  negative_denom, finite_result = alloc(), alloc()
+  dependent(negative_denom, one, negative, Ops.SUB)
+  dependent(finite_result, (positive_result, 0), (negative_denom, 0), Ops.MUL)
+  nan_denom, nan_numerator = alloc(), alloc()
+  dependent(nan_denom, one, not_number, Ops.SUB)
+  dependent(nan_numerator, (finite_result, 0), (nan_denom, 0), Ops.MUL)
+  dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
+  return tuple(tasks)
+
 def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve sigmoid saturation and NaN semantics outside the bounded LUT."""
   store = _store_node(sink)
@@ -1505,7 +1632,7 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
     nonlocal next_slot
     stage_sink, out_idx = make_stage_sink(stage_val, out_slot)
-    for special in (_try_sigmoid_special_subtasks, _try_exp2_special_subtasks, _try_log2_special_subtasks,
+    for special in (_try_exp_correction_subtasks, _try_sigmoid_special_subtasks, _try_exp2_special_subtasks, _try_log2_special_subtasks,
                     _try_rsqrt_special_subtasks, _try_sqrt_special_subtasks):
       if (special_tasks := special(stage_sink)) is None: continue
       tasks.extend(special_tasks)
@@ -1730,6 +1857,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
+  elif lut_op is _LUT_EXP_CORRECTION:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp_correction_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.LOG2:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
     lut_le_start = 0xffffc000  # -16384
@@ -1835,6 +1966,12 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   if lut_op is _LUT_ROUNDOFF:
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 23107)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
+  elif lut_op is _LUT_EXP_CORRECTION:
+    # The correction LUT is intentionally local to z in [-2, 2]. Hold its
+    # endpoint bias outside that interval instead of applying EXP2's overflow
+    # extrapolation slope.
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+    emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
   else:
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 16434 << 16)  # OFLOW_SCALE=16434
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5)  # OFLOW_SHIFT=13
@@ -2217,6 +2354,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+  if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, exp_correction_tasks)
   if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)
   if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
   if (log2_tasks := _try_log2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, log2_tasks)

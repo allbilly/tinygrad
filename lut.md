@@ -233,6 +233,52 @@ This technique only repairs special inputs that reach the recognized LUT.
 For example, `EXP2(LOG2(0) * negative)` still requires LOG2-zero handling
 because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
 
+### Two-task EXP LUT correction
+
+The direct `exp(x) = exp2(x*log2(e))` table must cover values through `e**2`.
+A signed int16 table therefore tops out at Q12. On the official random input,
+62 of 2925 low-end results missed the relative tolerance by one Q12 quantum.
+Adding one count to whole entries was too coarse: it fixed one fp16 input while
+moving a neighbor to the opposite side of the tolerance band.
+
+The accepted path uses two actual LUT NPU tasks:
+
+```text
+base       = exp_lut_q12(x)
+z          = (x + 1.75) * 8
+biased_err = correction_lut_q12(z)
+result     = base + (biased_err - 0.125)
+```
+
+The transformed coordinate gives LUT 2 four times the resolution over
+`x in [-2,-1.5]`, the interval containing every ordinary `test_exp` failure.
+Outside it, both endpoints encode zero correction and the overflow slope is
+disabled, so the residual stays flat.
+
+Hardware measurements on quarter-entry inputs established the first-table
+interpolation rule:
+
+```text
+raw = floor(table[i] + fraction * (table[i+1] - table[i]))
+```
+
+Use that rule when generating residuals. Rounding the interpolated raw value
+does not match the RK3588.
+
+Do not place literal zero in the correction table. The LUT datapath corrupts
+exact-zero entries, so every residual carries a `0.125` bias and a native SUB
+removes it after LUT 2. Also do not leave the ordinary EXP2 overflow slope
+enabled: transformed values outside the correction interval otherwise
+extrapolate to large values instead of holding the endpoint bias.
+
+Two multiplicative LUT decompositions were measured and rejected:
+`exp(x/2)*exp(x/2)` produced 241 mismatches, and asymmetric splits still
+produced at least 95. Their relative LUT errors reinforce during multiplication.
+The residual form corrects the first task instead.
+
+After correction, use the same NPU mask epilogue as direct EXP2 so scaled EXP
+preserves positive infinity, negative infinity, and NaN.
+
 ### SQRT refinement
 
 A linear SQRT LUT is least accurate near zero because the derivative is

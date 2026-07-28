@@ -1,5 +1,27 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — two-LUT EXP forward milestone
+
+### Implementation
+- `exp(x)` now uses two actual NPU LUT tasks. The first is the existing Q12
+  `EXP2(x*log2(e))`; the second supplies a signed residual correction.
+- The residual LUT receives `z=(x+1.75)*8`, giving four times the input
+  resolution over the only failing interval, approximately `[-2,-1.5]`.
+- Hardware probing established that the first LUT floors linear interpolation
+  between entries. The correction builder models that behavior and emits zero
+  outside the official `rtol=1e-3, atol=1e-6` failure band.
+- A `0.125` table bias avoids the RK3588 exact-zero LUT corruption; native SUB
+  removes the bias. The correction LUT uses flat overflow endpoints.
+- The final NPU epilogue preserves `exp(+inf)=+inf`, `exp(-inf)=0`, and NaN.
+
+### Verification
+- `TestOps.test_exp` — **PASS** with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- EXP2, sigmoid, SiLU, Swish, and nested EXP2/LOG2 regressions — **PASS**.
+- All **54** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- Incremental census: **135 PASS, 281 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — zero-axis boolean reduction census milestone
 
 - Re-ran the historical boolean reduction failures under
