@@ -1,5 +1,246 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — PC-chain execution fixed
+
+### Root causes and fix
+- `_emit_dpu` already ended every single-task command stream with
+  `PC_OPERATION_ENABLE`, but `_submit_multi` counted that word as body and
+  appended another complete four-qword PC tail. The duplicate enable made the
+  original chain time out.
+- Multi-task DPU register writes must follow the ordering proven by
+  `ref/rk3588/experimental/multicore_elementwise.py`; a canonical ordering pass
+  now preserves the existing branch-oriented emitter while producing that
+  hardware-tested sequence.
+- PC-chain packing now emits `(cmds[:-1] + four-word tail)`, uses the next
+  subtask's raw body length (`len(cmds)-1`) for `PC_REGISTER_AMOUNTS`, and sets
+  descriptor `regcfg_amount` to `len(cmds)+3`.
+- RDMA channel configuration now uses the reference value `0x7`; the old
+  `0x70007` single-task value and the old notch write remain commented in the
+  Rockchip source for reference.
+
+### Verification
+- Backend PC-chain probe: two separately relocated fp16 ADD subtasks in one
+  ioctl, both 16-element outputs exact — **PASS**.
+- Reference `ADD,MUL,SUB` three-task PC chain — **PASS** for all three tasks.
+- `test/rockchip/test_hw.py` — **39 passed**.
+- The temporary probe also exposed and fixed two test-only mistakes: it assumed
+  output slot 2 although the captured task reported slot 0, and it passed a
+  pointer from a temporary NumPy array that had already been freed. Neither was
+  a backend defect.
+
+## 2026-07-28 — "forward pass failed" investigation (silent wrong results)
+
+### Investigation results
+Investigated all non-RKPLAN_REJECT failures (the "forward pass failed" and
+"AssertionError" cases — silent wrong results, the highest-priority bugs).
+Found 8 tests with "forward pass failed" and ~12 with "AssertionError" (dtype
+mismatch). All require major features — no quick fixes.
+
+### "forward pass failed" breakdown
+
+| Test | Shape | Root cause | Fix needed |
+|---|---|---|---|
+| test_exp | (45,65) | LUT precision: 315/2925 elements fail tolerance | multi-task (range reduction) |
+| test_log | (45,65) | LUT NaN mismatch (1527) + precision (303) | multi-task (NaN pre-check) |
+| test_log2 | (45,65) | LUT NaN mismatch (1453) + precision (291) | multi-task (NaN pre-check) |
+| test_log10 | (45,65) | LUT NaN mismatch + precision | multi-task (NaN pre-check) |
+| test_sin | (45,65) | LUT precision: 79/2925 elements fail | multi-task or better algorithm |
+| test_sqrt | (45,65) | LUT NaN mismatch (1475) + precision (29) | multi-task (NaN pre-check) |
+| test_rsqrt | (45,65) | LUT NaN mismatch + precision | multi-task (NaN pre-check) |
+| test_div_naninf | — | NaN/inf handling | multi-task |
+
+### "AssertionError: dtype mismatch" breakdown (12+ tests)
+| Test | Root cause | Fix needed |
+|---|---|---|
+| test_add, test_arange, test_empty_0, test_eye, test_linspace, test_meshgrid, test_ones, test_zeros, test_sum_collapse, test_sum_collapse_neg | torch creates fp32 for ones/zeros/arange/linspace/eye; tinygrad uses fp16 (DEFAULT_FLOAT=HALF) | fp32 support |
+| test_flip_eye_crash, test_mulacc_with_zero_strides | dtype mismatch or numerical | fp32 support |
+
+### LUT precision improvement (sin, sqrt)
+Doubled `output_scale` from 8192 to 16384 (and `minus_exp` from 13 to 14) for
+sin and sqrt LUT builders. This halves the output quantization step:
+- **sin**: 102 → 79 failing elements (23 fewer)
+- **sqrt**: 34 → 29 failing elements (5 fewer, valid inputs only)
+
+The tests still fail because `np.testing.assert_allclose` requires ALL elements
+to pass — even 1 failure out of 2925 fails the test. But the NPU now produces
+more accurate results.
+
+### LUT precision root causes (fundamental hardware limits)
+1. **513 entries per table** — hardware limit, can't increase
+2. **int16 LUT output** — max ±32767, limits output_scale
+3. **fp16 index_scale** — BN_MUL_CFG stores fp16, quantization error ~0.015%
+4. **"exact 0" hardware bug** — LUT output of 0 produces garbage (8.0 for sin);
+   workaround sets minimum to 1/output_scale, causing error near zero crossings
+5. **No NaN production** — LUT always returns finite values; log/sqrt of negatives
+   clips instead of returning NaN (test expects NaN)
+
+### What was tried but didn't work
+- **fp16-quantizing index_scale before computing LUT entries**: Made sin WORSE
+  (79→374 failures). The hardware's interpolation doesn't match a simple linear
+  model — the small systematic error from non-quantized index_scale partially
+  cancels the interpolation error. Reverted.
+- **Removing "exact 0" workaround**: sin(0) returns 8.0 (garbage). Bug confirmed
+  real. Workaround is necessary.
+
+### Test count unchanged
+457 failed, 84 passed, 8 skipped — identical before and after LUT precision
+improvements. The improvements are code quality improvements (more accurate NPU
+output) but don't change test pass/fail status.
+
+## 2026-07-28 — PPU windowed pooling investigation (max_pool2d)
+
+### Attempted: PPU windowed pooling for max_pool2d
+Investigated whether the NPU's PPU (Pooling Processing Unit) — which supports
+windowed pooling with kernel size, stride, and 3D output — could be used to
+pass some of the `max_pool2d` tests currently failing with `unsupported_layout`.
+
+**Approach:**
+1. Wrote a `_try_pool2d` classifier that detects the windowed max_pool2d AST
+   pattern: `REDUCE(MAX, INDEX(input, idx))` with 2 REDUCE ranges (kh, kw) and
+   up to 2 LOOP ranges (out_h, out_w). For C=1 NCHW layout, the index
+   expression is `reduce_h*W + out_h*sh*W + out_w*sw + reduce_w`.
+2. Wrote a `_emit_ppu_pool2d` emitter that programs the PPU with
+   `POOLING_KERNEL_CFG` for kernel size and stride (instead of global mode),
+   and `DATA_CUBE_OUT_WIDTH/HEIGHT` for the 2D output.
+
+**Result: WRONG OUTPUT — PPU requires HWC layout, not NCHW.**
+The PPU's RDMA reads data in atoms of 16 FP16 elements (32 bytes) per pixel.
+For C=1 NCHW data, each pixel is only 2 bytes (1 fp16 channel), but the PPU
+reads 32 bytes per pixel — mixing adjacent rows of the input into a single
+pixel's channel data. This produces silently wrong results:
+- Input (4x4, C=1): `[[0.20, 0.90, ...], ...]`
+- Expected output (2x2): `[[0.90, 0.73], [0.66, 0.94]]`
+- Actual output: `[[0.20, 0.90], [0.46, 0.94]]` (wrong)
+
+**Root cause:** The PPU expects HWC layout with C padded to the atom size
+(8 channels for FP16 on RK3588). tinygrad uses NCHW layout. For C=1, NCHW
+and HWC layouts differ, and the PPU's atom-based RDMA reads 8 channels per
+pixel, producing wrong results with NCHW data.
+
+**Fix needed:** A data layout transform (NCHW→HWC with C=8 padding) before
+the PPU can process it. This requires **multi-task support** — a DMA task
+to repack the data, then the PPU task. This is a major architectural feature.
+
+**DeepWiki confirmation:** The NVDLA PDP *can* process C=1 in FP16 mode
+(`surface_num = ceil(C / 16) = 1`), but the RDMA still reads `ATOM_CUBE_SIZE`
+(32-byte) chunks. The valid elements within each atom are meaningful, but
+the data must be laid out as HWC with the channel dimension innermost and
+atom-aligned. NCHW data with C=1 has the channel interleaved with the
+width dimension, not atom-aligned.
+
+**Code state:** The `_try_pool2d` classifier and `_emit_ppu_pool2d` emitter
+are commented out in `rockchip.py` for reference. The `plan_rk` PPU path
+and `emit_rk` dispatcher are unchanged — no regressions (457 failed, 84
+passed, same as before).
+
+### max_pool2d test analysis
+- `test_max_pool2d_simple`: shape (1,1,2,3), C=1 — needs NCHW→HWC transform
+- `test_max_pool2d`: shape (32,2,11,28), C=2 — needs NCHW→HWC + C>1 support
+- `test_max_pool2d_unit_stride`: shape (3,2,17,14), C=2 — same
+- All max_pool2d tests use C≥1 NCHW layout, which requires the layout transform
+
+## 2026-07-28 — Failure category investigation (all 457 failures)
+
+### Investigation results
+After the fused epilogue fix, investigated all remaining failure categories
+to determine which are fixable vs hardware limitations. Conclusion: **all 457
+failures require major features that are not implementable in the current
+single-task PR1 architecture**.
+
+### Failure category breakdown
+
+| Category | Count | Root cause | Fix needed |
+|---|---|---|---|
+| unsupported_dtype (float32) | 198 | NPU only supports fp16 | fp32 pipeline |
+| unsupported_op:Ops.WHERE | 120 | WHERE needs branching | multi-task |
+| unsupported_op:fused_epilogue | 116 | CMAC can't apply epilogue | BS/BN fusion or multi-task |
+| unsupported_layout | 126 | 3D+ strided access, broadcast | surface stride DMA + broadcast |
+| unsupported_op:non_index_operand | 86 | EW op on non-INDEX result | multi-task |
+| unsupported_layout:Ops.ADD | 58 | 3D strided access in CMAC | surface stride DMA |
+| unsupported_op:Ops.MUL | 46 | product reduction | hardware limitation |
+| unsupported_op:Ops.RECIPROCAL | 4 | RECIPROCAL(ADD(...)) | multi-task |
+| unsupported_op:Ops.TRUNC | 2 | NPU DPU ALU has no trunc | not supported by hardware |
+| unsupported_op:Ops.SIN | 2 | SIN(ADD(...)) | multi-task |
+| no_add_mul_reduction | 4 | non-contiguous sum | strided DMA |
+| cmac_exceeds_cbuf | 4 | weight > CBUF capacity | N-splitting (multi-task) |
+
+### Layout rejection details
+- 29 ADD: 3D+ strided access (ADD(MUL(RANGE,CONST),ADD(...)))
+- 14 RANGE: broadcast (flat RANGE with 2D partner, uniformity check fails)
+- 2 MUL: scaled index
+- 1 FLOORMOD, 1 FLOORDIV: modular index
+
+### Key findings
+1. **TRUNC/FLOOR/CEIL/ROUND**: Not supported by NPU DPU EW ALU. The ALU only
+   has ADD (algo=2), SUB (algo=4), MUL (algo=1), MAX (algo=0), FDIV (algo=3).
+   No truncation/rounding algorithms exist in the hardware.
+2. **cmac_exceeds_cbuf**: Two cases — (16,1024)@(1024,1024) and (16384,)@(16384,32).
+   Both exceed the 384KB CBUF. The `align_in = max(aligned_k, align_out)` formula
+   is correct per the reference gemm.py — it's a hardware constraint, not a bug.
+   Fix requires N-splitting (multiple CMAC passes with accumulation).
+3. **RECIPROCAL/SIN rejections**: These are RECIPROCAL(ADD(...)) and SIN(ADD(...))
+   — the inner ADD is a previous EW op result, not an INDEX. Needs multi-task
+   to chain DPU passes.
+4. **no_add_mul_reduction**: REDUCE(ADD, INDEX) where the INDEX has an ADD index
+   expression (non-contiguous access from slice/expand). Same root cause as
+   unsupported_layout — needs strided DMA.
+
+### Next major features needed (in priority order)
+1. **Multi-task support** — enables chaining DPU passes (WHERE, non_index_operand,
+   RECIPROCAL/SIN on computed inputs, N-splitting for large matmuls). Would fix
+   ~370 of 457 failures.
+2. **Surface stride DMA** — enables 3D+ tensor access. Would fix ~190 failures.
+3. **fp32 support** — enables float32 tests. Would fix 198 failures.
+4. **Broadcast in DPU EW** — enables elementwise ops with broadcast. Would fix
+   ~40 failures (subset of layout failures).
+
+## 2026-07-28 — Fused epilogue correctness fix
+
+### Bug found and fixed
+The fused epilogue check in `plan_rk` only caught `Ops.ADD` epilogue (bias add).
+ReLU decomposes to `Ops.WHERE`, which passed through the check. The CMAC ran
+without applying the ReLU, producing negative values where zeros were expected —
+silent wrong results. For example, `(a@b).relu()` returned the raw matmul output
+with 51.6% of elements wrong (max diff 42.84).
+
+Fix: replaced the narrow `Ops.ADD` check with a general check — the store value
+must be the reduce itself (possibly via no-op CAST); anything else is a fused
+epilogue that CMAC cannot apply. This catches WHERE, MAX, ADD, and any other
+epilogue op. The tests now fail with `RKPLAN_REJECT:unsupported_op:fused_epilogue`
+(honest rejection) instead of producing wrong results.
+
+### Impact
+- `fused_epilogue` rejections: 4 → 116 (112 tests that were silently dropping
+  the epilogue now reject honestly)
+- `test_matvec`, `test_matvecmat`: were `forward_pass_failed` (silent wrong
+  results), now `RKPLAN_REJECT:unsupported_op:fused_epilogue` (honest)
+- Test count unchanged: 84 passed, 457 failed, 8 skipped
+- No regressions in passing tests
+
+### LUT out-of-range inputs (deferred)
+The LUT hardware clips out-of-range inputs to the LUT range instead of returning
+nan. For example, `log(0.1)` returns `log(0.25) ≈ -1.386` instead of `-2.3`.
+This is a hardware limitation — the NPU LUT has no "return nan" mode. The slope
+registers control extrapolation beyond the table, but there's no "clamp to nan"
+option. Fixing this would require multi-task support (pre-check or post-check
+kernel), which is a major feature.
+
+### Updated rejection counts
+| Reason                          | Count |
+|---------------------------------|-------|
+| unsupported_dtype (float32)     | 198   |
+| unsupported_op:Ops.WHERE        | 120   |
+| unsupported_op:fused_epilogue   | 116   |
+| unsupported_layout              | 126   |
+| unsupported_op:non_index_operand| 86    |
+| unsupported_layout:Ops.ADD      | 58    |
+| unsupported_op:Ops.MUL          | 46    |
+| unsupported_op:Ops.RECIPROCAL   | 4     |
+| unsupported_op:Ops.TRUNC        | 2     |
+| unsupported_op:Ops.SIN          | 2     |
+| no_add_mul_reduction            | 4     |
+| cmac_exceeds_cbuf               | 4     |
+
 ## 2026-07-28 02:50 UTC — DPU LUT ops + MUL fix
 
 ### New work
@@ -9,6 +250,22 @@
 - Fixed MUL EW op: was missing OUT_CVT_SCALE emission (EINVAL)
 - LOG2 uses index_scale=4090 to avoid x=4.0 hitting LUT_LO_END boundary
 - SIN uses index_scale=16384/π to map x∈[-π,π] to LUT range
+
+### 2026-07-27 — LOG (natural log) via LOG2 + output scaling
+- LOG(x) = LOG2(x) * ln(2) implemented via OUT_CVT_SCALE Q15 fixed-point
+- Key finding: modifying LUT entries directly for output_scale_factor causes
+  interpolation artifacts (LOG(1.0) returned 16.0 instead of ~0). Root cause:
+  LUT hardware interpolates between table entries; scaling entries changes
+  the interpolation slope but not the slope registers, causing wrong results
+  for certain entry values.
+- Solution: keep LUT entries unchanged, apply output_scale_factor via
+  OUT_CVT_SCALE register as Q15 fixed-point (scale = factor * 32768, shift = 15)
+  combined with OUT_CVT_SHIFT for MINUS_EXP. This correctly scales the output
+  without affecting LUT interpolation.
+- Also added LUT_LE_END=0 and LUT_LO_START=0 register writes (were missing).
+- Fixed UnboundLocalError: lut_result was only defined in DPU path, not CMAC/PPU.
+- 48 unsupported_op:Ops.MUL rejections are from REDUCE(MUL,...) product
+  reductions (test_prod, test_cumprod, etc.) — NPU only supports ADD/MAX reduces.
 
 ### test_ops.py results
 
@@ -1780,3 +2037,577 @@ During testing, the NPU occasionally produced transient OSError failures
 from `ref/rk3588` (which calls `reset_npu`) restores the device. These failures
 are not caused by the code changes — the baseline also fails when the NPU is in
 a bad state, and all tests pass on retry after reset.
+
+### Re-test on latest code (2026-07-28, code had grown significantly)
+
+The original code kept changing between test rounds. Latest re-test with
+the significantly larger codebase (new `_try_abs`, `_try_cmac_epilogue`,
+`_build_exp2_lut(input_scale)`, FP32 support, etc.):
+
+**Baseline (original code, no changes applied):**
+- `support/rockchip.py`: 819 sz-lines
+- `ops_rockchip.py`: 230 sz-lines
+- Total repo: 25356 sz-lines
+- Tests: **107 passed, 4 failed** (pre-existing baseline failures)
+
+**4 pre-existing baseline failures** (not caused by refactoring changes):
+- `test_mean_axis0_rejected` — expects REJECT but code classifies as "cmac"
+- `test_mean_axis1_rejected` — same
+- `test_mean_full_rejected` — same
+- `test_reject_float32` — expects REJECT but code classifies as "dpu"
+
+These tests expect the classifier to reject mean(axis=0/1/full) and fp32
+ADD, but the current code accepts them (likely tests added before the
+classifier was updated to reject them, or the code was intentionally
+changed to accept these cases).
+
+**Changes applied (A, F, J, K — E subsumed by F):**
+
+The changes were adapted to the new code structure:
+- **A**: `_build_exp2_lut` now takes `input_scale` param and uses
+  `math.exp2(x * input_scale)`. The comprehension includes `* input_scale`.
+  The `input_scale != 1.0` conditional and `minus_exp` logic remain as-is.
+- **F**: New `abs_slot` branch added to `_emit_dpu` — it cannot use
+  `_emit_ew_pair` (has extra BS/BN register writes), so it stays inline.
+  6 of 7 branches now use the helper (was 6 of 6 before).
+- **J**: Now includes `epilogue != "none"` check in the INDEX branch
+  (new epilogue fusion code). `sum_info` hoisted before the if/elif chain.
+- **K**: Unchanged — `_CONST_SLOT`/`_ZERO_SLOT` alloc merge still applies.
+
+**Stacked result:**
+
+| File | Baseline | Stacked | Delta |
+|------|----------|---------|-------|
+| `support/rockchip.py` | 819 | 799 | **-20** |
+| `ops_rockchip.py` | 230 | 223 | **-7** |
+| **Total repo** | 25356 | 25329 | **-27** |
+
+Tests: **107 passed, 4 failed** — identical to baseline (same 4 pre-existing
+failures, no new failures introduced).
+
+**Savings reduced from -30 to -27** because:
+- A saves less: the `input_scale` param and `minus_exp` logic add lines
+  that can't be merged into the comprehension (-8 → ~-5)
+- F saves less: the new `abs_slot` branch can't use the helper (-11 → ~-8)
+- J and K savings unchanged (-2 and -7)
+
+**Not applied to the real repo** — pending user approval.
+
+## 2026-07-28 — New line-saving suggestions (L1–L5): /tmp test results
+
+After the code grew significantly (new `_try_abs`, `_try_cmac_epilogue`,
+`_build_exp2_lut(input_scale)`, FP32 support, RSQRT LUT, etc.), identified
+5 new line-saving opportunities. Tested in `/tmp/tinygrad_test` against
+`test_hw.py` (39 tests) + `test_pr1.py` (72 tests).
+
+Baseline: support=819, ops=230, total=25356, **107 passed, 4 failed**
+(pre-existing failures: `test_mean_axis0/1/full_rejected`, `test_reject_float32`).
+
+### Results table
+
+| # | Suggestion | File | sz-line delta | Verdict |
+|---|-----------|------|---------------|---------|
+| L1 | LUT config dedup: 5 if/elif branches (EXP2/LOG2/SIN/SQRT/RECIPROCAL) all set same `lut_le_start`, `lut_lo_end`, `lut_cfg` → dict lookup + shared defaults | `support/rockchip.py` | **-25** | Apply |
+| L2 | `_convert_fp32_to_fp16_buf`/`_convert_fp16_to_fp32_buf` merge: two near-identical functions → one `_convert_buf(src, dst, n, to_fp16)` | `ops_rockchip.py` | **-3** | Apply |
+| L3 | `prod()` for total in `_emit_dpu_lut`: `total=1; for s in shape: total*=s` → `total=prod(shape)` (prod already imported) | `support/rockchip.py` | **-1** | Apply |
+| L4 | `_try_cmac_epilogue` ReLU dedup: two ReLU forms (WHERE(CMPLT(0,x),x,0) and WHERE(CMPLT(x,0),0,x)) → one `or` condition | `support/rockchip.py` | **-2** | Apply |
+| L5 | `_extract_mul_const_idx` helper: MUL(INDEX,CONST) scaling extraction appeared twice in `_try_lut` → factored into helper | `support/rockchip.py` | **-3** | Apply |
+
+### Stacked result (L1–L5 applied together)
+
+| File | Baseline | Stacked | Delta |
+|------|----------|---------|-------|
+| `support/rockchip.py` | 819 | 788 | **-31** |
+| `ops_rockchip.py` | 230 | 227 | **-3** |
+| **Total repo** | 25356 | 25322 | **-34** |
+
+Tests: **107 passed, 4 failed** — identical to baseline (same 4 pre-existing
+failures, no new failures introduced).
+
+### Details per change
+
+**L1 — LUT config dedup (-25 sz-lines):**
+`_emit_dpu_lut` had 5 if/elif branches (28 lines) for EXP2/LOG2/SIN/SQRT/RECIPROCAL.
+All 5 set identical `lut_le_start = 0xffffc000`, `lut_lo_end = 0x00004000`,
+`lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)`. Only the builder call differs
+(and EXP2 takes `input_scale` as an argument). Replaced with:
+```python
+_LUT_BUILDERS = {Ops.EXP2: _build_exp2_lut, Ops.LOG2: _build_log2_lut, ...}
+lut, ... = _LUT_BUILDERS[lut_op](input_scale) if lut_op is Ops.EXP2 else _LUT_BUILDERS[lut_op]()
+lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+```
+28 lines → 5 lines.
+
+**L2 — fp32 conversion merge (-3 sz-lines):**
+`_convert_fp32_to_fp16_buf` (5 lines) and `_convert_fp16_to_fp32_buf` (5 lines)
+merged into `_convert_buf(src, dst, n, to_fp16: bool)` (5 lines). 4 call sites
+updated. Net: 10 lines → 5 lines + 4 call site changes (same line count).
+
+**L3 — prod() for total (-1 sz-line):**
+`total = 1; for s in _shape_of_store(sink): total *= s` (2 lines) →
+`total = prod(_shape_of_store(sink))` (1 line). `prod` already imported.
+
+**L4 — ReLU dedup (-2 sz-lines):**
+Two ReLU forms in `_try_cmac_epilogue` (6 lines) merged into one `or` condition (4 lines):
+```python
+if cond_u.op is Ops.CMPLT and ((t_u is reduce and f_u.op is Ops.CONST and float(f_u.arg) == 0.0) or (f_u is reduce and t_u.op is Ops.CONST and float(t_u.arg) == 0.0)):
+```
+
+**L5 — _extract_mul_const_idx helper (-3 sz-lines):**
+MUL(INDEX, CONST) scaling extraction appeared twice in `_try_lut` (once for
+RECIPROCAL path, once for general LUT path). Factored into:
+```python
+def _extract_mul_const_idx(inner: UOp) -> tuple[float, UOp]|None:
+  if inner.op is not Ops.MUL: return None
+  a, b = inner.src
+  if a.op is Ops.CONST and _unwrap(b).op is Ops.INDEX: return float(a.arg), _unwrap(b)
+  if b.op is Ops.CONST and _unwrap(a).op is Ops.INDEX: return float(b.arg), _unwrap(a)
+  return None
+```
+Helper is 5 lines; two 6-line extraction blocks replaced by 2-line calls. Net: -3.
+
+### Combined total (A+F+J+K + L1-L5)
+
+If all 9 changes (A, F, J, K from previous round + L1-L5 from this round) are
+applied together, the total savings would be approximately **-61 sz-lines**
+(-27 from A/F/J/K + -34 from L1-L5). Not yet tested stacked together.
+
+**Not applied to the real repo** — pending user approval.
+
+## 2026-07-28 — New line-saving suggestions (L6–L11): /tmp test results
+
+Identified 6 more line-saving opportunities after the L1-L5 round. Tested in
+`/tmp/tinygrad_test` against `test_hw.py` (39 tests) + `test_pr1.py` (72 tests).
+
+Baseline (same as L1-L5 round): support=819, ops=230, total=25356,
+**107 passed, 4 failed** (pre-existing failures).
+
+### Results table
+
+| # | Suggestion | File | sz-line delta | Verdict |
+|---|-----------|------|---------------|---------|
+| L6 | `_emit_dpu` OUT_CVT_SCALE if/else → ternary (FDIV vs others) | `support/rockchip.py` | **-2** | Apply |
+| L7 | `_emit_cmac` epilogue if/elif/else compression (relu/scale/none → if none else ternary + inner if) | `support/rockchip.py` | **-4** | Apply |
+| L8 | fp32 copy 4-branch → 2-branch (mixed=convert, same=memmove with elem size) | `ops_rockchip.py` | **-7** | Apply |
+| L9 | `_emit_dpu` scalar swap branch compression (if swap/else → ternary slot selection) | `support/rockchip.py` | **-4** | Apply |
+| L10 | LUT builder consolidation: 4 builders (LOG2/SIN/SQRT/RSQRT) share LO loop + finish → `_lut_fill`/`_lut_ret` helpers | `support/rockchip.py` | **-37** | Apply |
+| L11 | `_emit_dpu_lut` OUT_CVT_SCALE if/else → ternary (Q15 vs scale=1) | `support/rockchip.py` | **-3** | Apply |
+
+### Stacked result (L1–L11 all applied together)
+
+| File | Baseline | Stacked | Delta |
+|------|----------|---------|-------|
+| `support/rockchip.py` | 819 | 745 | **-74** |
+| `ops_rockchip.py` | 230 | 220 | **-10** |
+| **Total repo** | 25356 | 25272 | **-84** |
+
+Tests: **107 passed, 4 failed** — identical to baseline (same 4 pre-existing
+failures, no new failures introduced).
+
+### Details per change
+
+**L6 — OUT_CVT_SCALE ternary (-2 sz-lines):**
+`_emit_dpu` had if/else for FDIV (scale=1) vs others (scale=(1<<16)|1).
+Collapsed to single `emitter_emit(..., 1 if ew_op is Ops.FDIV else (1 << 16) | 1)`.
+
+**L7 — epilogue compression (-4 sz-lines):**
+`_emit_cmac` had if/elif/else for relu/scale/none epilogue (11 lines).
+Restructured to if "none" (1 line) else ternary BS_CFG + inner if for scale
+MUL_CFG (5 lines). 11 → 6 lines.
+
+**L8 — fp32 copy merge (-7 sz-lines):**
+`ops_rockchip.py` had 4-branch if/elif for fp32 copy (fp32→fp32, fp32→fp16,
+fp16→fp32, fp16→fp16). Collapsed to 2-branch: mixed (convert) vs same
+(memmove with correct elem size). 12 lines → 5 lines.
+
+**L9 — scalar swap compression (-4 sz-lines):**
+`_emit_dpu` scalar branch had if swap/else with 4 emitter calls each (12 lines).
+Collapsed to ternary slot selection + 3 shared emitter calls (8 lines).
+
+**L10 — LUT builder consolidation (-37 sz-lines):**
+The 4 LUT builders (LOG2, SIN, SQRT, RSQRT) each had the same structure:
+init lut, set index_scale/output_scale/step, fill LE table, fill LO table,
+compute bn_mul_operand, return. Extracted two helpers:
+- `_lut_fill(lut, base, step, output_scale, fn, clip=None)` — fills a table
+  with `fn(i*step) * output_scale`, clipped, avoiding exact 0
+- `_lut_ret(lut, index_scale, output_scale, minus_exp)` — packs return tuple
+  with bn_mul_operand
+
+Each builder went from ~18 lines to ~6 lines. 4 builders = ~72 lines → ~24 lines
++ 2 helpers (10 lines) = 34 lines. Net: -37.
+
+**L11 — _emit_dpu_lut OUT_CVT_SCALE compression (-3 sz-lines):**
+if/else for Q15 scaling (output_scale_factor != 1.0) → ternary with `q15` bool.
+8 lines → 4 lines.
+
+### Combined total (A+F+J+K + L1-L11)
+
+If all 15 changes (A, F, J, K from previous round + L1-L11 from these two rounds)
+are applied together, the total savings would be approximately **-111 sz-lines**
+(-27 from A/F/J/K + -84 from L1-L11). Not yet tested stacked together.
+
+**Not applied to the real repo** — pending user approval.
+
+## 2026-07-27 — fp32 buffer-level conversion support
+
+### Implemented: fp32 support for DPU/DPU_LUT
+Added fp32 input/output support via buffer-level fp32↔fp16 conversion. The NPU
+processes fp16 internally, so fp32 buffers are converted to fp16 temp buffers
+before NPU submission, and fp16 outputs are converted back to fp32 after.
+
+**Changes:**
+- `_is_fp16_only`: now accepts fp32 PARAM and STORE nodes (in addition to fp16)
+- `supported_dtypes()`: now returns `{dtypes.half, dtypes.float}`
+- `RKPlan`/`RKTask`: added `fp32_inputs` (slot numbers) and `fp32_output` fields
+- Classifier: detects fp32 PARAM slots, rejects fp32 for CMAC/PPU (their host-side
+  data transforms assume fp16)
+- `encode_rk`/`decode_rk`: version bumped to 3, added 1-byte fp32_mask after const_val
+  (bit 7 = fp32_output, bits 0-6 = fp32 input slot mask)
+- `RockchipProgram.__call__`: converts fp32 inputs→fp16 temp buffers before NPU,
+  redirects fp32 output to fp16 temp buffer, converts back after NPU
+- Copy tasks: handle fp32→fp32, fp32→fp16, fp16→fp32 copies directly
+
+**Results:**
+- `DEFAULT_FLOAT=HALF`: 455 failed/86 passed (was 457/84) — 2 more passes, no regressions
+- `DEFAULT_FLOAT=FLOAT`: 461 failed/81 passed — 8 dtype-mismatch tests pass but 11
+  CMAC/PPU tests now reject (fp32 not supported for those kinds)
+- Net improvement: +2 tests with HALF, fp32 support infrastructure in place
+
+### `unsupported_op:non_index_operand` investigation (86 tests)
+
+**Root cause:** The DPU classifier (line 438) requires binary EW ops (ADD/SUB/MUL/
+MAX/FDIV) to have both operands be INDEX nodes (direct tensor loads). When tinygrad
+fuses multi-step computations into a single kernel, intermediate values (WHERE,
+CMPNE, CMPLT results) appear as non-INDEX operands, causing rejection.
+
+**Affected tests:** test_abs, test_copysign, test_celu, test_elu, test_gelu,
+test_hardsigmoid, test_hardswish, test_mish, test_selu, test_silu, test_swish,
+test_softplus, test_softsign, test_tanh, test_relu6, test_lerp, and more.
+
+**Example: `abs(x)` = `x * sign(x)`**
+Tinygrad decomposes `abs()` into `MUL(x, WHERE(CMPNE(x,0), WHERE(CMPLT(x,0),-1,1), 0))`.
+The MUL has src[0]=INDEX (x) and src[1]=WHERE (sign result). The WHERE operand is
+not an INDEX, so the classifier rejects it.
+
+**`sign()` decomposition:** `WHERE(CMPNE(x, 0), WHERE(CMPLT(x, 0), CONST(-1), CONST(1)), CONST(0))`
+This requires WHERE, CMPNE, and CMPLT — none are in `_DPU_EW_CFGS`.
+
+### Path forward: two approaches
+
+**Approach A — Multi-task support (for WHERE/sign/activations)**
+The `ref/rk3588/experimental/kernel_6_18/where.py` reference shows WHERE is
+implemented as 7 separate NPU submissions:
+1. `diff = x - 0.5` (SUB)
+2. `mask = cmplt(diff)` (custom BS/BN pipeline compare)
+3. Scratch multiply (stale data workaround)
+4. `a*mask` (MUL with op_type=1, op_cvt_bypass)
+5. `1-mask` (SUB)
+6. `b*(1-mask)` (MUL)
+7. `a*mask + b*(1-mask)` (ADD)
+
+This requires major architectural changes:
+- Detect multi-step computations in classifier
+- Decompose into multiple RKPlans
+- Emit multiple RKTasks in a single PROGRAM
+- Manage intermediate buffers between tasks
+- Update LINEAR/INS structure for multiple tasks
+
+**Approach B — BS/BN pipeline exploitation (for neg/abs)**
+The DPU has BS (Broadcast Scale) and BN (Broadcast Normal) pipelines:
+- `bs_op(x) = relu(alu(mul(x, bs_mul_operand), bs_alu_operand))`
+- `bn_op(w) = relu(alu(mul(w, bn_mul_operand), bn_alu_operand))`
+- `ew_op(a, b) = ew_alu_algo(a, b)`
+
+Currently BS and BN are fully bypassed. Enabling BN_MUL with operand=-1 would
+give `neg(x)` as a unary op. Then `abs(x) = max(x, neg(x))` could be done as a
+single-task operation with both SRC and EW pointing to x:
+- BS: bypassed (output = x)
+- BN: mul by -1 (output = -x)
+- EW: MAX (output = max(x, -x) = abs(x))
+
+This requires:
+- Graph rewrite: detect `abs(x)` = `MUL(x, sign(x))` → rewrite to `MAX(x, x)` with BN negate
+- Or: detect `neg(x)` = `MUL(x, CONST(-1))` → handle as unary DPU op with BN_MUL
+- Emitter: add BS/BN configuration to `_emit_dpu`
+- Classifier: accept `MAX(INDEX, INDEX)` where both indexes point to same buffer
+
+**Approach B is simpler and could fix abs/neg quickly, but doesn't help with
+WHERE-based ops (sign, activations). Approach A is needed for the majority.**
+
+## 2026-07-27 — abs() via BS pipeline + CMAC epilogue fusion
+
+### abs() implementation (BS MUL + EW MAX)
+Implemented `abs(x) = max(x, -x)` using the DPU's BS pipeline:
+- BS: MUL by -1 (fp16 0xBC00 at bits 16-31 of BS_MUL_CFG) → output = -x
+- BN: fully bypassed → output = x (from EW weight path)
+- EW: MAX → output = max(-x, x) = abs(x)
+- Both RDMA_SRC and RDMA_EW point to the same input buffer
+
+Key fix: BS_MUL_OPERAND field is at bits 16-31 (not 0-15) of REG_DPU_BS_MUL_CFG.
+The fp16 value must be left-shifted by 16.
+
+Added `_try_abs` detector, `is_abs` flag in RKPlan, and abs branch in `_emit_dpu`.
+Also fixed `abs_slot` initialization (was UnboundLocalError for non-DPU paths).
+
+Tests fixed: `test_abs`, `test_abs_exact` (2 new passes).
+
+### CMAC epilogue fusion (BS ReLU + BS scale)
+Implemented BS-fusable epilogue fusion for CMAC (sum/matmul) operations.
+The DPU BS pipeline sits after the CORE→DPU FP32→FP16 conversion, so it can
+apply post-reduce operations without a separate kernel.
+
+Supported epilogues:
+1. **ReLU**: `WHERE(CMPLT(0, x), x, 0)` → BS_RELU_BYPASS=0, BS_BYPASS=0
+   - BS_CFG = 0x12 (BS enabled, ReLU enabled, MUL/ALU bypassed)
+2. **Scale**: `MUL(x, const)` or `MUL(const, x)` → BS_MUL_BYPASS=0, BS_BYPASS=0
+   - BS_CFG = 0x42 (BS enabled, MUL enabled, ReLU/ALU bypassed)
+   - BS_MUL_CFG = fp16(scale) << 16
+
+Added `_try_cmac_epilogue` detector, `epilogue`/`epilogue_scale` fields in RKPlan,
+and epilogue-aware BS configuration in `_emit_cmac`. Also removed the post-reduce
+scalar MUL rejection in `_try_sum` (was blocking mean = sum * 1/N).
+
+Tests: 3 new passes (450 failed, 91 passed — up from 453/88).
+
+### Remaining rejection breakdown (top categories)
+| Reason | Count | Notes |
+|---|---|---|
+| unsupported_dtype | 142 | uint PARAMs from mean/var/count ops, fp32 CMAC |
+| unsupported_op:Ops.WHERE | 130 | WHERE not supported (needs multi-task) |
+| unsupported_layout | 128 | non-contiguous or non-2D index patterns |
+| unsupported_op:fused_epilogue | ~80 | complex epilogues (not just relu/scale) |
+| unsupported_op:non_index_operand | 106 | binary EW with non-INDEX operands |
+| unsupported_op:Ops.MUL | 48 | MUL in reduce body not matching matmul/sum |
+| unsupported_layout:Ops.ADD | 60 | ADD with non-standard layout |
+| unsupported_layout:Ops.RANGE | 28 | RANGE with non-standard layout |
+
+## 2026-07-27 — full rejection breakdown + cast hack investigation
+
+### Precise rejection counts (from test_ops.py full run)
+```
+ 162  unsupported_op:Ops.WHERE
+ 142  unsupported_dtype
+ 136  unsupported_layout
+ 106  unsupported_op:non_index_operand
+  60  unsupported_layout:Ops.ADD
+  50  unsupported_op:Ops.MUL
+  34  unsupported_op:fused_epilogue
+  28  unsupported_layout:Ops.RANGE
+  20  unsupported_layout:(8,    -- non-2D output shapes
+  18  cmac_exceeds_cbuf
+  12  unsupported_layout:(6,
+  10  unsupported_layout:(64,
+   8  unsupported_dtype:fp32_cmac
+   6  unsupported_op:Ops.ADD
+   4  unsupported_op:Ops.RECIPROCAL
+   4  unsupported_layout:Ops.MUL
+   4  no_add_mul_reduction
+   2  unsupported_op:Ops.TRUNC
+   2  unsupported_op:Ops.SIN
+   2  unsupported_op:Ops.EXP2
+   2  unsupported_layout:Ops.FLOORMOD
+   2  unsupported_layout:Ops.FLOORDIV
+   2  unsupported_layout:(32,
+   2  unsupported_layout:(24,
+   2  unsupported_layout:(18,
+   2  unsupported_layout:(1,):135
+```
+
+### What each rejection means (AST evidence gathered)
+
+**unsupported_op:Ops.WHERE (162 tests)** — the single largest category.
+These are ops that lower to WHERE in the UOp graph:
+- `ceil`, `floor`, `round`, `trunc` → `WHERE(CMPLT(TRUNC(x), x), TRUNC(x)+1, TRUNC(x))`
+- `sign` → `WHERE(CMPNE(x,0), WHERE(CMPLT(x,0),-1,1), 0)`
+- `clip`, `hardtanh`, `leaky_relu` → nested WHERE for clamping
+- `hardsigmoid`, `hardswish` → WHERE for piecewise linear regions
+- `cmp_gt/lt/eq/ge/le` → WHERE producing bool (also dtype issue)
+- `masked_fill`, `where`, `inf_where` → general WHERE
+- `isfinite`, `isinf`, `isnan`, `isclose`, `logical_not` → WHERE with comparisons
+
+The DPU EW unit does NOT support WHERE directly. The other branch (a1d2362b1)
+solves this by rewriting WHERE as `b + (a-b)*mask` where mask is produced by
+a CUSTOM "cmplt_diff2bool" op using BS/BN custom math. This needs the
+extra_matcher approach (see cast hack section below).
+
+**unsupported_dtype (142 tests)** — second largest.
+Two sub-categories:
+1. **bool/int/uint PARAMs** (~134): ops like `cmp_gt` produce bool, `cast('int')`
+   has int PARAMs, `mean`/`var`/`sum` have uint PARAMs (mask/count). The NPU
+   only processes fp16. Our current `_is_fp16_only` rejects these.
+2. **fp32_cmac** (8): fp32 inputs to CMAC operations. We support fp32 for
+   DPU/DPU_LUT via buffer conversion, but not for CMAC (pad/swizzle assumes fp16).
+
+**unsupported_op:non_index_operand (106 tests)** — third largest.
+EW ops where one operand is neither INDEX nor CONST. These are multi-step
+computations that can't be done in a single DPU pass:
+- `minimum(x, scalar)` → `MUL(MAX(MUL(INDEX, -1), CONST), -1)` (negated MAX)
+- `relu6` → `WHERE(CMPLT(INDEX, 0), 0, WHERE(CMPLT(INDEX, 6), INDEX, 6))` (nested WHERE)
+- `tanh` → `MUL(SUB(RECIPROCAL(ADD(EXP2(MUL(INDEX, 2)), 1)), 1), ...)` (multi-step)
+- `hardsigmoid`, `hardswish` → multi-step with WHERE
+
+**unsupported_op:fused_epilogue (34 tests)** — epilogues not recognized by
+`_try_cmac_epilogue`. These are complex post-reduce ops like:
+- `std` → `SQRT(MUL(SUB(MEAN, x), ...))` (not just relu/scale)
+- Nested WHERE after reduce
+- Multiple MUL/ADD chains after reduce
+
+### Cast hack investigation — BLOCKED, ref repo already solved
+
+**The problem:** int32→fp16 buffer size mismatch. When a PARAM is int32
+(4 bytes/elem), the buffer allocated by tinygrad is `n*4` bytes. But the NPU
+expects fp16 (2 bytes/elem). Our current buffer-level conversion approach
+(used for fp32) converts the data but doesn't change the buffer size — the
+NPU reads `n*2` bytes from a `n*4` byte buffer, which works for fp32→fp16
+(both are "wider→narrower"). But for int32→fp16, the conversion is not just
+a format change — it's a semantic cast (int values reinterpreted as fp16).
+
+**The other branch's solution (commit a1d2362b1):**
+The `rockchip/backend-consideration` branch solved this using `extra_matcher`
+on `RockchipRenderer`. The `extra_matcher` is a `PatternMatcher` that runs
+during codegen's `final rewrite` phase (codegen/__init__.py:341-343), BEFORE
+`native_program` is called. It rewrites UOps at the graph level:
+
+```python
+# int ops → fp16 with cast-back to preserve dtype
+(UPat(Ops.MUL, dtypes.int, name="x"),
+ lambda x: x.src[0].cast(dtypes.float16).alu(Ops.MUL, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+(UPat(Ops.ADD, dtypes.int, name="x"),
+ lambda x: x.src[0].cast(dtypes.float16).alu(Ops.ADD, x.src[1].cast(dtypes.float16)).cast(dtypes.int)),
+# float ops → fp16 with cast-back
+(UPat(Ops.ADD, dtypes.float, name="x"),
+ lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half)).cast(x.dtype)),
+# Comparison ops → CUSTOM NPU ops
+(UPat(Ops.CMPLT, name="x"),
+ lambda x: UOp(Ops.CUSTOM, dtypes.bool, src=(...,), arg="cmplt_diff2bool")),
+# WHERE → b + (a-b)*mask (avoids constant-first subtraction HW bug)
+(UPat(Ops.WHERE, name="w", src=(UPat.var("c", dtypes.bool), UPat.var("a"), UPat.var("b"))),
+ lambda w,c,a,b: b.cast(dtypes.float16).alu(Ops.ADD, a.cast(dtypes.float16).alu(Ops.SUB, b.cast(dtypes.float16)).alu(Ops.MUL, c.cast(dtypes.float16))).cast(w.dtype)),
+```
+
+**Why this solves the buffer mismatch:**
+The `extra_matcher` rewrites the UOp graph so that by the time
+`native_program` sees the AST, all ops are fp16. The CAST(int→fp16) is a
+separate UOp that the other branch's Python uops emulator handles in software
+(`RockchipProgram.__call__` interprets UOps including CAST).
+
+**Architecture gap for our native_program approach:**
+Our `RockchipRenderer` uses `native_program` (builds NPU register commands
+directly) instead of a Python uops emulator. To port the `extra_matcher`:
+1. Add the `extra_matcher` PatternMatcher to `RockchipRenderer`
+2. Handle CAST(int→fp16) in the classifier: accept `CAST(fp16, PARAM(int))`
+   and convert int32→fp16 buffer in `__call__` (extend existing fp32 approach)
+3. Handle CAST(int, ...) output: convert fp16→int32 after NPU execution
+4. Handle CUSTOM ops (cmplt_diff2bool, cmpeq_32800_to_bool) in the emitter
+   using BS/BN custom math (reference: ref/rk3588/experimental/ops_rockchip_standalone.py)
+
+**Key reference files:**
+- `ref/rk3588/experimental/ops_rockchip_standalone.py` — BS/BN custom math for
+  cmplt_diff2bool and cmpeq_32800_to_bool
+- `ref/rk3588/experimental/kernel_6_18/where.py` — WHERE as EW multiply+add
+- `ref/rk3588/experimental/rknnops.h` — ALU algo values (0=MAX, 1=MIN, 2=ADD,
+  3=DIV, 4=SUB, 9=MUL, 10=ReLU)
+- Commit `a1d2362b1` — full extra_matcher with WHERE/comparison lowering
+
+### EW ALU algorithm values (from NVDLA hw + rknnops.h)
+| Algo | Value | Operation |
+|------|-------|-----------|
+| MAX  | 0     | max(a, b) |
+| MIN  | 1     | min(a, b) |
+| ADD  | 2     | a + b     |
+| EQL  | 3     | a == b    |
+| SUB  | 4     | a - b     |
+| MUL  | 9     | a * b     |
+
+These are used in EW_ALU_ALGO (bits 16-19 of REG_DPU_EW_CFG),
+BS_ALU_ALGO (bits 16-19 of REG_DPU_BS_CFG), and BN_ALU_ALGO (bits 16-19
+of REG_DPU_BN_CFG). MIN (algo=1) is supported but not yet used in our code.
+
+### unsupported_op:Ops.MUL — root cause analysis (25 ASTs captured)
+
+The rejection fires at rockchip.py:516-528 — when the reduce body is `MUL(...)`
+but doesn't match `MUL(INDEX, INDEX)` (matmul) or `MUL(INDEX, CONST)` (scaled sum).
+
+| Pattern | Count | What it is | Fixable? |
+|---|---|---|---|
+| `MUL(WHERE(mask, IDX, 0), IDX)` | ~18 | masked sum — WHERE produces 0/1 mask inside reduce body | Yes — WHERE extra_matcher |
+| `MUL(WHERE(clamp), ...)` | ~3 | clamping inside reduce — same root cause | Yes — WHERE extra_matcher |
+| `MUL(ADD(IDX, MUL(IDX,-1)), ADD(IDX, MUL(IDX,-1)))` | 2 | variance `(x-mean)²` — both operands are composite | No — needs multi-task |
+| `IDX` (anomaly) | 2 | different reduce node in same sink, misattributed | N/A |
+
+**~84% (21/25) are WHERE rejections in disguise.** The dominant pattern is
+`REDUCE(ADD, MUL(WHERE(condition, IDX, 0), IDX))` — a masked sum. The WHERE
+inside the reduce body produces a 0/1 mask, making the MUL operand a WHERE
+node instead of INDEX or CONST.
+
+If WHERE were lowered via `extra_matcher` (commit a1d2362b1 approach), WHERE
+would be rewritten to `b + (a-b)*mask` where mask is a CUSTOM `cmplt_diff2bool`
+op. The MUL would then become `MUL(CUSTOM(...), IDX)` — which still wouldn't
+match `MUL(INDEX, CONST)` directly, but the mask would be a separate DPU pass,
+and the remaining `MUL(INDEX, INDEX)` or `MUL(INDEX, CONST)` would match the
+CMAC patterns.
+
+Only the 2 variance cases (`MUL(x-mean, x-mean)`) are genuinely blocked — both
+MUL operands are composite expressions, not INDEX or CONST. This needs
+multi-task decomposition (compute `x-mean` in one pass, then `sum((x-mean)²)`
+in another).
+
+### Feasibility assessment for remaining fixes (corrected)
+| Fix | Tests | Feasible? | Approach |
+|-----|-------|-----------|----------|
+| WHERE→b+(a-b)*mask via extra_matcher | ~162 | Yes (port from a1d2362b1) | extra_matcher + CUSTOM ops + BS/BN math |
+| int/bool dtype via extra_matcher | ~134 | Yes (port from a1d2362b1) | extra_matcher + buffer conversion |
+| EW MIN (algo=1) for minimum/clip | ~10 | Yes | Add Ops.MIN mapping (not in tinygrad, use MAX with negation) |
+| non_index_operand (multi-step) | ~106 | Partially | Depends on WHERE fix; some need multi-task |
+| MUL-in-reduce (masked sum) | ~21 of 25 | Yes (WHERE fix) | WHERE extra_matcher resolves ~84% |
+| MUL-in-reduce (variance) | 2 | No | Needs multi-task decomposition |
+| Conv2d pipeline | ~80 | No (major arch) | Needs CSC/CMAC/CACC conv pipeline |
+| Non-contiguous layout | ~136 | No (major arch) | Needs conv pipeline indexing |
+| Large matmul (CBUF) | ~18 | No | Hardware CBUF size limit |
+| LUT precision/NaN | ~15 | No | Needs multi-task for range reduction |
+
+## PC Chain Progress (2026-07-27)
+
+### Status: In Progress — submit succeeds but output is zeros
+
+### What works
+- Multi-task image encoding/decoding (`encode_rk_multi`/`decode_rk_multi` in support/rockchip.py)
+- `RockchipProgram._submit_multi` packs N tasks into cmd_buf with PC chain tails
+- `DRM_IOCTL_RKNPU_SUBMIT` with `task_number=N`, `RKNPU_JOB_PC|BLOCK|PINGPONG` succeeds (no timeout) when using `enable_mask=0x18` (no `| 1`)
+- Single-task DPU ops still work correctly after changes
+
+### Current blocker: output is all zeros
+- Submit returns 0 (success) but output buffer remains zeros
+- Task 0 is not executing its DPU operation
+
+### Key findings from ref/rk3588/experimental/pcchain.md
+The pcchain.md document is the authoritative reference for PC chain format:
+
+1. **regcfg_amount = body qwords + 4 (PC tail qwords)** — descriptor amount MUST include the tail
+2. **PC_REGISTER_AMOUNTS = next body qword count (raw, not ceil_div)** — NOT `ceil(n/2)+1`
+3. **enable_mask = 0x18 for DPU** — NO `| 1` bit (the `| 1` causes immediate timeout)
+4. **flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG** — all three required
+5. **task_number = n_tasks, subcore_task[0] = (0, n_tasks)** — submit ALL tasks to driver
+6. **Re-arm S_POINTER=0x0e in every chained segment** — critical for PC chain (pcchain.md §ADD Reference Captures)
+7. **Last segment tail**: first qword = 0 (not E(PC_REG, PC_BASE_ADDRESS, 0))
+
+### Changes made
+- `support/rockchip.py _emit_dpu`: Added S_POINTER (0x0e) for DPU and RDMA at start of body, added DATA_CUBE_HEIGHT and DATA_CUBE_NOTCH_ADDR to match ref elementwise.py
+- `ops_rockchip.py _submit_multi`: Rewrote to follow pcchain.md spec exactly:
+  - regcfg_amount = len(cmds) + 4
+  - PC_REGISTER_AMOUNTS = raw next body count
+  - enable_mask = 0x18 (no | 1)
+  - flags = PC | BLOCK | PINGPONG
+  - task_number = n_tasks
+
+### Remaining issue
+S_POINTER value `0x0e` (ref value) causes timeout in PC chain mode, while `0x30` (our original PP_CLEAR value) works in single-task but produces zeros in PC chain. Need to:
+- Test `0x0e` in single-task mode to see if it works
+- Compare exact register sequence with ref elementwise.py line-by-line
+- May need to run ref elementwise.py first to confirm it works on this hardware, then diff
+
+### Files modified
+- `tinygrad/runtime/support/rockchip.py` — _emit_dpu: added S_POINTER, DATA_CUBE_HEIGHT, DATA_CUBE_NOTCH_ADDR
+- `tinygrad/runtime/ops_rockchip.py` — _submit_multi: complete rewrite per pcchain.md
+- `tinygrad/runtime/support/rockchip.py` — RKSubTask, encode_rk_multi, decode_rk_multi, build_native_program_multi (from earlier session)

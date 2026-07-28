@@ -15,7 +15,8 @@ from tinygrad.uop.ops import UOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.support.rockchip import build_native_program, encode_rk, decode_rk, RKTask, RKReloc, _CONST_SLOT, _ZERO_SLOT
+from tinygrad.runtime.support.rockchip import (build_native_program, build_native_program_multi,
+  encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask, _CONST_SLOT, _ZERO_SLOT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -34,6 +35,18 @@ def _fp32_to_fp16(b):
   try: return struct.unpack('<H', struct.pack('<e', struct.unpack('<f', struct.pack('<I', b))[0]))[0]
   except OverflowError: return 0xFC00 if b>>31 else 0x7C00
 
+def _convert_fp32_to_fp16_buf(src, dst, n):
+  """Convert n fp32 elements at src to fp16 at dst (buffer-level cast, not NPU compute)."""
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32).astype(np.float16)
+  ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
+def _convert_fp16_to_fp32_buf(src, dst, n):
+  """Convert n fp16 elements at src to fp32 at dst (buffer-level cast, not NPU compute)."""
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.float32)
+  ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
+
 def _unpack_cmac_out(src, dst, M, N, align_out):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   for i in range(M * N):
@@ -43,9 +56,14 @@ class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
   task: RKTask
   relocs: list[RKReloc]
+  subtasks: list[RKSubTask] | None  # multi-task (PC chain) or None for single-task
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.device, self.name, self.submit_count, self.last_enable_mask = dev, obj.name, 0, 0
-    if len(obj.lib) >= 4 and struct.unpack_from("<I", obj.lib, 0)[0] == 0x524b494d:
+    self.subtasks = None
+    if len(obj.lib) >= 8 and struct.unpack_from("<II", obj.lib, 0) == (0x524b494d, 4):
+      # Version 4: multi-task PC chain image
+      self.subtasks = decode_rk_multi(obj.lib)
+    elif len(obj.lib) >= 4 and struct.unpack_from("<I", obj.lib, 0)[0] == 0x524b494d:
       self.cmds, self.task, self.relocs = decode_rk(obj.lib)
     else:
       raise RuntimeError(f"rk: no Python fallback — binary is not an RKImage (len={len(obj.lib)}, first byte={obj.lib[0]:#x})")
@@ -53,6 +71,8 @@ class RockchipProgram(Program['RockchipDevice']):
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     dev = self.device
     dev.reset_npu()
+    if self.subtasks is not None:
+      return self._submit_multi(bufs)
     task = self.task
     temp:list[HCQBuffer] = []
     try:
@@ -102,12 +122,47 @@ class RockchipProgram(Program['RockchipDevice']):
           temp.append(out_padded)
           ppu_padded = (channels, chan_padded, out_padded)
           buf_map[task.out_slot] = out_padded  # type: ignore[assignment]
+      # fp32 buffer-level conversion: NPU processes fp16, so convert fp32 inputs→fp16 temp buffers,
+      # and redirect fp32 output to a fp16 temp buffer (converted back to fp32 after NPU execution).
+      # Copy tasks handle fp32 directly (no NPU processing), so skip conversion for them.
+      # PPU fp32 not yet supported (channel padding complicates output redirect).
+      fp32_out_temp = None  # (original_out_buf, fp16_temp_buf, n_elements) for fp16→fp32 after NPU
+      if task.kind in ("dpu", "dpu_lut") and not task.is_copy:
+        total = task.layout[0] if task.kind != "ppu" else task.layout[2]  # n_elements
+        # Convert fp32 input buffers to fp16 temp buffers
+        for slot in task.fp32_inputs:
+          if slot in buf_map and slot != _CONST_SLOT and slot != _ZERO_SLOT:
+            src_buf = buf_map[slot]
+            fp16_buf = dev._gpu_alloc(max(total * 2, 4096), 0)
+            temp.append(fp16_buf)
+            _convert_fp32_to_fp16_buf(src_buf.va_addr, fp16_buf.va_addr, total)
+            buf_map[slot] = fp16_buf  # type: ignore[assignment]
+        # Redirect fp32 output to fp16 temp buffer
+        if task.fp32_output and task.out_slot in buf_map:
+          orig_out = buf_map[task.out_slot]
+          fp16_out = dev._gpu_alloc(max(total * 2, 4096), 0)
+          temp.append(fp16_out)
+          buf_map[task.out_slot] = fp16_out  # type: ignore[assignment]
+          fp32_out_temp = (orig_out, fp16_out, total)
       # DPU DMA copy: host-side memmove (data movement, not NPU compute).
       # No submit_count increment — no NPU submission. Documented honestly as non-native.
       if task.is_copy:
         total = task.layout[0]
-        in_buf, out_buf = buf_map[self.relocs[1].globals_slot], buf_map[self.relocs[0].globals_slot]
-        ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
+        in_slot = self.relocs[1].globals_slot
+        in_is_fp32 = in_slot in task.fp32_inputs
+        out_is_fp32 = task.fp32_output
+        in_buf, out_buf = buf_map[in_slot], buf_map[self.relocs[0].globals_slot]
+        if in_is_fp32 and out_is_fp32:
+          # fp32→fp32 copy: just memmove fp32 data directly
+          ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 4)  # type: ignore[arg-type]
+        elif in_is_fp32 and not out_is_fp32:
+          # fp32→fp16 copy: convert
+          _convert_fp32_to_fp16_buf(in_buf.va_addr, out_buf.va_addr, total)
+        elif not in_is_fp32 and out_is_fp32:
+          # fp16→fp32 copy: convert
+          _convert_fp16_to_fp32_buf(in_buf.va_addr, out_buf.va_addr, total)
+        else:
+          ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
         return
       n_cmds = len(self.cmds)
       assert n_cmds <= dev.cmd_buf_size
@@ -165,11 +220,144 @@ class RockchipProgram(Program['RockchipDevice']):
       elif task.kind == "ppu" and ppu_padded is not None:
         channels, chan_padded, out_padded = ppu_padded
         ctypes.memmove(bufs[task.out_slot].va_addr, out_padded.va_addr, channels * 2)  # type: ignore[arg-type]
+      # fp32 output: convert fp16 temp buffer → fp32 in original output buffer
+      if fp32_out_temp is not None:
+        orig_out, fp16_out, n = fp32_out_temp
+        _convert_fp16_to_fp32_buf(fp16_out.va_addr, orig_out.va_addr, n)
     finally:
       for b in temp: dev._gpu_free(b)
     self.submit_count += 1
     self.last_enable_mask = task.enable_mask
     dev.submitted_masks.add(task.enable_mask)
+
+  def _submit_multi(self, bufs:tuple) -> None:
+    """Submit multiple DPU tasks as a PC chain (single IOCTL, multiple tasks).
+    PC chain format from ref/rk3588/experimental/pcchain.md and examples/elementwise.py.
+    Key rules (pcchain.md §Debug Checklist, §ADD Reference Captures):
+      - regcfg_amount = body qwords + 4 (PC tail qwords)
+      - PC_REGISTER_AMOUNTS = next body qword count (raw, not ceil_div)
+      - enable_mask = 0x18 for DPU (no | 1)
+      - flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG
+      - task_number = n_tasks, subcore_task[0] = (0, n_tasks)
+      - Re-arm S_POINTER=0x0e in every chained segment (already in body cmds)
+    """
+    dev = self.device
+    from tinygrad.runtime.support.rockchip import _T_PC_REG, _T_VERSION, _PC_CHAIN_TAIL_QWORDS
+    _T_PC = 0x0081
+    subtasks = self.subtasks
+    assert subtasks is not None
+    temp:list[HCQBuffer] = []
+    try:
+      buf_map:dict[int, HCQBuffer] = {i: b for i, b in enumerate(bufs)}
+      n_tasks = len(subtasks)
+      # Emitters already end each command stream with PC_OPERATION_ENABLE. For a chain that
+      # word is the final word of the four-qword PC tail, not part of the register body.
+      offsets = []
+      offset = 0
+      for st in subtasks:
+        offsets.append(offset)
+        offset += ((len(st.cmds) + _PC_CHAIN_TAIL_QWORDS) // 2) * 2  # (cmds - enable) + tail, aligned to 2 qwords
+      total_qwords = offset
+      assert total_qwords <= dev.cmd_buf_size, f"PC chain: {total_qwords} qwords > cmd_buf {dev.cmd_buf_size}"
+      # Pack cmds + PC chain tails into cmd_buf
+      regcmd = ctypes.cast(dev.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * dev.cmd_buf_size)).contents  # type: ignore[arg-type]
+      for i in range(total_qwords): regcmd[i] = 0  # clear
+      cmd_buf_dma = dev.cmd_buf.meta.dma_addr
+      for idx, st in enumerate(subtasks):
+        base = offsets[idx]
+        n_body = len(st.cmds) - 1
+        assert (st.cmds[-1] & 0xffff) == rk.REG_PC_OPERATION_ENABLE
+        # Write the body without its single-task PC_OPERATION_ENABLE; the chain tail supplies it.
+        for j, cmd in enumerate(st.cmds[:-1]): regcmd[base + j] = cmd
+        # PC chain tail (4 qwords) — pcchain.md §PC Tail Layout
+        tail_base = base + n_body
+        if idx + 1 < n_tasks:
+          next_st = subtasks[idx + 1]
+          next_addr = (cmd_buf_dma + offsets[idx + 1] * 8) & 0xfffffff0
+          next_n_body = len(next_st.cmds) - 1  # raw body count (pcchain.md §Amount Encoding)
+          regcmd[tail_base + 0] = ((_T_PC_REG << 48) | ((next_addr & 0xFFFFFFFF) << 16) | rk.REG_PC_BASE_ADDRESS)
+          regcmd[tail_base + 1] = ((_T_PC_REG << 48) | ((next_n_body & 0xFFFFFFFF) << 16) | rk.REG_PC_REGISTER_AMOUNTS)
+          regcmd[tail_base + 2] = ((_T_VERSION << 48) | 0)
+          regcmd[tail_base + 3] = ((_T_PC << 48) | ((st.task.enable_mask & 0xFFFFFFFF) << 16) | rk.REG_PC_OPERATION_ENABLE)
+        else:
+          # Last task: null tail (pcchain.md §PC Tail Layout, last segment uses 0 for first qword)
+          regcmd[tail_base + 0] = 0
+          regcmd[tail_base + 1] = ((_T_PC_REG << 48) | (0 << 16) | rk.REG_PC_REGISTER_AMOUNTS)
+          regcmd[tail_base + 2] = ((_T_VERSION << 48) | 0)
+          regcmd[tail_base + 3] = ((_T_PC << 48) | ((st.task.enable_mask & 0xFFFFFFFF) << 16) | rk.REG_PC_OPERATION_ENABLE)
+      # Apply relocs for each subtask and prepare buffers
+      for idx, st in enumerate(subtasks):
+        task = st.task
+        base = offsets[idx]
+        if getenv("DEBUG") >= 2: print(f"  task {idx}: base={base}, n_cmds={len(st.cmds)}, n_relocs={len(st.relocs)}")
+        for r in st.relocs:
+          if r.globals_slot == _CONST_SLOT:
+            total = task.layout[0]
+            cbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
+            temp.append(cbuf)
+            cval = struct.unpack('<f', struct.pack('<I', r.addend))[0]
+            fp16_bytes = struct.pack('<e', cval) * total
+            ctypes.memmove(cbuf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
+            dma = cbuf.meta.dma_addr
+            v = (dma >> r.shift) & r.mask
+          elif r.globals_slot == _ZERO_SLOT:
+            total = task.layout[0]
+            zbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
+            temp.append(zbuf)
+            ctypes.memset(zbuf.va_addr, 0, total * 2)  # type: ignore[arg-type]
+            dma = zbuf.meta.dma_addr
+            v = (dma >> r.shift) & r.mask
+          else:
+            dma = buf_map[r.globals_slot].meta.dma_addr
+            v = ((dma + r.addend) >> r.shift) & r.mask
+          if r.field_shift:
+            v = (v << r.field_shift) & 0xFFFFFFFF
+            fm = (r.mask << r.field_shift) & 0xFFFFFFFF
+          else: fm = r.mask
+          w = regcmd[base + r.word_index]
+          regcmd[base + r.word_index] = (w & ~(fm << 16)) | ((v & fm) << 16)
+          if getenv("DEBUG") >= 2: print(f"    reloc: word_idx={r.word_index}, slot={r.globals_slot}, dma={dma:#x}, v={v:#x}, fm={fm:#x}")
+      # Fill task_buf entries — pcchain.md §Task Descriptor Rules
+      # regcfg_amount = body qwords + 4 PC-tail qwords. The emitter's final enable is
+      # replaced by that tail, hence len(cmds) + 3 rather than len(cmds) + 4.
+      tasks = ctypes.cast(dev.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents  # type: ignore[arg-type]
+      ctypes.memset(dev.task_buf.va_addr, 0, n_tasks * ctypes.sizeof(rk.struct_rknpu_task))  # type: ignore[arg-type]
+      for idx, st in enumerate(subtasks):
+        t = tasks[idx]
+        t.flags = 0
+        t.op_idx = st.task.op_idx
+        t.enable_mask = st.task.enable_mask
+        t.int_mask = st.task.int_mask
+        t.int_clear = 0x1ffff
+        t.int_status = 0
+        t.regcfg_amount = len(st.cmds) + _PC_CHAIN_TAIL_QWORDS - 1
+        t.regcfg_offset = 0  # absolute mode (pcchain.md §Task Descriptor Rules)
+        t.regcmd_addr = cmd_buf_dma + offsets[idx] * 8
+      if getenv("DEBUG") >= 2:
+        for idx in range(n_tasks):
+          t = tasks[idx]
+          print(f"  task_buf[{idx}]: op_idx={t.op_idx}, enable_mask={t.enable_mask:#x}, regcfg_amount={t.regcfg_amount}, regcmd_addr={t.regcmd_addr:#x}")
+          base = offsets[idx]
+          for j in range(len(subtasks[idx].cmds) + 4):
+            print(f"    [{base+j}] = {regcmd[base+j]:#018x}")
+      # Submit — pcchain.md §Submit Shape: single-core PC chain
+      # flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG (pcchain.md §Conv PC-Chain)
+      rk.DRM_IOCTL_RKNPU_SUBMIT(dev.fd_ctl, __payload=rk.struct_rknpu_submit(
+        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
+        task_start=0, task_number=n_tasks, task_counter=0, priority=0,
+        task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
+        user_data=0, core_mask=1, fence_fd=-1,
+        subcore_task=(rk.struct_rknpu_subcore_task*5)(
+          rk.struct_rknpu_subcore_task(task_start=0, task_number=n_tasks),
+          rk.struct_rknpu_subcore_task(task_start=n_tasks, task_number=0),
+          rk.struct_rknpu_subcore_task(task_start=n_tasks, task_number=0),
+          rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
+          rk.struct_rknpu_subcore_task(task_start=0, task_number=0))))
+      if getenv("DEBUG") >= 1: print(f"submit {self.name}: PC chain {n_tasks} tasks")
+    finally:
+      for b in temp: dev._gpu_free(b)
+    self.submit_count += 1
+    dev.submitted_masks.add(subtasks[-1].task.enable_mask)
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
@@ -179,14 +367,20 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): self.target, self.tensor_cores = target, []
   def native_program(self, ast:UOp) -> UOp|None: return build_native_program(ast)
   def asm(self, prg:UOp, lin:UOp) -> bytes:
+    # Multi-task (PC chain): first INS carries a tuple of RKSubTask
+    subtasks = None
     task, cmds, relocs = None, [], []
     for u in lin.src:
-      if isinstance(u.arg, RKTask): task = u.arg
+      if isinstance(u.arg, tuple) and u.arg and isinstance(u.arg[0], RKSubTask):
+        subtasks = u.arg
+      elif isinstance(u.arg, RKTask): task = u.arg
       elif isinstance(u.arg, RKReloc): relocs.append(u.arg)
       elif isinstance(u.arg, int): cmds.append(u.arg)
+    if subtasks is not None:
+      return encode_rk_multi(subtasks)
     if task is None: raise RuntimeError("rk: no RKTask metadata — non-NPU kernel with no Python fallback")
     return encode_rk(tuple(cmds), task, tuple(relocs))
-  def supported_dtypes(self) -> set[DType]: return {dtypes.half}
+  def supported_dtypes(self) -> set[DType]: return {dtypes.half, dtypes.float}
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
   """DMA-backed allocator: buffers are NPU GEM objects with va_addr (CPU mmap) and dma_addr (NPU)."""
