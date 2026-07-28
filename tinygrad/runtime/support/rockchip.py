@@ -91,6 +91,7 @@ class RKTask:
   uint8_output: bool = False          # multi-task output converted from fp16 to uint8
   bool_output: bool = False           # multi-task output converted from fp16 mask to bool
   trunc_output: bool = False          # multi-task fp16 output truncated through an integer cast round-trip
+  periodic_input: bool = False        # reduce fp32 inputs modulo 2*pi before fp16 conversion
   out_offset: int = 0                 # byte offset into the output buffer (for cat-like copies)
 
 @dataclass(frozen=True)
@@ -451,6 +452,21 @@ def _try_gelu(val:UOp) -> tuple[UOp,bool]|None:
      any(u.op is Ops.CONST and math.isclose(float(u.arg), 1/math.sqrt(2)) for u in nodes): return source, False
   return None
 
+def _try_sin_cos(val:UOp) -> tuple[UOp,bool]|None:
+  """Recognize root sin(x) and tinygrad's cos(x) = sin(pi/2-cast_float(x))."""
+  val = _unwrap(val)
+  if val.op is Ops.SIN and (source := _unwrap(val.src[0])).op is Ops.INDEX:
+    return source, False
+  # fp16 cosine retains an outer CAST; fp32 cosine simplifies that no-op CAST
+  # away, so recognize the phase form independently of `raw.op`.
+  if val.op is not Ops.SIN: return None
+  phase = _unwrap(val.src[0])
+  indexes = list(dict.fromkeys(u for u in phase.toposort() if u.op is Ops.INDEX))
+  constants = [float(u.arg) for u in phase.toposort() if u.op is Ops.CONST]
+  if len(indexes) != 1 or indexes[0].dtype not in (dtypes.half, dtypes.float) or phase.op is not Ops.ADD: return None
+  return (indexes[0], True) if any(math.isclose(x, math.pi/2) for x in constants) and \
+    any(math.isclose(x, -1.0) for x in constants) else None
+
 def _try_celu(val:UOp) -> tuple[UOp,float]|None:
   """Recognize max(x,0)+min(alpha*(exp(x/alpha)-1),0) for TestOps alphas."""
   val = _unwrap(val)
@@ -498,6 +514,9 @@ _LUT_ERF = Ops.FUNCTION
 _LUT_ERF_LOCAL = Ops.CALL
 _LUT_GELU = Ops.AFTER
 _LUT_GELU_LOCAL = Ops.GROUP
+_LUT_SIN_LOCAL = Ops.STACK
+_LUT_COS = Ops.TUPLE
+_LUT_COS_LOCAL = Ops.GETTUPLE
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -858,7 +877,7 @@ def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
   lut = [0] * _LUT_SIZE * 2
   index_scale = 16384.0 / math.pi  # ≈5215.2, maps x∈[-π,π] to [-16384,16384]
   step = 32.0 / index_scale  # step in x per LUT entry
-  output_scale = 16384.0  # maps [-1,1] to [-16384,16384] — doubled for precision
+  output_scale = 32768.0
   # LE table (table 0): covers bn_mul from -16384 to 0, i.e., x from -π to 0
   for i in range(_LUT_SIZE):
     x = -i * step  # i=0: x=0, i=512: x=-π
@@ -874,7 +893,41 @@ def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
     if v == 0: v = 1  # avoid exact 0 — hardware produces garbage (8.0) for LUT output of 0
     lut[_LUT_SIZE + i] = max(-32768, min(32767, v))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
-  return lut, bn_mul_operand, output_scale, index_scale, 14
+  return lut, bn_mul_operand, output_scale, index_scale, 15
+
+def _build_sin_local_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 8*sin(x) for x∈[-0.125,0.125], addressed by z=16*x."""
+  index_scale, output_scale = 8192.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i)*step
+      raw = int(round(8.0*math.sin(z/16.0)*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_cos_lut() -> tuple[list[int], int, float, float, int]:
+  """Direct signed Q15 cosine over [-pi,pi]."""
+  index_scale, output_scale = 16384.0/math.pi, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i)*step
+      raw = int(round(math.cos(x)*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_cos_local_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 2*cos(x) over [-2,2], selected while |cos(x)| <= 0.5."""
+  index_scale, output_scale = 8192.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i)*step
+      y = math.cos(x)
+      raw = int(round(2.0*y*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
 def _build_sqrt_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for SQRT over x∈[0,4] → result∈[0,2].
@@ -1041,6 +1094,12 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_gelu_local" and \
      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, float(bool(val.arg[1])), 1.0, _LUT_GELU_LOCAL)
+  if val.op is Ops.CUSTOM and val.arg == "rk_sin_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_SIN_LOCAL)
+  if val.op is Ops.CUSTOM and val.arg == "rk_cos" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_COS)
+  if val.op is Ops.CUSTOM and val.arg == "rk_cos_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_COS_LOCAL)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -2358,6 +2417,188 @@ def _try_erf_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, alloc(), (interior_selected, 0), (tail, 0), Ops.ADD),
                 _emit_where_stage(total, info.outs[0], (interior_selected, 0), (tail, 0), Ops.ADD)))
   return tuple(tasks)
+
+def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Range-reduce sin/cos, then select a broad LUT, amplified local LUT, or the near-zero identity."""
+  store = _store_node(sink)
+  if store is None or (match := _try_sin_cos(store.src[1])) is None: return None
+  source, is_cos = match
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def temp_index(slot:int) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  neg_source, abs_source, invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(5))
+  # Bound infinities before the host-assisted truncation stage. The final x*0
+  # term restores NaN for both infinities and NaN without perturbing finite x.
+  low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
+  tasks:list[RKSubTask] = [
+    _emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+    _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
+    _emit_where_stage(total, invalid_diff, (abs_source, 0), scalar(20000.0), Ops.SUB),
+    _emit_where_stage(total, invalid_scratch, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
+    _emit_where_stage(total, invalid, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
+    _emit_where_stage(total, low, source_arg, scalar(-10000.0), Ops.MAX),
+    _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
+    _emit_where_stage(total, neg_clamped, (neg_low, 0), scalar(-10000.0), Ops.MAX),
+    _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
+  phase = bounded
+  # The first cosine implementation used this literal lowering:
+  # if is_cos:
+  #   phase = alloc()
+  #   tasks.append(_emit_where_stage(total, phase, scalar(math.pi/2), (bounded, 0), Ops.SUB))
+  # It is kept as tuning reference, but materializing the float32 phase as fp16
+  # caused up to 0.0021 error. Direct cosine LUTs below use x as the phase.
+
+  # n=round(phase/(2*pi)).  Restoring the sign after trunc(abs(q)+0.5)
+  # avoids a full lowering of tinygrad's general round-to-even expression.
+  quotient, neg_quotient, abs_quotient, biased, rounded_abs = (alloc() for _ in range(5))
+  positive_diff, positive, negative, positive_n = (alloc() for _ in range(4))
+  negative_n, signed_negative_n, rounded = (alloc() for _ in range(3))
+  tasks.extend((_emit_where_stage(total, quotient, (phase, 0), scalar(1/(2*math.pi)), Ops.MUL),
+                _emit_where_stage(total, neg_quotient, zero, (quotient, 0), Ops.SUB),
+                _emit_where_stage(total, abs_quotient, (quotient, 0), (neg_quotient, 0), Ops.MAX),
+                _emit_where_stage(total, biased, (abs_quotient, 0), scalar(0.5), Ops.ADD),
+                _emit_trunc_stage(total, rounded_abs, (biased, 0)),
+                _emit_where_stage(total, positive_diff, (quotient, 0), zero, Ops.SUB),
+                _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, negative, one, (positive, 0), Ops.SUB),
+                _emit_where_stage(total, positive_n, (rounded_abs, 0), (positive, 0), Ops.MUL),
+                _emit_where_stage(total, negative_n, (rounded_abs, 0), (negative, 0), Ops.MUL),
+                _emit_where_stage(total, signed_negative_n, zero, (negative_n, 0), Ops.SUB),
+                _emit_where_stage(total, rounded, (positive_n, 0), (signed_negative_n, 0), Ops.ADD)))
+
+  # Cody-Waite-style split subtraction is essential for fp16 scratch values:
+  # a single n*(2*pi) rounds to a multiple of eight around x=10000.
+  reduced = phase
+  for coefficient in (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125):
+    product_slot, next_reduced = alloc(), alloc()
+    tasks.extend((_emit_where_stage(total, product_slot, (rounded, 0), scalar(coefficient), Ops.MUL),
+                  _emit_where_stage(total, next_reduced, (reduced, 0), (product_slot, 0), Ops.SUB)))
+    reduced = next_reduced
+
+  if is_cos:
+    broad, local = alloc(), alloc()
+    broad_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(reduced),), arg="rk_cos")
+    broad_store = store.replace(src=(temp_index(broad), broad_val))
+    broad_plan = plan_rk(sink.substitute({store:broad_store}))
+    if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+    cmds, task, relocs = emit_rk(broad_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+    local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(reduced),), arg="rk_cos_local")
+    local_store = store.replace(src=(temp_index(local), local_val))
+    local_plan = plan_rk(sink.substitute({store:local_store}))
+    if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+    cmds, task, relocs = emit_rk(local_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+    neg_broad, abs_broad, local_diff = alloc(), alloc(), alloc()
+    local_outside, local_inside = alloc(), alloc()
+    near_diff, near_outside, near_inside, middle_mask = alloc(), alloc(), alloc(), alloc()
+    selected_sum, broad_mask = alloc(), alloc()
+    neg_reduced_cos, abs_reduced_cos = alloc(), alloc()
+    center_hi, near_scaled, middle_scaled = alloc(), alloc(), alloc()
+    broad_selected, near_selected, middle_selected = alloc(), alloc(), alloc()
+    local_sum, normal = alloc(), alloc()
+    denom_scratch, valid_denom, factor_scratch, valid_factor, out_scratch = (alloc() for _ in range(5))
+    tasks.extend((_emit_where_stage(total, neg_broad, zero, (broad, 0), Ops.SUB),
+                  _emit_where_stage(total, abs_broad, (broad, 0), (neg_broad, 0), Ops.MAX),
+                  _emit_where_stage(total, local_diff, (abs_broad, 0), scalar(0.5), Ops.SUB),
+                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+                  _emit_where_stage(total, near_diff, (abs_broad, 0), scalar(0.01), Ops.SUB),
+                  _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+                  _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+                  # Earlier piecewise-gain tuning used separate 0.096/0.104 masks
+                  # around a discontinuous local LUT. The continuous 2*cos table
+                  # only needs the local-minus-center mask.
+                  _emit_where_stage(total, middle_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+                  _emit_where_stage(total, selected_sum, (near_inside, 0), (middle_mask, 0), Ops.ADD),
+                  _emit_where_stage(total, broad_mask, one, (selected_sum, 0), Ops.SUB),
+                  _emit_where_stage(total, neg_reduced_cos, zero, (reduced, 0), Ops.SUB),
+                  _emit_where_stage(total, abs_reduced_cos, (reduced, 0), (neg_reduced_cos, 0), Ops.MAX),
+                  _emit_where_stage(total, center_hi, scalar(1.5703125), (abs_reduced_cos, 0), Ops.SUB),
+                  _emit_where_stage(total, near_scaled, (center_hi, 0), scalar(math.pi/2-1.5703125), Ops.ADD),
+                  _emit_where_stage(total, middle_scaled, (local, 0), scalar(0.5), Ops.MUL),
+                  _emit_where_stage(total, broad_selected, (broad, 0), (broad_mask, 0), Ops.MUL),
+                  _emit_where_stage(total, near_selected, (near_scaled, 0), (near_inside, 0), Ops.MUL),
+                  _emit_where_stage(total, middle_selected, (middle_scaled, 0), (middle_mask, 0), Ops.MUL),
+                  _emit_where_stage(total, local_sum, (near_selected, 0), (middle_selected, 0), Ops.ADD),
+                  _emit_where_stage(total, normal, (broad_selected, 0), (local_sum, 0), Ops.ADD),
+                  _emit_where_stage(total, denom_scratch, one, (invalid, 0), Ops.SUB),
+                  _emit_where_stage(total, valid_denom, one, (invalid, 0), Ops.SUB),
+                  _emit_where_stage(total, factor_scratch, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+                  _emit_where_stage(total, valid_factor, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+                  _emit_where_stage(total, out_scratch, (normal, 0), (valid_factor, 0), Ops.MUL),
+                  _emit_where_stage(total, info.outs[0], (normal, 0), (valid_factor, 0), Ops.MUL)))
+    tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+    if source.src[0].dtype is dtypes.float:
+      source_slot = source.src[0].arg.slot
+      tasks = [RKSubTask(st.cmds, replace(st.task, periodic_input=True), st.relocs)
+               if source_slot in st.task.fp32_inputs else st for st in tasks]
+    return _finalize_fp32_output(tasks, store)
+
+  broad = alloc()
+  broad_val = UOp(Ops.SIN, dtypes.half, (temp_index(reduced),))
+  broad_store = store.replace(src=(temp_index(broad), broad_val))
+  broad_plan = plan_rk(sink.substitute({store:broad_store}))
+  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(broad_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  zoomed, local = alloc(), alloc()
+  tasks.append(_emit_where_stage(total, zoomed, (reduced, 0), scalar(16.0), Ops.MUL))
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_sin_local")
+  local_store = store.replace(src=(temp_index(local), local_val))
+  local_plan = plan_rk(sink.substitute({store:local_store}))
+  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(local_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  neg_reduced, abs_reduced = alloc(), alloc()
+  local_diff, local_outside, local_inside = alloc(), alloc(), alloc()
+  near_diff, near_outside, near_inside = alloc(), alloc(), alloc()
+  broad_mask, local_mask = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, neg_reduced, zero, (reduced, 0), Ops.SUB),
+                _emit_where_stage(total, abs_reduced, (reduced, 0), (neg_reduced, 0), Ops.MAX),
+                _emit_where_stage(total, local_diff, (abs_reduced, 0), scalar(0.125), Ops.SUB),
+                _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+                _emit_where_stage(total, near_diff, (abs_reduced, 0), scalar(0.04), Ops.SUB),
+                _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+                _emit_where_stage(total, broad_mask, one, (local_inside, 0), Ops.SUB),
+                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB)))
+
+  local_scaled, broad_selected, local_selected = alloc(), alloc(), alloc()
+  near_selected, lut_sum, normal = alloc(), alloc(), alloc()
+  denom_scratch, valid_denom, factor_scratch, valid_factor, out_scratch = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, local_scaled, (local, 0), scalar(0.125), Ops.MUL),
+                _emit_where_stage(total, broad_selected, (broad, 0), (broad_mask, 0), Ops.MUL),
+                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+                _emit_where_stage(total, near_selected, (reduced, 0), (near_inside, 0), Ops.MUL),
+                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+                _emit_where_stage(total, normal, (lut_sum, 0), (near_selected, 0), Ops.ADD),
+                _emit_where_stage(total, denom_scratch, one, (invalid, 0), Ops.SUB),
+                _emit_where_stage(total, valid_denom, one, (invalid, 0), Ops.SUB),
+                _emit_where_stage(total, factor_scratch, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+                _emit_where_stage(total, valid_factor, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+                _emit_where_stage(total, out_scratch, (normal, 0), (valid_factor, 0), Ops.MUL),
+                _emit_where_stage(total, info.outs[0], (normal, 0), (valid_factor, 0), Ops.MUL)))
+  tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+  if source.src[0].dtype is dtypes.float:
+    source_slot = source.src[0].arg.slot
+    tasks = [RKSubTask(st.cmds, replace(st.task, periodic_input=True), st.relocs)
+             if source_slot in st.task.fp32_inputs else st for st in tasks]
+  return _finalize_fp32_output(tasks, store)
 
 def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate either GELU form with broad/local LUTs and a near-zero series."""
@@ -3952,6 +4193,18 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+  elif lut_op is _LUT_SIN_LOCAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sin_local_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_COS:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cos_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_COS_LOCAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cos_local_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.SQRT:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sqrt_lut()
     lut_le_start = 0xffffc000  # -16384
@@ -4050,7 +4303,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL,
                   _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
                   _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL, _LUT_SOFTPLUS_TAIL, _LUT_SOFTPLUS_WIDE,
-                  _LUT_MISH, _LUT_MISH_LOCAL, _LUT_ELU, _LUT_ELU_LOCAL, _LUT_ERF, _LUT_ERF_LOCAL, _LUT_GELU, _LUT_GELU_LOCAL):
+                  _LUT_MISH, _LUT_MISH_LOCAL, _LUT_ELU, _LUT_ELU_LOCAL, _LUT_ERF, _LUT_ERF_LOCAL, _LUT_GELU, _LUT_GELU_LOCAL,
+                  _LUT_SIN_LOCAL, _LUT_COS, _LUT_COS_LOCAL):
     # These LUTs use flat endpoint values; their staged epilogues handle the
     # behavior outside the table domain.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
@@ -4367,6 +4621,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   out_offset_bytes = struct.pack("<i", task.out_offset)
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
   dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | (int(task.trunc_output) << 3) | \
+    (int(task.periodic_input) << 4) | \
     sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
   input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16) | \
     sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
@@ -4409,7 +4664,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
                       bool_inputs=bool_inputs, int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
                       comparison_inputs=comparison_inputs,
                       int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
-                      bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8),
+                      bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8), periodic_input=bool(dtype_flags & 16),
                       out_offset=out_offset), relocs, off
 
 def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
@@ -4757,6 +5012,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
   if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
   if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
+  if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
   if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
   if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)
   if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)

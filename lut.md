@@ -1330,6 +1330,90 @@ additional scale or a narrower domain. Extreme TestOps cases at approximately
 `±300` cannot use the bounded table without explicit saturation and special
 value handling.
 
+## Trigonometric LUT tuning
+
+The `rknnops.h` algorithms 28–30 prove that the DPU accepts trigonometric
+tables, but their bounded tables do not provide periodic reduction. The
+backend's passing sine/cosine implementation separates those concerns:
+
+```text
+fp32 input, if any: host buffer conversion reduces finite x modulo 2*pi
+NPU:                reduce x to [-pi,pi] with a split 2*pi subtraction
+LUT task 1:         broad Q15 function table
+LUT task 2:         amplified local Q15 table
+NPU:                masks select broad, local, and optional central formula
+```
+
+### Sine tables
+
+The broad table uses:
+
+```text
+domain       [-pi, pi]
+index_scale  16384/pi
+value        round(sin(x) * 32768)
+decode       Q15
+```
+
+The older Q14 table passed most samples but left dozens of relative-tolerance
+misses near zero. The second table spends the whole coordinate and output
+ranges on `[-0.125,0.125]`:
+
+```text
+input        z = 16*x
+table value  round(8*sin(z/16) * 32768)
+decode       table / 8
+```
+
+For `abs(x)<=0.04`, the fp16 input itself is closer to PyTorch's fp16 sine
+than either quantized table, so the final selector uses `x`.
+
+### Cosine tables
+
+Do not implement cosine by materializing `pi/2-x` in an fp16 scratch buffer.
+Tinygrad forms that phase in float32; the early NPU experiment introduced up
+to `0.0021` absolute error. Use direct tables:
+
+```text
+broad domain/index  [-pi,pi], 16384/pi
+broad value         round(cos(x) * 32768)
+local domain/index  [-2,2], 8192
+local value         round(2*cos(x) * 32768)
+local decode        table / 2, selected while abs(cos(x)) <= 0.5
+```
+
+Q15/2 still cannot distinguish the fp16 inputs immediately adjacent to
+`±pi/2`. For `abs(cos(x))<=0.01`, compute the local first-order form with a
+split constant:
+
+```text
+center = (1.5703125 - abs(x)) + fp16(pi/2 - 1.5703125)
+```
+
+This is exact at the critical neighboring fp16 values and avoids a third LUT.
+An attempted single local table with `8*cos` near zero and `2*cos` elsewhere
+failed because the gain discontinuity is interpolated by hardware. If
+piecewise gain is revisited, leave an explicit broad-table guard band wider
+than the LUT interpolation interval.
+
+### Periodic fp32 conversion and specials
+
+Values such as `1e5` and `1e6` cannot survive an ordinary fp32-to-fp16 cast.
+The `periodic_input` flag is serialized in multi-task metadata and makes the
+existing conversion layer reduce finite values in float64 before casting.
+NaN and infinities are encoded as `65472`, detected before the NPU clamp, and
+restored with:
+
+```text
+valid  = 1 - invalid_mask
+factor = valid / valid       # 1 for finite, NaN for invalid
+result = normal * factor
+```
+
+Duplicate invalid-mask, denominator, factor, and final-consumer tasks are
+intentional hardware visibility workarounds. Omitting them produced stale
+zero masks or `-inf` instead of NaN.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

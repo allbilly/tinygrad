@@ -4595,3 +4595,70 @@ Fixed two segfault issues that were killing the test process:
 
 ### Status file
 See `test_ops_status.md` for full breakdown of failures by category and passing tests.
+
+## 2026-07-29 — periodic two-LUT sine and cosine
+
+`TestOps.test_sin` and `TestOps.test_cos` now pass unchanged with
+`DEFAULT_FLOAT=HALF FORWARD_ONLY=1`. A combined serial hardware run completed
+with **2 passed in 42.45 seconds**, including:
+
+- the ordinary `(45,65)` tensors and scalar forms;
+- NaN, positive infinity, negative infinity, and signed/unsigned zero;
+- the explicit float32 angles `±10`, `±100`, `±1000`, `±10000`, `±100000`,
+  and `±1000000`.
+
+The common recognizer handles root `SIN(INDEX)` and both fp16/fp32 forms of
+tinygrad's `cos(x) = sin(pi/2-cast_float(x))`. The actual programs use direct
+function tables rather than sending the composite graph through the generic
+elementwise fallback:
+
+| function | tasks | LUT tasks | central path |
+|---|---:|---:|---|
+| sine | 56 | 2 | Q15 `8*sin(x)` local LUT, then `x` for `abs(x)<=0.04` |
+| cosine | 60 | 2 | Q15 `2*cos(x)` local LUT, then split `pi/2-abs(x)` for `abs(cos(x))<=0.01` |
+
+### Range reduction and fp32 angles
+
+The staged reducer computes `n=round(x/(2*pi))` by
+`trunc(abs(q)+0.5)` plus sign restoration. A single `n*(2*pi)` is unusable
+near 10000 because the fp16 scratch result rounds in units of eight. The
+working Cody-Waite-style subtraction is:
+
+```text
+r = ((((x - n*4) - n*2) - n*0.25) - n*0.03125)
+    - n*(2*pi - 6.28125)
+```
+
+Explicit TestOps values are float32 and include magnitudes above fp16's
+maximum. `periodic_input` task metadata therefore extends the existing
+buffer-level fp32-to-fp16 conversion: finite angles are reduced to
+`[-pi,pi]` in float64 before the required fp16 cast. Nonfinite inputs become
+a reserved fp16 sentinel. The NPU detects that sentinel, evaluates the normal
+bounded program, then multiplies by a duplicated `denom/denom` validity
+factor so the result is NaN. The duplicate comparison and first-consumer
+tasks are required for stable scratch visibility.
+
+### Accuracy notes
+
+- Raising the old sine table from Q14 to Q15 removed most one-ULP error, but a
+  second amplified table was still necessary near zero.
+- Materializing cosine as `sin(pi/2-x)` on the NPU produced up to `0.0021`
+  absolute error because tinygrad performs the phase in float32. Direct cosine
+  tables avoid that intermediate fp16 rounding.
+- A uniform `2*cos` local table reduced cosine to nine failures, all at the
+  four fp16 values adjacent to `±pi/2` with maximum absolute error
+  `4.77e-6`. The split constant `1.5703125 +
+  (pi/2-1.5703125)` supplies the exact near-zero result without a third LUT.
+- The rejected phase-shift cosine path and the earlier discontinuous
+  piecewise-gain tuning are retained in comments for future tuning reference.
+- The hardware-free `test/rockchip/test_pr1.py` run remains at **68 passed,
+  4 failed**; the four failures are pre-existing stale expectations that fp32
+  DPU and mean/CMAC support should be rejected. Codec tests pass **13/13**.
+- The complete hardware regression remains at **68 passed, 2 failed** in
+  207.43 seconds. The only failures are the unchanged fill-zero/fill-full
+  cases, both returning ones.
+- `rockchip-sin-cos-two-lut-10dce2398.patch` is the reverse-apply-checked
+  standalone patch against parent `10dce2398`.
+- `.venv` has no `pytest-xdist` or Ruff module, so `-n12` and
+  `python -m ruff` cannot run there. NPU tests remain serial by hardware
+  necessity.

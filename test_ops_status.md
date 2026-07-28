@@ -36,6 +36,14 @@ Both `TestOps.test_gelu` methods now pass for exact and tanh approximations,
 including every ±300–400 extreme subcase. Their shared 53-task/two-LUT path
 advances the complete hardware file to **68 passed, 2 failed** in 207.94
 seconds.
+`TestOps.test_sin` and `TestOps.test_cos` now pass unchanged in one combined
+hardware run: **2 passed in 42.45 seconds**. The 56-task sine and 60-task
+cosine programs each use two LUT tasks, explicit periodic reduction, fp32
+large-angle preprocessing, and IEEE-special restoration. Integer cosine now
+returns float32, matching the scalar reference. `test_tan` remains the next
+member of the trigonometric group. The complete hardware file remains at
+**68 passed, 2 failed** in 207.43 seconds; only the two established fill
+failures remain.
 
 ## Summary
 
@@ -83,9 +91,9 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
 ### 4. Transcendental ops — ~12 tests
-Exp, sin, cos, tan, sinh, cosh, sigmoid_extreme.
+Exp, tan, sinh, cosh, sigmoid_extreme.
 
-**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_sigmoid*
+**Tests:** test_exp, test_tan, test_sinh, test_cosh, test_sigmoid*
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.

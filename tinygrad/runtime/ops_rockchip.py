@@ -41,6 +41,16 @@ def _convert_fp32_to_fp16_buf(src, dst, n):
   arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32).astype(np.float16)
   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
 
+def _convert_periodic_fp32_to_fp16_buf(src, dst, n):
+  """Reduce finite fp32 angles to [-pi,pi]; encode nonfinite values as a detectable sentinel."""
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32).astype(np.float64)
+  finite = np.isfinite(arr)
+  arr[finite] = np.remainder(arr[finite]+np.pi, 2*np.pi)-np.pi
+  arr[~finite] = 65472.0
+  arr = arr.astype(np.float16)
+  ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
 def _convert_fp16_to_fp32_buf(src, dst, n):
   """Convert n fp16 elements at src to fp32 at dst (buffer-level cast, not NPU compute)."""
   import numpy as np
@@ -468,11 +478,13 @@ class RockchipProgram(Program['RockchipDevice']):
       temp.append(scratch := dev._gpu_alloc(max(total * 2, 4096), 0))
       prepared.append(scratch)
     source_counts:dict[int, int] = {}
+    periodic_slots = {s for st in subtasks if st.task.periodic_input for s in st.task.fp32_inputs}
     for slot in {s for st in subtasks for s in st.task.fp32_inputs}:
       source_counts[slot] = source_n = prepared[slot].size // 4
       converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
       temp.append(converted)
-      _convert_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+      if slot in periodic_slots: _convert_periodic_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+      else: _convert_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
       prepared[slot] = converted
     for slot in {s for st in subtasks for s in st.task.int32_inputs}:
       source_counts[slot] = source_n = prepared[slot].size // 4
