@@ -1,5 +1,24 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — staged elementwise and sigmoid LUT milestone
+
+### Implementation
+- Added a recursive elementwise splitter that materializes nested DPU/LUT
+  expressions into scratch buffers and reuses the existing single-stage
+  classifier and emitters for every stage.
+- Mixed LUT/DPU programs submit reset-separated stages because a direct mixed
+  PC chain times out on RK3588; ordinary all-DPU programs retain PC chaining.
+- Fixed signed EXP2 LUT output scaling and added a direct sigmoid LUT over
+  `[-8, 8]`, avoiding accumulated EXP2, ADD, and reciprocal rounding.
+
+### Verification
+- `TestOps.test_sigmoid` and `TestOps.test_add3` — **PASS**.
+- Nested `tanh` and `lerp` now execute on hardware; their remaining failures
+  are numerical tolerance rather than unsupported expression structure.
+- `test_add3`, `test_sigmoid`, `test_where`, `test_clip`, and
+  `test/rockchip/test_hw.py` — **43 passed**.
+- `python -m mypy tinygrad/` and targeted Ruff — **PASS**.
+
 ## 2026-07-28 — nested WHERE / clip milestone
 
 ### Implementation

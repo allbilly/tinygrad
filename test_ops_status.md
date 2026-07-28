@@ -1,5 +1,30 @@
 # test_ops.py per-test status (FORWARD_ONLY=1)
 
+## Incremental hardware verification — 2026-07-28, commit 308729494
+
+The generated table below is the older `993ea1197` baseline. These newer
+results were run with `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1` and the
+Rockchip pytest plugin; aggregate counts will be regenerated after the
+remaining tests have been isolated.
+
+| Test/group | Current status | Verification or remaining cause |
+|---|---|---|
+| `test_where` | PASS | Direct comparison, boolean mask, broadcast, and int32-result cases |
+| `test_where_permute` | PASS | WHERE plus affine int32 copy |
+| `test_clip` | PASS | Nested WHERE, equal bounds, and one-sided bounds |
+| `test_flip`, `test_permute`, `test_transpose`, strided slices | PASS | Arbitrary-rank affine copy |
+| `test_abs`, `test_add`, `test_add3`, `test_sub`, `test_mul`, `test_div`, `test_relu` | PASS | Isolated hardware runs |
+| `test_sigmoid` | PASS | Direct 513-entry sigmoid LUT |
+| `test_exp` | FAIL | LUT precision: 301/2925 elements exceed tolerance |
+| `test_exp2` | FAIL | Finite case passes; inf/-inf/NaN behavior is unsupported |
+| `test_log`, `test_log2`, `test_sqrt`, `test_rsqrt` | FAIL | Negative-input NaN behavior plus LUT precision/range |
+| `test_sin` | FAIL | LUT precision: 68/2925 elements exceed tolerance |
+| `test_tanh`, `test_lerp` | FAIL | Now execute as staged expressions; fp16 rounding exceeds strict tolerance |
+
+Latest milestone regression: `test_add3`, `test_sigmoid`, `test_where`,
+`test_clip`, and `test/rockchip/test_hw.py` — **43 passed**; mypy and targeted
+Ruff — **PASS**.
+
 Generated: 2026-07-27 21:22 UTC | commit 993ea1197
 
 **Summary:** 71 PASS, 21 PARTIAL, 324 FAIL, 8 SKIP (out of 424 unique tests)

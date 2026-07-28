@@ -200,6 +200,7 @@ def _try_abs(val: UOp) -> int|None:
 
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
+_LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -214,7 +215,7 @@ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, fl
   index_scale = 8192.0 / input_scale if input_scale != 1.0 else 8192.0
   step = 32.0 / index_scale  # step in x domain
   # Determine output_scale and minus_exp based on max output value
-  max_val = math.exp2(2.0 * input_scale)  # max output at x=2
+  max_val = math.exp2(2.0 * abs(input_scale))  # either input endpoint can be the maximum for signed scaling
   if max_val <= 4.0:
     output_scale, minus_exp = 8192.0, 13
   elif max_val <= 8.0:
@@ -332,6 +333,31 @@ def _build_rsqrt_lut() -> tuple[list[int], int, float, float, int]:
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, output_scale, index_scale, 13
 
+def _build_sigmoid_lut() -> tuple[list[int], int, float, float, int]:
+  """Build sigmoid directly over [-8, 8], avoiding EXP2+ADD+FDIV rounding."""
+  index_scale, output_scale, minus_exp = 2048.0, 32768.0, 15
+  step = 32.0 / index_scale
+  lut = [0] * _LUT_SIZE * 2
+  for i in range(_LUT_SIZE):
+    x = -(512-i) * step
+    lut[i] = max(1, min(32767, int(round(output_scale / (1.0 + math.exp(-x))))))
+  for i in range(_LUT_SIZE):
+    x = i * step
+    lut[_LUT_SIZE+i] = max(1, min(32767, int(round(output_scale / (1.0 + math.exp(-x))))))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
+def _try_sigmoid(val:UOp) -> int|None:
+  """RECIPROCAL(1 + EXP2(INDEX * -log2(e))) → input slot."""
+  if val.op is not Ops.RECIPROCAL or (add := _unwrap(val.src[0])).op is not Ops.ADD: return None
+  one, exp = add.src
+  if exp.op is Ops.CONST: one, exp = exp, one
+  if one.op is not Ops.CONST or float(one.arg) != 1.0 or (exp := _unwrap(exp)).op is not Ops.EXP2: return None
+  mul = _unwrap(exp.src[0])
+  if mul.op is not Ops.MUL: return None
+  idx = next((_unwrap(x) for x in mul.src if _unwrap(x).op is Ops.INDEX), None)
+  scale = next((float(x.arg) for x in mul.src if x.op is Ops.CONST), None)
+  return idx.src[0].buf_uop.arg.slot if idx is not None and scale is not None and abs(scale + math.log2(math.e)) < 1e-3 else None
+
 def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   """Recognize LUT patterns and return (index_slot, input_scale, output_scale, lut_op).
   Patterns:
@@ -341,6 +367,7 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   - RECIPROCAL(SQRT(INDEX)) → (slot, 1.0, 1.0, RECIPROCAL)  [rsqrt(x)]
   Returns None if not a LUT pattern."""
   input_scale, output_scale = 1.0, 1.0
+  if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
     a, b = val.src
@@ -767,6 +794,53 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   return tuple(tasks) if lower(val, out, True) else None
 
+def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Split a nested fp16 elementwise expression into independently classifiable DPU stages."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  val, info = _unwrap(store.src[1]), ProgramInfo.from_sink(sink)
+  if val.op not in (_DPU_EW_CFGS.keys() | _LUT_OPS | {Ops.RECIPROCAL}): return None
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  materialized:dict[UOp, UOp] = {}
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
+    out_idx = temp_index(out_slot, stage_val.dtype)
+    stage_sink = sink.substitute({store:store.replace(src=(out_idx, stage_val))})
+    plan = plan_rk(stage_sink)
+    if isinstance(plan, str) or plan.kind not in ("dpu", "dpu_lut"): return None
+    cmds, task, relocs = emit_rk(plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+    return out_idx
+
+  def lower_arg(u:UOp) -> UOp|None:
+    u = _unwrap(u)
+    if u.op in (Ops.INDEX, Ops.CONST): return u
+    if u not in materialized:
+      slot = alloc()
+      if (idx := lower(u, slot)) is None: return None
+      materialized[u] = idx
+    return materialized[u]
+
+  def lower(u:UOp, out_slot:int) -> UOp|None:
+    u = _unwrap(u)
+    if (idx := emit_stage(u, out_slot)) is not None: return idx
+    if u.op not in (_DPU_EW_CFGS.keys() | _LUT_OPS | {Ops.RECIPROCAL}): return None
+    src = tuple(lower_arg(x) for x in u.src)
+    if any(x is None for x in src): return None
+    return emit_stage(u.replace(src=src), out_slot)  # type: ignore[arg-type]
+
+  return tuple(tasks) if lower(val, out) is not None and len(tasks) > 1 else None
+
 def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """DPU elementwise op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy. Register sequence from elementwise.py."""
   cmds:list[RKCmd] = []
@@ -946,6 +1020,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_le_start = 0xffffc000  # -16384
     lut_lo_end = 0x00004000    # 16384
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+  elif lut_op is _LUT_SIGMOID:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   else:
     raise AssertionError(f"dpu_lut: no builder for {lut_op}")
   # Apply output_scale_factor via OUT_CVT_SCALE (Q15 fixed-point) — see below
@@ -1382,7 +1460,9 @@ def build_native_program(sink: UOp) -> UOp|None:
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
   plan = plan_rk(sink)
-  if isinstance(plan, str): raise RuntimeError(plan)  # reject — preserve reason, no fallback
+  if isinstance(plan, str):
+    if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
+    raise RuntimeError(plan)  # reject — preserve reason, no fallback
   cmds, task, relocs = emit_rk(plan)
   # each INS carries an int (packed command), RKReloc, or RKTask as its arg
   ins_args = [task] + list(cmds) + list(relocs)

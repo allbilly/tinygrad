@@ -270,11 +270,11 @@ class RockchipProgram(Program['RockchipDevice']):
     _T_PC = 0x0081
     subtasks = self.subtasks
     assert subtasks is not None
-    # The custom comparison stage leaves DPU state that makes a full WHERE chain unstable.
+    # Custom comparison and LUT stages leave DPU state that makes a mixed chain unstable.
     # Submit those programs stage-by-stage with resets, retaining shared scratch allocations.
     def is_cmp(st): return any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
                                ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds)
-    if len(subtasks) > 1 and any(is_cmp(st) for st in subtasks):
+    if len(subtasks) > 1 and any(is_cmp(st) or st.task.kind == "dpu_lut" for st in subtasks):
       ext, shared, original = list(bufs), [], self.subtasks
       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                      default=len(ext)-1)
