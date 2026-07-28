@@ -226,6 +226,12 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").tanh().realize().numpy()
     np.testing.assert_allclose(actual, np.tanh(a_np), rtol=1e-3, atol=1e-6)
 
+  def test_dpu_tanh_direct_lut(self):
+    a_np = np.concatenate((np.linspace(-4, 4, 2049, dtype=np.float16),
+                           np.array([-np.inf, -300, -4.01, -0.0, 0.0, 4.01, 300, np.inf, np.nan], dtype=np.float16)))
+    actual = Tensor(a_np, device="ROCKCHIP").tanh().realize().numpy()
+    np.testing.assert_allclose(actual, np.tanh(a_np), rtol=1e-3, atol=1e-6)
+
   def test_dpu_quick_gelu_two_lut(self):
     a_np = np.array([-400, -300, -10.5, -2, -1.9, -1.6, -1.5, -1.4, -1,
                      -0.918457, -0.534668, -0.403809, -0.331787, -0.161, -0.16, -0.159,

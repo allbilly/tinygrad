@@ -356,6 +356,8 @@ _LUT_CELU = Ops.FLOORMOD
 _LUT_CELU_LOCAL = Ops.FLOORDIV
 _LUT_QUICK_GELU = Ops.SHL
 _LUT_QUICK_GELU_LOCAL = Ops.SHR
+_LUT_TANH = Ops.CDIV
+_LUT_TANH_LOCAL = Ops.XOR
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -502,6 +504,26 @@ def _build_quick_gelu_local_lut() -> tuple[list[int], int, float, float, int]:
       staged = float(np.float16(xh*sigmoid))
       raw = int(round((0.5*ideal+0.5*staged)*output_scale))
       lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_tanh_lut() -> tuple[list[int], int, float, float, int]:
+  """Direct signed Q15 tanh over [-4,4]."""
+  index_scale, output_scale = 4096.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i)*step
+      lut[offset+i] = max(-32768, min(32767, int(round(math.tanh(x)*output_scale))))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_tanh_local_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 4*tanh(x) for x∈[-0.25,0.25], addressed by z=x*16."""
+  index_scale, output_scale = 4096.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i)*step
+      lut[offset+i] = max(-32768, min(32767, int(round(4.0*math.tanh(z/16.0)*output_scale))))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
 def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
@@ -676,6 +698,10 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_QUICK_GELU)
   if val.op is Ops.CUSTOM and val.arg == "rk_quick_gelu_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_QUICK_GELU_LOCAL)
+  if val.op is Ops.CUSTOM and val.arg == "rk_tanh" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_TANH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_tanh_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_TANH_LOCAL)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -1286,7 +1312,7 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Keep the staged tanh interior and replace bounded-LUT tails with sign(x)."""
+  """Use direct Q15 tanh in [-4,4], exact sign tails, and restore NaN."""
   store = _store_node(sink)
   if store is None or (source := _try_tanh(store.src[1])) is None: return None
   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
@@ -1303,15 +1329,75 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   base_slot = alloc()
-  base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
-  base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
-  if base_tasks is None: return None
-  tasks.extend(base_tasks)
-  used_slots = [st.task.out_slot for st in base_tasks] + \
-    [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-  next_slot = max(next_slot, max(used_slots, default=-1)+1)
+  direct_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_tanh")
+  direct_store = store.replace(src=(temp_index(base_slot), direct_val))
+  direct_plan = plan_rk(sink.substitute({store:direct_store}))
+  if isinstance(direct_plan, str) or direct_plan.kind != "dpu_lut":
+    # Preserve the older staged sigmoid interior as a fallback for scheduler changes.
+    base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
+    base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
+    if base_tasks is None: return None
+    tasks.extend(base_tasks)
+    used_slots = [st.task.out_slot for st in base_tasks] + \
+      [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1)+1)
+  else:
+    cmds, task, relocs = emit_rk(direct_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
 
   source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  scaled = alloc()
+  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(16.0), Ops.MUL))
+  local_slot = alloc()
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_tanh_local")
+  local_store = store.replace(src=(temp_index(local_slot), local_val))
+  local_plan = plan_rk(sink.substitute({store:local_store}))
+  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(local_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+  local_scaled_scratch, local_scaled = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.25), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.25), Ops.MUL)))
+  local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
+  local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
+  tasks.extend((_emit_where_stage(total, local_low_diff, scalar(-0.25), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_high_diff, source_arg, scalar(0.25), Ops.SUB),
+                _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
+                _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
+                _emit_where_stage(total, local_inside_scratch, one, (local_outside, 0), Ops.SUB),
+                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB)))
+  near_low_diff, near_low, near_high_diff, near_high = (alloc() for _ in range(4))
+  near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
+  local_mask_scratch, local_mask = alloc(), alloc()
+  clamp_low, negated, negated_clamped, identity = (alloc() for _ in range(4))
+  tasks.extend((_emit_where_stage(total, near_low_diff, scalar(-0.04), source_arg, Ops.SUB),
+                _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, near_high_diff, source_arg, scalar(0.04), Ops.SUB),
+                _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
+                _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
+                _emit_where_stage(total, near_inside_scratch, one, (near_outside, 0), Ops.SUB),
+                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+                _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
+                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+                _emit_where_stage(total, clamp_low, source_arg, scalar(-0.04), Ops.MAX),
+                _emit_where_stage(total, negated, (_ZERO_SLOT, 0), (clamp_low, 0), Ops.SUB),
+                _emit_where_stage(total, negated_clamped, (negated, 0), scalar(-0.04), Ops.MAX),
+                _emit_where_stage(total, identity, (_ZERO_SLOT, 0), (negated_clamped, 0), Ops.SUB)))
+  broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
+  identity_selected_scratch, identity_selected, lut_sum_scratch, lut_sum, interior_slot = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, broad_selected_scratch, (base_slot, 0), (local_outside, 0), Ops.MUL),
+                _emit_where_stage(total, broad_selected, (base_slot, 0), (local_outside, 0), Ops.MUL),
+                _emit_where_stage(total, local_selected_scratch, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+                _emit_where_stage(total, identity_selected_scratch, (identity, 0), (near_inside, 0), Ops.MUL),
+                _emit_where_stage(total, identity_selected, (identity, 0), (near_inside, 0), Ops.MUL),
+                _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+                _emit_where_stage(total, alloc(), (lut_sum, 0), (identity_selected, 0), Ops.ADD),
+                _emit_where_stage(total, interior_slot, (lut_sum, 0), (identity_selected, 0), Ops.ADD)))
   low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
   tasks.extend((_emit_where_stage(total, low_diff, scalar(-4.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
@@ -1325,8 +1411,8 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
                 _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
   base_selected_scratch, base_selected, sign_selected_scratch, sign_selected, finite = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, base_selected_scratch, (base_slot, 0), (inside, 0), Ops.MUL),
-                _emit_where_stage(total, base_selected, (base_slot, 0), (inside, 0), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, base_selected_scratch, (interior_slot, 0), (inside, 0), Ops.MUL),
+                _emit_where_stage(total, base_selected, (interior_slot, 0), (inside, 0), Ops.MUL),
                 _emit_where_stage(total, sign_selected_scratch, (sign, 0), (outside, 0), Ops.MUL),
                 _emit_where_stage(total, sign_selected, (sign, 0), (outside, 0), Ops.MUL),
                 _emit_where_stage(total, alloc(), (base_selected, 0), (sign_selected, 0), Ops.ADD),
@@ -2805,6 +2891,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_quick_gelu_local_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_TANH:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tanh_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_TANH_LOCAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tanh_local_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.LOG2:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
     lut_le_start = 0xffffc000  # -16384
@@ -2911,7 +3005,7 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 23107)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
   elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL,
-                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL):
+                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL):
     # These LUTs use flat endpoint values; their staged epilogues handle the
     # behavior outside the table domain.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)

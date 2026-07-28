@@ -688,6 +688,71 @@ The CELU investigation gives a reusable order for parameterized activations:
 5. add a local table only for a measured narrow precision band;
 6. verify every parameter value, not just the default.
 
+## Case study: two-task tanh LUT with a near-zero identity interval
+
+The original tanh lowering evaluated the tinygrad decomposition:
+
+```text
+tanh(x) = 2 / (1 + exp(-2*x)) - 1
+```
+
+as several fp16 NPU tasks. Its bounded sigmoid table and the ADD/FDIV stores
+accumulated enough rounding error to miss 907 of 2925 official values, with a
+maximum absolute error of 0.02441. Exact sign selection outside `[-4,4]`
+already fixed the extreme test but could not improve this interior.
+
+The accepted interior uses two actual LUT NPU tasks:
+
+```text
+broad = tanh_q15(x)                              # x in [-4,4]
+local = four_times_tanh_q15(x * 16) * 0.25     # x in [-0.25,0.25]
+```
+
+The broad table uses `index_scale=4096`, so its signed halves span four source
+units with a step of `1/128`. Direct Q15 output reduced the official mismatch
+count from 907 to 87 and the maximum error to 0.0002441.
+
+The local table spends the same coordinate range on only 0.25 source units per
+side. It stores `4*tanh(x)` because the amplified endpoint remains below one:
+`4*tanh(0.25)≈0.9797`. After the exact `0.25` rescale, its effective output
+quantum is:
+
+```text
+1 / (32768 * 4) = 1 / 131072
+```
+
+This reduced the official method to two misses, both around `x=0.0027`. At
+that scale even one effective local count exceeds `atol + rtol*abs(tanh(x))`.
+The approximation `tanh(x)≈x` has relative error approximately `x²/3`, so the
+backend selects the original fp16 input for `|x|<=0.04`. This interval is
+comfortably inside the `1e-3` relative target and restores signed/exact zero.
+
+Arithmetic branch selection needs special care. Multiplying the unbounded
+source by the near-zero mask would evaluate `inf*0` in tail lanes and poison
+the later sum with NaN. The identity candidate is therefore clamped first:
+
+```text
+identity = min(max(x, -0.04), 0.04)
+```
+
+Only this finite candidate is multiplied by the near-zero mask. The existing
+outer epilogue then selects exact sign beyond `|x|=4` and restores NaN with an
+`isnan` denominator.
+
+Measured progression:
+
+```text
+staged sigmoid interior: 907/2925 mismatches, max abs 0.02441
+broad Q15 LUT:            87/2925 mismatches, max abs 0.0002441
+broad + local Q15:         2/2925 mismatches, max abs 0.0000076
++ clamped identity:         0/2925 mismatches
+```
+
+The final program contains 67 NPU tasks and submits successfully. This revises
+the earlier interpretation of QuickGELU's 70-task `EINVAL`: 64 is not a
+universal RK3588 task ceiling. Task count remains a useful pressure signal, but
+command payload and the exact program shape must also be measured.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of
@@ -802,7 +867,8 @@ value handling.
 - Input and output scales are representable by the actual registers.
 - Focused official TestOps methods pass unchanged.
 - A hardware regression covers the critical boundary values.
-- Full `test/rockchip/test_hw.py` passes in one process.
+- Full `test/rockchip/test_hw.py` matches the current-HEAD baseline; isolate
+  methods when persistent NPU state makes a shared-process result ambiguous.
 - Mypy, Ruff, and `git diff --check` pass.
 - Rejected Rockchip WIP is preserved as an apply-checkable patch.
 - `progress.md` and `test_ops_status.md` are updated before the milestone

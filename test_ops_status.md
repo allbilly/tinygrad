@@ -1,7 +1,13 @@
 # test_ops.py Status — Rockchip NPU Backend
 
-**Last run:** 2026-07-29 (commit 9939574e9 + segfault fixes)
+**Last run:** 2026-07-29 (parent `00f113a15` + two-LUT tanh working tree)
 **Command:** `PYTHONPATH=. DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 .venv/bin/python -m pytest test/backend/test_ops.py -q --tb=line`
+
+The run completed in 586.59 seconds. Ordinary and extreme tanh pass in focused
+and full-suite execution. The aggregate count is unchanged from the prior
+single-process census because NPU state/order changes which otherwise-green
+method fails; use the method list, not only the aggregate, when measuring a
+milestone.
 
 ## Summary
 
@@ -48,10 +54,10 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
-### 4. Transcendental ops — ~15 tests
-Log, exp, sin, cos, tan, sinh, cosh, tanh, erf, gelu, elu, selu, mish, softplus, sigmoid_extreme.
+### 4. Transcendental ops — ~14 tests
+Log, exp, sin, cos, tan, sinh, cosh, erf, gelu, elu, selu, mish, softplus, sigmoid_extreme.
 
-**Tests:** test_log*, test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_tanh, test_erf, test_gelu*, test_elu, test_selu, test_mish, test_softplus, test_sigmoid*
+**Tests:** test_log*, test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_elu, test_selu, test_mish, test_softplus, test_sigmoid*
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -105,6 +111,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - Simple pad: 1D/2D/3D/4D positive padding with zero/non-zero values
 - Cat dim=0: host-side memmove
 - SQRT, EXP2, quick_gelu (fp32 fixes)
+- tanh, including ordinary interior precision and extreme/special values
 - abs, sign, round, inf_div (fp32 inputs)
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)

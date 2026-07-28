@@ -1,5 +1,54 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — two-LUT tanh interior milestone
+
+### Implementation
+
+- The tanh recognizer still accepts both
+  `2*RECIPROCAL(1+EXP2(...))-1` and the post-rewrite FDIV form.
+- LUT task 1 directly evaluates tanh in signed Q15 over `[-4,4]`. This replaces
+  the accumulated fp16 error of the older staged sigmoid interior while
+  preserving that implementation as a planner fallback.
+- LUT task 2 targets the strict relative-tolerance band `[-0.25,0.25]`. It
+  receives `z=x*16`, stores `4*tanh(z/16)` in Q15, and an exact `0.25` DPU
+  multiply restores tanh. The effective local output quantum is
+  `1/(32768*4)`.
+- For `|x|<=0.04`, the fp16 identity is within TestOps tolerance and is more
+  accurate than one local-LUT output count. The source is clamped to this
+  interval before arithmetic mask selection so infinity cannot contaminate the
+  result through `inf*0`.
+- The existing exact-sign epilogue remains active outside `[-4,4]`, and its
+  NPU `isnan` denominator still restores NaN.
+- The direct two-LUT path is 67 NPU tasks. It submits successfully, proving
+  that QuickGELU's earlier 70-task `EINVAL` was not a universal hard 64-task
+  limit; program shape and command payload also matter.
+
+### Measurements and verification
+
+- The original staged interior failed **907/2925** official values with maximum
+  absolute error `0.02441`.
+- The broad Q15 LUT alone reduced this to **87/2925**, maximum error
+  `0.0002441`.
+- Adding the local LUT reduced it to **2/2925**, both near `x=0.0027`.
+- The clamped identity interval removes those last two misses:
+  `TestOps.test_tanh` and `TestOps.test_tanh_extreme` both **PASS**.
+- A 2049-point hardware grid over `[-4,4]`, plus signed zero, `±4.01`,
+  `±300`, infinities, and NaN, **PASS**.
+- Sigmoid, SiLU, and QuickGELU focused regressions **PASS**.
+- The complete hardware file reports **60 passed, 2 failed** in one serial
+  process. The two fill failures return `1` for zero/3.5 fills and reproduce
+  unchanged against a pristine temporary export of parent `00f113a15`; they
+  are pre-existing current-HEAD failures, not tanh regressions.
+- A fresh full forward-only census completed in 586.59 seconds:
+  **140 passed, 375 failed, 8 skipped, 27 subtests passed**. Ordinary tanh no
+  longer appears in the failure list. The aggregate pass count remains
+  order/state-sensitive, so no synthetic incremental count is claimed.
+- Full mypy retains the same 13 pre-existing Rockchip errors as pristine
+  `00f113a15`. Focused Ruff retains the same five pre-existing findings; the
+  new tanh lines add none. Compileall and `git diff --check` pass.
+- `lut.md` records the two-level table math, the near-zero identity rule, and
+  infinity-safe selection method.
+
 ## 2026-07-28 — two-LUT QuickGELU interior milestone
 
 ### Implementation
@@ -502,17 +551,15 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. Ordinary tanh: 907/2925 interior precision mismatches remain; extreme tanh
-   already passes.
-2. LOG2: positive finite broad-range precision still needs normalization
+1. LOG2: positive finite broad-range precision still needs normalization
    (power-of-four range reduction was the promising direction).
-3. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
+2. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
    staged LOG2/EXP2 interaction before tuning a LUT.
-4. Softplus and Mish: supported paths are numerically inaccurate and likely
+3. Softplus and Mish: supported paths are numerically inaccurate and likely
    depend on improved LOG/EXP range handling.
-5. ELU and SELU: still unsupported composite activation graphs.
-6. Boolean reductions and remaining integer/bool dtype groups.
-7. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
+4. ELU and SELU: still unsupported composite activation graphs.
+5. Boolean reductions and remaining integer/bool dtype groups.
+6. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
    convolution groups. These are larger architectural milestones, not LUT
    quick wins.
 
@@ -4130,4 +4177,3 @@ Fixed two segfault issues that were killing the test process:
 
 ### Status file
 See `test_ops_status.md` for full breakdown of failures by category and passing tests.
-
