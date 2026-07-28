@@ -90,6 +90,7 @@ class RKTask:
   int32_output: bool = False          # multi-task output converted from fp16 to int32
   uint8_output: bool = False          # multi-task output converted from fp16 to uint8
   bool_output: bool = False           # multi-task output converted from fp16 mask to bool
+  trunc_output: bool = False          # multi-task fp16 output truncated through an integer cast round-trip
 
 @dataclass(frozen=True)
 class RKSubTask:
@@ -687,7 +688,7 @@ def _where_arg(u: UOp) -> tuple[int, int]|None:
 
 def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
                       bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
-                      uint8_output=False, bool_output=False, comparison_inputs:tuple[int,...]=(),
+                      uint8_output=False, bool_output=False, trunc_output=False, comparison_inputs:tuple[int,...]=(),
                       fp32_inputs:tuple[int,...]=(), fp32_output=False) -> RKSubTask:
   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
   cmds:list[RKCmd] = []
@@ -734,9 +735,13 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
   emitter_pc_op_en(cmds, 12)
   task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs, int32_inputs=int32_inputs,
                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
-                bool_output=bool_output, comparison_inputs=comparison_inputs,
+                bool_output=bool_output, trunc_output=trunc_output, comparison_inputs=comparison_inputs,
                 fp32_inputs=fp32_inputs, fp32_output=fp32_output)
   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
+
+def _emit_trunc_stage(total:int, out_slot:int, source:tuple[int,int]) -> RKSubTask:
+  """Run an identity DPU stage, then apply the fp16→int32→fp16 cast boundary."""
+  return _emit_where_stage(total, out_slot, source, (_ZERO_SLOT, 0), Ops.ADD, trunc_output=True)
 
 def _try_cast_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
   """Run a DPU identity stage in fp16, with buffer-level conversion at its edges."""
@@ -916,6 +921,8 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
         a, b = (lower_arg(x) for x in u.src)
         if a is None or b is None: return None
         tasks.append(_emit_where_stage(total, materialized[u], a, b, u.op))
+      elif u.op is Ops.TRUNC and (source := _where_arg(u.src[0])) is not None:
+        tasks.append(_emit_trunc_stage(total, materialized[u], source))
       else: return None
     return (materialized[u], 0)
 
@@ -982,7 +989,7 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None: return None
   val, info = _unwrap(store.src[1]), ProgramInfo.from_sink(sink)
-  if val.op not in (_DPU_EW_CFGS.keys() | _LUT_OPS | {Ops.RECIPROCAL}): return None
+  if val.op not in (_DPU_EW_CFGS.keys() | _LUT_OPS | {Ops.RECIPROCAL, Ops.TRUNC}): return None
   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
   materialized:dict[UOp, UOp] = {}
@@ -1030,12 +1037,15 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def lower(u:UOp, out_slot:int) -> UOp|None:
     u = _unwrap(u)
     if (idx := emit_stage(u, out_slot)) is not None: return idx
+    if u.op is Ops.TRUNC and (source := _where_arg(u.src[0])) is not None:
+      tasks.append(_emit_trunc_stage(prod(_shape_of_store(sink)), out_slot, source))
+      return temp_index(out_slot, u.dtype)
     if u.op not in (_DPU_EW_CFGS.keys() | _LUT_OPS | {Ops.RECIPROCAL}): return None
     src = tuple(lower_arg(x) for x in u.src)
     if any(x is None for x in src): return None
     return emit_stage(u.replace(src=src), out_slot)  # type: ignore[arg-type]
 
-  return tuple(tasks) if lower(val, out) is not None and len(tasks) > 1 else None
+  return tuple(tasks) if lower(val, out) is not None and (len(tasks) > 1 or val.op is Ops.TRUNC) else None
 
 def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """DPU elementwise op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy. Register sequence from elementwise.py."""
@@ -1601,7 +1611,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   fp32_mask = (1 << 7 if task.fp32_output else 0) | sum(1 << s for s in task.fp32_inputs if s < 7)
   fp32_bytes = struct.pack("<B", fp32_mask)
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
-  dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | \
+  dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | (int(task.trunc_output) << 3) | \
     sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
   input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16) | \
     sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
@@ -1642,7 +1652,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
                       bool_inputs=bool_inputs, int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
                       comparison_inputs=comparison_inputs,
                       int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
-                      bool_output=bool(dtype_flags & 4)), relocs, off
+                      bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8)), relocs, off
 
 def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
   """Pack multiple tasks into one image (version 4 = PC chain).

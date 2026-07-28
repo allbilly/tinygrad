@@ -1,5 +1,23 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — fp16 rounding milestone
+
+### Implementation
+- `TRUNC` now uses an identity DPU stage followed by the same typed conversion
+  boundary as an fp16→int32→fp16 cast round-trip.
+- Nonfinite values and signed zero bypass the integer conversion so NaN,
+  `±inf`, and `-0` retain their fp16 representations.
+- WHERE lowering can materialize a truncation stage, unlocking tinygrad's
+  decompositions of floor and ceil.
+
+### Verification
+- `test_trunc`, `test_floor`, and `test_ceil` — **PASS**.
+- Full hardware plus recent cast/fill/WHERE/predicate/sign regression —
+  **63 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+- `test_round` remains unsupported because its decomposition contains a deeper
+  nested WHERE graph than floor/ceil.
+
 ## 2026-07-28 — stable sign lowering milestone
 
 ### Implementation

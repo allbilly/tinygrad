@@ -126,6 +126,12 @@ class TestDPU(unittest.TestCase):
     a = Tensor(a_np, device="ROCKCHIP").realize()
     np.testing.assert_array_equal(a.sign().realize().numpy(), np.sign(a_np))
 
+  def test_dpu_rounding(self):
+    a_np = np.array([-8.75,-2,-0.5,-0.0,0,0.5,3.75,8], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    for op, expected in ((a.trunc, np.trunc(a_np)), (a.floor, np.floor(a_np)), (a.ceil, np.ceil(a_np))):
+      np.testing.assert_array_equal(op().realize().numpy(), expected)
+
   def test_dpu_comparison_outputs(self):
     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
     b_np = np.array([-1,0,0,2,2], dtype=np.float16)

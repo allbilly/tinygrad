@@ -71,6 +71,14 @@ def _convert_fp16_to_bool_buf(src, dst, n):
   arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.bool_)
   ctypes.memmove(dst, arr.ctypes.data, n)  # type: ignore[arg-type]
 
+def _truncate_fp16_buf(src, dst, n):
+  """Implement trunc as the same fp16→int32→fp16 cast round-trip used by its graph semantics."""
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).copy()
+  finite_nonzero = np.isfinite(arr) & (arr != 0)
+  arr[finite_nonzero] = arr[finite_nonzero].astype(np.int32).astype(np.float16)
+  ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
 def _convert_int32_to_fp16_buf(src, dst, n):
   import numpy as np
   arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.int32).astype(np.float16)
@@ -351,14 +359,15 @@ class RockchipProgram(Program['RockchipDevice']):
       temp.append(converted)
       _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_counts.get(slot, prepared[slot].size // 2), total)
       prepared[slot] = converted
-    converted_output = next(((st.task.out_slot, st.task.fp32_output, st.task.uint8_output, st.task.bool_output) for st in subtasks
-                             if st.task.fp32_output or st.task.int32_output or st.task.uint8_output or st.task.bool_output), None)
+    converted_output = next(((st.task.out_slot, st.task.fp32_output, st.task.uint8_output, st.task.bool_output, st.task.trunc_output)
+                             for st in subtasks if st.task.fp32_output or st.task.int32_output or st.task.uint8_output or
+                             st.task.bool_output or st.task.trunc_output), None)
     output_conversion = None
     if converted_output is not None:
-      output_slot, is_fp32, is_uint8, is_bool = converted_output
+      output_slot, is_fp32, is_uint8, is_bool, is_trunc = converted_output
       converted = dev._gpu_alloc(max(total * 2, 4096), 0)
       temp.append(converted)
-      output_conversion = (prepared[output_slot], converted, total, is_fp32, is_uint8, is_bool)
+      output_conversion = (prepared[output_slot], converted, total, is_fp32, is_uint8, is_bool, is_trunc)
       prepared[output_slot] = converted
     bufs = tuple(prepared)
     try:
@@ -469,8 +478,9 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0))))
       if output_conversion is not None:
-        original_out, converted, n, is_fp32, is_uint8, is_bool = output_conversion
-        if is_bool: _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, n)
+        original_out, converted, n, is_fp32, is_uint8, is_bool, is_trunc = output_conversion
+        if is_trunc: _truncate_fp16_buf(converted.va_addr, original_out.va_addr, n)
+        elif is_bool: _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, n)
         elif is_uint8: _convert_fp16_to_uint8_buf(converted.va_addr, original_out.va_addr, n)
         elif is_fp32: _convert_fp16_to_fp32_buf(converted.va_addr, original_out.va_addr, n)
         else: _convert_fp16_to_int32_buf(converted.va_addr, original_out.va_addr, n)
