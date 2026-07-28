@@ -753,6 +753,91 @@ the earlier interpretation of QuickGELU's 70-task `EINVAL`: 64 is not a
 universal RK3588 task ceiling. Task count remains a useful pressure signal, but
 command payload and the exact program shape must also be measured.
 
+## Case study: exact-normalized two-task LOG2
+
+The original linear LOG2 table covers `[0.25,4]` and clips every smaller
+positive result to -2. Repeated square-root normalization was rejected because
+three nonlinear LUT/store stages accumulated too much error. Powers of four
+give exact fp16 normalization and integer output offsets.
+
+For the four ranges needed by the official `[-2,2]` random input, construct
+nested threshold masks from the original source:
+
+```text
+m1 = x < 0.25
+m2 = x < 0.0625
+m3 = x < 0.015625
+m4 = x < 0.00390625
+
+factor = 1 + 3*m1 + 12*m2 + 48*m3 + 192*m4
+offset = -2*(m1 + m2 + m3 + m4)
+normalized = x * factor
+result = log2(normalized) + offset
+```
+
+The difference weights produce factors 1, 4, 16, 64, or 256 without a dynamic
+power operation. For the smallest official positive input, approximately
+0.00215, the factor is 256 and the normalized value is about 0.55. Multiplying
+by a power of two and adding an even integer are exact for these fp16 inputs.
+
+The broad table uses `index_scale=4096`, an exact `1/128` grid, and Q13 output.
+Range reduction removed the large clipping error but left 49 strict relative
+misses around `normalized=1`, where Q13's output quantum is too coarse.
+
+The second LUT zooms that interval:
+
+```text
+z = (normalized - 1) * 20
+local_raw = Q15(4 * log2(1 + z/20))
+local = local_raw * 0.25
+```
+
+It is selected on `[0.9,1.1]`. Four-times amplification fits signed Q15 over
+that interval and gives an effective output quantum of `1/131072`. A six-times
+experiment used a non-power `1/6` epilogue and produced 1.5x results. An
+eight-times experiment used `0.125` but produced 2x results in this long staged
+program. Keep the hardware-proven binary 4x/0.25 form.
+
+One fp16 input remained:
+
+```text
+x = 1.0009765625
+expected log2(x) = 0.0014085769653320312
+local result     = 0.00141143798828125
+```
+
+For `d=normalized-1` with `|d|<=0.0015`, the first-order form
+`d*log2(e)` has relative truncation error approximately `|d|/2`, within the
+`1e-3` target. This narrow arithmetic interval removes the final mismatch and
+also gives exact `log2(1)=0`.
+
+Special inputs require two layers of protection:
+
+- float32 input slots must be declared through `fp32_inputs` on every
+  normalization stage that reads the source;
+- clamp only the LUT candidate to `[0.25,4]` before local selection, while
+  keeping zero/infinity/NaN masks on the original source.
+
+Without the clamp, `+inf` contaminated the local arithmetic and remained NaN
+even after the positive-infinity denominator. With it, the candidate is finite
+and the established epilogue creates `-inf` for zero, `+inf` for positive
+infinity, and NaN for negatives/NaN.
+
+Measured progression:
+
+```text
+bounded broad table:      277/2925 mismatches, max abs 6.86
++ exact normalization:     49/2925 mismatches
++ local Q15 table:         11/2925 mismatches
++ 4x narrower table:        1/2925 mismatch
++ near-one linear branch:   0/2925 mismatches
+```
+
+The accepted graph has 94 tasks and passes a hardware grid from `2^-10` to 4.
+Values below the lowest implemented threshold remain future generalization
+work; extend the exact mask/weight sequence rather than returning to nonlinear
+SQRT normalization.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of

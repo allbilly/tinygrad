@@ -1,0 +1,175 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 4dc6b2030..4d4f1fe44 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -160,0 +161,9 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_log2_two_lut_normalization(self):
++    boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
++                           0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,
++                           1, 1.001, 1.1, 1.101, 2, 4], dtype=np.float16)
++    dense = np.exp2(np.linspace(-10, 2, 2049, dtype=np.float32)).astype(np.float16)
++    a_np = np.concatenate((dense, boundaries, np.array([0, -2, np.inf, -np.inf, np.nan], dtype=np.float16)))
++    actual = Tensor(a_np, device="ROCKCHIP").log2().realize().numpy()
++    np.testing.assert_allclose(actual, np.log2(a_np), rtol=1e-3, atol=2e-4)
++
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 6271cd101..5b00250b2 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -360,0 +361 @@ _LUT_TANH_LOCAL = Ops.XOR
++_LUT_LOG2_LOCAL = Ops.OR
+@@ -535,2 +536,2 @@ def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
+-  index_scale = 4090.0  # avoid x=4.0 hitting LUT_LO_END=16384 exactly
+-  step = 32.0 / index_scale  # ≈ 1/127.8
++  index_scale = 4096.0
++  step = 32.0 / index_scale  # 1/128
+@@ -553,0 +555,11 @@ def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
++def _build_log2_local_lut() -> tuple[list[int], int, float, float, int]:
++  """Q15 4*log2(x) for x∈[0.9,1.1], addressed by z=(x-1)*20."""
++  index_scale, output_scale = 8192.0, 32768.0
++  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      z = (-(512-i) if table == 0 else i)*step
++      raw = int(round(4.0*math.log2(1.0+z/20.0)*output_scale))
++      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
+@@ -704,0 +717,2 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
++  if val.op is Ops.CUSTOM and val.arg == "rk_log2_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOG2_LOCAL)
+@@ -2126 +2140 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Preserve LOG2 zero, infinity, and NaN semantics around the bounded LUT."""
++  """Normalize finite LOG2 inputs and preserve zero, infinity, and NaN semantics."""
+@@ -2135 +2148,0 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  zero = UOp.const(dtypes.half, 0.0)
+@@ -2141,0 +2155,3 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++
+@@ -2165,0 +2182,33 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  source_arg = (source.src[0].buf_uop.arg.slot, 0)
++  source_fp32 = (source_arg[0],) if source.dtype is dtypes.float else ()
++  range_masks:list[tuple[int,int]] = []
++  for threshold in (0.25, 0.0625, 0.015625, 0.00390625):
++    diff, mask = alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, diff, scalar(threshold), source_arg, Ops.SUB, fp32_inputs=source_fp32),
++                  _emit_where_stage(total, mask, (diff, 0), (diff, 0), Ops.MAX, compare=True)))
++    range_masks.append((mask, 0))
++
++  weighted:list[tuple[int,int]] = []
++  for mask_arg, weight in zip(range_masks, (3.0, 12.0, 48.0, 192.0)):
++    slot = alloc()
++    tasks.append(_emit_where_stage(total, slot, mask_arg, scalar(weight), Ops.MUL))
++    weighted.append((slot, 0))
++  factor_lo, factor_hi, factor_delta, factor, normalized = (alloc() for _ in range(5))
++  tasks.extend((_emit_where_stage(total, factor_lo, weighted[0], weighted[1], Ops.ADD),
++                _emit_where_stage(total, factor_hi, weighted[2], weighted[3], Ops.ADD),
++                _emit_where_stage(total, factor_delta, (factor_lo, 0), (factor_hi, 0), Ops.ADD),
++                _emit_where_stage(total, factor, (factor_delta, 0), one, Ops.ADD),
++                _emit_where_stage(total, normalized, source_arg, (factor, 0), Ops.MUL, fp32_inputs=source_fp32)))
++
++  count_lo, count_hi, count, offset = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, count_lo, range_masks[0], range_masks[1], Ops.ADD),
++                _emit_where_stage(total, count_hi, range_masks[2], range_masks[3], Ops.ADD),
++                _emit_where_stage(total, count, (count_lo, 0), (count_hi, 0), Ops.ADD),
++                _emit_where_stage(total, offset, (count, 0), scalar(-2.0), Ops.MUL)))
++
++  bounded_low, negated, negated_bounded, bounded = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, bounded_low, (normalized, 0), scalar(0.25), Ops.MAX),
++                _emit_where_stage(total, negated, (_ZERO_SLOT, 0), (bounded_low, 0), Ops.SUB),
++                _emit_where_stage(total, negated_bounded, (negated, 0), scalar(-4.0), Ops.MAX),
++                _emit_where_stage(total, bounded, (_ZERO_SLOT, 0), (negated_bounded, 0), Ops.SUB)))
++
+@@ -2167 +2216,2 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  lut_plan = plan_rk(stage_sink(val, lut_slot))
++  normalized_val = UOp(Ops.LOG2, dtypes.half, (temp_index(bounded),))
++  lut_plan = plan_rk(stage_sink(normalized_val, lut_slot))
+@@ -2171,0 +2222,52 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  centered, zoomed = alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, centered, (bounded, 0), one, Ops.SUB),
++                _emit_where_stage(total, zoomed, (centered, 0), scalar(20.0), Ops.MUL)))
++  local_slot = alloc()
++  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_log2_local")
++  local_plan = plan_rk(stage_sink(local_val, local_slot))
++  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(local_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++  local_scaled_scratch, local_scaled = alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.25), Ops.MUL),
++                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.25), Ops.MUL)))
++
++  local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
++  local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, local_low_diff, scalar(0.9), (bounded, 0), Ops.SUB),
++                _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, local_high_diff, (bounded, 0), scalar(1.1), Ops.SUB),
++                _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
++                _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
++                _emit_where_stage(total, local_inside_scratch, one, (local_outside, 0), Ops.SUB),
++                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB)))
++  near_low_diff, near_low, near_high_diff, near_high = (alloc() for _ in range(4))
++  near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
++  local_mask_scratch, local_mask, linear = alloc(), alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, near_low_diff, scalar(-0.0015), (centered, 0), Ops.SUB),
++                _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, near_high_diff, (centered, 0), scalar(0.0015), Ops.SUB),
++                _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
++                _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
++                _emit_where_stage(total, near_inside_scratch, one, (near_outside, 0), Ops.SUB),
++                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
++                _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
++                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
++                _emit_where_stage(total, linear, (centered, 0), scalar(math.log2(math.e)), Ops.MUL)))
++  broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
++  linear_selected_scratch, linear_selected, lut_sum_scratch, lut_sum, mantissa = (alloc() for _ in range(5))
++  tasks.extend((_emit_where_stage(total, broad_selected_scratch, (lut_slot, 0), (local_outside, 0), Ops.MUL),
++                _emit_where_stage(total, broad_selected, (lut_slot, 0), (local_outside, 0), Ops.MUL),
++                _emit_where_stage(total, local_selected_scratch, (local_scaled, 0), (local_mask, 0), Ops.MUL),
++                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
++                _emit_where_stage(total, linear_selected_scratch, (linear, 0), (near_inside, 0), Ops.MUL),
++                _emit_where_stage(total, linear_selected, (linear, 0), (near_inside, 0), Ops.MUL),
++                _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
++                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
++                _emit_where_stage(total, alloc(), (lut_sum, 0), (linear_selected, 0), Ops.ADD),
++                _emit_where_stage(total, mantissa, (lut_sum, 0), (linear_selected, 0), Ops.ADD)))
++  corrected = alloc()
++  dependent(corrected, (mantissa, 0), (offset, 0), Ops.ADD)
++
+@@ -2173,3 +2275,11 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
+-  negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, zero)))
+-  nonzero = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, zero)))
++  positive_arg = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
++  if positive_arg is None: return None
++  negative_diff, negative, positive_diff, source_positive = (alloc() for _ in range(4))
++  nonzero_scratch, nonzero_slot = alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), source_arg, Ops.SUB, fp32_inputs=source_fp32),
++                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, positive_diff, source_arg, (_ZERO_SLOT, 0), Ops.SUB, fp32_inputs=source_fp32),
++                _emit_where_stage(total, source_positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, nonzero_scratch, (negative, 0), (source_positive, 0), Ops.MAX),
++                _emit_where_stage(total, nonzero_slot, (negative, 0), (source_positive, 0), Ops.MAX)))
++  negative_arg, nonzero = (negative, 0), (nonzero_slot, 0)
+@@ -2177 +2287 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  if positive is None or negative is None or nonzero is None or not_number is None: return None
++  if not_number is None: return None
+@@ -2180 +2290 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  dependent(zero_result, (lut_slot, 0), nonzero, Ops.FDIV)
++  dependent(zero_result, (corrected, 0), nonzero, Ops.FDIV)
+@@ -2182 +2292 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  dependent(positive_denom, one, positive, Ops.SUB)
++  dependent(positive_denom, one, positive_arg, Ops.SUB)
+@@ -2185 +2295 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  dependent(invalid, negative, not_number, Ops.MAX)
++  dependent(invalid, negative_arg, not_number, Ops.MAX)
+@@ -2901,0 +3012,4 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
++  elif lut_op is _LUT_LOG2_LOCAL:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+@@ -3008 +3122 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
+-                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL):
++                  _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL):

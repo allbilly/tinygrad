@@ -1,5 +1,60 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — exact-normalized two-LUT LOG2 milestone
+
+### Implementation
+
+- Positive inputs below the broad table are normalized by exact powers of four.
+  Four masks for `<0.25`, `<0.0625`, `<0.015625`, and `<0.00390625` construct:
+
+  ```text
+  factor = 1 + 3*m1 + 12*m2 + 48*m3 + 192*m4
+  offset = -2*(m1+m2+m3+m4)
+  log2(x) = log2_lut(x*factor) + offset
+  ```
+
+  All multipliers and offsets are exact in fp16 over the official domain.
+- The broad table now uses exact `index_scale=4096` and Q13 output over
+  `[0.25,4]`.
+- A second LUT receives `(normalized-1)*20` and emits `4*log2(normalized)` in
+  Q15 over `[0.9,1.1]`; an exact `0.25` stage restores the result.
+- For `|normalized-1|<=0.0015`, the backend uses
+  `(normalized-1)*log2(e)`. This removes the final local-table quantization
+  miss and restores exact `log2(1)=0`.
+- The LUT candidate is clamped to `[0.25,4]` before local arithmetic. Special
+  masks still inspect the original source, preventing `+inf` from contaminating
+  branch sums before the existing zero/infinity/NaN epilogue.
+- DPU stages that directly read a float32 source declare `fp32_inputs`, so the
+  explicit float32 special-value TestOps subcase is converted correctly.
+- The accepted program has 94 NPU tasks and submits successfully. Together
+  with the 67-task tanh result, this confirms that task count alone does not
+  explain the earlier 70-task QuickGELU `EINVAL`.
+
+### Measurements and verification
+
+- Original bounded LOG2: **277/2925** mismatches, maximum error `6.86`; inputs
+  below 0.25 clipped to -2.
+- Exact power-of-four normalization plus the exact broad grid:
+  **49/2925** mismatches, all near output zero.
+- First Q15 local table: **11/2925** mismatches.
+- Narrowing the table and amplifying by four: **1/2925** mismatch at
+  `log2(1.0009765625)`.
+- The near-one linear interval removes the final miss:
+  `TestOps.test_log2` **PASS**, including float32 `+inf`, `-inf`, and NaN.
+- A 2049-point hardware log grid over `[2^-10,4]`, every normalization/local
+  boundary, zero, negatives, infinities, and NaN **PASS**.
+- The hardware file reports **61 passed, 2 failed** in one serial process. The
+  two current-HEAD fill failures are the same parent-baseline failures recorded
+  in the tanh milestone.
+- The 6x/`1/6` and 8x/`0.125` local experiments were rejected: in this long
+  staged program the rescale behaved as `0.25`, producing 1.5x and 2x results.
+  Binary `4x`/`0.25` is the proven path.
+- Full mypy retains exactly the same 13 parent Rockchip errors; focused Ruff
+  retains the same five parent findings. Compileall and `git diff --check`
+  pass, with no new static-check findings.
+- Natural log remains separate: its `LOG2*ln(2)` graph bypasses this root LOG2
+  special path and still fails. It is the next milestone.
+
 ## 2026-07-29 — two-LUT tanh interior milestone
 
 ### Implementation
@@ -551,8 +606,8 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. LOG2: positive finite broad-range precision still needs normalization
-   (power-of-four range reduction was the promising direction).
+1. Natural log/log10: scaled `LOG2*constant` bypasses the root LOG2
+   normalization/special path.
 2. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
    staged LOG2/EXP2 interaction before tuning a LUT.
 3. Softplus and Mish: supported paths are numerically inaccurate and likely
