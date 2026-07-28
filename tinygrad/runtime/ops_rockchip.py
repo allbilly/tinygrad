@@ -166,7 +166,17 @@ class RockchipProgram(Program['RockchipDevice']):
         in_is_fp32 = in_slot in task.fp32_inputs
         out_is_fp32 = task.fp32_output
         in_buf, out_buf = buf_map[in_slot], buf_map[self.relocs[0].globals_slot]
-        if in_is_fp32 and out_is_fp32:
+        if len(task.layout) > 1 and in_is_fp32 == out_is_fp32:
+          _, ndim, *meta = task.layout
+          shape, strides, offset = meta[:ndim], meta[ndim:2*ndim], meta[-1]
+          itemsize = 4 if in_is_fp32 else 2
+          for out_idx in range(total):
+            rem, src_idx = out_idx, offset
+            for dim in range(ndim-1, -1, -1):
+              rem, coord = divmod(rem, shape[dim])
+              src_idx += coord * strides[dim]
+            ctypes.memmove(out_buf.va_addr + out_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
+        elif in_is_fp32 and out_is_fp32:
           # fp32→fp32 copy: just memmove fp32 data directly
           ctypes.memmove(out_buf.va_addr, in_buf.va_addr, total * 4)  # type: ignore[arg-type]
         elif in_is_fp32 and not out_is_fp32:

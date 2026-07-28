@@ -91,9 +91,9 @@ class RKSubTask:
 def _is_fp16_only(sink: UOp) -> bool:
   """All tensor-carrying nodes must be fp16 or fp32 (REDUCE may be fp32 for the NPU accumulator).
   fp32 inputs/outputs are handled via buffer-level conversion in RockchipProgram.__call__."""
-  return all(not ((u.op is Ops.PARAM and u.dtype not in (dtypes.half, dtypes.float)) or
+  return all(not ((u.op is Ops.PARAM and u.dtype not in (dtypes.half, dtypes.float, dtypes.int)) or
                   (u.op is Ops.REDUCE and u.dtype not in (dtypes.half, dtypes.float)) or
-                  (u.op is Ops.STORE and u.src[1].dtype not in (dtypes.half, dtypes.void, dtypes.float))) for u in sink.toposort())
+                  (u.op is Ops.STORE and u.src[1].dtype not in (dtypes.half, dtypes.void, dtypes.float, dtypes.int))) for u in sink.toposort())
 
 def _find_op(sink: UOp, op: Ops) -> UOp|None: return next((u for u in sink.toposort() if u.op is op), None)
 def _reduce_node(sink: UOp) -> UOp|None: return _find_op(sink, Ops.REDUCE)
@@ -117,6 +117,27 @@ def _is_2d_index(idx: UOp, outer_kind: str = "LOOP", inner_kind: str = "LOOP", s
   if mr.arg[1].name != outer_kind or rs.arg[1].name != inner_kind or \
      (stride >= 0 and int(mc.arg) != stride) or (stride < 0 and mr.arg[0] != 0): return None
   return (int(mr.src[0].arg) if mr.src and mr.src[0].op is Ops.CONST else 0, int(mc.arg), int(mc.arg))
+
+def _index_axes(idx:UOp) -> tuple[int,int]|None:
+  if idx.op is not Ops.ADD: return None
+  mul, inner = idx.src
+  if mul.op is not Ops.MUL or inner.op is not Ops.RANGE: return None
+  outer = next((x for x in mul.src if x.op is Ops.RANGE), None)
+  return (outer.arg[0], inner.arg[0]) if outer is not None else None
+
+def _affine_index(idx:UOp) -> tuple[dict[int,int], int]|None:
+  if idx.op is Ops.RANGE: return ({idx.arg[0]: 1}, 0)
+  if idx.op is Ops.CONST: return ({}, int(idx.arg))
+  if idx.op is Ops.ADD:
+    a, b = _affine_index(idx.src[0]), _affine_index(idx.src[1])
+    if a is None or b is None: return None
+    return ({k:a[0].get(k, 0)+b[0].get(k, 0) for k in a[0].keys()|b[0].keys()}, a[1]+b[1])
+  if idx.op is Ops.MUL:
+    c, x = (idx.src[0], idx.src[1]) if idx.src[0].op is Ops.CONST else (idx.src[1], idx.src[0])
+    if c.op is not Ops.CONST or (aff := _affine_index(x)) is None: return None
+    scale = int(c.arg)
+    return ({k:v*scale for k,v in aff[0].items()}, aff[1]*scale)
+  return None
 
 def _try_sub(val: UOp) -> tuple[int, int]|None:
   """ADD(INDEX, MUL(INDEX, CONST(-1))) → (src_slot, ew_slot) for DPU SUB, or None."""
@@ -511,10 +532,10 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     elif reciprocal is not None: kind, a2d, ru = "dpu", True, True
     elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)): kind, a2d, ru = "dpu", True, True
     elif abs_slot is not None: kind, a2d, ru = "dpu", True, True
-    elif _unwrap(val).op is Ops.INDEX: kind, a2d, ru = "dpu", False, False
+    elif _unwrap(val).op is Ops.INDEX: kind, a2d, ru = "dpu", True, False
     elif _unwrap(val).op is Ops.CONST: kind, a2d, ru = "dpu", True, False
     else: return f"RKPLAN_REJECT:unsupported_op:{val.op if val.op not in _DPU_EW_CFGS else 'non_index_operand'}"
-    if (r := _check_dpu_layout(sink, a2d, ru)): return r
+    if val.op is not Ops.INDEX and (r := _check_dpu_layout(sink, a2d, ru)): return r
   # R1 CMAC: REDUCE(ADD, MUL(INDEX, INDEX)) or REDUCE(ADD, INDEX) [sum via ones]
   elif reduce.arg[0] is Ops.ADD:
     body = _reduce_body(reduce)
@@ -571,8 +592,12 @@ def plan_rk(sink: UOp) -> RKPlan|str:
   # fp32 is only supported for DPU/DPU_LUT (buffer-level fp32↔fp16 conversion in __call__).
   # CMAC and PPU require host-side data transforms (pad/swizzle) that assume fp16 — reject fp32 for them.
   fp32_param_slots = {u.arg.slot for u in sink.toposort() if u.op is Ops.PARAM and u.dtype is dtypes.float}
-  fp32_inputs = tuple(s for s in in_slots if s in fp32_param_slots)  # actual slot numbers
-  fp32_output = out_slots[0] in fp32_param_slots
+  int_param_slots = {u.arg.slot for u in sink.toposort() if u.op is Ops.PARAM and u.dtype is dtypes.int}
+  is_copy = reduce is None and store is not None and _unwrap(store.src[1]).op is Ops.INDEX
+  if int_param_slots and not is_copy: return "RKPLAN_REJECT:unsupported_dtype"
+  wide_param_slots = fp32_param_slots | int_param_slots
+  fp32_inputs = tuple(s for s in in_slots if s in wide_param_slots)  # four-byte input slots
+  fp32_output = out_slots[0] in wide_param_slots
   if (fp32_inputs or fp32_output) and kind not in ("dpu", "dpu_lut"):
     return f"RKPLAN_REJECT:unsupported_dtype:fp32_{kind}"
   return RKPlan(kind, sink, out_slots[0], in_slots, input_scale=input_scale, output_scale=output_scale, lut_op=lut_op,
@@ -716,7 +741,16 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None or lut_result is not None) else _try_reciprocal(val)
   abs_slot = _try_abs(val) if not (is_copy or is_fill or lut_result is not None or sub_slots is not None or
                                    scalar is not None or reciprocal is not None) else None
-  layout = (total,)
+  layout:tuple[int,...] = (total,)
+  if is_copy and (aff := _affine_index(vu.src[1])) is not None:
+    extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
+               if u.op is Ops.RANGE and u.arg[1].name == "LOOP" and u.src[0].op is Ops.CONST}
+    store_aff = _affine_index(store.src[0].src[1])
+    axes = sorted(store_aff[0], key=lambda x: store_aff[0][x], reverse=True) if store_aff is not None else sorted(extents)
+    shape = tuple(extents[i] for i in axes)
+    strides = tuple(aff[0].get(i, 0) for i in axes)
+    contiguous = tuple(prod(shape[i+1:]) for i in range(len(shape)))
+    if strides != contiguous or aff[1]: layout = (total, len(shape), *shape, *strides, aff[1])
   # track the EW op for FDIV-specific register emissions (OUT_CVT_SCALE, FP16TOFP32_EN=0)
   ew_op = Ops.SUB if sub_slots else (Ops.FDIV if reciprocal else (val.op if scalar else
           (Ops.ADD if is_fill else (Ops.MAX if abs_slot else (None if is_copy else val.op)))))

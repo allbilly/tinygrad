@@ -1,5 +1,30 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — affine movement and int32 copy milestone
+
+### Implementation
+- DPU copy classification now admits int32 buffers and arbitrary affine input
+  indexing instead of requiring flat/2D axis-0 layouts.
+- Copy tasks encode logical shape, input strides, and offset. Runtime data
+  movement evaluates that metadata for arbitrary rank and element width.
+- This covers transpose/permute, negative-stride flip, stepped slices, and
+  int32 copies without pretending the DPU performed unsupported int32 math.
+- Four-byte copy metadata reuses the existing wide-buffer flag; non-copy int32
+  arithmetic remains honestly rejected.
+
+### Verification
+- `test_flip`, `test_permute`, `test_transpose`, in-bounds 1D/ND slices,
+  negative-stride slices, stepped slices, and `test_where_permute` — **PASS**.
+- The movement group plus `test/rockchip/test_hw.py` — **47 passed**.
+- `python -m mypy tinygrad/` — **PASS**.
+- targeted Ruff check — **PASS**.
+
+### Full-suite baseline note
+- A serial `FORWARD_ONLY=1 test/backend/test_ops.py` run reached about 95%
+  before pytest segfaulted while formatting a failure: 92 passed, 319 failed,
+  and 8 skipped had completed at that point. Remaining late tests must be run
+  in isolated subprocesses so one corruption/crash cannot discard the run.
+
 ## 2026-07-28 — `Ops.WHERE` hardware lowering
 
 ### Implementation
