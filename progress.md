@@ -1,5 +1,24 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — nested WHERE / clip milestone
+
+### Implementation
+- Generalized WHERE lowering to recursively materialize nested WHERE branch and
+  comparison operands into shared NPU scratch buffers.
+- Added OR-of-comparisons mask lowering using the existing hardware comparison
+  stage plus DPU MAX for boolean OR. This handles the equal-bound `clip(c, c)`
+  form emitted by tinygrad.
+- Reused one materialized result when a nested WHERE appears in both the
+  condition and a branch, avoiding duplicate NPU work.
+
+### Verification
+- `TestOps.test_clip` — **PASS** for ordinary, boundary, equal, lower-only, and
+  upper-only bounds.
+- `TestOps.test_where`, `TestOps.test_clip`, and `test/rockchip/test_hw.py` —
+  **41 passed**.
+- `python -m mypy tinygrad/` — **PASS** (215 source files).
+- targeted Ruff check — **PASS**.
+
 ## 2026-07-28 — affine movement and int32 copy milestone
 
 ### Implementation

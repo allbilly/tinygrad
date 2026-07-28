@@ -690,35 +690,82 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
-  cond = _unwrap(val.src[0])
-  true, false = (_where_arg(x) for x in val.src[1:])
-  if true is None or false is None: return None
   total, info = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink)
-  broadcasts = tuple(a[0] for u, a in zip(val.src[1:], (true, false))
-                     if _unwrap(u).op is Ops.INDEX and int(_unwrap(u).src[0].src[0].arg) < total)
   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  t0, mask, scratch, selected_false = range(next_slot, next_slot+4)
+  tasks:list[RKSubTask] = []
+  materialized:dict[UOp, int] = {}
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-  int_out = dtypes.is_int(val.dtype)
-  if cond.op is Ops.CMPLT:
-    lhs, rhs = (_where_arg(x) for x in cond.src)
-    if lhs is None or rhs is None: return None
-    return (_emit_where_stage(total, t0, rhs, lhs, Ops.SUB),
-            _emit_where_stage(total, mask, (t0,0), (t0,0), Ops.MAX, compare=True),
-            _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
-            _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, out, (t0,0), (selected_false,0), Ops.ADD, broadcast_inputs=broadcasts, int32_output=int_out))
-  if cond.op is Ops.INDEX and (mask_arg := _where_arg(cond)) is not None:
-    bool_slots = (mask_arg[0],)
-    return (_emit_where_stage(total, t0, true, mask_arg, Ops.MUL, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, scratch, one, mask_arg, Ops.SUB, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
-            _emit_where_stage(total, out, (t0,0), (selected_false,0), Ops.ADD, bool_inputs=bool_slots,
-                              broadcast_inputs=broadcasts, int32_output=int_out))
-  return None
+
+  def alloc(count:int=1) -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + count
+    return ret
+
+  def lower_arg(u:UOp) -> tuple[int,int]|None:
+    if (arg := _where_arg(u)) is not None: return arg
+    u = _unwrap(u)
+    if u.op is not Ops.WHERE: return None
+    if u not in materialized:
+      materialized[u] = alloc()
+      if not lower(u, materialized[u], False): return None
+    return (materialized[u], 0)
+
+  def lower(w:UOp, out_slot:int, final:bool) -> bool:
+    w = _unwrap(w)
+    if w.op is not Ops.WHERE: return False
+    cond = _unwrap(w.src[0])
+    true, false = (lower_arg(x) for x in w.src[1:])
+    if true is None or false is None: return False
+    broadcasts = tuple(a[0] for u, a in zip(w.src[1:], (true, false))
+                       if _unwrap(u).op is Ops.INDEX and int(_unwrap(u).src[0].src[0].arg) < total)
+    first = alloc(4)
+    t0, mask, scratch, selected_false = range(first, first+4)
+    int_out = final and dtypes.is_int(w.dtype)
+    if cond.op is Ops.CMPLT:
+      lhs, rhs = (lower_arg(x) for x in cond.src)
+      if lhs is None or rhs is None: return False
+      tasks.extend((_emit_where_stage(total, t0, rhs, lhs, Ops.SUB),
+                    _emit_where_stage(total, mask, (t0,0), (t0,0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
+                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
+                                      broadcast_inputs=broadcasts, int32_output=int_out)))
+      return True
+    if cond.op is Ops.OR and all(_unwrap(x).op is Ops.CMPLT for x in cond.src):
+      masks = []
+      for cmp in cond.src:
+        lhs, rhs = (lower_arg(x) for x in _unwrap(cmp).src)
+        if lhs is None or rhs is None: return False
+        diff = alloc(2)
+        cmp_mask = diff + 1
+        tasks.extend((_emit_where_stage(total, diff, rhs, lhs, Ops.SUB),
+                      _emit_where_stage(total, cmp_mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
+        masks.append((cmp_mask, 0))
+      combined = alloc()
+      tasks.extend((_emit_where_stage(total, combined, masks[0], masks[1], Ops.MAX),
+                    _emit_where_stage(total, scratch, true, (combined,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, t0, true, (combined,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, scratch, one, (combined,0), Ops.SUB),
+                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
+                                      broadcast_inputs=broadcasts, int32_output=int_out)))
+      return True
+    if cond.op is Ops.INDEX and (mask_arg := _where_arg(cond)) is not None:
+      bool_slots = (mask_arg[0],)
+      tasks.extend((_emit_where_stage(total, t0, true, mask_arg, Ops.MUL, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, scratch, one, mask_arg, Ops.SUB, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL,
+                                      bool_inputs=bool_slots, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD, bool_inputs=bool_slots,
+                                      broadcast_inputs=broadcasts, int32_output=int_out)))
+      return True
+    return False
+
+  return tuple(tasks) if lower(val, out, True) else None
 
 def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """DPU elementwise op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy. Register sequence from elementwise.py."""
