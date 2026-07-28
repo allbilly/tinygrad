@@ -31,6 +31,24 @@
 - Record the source branch/commit for any ported logic. Emulator-only passes do
   not count as Rockchip hardware evidence.
 
+### Reference-branch evidence audit
+
+| Branch/commit | Proven or useful work | Porting decision |
+|---|---|---|
+| `rockchip/backend-consideration` / `a1d2362b1` | Comparison and WHERE lowering, plus explicit NPU-state reset before ordinary elementwise tasks | Register math is useful evidence. Current staged comparison/WHERE support is newer; inspect the reset sequence for the remaining same-process SiLU→SUB timeout rather than cherry-picking the old renderer |
+| `rockchip/backend-consideration` / `3d5b8bce8` | Compiled EXP2 and custom-SiLU LUT templates | LUT register stream is useful, but the implementation postprocesses raw LUT output on the host and therefore is not a drop-in native TestOps solution |
+| `rockchip/wip` / `4fda72a2d` and `lrshift` / `be0f46dc6` | Truncation hardware path | Already superseded by the current typed conversion/rounding implementation; retain only as corroborating register evidence |
+| `rockchip_addmul` / `e0c38901b` | CNA convolution paths and region markers | High-value source for the layout/convolution milestone, but its broad metadata inference and function-name heuristics require validation against the current AST planner |
+| `recip` / `b3d2158c7` | Reciprocal experiment | Commit is explicitly a failed attempt; do not treat it as proof |
+| `lrshift` / `90187f9ed` | Logical-right-shift experiment | Attempt only; requires fresh hardware verification |
+| `codex/nested-where` / `04f6fdc0b` | Nested WHERE staging | Already incorporated and extended on `rockchip-2607` |
+
+The old `test_silu`/`test_exp2` branch results used relaxed tolerances or host
+dequantization. They remain algorithm references, while current milestones
+must pass the unchanged upstream tolerances with NPU-side output semantics.
+Activation probes must run serially in isolated subprocesses: concurrent
+probes on the single RK3588 NPU are invalid evidence and are discarded.
+
 ## 2026-07-28 — typed minimum milestone
 
 ### Implementation
