@@ -1564,7 +1564,68 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       lhs, rhs = (lower_arg(x) for x in cond.src)
       if lhs is None or rhs is None: return False
       tasks.extend((_emit_where_stage(total, t0, rhs, lhs, Ops.SUB),
-                    _emit_where_stage(total, mask, (t0,0), (t0,0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, mask, (t0,0), (t0,0), Ops.MAX, compare=True)))
+      lhs_u, rhs_u, true_u, false_u = (_unwrap(x) for x in (*cond.src, *w.src[1:]))
+
+      # WHERE(x<c, x, f) without 0*inf:
+      # min(x,c) + (f-c)*(1-mask). This preserves selected -inf and discards
+      # unselected +inf through MAX/negation rather than multiplication.
+      if true_u is lhs_u and lhs_u.op is Ops.INDEX and rhs_u.op is Ops.CONST and false_u.op is Ops.CONST and \
+         math.isfinite(float(rhs_u.arg)) and math.isfinite(float(false_u.arg)):
+        negative, maximum, minimum, inverse, adjustment = (alloc() for _ in range(5))
+        negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+        negative_threshold = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -float(rhs_u.arg)))[0])
+        delta = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(false_u.arg)-float(rhs_u.arg)))[0])
+        tasks.extend((_emit_where_stage(total, scratch, lhs, negative_one, Ops.MUL),
+                      _emit_where_stage(total, negative, lhs, negative_one, Ops.MUL),
+                      _emit_where_stage(total, scratch, (negative,0), negative_threshold, Ops.MAX),
+                      _emit_where_stage(total, maximum, (negative,0), negative_threshold, Ops.MAX),
+                      _emit_where_stage(total, scratch, (maximum,0), negative_one, Ops.MUL),
+                      _emit_where_stage(total, minimum, (maximum,0), negative_one, Ops.MUL),
+                      _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
+                      _emit_where_stage(total, inverse, one, (mask,0), Ops.SUB),
+                      _emit_where_stage(total, scratch, (inverse,0), delta, Ops.MUL),
+                      _emit_where_stage(total, adjustment, (inverse,0), delta, Ops.MUL),
+                      _emit_where_stage(total, scratch, (minimum,0), (adjustment,0), Ops.ADD),
+                      _emit_where_stage(total, out_slot, (minimum,0), (adjustment,0), Ops.ADD,
+                                        int32_output=int_out, uint8_output=uint8_out)))
+        return True
+
+      # Literal infinity cannot use the ordinary arm*mask selector because
+      # an unselected 0*inf becomes NaN. Gate a finite extremum first, then
+      # divide by the opposite gate so only selected lanes become infinity.
+      true_inf = true_u.op is Ops.CONST and math.isinf(float(true_u.arg))
+      false_inf = false_u.op is Ops.CONST and math.isinf(float(false_u.arg))
+      if true_inf or false_inf:
+        selected_true, inverse, selected_false = alloc(), alloc(), alloc()
+        tasks.extend((_emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
+                      _emit_where_stage(total, inverse, one, (mask,0), Ops.SUB)))
+        if true_inf:
+          finite_true = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', math.copysign(65504.0, float(true_u.arg))))[0])
+          gated_true = alloc()
+          tasks.extend((_emit_where_stage(total, scratch, finite_true, (mask,0), Ops.MUL),
+                        _emit_where_stage(total, gated_true, finite_true, (mask,0), Ops.MUL),
+                        _emit_where_stage(total, scratch, (gated_true,0), (inverse,0), Ops.FDIV),
+                        _emit_where_stage(total, selected_true, (gated_true,0), (inverse,0), Ops.FDIV)))
+        else:
+          tasks.extend((_emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+                        _emit_where_stage(total, selected_true, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts)))
+        if false_inf:
+          finite_false = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', math.copysign(65504.0, float(false_u.arg))))[0])
+          gated_false = alloc()
+          tasks.extend((_emit_where_stage(total, scratch, finite_false, (inverse,0), Ops.MUL),
+                        _emit_where_stage(total, gated_false, finite_false, (inverse,0), Ops.MUL),
+                        _emit_where_stage(total, scratch, (gated_false,0), (mask,0), Ops.FDIV),
+                        _emit_where_stage(total, selected_false, (gated_false,0), (mask,0), Ops.FDIV)))
+        else:
+          tasks.extend((_emit_where_stage(total, scratch, false, (inverse,0), Ops.MUL, broadcast_inputs=broadcasts),
+                        _emit_where_stage(total, selected_false, false, (inverse,0), Ops.MUL, broadcast_inputs=broadcasts)))
+        tasks.extend((_emit_where_stage(total, scratch, (selected_true,0), (selected_false,0), Ops.ADD),
+                      _emit_where_stage(total, out_slot, (selected_true,0), (selected_false,0), Ops.ADD,
+                                        int32_output=int_out, uint8_output=uint8_out)))
+        return True
+
+      tasks.extend((
                     _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
                     _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),

@@ -1,5 +1,28 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — infinity-safe WHERE milestone
+
+### Implementation
+- `WHERE(x<c, x, finite_constant)` now uses
+  `min(x,c) + (finite_constant-c)*(1-mask)`. This preserves selected `-inf`
+  and discards unselected `+inf` without evaluating `0*inf`.
+- A literal infinite arm is represented by a gated fp16 extremum:
+  `±65504*gate/(1-gate)`. Selected lanes become infinity and unselected lanes
+  become zero before the two arms are added.
+- The existing arithmetic-mask WHERE remains unchanged for ordinary finite
+  arms. The new paths are selected only for the two recognized shapes.
+- Remaining limitation: a general INDEX arm containing infinity can still
+  produce `0*inf` when it is unselected unless it matches the self-select form.
+
+### Verification
+- `TestOps.test_inf_where` and `TestOps.test_masked_fill` — **PASS** with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Ordinary WHERE, clip, minimum, maximum, and multiply-NaN/inf regressions —
+  **PASS**.
+- All **55** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- Incremental census: **137 PASS, 279 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — two-LUT EXP forward milestone
 
 ### Implementation

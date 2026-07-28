@@ -185,6 +185,15 @@ class TestDPU(unittest.TestCase):
                          (lambda: a != b, a_np != b_np), (lambda: a >= b, a_np >= b_np)):
       np.testing.assert_array_equal(op().realize().numpy(), expected)
 
+  def test_dpu_where_infinities(self):
+    a_np = np.array([-np.inf, -1, 0, 0.5, 2, np.inf], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal((a < 0).where(a, 1).realize().numpy(), np.where(a_np < 0, a_np, 1))
+    b_np = np.array([-2, -1, 0, 0.5, 1, 2], dtype=np.float16)
+    b = Tensor(b_np, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal((b > 0).where(-np.inf, b).realize().numpy(), np.where(b_np > 0, -np.inf, b_np))
+    np.testing.assert_array_equal((b > 0).where(b, np.inf).realize().numpy(), np.where(b_np > 0, b_np, np.inf))
+
   def test_dpu_direct_casts(self):
     half_np = np.array([-2.5,0,1.75,255], dtype=np.float16)
     half = Tensor(half_np, device="ROCKCHIP").realize()
