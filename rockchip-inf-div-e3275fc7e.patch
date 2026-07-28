@@ -1,0 +1,91 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 672c98fd2..e875fd97d 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -196,0 +197,10 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_infinity_division_sign(self):
++    # RK3588 FDIV keeps the numerator's infinity sign but drops the sign of a
++    # nonzero denominator. Signed-zero division remains a separate limitation.
++    a_np = np.array([-2, -1, -0.5, 0.5, 1, 2], dtype=np.float16)
++    a = Tensor(a_np, device="ROCKCHIP").realize()
++    for numerator in (np.inf, -np.inf, np.nan):
++      with np.errstate(invalid="ignore"):
++        expected = numerator / a_np
++      np.testing.assert_array_equal((numerator / a).realize().numpy(), expected)
++
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 99e8c01f1..744d50443 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -11 +11 @@ segfaulted, so those methods were rerun individually.
+-**Current summary: 137 PASS, 279 FAIL, 8 SKIP (424 unique tests).**
++**Current summary: 138 PASS, 278 FAIL, 8 SKIP (424 unique tests).**
+@@ -14 +14 @@ This is the previous complete hardware census plus independently rerun LUT
+-milestones. SQRT, RSQRT, and EXP moved from numeric mismatch to PASS.
++milestones. SQRT, RSQRT, EXP, and special-value division moved to PASS.
+@@ -29 +29 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| PASS | 137 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
++| PASS | 138 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+@@ -34 +34 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| FAIL: non-index operand | 13 | Elementwise graphs still outside the staged planner |
++| FAIL: non-index operand | 12 | Elementwise graphs still outside the staged planner |
+@@ -41 +41 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-The 137 passing methods are:
++The 138 passing methods are:
+@@ -49 +49 @@ The 137 passing methods are:
+-`test_diagonal`, `test_div`, `test_double_slice`, `test_einsum_arity_check1`,
++`test_diagonal`, `test_div`, `test_div_naninf`, `test_double_slice`, `test_einsum_arity_check1`,
+@@ -83,4 +83,4 @@ The 137 passing methods are:
+-Current nested-LOG2 milestone regression: all **53 hardware tests pass in
+-isolated sequential subprocesses**, including EXP2, LOG2, sigmoid, SQRT, and
+-RSQRT special-value assertions. A single-process run retains the
+-sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
++Current regression: all **56 hardware tests pass in isolated sequential
++subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
++and infinity-division special-value assertions. A single-process run retains
++the sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 6ccddfbc9..b4d0fd11d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -899,0 +900,38 @@ def _try_sign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_inf_div_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Restore the denominator sign that RK3588 FDIV drops for CONST(±inf) / INDEX.
++
++  The first task deliberately keeps the hardware infinity result. Multiplying it
++  by a separately reconstructed sign fixes nonzero denominators without trying
++  to synthesize infinity from a large finite constant.
++  """
++  store = _store_node(sink)
++  if store is None: return None
++  val = _unwrap(store.src[1])
++  if val.op is not Ops.FDIV or val.src[0].op is not Ops.CONST or not math.isinf(float(val.src[0].arg)): return None
++  denominator = _unwrap(val.src[1])
++  if denominator.op is not Ops.INDEX: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++
++  denominator_arg = (denominator.src[0].buf_uop.arg.slot, 0)
++  numerator_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(val.src[0].arg)))[0])
++  base, negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc(), alloc()
++  sign_scratch, sign, product_scratch = alloc(), alloc(), alloc()
++  zero = (_ZERO_SLOT, 0)
++  tasks.extend((_emit_where_stage(total, base, numerator_arg, denominator_arg, Ops.FDIV),
++                _emit_where_stage(total, negative_diff, zero, denominator_arg, Ops.SUB),
++                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, positive_diff, denominator_arg, zero, Ops.SUB),
++                _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
++                # Repeat the first dependent reads of freshly materialized comparison masks.
++                _emit_where_stage(total, sign_scratch, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
++                _emit_where_stage(total, sign, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
++                _emit_where_stage(total, product_scratch, (base, 0), (sign, 0), Ops.MUL),
++                _emit_where_stage(total, info.outs[0], (base, 0), (sign, 0), Ops.MUL)))
++  return tuple(tasks)
++
+@@ -2416,0 +2455 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)

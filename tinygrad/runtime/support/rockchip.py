@@ -897,6 +897,44 @@ def _try_sign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, info.outs[0], (positive_mask, 0), (negative_mask, 0), Ops.SUB)))
   return tuple(tasks)
 
+def _try_inf_div_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Restore the denominator sign that RK3588 FDIV drops for CONST(±inf) / INDEX.
+
+  The first task deliberately keeps the hardware infinity result. Multiplying it
+  by a separately reconstructed sign fixes nonzero denominators without trying
+  to synthesize infinity from a large finite constant.
+  """
+  store = _store_node(sink)
+  if store is None: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.FDIV or val.src[0].op is not Ops.CONST or not math.isinf(float(val.src[0].arg)): return None
+  denominator = _unwrap(val.src[1])
+  if denominator.op is not Ops.INDEX: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  denominator_arg = (denominator.src[0].buf_uop.arg.slot, 0)
+  numerator_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(val.src[0].arg)))[0])
+  base, negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc(), alloc()
+  sign_scratch, sign, product_scratch = alloc(), alloc(), alloc()
+  zero = (_ZERO_SLOT, 0)
+  tasks.extend((_emit_where_stage(total, base, numerator_arg, denominator_arg, Ops.FDIV),
+                _emit_where_stage(total, negative_diff, zero, denominator_arg, Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, positive_diff, denominator_arg, zero, Ops.SUB),
+                _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+                # Repeat the first dependent reads of freshly materialized comparison masks.
+                _emit_where_stage(total, sign_scratch, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, sign, (positive_mask, 0), (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, product_scratch, (base, 0), (sign, 0), Ops.MUL),
+                _emit_where_stage(total, info.outs[0], (base, 0), (sign, 0), Ops.MUL)))
+  return tuple(tasks)
+
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
 
@@ -2414,6 +2452,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+  if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

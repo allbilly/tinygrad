@@ -1,5 +1,29 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — signed infinity division milestone
+
+### Implementation
+- RK3588 FDIV preserves the numerator sign for `CONST(±inf) / INDEX` but drops
+  the denominator sign. A dedicated multi-task lowering now retains that native
+  infinity result and multiplies it by a reconstructed denominator sign.
+- The sign is computed entirely on the NPU as
+  `(x>0) - (0>x)`, using the hardware-proven comparison-mask stages and repeated
+  first dependent reads.
+- `CONST(NaN) / INDEX` remains on native FDIV, which already produces NaN.
+- Remaining limitation: exact signed-zero denominators reconstruct a zero sign,
+  so infinity divided by `±0` is tracked separately from the current TestOps
+  contract.
+
+### Verification
+- `TestOps.test_div_naninf` — **PASS** with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Division, scalar division, and NaN/inf multiplication regressions — **PASS**.
+- Both infinity numerator signs and a NaN numerator over positive and negative
+  nonzero denominators — **PASS** in the focused hardware test.
+- All **56** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- Incremental census: **138 PASS, 278 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — infinity-safe WHERE milestone
 
 ### Implementation
