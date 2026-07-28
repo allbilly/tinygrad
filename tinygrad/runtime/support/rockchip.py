@@ -210,6 +210,14 @@ def _try_abs(val: UOp) -> int|None:
     return au.src[0].buf_uop.arg.slot
   return None
 
+def _try_sign(val:UOp) -> int|None:
+  """Recognize the sign WHERE tree by reusing the sign component of abs(x)."""
+  val = _unwrap(val)
+  if val.op is not Ops.WHERE or val.src[0].op is not Ops.CMPNE: return None
+  source = _unwrap(val.src[0].src[0])
+  if source.op is not Ops.INDEX: return None
+  return _try_abs(UOp(Ops.MUL, val.dtype, (source, val)))
+
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
@@ -756,6 +764,27 @@ def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
   return (_emit_where_stage(total, info.outs[0], (_ZERO_SLOT, 0), value, Ops.ADD,
                             fp32_output=output_dtype is dtypes.float, int32_output=output_dtype is dtypes.int,
                             uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool),)
+
+def _try_sign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower sign(x) as the difference of positive and negative comparison masks."""
+  store = _store_node(sink)
+  if store is None or (input_slot := _try_sign(store.src[1])) is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  tasks: list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  zero = (_ZERO_SLOT, 0)
+  negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_diff, zero, (input_slot, 0), Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, positive_diff, (input_slot, 0), zero, Ops.SUB),
+                _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, alloc(), (positive_mask, 0), (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, info.outs[0], (positive_mask, 0), (negative_mask, 0), Ops.SUB)))
+  return tuple(tasks)
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
@@ -1646,6 +1675,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
+  if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)

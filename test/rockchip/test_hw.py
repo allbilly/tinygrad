@@ -121,6 +121,11 @@ class TestDPU(unittest.TestCase):
     c = a.abs().realize()
     np.testing.assert_array_equal(c.numpy(), np.abs(a_np))
 
+  def test_dpu_sign(self):
+    a_np = np.array([-np.inf,-8,-0.0,0,5,np.inf], dtype=np.float16)
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(a.sign().realize().numpy(), np.sign(a_np))
+
   def test_dpu_comparison_outputs(self):
     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
     b_np = np.array([-1,0,0,2,2], dtype=np.float16)

@@ -1,5 +1,22 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — stable sign lowering milestone
+
+### Implementation
+- `sign(x)` now lowers to negative and positive comparison masks, followed by
+  their difference, entirely through ordinary DPU stages.
+- The final mask subtraction is duplicated as a warm-up before writing the
+  output, preserving the stale-dependent-read workaround used by comparison
+  and WHERE programs.
+- Added direct hardware coverage for negative/positive infinity, signed zero,
+  and ordinary negative/positive values.
+
+### Verification
+- `test_sign` and `test_sign_exact` — **PASS**.
+- Full hardware plus recent cast/fill/WHERE/predicate regression —
+  **59 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — typed constant fill milestone
 
 ### Implementation
