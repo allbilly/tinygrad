@@ -1,5 +1,23 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — LOG2 square-root range-reduction assessment
+
+- Confirmed `test_log2` has two independent blockers: the linear LUT clips
+  positive results below −2, and it maps negative inputs to −2 instead of NaN.
+- Reviewed the local NVDLA LUT programming documentation. Exponential LE mode
+  normally depends on `LE_INDEX_OFFSET`; that control is not exposed in the
+  RK3588 DPU register set currently available to this backend.
+- Tested `log2(x) = 8*log2(x**(1/8))` using three native SQRT LUT stages,
+  followed by NPU-only masks for zero, negative values, infinity, and NaN.
+  Special-value placement became correct, but accumulated LUT interpolation
+  error missed 1195/2925 values (40.9%) at the strict upstream tolerance.
+- Rejected and removed the experiment from the stable source. It is preserved
+  in the apply-checkable
+  `rockchip-log2-sqrt-range-wip-f00e79e2e.patch`.
+- Next LOG2 direction: exact power-of-four normalization into `[0.25, 4]`,
+  recording an integer −2 offset for each normalization step. This avoids
+  repeated nonlinear interpolation.
+
 ## 2026-07-28 — EXP2 IEEE special-value milestone
 
 ### Implementation

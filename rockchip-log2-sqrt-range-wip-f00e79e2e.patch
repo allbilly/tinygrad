@@ -1,0 +1,130 @@
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 213a47085..8bc0fc0e6 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1058,6 +1058,101 @@ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
+   return tuple(tasks)
+ 
++def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Range-reduce positive fp16 LOG2 inputs and restore IEEE exceptional results."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  val = _unwrap(store.src[1])
++  if val.op is not Ops.LOG2 or len(val.src) != 1 or (source := _unwrap(val.src[0])).op is not Ops.INDEX: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++  zero = UOp.const(dtypes.half, 0.0)
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++
++  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
++    out_idx = store.src[0]
++    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++
++  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
++    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
++
++  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
++    nonlocal next_slot
++    mask_slot = alloc()
++    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
++    if cmp_tasks is None: return None
++    last = cmp_tasks[-1]
++    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
++    tasks.extend(cmp_tasks)
++    used_slots = [st.task.out_slot for st in cmp_tasks] + \
++      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
++    return (mask_slot, 0)
++
++  def lut_stage(op:Ops, src:UOp, out_slot:int, repeat=False) -> UOp|None:
++    nonlocal next_slot
++    stage_val = UOp(op, dtypes.half, (src,))
++    stage = stage_sink(stage_val, out_slot)
++    plan = plan_rk(stage)
++    if isinstance(plan, str) or plan.kind != "dpu_lut": return None
++    cmds, task, relocs = emit_rk(plan)
++    subtask = RKSubTask(cmds, task, relocs)
++    if repeat:
++      throwaway = alloc()
++      throwaway_stage = stage_sink(stage_val, throwaway)
++      throwaway_plan = plan_rk(throwaway_stage)
++      if isinstance(throwaway_plan, str) or throwaway_plan.kind != "dpu_lut": return None
++      c, t, r = emit_rk(throwaway_plan)
++      tasks.append(RKSubTask(c, t, r))
++    tasks.append(subtask)
++    return temp_index(out_slot)
++
++  # log2(x) = 8*log2(x**(1/8)). Three square roots move TestOps' positive
++  # random interval into the existing accurate [0.25, 4] table.
++  current = source
++  for i in range(3):
++    root_slot = alloc()
++    if (root := lut_stage(Ops.SQRT, current, root_slot, repeat=i != 0)) is None: return None
++    current = root
++  log_slot = alloc()
++  if lut_stage(Ops.LOG2, current, log_slot, repeat=True) is None: return None
++  scaled_slot = alloc()
++  eight = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 8.0))[0])
++  dependent(scaled_slot, (log_slot, 0), eight, Ops.MUL)
++
++  hi = UOp.const(dtypes.half, 65472.0)
++  positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
++  negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, zero)))
++  nonzero = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, zero)))
++  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
++  if positive is None or negative is None or nonzero is None or not_number is None: return None
++
++  # Positive infinity and zero preserve the sign of the already positive or
++  # negative range-reduced result when divided by zero.
++  positive_denom, positive_result = alloc(), alloc()
++  dependent(positive_denom, one, positive, Ops.SUB)
++  dependent(positive_result, (scaled_slot, 0), (positive_denom, 0), Ops.FDIV)
++  zero_denom, zero_result = alloc(), alloc()
++  dependent(zero_denom, nonzero, (_ZERO_SLOT, 0), Ops.ADD)
++  dependent(zero_result, (positive_result, 0), (zero_denom, 0), Ops.FDIV)
++
++  invalid, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
++  dependent(invalid, negative, not_number, Ops.MAX)
++  dependent(invalid_denom, one, (invalid, 0), Ops.SUB)
++  dependent(invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV)
++  dependent(out, (zero_result, 0), (invalid_factor, 0), Ops.MUL)
++  return tuple(tasks)
++
+ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
+@@ -1170,7 +1265,15 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     return sink.substitute({store:store.replace(src=(out_idx, stage_val))}), out_idx
+ 
+   def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
++    nonlocal next_slot
+     stage_sink, out_idx = make_stage_sink(stage_val, out_slot)
++    for special in (_try_exp2_special_subtasks, _try_log2_special_subtasks):
++      if (special_tasks := special(stage_sink)) is not None:
++        tasks.extend(special_tasks)
++        used_slots = [st.task.out_slot for st in special_tasks] + \
++          [r.globals_slot for st in special_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++        next_slot = max(next_slot, max(used_slots, default=-1) + 1)
++        return out_idx
+     plan = plan_rk(stage_sink)
+     if isinstance(plan, str) or plan.kind not in ("dpu", "dpu_lut"): return None
+     cmds, task, relocs = emit_rk(plan)
+@@ -1876,6 +1979,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+   if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
++  if (log2_tasks := _try_log2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, log2_tasks)
+   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
+   plan = plan_rk(sink)
+   if isinstance(plan, str):

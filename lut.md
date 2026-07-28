@@ -233,6 +233,33 @@ This technique only repairs special inputs that reach the recognized LUT.
 For example, `EXP2(LOG2(0) * negative)` still requires LOG2-zero handling
 because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
 
+### LOG2 range reduction
+
+The current linear LOG2 table is accurate only over approximately
+`[0.25, 4]`. A tested range-reduction identity was:
+
+```text
+log2(x) = 8 * log2(x**(1/8))
+```
+
+Three SQRT LUT stages moved TestOps' positive random inputs into the table
+domain, and comparison masks repaired negative/zero/NaN/infinity placement.
+The result was not accurate enough: repeated SQRT interpolation and fp16
+stores caused 1195/2925 strict-tolerance mismatches. The implementation is
+saved in `rockchip-log2-sqrt-range-wip-f00e79e2e.patch`.
+
+Prefer exact power-of-two normalization for the next attempt:
+
+```text
+while 0 < x < 0.25:
+  x *= 4
+  offset -= 2
+result = log2_lut(x) + offset
+```
+
+Multiplication by four and addition of integer offsets are exact for the
+relevant fp16 values, avoiding accumulated nonlinear LUT error.
+
 ### Mixed task stability
 
 A direct mixed LUT/DPU PC chain can time out on RK3588. The backend uses the
