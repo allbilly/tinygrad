@@ -1,5 +1,28 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — SQRT refinement and IEEE special-value milestone
+
+### Implementation
+- Direct fp16 SQRT keeps the existing `[0,4]` DPU LUT as its initial estimate,
+  then performs three NPU-only Newton steps:
+  `y = (y + x/y) / 2`.
+- The refinements remove the LUT's high-curvature interpolation error near
+  zero while retaining the wider table domain.
+- Comparison masks and arithmetic stages restore IEEE behavior after the
+  bounded LUT: signed zero becomes zero, `+inf` becomes infinity, and negative
+  inputs, `-inf`, and NaN become NaN.
+- No host-side numeric postprocessing is used.
+
+### Verification
+- `TestOps.test_sqrt` — **PASS** at the unchanged upstream fp16 tolerance.
+- The focused hardware vector covers `+inf`, `-inf`, NaN, negative finite,
+  signed zero, ordinary fractional input, and the upper LUT endpoint.
+- All **50** Rockchip hardware methods — **PASS** in isolated sequential
+  subprocesses.
+- `python -m mypy tinygrad/` and Ruff on the changed source/test — **PASS**.
+  Full-tree Ruff still has the pre-existing generated/reference-tree backlog.
+- Incremental test_ops census: **130 PASS, 286 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — LOG2 square-root range-reduction assessment
 
 - Confirmed `test_log2` has two independent blockers: the linear LUT clips

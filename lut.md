@@ -233,6 +233,38 @@ This technique only repairs special inputs that reach the recognized LUT.
 For example, `EXP2(LOG2(0) * negative)` still requires LOG2-zero handling
 because the bounded LOG2 stage currently saturates before EXP2 sees infinity.
 
+### SQRT refinement
+
+A linear SQRT LUT is least accurate near zero because the derivative is
+unbounded there. Tightening the table from `[0,4]` to `[0,2]` reduced the
+official test from 34 to 18 mismatches, but unnecessarily narrowed the useful
+domain. The accepted implementation keeps `[0,4]` and treats its LUT result as
+an initial estimate.
+
+Run Newton's method entirely on the NPU:
+
+```text
+y0 = sqrt_lut(x)
+y1 = (y0 + x/y0) / 2
+y2 = (y1 + x/y1) / 2
+y3 = (y2 + x/y2) / 2
+```
+
+One refinement left four strict-tolerance mismatches with the narrower table;
+two passed there. With the wider `[0,4]` table, two refinements still left four
+near-zero mismatches, while three passed `TestOps.test_sqrt`.
+
+The bounded table cannot create IEEE special results by itself. Apply the
+special-value epilogue after refinement:
+
+- multiply by the nonzero mask to force both signed-zero inputs to zero;
+- divide by `1-positive_overflow` to create `+inf`;
+- combine negative and NaN masks, then multiply by
+  `(1-invalid)/(1-invalid)` to create NaN through `0/0`.
+
+The negative/NaN lanes may contain meaningless intermediate Newton results;
+the final invalid factor replaces them without host-side computation.
+
 ### LOG2 range reduction
 
 The current linear LOG2 table is accurate only over approximately

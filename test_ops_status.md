@@ -8,7 +8,10 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 129 PASS, 287 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 130 PASS, 286 FAIL, 8 SKIP (424 unique tests).**
+
+This is the previous complete hardware census plus the independently rerun
+SQRT milestone: `TestOps.test_sqrt` moved from numeric mismatch to PASS.
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,11 +20,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 129 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+| PASS | 130 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 35 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
-| FAIL: numeric mismatch | 29 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: numeric mismatch | 28 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 13 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
@@ -29,7 +32,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 129 passing methods are:
+The 130 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -62,6 +65,7 @@ The 129 passing methods are:
 `test_slice_one_endpoint_out_of_bounds`, `test_slice_start_gt_end`,
 `test_slice_stride_gt_one`, `test_slice_with_none`, `test_slice_zero_in_shape`,
 `test_silu`, `test_small_gemm`, `test_split`, `test_squeeze`, `test_stack_slice`,
+`test_sqrt`,
 `test_std_mean_loaded_nan`, `test_std_zero_in_axis`, `test_sub`,
 `test_sum_collapse_neg`, `test_sum_fake`, `test_sum_simple`,
 `test_sum_with_zeros_shape`, `test_tiny_add`, `test_tiny_mul`,
@@ -70,12 +74,12 @@ The 129 passing methods are:
 `test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Current EXP2 milestone regression: all **49 hardware tests pass in isolated
-sequential subprocesses**, including the new EXP2 special-value assertion, and
-the official `TestOps.test_exp2` passes. A single-process run retains the
+Current SQRT milestone regression: all **50 hardware tests pass in isolated
+sequential subprocesses**, including the EXP2 and SQRT special-value assertions,
+and the official `TestOps.test_exp2` and `TestOps.test_sqrt` pass. A single-process run retains the
 sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
-records the LUT tuning and special-value procedure plus the remaining SiLU
-one-ULP dense-grid diagnostic.
+records the LUT tuning, Newton refinement, and special-value procedures plus
+the remaining SiLU one-ULP dense-grid diagnostic.
 
 ## Historical detailed baseline — 2026-07-27, commit 993ea1197
 
