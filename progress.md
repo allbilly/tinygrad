@@ -1,5 +1,463 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — urgent durable handoff and debugging playbook
+
+This section is the restart point if the current Codex session ends. It records
+the exact repository state, test contract, hardware-debugging methods, and
+uncommitted experiment before any more implementation work.
+
+### Repository and test state
+
+- Branch: `rockchip-2607`.
+- Last verified milestone commit: `f409ec1f6` (`rockchip: saturate extreme
+  quick gelu`).
+- Last complete TestOps census:
+  **142 PASS, 274 FAIL, 8 SKIP** out of 424 methods.
+- Test contract: forward only, fp16 default:
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Gradients are deliberately out of scope. Note that
+  `test_sigmoid_extreme` contains explicit gradient assertions which ignore
+  `FORWARD_ONLY=1`; count that method as PARTIAL even though both forward
+  ranges pass.
+- All 60 tests in `test/rockchip/test_hw.py` passed at `f409ec1f6` when each
+  method was launched in its own sequential pytest subprocess.
+- The full hardware census and pass list are in `test_ops_status.md`.
+- Detailed LUT math, table formats, tuning rules, and known hardware behavior
+  are in `lut.md`.
+
+Preserve these pre-existing uncommitted user changes:
+
+- `AGENTS.md`.
+- The bottom `2026-07-28 — Line-saving plan for 25k sz.py limit` hunk in this
+  file.
+- The untracked `ref/` reference repositories.
+
+Do not use `git stash` or `git checkout`, do not alter staged files, and back up
+source/test files under `/tmp` with a timestamp before editing. The current
+CELU source was backed up before modification as:
+
+- `/tmp/rockchip.py.before-celu-lut-20260728-162433`
+- `/tmp/test_hw.py.before-celu-lut-20260728-162433`
+
+### Current uncommitted CELU two-LUT experiment
+
+`tinygrad/runtime/support/rockchip.py` contains an intentionally uncommitted
+CELU experiment, preserved independently as
+`rockchip-celu-two-lut-wip-f409ec1f6.patch`. Apply it only to commit
+`f409ec1f6`, or inspect it as a design reference.
+
+The experiment:
+
+1. Recognizes
+   `max(x,0) + min(alpha*(exp(x/alpha)-1),0)` for TestOps alphas 1–4.
+2. Uses a broad Q15 LUT for the negative branch on `[-2,0]`.
+3. Uses a second local Q15 LUT on `[-0.125,0]`: the input is multiplied by 16,
+   the table emits `CELU(x)*8`, and an NPU stage multiplies by `0.125`.
+4. Selects broad/local/positive/fallback branches with NPU comparison masks.
+
+Measured results:
+
+- The first broad-only version reduced `test_celu` from 148/2925 mismatches to
+  17/2925, all clustered within one Q15 count near zero.
+- The local second LUT removes that near-zero failure band.
+- The latest full method still **FAILS: 450/2925 mismatches**. The first alpha
+  iteration that needs a tail below `-1` exposes the problem: the `x < -2`
+  fallback is the existing staged CELU expression, whose EXP path clips the
+  tail at `-1`. Examples are actual `-1.0` versus expected `-1.1523`,
+  `-1.1240`, and `-1.2334`; maximum absolute error is `0.2646`.
+- Therefore this is not a completed milestone and must not be added to the
+  142-pass census.
+
+Best next CELU step: do not use the existing expression as the wide-negative
+fallback. Extend the broad LUT/range strategy for each alpha, or add an
+alpha-aware asymptotic branch. CELU tends to `-alpha`, not `-1`; any tail
+threshold must be selected from
+`alpha*exp(x/alpha)` against `rtol=1e-3, atol=1e-6`. Probe every alpha 1, 2, 3,
+and 4 independently before running the whole method. Keep the local second LUT:
+it already addresses the strict near-zero relative tolerance.
+
+### Exact commands
+
+Always enter the virtual environment first:
+
+```sh
+cd /home/orangepi/tinygrad
+. .venv/bin/activate
+```
+
+Run one official TestOps method:
+
+```sh
+DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  python -m pytest test/backend/test_ops.py::TestOps::test_celu \
+  -q -x -p test.rockchip.conftest_rockchip
+```
+
+Run one focused Rockchip hardware method:
+
+```sh
+DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  python -m pytest test/rockchip/test_hw.py::TestRockchipHW::METHOD \
+  -q -x -p test.rockchip.conftest_rockchip
+```
+
+Do not use `pytest -n12` for NPU execution. There is one physical RK3588 NPU;
+parallel workers race device state, causing timeouts, corruption, and
+misleading failures. The repository's `-n12` instruction remains appropriate
+for CPU-only tests. Hardware regression methods must be isolated and serial:
+
+```sh
+. .venv/bin/activate
+python - <<'PY'
+import subprocess
+from pathlib import Path
+import re
+
+src = Path("test/rockchip/test_hw.py").read_text()
+methods = re.findall(r"^  def (test_[A-Za-z0-9_]+)\(", src, re.M)
+failed = []
+for method in methods:
+  cmd = [
+    "python", "-m", "pytest",
+    f"test/rockchip/test_hw.py::TestRockchipHW::{method}",
+    "-q", "-x", "-p", "test.rockchip.conftest_rockchip",
+  ]
+  env = {
+    **__import__("os").environ,
+    "DEV": "ROCKCHIP",
+    "DEFAULT_FLOAT": "HALF",
+    "FORWARD_ONLY": "1",
+  }
+  ret = subprocess.run(cmd, env=env)
+  if ret.returncode: failed.append(method)
+print("FAILED:", failed)
+raise SystemExit(bool(failed))
+PY
+```
+
+Validation before a backend milestone commit:
+
+```sh
+. .venv/bin/activate
+python -m mypy tinygrad/
+ruff check tinygrad/runtime/support/rockchip.py \
+  tinygrad/runtime/ops_rockchip.py test/rockchip/test_hw.py
+git diff --check
+git status --short
+```
+
+The virtual environment currently does not contain Ruff; use the system
+`ruff` command. A focused source change does not require changing unrelated
+lint failures elsewhere in the repository.
+
+### Inspecting the scheduled UOp graph
+
+The mathematical Tensor expression is frequently different from the graph the
+Rockchip planner receives. Inspect the scheduled graph before writing a
+matcher:
+
+```python
+from tinygrad import Tensor
+
+out = FUNCTION_USING_TENSORS
+schedule, _ = out.linear_with_vars()
+for call in schedule:
+  if call.src and call.src[0].op.name == "SINK":
+    print(call.src[0])
+```
+
+Useful rules:
+
+- Print the actual `SINK` UOp, including STORE, INDEX, CAST, and constants.
+- Inspect both graph forms around `_pm_fdiv`. Tinygrad rewrites reciprocal
+  expressions such as `1/(1+exp(...))` into FDIV, so sigmoid, tanh, QuickGELU,
+  and related recognizers often need pre-rewrite and post-rewrite forms.
+- Use `_unwrap` consistently for CAST/BITCAST wrappers, but stop recursive
+  expression traversal at INDEX nodes. Traversing into INDEX addressing can
+  falsely discover unrelated constants and operations.
+- When recognizing a composite, prove there is one intended source INDEX and
+  validate constants within fp16/rewrite tolerance. Do not match merely because
+  an EXP2 or ADD appears somewhere in `toposort()`.
+- If planning rejects a graph, print the exact UOp reaching `plan_rk`, the
+  result of each `_try_*` matcher, and the final rejection string. Historical
+  unsupported categories in `test_ops_status.md` are a baseline, not proof of
+  the current graph.
+
+### Isolating stages and locating numeric error
+
+When a multi-task lowering fails, materialize intermediate stages as separate
+Tensor operations with `.realize()` and compare them before combining them.
+Probe in this order:
+
+1. Input transform.
+2. Base LUT or DPU result.
+3. Local/correction LUT result.
+4. Each comparison mask.
+5. Each masked branch.
+6. Final branch additions and special-value epilogue.
+
+Use deterministic TestOps-shaped fp16 inputs. TestOps seeds NumPy with zero and
+normally samples uniform ranges; reproduce its exact shape, low/high range,
+dtype, and alpha/parameter loop. A useful comparison report is:
+
+```python
+bad = ~np.isclose(actual, expected, rtol=1e-3, atol=1e-6,
+                  equal_nan=True)
+print("count", bad.sum())
+print("x range", x[bad].min(), x[bad].max())
+for i in np.flatnonzero(bad)[:30]:
+  print(i, x.flat[i], actual.flat[i], expected.flat[i],
+        actual.flat[i] - expected.flat[i])
+```
+
+Also probe dense grids around:
+
+- zero and every comparison boundary;
+- every LUT domain endpoint;
+- every fp16 power-of-two transition;
+- exact special values `+0`, `-0`, `+inf`, `-inf`, and NaN;
+- TestOps' wide ranges, commonly `[-400,400]` for extreme activations.
+
+Classify the failure before changing the implementation:
+
+- constant offset suggests LUT zero corruption or a missing bias removal;
+- failures in a narrow x-band suggest local table resolution;
+- failures at all wide tails suggest endpoint clipping/range reduction;
+- correct first stage but wrong dependent mask suggests stale NPU lanes;
+- values wrong only for alpha/parameter > 1 suggest a hard-coded asymptote or
+  range;
+- correct isolated tests but timeout in a suite suggests device sequencing,
+  not numerical math.
+
+### RK3588 LUT geometry and software modeling
+
+For the signed linear table configuration used here:
+
+- There are 513 entries per table.
+- Adjacent logical entries are separated by
+  `step = 32 / index_scale`.
+- The signed covered domain is approximately
+  `[-16384/index_scale, +16384/index_scale]`.
+- Increasing `index_scale` narrows the covered x-domain and improves local
+  resolution.
+- Output integer counts are interpreted according to the configured Q scale;
+  Q15 gives roughly `1/32768` resolution but must stay within signed int16.
+
+Model hardware interpolation before generating residual values. Hardware uses
+flooring between adjacent integer LUT entries, not an ideal floating linear
+interpolator:
+
+```python
+pos = (x - x0) / step
+i = math.floor(pos)
+frac = pos - i
+raw = math.floor(table[i] + frac * (table[i+1] - table[i]))
+y = raw / output_scale
+```
+
+Use hardware probes to confirm endpoint and overflow behavior for a new table.
+Do not assume the same slope/overflow configuration as EXP2 applies to LOG2 or
+a correction table.
+
+The RK3588 LUT path corrupts exact zero table entries in some configurations.
+Two proven workarounds are:
+
+- replace raw zero entries by one count, then restore exact zero with an NPU
+  nonzero/comparison mask; or
+- add a representable constant table bias (EXP correction uses `0.125`) and
+  remove it with a native SUB stage.
+
+Avoid multiplying an unselected infinity by zero. Arithmetic selection
+`a*mask + b*(1-mask)` is unsafe when either arm may be infinite. Use one of the
+specialized finite/infinity constructions already documented below or preserve
+the operation's native infinity result and repair only its sign/mask.
+
+### When and how to use two NPU LUT tasks
+
+A second LUT is justified only after measuring where the first LUT fails:
+
+1. Tune the broad table to cover the required domain.
+2. Reproduce hardware interpolation in software.
+3. Record mismatch count and the exact failing x interval.
+4. If failures form a narrow interval, transform that interval into a larger
+   fraction of the second LUT domain.
+5. Amplify the second LUT's output when relative tolerance near zero requires
+   finer effective resolution, then exactly rescale in a native DPU task.
+6. Select broad/local/fallback results with NPU masks.
+
+For input transform `z = x*S`, the local x-domain is the z-domain divided by
+`S`. For output amplification `A`, ensure `A*f(x)` never exceeds the signed
+int16 range at the chosen Q scale. Prefer exact binary rescalings such as
+`1/16`, `1/8`, or `1/4` to minimize new fp16 rounding. HardSwish's committed
+two-LUT implementation and the CELU WIP are concrete examples.
+
+Two LUT tasks do not automatically improve accuracy. They help only when:
+
+- the error is LUT quantization/interpolation, not an already-rounded upstream
+  value;
+- the local interval and amplification are measured;
+- the mask boundaries themselves meet tolerance;
+- zero-entry and stale-mask quirks are handled.
+
+### Comparison masks, dependent reads, and multi-task sequencing
+
+On this hardware, the first task that consumes a freshly generated comparison
+mask can see stale lanes. The established workaround is to emit the first
+dependent operation twice: write the first result to scratch, then repeat the
+same operation to the real slot. This applies to comparison-based signs,
+saturation branches, local LUT selection, and special-value epilogues.
+
+Do not optimize away those duplicated dependent reads until a hardware probe
+shows the sequence is safe. The scratch operation is a synchronization/data
+visibility workaround, not dead code.
+
+The NPU also has sequence sensitivity: a single-process SiLU→SUB regression
+sequence can time out although both methods pass independently. Keep the
+per-method subprocess isolation in the full hardware sweep. A pass produced by
+12 concurrent pytest workers is not trustworthy.
+
+For PC chaining:
+
+- each chained DPU segment must re-arm `S_POINTER`;
+- descriptor `regcfg_amount` includes the four PC tail qwords;
+- `PC_REGISTER_AMOUNTS` is the next body qword count, not a rounded descriptor
+  count;
+- DPU `enable_mask=0x18`; adding bit 0 caused timeouts in the historical probe;
+- submit uses PC, BLOCK, and PINGPONG flags;
+- the last segment tail starts with zero.
+
+The old PC-chain investigation later in this file records the exact reference
+captures. Current committed multi-task execution is proven only by isolated
+hardware regressions; preserve its register order.
+
+### Special values and FDIV
+
+Bounded LUTs must receive explicit NPU epilogues when IEEE behavior matters.
+The reliable pattern is:
+
+1. Preserve the accurate finite interior.
+2. Build positive/negative/zero masks on the NPU.
+3. Select exact asymptotes or construct infinity without `0*inf`.
+4. Restore NaN last, commonly by dividing through an NPU-generated denominator
+   that becomes zero only on NaN lanes.
+
+Specific hardware facts:
+
+- DPU FDIV has register/setup differences from ordinary elementwise ALU; use
+  the existing FDIV emitter rather than treating DIV as ADD/MUL with a new
+  opcode.
+- `CONST(±inf) / INDEX` preserves numerator sign but loses denominator sign.
+  The committed fix reconstructs sign for nonzero denominators using
+  `(x>0)-(0>x)`.
+- Exact signed-zero denominators remain a limitation for that reconstruction.
+- A general INDEX WHERE arm containing infinity may still evaluate `0*inf`
+  unless it matches a specialized infinity-safe form.
+- Tanh and QuickGELU keep their existing accurate interior and repair only
+  asymptotic tails. This is safer than replacing the whole graph with a
+  lower-resolution LUT.
+
+### Test census workflow
+
+Run TestOps methods serially, ideally each in its own subprocess. Record one
+final classification per unique method: PASS, FAIL, or SKIP. Do not count
+subcases as methods and do not promote a method with an explicit out-of-scope
+gradient failure to PASS.
+
+After a completed milestone:
+
+1. Run the focused official method.
+2. Run direct dependency/regression methods.
+3. Add a focused hardware test covering boundaries and the original failure.
+4. Run all hardware methods in isolated subprocesses.
+5. Run mypy, Ruff, and `git diff --check`.
+6. Update the summary, pass list, and cause counts in `test_ops_status.md`.
+7. Add a dated milestone at the top of this file.
+8. Save a standalone patch artifact.
+9. Commit only that milestone's source, test, documentation, and patch.
+
+The full 424-method census is expensive. It is acceptable to update the global
+count incrementally only when the previously failing official method now
+passes and all known regressions pass. Periodically rerun the complete census
+because one fix may change failure classifications elsewhere.
+
+### Patch and commit procedure
+
+Create a focused artifact from the parent of the milestone:
+
+```sh
+git diff HEAD --unified=0 -- \
+  tinygrad/runtime/support/rockchip.py \
+  tinygrad/runtime/ops_rockchip.py \
+  test/rockchip/test_hw.py > /tmp/milestone.patch
+```
+
+Repository files must be created with `apply_patch`, so copy the captured diff
+into `rockchip-DESCRIPTION-PARENT.patch` through `apply_patch`. Validate it
+against the currently modified tree:
+
+```sh
+git apply --unidiff-zero --check --reverse \
+  rockchip-DESCRIPTION-PARENT.patch
+```
+
+Use `git diff --cached` before every commit. Because this file contains the
+user's uncommitted line-saving plan, stage `progress.md` interactively:
+
+```sh
+git add -p progress.md
+```
+
+Stage the new top milestone/handoff hunk (`y`) and leave the bottom line-saving
+plan hunk unstaged (`n`). Never run `git add .`. Do not add `AGENTS.md` or
+`ref/`.
+
+### Verified milestone commits and patch artifacts
+
+Newest first:
+
+| Commit | Milestone | Patch artifact |
+|---|---|---|
+| `f409ec1f6` | Extreme QuickGELU saturation | `rockchip-quick-gelu-saturation-d1fb873b7.patch` |
+| `d1fb873b7` | Extreme tanh saturation | `rockchip-tanh-saturation-7da932bd1.patch` |
+| `7da932bd1` | Two-task HardSwish LUT | `rockchip-hardswish-two-lut-7fa920be7.patch` |
+| `7fa920be7` | Exact HardSigmoid saturation | `rockchip-hardsigmoid-saturation-653a836f8.patch` |
+| `653a836f8` | Signed infinity division | `rockchip-inf-div-e3275fc7e.patch` |
+| `e3275fc7e` | Infinity-safe WHERE | `rockchip-infinity-where-2a7cc48f6.patch` |
+| `2a7cc48f6` | Two-task EXP LUT | `rockchip-exp-two-lut-dbb79fff3.patch` |
+| `dbb79fff3` | Verify zero-axis boolean reductions | documentation-only |
+
+Additional earlier artifacts in the repository preserve completed work and
+rejected experiments, including nested LOG2 special values, SQRT/RSQRT
+refinement, sigmoid saturation, native SiLU/HardSwish attempts, SIN full-scale,
+roundoff, and typed maximum. A `*-wip-*` name means reference only, not a
+verified milestone.
+
+### Remaining forward-only work, in practical order
+
+1. CELU: current two-LUT WIP needs an alpha-aware negative tail; it is the
+   active low-hanging candidate.
+2. Ordinary QuickGELU: 120/2925 interior rounding mismatches remain; extreme
+   QuickGELU already passes.
+3. Ordinary tanh: 907/2925 interior precision mismatches remain; extreme tanh
+   already passes.
+4. LOG2: positive finite broad-range precision still needs normalization
+   (power-of-four range reduction was the promising direction).
+5. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
+   staged LOG2/EXP2 interaction before tuning a LUT.
+6. Softplus and Mish: supported paths are numerically inaccurate and likely
+   depend on improved LOG/EXP range handling.
+7. ELU and SELU: still unsupported composite activation graphs.
+8. Boolean reductions and remaining integer/bool dtype groups.
+9. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
+   convolution groups. These are larger architectural milestones, not LUT
+   quick wins.
+
+Do not work on gradients until forward coverage is complete. Before porting a
+new algorithm, search other branches and `ref/` for proven register sequences,
+rounding logic, `rknnops.h` algorithm values, and standalone RK3588 probes.
+Reference implementations are evidence for hardware setup, but re-run them
+against the current scheduled UOp graph and fp16 TestOps tolerance.
+
 ## 2026-07-28 — extreme QuickGELU asymptote milestone
 
 ### Implementation
