@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 112 PASS, 304 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 114 PASS, 302 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,11 +17,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 112 | Core fp16 arithmetic, comparisons/predicates, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
+| PASS | 114 | Core fp16 arithmetic/casts, comparisons/predicates, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 79 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
-| FAIL: unsupported dtype | 41 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
+| FAIL: unsupported dtype | 40 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
-| FAIL: numeric mismatch | 33 | LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: numeric mismatch | 32 | LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 14 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
@@ -29,11 +29,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 56 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 112 passing methods are:
+The 114 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
-`test_big_gemm`, `test_broadcastdot`, `test_chunk`, `test_clip`,
+`test_big_gemm`, `test_broadcastdot`, `test_cast`, `test_chunk`, `test_clip`,
 `test_cmp_eq`, `test_cmp_ge`, `test_cmp_gt`, `test_cmp_le`, `test_cmp_lt`,
 `test_conv2d_errors`, `test_cummax_zero_axis`, `test_cummin_zero_axis`,
 `test_cumprod_zero_axis`, `test_cumsum_zero_axis`, `test_detach`,
@@ -65,7 +65,8 @@ The 112 passing methods are:
 `test_sum_with_zeros_shape`, `test_tiny_add`, `test_tiny_mul`,
 `test_topo_sort`, `test_transpose`, `test_unflatten`, `test_unfold`,
 `test_unsqueeze`, `test_var_zero_in_axis`, `test_view`, `test_where`,
-`test_where_permute`, `test_zeros`, and `TestOpsUint8::test_cast_relu`.
+`test_where_permute`, `test_zeros`, `TestOpsUint8::test_cast`, and
+`TestOpsUint8::test_cast_relu`.
 
 Targeted regression after the PC-chain, WHERE, nested-elementwise, arithmetic
 WHERE, and MAX milestones: **48 passed**. `python -m mypy tinygrad/` and

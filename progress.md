@@ -1,5 +1,21 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — direct cast milestone
+
+### Implementation
+- Direct casts run an identity ADD stage on the DPU's fp16 datapath and use
+  temporary boundary conversion for fp32/int32/bool/uint8 buffers.
+- Multi-task execution now converts fp32 inputs and outputs as well as the
+  existing int32/bool/uint8 forms, using each source buffer's true element
+  count.
+- Added hardware coverage for half→fp32/int32/bool/uint8 plus
+  int32/bool→fp32.
+
+### Verification
+- `TestOps.test_cast` and `TestOpsUint8.test_cast` — **PASS**.
+- Full hardware plus recent dtype/WHERE regression — **54 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — finite/NaN predicate milestone
 
 ### Implementation

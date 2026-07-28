@@ -123,6 +123,18 @@ class TestDPU(unittest.TestCase):
                          (lambda: a != b, a_np != b_np), (lambda: a >= b, a_np >= b_np)):
       np.testing.assert_array_equal(op().realize().numpy(), expected)
 
+  def test_dpu_direct_casts(self):
+    half_np = np.array([-2.5,0,1.75,255], dtype=np.float16)
+    half = Tensor(half_np, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(half.cast(dtypes.float).realize().numpy(), half_np.astype(np.float32))
+    np.testing.assert_array_equal(half.cast(dtypes.int).realize().numpy(), half_np.astype(np.int32))
+    np.testing.assert_array_equal(half.cast(dtypes.bool).realize().numpy(), half_np.astype(np.bool_))
+    np.testing.assert_array_equal(half.cast(dtypes.uint8).realize().numpy(), half_np.astype(np.uint8))
+    int_np = np.array([-2,0,1,255], dtype=np.int32)
+    bool_np = np.array([True,False,True,False], dtype=np.bool_)
+    np.testing.assert_array_equal(Tensor(int_np, device="ROCKCHIP").cast(dtypes.float).realize().numpy(), int_np.astype(np.float32))
+    np.testing.assert_array_equal(Tensor(bool_np, device="ROCKCHIP").cast(dtypes.float).realize().numpy(), bool_np.astype(np.float32))
+
   def test_dpu_2d_add(self):
     # 2D row-major contiguous element-wise add
     a_np = np.random.randn(8,16).astype(np.float16)

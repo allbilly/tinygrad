@@ -679,7 +679,8 @@ def _where_arg(u: UOp) -> tuple[int, int]|None:
 
 def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
                       bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
-                      uint8_output=False, bool_output=False, comparison_inputs:tuple[int,...]=()) -> RKSubTask:
+                      uint8_output=False, bool_output=False, comparison_inputs:tuple[int,...]=(),
+                      fp32_inputs:tuple[int,...]=(), fp32_output=False) -> RKSubTask:
   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
   cmds:list[RKCmd] = []
   relocs:list[RKReloc] = []
@@ -725,8 +726,24 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
   emitter_pc_op_en(cmds, 12)
   task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs, int32_inputs=int32_inputs,
                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
-                bool_output=bool_output, comparison_inputs=comparison_inputs)
+                bool_output=bool_output, comparison_inputs=comparison_inputs,
+                fp32_inputs=fp32_inputs, fp32_output=fp32_output)
   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
+
+def _try_cast_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
+  """Run a DPU identity stage in fp16, with buffer-level conversion at its edges."""
+  store = _store_node(sink)
+  if store is None or store.src[1].op is not Ops.CAST: return None
+  cast, source = store.src[1], _unwrap(store.src[1].src[0])
+  if source.op is not Ops.INDEX or cast.dtype not in (dtypes.float, dtypes.int, dtypes.bool, dtypes.uint8): return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  input_slot, out_slot = source.src[0].buf_uop.arg.slot, info.outs[0]
+  return (_emit_where_stage(total, out_slot, (input_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                            bool_inputs=((input_slot,) if source.dtype is dtypes.bool else ()),
+                            int32_inputs=((input_slot,) if source.dtype is dtypes.int else ()),
+                            fp32_inputs=((input_slot,) if source.dtype is dtypes.float else ()),
+                            fp32_output=cast.dtype is dtypes.float, int32_output=cast.dtype is dtypes.int,
+                            uint8_output=cast.dtype is dtypes.uint8, bool_output=cast.dtype is dtypes.bool),)
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
@@ -1615,6 +1632,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)
