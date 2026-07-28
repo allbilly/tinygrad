@@ -688,6 +688,79 @@ The CELU investigation gives a reusable order for parameterized activations:
 5. add a local table only for a measured narrow precision band;
 6. verify every parameter value, not just the default.
 
+## Case study: QuickGELU with two LUTs and a Taylor interval
+
+PyTorch's QuickGELU reference is not a single rounded evaluation of
+`x/(1+exp(-1.702*x))`. With fp16 input it rounds three stages:
+
+```text
+scaled  = fp16(float32(x) * 1.702)
+sigmoid = fp16(1 / (1 + exp(-scaled)))
+result  = fp16(x * sigmoid)
+```
+
+The original Rockchip staged implementation missed 120/2925 official values.
+A direct Q14 table reduced that to 71, but it approximated the continuous
+function and could not reproduce all discontinuous fp16 stage boundaries.
+Blending continuous and staged values across the whole table, shifted-grid
+averaging, and a smooth residual LUT were measured and rejected for the same
+reason: neighboring fp16 inputs can require opposite one-ULP corrections.
+
+The accepted lowering partitions the problem:
+
+```text
+fallback = staged QuickGELU with exact zero/x asymptotic tails
+broad    = direct QuickGELU Q14(x)                         # x in [-2,2]
+negative = QuickGELU Q15((x+1.5)*4)                       # x in [-2,-1]
+nearzero = fp16(0.5*x + 0.4253*x*x)                       # x in [-0.16,0.16]
+```
+
+The negative table uses the full signed LUT coordinate range for only one unit
+of source input. Its table value is the midpoint of the continuous function
+and the explicitly fp16-staged reference. This empirical midpoint survived the
+actual floor interpolation better than either endpoint model alone.
+
+The Taylor coefficient comes from:
+
+```text
+x*sigmoid(1.702*x) = 0.5*x + (1.702/4)*x² + O(x⁴)
+```
+
+The fp16 constant is `0.4253`. Exhaustive software evaluation of all fp16
+values through `|x|<=0.1` found no tolerance failures; the production interval
+extends to `0.16` because the official sampled values remain within tolerance
+there and it removes the near-zero table-quantization band.
+
+Five broad-table knots receive small measured Q14 corrections:
+
+```text
+negative table: index 276 += 4
+negative table: indices 375, 408, 427 += 1
+positive table: index 49 += 1
+```
+
+These are sparse interpolation corrections, not a per-input result table.
+They cover the previously failing inputs near `-0.9185`, `-0.5347`, `-0.4038`,
+`-0.3318`, and `0.1917`. The official 2925-value method passes. A 4097-point
+software floor-interpolation diagnostic still reports eight one-ULP tolerance
+misses, and an exhaustive fp16 model reports 57/32770; those diagnostics are
+retained rather than obscured by a looser tolerance.
+
+Two hardware constraints shaped the final task graph:
+
+- Mask the source by the Taylor interval before computing `x*x`. Computing the
+  polynomial on unselected ±400 lanes overflows to infinity, and arithmetic
+  selection then turns `inf*0` into NaN.
+- Keep the PC chain to 64 tasks. The first correct branch graph had 70 tasks
+  and `DRM_IOCTL_RKNPU_SUBMIT` returned `EINVAL`. Reusing the broad lower-bound
+  comparison for the negative interval and removing non-mask scratch repeats
+  reduced it to the accepted 64 without removing comparison-mask visibility
+  workarounds.
+
+The earlier broad plus near-zero direct-table experiment is preserved as
+`_try_quick_gelu_direct_two_lut_wip`. It reduced the official failure count but
+does not satisfy the fp16-staged target and must not be re-enabled as-is.
+
 ## Case study: round-to-nearest-even
 
 `rknnops.h` algorithm 23 differs from the ordinary activation tables:

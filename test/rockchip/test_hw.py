@@ -226,10 +226,14 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").tanh().realize().numpy()
     np.testing.assert_allclose(actual, np.tanh(a_np), rtol=1e-3, atol=1e-6)
 
-  def test_dpu_quick_gelu_extreme_saturation(self):
-    a_np = np.array([-400, -300, -10.5, 5.5, 300, 400], dtype=np.float16)
+  def test_dpu_quick_gelu_two_lut(self):
+    a_np = np.array([-400, -300, -10.5, -2, -1.9, -1.6, -1.5, -1.4, -1,
+                     -0.918457, -0.534668, -0.403809, -0.331787, -0.161, -0.16, -0.159,
+                     -0.0, 0.0, 0.159, 0.16, 0.161, 0.19165, 2, 5.5, 300, 400], dtype=np.float16)
     with np.errstate(over="ignore"):
-      expected = (a_np.astype(np.float32) / (1 + np.exp(-1.702*a_np.astype(np.float32)))).astype(np.float16)
+      scaled = (a_np.astype(np.float32)*np.float32(1.702)).astype(np.float16)
+      sigmoid = (1/(1+np.exp(-scaled.astype(np.float32)))).astype(np.float16)
+      expected = (a_np*sigmoid).astype(np.float16)
     actual = Tensor(a_np, device="ROCKCHIP").quick_gelu().realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 

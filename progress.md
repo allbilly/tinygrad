@@ -1,5 +1,46 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — two-LUT QuickGELU interior milestone
+
+### Implementation
+
+- The existing staged QuickGELU plus exact wide-tail saturation is retained as
+  the fallback outside the optimized domain.
+- LUT task 1 is a direct signed-Q14 table over `[-2,2]`. Five sparse measured
+  knot corrections reproduce PyTorch's fp16 stage-rounding boundaries without
+  changing the table's overall function.
+- LUT task 2 spends its Q15 resolution on the dominant negative failure band
+  `[-2,-1]`. It receives `z=(x+1.5)*4`; its entries blend the continuous
+  QuickGELU value and the fp16-staged reference to land on the required half
+  result after hardware interpolation.
+- Near zero, the backend uses the fp16 Taylor form
+  `0.5*x + 0.4253*x*x` on `[-0.16,0.16]`. It meets the strict absolute/relative
+  tolerance where even amplified Q15 output was one count too coarse.
+- The polynomial input is masked before squaring. This prevents an unselected
+  wide input such as 400 from overflowing to infinity and contaminating the
+  arithmetic branch sum through `inf*0`.
+- The accepted program contains exactly 64 NPU tasks. A 70-task version was
+  rejected by the driver with `EINVAL`; redundant polynomial scratches,
+  duplicate interval comparisons, and non-mask combination scratches were
+  removed while retaining comparison-mask visibility passes.
+- The rejected broad-plus-near-zero direct two-LUT implementation remains as
+  `_try_quick_gelu_direct_two_lut_wip` for hardware/debug reference.
+
+### Verification
+
+- `TestOps.test_quick_gelu` and `TestOps.test_quick_gelu_extreme` — **PASS**
+  with `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Focused hardware coverage includes all five corrected broad knots, the
+  negative local table, both Taylor boundaries, signed zero, and ±400 tails.
+- All **61** Rockchip hardware methods — **PASS** in isolated sequential
+  subprocesses.
+- `python -m mypy tinygrad/`, Ruff on changed source/test files, and
+  `git diff --check` — **PASS**.
+- A 4097-point software model of the measured floor interpolation retains
+  eight one-ULP tolerance misses. They are recorded in `lut.md`; the official
+  deterministic method is fully green.
+- Incremental census: **144 PASS, 272 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — two-LUT CELU forward milestone
 
 ### Implementation
@@ -47,7 +88,7 @@ recent CELU investigation before any more implementation work.
 - Last verified milestone commit: `f409ec1f6` (`rockchip: saturate extreme
   quick gelu`).
 - Current TestOps census:
-  **143 PASS, 273 FAIL, 8 SKIP** out of 424 methods.
+  **144 PASS, 272 FAIL, 8 SKIP** out of 424 methods.
 - Test contract: forward only, fp16 default:
   `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
 - Gradients are deliberately out of scope. Note that
@@ -461,19 +502,17 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. Ordinary QuickGELU: 120/2925 interior rounding mismatches remain; extreme
-   QuickGELU already passes.
-2. Ordinary tanh: 907/2925 interior precision mismatches remain; extreme tanh
+1. Ordinary tanh: 907/2925 interior precision mismatches remain; extreme tanh
    already passes.
-3. LOG2: positive finite broad-range precision still needs normalization
+2. LOG2: positive finite broad-range precision still needs normalization
    (power-of-four range reduction was the promising direction).
-4. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
+3. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
    staged LOG2/EXP2 interaction before tuning a LUT.
-5. Softplus and Mish: supported paths are numerically inaccurate and likely
+4. Softplus and Mish: supported paths are numerically inaccurate and likely
    depend on improved LOG/EXP range handling.
-6. ELU and SELU: still unsupported composite activation graphs.
-7. Boolean reductions and remaining integer/bool dtype groups.
-8. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
+5. ELU and SELU: still unsupported composite activation graphs.
+6. Boolean reductions and remaining integer/bool dtype groups.
+7. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
    convolution groups. These are larger architectural milestones, not LUT
    quick wins.
 
