@@ -23,12 +23,12 @@
 | `RKPLAN_REJECT:unsupported_op:fused_epilogue` | 36 | Fused epilogue not supported |
 | `TimeoutError` | 21 | NPU timeout (sin, tan, sinh, softplus, etc.) |
 | `RKPLAN_REJECT:unsupported_op:non_index_operand` | 20 | Non-index operand in store |
-| `AssertionError: cmac` | 12 | CMAC sum classification failed |
-| `RKPLAN_REJECT:unsupported_op:Ops.MUL` | 12 | MUL op not supported |
 | `RKPLAN_REJECT:cmac_exceeds_cbuf` | 18 | CMAC exceeds circular buffer |
 | `AssertionError: dtype` | 15 | dtype mismatch (fp16 vs fp32) |
-| `RKPLAN_REJECT:unsupported_op:Ops.ADD` | 6 | ADD op not supported |
 | `RKPLAN_REJECT:unsupported_op:Ops.XOR/OR/AND/SHL/SHR` | 14 | Bitwise ops not supported |
+| `AssertionError: cmac` | 12 | CMAC sum classification failed |
+| `RKPLAN_REJECT:unsupported_op:Ops.MUL` | 12 | `REDUCE(MUL, ...)` not supported — product/cumprod/argmax/argmin (line 919 only handles ADD and MAX) |
+| `RKPLAN_REJECT:unsupported_op:Ops.ADD` | 6 | `REDUCE(ADD, ADD(...))` — reduce body is ADD not MUL/INDEX — cross_entropy/binary_crossentropy/nll_loss (line 901) |
 
 ## Failure Categories
 
@@ -78,6 +78,26 @@ fp32 output dtype mismatch, int operations.
 
 ### 10. Other — ~20 tests
 test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stack, test_sort, test_topk, test_tril, test_triu, test_nonzero, test_gather, test_fancy_indexing*, etc.
+
+## Low-Hanging Fruit (ordered by effort/impact)
+
+| Error | Count | Effort | Impact | Notes |
+|-------|-------|--------|--------|-------|
+| Bitwise (AND/OR/XOR/SHL/SHR) | 14 | **Low** | Low | Simple EW ops, just need register config like other EW |
+| `non_index_operand` | 20 | **Low** | Med | Store pattern recognition — handle more cases like pad did |
+| `fused_epilogue` | 36 | **Low-Med** | Med | Split fused ops into separate tasks |
+| `unsupported_dtype` | 58 | **Med** | High | Add fp32/int32 conversion paths (already have fp16↔fp32 infra) |
+| `TimeoutError` | 21 | **Med** | Low | NPU hangs from wrong register config for transcendentals |
+| `cmac_exceeds_cbuf` | 18 | **Med** | Low | Needs tiling/segmentation of large CMAC |
+| `cmac classification` | 12 | **Med** | Low | CMAC sum classification logic |
+| `Ops.MUL` (REDUCE(MUL)) | 12 | **Med** | Low | Product reduction — needs PPU/CMAC MUL reduce support (line 919 only handles ADD/MAX). Tests: prod, cumprod, argmax, argmin, argsort |
+| `Ops.ADD` (REDUCE(ADD,ADD)) | 6 | **Med** | Low | Nested ADD in reduce body — cross_entropy/binary_crossentropy/nll_loss. Needs flattening or multi-stage CMAC (line 901) |
+| `Ops.WHERE` | 196 | **High** | **Highest** | Used everywhere — host-side WHERE like pad, or DPU WHERE op |
+| `unsupported_layout` | 138 | **High** | High | Conv/pool/matmul 2D/3D DPU layouts — core NPU feature |
+
+**Suggested order:** Bitwise → non_index_operand → fused_epilogue → unsupported_dtype → WHERE → unsupported_layout
+
+The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are the big ones but hardest.
 
 ## What Works (140 passing)
 - Basic EW ops: add, sub, mul, div (1D/2D, same shape)
