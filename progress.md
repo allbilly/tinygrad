@@ -1,5 +1,34 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — saturated two-LUT Erf milestone
+
+- `_try_erf` recognizes tinygrad's Abramowitz-Stegun lowering after the
+  reciprocal-to-FDIV rewrite: one fp16 INDEX, one EXP2, five FDIV/RECIPROCAL
+  nodes, two WHEREs, one CMPLT, and one CMPNE.
+- The generic  approximation missed 1766/2925 official values with maximum
+  absolute error about `0.0596`. The replacement uses:
+
+  ```text
+  broad  = Q15 erf(x), x in [-4,4]
+  local  = Q15 3*erf(x), x in [-0.25,0.25], addressed by z=16*x
+  center = (2/sqrt(pi))*x, |x|<=0.04
+  tails  = sign(x), |x|>4
+  ```
+
+- Every LUT and linear input is symmetrically bounded before evaluation. This
+  makes ±300–400 and infinities safe from unselected `inf*0` contamination.
+- Comparison-mask combinations and first branch selections retain duplicate
+  scratch reads for RK3588 visibility.
+- Final raw schedule: **64 NPU tasks**, exactly **two LUT tasks**.
+- `TestOps.test_erf`: **PASS**, including ordinary values, both extreme ranges,
+  and scalar.
+- Hardware regression: all 4097 fp16 grid points over `[-4,4]`, ±400,
+  infinities, NaN, and signed zero pass at the official tolerance.
+- Complete serial `test/rockchip/test_hw.py`: **67 passed, 2 failed** in
+  195.69 seconds; only fill-zero/fill-full remain.
+- Compileall and `git diff --check` pass; mypy retains the same 13 pre-existing
+  findings. Ruff remains unavailable through the required `.venv` Python.
+
 ## 2026-07-29 — shared two-LUT ELU/SELU milestone
 
 ### Recognition and shared form

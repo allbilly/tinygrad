@@ -1156,6 +1156,41 @@ the correct positive branch but the final DPU ADD changes it to NaN; retain
 that as an explicit backend limitation until the infinity-safe final merge is
 implemented.
 
+## Case study: saturated Erf
+
+The polynomial EXP2 approximation in the Tensor graph is useful as a portable
+fallback but compounds fp16 rounding on the RK3588. Erf is bounded and odd, so
+a direct decomposition is simpler:
+
+```text
+broad domain  = [-4,4], Q15 erf(x), index_scale=4096
+local domain  = [-0.25,0.25], Q15 3*erf(x), addressed by 16*x
+center        = (2/sqrt(pi))*x for |x|<=0.04
+outside       = sign(x)
+```
+
+The local gain of three fits because `3*erf(0.25)≈0.829`. It gives an effective
+restored quantum near `1.02e-5`, while the center line avoids the LUT exact-zero
+workaround where relative tolerance is tightest.
+
+Use the MAX/SUB symmetric clamp before every LUT or center computation:
+
+```text
+low         = max(x, -limit)
+neg         = 0 - low
+neg_clamped = max(neg, -limit)
+bounded     = 0 - neg_clamped
+```
+
+This is both a domain clamp and an infinity-safety device. The final tail is
+constructed only from finite comparison masks, so ±400 and infinities become
+exact ±1 without evaluating an unbounded arithmetic branch.
+
+The final graph is exactly 64 tasks with two LUT tasks. All 4097 fp16 points on
+`[-4,4]`, ±400, infinities, NaN, and zero pass. Negative zero is returned as
+positive zero, which satisfies the current numerical contract but remains a
+bit-level sign detail if an exact-sign test is added later.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of

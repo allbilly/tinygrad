@@ -1,6 +1,6 @@
 # PR 1 hardware numerical tests: one per compute family (DPU, CNA+CORE, PPU).
 # These tests require an RK3588 NPU and /dev/dri/card1.
-import os, unittest, numpy as np
+import os, math, unittest, numpy as np
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import to_mv
 
@@ -219,6 +219,13 @@ class TestDPU(unittest.TestCase):
     with np.errstate(over="ignore", invalid="ignore"):
       expected = (1.0507*np.where(a_np >= 0, a_np, 1.67326*np.expm1(a_np.astype(np.float32)))).astype(np.float16)
     actual = Tensor(a_np, device="ROCKCHIP").selu().realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
+  def test_dpu_erf_two_lut(self):
+    a_np = np.concatenate((np.linspace(-4, 4, 4097, dtype=np.float16),
+                           np.array([-400, 400, -np.inf, np.inf, np.nan, -0.0, 0.0], dtype=np.float16)))
+    expected = np.array([math.erf(float(x)) for x in a_np], dtype=np.float16)
+    actual = Tensor(a_np, device="ROCKCHIP").erf().realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
   def test_dpu_sqrt_special_values(self):
