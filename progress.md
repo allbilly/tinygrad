@@ -1,5 +1,30 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — sigmoid forward saturation milestone
+
+### Implementation
+- Direct sigmoid keeps its accurate `[-8,8]` LUT and adds NPU-only masks
+  outside that domain.
+- Inputs above 8 replace the LUT overflow result with one; inputs below −8
+  become zero; NaN is restored through a controlled `0/0`.
+- Ordinary sigmoid, SiLU, and swish stay on their existing tuned paths.
+- The fused `s*s*exp(-x)` gradient experiment is preserved in
+  `rockchip-sigmoid-gradient-wip-707786779.patch` and excluded per the current
+  `FORWARD_ONLY=1` scope.
+
+### Verification
+- Ordinary `TestOps.test_sigmoid` — **PASS**.
+- The forward portions of `TestOps.test_sigmoid_extreme` — **PASS** for both
+  `[300,400]` and `[-400,-300]`. The method still contains unconditional
+  explicit gradient assertions, so it remains PARTIAL rather than being added
+  to the all-method PASS count.
+- Focused infinities, NaN, endpoints, and ±400 hardware vector — **PASS**.
+- `test_silu`, `test_swish`, and the dense staged SiLU hardware test — **PASS**.
+- All **52** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on the changed source/test — **PASS**.
+- TestOps method census remains **131 PASS, 285 FAIL, 8 SKIP** until gradient
+  work is brought back into scope.
+
 ## 2026-07-28 — RSQRT range-reduction milestone
 
 ### Implementation

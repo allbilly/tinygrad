@@ -1,0 +1,48 @@
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 2ed1aee10..03e951600 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1131,0 +1132,37 @@ def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_sigmoid_grad_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower sigmoid's shared s*s*exp(-x) gradient as s*(1-s)."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  val = _unwrap(store.src[1])
++  sigmoids = [u for u in val.toposort() if _try_sigmoid(u) is not None]
++  if len(sigmoids) != 1 or val.op is not Ops.MUL: return None
++  sigmoid = sigmoids[0]
++  add = _unwrap(sigmoid.src[0])
++  exp = next((_unwrap(u) for u in add.src if _unwrap(u).op is Ops.EXP2), None)
++  if exp is None: return None
++  matched = False
++  for square, exp_factor in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
++    square = _unwrap(square)
++    if square.op is Ops.MUL and all(_unwrap(x) is sigmoid for x in square.src) and _unwrap(exp_factor) is exp:
++      matched = True
++  if not matched: return None
++
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  out, sigmoid_slot = info.outs[0], max(info.globals, default=-1) + 1
++  out_idx = store.src[0]
++  sigmoid_idx = out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(sigmoid_slot), *out_idx.src[1:]))
++  sigmoid_sink = sink.substitute({store:store.replace(src=(sigmoid_idx, sigmoid))})
++  if (sigmoid_tasks := _try_sigmoid_special_subtasks(sigmoid_sink)) is None: return None
++  used_slots = [sigmoid_slot] + [st.task.out_slot for st in sigmoid_tasks] + \
++    [r.globals_slot for st in sigmoid_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  scratch, one_minus = max(used_slots) + 1, max(used_slots) + 2
++  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++  return (*sigmoid_tasks, _emit_where_stage(total, scratch, one, (sigmoid_slot, 0), Ops.SUB),
++          _emit_where_stage(total, one_minus, one, (sigmoid_slot, 0), Ops.SUB),
++          _emit_where_stage(total, scratch+2, (sigmoid_slot, 0), (one_minus, 0), Ops.MUL),
++          _emit_where_stage(total, out, (sigmoid_slot, 0), (one_minus, 0), Ops.MUL))
++
+@@ -2194,0 +2232 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (sigmoid_grad_tasks := _try_sigmoid_grad_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_grad_tasks)
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 651b97d10..1124942f4 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -153,0 +154,3 @@ class TestDPU(unittest.TestCase):
++    for value in (-300.0, 300.0):
++      x = Tensor([value], device="ROCKCHIP")
++      self.assertEqual(x.sigmoid()[0].gradient(x)[0].item(), 0.0)

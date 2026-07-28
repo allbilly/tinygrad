@@ -13,6 +13,12 @@ segfaulted, so those methods were rerun individually.
 This is the previous complete hardware census plus the independently rerun
 SQRT and RSQRT milestones: both methods moved from numeric mismatch to PASS.
 
+Forward-only follow-up: both forward ranges in `test_sigmoid_extreme` now pass,
+but the method has two explicit gradient assertions that run even with
+`FORWARD_ONLY=1`. Per current scope those assertions are not counted as a
+backend regression, and the method remains PARTIAL rather than increasing the
+PASS total.
+
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
 distinguishes uint8 from int32 output, and the conversion writes one byte per
@@ -74,9 +80,9 @@ The 131 passing methods are:
 `test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Current RSQRT milestone regression: all **51 hardware tests pass in isolated
-sequential subprocesses**, including the EXP2, SQRT, and RSQRT special-value
-assertions, and the corresponding official TestOps methods pass. A single-process run retains the
+Current sigmoid-forward milestone regression: all **52 hardware tests pass in
+isolated sequential subprocesses**, including EXP2, sigmoid, SQRT, and RSQRT
+special-value assertions. A single-process run retains the
 sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
 records the LUT tuning, range reduction, Newton refinement, and special-value
 procedures plus the remaining SiLU one-ULP dense-grid diagnostic.

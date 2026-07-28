@@ -296,6 +296,39 @@ Two rejected baselines are useful tuning references:
 RK3588 FDIV returns positive infinity for both `1/+0` and `1/-0`; the latter
 signed-zero case cannot be recovered with numeric comparison masks.
 
+### Sigmoid saturation
+
+The direct sigmoid table is tuned over `[-8,8]`. RK3588's LUT overflow path
+does not simply clamp to the final table entry: large positive input was
+observed to return 2 instead of 1. Keep the accurate ordinary table and repair
+only its out-of-domain lanes:
+
+```text
+high = x > 8
+low = x < -8
+result = lut + high*(1-lut)
+result = result*(1-low)
+```
+
+Apply the usual NaN `0/0` factor afterward. This makes the forward ±300–400
+ranges exact without changing ordinary sigmoid, SiLU, or swish.
+
+Tinygrad expresses the sigmoid gradient as shared `s*s*exp(-x)`. A staged
+rewrite to `s*(1-s)` was tested but scratch composition did not yet preserve
+the saturated value; it is saved in
+`rockchip-sigmoid-gradient-wip-707786779.patch`. Gradient work is outside the
+current `FORWARD_ONLY=1` scope.
+
+### SIN near-zero tuning assessment
+
+Using the full signed int16 output scale (32767 with minus-exp 15) reduced the
+first SIN tensor from 68 to 54 strict mismatches and halved the worst absolute
+error, but did not pass. Remaining failures cluster near zero, where the
+hardware's unusable exact-zero table entry and fp16 index quantization dominate
+relative error. The experiment is preserved in
+`rockchip-sin-fullscale-wip-707786779.patch`; complete SIN/COS support also
+needs large-argument reduction.
+
 ### LOG2 range reduction
 
 The current linear LOG2 table is accurate only over approximately

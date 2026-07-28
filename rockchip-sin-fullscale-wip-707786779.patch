@@ -1,0 +1,10 @@
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index cba8199da..150a262fe 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -298 +298 @@ def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
+-  output_scale = 16384.0  # maps [-1,1] to [-16384,16384] — doubled for precision
++  output_scale = 32767.0  # use the full signed int16 range without clipping +1
+@@ -314 +314 @@ def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
+-  return lut, bn_mul_operand, output_scale, index_scale, 14
++  return lut, bn_mul_operand, output_scale, index_scale, 15

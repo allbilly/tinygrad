@@ -1058,6 +1058,72 @@ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
   return tuple(tasks)
 
+def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve sigmoid saturation and NaN semantics outside the bounded LUT."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  val = _unwrap(store.src[1])
+  if _try_sigmoid(val) is None: return None
+  indexes = [u for u in val.toposort() if u.op is Ops.INDEX]
+  if len(indexes) != 1 or (source := _unwrap(indexes[0])).dtype is not dtypes.half: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
+    nonlocal next_slot
+    mask_slot = alloc()
+    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
+    if cmp_tasks is None: return None
+    last = cmp_tasks[-1]
+    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    tasks.extend(cmp_tasks)
+    used_slots = [st.task.out_slot for st in cmp_tasks] + \
+      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+    return (mask_slot, 0)
+
+  lut_slot = alloc()
+  lut_plan = plan_rk(stage_sink(val, lut_slot))
+  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(lut_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  high = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 8.0), source)))
+  low = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, UOp.const(dtypes.half, -8.0))))
+  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
+  if high is None or low is None or not_number is None: return None
+
+  high_delta, high_adjustment, high_result = alloc(), alloc(), alloc()
+  dependent(high_delta, one, (lut_slot, 0), Ops.SUB)
+  dependent(high_adjustment, (high_delta, 0), high, Ops.MUL)
+  dependent(high_result, (lut_slot, 0), (high_adjustment, 0), Ops.ADD)
+  low_denom, bounded = alloc(), alloc()
+  dependent(low_denom, one, low, Ops.SUB)
+  dependent(bounded, (high_result, 0), (low_denom, 0), Ops.MUL)
+  nan_denom, nan_numerator = alloc(), alloc()
+  dependent(nan_denom, one, not_number, Ops.SUB)
+  dependent(nan_numerator, (bounded, 0), (nan_denom, 0), Ops.MUL)
+  dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
+  return tuple(tasks)
+
 def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve SQRT zero, infinity, and NaN semantics around the bounded LUT."""
   store = _store_node(sink)
@@ -2076,6 +2142,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+  if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)
   if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
   if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
