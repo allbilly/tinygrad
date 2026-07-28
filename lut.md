@@ -838,6 +838,51 @@ Values below the lowest implemented threshold remain future generalization
 work; extend the exact mask/weight sequence rather than returning to nonlinear
 SQRT normalization.
 
+### Folding natural-log and log10 scales
+
+Tinygrad lowers the other logarithm bases as:
+
+```text
+ln(x)    = log2(x) * ln(2)
+log10(x) = log2(x) * log10(2)
+```
+
+Applying the constant after the completed special-value epilogue introduced an
+extra fp16 store. Natural log had 26 one-ULP misses even though root LOG2
+passed. Fold the function scale into every finite component instead:
+
+```text
+broad table output conversion *= function_scale
+local table value             = 4 * function_scale * log2(normalized)
+offset                        = -2 * count * function_scale
+near-one coefficient          = function_scale * log2(e)
+```
+
+This produces the requested base directly and keeps zero/infinity/NaN handling
+unchanged because all base-change factors are positive.
+
+The local coordinate transform is widened to:
+
+```text
+z = (normalized - 1) * 12.5
+selection interval = [0.85, 1.15]
+```
+
+Four-times output remains inside signed Q15 even for unscaled LOG2 at those
+endpoints. The wider table removed natural log's four remaining failures near
+outputs `-0.109` and `+0.117`.
+
+Log10 still had five misses closer to one. Replace the first-order interval
+with the second-order series:
+
+```text
+function_scale * log2(e) * (d - d²/2), |d| <= 0.02
+```
+
+The next relative term is proportional to `d²/3`, below `1.4e-4` at the
+interval boundary. All three official log methods pass with the same 97-task
+graph.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of

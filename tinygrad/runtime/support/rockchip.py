@@ -552,14 +552,14 @@ def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, output_scale, index_scale, 13
 
-def _build_log2_local_lut() -> tuple[list[int], int, float, float, int]:
-  """Q15 4*log2(x) for x∈[0.9,1.1], addressed by z=(x-1)*20."""
+def _build_log2_local_lut(function_scale:float=1.0) -> tuple[list[int], int, float, float, int]:
+  """Q15 4*scaled-log2(x) near one, addressed by z=(x-1)*12.5."""
   index_scale, output_scale = 8192.0, 32768.0
   step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
   for table, offset in ((0, 0), (1, _LUT_SIZE)):
     for i in range(_LUT_SIZE):
       z = (-(512-i) if table == 0 else i)*step
-      raw = int(round(4.0*math.log2(1.0+z/20.0)*output_scale))
+      raw = int(round(4.0*function_scale*math.log2(1.0+z/12.5)*output_scale))
       lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
@@ -714,8 +714,9 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_TANH)
   if val.op is Ops.CUSTOM and val.arg == "rk_tanh_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_TANH_LOCAL)
-  if val.op is Ops.CUSTOM and val.arg == "rk_log2_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
-    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOG2_LOCAL)
+  if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_log2_local" and \
+     (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_LOG2_LOCAL)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -2141,7 +2142,13 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None: return None
   val = _unwrap(store.src[1])
-  if val.op is not Ops.LOG2 or len(val.src) != 1 or (source := _unwrap(val.src[0])).op is not Ops.INDEX: return None
+  output_scale, log2_val = 1.0, val
+  if val.op is Ops.MUL:
+    lhs, rhs = (_unwrap(x) for x in val.src)
+    if lhs.op is Ops.CONST and rhs.op is Ops.LOG2: output_scale, log2_val = float(lhs.arg), rhs
+    elif rhs.op is Ops.CONST and lhs.op is Ops.LOG2: output_scale, log2_val = float(rhs.arg), lhs
+    else: return None
+  if log2_val.op is not Ops.LOG2 or len(log2_val.src) != 1 or (source := _unwrap(log2_val.src[0])).op is not Ops.INDEX: return None
   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
@@ -2204,7 +2211,7 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.extend((_emit_where_stage(total, count_lo, range_masks[0], range_masks[1], Ops.ADD),
                 _emit_where_stage(total, count_hi, range_masks[2], range_masks[3], Ops.ADD),
                 _emit_where_stage(total, count, (count_lo, 0), (count_hi, 0), Ops.ADD),
-                _emit_where_stage(total, offset, (count, 0), scalar(-2.0), Ops.MUL)))
+                _emit_where_stage(total, offset, (count, 0), scalar(-2.0*output_scale), Ops.MUL)))
 
   bounded_low, negated, negated_bounded, bounded = (alloc() for _ in range(4))
   tasks.extend((_emit_where_stage(total, bounded_low, (normalized, 0), scalar(0.25), Ops.MAX),
@@ -2213,7 +2220,9 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, bounded, (_ZERO_SLOT, 0), (negated_bounded, 0), Ops.SUB)))
 
   lut_slot = alloc()
-  normalized_val = UOp(Ops.LOG2, dtypes.half, (temp_index(bounded),))
+  normalized_log2 = UOp(Ops.LOG2, dtypes.half, (temp_index(bounded),))
+  normalized_val = normalized_log2 if output_scale == 1.0 else \
+    UOp(Ops.MUL, dtypes.half, (normalized_log2, UOp.const(dtypes.half, output_scale)))
   lut_plan = plan_rk(stage_sink(normalized_val, lut_slot))
   if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
   cmds, task, relocs = emit_rk(lut_plan)
@@ -2221,9 +2230,9 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   centered, zoomed = alloc(), alloc()
   tasks.extend((_emit_where_stage(total, centered, (bounded, 0), one, Ops.SUB),
-                _emit_where_stage(total, zoomed, (centered, 0), scalar(20.0), Ops.MUL)))
+                _emit_where_stage(total, zoomed, (centered, 0), scalar(12.5), Ops.MUL)))
   local_slot = alloc()
-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_log2_local")
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_log2_local", output_scale))
   local_plan = plan_rk(stage_sink(local_val, local_slot))
   if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
   cmds, task, relocs = emit_rk(local_plan)
@@ -2234,9 +2243,9 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
   local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, local_low_diff, scalar(0.9), (bounded, 0), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, local_low_diff, scalar(0.85), (bounded, 0), Ops.SUB),
                 _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, (bounded, 0), scalar(1.1), Ops.SUB),
+                _emit_where_stage(total, local_high_diff, (bounded, 0), scalar(1.15), Ops.SUB),
                 _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
                 _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
@@ -2244,10 +2253,11 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB)))
   near_low_diff, near_low, near_high_diff, near_high = (alloc() for _ in range(4))
   near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
-  local_mask_scratch, local_mask, linear = alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, near_low_diff, scalar(-0.0015), (centered, 0), Ops.SUB),
+  local_mask_scratch, local_mask = alloc(), alloc()
+  square, half_square, adjusted, polynomial = (alloc() for _ in range(4))
+  tasks.extend((_emit_where_stage(total, near_low_diff, scalar(-0.02), (centered, 0), Ops.SUB),
                 _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_high_diff, (centered, 0), scalar(0.0015), Ops.SUB),
+                _emit_where_stage(total, near_high_diff, (centered, 0), scalar(0.02), Ops.SUB),
                 _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
                 _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
@@ -2255,15 +2265,18 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
                 _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
                 _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
-                _emit_where_stage(total, linear, (centered, 0), scalar(math.log2(math.e)), Ops.MUL)))
+                _emit_where_stage(total, square, (centered, 0), (centered, 0), Ops.MUL),
+                _emit_where_stage(total, half_square, (square, 0), scalar(0.5), Ops.MUL),
+                _emit_where_stage(total, adjusted, (centered, 0), (half_square, 0), Ops.SUB),
+                _emit_where_stage(total, polynomial, (adjusted, 0), scalar(output_scale*math.log2(math.e)), Ops.MUL)))
   broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
   linear_selected_scratch, linear_selected, lut_sum_scratch, lut_sum, mantissa = (alloc() for _ in range(5))
   tasks.extend((_emit_where_stage(total, broad_selected_scratch, (lut_slot, 0), (local_outside, 0), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (lut_slot, 0), (local_outside, 0), Ops.MUL),
                 _emit_where_stage(total, local_selected_scratch, (local_scaled, 0), (local_mask, 0), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
-                _emit_where_stage(total, linear_selected_scratch, (linear, 0), (near_inside, 0), Ops.MUL),
-                _emit_where_stage(total, linear_selected, (linear, 0), (near_inside, 0), Ops.MUL),
+                _emit_where_stage(total, linear_selected_scratch, (polynomial, 0), (near_inside, 0), Ops.MUL),
+                _emit_where_stage(total, linear_selected, (polynomial, 0), (near_inside, 0), Ops.MUL),
                 _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
                 _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
                 _emit_where_stage(total, alloc(), (lut_sum, 0), (linear_selected, 0), Ops.ADD),
@@ -3010,7 +3023,7 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_LOG2_LOCAL:
-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut()
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut(input_scale)
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.LOG2:

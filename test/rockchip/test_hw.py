@@ -167,6 +167,13 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").log2().realize().numpy()
     np.testing.assert_allclose(actual, np.log2(a_np), rtol=1e-3, atol=2e-4)
 
+  def test_dpu_scaled_logs_normalization(self):
+    positive = np.exp2(np.linspace(-10, 2, 1025, dtype=np.float32)).astype(np.float16)
+    a_np = np.concatenate((positive, np.array([0, -2, np.inf, -np.inf, np.nan], dtype=np.float16)))
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    np.testing.assert_allclose(a.log().realize().numpy(), np.log(a_np), rtol=1e-3, atol=2e-4)
+    np.testing.assert_allclose(a.log10().realize().numpy(), np.log10(a_np), rtol=1e-3, atol=2e-4)
+
   def test_dpu_sigmoid_extreme_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -400, -8, -2, 0, 2, 8, 400], dtype=np.float16)
     with np.errstate(over="ignore"):

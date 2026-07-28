@@ -1,5 +1,47 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — normalized natural-log and log10 milestone
+
+### Implementation
+
+- `_try_log2_special_subtasks` now recognizes both root LOG2 and
+  `LOG2(source)*constant`, covering tinygrad's natural-log and log10 graphs.
+- The base-change constant is folded into the broad LUT output conversion, the
+  local Q15 table values, the exact power-of-four offset, and the near-one
+  polynomial. This avoids an additional fp16 LOG2 store followed by a
+  multiply, which initially left 26 natural-log rounding misses.
+- The local table was widened from `[0.9,1.1]` to `[0.85,1.15]` using
+  `z=(normalized-1)*12.5`. Four-times Q15 output still fits for LOG2, natural
+  log, and log10 across this interval.
+- The near-one approximation is now second order:
+
+  ```text
+  scale*log2(e)*(d - d*d/2), d=normalized-1, |d|<=0.02
+  ```
+
+  It retains exact zero at one and meets log10's tighter small-output relative
+  tolerance.
+- The same 97-task graph is used for log2, log, and log10; only the folded
+  function scale differs.
+
+### Measurements and verification
+
+- Recognizer plus post-epilogue scale: natural log improved from broad clipping
+  and NaN placement failure to **26/2925** one-ULP misses.
+- Folding the scale into the tables/offset reduced natural log to **4/2925**,
+  all just outside the original local interval.
+- Widening the local table: `TestOps.test_log` **PASS**.
+- Folded log10 initially retained **5/2925** near-one misses; the quadratic
+  interval removes them: `TestOps.test_log10` **PASS**.
+- `TestOps.test_log2` remains **PASS**, including its float32 special-value
+  subcase.
+- Focused hardware coverage over `[2^-10,4]`, zero, negative values,
+  infinities, and NaN passes for both natural log and log10.
+- The complete serial hardware file reports **62 passed, 2 failed**. The two
+  fill failures are unchanged parent/current-HEAD baseline failures.
+- Full mypy and focused Ruff retain only the same 13/five pre-existing parent
+  findings; compileall and `git diff --check` pass.
+
 ## 2026-07-29 — exact-normalized two-LUT LOG2 milestone
 
 ### Implementation
@@ -606,15 +648,13 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. Natural log/log10: scaled `LOG2*constant` bypasses the root LOG2
-   normalization/special path.
-2. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
+1. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
    staged LOG2/EXP2 interaction before tuning a LUT.
-3. Softplus and Mish: supported paths are numerically inaccurate and likely
+2. Softplus and Mish: supported paths are numerically inaccurate and likely
    depend on improved LOG/EXP range handling.
-4. ELU and SELU: still unsupported composite activation graphs.
-5. Boolean reductions and remaining integer/bool dtype groups.
-6. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
+3. ELU and SELU: still unsupported composite activation graphs.
+4. Boolean reductions and remaining integer/bool dtype groups.
+5. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
    convolution groups. These are larger architectural milestones, not LUT
    quick wins.
 
