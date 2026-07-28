@@ -913,7 +913,7 @@ This passes the official `[-2,2]` method. On a 2049-point `[-8,8]` grid, the
 ordinary Q15 quantum becomes too large relative to the very small positive
 tail: 356 values above approximately `3.63` miss by one step.
 
-The second NPU task uses the same coordinate grid but stores:
+The second NPU task widens the coordinate domain to `[-16,16]` and stores:
 
 ```text
 stored value = 32 * correction(x)
@@ -948,6 +948,88 @@ CACHELEVEL=0 CCACHE=0
 ```
 
 `CACHELEVEL=0` alone does not disable compiled-image caching.
+
+## Case study: beta-aware Softplus
+
+Softplus reuses the same bounded correction with the opposite asymptote:
+
+```text
+softplus(x,beta) = max(x,0) - correction(beta*x)/beta
+correction(z)    = -log1p(exp(-abs(z)))
+```
+
+The renderer exposes the optimized root
+`ln(2)*LOG2(sum_of_exponentials) + MAX(x,0)`. For non-unit beta, an outer
+positive scale gives `1/beta`; the MAX and exponential inputs reveal beta.
+
+### Address the original input
+
+Do not first materialize `z=beta*x` in fp16. For `beta=3`, this left 178
+official misses because PyTorch computes from the original fp16 input at higher
+internal precision. Instead, scale the table index:
+
+```text
+broad index_scale = 2048 * beta
+tail index_scale  = 1024 * beta
+table function    = correction(beta*x)
+OUT_CVT scale     = 1/beta
+```
+
+This addresses the original input while evaluating the beta-scaled function at
+each knot. OUT_CVT applies the base change before the fp16 result store.
+
+### Softplus tail
+
+The LogSigmoid `32x` positive-tail table cannot start early enough for
+beta=3 Softplus without overflowing signed Q15. A Softplus-specific table
+keeps the graph at two LUT tasks:
+
+```text
+domain in beta*x = [-16,16]
+stored value     = 21 * correction(beta*x)
+selection        = beta*x < -3.05
+restore          = stored_value / 21
+```
+
+At the selection boundary the amplified magnitude remains below one. The
+beta=3 official failure sequence was:
+
+```text
+unscaled correction after fp16 beta*x: 178 misses
+original-input broad table:             26 misses
+13x tail from -2.55:                     5 misses
+20x tail from -3.00:                     1 miss
+21x tail from -3.05:                     1 broad-branch miss
+```
+
+The remaining input was `x=-0.873`, or `beta*x≈-2.619`. Add one Q15 count to
+negative broad-table indices 344 and 345 only when beta is three. This is a
+measured interpolation-boundary correction; the default-beta table is
+unchanged.
+
+### Beta below one requires Q13
+
+For `beta=1/3`:
+
+```text
+max correction = ln(2)/beta ≈ 2.079
+```
+
+That does not fit signed Q15, and Q15 OUT_CVT cannot encode a multiplier of
+three. Use a direct Q13 wide table over `x in [-8,8]`:
+
+```text
+stored value = correction(beta*x)/beta
+output       = Q13
+```
+
+This leaves a representable range near `[-4,4]`. A far-negative comparison
+zeros the clamped table output for `-inf`; all finite official inputs remain in
+the direct-table domain.
+
+The final raw-schedule graphs use 12 tasks/two LUTs for beta one and three, and
+eight tasks/one LUT for beta one-third. All three official subcases and the
+2049-point `[-2,2]` hardware regressions, including infinities and NaN, pass.
 
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 

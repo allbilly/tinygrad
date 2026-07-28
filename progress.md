@@ -1,5 +1,66 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — beta-aware Softplus milestone
+
+### Recognition and decomposition
+
+- Softplus has the same stable logaddexp core as LogSigmoid but the renderer
+  reassociates it as `ln(2)*LOG2(...) + MAX(x,0)`.
+- The official method contains three forward subcases: `beta=1`, `beta=3`,
+  and `beta=1/3`. `_try_softplus` now returns both the original fp16 input
+  INDEX and the recovered beta from the outer reciprocal scale.
+- Address tables from the original input. Materializing `beta*x` through a DPU
+  stage rounded it to fp16 before lookup and left 178 beta=3 misses; PyTorch
+  evaluates beta scaling from the original fp16 value at higher internal
+  precision.
+- For `beta>=1`, evaluate:
+
+  ```text
+  softplus(x,beta) = max(x,0) - correction(beta*x)/beta
+  correction(z)    = -log1p(exp(-abs(z)))
+  ```
+
+  The broad builder scales its index range by beta, while OUT_CVT applies
+  `1/beta`. This avoids both the premature input rounding and an extra output
+  store.
+
+### Q formats and tail tuning
+
+- `beta=1` and `beta=3` use two LUT tasks: a broad Q15 correction and a
+  Softplus-specific Q15 tail.
+- The first beta=3 two-table path had 26 misses over the official 2925 values.
+  Moving the amplified-tail boundary and increasing its gain reduced this to
+  five, then one.
+- Final tail stores `21*correction(beta*x)` over
+  `beta*x in [-16,16]`, selects below `beta*x=-3.05`, and restores by `1/21`.
+- The last beta=3 miss at `x=-0.873` (`beta*x≈-2.619`) was in the broad
+  branch. The two neighboring negative-table knots, indices 344 and 345,
+  receive a beta=3-only `+1` Q15 interpolation correction.
+- `beta=1/3` cannot use the same Q15 design:
+  `ln(2)/beta≈2.079` exceeds the signed Q15 result range, and a Q15 hardware
+  output multiplier cannot represent `3`. It uses one Q13 wide table that
+  stores the already-divided correction directly, leaving two integer bits of
+  headroom. A far-negative mask maps `-inf` to exact zero.
+- Final raw-schedule task counts:
+
+  ```text
+  beta=1   : 12 tasks, 2 LUT tasks
+  beta=3   : 12 tasks, 2 LUT tasks
+  beta=1/3 :  8 tasks, 1 LUT task
+  ```
+
+### Verification
+
+- `TestOps.test_softplus`: **PASS**, including all three beta subcases.
+- Hardware regression: 2049 fp16 points over `[-2,2]` plus `-inf`, `+inf`,
+  and NaN pass for every beta.
+- `TestOps.test_logsigmoid` and its dense/special hardware regression remain
+  **PASS** after widening the shared amplified tail to `[-16,16]`.
+- Complete serial hardware file: **64 passed, 2 failed** in 164.53 seconds;
+  only the unchanged fill-zero/fill-full baseline failures remain.
+- Compileall and `git diff --check` pass. Full mypy and focused Ruff retain
+  only the same 13/five pre-existing findings.
+
 ## 2026-07-29 — two-NPU-task LogSigmoid milestone
 
 ### Failure mechanism and debug method
@@ -707,8 +768,8 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. Softplus and Mish: supported paths are numerically inaccurate and likely
-   depend on improved LOG/EXP range handling.
+1. Mish: now has a passing Softplus dependency; inspect its multiply/tanh
+   composition and materialize those stages without losing the Softplus path.
 2. ELU and SELU: still unsupported composite activation graphs.
 3. Boolean reductions and remaining integer/bool dtype groups.
 4. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and

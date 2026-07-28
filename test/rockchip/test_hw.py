@@ -189,6 +189,15 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").logsigmoid().realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_softplus_betas(self):
+    a_np = np.concatenate((np.linspace(-2, 2, 2049, dtype=np.float16),
+                           np.array([-np.inf, np.inf, np.nan], dtype=np.float16)))
+    for beta in (1.0, 3.0, 1/3):
+      with np.errstate(over="ignore", invalid="ignore"):
+        expected = (np.logaddexp(0, beta*a_np.astype(np.float32))/beta).astype(np.float16)
+      actual = Tensor(a_np, device="ROCKCHIP").softplus(beta=beta).realize().numpy()
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_sqrt_special_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -2, -0.0, 0, 0.25, 4], dtype=np.float16)
     actual = Tensor(a_np, device="ROCKCHIP").sqrt().realize().numpy()

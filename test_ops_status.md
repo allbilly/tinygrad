@@ -17,6 +17,8 @@ base-change scales into the normalized two-LUT path.
 `TestOps.test_logsigmoid` now passes through a dedicated 15-task/two-LUT path;
 the complete hardware file is at 63 passed with only the two baseline fill
 failures.
+`TestOps.test_softplus` now passes for beta `1`, `3`, and `1/3`; the complete
+hardware file advances to 64 passing methods with the same two fill failures.
 
 ## Summary
 
@@ -63,10 +65,10 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
-### 4. Transcendental ops — ~13 tests
-Exp, sin, cos, tan, sinh, cosh, erf, gelu, elu, selu, mish, softplus, sigmoid_extreme.
+### 4. Transcendental ops — ~12 tests
+Exp, sin, cos, tan, sinh, cosh, erf, gelu, elu, selu, mish, sigmoid_extreme.
 
-**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_elu, test_selu, test_mish, test_softplus, test_sigmoid*
+**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_elu, test_selu, test_mish, test_sigmoid*
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -124,6 +126,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
+- Softplus for beta `1`, `3`, and `1/3`, including dense/special coverage
 - abs, sign, round, inf_div (fp32 inputs)
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)
