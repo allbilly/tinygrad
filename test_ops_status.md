@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 126 PASS, 290 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 127 PASS, 289 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,19 +17,19 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 126 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions/activations, and uint8 ReLU cast |
+| PASS | 127 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum, affine copies, GEMM subsets, selected reductions/activations, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 36 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
 | FAIL: numeric mismatch | 30 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
-| FAIL: non-index operand | 14 | Elementwise graphs still outside the staged planner |
+| FAIL: non-index operand | 13 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
 | FAIL: CBUF limit | 9 | Large reductions/variance and one convolution |
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 126 passing methods are:
+The 127 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -46,7 +46,7 @@ The 126 passing methods are:
 `test_isfinite`, `test_isinf`, `test_isnan`, `test_leaky_relu`,
 `test_logical_not`, `test_matmul`, `test_matmul_simple`, `test_matvec`,
 `test_matvecmat`, `test_mean`, `test_mean_zero_axis`, `test_meshgrid`,
-`test_mul`, `test_mul_naninf`, `test_neg`, `test_negative_dims`,
+`test_minimum`, `test_mul`, `test_mul_naninf`, `test_neg`, `test_negative_dims`,
 `test_negative_dims_eye`, `test_negative_dims_full`,
 `test_negative_dims_kaiming`, `test_ones`, `test_ones_like`, `test_permute`,
 `test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,

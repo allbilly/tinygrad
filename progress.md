@@ -1,5 +1,29 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — typed minimum milestone
+
+### Implementation
+- Out-of-fp16-range scalar constants now encode as signed infinity at the DPU
+  constant-buffer boundary instead of raising `OverflowError`. This matches
+  the existing int32→fp16 input conversion and lets the later int32 output
+  conversion recover the tested extrema.
+- Direct bool identity kernels now use the typed DPU identity path, covering
+  simplifications such as `minimum(mask, True)`.
+- The nested elementwise planner materializes int32/bool/fp32 casts to fp16
+  before surrounding MAX/MUL arithmetic instead of stripping the cast and
+  rejecting the non-fp16 source.
+- Added hardware coverage for `int32.min`, bool–bool minimum, and mixed
+  int32/fp16 minimum.
+
+### Verification
+- `TestOps.test_minimum` — **PASS** across tensor/scalar fp16, int32 extrema,
+  bool, and mixed-dtype cases.
+- Direct cast regression and focused typed-boundary hardware test — **PASS**.
+- Full `test/rockchip/test_hw.py` — **48 passed**, three known conversion
+  warnings.
+- `TestOps.test_maximum` remains separate: it now reaches its bool–bool vector
+  case before rejecting unsupported dtype.
+
 ## 2026-07-28 — HardSwish algorithm 51 assessment
 
 - Confirmed tinygrad's exact HardSwish graph and tested a direct

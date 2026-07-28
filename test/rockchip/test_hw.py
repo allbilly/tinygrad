@@ -160,6 +160,18 @@ class TestDPU(unittest.TestCase):
     np.testing.assert_array_equal(Tensor(int_np, device="ROCKCHIP").cast(dtypes.float).realize().numpy(), int_np.astype(np.float32))
     np.testing.assert_array_equal(Tensor(bool_np, device="ROCKCHIP").cast(dtypes.float).realize().numpy(), bool_np.astype(np.float32))
 
+  def test_dpu_typed_minimum_boundaries(self):
+    int_np = np.array([-1234,0,1234,np.iinfo(np.int32).max,np.iinfo(np.int32).min], dtype=np.int32)
+    ints = Tensor(int_np, device="ROCKCHIP").realize()
+    int_min = Tensor(np.iinfo(np.int32).min, dtype=dtypes.int, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(ints.minimum(int_min).realize().numpy(), np.minimum(int_np, np.iinfo(np.int32).min))
+    bool_a, bool_b = np.array([True,False,False]), np.array([True,True,False])
+    a = Tensor(bool_a, device="ROCKCHIP").realize()
+    b = Tensor(bool_b, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(a.minimum(b).realize().numpy(), np.minimum(bool_a, bool_b))
+    expected = np.minimum(int_np.astype(np.float16), np.float16(1.2))
+    np.testing.assert_array_equal(ints.minimum(Tensor(1.2, dtype=dtypes.half, device="ROCKCHIP")).realize().numpy(), expected)
+
   def test_dpu_2d_add(self):
     # 2D row-major contiguous element-wise add
     a_np = np.random.randn(8,16).astype(np.float16)

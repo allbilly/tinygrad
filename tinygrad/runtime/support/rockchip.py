@@ -779,17 +779,19 @@ def _emit_trunc_stage(total:int, out_slot:int, source:tuple[int,int]) -> RKSubTa
 def _try_cast_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
   """Run a DPU identity stage in fp16, with buffer-level conversion at its edges."""
   store = _store_node(sink)
-  if store is None or store.src[1].op is not Ops.CAST: return None
-  cast, source = store.src[1], _unwrap(store.src[1].src[0])
-  if source.op is not Ops.INDEX or cast.dtype not in (dtypes.float, dtypes.int, dtypes.bool, dtypes.uint8): return None
+  if store is None: return None
+  if store.src[1].op is Ops.CAST: output_dtype, source = store.src[1].dtype, _unwrap(store.src[1].src[0])
+  elif store.src[1].op is Ops.INDEX and store.src[1].dtype is dtypes.bool: output_dtype, source = dtypes.bool, store.src[1]
+  else: return None
+  if source.op is not Ops.INDEX or output_dtype not in (dtypes.half, dtypes.float, dtypes.int, dtypes.bool, dtypes.uint8): return None
   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
   input_slot, out_slot = source.src[0].buf_uop.arg.slot, info.outs[0]
   return (_emit_where_stage(total, out_slot, (input_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
                             bool_inputs=((input_slot,) if source.dtype is dtypes.bool else ()),
                             int32_inputs=((input_slot,) if source.dtype is dtypes.int else ()),
                             fp32_inputs=((input_slot,) if source.dtype is dtypes.float else ()),
-                            fp32_output=cast.dtype is dtypes.float, int32_output=cast.dtype is dtypes.int,
-                            uint8_output=cast.dtype is dtypes.uint8, bool_output=cast.dtype is dtypes.bool),)
+                            fp32_output=output_dtype is dtypes.float, int32_output=output_dtype is dtypes.int,
+                            uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool),)
 
 def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
   """Fill non-fp16 outputs through the DPU, then convert the fp16 result buffer."""
@@ -1089,6 +1091,14 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def lower_arg(u:UOp) -> UOp|None:
     nonlocal next_slot
+    if u.op is Ops.CAST and u.dtype is dtypes.half and _unwrap(u.src[0]).op is Ops.INDEX:
+      if u not in materialized:
+        slot = alloc()
+        stage_sink, idx = make_stage_sink(u, slot)
+        if (cast_tasks := _try_cast_subtasks(stage_sink)) is None: return None
+        tasks.extend(cast_tasks)
+        materialized[u] = idx
+      return materialized[u]
     u = _unwrap(u)
     if u.op in (Ops.INDEX, Ops.CONST): return u
     if u not in materialized:

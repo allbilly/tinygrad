@@ -419,7 +419,9 @@ class RockchipProgram(Program['RockchipDevice']):
             cbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
             temp.append(cbuf)
             cval = struct.unpack('<f', struct.pack('<I', r.addend))[0]
-            fp16_bytes = struct.pack('<e', cval) * total
+            try: fp16_value = struct.pack('<e', cval)
+            except OverflowError: fp16_value = struct.pack('<e', float("-inf") if cval < 0 else float("inf"))
+            fp16_bytes = fp16_value * total
             ctypes.memmove(cbuf.va_addr, fp16_bytes, total * 2)  # type: ignore[arg-type]
             dma = cbuf.meta.dma_addr
             v = (dma >> r.shift) & r.mask
