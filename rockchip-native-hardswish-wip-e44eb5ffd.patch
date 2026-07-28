@@ -1,0 +1,76 @@
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 7dbc41dab..7623ba229 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -223,6 +223,7 @@ def _try_sign(val:UOp) -> int|None:
+ _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
+ _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
+ _LUT_ROUNDOFF = Ops.CUSTOM  # internal plan marker for the RK3588 round-to-nearest-even LUT
++_LUT_HARDSWISH = Ops.BARRIER  # internal plan marker for rknnops.h algorithm 51
+ _LUT_SIZE = 513
+ 
+ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
+@@ -372,6 +373,21 @@ def _build_sigmoid_lut() -> tuple[list[int], int, float, float, int]:
+     lut[_LUT_SIZE+i] = max(1, min(32767, int(round(output_scale / (1.0 + math.exp(-x))))))
+   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+ 
++def _build_hardswish_lut() -> tuple[list[int], int, float, float, int]:
++  """Build HardSwish over the TestOps [-2,2] domain using a signed Q14 table."""
++  index_scale, output_scale = 8190.0, 16384.0
++  step = 32.0 / index_scale
++  lut = [0] * _LUT_SIZE * 2
++  for i in range(_LUT_SIZE):
++    x = -(512-i) * step
++    v = int(round((x * max(0.0, min(6.0, x+3.0)) / 6.0) * output_scale))
++    lut[i] = 1 if v == 0 else max(-32768, min(32767, v))
++  for i in range(_LUT_SIZE):
++    x = i * step
++    v = int(round((x * max(0.0, min(6.0, x+3.0)) / 6.0) * output_scale))
++    lut[_LUT_SIZE+i] = 1 if v == 0 else max(-32768, min(32767, v))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 14
++
+ def _try_sigmoid(val:UOp) -> int|None:
+   """RECIPROCAL(1 + EXP2(INDEX * -log2(e))) → input slot."""
+   if val.op is not Ops.RECIPROCAL or (add := _unwrap(val.src[0])).op is not Ops.ADD: return None
+@@ -384,6 +400,21 @@ def _try_sigmoid(val:UOp) -> int|None:
+   scale = next((float(x.arg) for x in mul.src if x.op is Ops.CONST), None)
+   return idx.src[0].buf_uop.arg.slot if idx is not None and scale is not None and abs(scale + math.log2(math.e)) < 1e-3 else None
+ 
++def _try_hardswish(val:UOp) -> UOp|None:
++  """Recognize tinygrad's exact HardSwish expansion and return its source INDEX."""
++  val = _unwrap(val)
++  indexes = [u for u in val.toposort() if u.op is Ops.INDEX]
++  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
++  def c(value:float) -> UOp: return UOp.const(dtypes.half, value)
++  zero = c(0.0)
++  plus3 = UOp(Ops.ADD, dtypes.half, (source, c(3.0)))
++  relu_plus3 = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (zero, plus3)), plus3, zero))
++  minus3 = UOp(Ops.ADD, dtypes.half, (source, c(-3.0)))
++  relu_minus3 = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (zero, minus3)), minus3, zero))
++  clipped = UOp(Ops.ADD, dtypes.half, (relu_plus3, UOp(Ops.MUL, dtypes.half, (relu_minus3, c(-1.0)))))
++  expected = UOp(Ops.MUL, dtypes.half, (UOp(Ops.MUL, dtypes.half, (source, clipped)), c(1/6)))
++  return source if val is expected else None
++
+ def _try_round(val:UOp) -> UOp|None:
+   """Recognize tinygrad's exact round-to-nearest-even expansion and return its source INDEX."""
+   val = _unwrap(val)
+@@ -421,6 +452,8 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
+   input_scale, output_scale = 1.0, 1.0
+   if val.op is Ops.CUSTOM and val.arg == "rk_roundoff" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ROUNDOFF)
++  if (hardswish_source := _try_hardswish(val)) is not None:
++    return (hardswish_source.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_HARDSWISH)
+   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
+   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
+   if val.op is Ops.MUL:
+@@ -1315,6 +1348,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_HARDSWISH:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+   elif lut_op is _LUT_ROUNDOFF:
+     lut = [0 if i % 2 == 0 else 1 << 14 for i in range(_LUT_SIZE)] * 2
+     bn_mul_operand, minus_exp = 0, 0

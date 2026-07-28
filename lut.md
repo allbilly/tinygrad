@@ -360,6 +360,25 @@ The direct native SiLU experiment based on algorithm 15 is preserved in
 - restricting the table domain solely to make the test pass is not a sound
   replacement for the stable staged implementation.
 
+## Case study: rejected signed-Q14 HardSwish
+
+`rknnops.h` algorithm 51 uses the shared biased unsigned Q0.15 path, normalizes
+the table by the maximum absolute output, and selects a different output
+precision. It is not equivalent to loading signed values into the ordinary
+fp16 LUT emitter.
+
+An exact recognizer plus signed Q14 table over `[-2,2]` was measured as a
+single `dpu_lut` task. It failed 98/2925 official values, compared with 34/2925
+for the existing staged graph. Most additional failures were one Q14 count
+near zero, where strict relative tolerance and the nonzero-center workaround
+make the signed table unsuitable.
+
+The experiment is preserved in
+`rockchip-native-hardswish-wip-e44eb5ffd.patch`. Future work should port and
+measure the complete biased-Q0.15 pipeline, including output precision,
+debiasing, and restoration of the reference `max_abs` scale. Reusing only the
+reference function samples is insufficient.
+
 ## Case study: round-to-nearest-even
 
 `rknnops.h` algorithm 23 differs from the ordinary activation tables:

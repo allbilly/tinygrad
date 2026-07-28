@@ -1,5 +1,20 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — HardSwish algorithm 51 assessment
+
+- Confirmed tinygrad's exact HardSwish graph and tested a direct
+  `dpu_lut` implementation based on `rknnops.h` algorithm 51.
+- A signed Q14 adaptation over `[-2,2]` executed as one native LUT task, but
+  failed 98/2925 official values. The one-count zero workaround and LUT
+  interpolation dominate near zero; this is worse than the stable staged
+  baseline of 34/2925 mismatches.
+- Restored the staged implementation without source changes. The direct
+  recognizer, table builder, and emitter branch are preserved in the
+  apply-checkable `rockchip-native-hardswish-wip-e44eb5ffd.patch`.
+- The next viable HardSwish direction is the reference biased-Q0.15 data path
+  with its matching output-precision/debias semantics, not another signed-Q14
+  table.
+
 ## 2026-07-28 — staged SiLU/swish LUT accuracy milestone
 
 ### Reference assessment
