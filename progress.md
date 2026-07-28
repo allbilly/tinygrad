@@ -1,5 +1,25 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — arithmetic WHERE branches milestone
+
+### Implementation
+- WHERE lowering now materializes ADD/MUL/MAX/FDIV expressions used by branch
+  values and comparison operands.
+- The staged elementwise planner can embed a complete WHERE subgraph and then
+  continue with surrounding arithmetic.
+- Multiplication is distributed through WHERE before classification so
+  tinygrad's clamp and hard-activation decompositions reach the shared lowering.
+- Scratch-slot accounting excludes constant/zero sentinel relocations; counting
+  `0xFFFF` as a slot previously attempted tens of thousands of allocations.
+
+### Verification
+- `test_leaky_relu`, `test_relu6`, `test_hardsigmoid`, and `test_hardtanh` —
+  **PASS**.
+- `test_hardswish` now executes but retains 34/2925 fp16 tolerance mismatches.
+- The new activation group plus prior staged/WHERE tests and
+  `test/rockchip/test_hw.py` — **47 passed**.
+- `python -m mypy tinygrad/` and targeted Ruff — **PASS**.
+
 ## 2026-07-28 — staged elementwise and sigmoid LUT milestone
 
 ### Implementation

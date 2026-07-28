@@ -18,6 +18,14 @@ _pm_fdiv = PatternMatcher([
   (UPat(Ops.RECIPROCAL, src=(UPat.var("b"),), name="r") * UPat.var("a"), lambda a, b, r: UOp(Ops.FDIV, r.dtype, (a, b))),
 ])
 
+def _mul_where(w:UOp, x:UOp) -> UOp:
+  return UOp(Ops.WHERE, w.dtype, (w.src[0], UOp(Ops.MUL, w.dtype, (w.src[1], x)), UOp(Ops.MUL, w.dtype, (w.src[2], x))))
+
+_pm_where_mul = PatternMatcher([
+  (UPat(Ops.MUL, src=(UPat(Ops.WHERE, name="w"), UPat.var("x"))), _mul_where),
+  (UPat(Ops.MUL, src=(UPat.var("x"), UPat(Ops.WHERE, name="w"))), lambda x, w: _mul_where(w, x)),
+])
+
 # target ids for emit_raw (rkt_get_target(reg) + 1, from rkt_registers.h)
 # PC=0x80 is the value used by the working allbilly reference (autogen has 0x100, which is wrong for PC)
 _T_DPU, _T_DPU_RDMA, _T_CNA, _T_CORE, _T_PPU, _T_PPU_RDMA, _T_PC = 0x1001, 0x2001, 0x201, 0x801, 0x4001, 0x8001, 0x81
@@ -731,10 +739,15 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def lower_arg(u:UOp) -> tuple[int,int]|None:
     if (arg := _where_arg(u)) is not None: return arg
     u = _unwrap(u)
-    if u.op is not Ops.WHERE: return None
     if u not in materialized:
       materialized[u] = alloc()
-      if not lower(u, materialized[u], False): return None
+      if u.op is Ops.WHERE:
+        if not lower(u, materialized[u], False): return None
+      elif u.op in _DPU_EW_CFGS and len(u.src) == 2:
+        a, b = (lower_arg(x) for x in u.src)
+        if a is None or b is None: return None
+        tasks.append(_emit_where_stage(total, materialized[u], a, b, u.op))
+      else: return None
     return (materialized[u], 0)
 
   def lower(w:UOp, out_slot:int, final:bool) -> bool:
@@ -813,9 +826,12 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
 
-  def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
+  def make_stage_sink(stage_val:UOp, out_slot:int) -> tuple[UOp, UOp]:
     out_idx = temp_index(out_slot, stage_val.dtype)
-    stage_sink = sink.substitute({store:store.replace(src=(out_idx, stage_val))})
+    return sink.substitute({store:store.replace(src=(out_idx, stage_val))}), out_idx
+
+  def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
+    stage_sink, out_idx = make_stage_sink(stage_val, out_slot)
     plan = plan_rk(stage_sink)
     if isinstance(plan, str) or plan.kind not in ("dpu", "dpu_lut"): return None
     cmds, task, relocs = emit_rk(plan)
@@ -823,11 +839,21 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return out_idx
 
   def lower_arg(u:UOp) -> UOp|None:
+    nonlocal next_slot
     u = _unwrap(u)
     if u.op in (Ops.INDEX, Ops.CONST): return u
     if u not in materialized:
       slot = alloc()
-      if (idx := lower(u, slot)) is None: return None
+      if u.op is Ops.WHERE:
+        stage_sink, idx = make_stage_sink(u, slot)
+        if (where_tasks := _try_where_subtasks(stage_sink)) is None: return None
+        tasks.extend(where_tasks)
+        used_slots = [r.globals_slot for st in where_tasks for r in st.relocs
+                      if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+        next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+      else:
+        if (lowered := lower(u, slot)) is None: return None
+        idx = lowered
       materialized[u] = idx
     return materialized[u]
 
@@ -1458,6 +1484,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  sink = graph_rewrite(sink, _pm_where_mul, name="rk distribute where mul")
   if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
