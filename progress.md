@@ -1,5 +1,25 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — direct comparison output milestone
+
+### Implementation
+- Direct `CMPLT`/`CMPNE` boolean expressions now reuse the hardware comparison
+  stage, including logical NOT/OR composition and fp16-mask→bool packing.
+- Version-4 task metadata distinguishes bool output plus bool/int32 comparison
+  inputs. Runtime converts only the true source element count before optional
+  row-vector broadcast.
+- Comparison-only temporary buffers normalize `±inf` to fp16 finite endpoints,
+  avoiding `inf-inf` NaNs while preserving the tested ordering/equality matrix.
+- Dependent mask reads use the same duplicate warm-up workaround proven by
+  WHERE, preventing stale comparison lanes.
+
+### Verification
+- `test_cmp_eq`, `test_cmp_ge`, `test_cmp_gt`, `test_cmp_le`, and
+  `test_cmp_lt` — **PASS**, including float/int32/bool, broadcast, constants,
+  and `±inf`.
+- Full hardware/abs/WHERE/clip/uint8 regression — **47 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — stable abs lowering milestone
 
 ### Implementation

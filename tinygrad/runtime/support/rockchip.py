@@ -84,9 +84,12 @@ class RKTask:
   fp32_inputs: tuple[int, ...] = ()   # slot numbers that are fp32 (need fp32→fp16 conversion before NPU)
   fp32_output: bool = False           # output slot is fp32 (need fp16→fp32 conversion after NPU)
   bool_inputs: tuple[int, ...] = ()   # boolean mask slots converted to fp16 before multi-task execution
+  int32_inputs: tuple[int, ...] = ()  # int32 slots converted to fp16 before multi-task execution
   broadcast_inputs: tuple[int, ...] = () # scalar fp16 input slots expanded to the logical element count
+  comparison_inputs: tuple[int, ...] = () # fp16 slots whose infinities are normalized before comparison
   int32_output: bool = False          # multi-task output converted from fp16 to int32
   uint8_output: bool = False          # multi-task output converted from fp16 to uint8
+  bool_output: bool = False           # multi-task output converted from fp16 mask to bool
 
 @dataclass(frozen=True)
 class RKSubTask:
@@ -675,8 +678,8 @@ def _where_arg(u: UOp) -> tuple[int, int]|None:
   return None
 
 def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
-                      bool_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
-                      uint8_output=False) -> RKSubTask:
+                      bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
+                      uint8_output=False, bool_output=False, comparison_inputs:tuple[int,...]=()) -> RKSubTask:
   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
   cmds:list[RKCmd] = []
   relocs:list[RKReloc] = []
@@ -720,8 +723,9 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
     emitter_reloc(cmds, relocs, arg[0], arg[1])
   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
   emitter_pc_op_en(cmds, 12)
-  task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs,
-                broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output)
+  task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs, int32_inputs=int32_inputs,
+                broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
+                bool_output=bool_output, comparison_inputs=comparison_inputs)
   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
@@ -738,6 +742,77 @@ def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
   return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL),
           _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX))
+
+def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Materialize CMPLT/CMPNE boolean expressions as fp16 0/1 masks, then pack to bool."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.bool: return None
+  val, info = _unwrap(store.src[1]), ProgramInfo.from_sink(sink)
+  if val.op not in (Ops.CMPLT, Ops.CMPNE, Ops.OR, Ops.AND): return None
+  total, out_slot, next_slot = prod(_shape_of_store(sink)), info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def dependent(out:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, bool_output=False) -> None:
+    # The first DPU task consuming a freshly materialized comparison mask can
+    # observe stale lanes. Repeat the identical read, as in the proven WHERE path.
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out, lhs, rhs, op, bool_output=bool_output))
+
+  def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
+    u = _unwrap(u)
+    if (arg := _where_arg(u)) is None: return None
+    if u.op is Ops.CONST: return arg, (), (), ()
+    slot, source_n = arg[0], int(u.src[0].src[0].arg)
+    return arg, ((slot,) if u.dtype is dtypes.bool else ()), \
+      ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ())
+
+  def lower(u:UOp) -> tuple[int,int]|None:
+    u = _unwrap(u)
+    if u.op is Ops.CMPLT:
+      lhs_info, rhs_info = (data_arg(x) for x in u.src)
+      if lhs_info is None or rhs_info is None: return None
+      lhs, rhs = lhs_info[0], rhs_info[0]
+      bool_inputs, int32_inputs, broadcasts = (tuple(dict.fromkeys(lhs_info[i] + rhs_info[i])) for i in range(1, 4))
+      comparison_inputs = tuple(dict.fromkeys(x[0] for x in (lhs, rhs) if x[0] not in (_CONST_SLOT, _ZERO_SLOT)))
+      diff, mask = alloc(), alloc()
+      tasks.extend((_emit_where_stage(total, diff, rhs, lhs, Ops.SUB, bool_inputs=bool_inputs,
+                                      int32_inputs=int32_inputs, broadcast_inputs=broadcasts,
+                                      comparison_inputs=comparison_inputs),
+                    _emit_where_stage(total, mask, (diff, 0), (diff, 0), Ops.MAX, compare=True)))
+      return (mask, 0)
+    if u.op is Ops.CMPNE:
+      # tinygrad represents logical NOT(x) as CMPNE(x, True).
+      for logical, const in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
+        if const.op is Ops.CONST and const.dtype is dtypes.bool and bool(const.arg):
+          if (arg := lower(logical)) is None: return None
+          result = alloc()
+          dependent(result, one, arg, Ops.SUB)
+          return (result, 0)
+      lhs_data, rhs_data = (data_arg(x) for x in u.src)
+      if lhs_data is None or rhs_data is None: return None
+      lt, gt = lower(UOp(Ops.CMPLT, dtypes.bool, (u.src[0], u.src[1]))), \
+               lower(UOp(Ops.CMPLT, dtypes.bool, (u.src[1], u.src[0])))
+      if lt is None or gt is None: return None
+      result = alloc()
+      dependent(result, lt, gt, Ops.MAX)
+      return (result, 0)
+    if u.op in (Ops.OR, Ops.AND):
+      lhs_mask, rhs_mask = (lower(x) for x in u.src)
+      if lhs_mask is None or rhs_mask is None: return None
+      result = alloc()
+      dependent(result, lhs_mask, rhs_mask, Ops.MAX if u.op is Ops.OR else Ops.MUL)
+      return (result, 0)
+    return None
+
+  if (result := lower(val)) is None: return None
+  dependent(out_slot, result, (_ZERO_SLOT, 0), Ops.ADD, bool_output=True)
+  return tuple(tasks)
 
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
@@ -1449,8 +1524,10 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   fp32_mask = (1 << 7 if task.fp32_output else 0) | sum(1 << s for s in task.fp32_inputs if s < 7)
   fp32_bytes = struct.pack("<B", fp32_mask)
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
-  dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | sum(1 << (8+s) for s in task.bool_inputs if s < 16)
-  input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16)
+  dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | \
+    sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
+  input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16) | \
+    sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
   task_header = struct.pack("<IIIIIIIIi", n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout,
                             task.out_slot, input_flags, dtype_flags)
   return task_header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes + fp32_bytes
@@ -1480,11 +1557,15 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
   fp32_output = bool(fp32_mask & (1 << 7))
   fp32_inputs = tuple(s for s in range(7) if fp32_mask & (1 << s))
   bool_inputs = tuple(s for s in range(16) if dtype_flags & (1 << (8+s)))
+  int32_inputs = tuple(s for s in range(7) if dtype_flags & (1 << (24+s)))
   broadcast_inputs = tuple(s for s in range(16) if input_flags & (1 << s))
+  comparison_inputs = tuple(s for s in range(16) if input_flags & (1 << (16+s)))
   return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill,
                       const_val=const_val, fp32_inputs=fp32_inputs, fp32_output=fp32_output,
-                      bool_inputs=bool_inputs, broadcast_inputs=broadcast_inputs,
-                      int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2)), relocs, off
+                      bool_inputs=bool_inputs, int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
+                      comparison_inputs=comparison_inputs,
+                      int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
+                      bool_output=bool(dtype_flags & 4)), relocs, off
 
 def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
   """Pack multiple tasks into one image (version 4 = PC chain).
@@ -1515,6 +1596,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):

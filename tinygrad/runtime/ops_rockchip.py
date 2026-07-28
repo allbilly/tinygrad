@@ -66,6 +66,22 @@ def _convert_fp16_to_uint8_buf(src, dst, n):
   arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.uint8)
   ctypes.memmove(dst, arr.ctypes.data, n)  # type: ignore[arg-type]
 
+def _convert_fp16_to_bool_buf(src, dst, n):
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.bool_)
+  ctypes.memmove(dst, arr.ctypes.data, n)  # type: ignore[arg-type]
+
+def _convert_int32_to_fp16_buf(src, dst, n):
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.int32).astype(np.float16)
+  ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
+def _sanitize_fp16_comparison_buf(src, dst, n):
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).copy()
+  np.nan_to_num(arr, copy=False, nan=float("nan"), posinf=65504.0, neginf=-65504.0)
+  ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
 def _unpack_cmac_out(src, dst, M, N, align_out):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   for i in range(M * N):
@@ -305,24 +321,38 @@ class RockchipProgram(Program['RockchipDevice']):
     while len(prepared) <= max_slot:
       temp.append(scratch := dev._gpu_alloc(max(total * 2, 4096), 0))
       prepared.append(scratch)
-    for slot in {s for st in subtasks for s in st.task.bool_inputs}:
-      converted = dev._gpu_alloc(max(total * 2, 4096), 0)
+    source_counts:dict[int, int] = {}
+    for slot in {s for st in subtasks for s in st.task.int32_inputs}:
+      source_counts[slot] = source_n = prepared[slot].size // 4
+      converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
       temp.append(converted)
-      _convert_bool_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, total)
+      _convert_int32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
       prepared[slot] = converted
+    for slot in {s for st in subtasks for s in st.task.bool_inputs}:
+      source_counts[slot] = source_n = prepared[slot].size
+      converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+      temp.append(converted)
+      _convert_bool_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+      prepared[slot] = converted
+    for slot in {s for st in subtasks for s in st.task.comparison_inputs}:
+      source_counts[slot] = source_n = source_counts.get(slot, prepared[slot].size // 2)
+      sanitized = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+      temp.append(sanitized)
+      _sanitize_fp16_comparison_buf(prepared[slot].va_addr, sanitized.va_addr, source_n)
+      prepared[slot] = sanitized
     for slot in {s for st in subtasks for s in st.task.broadcast_inputs}:
       converted = dev._gpu_alloc(max(total * 2, 4096), 0)
       temp.append(converted)
-      _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, prepared[slot].size // 2, total)
+      _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_counts.get(slot, prepared[slot].size // 2), total)
       prepared[slot] = converted
-    integer_output = next(((st.task.out_slot, st.task.uint8_output) for st in subtasks
-                           if st.task.int32_output or st.task.uint8_output), None)
+    integer_output = next(((st.task.out_slot, st.task.uint8_output, st.task.bool_output) for st in subtasks
+                           if st.task.int32_output or st.task.uint8_output or st.task.bool_output), None)
     integer_output_conversion = None
     if integer_output is not None:
-      output_slot, is_uint8 = integer_output
+      output_slot, is_uint8, is_bool = integer_output
       converted = dev._gpu_alloc(max(total * 2, 4096), 0)
       temp.append(converted)
-      integer_output_conversion = (prepared[output_slot], converted, total, is_uint8)
+      integer_output_conversion = (prepared[output_slot], converted, total, is_uint8, is_bool)
       prepared[output_slot] = converted
     bufs = tuple(prepared)
     try:
@@ -433,8 +463,9 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0))))
       if integer_output_conversion is not None:
-        original_out, converted, n, is_uint8 = integer_output_conversion
-        if is_uint8: _convert_fp16_to_uint8_buf(converted.va_addr, original_out.va_addr, n)
+        original_out, converted, n, is_uint8, is_bool = integer_output_conversion
+        if is_bool: _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, n)
+        elif is_uint8: _convert_fp16_to_uint8_buf(converted.va_addr, original_out.va_addr, n)
         else: _convert_fp16_to_int32_buf(converted.va_addr, original_out.va_addr, n)
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: PC chain {n_tasks} tasks")
     finally:
