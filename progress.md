@@ -1,25 +1,60 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — two-LUT CELU forward milestone
+
+### Implementation
+
+- The backend recognizes
+  `max(x,0) + min(alpha*(exp(x/alpha)-1),0)` for TestOps alphas 1–4.
+- LUT task 1 covers the negative branch on `[-2,0]` in Q14. Q15 was rejected:
+  for alpha greater than one, valid CELU outputs fall below `-1` and saturate
+  the signed table. Over the tested domain and alpha range the most negative
+  value is about `-1.574`, so Q14 fits while retaining enough broad precision.
+- LUT task 2 handles the strict relative-tolerance region `[-0.125,0]`. It
+  receives `x*16`, emits `CELU(x)*8` in Q15, and an exact `0.125` DPU multiply
+  restores the result.
+- NPU comparison masks select the existing expression below the table domain,
+  the Q14 broad table, the Q15 local table, or positive passthrough. Exact zero
+  remains zero because no branch mask selects it.
+- Zero-valued LUT entries use the established one-count workaround; interval
+  masks remove that bias at zero.
+
+### Verification
+
+- `TestOps.test_celu` — **PASS** for tensor and scalar inputs at every alpha
+  from 1 through 4 with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Focused hardware coverage includes the `-2` broad endpoint, Q14 values below
+  `-1`, both sides of the `-0.125` local boundary, near-zero values, signed
+  zero, and positive passthrough for every alpha.
+- All **61** Rockchip hardware methods — **PASS** in isolated sequential
+  subprocesses.
+- `python -m mypy tinygrad/`, Ruff on changed source/test files, and
+  `git diff --check` — **PASS**.
+- `lut.md` records the output-range-first Q-scale rule and the CELU two-table
+  measurements.
+- Incremental census: **143 PASS, 273 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — urgent durable handoff and debugging playbook
 
 This section is the restart point if the current Codex session ends. It records
 the exact repository state, test contract, hardware-debugging methods, and
-uncommitted experiment before any more implementation work.
+recent CELU investigation before any more implementation work.
 
 ### Repository and test state
 
 - Branch: `rockchip-2607`.
 - Last verified milestone commit: `f409ec1f6` (`rockchip: saturate extreme
   quick gelu`).
-- Last complete TestOps census:
-  **142 PASS, 274 FAIL, 8 SKIP** out of 424 methods.
+- Current TestOps census:
+  **143 PASS, 273 FAIL, 8 SKIP** out of 424 methods.
 - Test contract: forward only, fp16 default:
   `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
 - Gradients are deliberately out of scope. Note that
   `test_sigmoid_extreme` contains explicit gradient assertions which ignore
   `FORWARD_ONLY=1`; count that method as PARTIAL even though both forward
   ranges pass.
-- All 60 tests in `test/rockchip/test_hw.py` passed at `f409ec1f6` when each
+- All 61 tests in `test/rockchip/test_hw.py` passed for the CELU milestone when each
   method was launched in its own sequential pytest subprocess.
 - The full hardware census and pass list are in `test_ops_status.md`.
 - Detailed LUT math, table formats, tuning rules, and known hardware behavior
@@ -39,18 +74,17 @@ CELU source was backed up before modification as:
 - `/tmp/rockchip.py.before-celu-lut-20260728-162433`
 - `/tmp/test_hw.py.before-celu-lut-20260728-162433`
 
-### Current uncommitted CELU two-LUT experiment
+### CELU two-LUT investigation record
 
-`tinygrad/runtime/support/rockchip.py` contains an intentionally uncommitted
-CELU experiment, preserved independently as
-`rockchip-celu-two-lut-wip-f409ec1f6.patch`. Apply it only to commit
-`f409ec1f6`, or inspect it as a design reference.
+The initial CELU experiment is preserved independently as
+`rockchip-celu-two-lut-wip-f409ec1f6.patch`. It is useful as a design and
+failure reference, but the completed implementation is in the milestone above.
 
-The experiment:
+The final design:
 
 1. Recognizes
    `max(x,0) + min(alpha*(exp(x/alpha)-1),0)` for TestOps alphas 1–4.
-2. Uses a broad Q15 LUT for the negative branch on `[-2,0]`.
+2. Uses a broad Q14 LUT for the negative branch on `[-2,0]`.
 3. Uses a second local Q15 LUT on `[-0.125,0]`: the input is multiplied by 16,
    the table emits `CELU(x)*8`, and an NPU stage multiplies by `0.125`.
 4. Selects broad/local/positive/fallback branches with NPU comparison masks.
@@ -60,21 +94,18 @@ Measured results:
 - The first broad-only version reduced `test_celu` from 148/2925 mismatches to
   17/2925, all clustered within one Q15 count near zero.
 - The local second LUT removes that near-zero failure band.
-- The latest full method still **FAILS: 450/2925 mismatches**. The first alpha
-  iteration that needs a tail below `-1` exposes the problem: the `x < -2`
-  fallback is the existing staged CELU expression, whose EXP path clips the
-  tail at `-1`. Examples are actual `-1.0` versus expected `-1.1523`,
-  `-1.1240`, and `-1.2334`; maximum absolute error is `0.2646`.
-- Therefore this is not a completed milestone and must not be added to the
-  142-pass census.
-
-Best next CELU step: do not use the existing expression as the wide-negative
-fallback. Extend the broad LUT/range strategy for each alpha, or add an
-alpha-aware asymptotic branch. CELU tends to `-alpha`, not `-1`; any tail
-threshold must be selected from
-`alpha*exp(x/alpha)` against `rtol=1e-3, atol=1e-6`. Probe every alpha 1, 2, 3,
-and 4 independently before running the whole method. Keep the local second LUT:
-it already addresses the strict near-zero relative tolerance.
+- The first combined version still had 450/2925 mismatches. Although it looked
+  like a negative-tail failure, TestOps samples only `[-2,2]`; the `x < -2`
+  fallback was never selected. The actual cause was Q15 signed saturation:
+  alpha-aware CELU values such as `-1.1523`, `-1.1240`, and `-1.2334` all
+  became `-1.0`.
+- Q13 removed saturation but left one mismatch at input `-0.1254`, one Q13
+  count beyond tolerance. Q14 is the correct broad compromise: it covers the
+  full `[-1.574,0]` output range and its one-count error passes there.
+- Widening the local transform from 16 to 15.75 was tested and rejected: it
+  created 81/2925 failures. The proven `x*16`, output-times-8 path was restored.
+- The final Q14 broad plus Q15 local design passes all four alpha iterations
+  and scalar subcases.
 
 ### Exact commands
 
@@ -97,7 +128,7 @@ Run one focused Rockchip hardware method:
 
 ```sh
 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
-  python -m pytest test/rockchip/test_hw.py::TestRockchipHW::METHOD \
+  python -m pytest test/rockchip/test_hw.py::CLASS::METHOD \
   -q -x -p test.rockchip.conftest_rockchip
 ```
 
@@ -109,27 +140,23 @@ for CPU-only tests. Hardware regression methods must be isolated and serial:
 ```sh
 . .venv/bin/activate
 python - <<'PY'
-import subprocess
-from pathlib import Path
-import re
+import os, subprocess, sys
 
-src = Path("test/rockchip/test_hw.py").read_text()
-methods = re.findall(r"^  def (test_[A-Za-z0-9_]+)\(", src, re.M)
+env = {**os.environ, "DEV": "ROCKCHIP", "DEFAULT_FLOAT": "HALF", "FORWARD_ONLY": "1"}
+collect = subprocess.run(
+  [sys.executable, "-m", "pytest", "test/rockchip/test_hw.py", "--collect-only",
+   "-q", "-p", "test.rockchip.conftest_rockchip"],
+  env=env, text=True, capture_output=True, check=True,
+)
+nodes = [x for x in collect.stdout.splitlines()
+         if x.startswith("test/rockchip/test_hw.py::")]
 failed = []
-for method in methods:
-  cmd = [
-    "python", "-m", "pytest",
-    f"test/rockchip/test_hw.py::TestRockchipHW::{method}",
-    "-q", "-x", "-p", "test.rockchip.conftest_rockchip",
-  ]
-  env = {
-    **__import__("os").environ,
-    "DEV": "ROCKCHIP",
-    "DEFAULT_FLOAT": "HALF",
-    "FORWARD_ONLY": "1",
-  }
-  ret = subprocess.run(cmd, env=env)
-  if ret.returncode: failed.append(method)
+for node in nodes:
+  ret = subprocess.run(
+    [sys.executable, "-m", "pytest", node, "-q", "-x",
+     "-p", "test.rockchip.conftest_rockchip"], env=env,
+  )
+  if ret.returncode: failed.append(node)
 print("FAILED:", failed)
 raise SystemExit(bool(failed))
 PY
@@ -434,21 +461,19 @@ verified milestone.
 
 ### Remaining forward-only work, in practical order
 
-1. CELU: current two-LUT WIP needs an alpha-aware negative tail; it is the
-   active low-hanging candidate.
-2. Ordinary QuickGELU: 120/2925 interior rounding mismatches remain; extreme
+1. Ordinary QuickGELU: 120/2925 interior rounding mismatches remain; extreme
    QuickGELU already passes.
-3. Ordinary tanh: 907/2925 interior precision mismatches remain; extreme tanh
+2. Ordinary tanh: 907/2925 interior precision mismatches remain; extreme tanh
    already passes.
-4. LOG2: positive finite broad-range precision still needs normalization
+3. LOG2: positive finite broad-range precision still needs normalization
    (power-of-four range reduction was the promising direction).
-5. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
+4. LogSigmoid: current output is broadly NaN; inspect its rewritten graph and
    staged LOG2/EXP2 interaction before tuning a LUT.
-6. Softplus and Mish: supported paths are numerically inaccurate and likely
+5. Softplus and Mish: supported paths are numerically inaccurate and likely
    depend on improved LOG/EXP range handling.
-7. ELU and SELU: still unsupported composite activation graphs.
-8. Boolean reductions and remaining integer/bool dtype groups.
-9. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
+6. ELU and SELU: still unsupported composite activation graphs.
+7. Boolean reductions and remaining integer/bool dtype groups.
+8. Remaining WHERE-in-reduction, broadcast/layout, fused epilogue, CBUF, and
    convolution groups. These are larger architectural milestones, not LUT
    quick wins.
 

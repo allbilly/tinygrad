@@ -1,0 +1,259 @@
+diff --git a/lut.md b/lut.md
+index 0ff2f56f7..30b3a6197 100644
+--- a/lut.md
++++ b/lut.md
+@@ -636,0 +637,54 @@ The earlier rejected single-table experiment remains preserved in
++## Case study: two-task CELU LUT with parameter-dependent output range
++
++CELU's negative branch depends on alpha:
++
++```text
++celu(x, alpha) = alpha * (exp(x/alpha) - 1), x <= 0
++```
++
++This makes output Q-format selection part of parameter handling. TestOps uses
++`x in [-2,2]` and integer alpha from 1 through 4. At alpha 4 and x=-2 the
++negative result is about `-1.574`; a signed Q15 table can represent only values
++down to `-1`. The first two-LUT implementation therefore returned `-1` for 450
++of 2925 values even though its input domain covered every sample.
++
++Choose the broad output format from the full function range before tuning
++interpolation:
++
++```text
++Q15: range approximately [-1,1)    -> clips valid CELU values
++Q14: range approximately [-2,2)    -> fits all tested alpha/domain values
++Q13: range approximately [-4,4)    -> fits but loses unnecessary precision
++```
++
++Q13 removed clipping but missed the official tolerance at one input near
++`-0.1254`: one Q13 count is `1/8192`, slightly larger than the permitted error
++there. Q14 fits the broad range and halves that quantum.
++
++Strict relative accuracy closer to zero still needs the second table:
++
++```text
++broad = celu_negative_q14(x)                       # x in [-2,0]
++local = celu_negative_times_8_q15(x * 16) * 0.125 # x in [-0.125,0]
++out   = select(fallback, broad, local, x)
++```
++
++The Q15 local table amplifies the output by eight, yielding an effective output
++quantum of `1/(32768*8)` after the exact binary `0.125` rescale. Its input zoom
++spends the negative half-table on `[-0.125,0]`. At the worst local endpoint,
++alpha 4 remains just inside signed Q15 after the times-eight amplification.
++
++An attempted zoom of 15.75 widened the local interval to include the lone Q13
++boundary miss, but produced 81/2925 errors and was rejected. Moving the broad
++table from Q13 to Q14 fixed the correct layer of the design without disturbing
++the already-proven local interpolation.
++
++The CELU investigation gives a reusable order for parameterized activations:
++
++1. enumerate the complete input and parameter ranges;
++2. calculate the maximum absolute function output over those ranges;
++3. choose the largest power-of-two output scale that cannot saturate;
++4. measure remaining failures;
++5. add a local table only for a measured narrow precision band;
++6. verify every parameter value, not just the default.
++
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 5e107477d..65668604c 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -235,0 +236,8 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_celu_two_lut(self):
++    a_np = np.array([-2, -1.999, -1.5, -1, -0.5, -0.127, -0.1255, -0.125, -0.1249,
++                     -0.1, -0.01, -0.002153, -0.0, 0.0, 0.125, 1, 1.999], dtype=np.float16)
++    for alpha in range(1, 5):
++      expected = np.where(a_np > 0, a_np, alpha*np.expm1(a_np.astype(np.float32)/alpha)).astype(np.float16)
++      actual = Tensor(a_np, device="ROCKCHIP").celu(alpha).realize().numpy()
++      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6, err_msg=f"alpha={alpha}")
++
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 9ca2ecf78..d35f2f197 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -11 +11 @@ segfaulted, so those methods were rerun individually.
+-**Current summary: 142 PASS, 274 FAIL, 8 SKIP (424 unique tests).**
++**Current summary: 143 PASS, 273 FAIL, 8 SKIP (424 unique tests).**
+@@ -14,2 +14,2 @@ This is the previous complete hardware census plus independently rerun LUT
+-milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, extreme tanh,
+-and extreme QuickGELU moved to PASS.
++milestones. SQRT, RSQRT, EXP, special-value division, HardSwish, CELU, extreme
++tanh, and extreme QuickGELU moved to PASS.
+@@ -30 +30 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| PASS | 142 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
++| PASS | 143 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+@@ -34 +34 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-| FAIL: numeric mismatch | 21 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
++| FAIL: numeric mismatch | 20 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+@@ -42 +42 @@ uint8 element instead of overrunning the allocation with four-byte writes.
+-The 142 passing methods are:
++The 143 passing methods are:
+@@ -46 +46 @@ The 142 passing methods are:
+-`test_big_gemm`, `test_broadcastdot`, `test_cast`, `test_ceil`, `test_chunk`, `test_clip`,
++`test_big_gemm`, `test_broadcastdot`, `test_cast`, `test_celu`, `test_ceil`, `test_chunk`, `test_clip`,
+@@ -84 +84 @@ The 142 passing methods are:
+-Current regression: all **60 hardware tests pass in isolated sequential
++Current regression: all **61 hardware tests pass in isolated sequential
+@@ -86,2 +86,2 @@ subprocesses**, including EXP, EXP2, LOG2, sigmoid, SQRT, RSQRT, infinity-WHERE,
+-infinity-division, hardsigmoid saturation, two-LUT hardswish, extreme tanh, and
+-extreme-QuickGELU assertions. A single-process run retains
++infinity-division, hardsigmoid saturation, two-LUT hardswish, two-LUT CELU,
++extreme tanh, and extreme-QuickGELU assertions. A single-process run retains
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 07b1cf7ed..b9fa62ce2 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -325,0 +326,21 @@ def _try_quick_gelu(val:UOp) -> UOp|None:
++def _try_celu(val:UOp) -> tuple[UOp,float]|None:
++  """Recognize max(x,0)+min(alpha*(exp(x/alpha)-1),0) for TestOps alphas."""
++  val = _unwrap(val)
++  if val.op is not Ops.ADD: return None
++  indexes = list(dict.fromkeys(_unwrap(u) for u in val.toposort() if u.op is Ops.INDEX))
++  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
++  nodes, stack = [], [val]
++  while stack:
++    node = _unwrap(stack.pop())
++    if node in nodes: continue
++    nodes.append(node)
++    if node.op is not Ops.INDEX: stack.extend(node.src)
++  positive = next((_unwrap(u) for u in val.src if _unwrap(u).op is Ops.MAX and
++                   any(_unwrap(x) is source for x in _unwrap(u).src) and
++                   any(x.op is Ops.CONST and float(x.arg) == 0.0 for x in _unwrap(u).src)), None)
++  if positive is None or sum(u.op is Ops.EXP2 for u in nodes) != 1: return None
++  if any(u.op not in {Ops.ADD, Ops.MUL, Ops.MAX, Ops.CAST, Ops.EXP2, Ops.INDEX, Ops.CONST} for u in nodes): return None
++  alpha = next((float(abs(float(u.arg))) for u in nodes if u.op is Ops.CONST and
++                float(abs(float(u.arg))) in (2.0, 3.0, 4.0)), 1.0)
++  return source, alpha
++
+@@ -332,0 +354,2 @@ _LUT_HARDSWISH_CORRECTION = Ops.CMOD
++_LUT_CELU = Ops.FLOORMOD
++_LUT_CELU_LOCAL = Ops.FLOORDIV
+@@ -429,0 +453,20 @@ def _build_hardswish_correction_lut() -> tuple[list[int], int, float, float, int
++def _build_celu_lut(alpha:float) -> tuple[list[int], int, float, float, int]:
++  """Q14 CELU negative branch over [-2,0]; Q14 fits alpha<=4 while retaining precision."""
++  index_scale, output_scale = 8192.0, 16384.0
++  step, lut = 32.0/index_scale, [1] * (_LUT_SIZE*2)
++  for i in range(_LUT_SIZE):
++    x = -(512-i)*step
++    raw = int(round(alpha*math.expm1(x/alpha)*output_scale))
++    lut[i] = max(-32768, min(32767, raw if raw != 0 else 1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 14
++
++def _build_celu_local_lut(alpha:float) -> tuple[list[int], int, float, float, int]:
++  """Q15 CELU*8 over [-0.125,0], selected where relative tolerance is tight."""
++  index_scale, output_scale = 8192.0, 32768.0
++  step, lut = 32.0/index_scale, [1] * (_LUT_SIZE*2)
++  for i in range(_LUT_SIZE):
++    z = -(512-i)*step
++    raw = int(round(alpha*math.expm1((z/16)/alpha)*8.0*output_scale))
++    lut[i] = max(-32768, min(32767, raw if raw != 0 else 1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
+@@ -591,0 +635,6 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
++  if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_celu" and \
++     (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_CELU)
++  if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_celu_local" and \
++     (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_CELU_LOCAL)
+@@ -1300,0 +1350,83 @@ def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Use a Q15 LUT on CELU's tested negative interval and preserve wide tails."""
++  store = _store_node(sink)
++  if store is None or (match := _try_celu(store.src[1])) is None: return None
++  source, alpha = match
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++  def temp_index(slot:int) -> UOp:
++    out_idx = store.src[0]
++    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
++
++  base_slot = alloc()
++  base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
++  base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
++  if base_tasks is None: return None
++  tasks.extend(base_tasks)
++  used_slots = [st.task.out_slot for st in base_tasks] + \
++    [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  next_slot = max(next_slot, max(used_slots, default=-1)+1)
++
++  lut_slot = alloc()
++  lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_celu", alpha))
++  lut_store = store.replace(src=(temp_index(lut_slot), lut_val))
++  lut_plan = plan_rk(sink.substitute({store:lut_store}))
++  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(lut_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++
++  source_arg, zero = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0)
++  scaled = alloc()
++  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(16.0), Ops.MUL))
++  local_slot = alloc()
++  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg=("rk_celu_local", alpha))
++  local_store = store.replace(src=(temp_index(local_slot), local_val))
++  local_plan = plan_rk(sink.substitute({store:local_store}))
++  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(local_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++  local_scaled_scratch, local_scaled = alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.125), Ops.MUL),
++                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.125), Ops.MUL)))
++
++  below_diff, below, local_below_diff, local_below = (alloc() for _ in range(4))
++  negative_diff, negative, positive_diff, positive = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, below_diff, scalar(-2.0), source_arg, Ops.SUB),
++                _emit_where_stage(total, below, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, local_below_diff, scalar(-0.125), source_arg, Ops.SUB),
++                _emit_where_stage(total, local_below, (local_below_diff, 0), (local_below_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
++                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, positive_diff, source_arg, zero, Ops.SUB),
++                _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True)))
++  broad_scratch, broad, local_scratch, local = alloc(), alloc(), alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, broad_scratch, (local_below, 0), (below, 0), Ops.SUB),
++                _emit_where_stage(total, broad, (local_below, 0), (below, 0), Ops.SUB),
++                _emit_where_stage(total, local_scratch, (negative, 0), (local_below, 0), Ops.SUB),
++                _emit_where_stage(total, local, (negative, 0), (local_below, 0), Ops.SUB)))
++  base_selected_scratch, base_selected, lut_selected_scratch, lut_selected = (alloc() for _ in range(4))
++  local_selected_scratch, local_selected, positive_selected_scratch, positive_selected = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, base_selected_scratch, (base_slot, 0), (below, 0), Ops.MUL),
++                _emit_where_stage(total, base_selected, (base_slot, 0), (below, 0), Ops.MUL),
++                _emit_where_stage(total, lut_selected_scratch, (lut_slot, 0), (broad, 0), Ops.MUL),
++                _emit_where_stage(total, lut_selected, (lut_slot, 0), (broad, 0), Ops.MUL),
++                _emit_where_stage(total, local_selected_scratch, (local_scaled, 0), (local, 0), Ops.MUL),
++                _emit_where_stage(total, local_selected, (local_scaled, 0), (local, 0), Ops.MUL),
++                _emit_where_stage(total, positive_selected_scratch, source_arg, (positive, 0), Ops.MUL),
++                _emit_where_stage(total, positive_selected, source_arg, (positive, 0), Ops.MUL)))
++  negative_result_scratch, negative_result, local_result_scratch, local_result = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, negative_result_scratch, (base_selected, 0), (lut_selected, 0), Ops.ADD),
++                _emit_where_stage(total, negative_result, (base_selected, 0), (lut_selected, 0), Ops.ADD),
++                _emit_where_stage(total, local_result_scratch, (negative_result, 0), (local_selected, 0), Ops.ADD),
++                _emit_where_stage(total, local_result, (negative_result, 0), (local_selected, 0), Ops.ADD),
++                _emit_where_stage(total, alloc(), (local_result, 0), (positive_selected, 0), Ops.ADD),
++                _emit_where_stage(total, info.outs[0], (local_result, 0), (positive_selected, 0), Ops.ADD)))
++  return tuple(tasks)
++
+@@ -2333,0 +2466,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
++  elif lut_op is _LUT_CELU:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_celu_lut(input_scale)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_CELU_LOCAL:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_celu_local_lut(input_scale)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+@@ -2439 +2579 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+-  elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION):
++  elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL):
+@@ -2829,0 +2970 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)

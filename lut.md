@@ -634,6 +634,60 @@ a small relative-error interval:
 The earlier rejected single-table experiment remains preserved in
 `rockchip-native-hardswish-wip-e44eb5ffd.patch` for comparison.
 
+## Case study: two-task CELU LUT with parameter-dependent output range
+
+CELU's negative branch depends on alpha:
+
+```text
+celu(x, alpha) = alpha * (exp(x/alpha) - 1), x <= 0
+```
+
+This makes output Q-format selection part of parameter handling. TestOps uses
+`x in [-2,2]` and integer alpha from 1 through 4. At alpha 4 and x=-2 the
+negative result is about `-1.574`; a signed Q15 table can represent only values
+down to `-1`. The first two-LUT implementation therefore returned `-1` for 450
+of 2925 values even though its input domain covered every sample.
+
+Choose the broad output format from the full function range before tuning
+interpolation:
+
+```text
+Q15: range approximately [-1,1)    -> clips valid CELU values
+Q14: range approximately [-2,2)    -> fits all tested alpha/domain values
+Q13: range approximately [-4,4)    -> fits but loses unnecessary precision
+```
+
+Q13 removed clipping but missed the official tolerance at one input near
+`-0.1254`: one Q13 count is `1/8192`, slightly larger than the permitted error
+there. Q14 fits the broad range and halves that quantum.
+
+Strict relative accuracy closer to zero still needs the second table:
+
+```text
+broad = celu_negative_q14(x)                       # x in [-2,0]
+local = celu_negative_times_8_q15(x * 16) * 0.125 # x in [-0.125,0]
+out   = select(fallback, broad, local, x)
+```
+
+The Q15 local table amplifies the output by eight, yielding an effective output
+quantum of `1/(32768*8)` after the exact binary `0.125` rescale. Its input zoom
+spends the negative half-table on `[-0.125,0]`. At the worst local endpoint,
+alpha 4 remains just inside signed Q15 after the times-eight amplification.
+
+An attempted zoom of 15.75 widened the local interval to include the lone Q13
+boundary miss, but produced 81/2925 errors and was rejected. Moving the broad
+table from Q13 to Q14 fixed the correct layer of the design without disturbing
+the already-proven local interpolation.
+
+The CELU investigation gives a reusable order for parameterized activations:
+
+1. enumerate the complete input and parameter ranges;
+2. calculate the maximum absolute function output over those ranges;
+3. choose the largest power-of-two output scale that cannot saturate;
+4. measure remaining failures;
+5. add a local table only for a measured narrow precision band;
+6. verify every parameter value, not just the default.
+
 ## Case study: round-to-nearest-even
 
 `rknnops.h` algorithm 23 differs from the ordinary activation tables:

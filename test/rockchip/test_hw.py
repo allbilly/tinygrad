@@ -233,6 +233,14 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").quick_gelu().realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_celu_two_lut(self):
+    a_np = np.array([-2, -1.999, -1.5, -1, -0.5, -0.127, -0.1255, -0.125, -0.1249,
+                     -0.1, -0.01, -0.002153, -0.0, 0.0, 0.125, 1, 1.999], dtype=np.float16)
+    for alpha in range(1, 5):
+      expected = np.where(a_np > 0, a_np, alpha*np.expm1(a_np.astype(np.float32)/alpha)).astype(np.float16)
+      actual = Tensor(a_np, device="ROCKCHIP").celu(alpha).realize().numpy()
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6, err_msg=f"alpha={alpha}")
+
   def test_dpu_direct_casts(self):
     half_np = np.array([-2.5,0,1.75,255], dtype=np.float16)
     half = Tensor(half_np, device="ROCKCHIP").realize()
