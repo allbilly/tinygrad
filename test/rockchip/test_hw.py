@@ -206,6 +206,21 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").mish().realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_elu_selu_two_lut(self):
+    # Positive infinity remains tracked separately: the final DPU ADD turns
+    # an otherwise-correct infinity lane into NaN.
+    a_np = np.concatenate((np.linspace(-8, 8, 2049, dtype=np.float16),
+                           np.array([-np.inf, np.nan, -0.0, 0.0], dtype=np.float16)))
+    for alpha in (1.0, 0.1):
+      with np.errstate(over="ignore", invalid="ignore"):
+        expected = np.where(a_np >= 0, a_np, alpha*np.expm1(a_np.astype(np.float32))).astype(np.float16)
+      actual = Tensor(a_np, device="ROCKCHIP").elu(alpha).realize().numpy()
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    with np.errstate(over="ignore", invalid="ignore"):
+      expected = (1.0507*np.where(a_np >= 0, a_np, 1.67326*np.expm1(a_np.astype(np.float32)))).astype(np.float16)
+    actual = Tensor(a_np, device="ROCKCHIP").selu().realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_sqrt_special_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -2, -0.0, 0, 0.25, 4], dtype=np.float16)
     actual = Tensor(a_np, device="ROCKCHIP").sqrt().realize().numpy()

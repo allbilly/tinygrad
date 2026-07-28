@@ -1088,6 +1088,74 @@ The accepted graph has 45 tasks and exactly two LUT tasks. It uses
 asymptote and a zero negative asymptote. Consequently positive infinity and NaN
 match, while negative infinity returns zero instead of PyTorch's composite NaN.
 
+## Case study: one ELU/SELU decomposition
+
+ELU and SELU have the same exponential negative branch with different scales:
+
+```text
+output(x<0)  = negative_scale * expm1(x)
+output(x>=0) = positive_scale * x
+```
+
+The relevant `(negative_scale, positive_scale)` pairs are `(1,1)`,
+`(0.1,1)`, and `(1.0507*1.67326,1.0507)`. Recognizing this shared form avoids
+tuning three nearly identical composite EXP2 graphs.
+
+### Output-range-dependent gains
+
+Use Q15 for every table, but amplify or attenuate stored values according to
+their range:
+
+| Variant | Broad gain | Local gain |
+|---|---:|---:|
+| ELU alpha 0.1 | 8 | 16 |
+| ELU alpha 1 | 1 | 2 |
+| SELU | 1/2 | 1 |
+
+The broad table covers `[-8,0]` at `index_scale=2048`. The local table covers
+`[-0.5,0]`, addressed by `z=4*x` at `index_scale=8192`. Post-LUT powers of two
+restore the real scale exactly. This is preferable to dropping the entire
+SELU table to Q14 or leaving the small-alpha ELU table at an unnecessarily
+coarse direct Q15 quantum.
+
+Before either lookup, bound the source to its accepted negative interval. A
+useful clamp using only MAX and SUB is:
+
+```text
+low     = max(x, lower_bound)
+neg_low = 0 - low
+input   = 0 - max(neg_low, 0)
+```
+
+The last operation must be SUB. Using MAX there computes an absolute value and
+routes negative inputs into the unused positive table, an easy failure to
+misdiagnose as bad mask selection.
+
+### Near-zero interval and mask visibility
+
+After widening the local table, the remaining failures were all inside
+`[-0.025,0]`. Use the second-order expansion on `[-0.03,0]`:
+
+```text
+negative_scale*x + (negative_scale/2)*x²
+```
+
+An exhaustive fp16 model reports zero tolerance failures for all three scales
+inside that interval. Bound the polynomial source before squaring it, since
+masking an unbounded infinity after the multiplication is too late.
+
+Fresh comparison buffers have a hardware visibility hazard: the first DPU task
+that consumes one may see stale lanes. Emit the first mask combination or
+selection into a scratch slot, then repeat it into the live slot. The
+nonduplicated ELU prototype returned zero for every negative input even though
+the individual comparisons were correct.
+
+The final program has 55 tasks and exactly two LUT tasks. Dense `[-8,8]`,
+negative infinity, NaN, and signed-zero probes pass. Positive infinity reaches
+the correct positive branch but the final DPU ADD changes it to NaN; retain
+that as an explicit backend limitation until the infinity-safe final merge is
+implemented.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of

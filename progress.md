@@ -1,5 +1,77 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — shared two-LUT ELU/SELU milestone
+
+### Recognition and shared form
+
+- The next focused failures were precision-only: ELU missed 148/2925 values
+  and SELU missed 165/2925, while both already submitted successfully through
+  generic 51–60-task elementwise graphs.
+- ELU and SELU lower differently, so `_try_elu` recognizes both exact forms:
+
+  ```text
+  ELU  = relu(x) - alpha*relu(1-exp(x))
+  SELU = gamma*where(x<0, alpha*expm1(x), x)
+  ```
+
+  It returns one common representation:
+  `(source, negative_scale, positive_scale)`. The negative scales are `1`,
+  `0.1`, and `1.0507*1.67326`; SELU's positive scale is `1.0507`.
+- The recognizer requires one fp16 INDEX, exactly one EXP2, the expected
+  WHERE/CMPLT count for its form, and only the stable ELU op family.
+
+### LUT and Taylor tuning
+
+- Clamp the LUT inputs arithmetically before lookup. The first experiment
+  accidentally produced `abs(x)` instead of the intended clamped negative
+  input and consequently selected table-one zero workarounds for every
+  negative lane. The correct final stage is `0 - max(0-low, 0)`.
+- LUT task 1 covers `[-8,0]` with `index_scale=2048`. It always emits Q15, but
+  adjusts its stored gain to the output range:
+
+  ```text
+  ELU alpha=0.1 : gain 8
+  ELU alpha=1   : gain 1
+  SELU          : gain 1/2
+  ```
+
+  Exact reciprocal powers of two restore the output after lookup. This keeps
+  small-alpha precision without overflowing SELU's approximately `-1.758`
+  asymptote.
+- The initial local interval `[-0.125,0]` left 16 ELU and 17 SELU misses from
+  about `-0.13` through `-0.33`. Widening LUT task 2 to `[-0.5,0]`, addressed
+  by `z=4*x`, reduced the methods to four and six near-zero misses.
+- The final `[-0.03,0]` branch uses:
+
+  ```text
+  negative_scale*x + (negative_scale/2)*x²
+  ```
+
+  Exhaustive fp16 software evaluation found zero official-tolerance failures
+  for ELU alpha 1, ELU alpha 0.1, and SELU across this interval. As with Mish,
+  the polynomial input is bounded before squaring to prevent infinity
+  contamination.
+- Fresh comparison masks require a duplicated first consumer on this DPU.
+  The first nonduplicated path returned exact zero for all negative lanes.
+- Final raw schedule: **55 NPU tasks**, exactly **two LUT tasks**.
+
+### Verification and limitation
+
+- `TestOps.test_elu`: **PASS**, including alpha `1`, alpha `0.1`, and scalar.
+- `TestOps.test_selu`: **PASS**, including scalar.
+- Dense hardware regression: 2049 points over `[-8,8]` plus negative infinity,
+  NaN, and signed zero pass for all three parameter sets.
+- Positive infinity remains a known limitation: the final DPU ADD converts the
+  otherwise-correct positive infinity branch to NaN. The official methods do
+  not include this value, and the regression calls it out explicitly rather
+  than silently weakening comparison.
+- Complete serial `test/rockchip/test_hw.py`: **66 passed, 2 failed** in
+  188.91 seconds; only the unchanged fill-zero/fill-full baseline failures
+  remain.
+- Compileall and `git diff --check` pass. Full mypy retains exactly the same 13
+  pre-existing findings. Ruff is installed outside `.venv`, but the requested
+  `.venv/bin/python -m ruff` entry point remains unavailable.
+
 ## 2026-07-29 — two-LUT Mish milestone
 
 ### Recognition and failure reduction

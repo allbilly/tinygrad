@@ -23,6 +23,11 @@ hardware file advances to 64 passing methods with the same two fill failures.
 hardware regression covers a dense `[-2,2]` grid, finite `±8`, positive
 infinity, and NaN. The complete hardware file advances to **65 passed,
 2 failed** in 169.70 seconds; only fill-zero/fill-full remain.
+`TestOps.test_elu` and `TestOps.test_selu` now pass through one shared
+55-task/two-LUT path. The complete hardware file advances to **66 passed,
+2 failed** in 188.91 seconds. Dense finite inputs, negative infinity, NaN, and
+signed zero pass; positive infinity is separately tracked as a final-DPU-ADD
+limitation.
 
 ## Summary
 
@@ -70,9 +75,9 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
 ### 4. Transcendental ops — ~12 tests
-Exp, sin, cos, tan, sinh, cosh, erf, gelu, elu, selu, sigmoid_extreme.
+Exp, sin, cos, tan, sinh, cosh, erf, gelu, sigmoid_extreme.
 
-**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_elu, test_selu, test_sigmoid*
+**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_sigmoid*
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -132,6 +137,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
 - Softplus for beta `1`, `3`, and `1/3`, including dense/special coverage
 - Mish on the official method and dense `[-2,2]` interval, using two LUT tasks
+- ELU (alpha 1 and 0.1) and SELU, including dense finite/negative-special coverage
 - abs, sign, round, inf_div (fp32 inputs)
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)
