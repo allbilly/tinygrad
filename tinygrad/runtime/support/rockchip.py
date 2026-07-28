@@ -1071,7 +1071,7 @@ def _try_round_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return ret
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   source_slot = source.src[0].buf_uop.arg.slot
   negative, magnitude, rounded = alloc(), alloc(), alloc()
@@ -1195,7 +1195,7 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   base_slot = alloc()
   lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_hardswish")
@@ -1290,7 +1290,7 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   base_slot = alloc()
   base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
@@ -1353,7 +1353,7 @@ def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
 
   base_slot = alloc()
   base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
@@ -1399,7 +1399,7 @@ def _try_quick_gelu_direct_two_lut_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
 
   base_slot = alloc()
   base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
@@ -1497,7 +1497,7 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
 
   base_slot = alloc()
   base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
@@ -1602,7 +1602,7 @@ def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
 
   base_slot = alloc()
   base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
@@ -1805,7 +1805,7 @@ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
@@ -1824,7 +1824,7 @@ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     # Intermediate masks stay as fp16 0/1 scratch. Only a user-visible boolean
     # output should be packed to the byte-wide bool representation.
     last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
     tasks.extend(cmp_tasks)
     used_slots = [st.task.out_slot for st in cmp_tasks] + \
       [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
@@ -1860,7 +1860,7 @@ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(nan_denom, one, not_number, Ops.SUB)
   dependent(nan_numerator, (finite_result, 0), (nan_denom, 0), Ops.MUL)
   dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
-  return tuple(tasks)
+  return _finalize_fp32_output(tasks, store)
 
 def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Use two LUT tasks for exp(x): Q12 exp plus a signed Q12 residual."""
@@ -1885,7 +1885,7 @@ def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
@@ -1900,7 +1900,7 @@ def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
     if cmp_tasks is None: return None
     last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
     tasks.extend(cmp_tasks)
     used_slots = [st.task.out_slot for st in cmp_tasks] + \
       [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
@@ -1955,7 +1955,7 @@ def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(nan_denom, one, not_number, Ops.SUB)
   dependent(nan_numerator, (finite_result, 0), (nan_denom, 0), Ops.MUL)
   dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
-  return tuple(tasks)
+  return _finalize_fp32_output(tasks, store)
 
 def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve sigmoid saturation and NaN semantics outside the bounded LUT."""
@@ -1977,7 +1977,7 @@ def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
@@ -1992,7 +1992,7 @@ def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
     if cmp_tasks is None: return None
     last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
     tasks.extend(cmp_tasks)
     used_slots = [st.task.out_slot for st in cmp_tasks] + \
       [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
@@ -2021,7 +2021,7 @@ def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(nan_denom, one, not_number, Ops.SUB)
   dependent(nan_numerator, (bounded, 0), (nan_denom, 0), Ops.MUL)
   dependent(out, (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)
-  return tuple(tasks)
+  return _finalize_fp32_output(tasks, store)
 
 def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve LOG2 zero, infinity, and NaN semantics around the bounded LUT."""
@@ -2042,7 +2042,7 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
@@ -2057,7 +2057,7 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
     if cmp_tasks is None: return None
     last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
     tasks.extend(cmp_tasks)
     used_slots = [st.task.out_slot for st in cmp_tasks] + \
       [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
@@ -2087,7 +2087,21 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(invalid_denom, one, (invalid, 0), Ops.SUB)
   dependent(invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV)
   dependent(out, (finite, 0), (invalid_factor, 0), Ops.MUL)
+  return _finalize_fp32_output(tasks, store)
+
+def _finalize_fp32_output(tasks:list[RKSubTask], store:UOp) -> tuple[RKSubTask, ...]:
+  """Set fp32_output on the last task when the store's output PARAM is fp32."""
+  if store.src[0].src[0].dtype is dtypes.float:
+    last = tasks[-1]
+    tasks[-1] = RKSubTask(last.cmds, replace(last.task, fp32_output=True), last.relocs)
   return tuple(tasks)
+
+def _fix_cmp_fp32(cmp_tasks:tuple[RKSubTask, ...], source:UOp) -> tuple[RKSubTask, ...]:
+  """Add fp32_inputs to comparison tasks that read from a fp32 source."""
+  if source.src[0].dtype is not dtypes.float: return cmp_tasks
+  src_slot = source.src[0].arg.slot
+  return tuple(RKSubTask(st.cmds, replace(st.task, fp32_inputs=tuple(set(st.task.fp32_inputs+(src_slot,)))), st.relocs)
+    if any(r.globals_slot == src_slot for r in st.relocs) else st for st in cmp_tasks)
 
 def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve SQRT zero, infinity, and NaN semantics around the bounded LUT."""
@@ -2110,7 +2124,7 @@ def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
@@ -2125,7 +2139,7 @@ def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
     if cmp_tasks is None: return None
     last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
     tasks.extend(cmp_tasks)
     used_slots = [st.task.out_slot for st in cmp_tasks] + \
       [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
@@ -2170,7 +2184,7 @@ def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(invalid_denom, one, (invalid, 0), Ops.SUB)
   dependent(invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV)
   dependent(out, (zero_result, 0), (invalid_factor, 0), Ops.MUL)
-  return tuple(tasks)
+  return _finalize_fp32_output(tasks, store)
 
 def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve RSQRT zero, infinity, and NaN semantics around its dedicated LUT."""
@@ -2193,7 +2207,7 @@ def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return ret
 
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
@@ -2208,7 +2222,7 @@ def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
     if cmp_tasks is None: return None
     last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
     tasks.extend(cmp_tasks)
     used_slots = [st.task.out_slot for st in cmp_tasks] + \
       [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
@@ -2288,7 +2302,7 @@ def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(invalid_denom, one, (invalid, 0), Ops.SUB)
   dependent(invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV)
   dependent(out, (finite, 0), (invalid_factor, 0), Ops.MUL)
-  return tuple(tasks)
+  return _finalize_fp32_output(tasks, store)
 
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
@@ -2456,7 +2470,7 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   def temp_index(slot:int, dtype) -> UOp:
     out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
 
   def make_stage_sink(stage_val:UOp, out_slot:int) -> tuple[UOp, UOp]:
     out_idx = temp_index(out_slot, stage_val.dtype)
