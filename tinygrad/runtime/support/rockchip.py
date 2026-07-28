@@ -2420,6 +2420,25 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                     _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
                                       broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
       return True
+    if cond.op is Ops.CMPNE:
+      lhs, rhs = (lower_arg(x) for x in cond.src)
+      if lhs is None or rhs is None: return False
+      neg_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+      pos_mask, neg, neg_mask = alloc(), alloc(), alloc()
+      tasks.extend((_emit_where_stage(total, t0, lhs, rhs, Ops.SUB),
+                    _emit_where_stage(total, pos_mask, (t0,0), (t0,0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, neg, (t0,0), neg_one, Ops.MUL),
+                    _emit_where_stage(total, neg_mask, (neg,0), (neg,0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, mask, (pos_mask,0), (neg_mask,0), Ops.MAX)))
+      tasks.extend((
+                    _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
+                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
+                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
+      return True
     if cond.op is Ops.OR and all(_unwrap(x).op is Ops.CMPLT for x in cond.src):
       masks = []
       for cmp in cond.src:
@@ -2451,7 +2470,13 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       return True
     return False
 
-  return tuple(tasks) if lower(val, out, True) else None
+  if not lower(val, out, True): return None
+  fp32_slots = {u.arg.slot for u in sink.toposort() if u.op is Ops.PARAM and u.dtype is dtypes.float}
+  if fp32_slots:
+    for i, st in enumerate(tasks):
+      need = tuple(s for s in fp32_slots if s != st.task.out_slot and any(r.globals_slot == s for r in st.relocs) and s not in st.task.fp32_inputs)
+      if need: tasks[i] = RKSubTask(st.cmds, replace(st.task, fp32_inputs=tuple(set(st.task.fp32_inputs+need))), st.relocs)
+  return _finalize_fp32_output(tasks, store)
 
 def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Split a nested fp16 elementwise expression into independently classifiable DPU stages."""
