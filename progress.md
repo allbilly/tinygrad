@@ -1,5 +1,31 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — two-LUT HardSwish milestone
+
+### Implementation
+- The fused hardswish graph is recognized directly after Rockchip rewrites.
+- LUT task 1 is a signed Q14 base table over `[-2,2]`.
+- All remaining base-table tolerance failures were measured inside
+  approximately `[-0.118,0.113]`. LUT task 2 receives `x*16` and emits
+  `hardswish(x)*16` in Q15; an exact `1/16` stage restores the result.
+- The local table is selected on `[-0.125,15/128]`. Its asymmetric positive
+  boundary keeps the amplified result within signed Q15.
+- Zero table entries are replaced by one count, then an NPU nonzero mask
+  restores exact `hardswish(0)=0`.
+- A staged algebraic ReLU6 fallback is selected outside `[-2,2]`, preserving
+  correct wide-range behavior instead of exposing LUT endpoint clipping.
+
+### Verification
+- `TestOps.test_hardswish` — **PASS** with
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- Dense `[-2,2]`, exact zero, local boundaries, ReLU6 boundaries, and
+  `[-400,400]` fallback coverage — **PASS** on hardware.
+- Hardsigmoid, extreme hardsigmoid, ReLU6, and hardtanh regressions — **PASS**.
+- All **58** Rockchip hardware methods — **PASS** in isolated subprocesses.
+- `python -m mypy tinygrad/` and Ruff on changed source/test files — **PASS**.
+- `lut.md` now documents how to tune this two-task local-precision pattern.
+- Incremental census: **140 PASS, 276 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — exact hardsigmoid saturation milestone
 
 ### Implementation

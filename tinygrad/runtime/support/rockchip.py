@@ -257,11 +257,27 @@ def _try_hardsigmoid(val:UOp) -> tuple[int,float,float]|None:
         return source.src[0].buf_uop.arg.slot, float(alpha.arg), float(positive_const.arg)
   return None
 
+def _try_hardswish(val:UOp) -> UOp|None:
+  """Recognize x*relu6(x+3)/6 and return its source INDEX."""
+  val = _unwrap(val)
+  indexes = [u for u in val.toposort() if u.op is Ops.INDEX]
+  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
+  def c(value:float) -> UOp: return UOp.const(dtypes.half, value)
+  zero, plus = c(0.0), UOp(Ops.ADD, dtypes.half, (source, c(3.0)))
+  relu_plus = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (zero, plus)), plus, zero))
+  minus = UOp(Ops.ADD, dtypes.half, (source, c(-3.0)))
+  relu_minus = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (zero, minus)), minus, zero))
+  relu6 = UOp(Ops.ADD, dtypes.half, (relu_plus, UOp(Ops.MUL, dtypes.half, (relu_minus, c(-1.0)))))
+  expected = UOp(Ops.MUL, dtypes.half, (UOp(Ops.MUL, dtypes.half, (source, relu6)), c(1/6)))
+  return source if val is expected else None
+
 # LUT ops: EXP2 uses DPU LUT table (513 entries × 2 tables) with BN_MUL scaling
 _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
 _LUT_ROUNDOFF = Ops.CUSTOM  # internal plan marker for the RK3588 round-to-nearest-even LUT
 _LUT_EXP_CORRECTION = Ops.NEG  # internal marker for the second, residual exp LUT
+_LUT_HARDSWISH = Ops.POW  # internal marker for a fused hardswish LUT
+_LUT_HARDSWISH_CORRECTION = Ops.CMOD
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -332,6 +348,32 @@ def _build_exp_correction_lut() -> tuple[list[int], int, float, float, int]:
       lut[base_offset+i] = max(-32768, min(32767, int(round((residual+correction_bias) * correction_scale))))
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, correction_scale, index_scale, 12
+
+def _build_hardswish_lut() -> tuple[list[int], int, float, float, int]:
+  """Q14 hardswish over [-2,2], with nonzero entries for the LUT zero erratum."""
+  index_scale = 8192.0
+  output_scale, minus_exp = 16384.0, 14
+  step, lut = 32.0 / index_scale, [0] * _LUT_SIZE * 2
+  for table, base in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i) * step
+      y = x * min(6.0, max(0.0, x+3.0)) / 6.0
+      raw = int(round(y * output_scale))
+      lut[base+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
+def _build_hardswish_correction_lut() -> tuple[list[int], int, float, float, int]:
+  """Direct Q15 hardswish*16 near zero for tight relative accuracy."""
+  index_scale, output_scale = 8192.0, 32768.0
+  step, lut = 32.0 / index_scale, [0] * _LUT_SIZE * 2
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i) * step
+      x = float(np.float16(z / 16.0))
+      target = x * min(6.0, max(0.0, x+3.0)) / 6.0
+      raw = int(round(target*16.0*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
 def _build_log2_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for LOG2 over x∈[0.25,4.0] → result∈[-2,2].
@@ -491,6 +533,10 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   input_scale, output_scale = 1.0, 1.0
   if val.op is Ops.CUSTOM and val.arg == "rk_roundoff" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ROUNDOFF)
+  if val.op is Ops.CUSTOM and val.arg == "rk_hardswish" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_HARDSWISH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_hardswish_correction" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_HARDSWISH_CORRECTION)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -995,6 +1041,101 @@ def _try_hardsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
           _emit_where_stage(total, negative, (positive, 0), negative_one, Ops.MUL),
           _emit_where_stage(total, clamped, (negative, 0), negative_one, Ops.MAX),
           _emit_where_stage(total, info.outs[0], (clamped, 0), negative_one, Ops.MUL))
+
+def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate hardswish with a Q14 base LUT and a local Q15 correction LUT."""
+  store = _store_node(sink)
+  if store is None or (source := _try_hardswish(store.src[1])) is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+  def temp_index(slot:int) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  base_slot = alloc()
+  lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_hardswish")
+  stage_store = store.replace(src=(temp_index(base_slot), lut_val))
+  lut_plan = plan_rk(sink.substitute({store:stage_store}))
+  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(lut_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  plus, positive, negative, clamped_negative, relu6, product, fallback = (alloc() for _ in range(7))
+  tasks.extend((_emit_where_stage(total, plus, source_arg, scalar(3.0), Ops.ADD),
+                _emit_where_stage(total, positive, (plus, 0), zero, Ops.MAX),
+                _emit_where_stage(total, negative, (positive, 0), scalar(-1.0), Ops.MUL),
+                _emit_where_stage(total, clamped_negative, (negative, 0), scalar(-6.0), Ops.MAX),
+                _emit_where_stage(total, relu6, (clamped_negative, 0), scalar(-1.0), Ops.MUL),
+                _emit_where_stage(total, product, source_arg, (relu6, 0), Ops.MUL),
+                _emit_where_stage(total, fallback, (product, 0), scalar(1/6), Ops.MUL)))
+  wide_negative_diff, wide_negative_mask, wide_positive_diff, wide_positive_mask = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, wide_negative_diff, scalar(-2.0), source_arg, Ops.SUB),
+                _emit_where_stage(total, wide_negative_mask, (wide_negative_diff, 0), (wide_negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, wide_positive_diff, source_arg, scalar(2.0), Ops.SUB),
+                _emit_where_stage(total, wide_positive_mask, (wide_positive_diff, 0), (wide_positive_diff, 0), Ops.MAX, compare=True)))
+  wide_outside_scratch, wide_outside, wide_inside_scratch, wide_inside = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, wide_outside_scratch, (wide_negative_mask, 0), (wide_positive_mask, 0), Ops.MAX),
+                _emit_where_stage(total, wide_outside, (wide_negative_mask, 0), (wide_positive_mask, 0), Ops.MAX),
+                _emit_where_stage(total, wide_inside_scratch, one, (wide_outside, 0), Ops.SUB),
+                _emit_where_stage(total, wide_inside, one, (wide_outside, 0), Ops.SUB)))
+  base_inner_scratch, base_inner, fallback_outer_scratch, fallback_outer, wide = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, base_inner_scratch, (base_slot, 0), (wide_inside, 0), Ops.MUL),
+                _emit_where_stage(total, base_inner, (base_slot, 0), (wide_inside, 0), Ops.MUL),
+                _emit_where_stage(total, fallback_outer_scratch, (fallback, 0), (wide_outside, 0), Ops.MUL),
+                _emit_where_stage(total, fallback_outer, (fallback, 0), (wide_outside, 0), Ops.MUL),
+                _emit_where_stage(total, alloc(), (base_inner, 0), (fallback_outer, 0), Ops.ADD),
+                _emit_where_stage(total, wide, (base_inner, 0), (fallback_outer, 0), Ops.ADD)))
+
+  scaled = alloc()
+  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(16.0), Ops.MUL))
+  local_slot = alloc()
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_hardswish_correction")
+  local_store = store.replace(src=(temp_index(local_slot), local_val))
+  local_plan = plan_rk(sink.substitute({store:local_store}))
+  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(local_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  local_scaled_scratch, local_scaled = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(1/16), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(1/16), Ops.MUL)))
+  negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_diff, scalar(-0.125), source_arg, Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, positive_diff, source_arg, scalar(15/128), Ops.SUB),
+                _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True)))
+  outside_scratch, outside, inside_scratch, inside = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, outside_scratch, (negative_mask, 0), (positive_mask, 0), Ops.MAX),
+                _emit_where_stage(total, outside, (negative_mask, 0), (positive_mask, 0), Ops.MAX),
+                _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
+                _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
+  negative_zero_diff, negative_zero_mask, positive_zero_diff, positive_zero_mask = alloc(), alloc(), alloc(), alloc()
+  nonzero_scratch, nonzero = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_zero_diff, zero, source_arg, Ops.SUB),
+                _emit_where_stage(total, negative_zero_mask, (negative_zero_diff, 0), (negative_zero_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, positive_zero_diff, source_arg, zero, Ops.SUB),
+                _emit_where_stage(total, positive_zero_mask, (positive_zero_diff, 0), (positive_zero_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, nonzero_scratch, (negative_zero_mask, 0), (positive_zero_mask, 0), Ops.MAX),
+                _emit_where_stage(total, nonzero, (negative_zero_mask, 0), (positive_zero_mask, 0), Ops.MAX)))
+  local_nonzero_scratch, local_nonzero = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, local_nonzero_scratch, (local_scaled, 0), (nonzero, 0), Ops.MUL),
+                _emit_where_stage(total, local_nonzero, (local_scaled, 0), (nonzero, 0), Ops.MUL)))
+  base_selected_scratch, base_selected, local_selected_scratch, local_selected = alloc(), alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, base_selected_scratch, (wide, 0), (outside, 0), Ops.MUL),
+                _emit_where_stage(total, base_selected, (wide, 0), (outside, 0), Ops.MUL),
+                _emit_where_stage(total, local_selected_scratch, (local_nonzero, 0), (inside, 0), Ops.MUL),
+                _emit_where_stage(total, local_selected, (local_nonzero, 0), (inside, 0), Ops.MUL),
+                _emit_where_stage(total, alloc(), (base_selected, 0), (local_selected, 0), Ops.ADD),
+                _emit_where_stage(total, info.outs[0], (base_selected, 0), (local_selected, 0), Ops.ADD)))
+  return tuple(tasks)
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
@@ -2021,6 +2162,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp_correction_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_HARDSWISH:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_HARDSWISH_CORRECTION:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_correction_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.LOG2:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
     lut_le_start = 0xffffc000  # -16384
@@ -2126,10 +2275,9 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   if lut_op is _LUT_ROUNDOFF:
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 23107)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
-  elif lut_op is _LUT_EXP_CORRECTION:
-    # The correction LUT is intentionally local to z in [-2, 2]. Hold its
-    # endpoint bias outside that interval instead of applying EXP2's overflow
-    # extrapolation slope.
+  elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION):
+    # These LUTs use flat endpoint values; their staged epilogues handle the
+    # behavior outside the table domain.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
   else:
@@ -2515,6 +2663,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
+  if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

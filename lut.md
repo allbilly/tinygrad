@@ -578,24 +578,46 @@ The direct native SiLU experiment based on algorithm 15 is preserved in
 - restricting the table domain solely to make the test pass is not a sound
   replacement for the stable staged implementation.
 
-## Case study: rejected signed-Q14 HardSwish
+## Case study: two-task HardSwish LUT
 
-`rknnops.h` algorithm 51 uses the shared biased unsigned Q0.15 path, normalizes
-the table by the maximum absolute output, and selects a different output
-precision. It is not equivalent to loading signed values into the ordinary
-fp16 LUT emitter.
+The original staged fp16 graph missed 34/2925 official values by one or two
+ULPs. A single signed Q14 LUT over `[-2,2]` reduced the maximum error but still
+failed 93 values, all in approximately `[-0.118,0.113]`. This is an important
+tuning signal: broad absolute accuracy was sufficient, but the strict relative
+tolerance near the zero crossing required more output precision.
 
-An exact recognizer plus signed Q14 table over `[-2,2]` was measured as a
-single `dpu_lut` task. It failed 98/2925 official values, compared with 34/2925
-for the existing staged graph. Most additional failures were one Q14 count
-near zero, where strict relative tolerance and the nonzero-center workaround
-make the signed table unsuitable.
+The accepted path uses two actual LUT NPU tasks:
 
-The experiment is preserved in
-`rockchip-native-hardswish-wip-e44eb5ffd.patch`. Future work should port and
-measure the complete biased-Q0.15 pipeline, including output precision,
-debiasing, and restoration of the reference `max_abs` scale. Reusing only the
-reference function samples is insufficient.
+```text
+base  = hardswish_q14(x)                    # domain [-2,2]
+local = hardswish_times_16_q15(x * 16) / 16
+out   = local when -0.125 <= x <= 15/128 else base
+```
+
+The second table spends its full 513-entry half-domain on the narrow interval.
+Multiplying its function values by 16 before Q15 quantization gives an effective
+output quantum of `1/(32768*16)` after the exact `1/16` stage. Its positive
+selection endpoint is `15/128`, because `hardswish(0.125)*16` exceeds signed
+Q15, while the negative side safely reaches `-0.125`.
+
+Literal zero table entries still trigger the RK3588 corruption. Both tables
+replace zero entries with one count, and a separately reconstructed nonzero
+mask restores exact `hardswish(0)=0`. Outside `[-2,2]`, the backend selects a
+staged algebraic ReLU6 fallback, so the optimized LUT domain does not change
+general hardswish semantics.
+
+This two-level pattern is useful when a broad LUT is accurate everywhere except
+a small relative-error interval:
+
+1. measure the actual failing input band;
+2. keep the broad table for range and absolute accuracy;
+3. transform the narrow interval across a second LUT's full input resolution;
+4. amplify the local output before quantization when its range permits;
+5. select between the two entirely on the NPU;
+6. retain a non-LUT fallback outside the broad table domain.
+
+The earlier rejected single-table experiment remains preserved in
+`rockchip-native-hardswish-wip-e44eb5ffd.patch` for comparison.
 
 ## Case study: round-to-nearest-even
 

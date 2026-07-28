@@ -212,6 +212,15 @@ class TestDPU(unittest.TestCase):
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
     np.testing.assert_array_equal(actual[[0, 1, 5, 6, 7, 8, 9]], expected[[0, 1, 5, 6, 7, 8, 9]])
 
+  def test_dpu_hardswish_two_lut(self):
+    a_np = np.concatenate((np.linspace(-2, 2, 1025, dtype=np.float16),
+                           np.array([-400, -4, -3, -0.125, -0.0, 0.003313, 0.117, 0.125, 3, 4, 400], dtype=np.float16)))
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    expected = (a_np.astype(np.float32) * np.clip(a_np.astype(np.float32)+3, 0, 6) / 6).astype(np.float16)
+    actual = a.hardswish().realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    np.testing.assert_array_equal(actual[a_np == 0], expected[a_np == 0])
+
   def test_dpu_direct_casts(self):
     half_np = np.array([-2.5,0,1.75,255], dtype=np.float16)
     half = Tensor(half_np, device="ROCKCHIP").realize()
