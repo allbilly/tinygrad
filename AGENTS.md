@@ -12,14 +12,8 @@
 do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
 do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
 do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
-do not remove rockchip related WIP code or old code, just comment them for ref, wont count in sz.py anyway
+
+use FORWARD_ONLY=1 and DEFAULT_FLOAT=HALF
 
 u can clone any needed reference repo into ref/ with git clone --depth=1
 - allbilly/npu

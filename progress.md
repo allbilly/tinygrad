@@ -3895,3 +3895,50 @@ S_POINTER value `0x0e` (ref value) causes timeout in PC chain mode, while `0x30`
 - `tinygrad/runtime/support/rockchip.py` — _emit_dpu: added S_POINTER, DATA_CUBE_HEIGHT, DATA_CUBE_NOTCH_ADDR
 - `tinygrad/runtime/ops_rockchip.py` — _submit_multi: complete rewrite per pcchain.md
 - `tinygrad/runtime/support/rockchip.py` — RKSubTask, encode_rk_multi, decode_rk_multi, build_native_program_multi (from earlier session)
+
+## 2026-07-28 — Line-saving plan for 25k sz.py limit
+
+Current: 26,339 total / 2,042 rockchip. Need to save 1,339 lines. Target: rockchip → ~700 lines.
+Per AGENTS.md: old/WIP code can be commented out (doesn't count in sz.py). No feature cuts — all tests must still pass.
+
+### Dedup opportunities (~149 lines)
+1. 6 LUT builders repeat `lut=[0]*_LUT_SIZE*2`, `step`, `bn_mul_operand`, `return` → `_build_lut` helper (~35)
+2. `_emit_dpu_lut` 5 identical `elif` branches → dict lookup (~18)
+3. `alloc()` closure copied 5× → `_make_alloc` (~12)
+4. `_convert_*_buf` 4 functions → one `_convert_buf` (~12)
+5. `_submit_multi` reloc loop duplicates single-task → `_apply_relocs` helper (~15)
+6. PC tail if/else differs only in next_addr vs 0 → collapse (~5)
+7. `_try_round`/`_try_sign` share mask-pair pattern → helper (~8)
+8. `_emit_where_stage` 30+ `e()` calls → `_emit_dpu_base_regs` (~10)
+9. `reg_order` dict rebuilt every call → module-level constant (~3)
+10. `encode_rk`/`_encode_one_task` share packing → `_pack_task_body` (~8)
+11. `decode_rk`/`_decode_one_task` share unpacking → `_unpack_task_fields` (~10)
+12. `negative_one`/`one`/`zero` repeated → module-level constants (~4)
+13. `build_native_program` 7 identical dispatch lines → loop (~4)
+14. `dependent` double-emit → `repeat=2` param (~5)
+
+### Structural opportunities (~590 lines)
+15. LUT builders → data-driven table (op → range, fill_fn) (~100)
+16. `_emit_dpu_lut` shares register sequence with `_emit_dpu` → `_emit_dpu_common` (~80)
+17. `_emit_cmac` 46 registers → `(target, reg, value)` table + loop (~60)
+18. `_emit_ppu` 25 registers → table-driven emission (~30)
+19. WHERE/comparison/round/sign/abs subtask builders (~400 lines) → generic `_lower_multi_stage(sink, specs)` (~200)
+20. `_submit_multi` merges with single-task `__call__` (n_tasks=1 default) (~50)
+21. encode/decode v3+v4 → one codec with version flag (~40)
+22. `plan_rk` classification branches → dispatch table (~30)
+
+### Theoretical minimum (~760 lines)
+| Component | Current | Minimum |
+|-----------|---------|---------|
+| ops_rockchip.py (device, alloc, program, submit) | 470 | ~200 |
+| Emission (_emit_dpu, _emit_dpu_lut, _emit_cmac, _emit_ppu, _emit_where_stage) | ~500 | ~100 |
+| LUT builders (6 functions) | ~140 | ~30 |
+| Multi-task lowering (8 _try_*_subtasks) | ~443 | ~100 |
+| Classification (plan_rk + helpers) | ~400 | ~150 |
+| Codec (encode/decode v3+v4) | ~130 | ~50 |
+| Dataclasses + constants | ~100 | ~50 |
+| Pattern matchers | ~30 | ~20 |
+| Geometry helpers | ~100 | ~60 |
+| **Total** | **~2,042** | **~760** |
+
+Yes, it can be within 25k. Requires near-complete rewrite: table-driven emission, spec-driven multi-task lowering, merged runtime paths. No feature cuts. All tests preserved.
