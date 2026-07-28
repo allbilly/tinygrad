@@ -385,6 +385,19 @@ def _try_softplus(val:UOp) -> tuple[UOp,float]|None:
     sum(u.op is Ops.EXP2 for u in nodes) == 2 and sum(u.op is Ops.LOG2 for u in nodes) == 1 and \
     sum(u.op is Ops.MAX for u in nodes) == 1 else None
 
+def _try_mish(val:UOp) -> UOp|None:
+  """Recognize x*tanh(softplus(x)), tinygrad's Mish lowering."""
+  val = _unwrap(val)
+  indexes = list(dict.fromkeys(u for u in val.toposort() if u.op is Ops.INDEX))
+  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half or val.op is not Ops.MUL or \
+     not any(_unwrap(x) is source for x in val.src): return None
+  nodes = val.toposort()
+  allowed = {Ops.ADD, Ops.MUL, Ops.FDIV, Ops.MAX, Ops.CAST, Ops.EXP2, Ops.LOG2, Ops.RECIPROCAL,
+             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  return source if all(u.op in allowed for u in nodes) and sum(u.op is Ops.EXP2 for u in nodes) == 3 and \
+    sum(u.op is Ops.LOG2 for u in nodes) == 1 and sum(u.op is Ops.MAX for u in nodes) == 1 and \
+    sum(u.op in (Ops.RECIPROCAL, Ops.FDIV) for u in nodes) == 1 else None
+
 def _try_celu(val:UOp) -> tuple[UOp,float]|None:
   """Recognize max(x,0)+min(alpha*(exp(x/alpha)-1),0) for TestOps alphas."""
   val = _unwrap(val)
@@ -424,6 +437,8 @@ _LUT_LOGSIGMOID_CORRECTION = Ops.AND
 _LUT_LOGSIGMOID_TAIL = Ops.THREEFRY
 _LUT_SOFTPLUS_TAIL = Ops.WMMA
 _LUT_SOFTPLUS_WIDE = Ops.BARRIER
+_LUT_MISH = Ops.SPECIAL
+_LUT_MISH_LOCAL = Ops.BIND
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -674,6 +689,39 @@ def _build_softplus_wide_lut(input_beta:float) -> tuple[list[int], int, float, f
       lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else -1))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 13
 
+def _build_mish_lut() -> tuple[list[int], int, float, float, int]:
+  """Asymmetric Q15 Mish over [-8,8]; positive entries store Mish/8."""
+  # A direct Q14 table has excellent negative resolution, but its +2 ceiling
+  # cannot represent Mish across the full positive interval.  Scaling only the
+  # positive half preserves Q15 precision for the small negative tail.
+  index_scale, output_scale = 2048.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = (-(512-i) if table == 0 else i)*step
+      y = x*math.tanh(math.log1p(math.exp(x)))
+      if table == 1: y /= 8.0
+      raw = int(round(y*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_mish_local_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 Mish(x) over [-1,1], addressed by z=2*x."""
+  # The first passing narrow path used z=16*x and 8*Mish(x) over
+  # [-0.125,0.125].  Keep its shape here as a tuning reference: widening the
+  # broad LUT to [-8,8] needs this local table to cover more of the central
+  # interval while retaining enough Q15 output resolution.
+  index_scale, output_scale = 8192.0, 32768.0
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i)*step
+      x = z/2.0
+      y = x*math.tanh(math.log1p(math.exp(x)))
+      raw = int(round(y*output_scale))
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
 def _build_sin_lut() -> tuple[list[int], int, float, float, int]:
   """Build 1026-entry LUT for SIN over x∈[-π,π] → result∈[-1,1].
   Uses LUT_LE_START=-16384, index_scale=16384/π≈5215.2.
@@ -844,6 +892,10 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_softplus_wide" and \
      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_SOFTPLUS_WIDE)
+  if val.op is Ops.CUSTOM and val.arg == "rk_mish" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_MISH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_mish_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_MISH_LOCAL)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -1954,6 +2006,97 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
                 _emit_where_stage(total, raw_output, (positive, 0), (selected_correction, 0), Ops.SUB),
                 _emit_where_stage(total, info.outs[0], (raw_output, 0), zero, Ops.MAX)))
+  return tuple(tasks)
+
+def _try_mish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate Mish with broad/local LUTs and a near-zero Taylor interval."""
+  store = _store_node(sink)
+  if store is None or (source := _try_mish(store.src[1])) is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1) + 1
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+  def temp_index(slot:int) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
+  broad = alloc()
+  broad_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_mish")
+  broad_store = store.replace(src=(temp_index(broad), broad_val))
+  broad_plan = plan_rk(sink.substitute({store:broad_store}))
+  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(broad_plan)
+  tasks = [RKSubTask(cmds, task, relocs)]
+
+  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  zoomed = alloc()
+  tasks.append(_emit_where_stage(total, zoomed, source_arg, scalar(2.0), Ops.MUL))
+  local = alloc()
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_mish_local")
+  local_store = store.replace(src=(temp_index(local), local_val))
+  local_plan = plan_rk(sink.substitute({store:local_store}))
+  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(local_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  range_low_diff, range_low, range_high_diff, range_high = (alloc() for _ in range(4))
+  range_outside, range_inside = alloc(), alloc()
+  local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
+  local_outside, local_inside, poly_low_diff, poly_low = (alloc() for _ in range(4))
+  poly_high_diff, poly_high, poly_outside, poly_inside = (alloc() for _ in range(4))
+  local_mask, broad_mask = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, range_low_diff, scalar(-8.0), source_arg, Ops.SUB),
+                _emit_where_stage(total, range_low, (range_low_diff, 0), (range_low_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, range_high_diff, source_arg, scalar(8.0), Ops.SUB),
+                _emit_where_stage(total, range_high, (range_high_diff, 0), (range_high_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, range_outside, (range_low, 0), (range_high, 0), Ops.MAX),
+                _emit_where_stage(total, range_inside, one, (range_outside, 0), Ops.SUB),
+                _emit_where_stage(total, local_low_diff, scalar(-1.0), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_high_diff, source_arg, scalar(1.0), Ops.SUB),
+                _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
+                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+                _emit_where_stage(total, poly_low_diff, scalar(-0.08), source_arg, Ops.SUB),
+                _emit_where_stage(total, poly_low, (poly_low_diff, 0), (poly_low_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, poly_high_diff, source_arg, scalar(0.08), Ops.SUB),
+                _emit_where_stage(total, poly_high, (poly_high_diff, 0), (poly_high_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, poly_outside, (poly_low, 0), (poly_high, 0), Ops.MAX),
+                _emit_where_stage(total, poly_inside, one, (poly_outside, 0), Ops.SUB),
+                _emit_where_stage(total, local_mask, (local_inside, 0), (poly_inside, 0), Ops.SUB),
+                _emit_where_stage(total, broad_mask, (range_inside, 0), (local_inside, 0), Ops.SUB)))
+
+  bounded_low, neg_bounded_low, neg_clamped, bounded = (alloc() for _ in range(4))
+  poly_source, linear, square, quadratic, polynomial = (alloc() for _ in range(5))
+  positive_diff, positive, positive_extra, broad_scale, broad_scaled = (alloc() for _ in range(5))
+  broad_selected, local_scaled, local_selected, lut_sum = (alloc() for _ in range(4))
+  fallback, fallback_selected, inner = alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, bounded_low, source_arg, scalar(-0.08), Ops.MAX),
+                _emit_where_stage(total, neg_bounded_low, (_ZERO_SLOT, 0), (bounded_low, 0), Ops.SUB),
+                _emit_where_stage(total, neg_clamped, (neg_bounded_low, 0), scalar(-0.08), Ops.MAX),
+                _emit_where_stage(total, bounded, (_ZERO_SLOT, 0), (neg_clamped, 0), Ops.SUB),
+                _emit_where_stage(total, poly_source, (bounded, 0), (poly_inside, 0), Ops.MUL),
+                _emit_where_stage(total, linear, (poly_source, 0), scalar(0.6), Ops.MUL),
+                _emit_where_stage(total, square, (poly_source, 0), (poly_source, 0), Ops.MUL),
+                _emit_where_stage(total, quadratic, (square, 0), scalar(0.32), Ops.MUL),
+                _emit_where_stage(total, polynomial, (linear, 0), (quadratic, 0), Ops.ADD),
+                _emit_where_stage(total, positive_diff, source_arg, (_ZERO_SLOT, 0), Ops.SUB),
+                _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, positive_extra, (positive, 0), scalar(7.0), Ops.MUL),
+                _emit_where_stage(total, broad_scale, one, (positive_extra, 0), Ops.ADD),
+                _emit_where_stage(total, broad_scaled, (broad, 0), (broad_scale, 0), Ops.MUL),
+                _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_mask, 0), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local, 0), one, Ops.MUL),
+                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+                _emit_where_stage(total, fallback, source_arg, (_ZERO_SLOT, 0), Ops.MAX),
+                _emit_where_stage(total, fallback_selected, (fallback, 0), (range_outside, 0), Ops.MUL),
+                _emit_where_stage(total, inner, (lut_sum, 0), (polynomial, 0), Ops.ADD),
+                _emit_where_stage(total, info.outs[0], (inner, 0), (fallback_selected, 0), Ops.ADD)))
   return tuple(tasks)
 
 def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -3301,6 +3444,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_softplus_wide_lut(input_scale)
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_MISH:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_mish_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_MISH_LOCAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_mish_local_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is Ops.LOG2:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
     lut_le_start = 0xffffc000  # -16384
@@ -3408,7 +3559,7 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
   elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL,
                   _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
-                  _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL, _LUT_SOFTPLUS_TAIL, _LUT_SOFTPLUS_WIDE):
+                  _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL, _LUT_SOFTPLUS_TAIL, _LUT_SOFTPLUS_WIDE, _LUT_MISH, _LUT_MISH_LOCAL):
     # These LUTs use flat endpoint values; their staged epilogues handle the
     # behavior outside the table domain.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
@@ -4114,6 +4265,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (quick_gelu_tasks := _try_quick_gelu_two_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
   if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
   if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
+  if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:

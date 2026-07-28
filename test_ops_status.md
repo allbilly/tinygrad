@@ -19,6 +19,10 @@ the complete hardware file is at 63 passed with only the two baseline fill
 failures.
 `TestOps.test_softplus` now passes for beta `1`, `3`, and `1/3`; the complete
 hardware file advances to 64 passing methods with the same two fill failures.
+`TestOps.test_mish` now passes through a dedicated 45-task/two-LUT path. Its
+hardware regression covers a dense `[-2,2]` grid, finite `±8`, positive
+infinity, and NaN. The complete hardware file advances to **65 passed,
+2 failed** in 169.70 seconds; only fill-zero/fill-full remain.
 
 ## Summary
 
@@ -38,7 +42,7 @@ hardware file advances to 64 passing methods with the same two fill failures.
 | `RKPLAN_REJECT:unsupported_layout` | 138 | 2D/3D layouts not supported (conv, pool, matmul) |
 | `RKPLAN_REJECT:unsupported_dtype` | 58 | fp32/int32 dtype not supported |
 | `RKPLAN_REJECT:unsupported_op:fused_epilogue` | 36 | Fused epilogue not supported |
-| `TimeoutError` | 21 | NPU timeout (sin, tan, sinh, softplus, etc.) |
+| `TimeoutError` | 21 | Historical census: NPU timeout (sin, tan, sinh, etc.; Softplus and Mish were fixed post-census) |
 | `RKPLAN_REJECT:unsupported_op:non_index_operand` | 20 | Non-index operand in store |
 | `RKPLAN_REJECT:cmac_exceeds_cbuf` | 18 | CMAC exceeds circular buffer |
 | `AssertionError: dtype` | 15 | dtype mismatch (fp16 vs fp32) |
@@ -66,9 +70,9 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
 ### 4. Transcendental ops — ~12 tests
-Exp, sin, cos, tan, sinh, cosh, erf, gelu, elu, selu, mish, sigmoid_extreme.
+Exp, sin, cos, tan, sinh, cosh, erf, gelu, elu, selu, sigmoid_extreme.
 
-**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_elu, test_selu, test_mish, test_sigmoid*
+**Tests:** test_exp, test_sin, test_cos, test_tan, test_sinh, test_cosh, test_erf, test_gelu*, test_elu, test_selu, test_sigmoid*
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -127,6 +131,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
 - Softplus for beta `1`, `3`, and `1/3`, including dense/special coverage
+- Mish on the official method and dense `[-2,2]` interval, using two LUT tasks
 - abs, sign, round, inf_div (fp32 inputs)
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)

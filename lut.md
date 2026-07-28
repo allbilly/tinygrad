@@ -1031,6 +1031,63 @@ The final raw-schedule graphs use 12 tasks/two LUTs for beta one and three, and
 eight tasks/one LUT for beta one-third. All three official subcases and the
 2049-point `[-2,2]` hardware regressions, including infinities and NaN, pass.
 
+## Case study: Mish with asymmetric broad and local LUTs
+
+Mish combines an unbounded positive result, a small negative tail, and unusually
+tight relative tolerance near zero:
+
+```text
+mish(x) = x*tanh(log1p(exp(x)))
+```
+
+A single output Q format is wasteful. Q14 gives the negative side useful
+precision but clips positive results above two. Dividing the entire table by
+eight supplies positive headroom but makes the negative-tail quantum too large.
+The two signed hardware tables may contain differently scaled values even
+though they share one output exponent, so use:
+
+```text
+negative table = Q15 mish(x)
+positive table = Q15 mish(x)/8
+epilogue scale = 1 for x<0, 8 for x>=0
+domain         = [-8,8], index_scale=2048
+```
+
+The sign-dependent multiplier is applied in later DPU tasks. This asymmetric
+encoding is useful whenever the LE and LO halves have very different dynamic
+ranges.
+
+The broad spacing of `0.015625` is not sufficient around zero. The second NPU
+LUT addresses `z=2*x`, stores direct Q15 Mish, and is selected for `|x|<=1`.
+Inside `|x|<=0.08`, use the fp16-staged Taylor form:
+
+```text
+0.6*x + 0.32*x*x
+```
+
+Bound `x` to the Taylor interval before multiplying it by the polynomial mask.
+Masking an unbounded value first as `x*mask` is unsafe because an unselected
+infinity produces NaN through `inf*0`.
+
+Useful tuning sequence:
+
+1. Run the official method with both `CACHELEVEL=0` and `CCACHE=0`.
+2. Record failing result values and infer the corresponding source interval;
+   Mish output and input are not interchangeable near zero.
+3. Widen the local table only far enough to absorb broad-table interpolation
+   misses, then verify it does not clip at the Q15 signed limit.
+4. Exhaustively model the chosen Taylor expression over fp16 values before
+   selecting its interval.
+5. Probe a dense wider domain separately. The current `[-8,8]` probe retains
+   326 relative-tolerance misses in the tiny negative tail even though the
+   official and dense `[-2,2]` contracts pass. This is the target for a future
+   segmented negative-tail scale, not a reason to loosen tolerance.
+
+The accepted graph has 45 tasks and exactly two LUT tasks. It uses
+`max(x,0)` outside the finite table interval, which gives the correct positive
+asymptote and a zero negative asymptote. Consequently positive infinity and NaN
+match, while negative infinity returns zero instead of PyTorch's composite NaN.
+
 ## Case study: QuickGELU with two LUTs and a Taylor interval
 
 PyTorch's QuickGELU reference is not a single rounded evaluation of

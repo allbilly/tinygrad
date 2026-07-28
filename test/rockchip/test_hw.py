@@ -198,6 +198,14 @@ class TestDPU(unittest.TestCase):
       actual = Tensor(a_np, device="ROCKCHIP").softplus(beta=beta).realize().numpy()
       np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_mish_two_lut(self):
+    a_np = np.concatenate((np.linspace(-2, 2, 2049, dtype=np.float16),
+                           np.array([-8, 8, np.inf, np.nan], dtype=np.float16)))
+    with np.errstate(over="ignore", invalid="ignore"):
+      expected = (a_np.astype(np.float32)*np.tanh(np.logaddexp(0, a_np.astype(np.float32)))).astype(np.float16)
+    actual = Tensor(a_np, device="ROCKCHIP").mish().realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_sqrt_special_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -2, -0.0, 0, 0.25, 4], dtype=np.float16)
     actual = Tensor(a_np, device="ROCKCHIP").sqrt().realize().numpy()

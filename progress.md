@@ -1,5 +1,69 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-29 — two-LUT Mish milestone
+
+### Recognition and failure reduction
+
+- Tinygrad lowers `mish(x) = x*tanh(softplus(x))` to a composite graph with
+  three EXP2 nodes, one LOG2, one MAX, and either RECIPROCAL or FDIV depending
+  on whether the Rockchip pre-rewrite has run. `_try_mish` accepts both forms,
+  but still requires one fp16 INDEX and the exact stable-op family.
+- Letting the generic elementwise splitter handle that graph timed out. A
+  direct broad Q14 Mish LUT over `[-2,2]` reduced the official method to 79
+  misses, all in the tolerance-sensitive interval near zero.
+- A narrow Q15 local LUT plus the fp16-staged Taylor expression
+
+  ```text
+  mish(x) = 0.6*x + 0.32*x² + O(x³)
+  ```
+
+  removed those central misses. Exhaustive fp16 software modeling found no
+  Taylor failures for `|x|<=0.08`; the production mask uses that measured
+  interval.
+
+### Two-level LUT tuning
+
+- Widening the broad table directly from `[-2,2]` to `[-8,8]` changed its
+  spacing from about `0.003906` to `0.015625`. With the original narrow local
+  table this reintroduced 54/2925 official misses.
+- The final second LUT is a Q15 direct Mish table over `[-1,1]`, addressed by
+  `z=2*x`. It replaces the earlier `z=16*x`, `8*Mish(x)` experiment over
+  `[-0.125,0.125]`; that earlier mapping remains described in the source as a
+  tuning reference.
+- The broad LUT is asymmetric Q15:
+
+  ```text
+  x < 0: stored value = mish(x)
+  x >= 0: stored value = mish(x)/8
+  ```
+
+  Its staged epilogue multiplies only the positive half by eight. This preserves
+  Q15 resolution for the small negative result while providing enough positive
+  headroom through `x=8`.
+- A bounded copy of the source feeds the Taylor branch before multiplication.
+  This avoids `inf*0 -> NaN` contamination in unselected lanes. Outside
+  `[-8,8]`, the finite asymptotic fallback is `max(x,0)`.
+- Final raw schedule: **45 NPU tasks**, including exactly **two LUT tasks**.
+
+### Verification and retained diagnostics
+
+- `TestOps.test_mish`: **PASS** with `CACHELEVEL=0 CCACHE=0`.
+- Rockchip regression: 2049 fp16 points over `[-2,2]`, plus `-8`, `8`, positive
+  infinity, and NaN: **PASS**.
+- A deliberately wider 4097-point `[-8,8]` diagnostic has 326 strict-relative
+  misses in the small negative tail. The maximum absolute error is
+  `0.00390625`; this diagnostic is retained for future segmented-tail tuning
+  and is not hidden by loosening the official tolerance.
+- Negative infinity differs from PyTorch's composite convention: the staged
+  asymptotic branch returns zero while PyTorch produces NaN from
+  `-inf*tanh(0)`. Positive infinity and NaN match.
+- Complete serial `test/rockchip/test_hw.py`: **65 passed, 2 failed** in
+  169.70 seconds. Only the unchanged fill-zero/fill-full baseline failures
+  remain.
+- Compileall and `git diff --check` pass. Full mypy retains the same 13
+  pre-existing findings. The `.venv` does not contain Ruff, so the prescribed
+  `python -m ruff` check could not run in this milestone.
+
 ## 2026-07-29 — beta-aware Softplus milestone
 
 ### Recognition and decomposition
