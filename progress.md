@@ -4093,3 +4093,41 @@ Yes, it can be within 25k. Requires near-complete rewrite: table-driven emission
 - Circular/reflect/replicate pad modes use different WHERE patterns not yet parsed.
 - inf/-inf pad values have fp16 representation issues.
 
+
+## 2026-07-29 — Full test_ops.py run + segfault fixes
+
+### Full Test Run Results
+- **140 passed, 375 failed (276 test functions + 99 subtests), 8 skipped, 27 subtests passed**
+- Total: 424 test functions
+- Runtime: 575 seconds (9.5 minutes)
+
+### Segfault Fixes
+Fixed two segfault issues that were killing the test process:
+
+1. **Output conversion buffer overflow** (`_submit_multi` line 617):
+   - `n` was set to `total` (max across all subtasks), which could be larger than
+     the actual output buffer for broadcast/pad ops
+   - Fixed: use `out_n = prepared[output_slot].size // out_itemsize` where
+     `out_itemsize` is 4 for fp32/int32, 2 for fp16/trunc, 1 for uint8/bool
+   - This was causing segfaults in test_cosh, test_celu, test_logaddexp, test_full
+
+2. **Strided broadcast copy out-of-bounds** (`_submit_one` line 242):
+   - `ctypes.memmove` was writing past the output buffer when `total` > output size
+   - Fixed: added bounds checks `0 <= src_idx < in_n` and `0 <= out_idx < out_n`
+     before each memmove in both `_submit_one` and `_submit_multi` copy paths
+   - This was causing segfault in test_cat (dim=2, 3D tensor cat)
+
+### Top Failure Categories (by error type)
+1. **unsupported_op:Ops.WHERE** (196 occurrences) — pow, softmax, scatter, isclose, etc.
+2. **unsupported_layout** (138 occurrences) — conv, pool, matmul with 2D/3D layouts
+3. **unsupported_dtype** (58 occurrences) — fp32/int32 dtype
+4. **unsupported_op:fused_epilogue** (36 occurrences) — fused epilogue
+5. **TimeoutError** (21 occurrences) — sin, tan, sinh, softplus, etc.
+6. **unsupported_op:non_index_operand** (20 occurrences) — non-index operand in store
+7. **cmac_exceeds_cbuf** (18 occurrences) — CMAC exceeds circular buffer
+8. **AssertionError: cmac** (12 occurrences) — CMAC sum classification failed
+9. **unsupported_op:Ops.MUL/ADD/XOR/OR/AND/SHL/SHR** (32 occurrences) — bitwise + some EW
+
+### Status file
+See `test_ops_status.md` for full breakdown of failures by category and passing tests.
+

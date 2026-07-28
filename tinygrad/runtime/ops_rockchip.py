@@ -229,17 +229,21 @@ class RockchipProgram(Program['RockchipDevice']):
             for dim in range(ndim-1, -1, -1):
               rem, coord = divmod(rem, shape[dim])
               dst_idx += coord * dst_strides[dim]
-            ctypes.memmove(out_addr + dst_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
+            if 0 <= src_idx < in_buf.size // itemsize and 0 <= dst_idx < out_buf.size // itemsize:
+              ctypes.memmove(out_addr + dst_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
         elif len(task.layout) > 1 and in_is_fp32 == out_is_fp32:
           _, ndim, *meta = task.layout
           shape, strides, offset = meta[:ndim], meta[ndim:2*ndim], meta[-1]
           itemsize = 4 if in_is_fp32 else 2
+          in_n = in_buf.size // itemsize
+          out_n = out_buf.size // itemsize
           for out_idx in range(total):
             rem, src_idx = out_idx, offset
             for dim in range(ndim-1, -1, -1):
               rem, coord = divmod(rem, shape[dim])
               src_idx += coord * strides[dim]
-            ctypes.memmove(out_addr + out_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
+            if 0 <= src_idx < in_n and 0 <= out_idx < out_n:
+              ctypes.memmove(out_addr + out_idx*itemsize, in_buf.va_addr + src_idx*itemsize, itemsize)  # type: ignore[arg-type]
         elif in_is_fp32 and out_is_fp32:
           # fp32→fp32 copy: just memmove fp32 data directly
           ctypes.memmove(out_addr, in_buf.va_addr, total * 4)  # type: ignore[arg-type]
@@ -374,17 +378,21 @@ class RockchipProgram(Program['RockchipDevice']):
             for dim in range(ndim-1, -1, -1):
               rem, coord = divmod(rem, shape[dim])
               dst_idx += coord * dst_strides[dim]
-            ctypes.memmove(out_addr + dst_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
+            if 0 <= src_idx < in_buf.size // 2 and 0 <= dst_idx < out_buf.size // 2:
+              ctypes.memmove(out_addr + dst_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
         elif len(task.layout) > 1:
           # 2D copy with strides (broadcast expansion)
           _, ndim, *meta = task.layout
           shape, strides, offset = meta[:ndim], meta[ndim:2*ndim], meta[-1]
+          in_n = in_buf.size // 2
+          out_n = out_buf.size // 2
           for out_idx in range(total):
             rem, src_idx = out_idx, offset
             for dim in range(ndim-1, -1, -1):
               rem, coord = divmod(rem, shape[dim])
               src_idx += coord * strides[dim]
-            ctypes.memmove(out_addr + out_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
+            if 0 <= src_idx < in_n and 0 <= out_idx < out_n:
+              ctypes.memmove(out_addr + out_idx*2, in_buf.va_addr + src_idx*2, 2)  # type: ignore[arg-type]
         else:
           ctypes.memmove(out_addr, in_buf.va_addr, total * 2)  # type: ignore[arg-type]
       return
@@ -495,9 +503,14 @@ class RockchipProgram(Program['RockchipDevice']):
     output_conversion = None
     if converted_output is not None:
       output_slot, is_fp32, is_uint8, is_bool, is_trunc = converted_output
-      converted = dev._gpu_alloc(max(total * 2, 4096), 0)
+      # Use the actual output element count from the buffer size, not `total` (which is
+      # max across subtasks and may be larger than the real output for broadcast/pad ops)
+      # fp32/int32 outputs are 4 bytes; uint8/bool are 1 byte; fp16/trunc are 2 bytes
+      out_itemsize = 4 if is_fp32 else (1 if (is_uint8 or is_bool) else (2 if is_trunc else 4))
+      out_n = prepared[output_slot].size // out_itemsize
+      converted = dev._gpu_alloc(max(total * 2, out_n * 2, 4096), 0)
       temp.append(converted)
-      output_conversion = (prepared[output_slot], converted, total, is_fp32, is_uint8, is_bool, is_trunc)
+      output_conversion = (prepared[output_slot], converted, out_n, is_fp32, is_uint8, is_bool, is_trunc)
       prepared[output_slot] = converted
     bufs = tuple(prepared)
     try:
