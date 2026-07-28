@@ -14,6 +14,7 @@ remaining tests have been isolated.
 | `test_clip` | PASS | Nested WHERE, equal bounds, and one-sided bounds |
 | `test_flip`, `test_permute`, `test_transpose`, strided slices | PASS | Arbitrary-rank affine copy |
 | `test_abs`, `test_add`, `test_add3`, `test_sub`, `test_mul`, `test_div`, `test_relu` | PASS | Isolated hardware runs |
+| `test_relu_exact`, `test_relu_maximum_exact` | PASS | Single DPU MAX path is selected before general WHERE |
 | `test_sigmoid` | PASS | Direct 513-entry sigmoid LUT |
 | `test_leaky_relu`, `test_relu6`, `test_hardsigmoid`, `test_hardtanh` | PASS | Arithmetic inside/around staged WHERE |
 | `test_exp` | FAIL | LUT precision: 301/2925 elements exceed tolerance |
@@ -23,9 +24,8 @@ remaining tests have been isolated.
 | `test_tanh`, `test_lerp` | FAIL | Now execute as staged expressions; fp16 rounding exceeds strict tolerance |
 | `test_hardswish` | FAIL | Now executes; 34/2925 fp16 values exceed tolerance |
 
-Latest milestone regression: the new activation group, `test_add3`,
-`test_sigmoid`, `test_where`, `test_clip`, and `test/rockchip/test_hw.py` —
-**47 passed**; mypy and targeted Ruff — **PASS**.
+Latest exact/activation/WHERE regression plus `test/rockchip/test_hw.py` —
+**48 passed**; mypy and targeted Ruff — **PASS**.
 
 Generated: 2026-07-27 21:22 UTC | commit 993ea1197
 

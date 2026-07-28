@@ -1485,9 +1485,9 @@ def build_native_program(sink: UOp) -> UOp|None:
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   sink = graph_rewrite(sink, _pm_where_mul, name="rk distribute where mul")
-  if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
+    if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
     raise RuntimeError(plan)  # reject — preserve reason, no fallback
   cmds, task, relocs = emit_rk(plan)

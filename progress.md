@@ -1,5 +1,22 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — single-stage MAX/ReLU priority milestone
+
+### Implementation
+- Native single-task classification now runs before general multi-stage WHERE
+  lowering. MAX/ReLU-shaped WHERE expressions therefore use one DPU MAX task
+  instead of an unnecessary eight-stage comparison/select program.
+- Multi-stage WHERE and nested elementwise lowering remain the fallback when
+  the single-stage classifier rejects the expression.
+
+### Verification
+- `test_relu`, `test_relu_exact`, and `test_relu_maximum_exact` — **PASS**.
+- All fp16 portions of `test_maximum` pass; the test now stops only at its
+  unsupported int32 arithmetic cases.
+- Exact/activation/WHERE regression plus `test/rockchip/test_hw.py` —
+  **48 passed**.
+- `python -m mypy tinygrad/` and targeted Ruff — **PASS**.
+
 ## 2026-07-28 — arithmetic WHERE branches milestone
 
 ### Implementation
