@@ -7,7 +7,7 @@ import struct, math, numpy as np
 from dataclasses import dataclass
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import ceildiv, round_up, prod
-from tinygrad.uop.ops import Ops, UOp, ProgramInfo, GroupOp, PatternMatcher, graph_rewrite
+from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.upat import UPat
 
@@ -75,6 +75,9 @@ class RKTask:
   const_val: float = 1.0
   fp32_inputs: tuple[int, ...] = ()   # slot numbers that are fp32 (need fp32→fp16 conversion before NPU)
   fp32_output: bool = False           # output slot is fp32 (need fp16→fp32 conversion after NPU)
+  bool_inputs: tuple[int, ...] = ()   # boolean mask slots converted to fp16 before multi-task execution
+  broadcast_inputs: tuple[int, ...] = () # scalar fp16 input slots expanded to the logical element count
+  int32_output: bool = False          # multi-task output converted from fp16 to int32
 
 @dataclass(frozen=True)
 class RKSubTask:
@@ -88,7 +91,8 @@ class RKSubTask:
 def _is_fp16_only(sink: UOp) -> bool:
   """All tensor-carrying nodes must be fp16 or fp32 (REDUCE may be fp32 for the NPU accumulator).
   fp32 inputs/outputs are handled via buffer-level conversion in RockchipProgram.__call__."""
-  return all(not ((u.op is Ops.PARAM and u.dtype not in (dtypes.half, dtypes.float)) or (u.op is Ops.REDUCE and u.dtype not in (dtypes.half, dtypes.float)) or
+  return all(not ((u.op is Ops.PARAM and u.dtype not in (dtypes.half, dtypes.float)) or
+                  (u.op is Ops.REDUCE and u.dtype not in (dtypes.half, dtypes.float)) or
                   (u.op is Ops.STORE and u.src[1].dtype not in (dtypes.half, dtypes.void, dtypes.float))) for u in sink.toposort())
 
 def _find_op(sink: UOp, op: Ops) -> UOp|None: return next((u for u in sink.toposort() if u.op is op), None)
@@ -110,7 +114,8 @@ def _is_2d_index(idx: UOp, outer_kind: str = "LOOP", inner_kind: str = "LOOP", s
   if ms.op is not Ops.MUL or rs.op is not Ops.RANGE: return None
   mr, mc = ms.src
   if mr.op is not Ops.RANGE or mc.op is not Ops.CONST: return None
-  if mr.arg[1].name != outer_kind or rs.arg[1].name != inner_kind or (stride >= 0 and int(mc.arg) != stride) or (stride < 0 and mr.arg[0] != 0): return None
+  if mr.arg[1].name != outer_kind or rs.arg[1].name != inner_kind or \
+     (stride >= 0 and int(mc.arg) != stride) or (stride < 0 and mr.arg[0] != 0): return None
   return (int(mr.src[0].arg) if mr.src and mr.src[0].op is Ops.CONST else 0, int(mc.arg), int(mc.arg))
 
 def _try_sub(val: UOp) -> tuple[int, int]|None:
@@ -338,18 +343,18 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     if inner.op is Ops.MUL:
       a, b = inner.src
       if a.op is Ops.CONST and _unwrap(b).op is Ops.INDEX:
-        input_scale = float(a.arg); inner = _unwrap(b)
+        input_scale, inner = float(a.arg), _unwrap(b)
       elif b.op is Ops.CONST and _unwrap(a).op is Ops.INDEX:
-        input_scale = float(b.arg); inner = _unwrap(a)
+        input_scale, inner = float(b.arg), _unwrap(a)
     if inner.op is not Ops.INDEX: return None
     return (inner.src[0].buf_uop.arg.slot, input_scale, output_scale, val.op)
   # Check for MUL(INDEX, CONST) scaling (e.g., exp(x) = exp2(x * log2(e)))
   if inner.op is Ops.MUL:
     a, b = inner.src
     if a.op is Ops.CONST and _unwrap(b).op is Ops.INDEX:
-      input_scale = float(a.arg); inner = _unwrap(b)
+      input_scale, inner = float(a.arg), _unwrap(b)
     elif b.op is Ops.CONST and _unwrap(a).op is Ops.INDEX:
-      input_scale = float(b.arg); inner = _unwrap(a)
+      input_scale, inner = float(b.arg), _unwrap(a)
   if inner.op is not Ops.INDEX: return None
   return (inner.src[0].buf_uop.arg.slot, input_scale, output_scale, val.op)
 
@@ -406,13 +411,13 @@ def _is_cmac_matmul_layout(sink: UOp, reduce: UOp) -> bool:
   if len(out_shape) == 2:  # GEMM
     N = int(out_shape[1])
     if not _is_2d_index(store.src[0].src[1], "LOOP", "LOOP", N): return False
-    return (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", N)) or \
-           (_is_2d_index(a_idx.src[1], "REDUCE", "LOOP", N) and _is_2d_index(b_idx.src[1], "LOOP", "REDUCE", K))
+    return (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) is not None and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", N) is not None) or \
+           (_is_2d_index(a_idx.src[1], "REDUCE", "LOOP", N) is not None and _is_2d_index(b_idx.src[1], "LOOP", "REDUCE", K) is not None)
   if len(out_shape) == 1:  # GEMV: (K,)@(K,D)→(D,) or (D,K)@(K,)→(D,)
     D = int(out_shape[0])
     if not _is_1d_index(store.src[0].src[1], "LOOP"): return False
-    return (_is_1d_index(a_idx.src[1], "REDUCE") and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", D)) or \
-           (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) and _is_1d_index(b_idx.src[1], "REDUCE"))
+    return (_is_1d_index(a_idx.src[1], "REDUCE") and _is_2d_index(b_idx.src[1], "REDUCE", "LOOP", D) is not None) or \
+           (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) is not None and _is_1d_index(b_idx.src[1], "REDUCE"))
   return False
 
 def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
@@ -602,9 +607,98 @@ _DPU_EW_CFGS = {Ops.ADD: _EW_BASE | (2 << 16), Ops.SUB: _EW_BASE | (4 << 16),
                  Ops.MUL: _EW_BASE | (1 << 2) | (1 << 8), Ops.MAX: _EW_BASE,
                  Ops.FDIV: _EW_BASE | (3 << 16) | (1 << 8)}
 
+def _where_arg(u: UOp) -> tuple[int, int]|None:
+  u = _unwrap(u)
+  if u.op is Ops.INDEX: return u.src[0].buf_uop.arg.slot, 0
+  if u.op is Ops.CONST: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(u.arg)))[0]
+  return None
+
+def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
+                      bool_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False) -> RKSubTask:
+  """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
+  cmds:list[RKCmd] = []
+  relocs:list[RKReloc] = []
+  def e(t, r, v): emitter_emit(cmds, t, r, v)
+  e(_T_DPU, rk.REG_DPU_S_POINTER, 0xe)
+  e(_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
+  e(_T_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002)
+  e(_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, (total+7)//8-1)
+  e(_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0)
+  e(_T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+  e(_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007)
+  e(_T_DPU, rk.REG_DPU_BS_CFG, 0x53)
+  e(_T_DPU, rk.REG_DPU_BN_CFG, 0x53)
+  e(_T_DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+  e(_T_DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+  e(_T_DPU, rk.REG_DPU_BS_OW_CFG, 2)
+  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_0, 7)
+  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_1, (total+7)//8-1)
+  e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+  e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+  if compare:
+    e(_T_DPU, rk.REG_DPU_BS_CFG, 0x40040)
+    e(_T_DPU, rk.REG_DPU_BS_ALU_CFG, 0x33800000)
+    e(_T_DPU, rk.REG_DPU_BS_MUL_CFG, 0x40000000)
+    e(_T_DPU, rk.REG_DPU_BN_CFG, 0x40082)
+    e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0x7c000000)
+    e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0x3f800000)
+  e(_T_DPU, rk.REG_DPU_EW_CFG, _EW_BASE | 1 if compare else _DPU_EW_CFGS[op])
+  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001)
+  e(_T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+  e(_T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40)
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe)
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, (total+7)//8-1)
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0)
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7)
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008)
+  for target, reg, arg in ((_T_DPU, rk.REG_DPU_DST_BASE_ADDR, (out_slot, 0)),
+                           (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, a),
+                           (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, b)):
+    e(target, reg, 0)
+    emitter_reloc(cmds, relocs, arg[0], arg[1])
+  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
+  emitter_pc_op_en(cmds, 12)
+  task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs,
+                broadcast_inputs=broadcast_inputs, int32_output=int32_output)
+  return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
+
+def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  store = _store_node(sink)
+  if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
+  cond = _unwrap(val.src[0])
+  true, false = (_where_arg(x) for x in val.src[1:])
+  if true is None or false is None: return None
+  total, info = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink)
+  broadcasts = tuple(a[0] for u, a in zip(val.src[1:], (true, false))
+                     if _unwrap(u).op is Ops.INDEX and int(_unwrap(u).src[0].src[0].arg) < total)
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  t0, mask, scratch, selected_false = range(next_slot, next_slot+4)
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  int_out = dtypes.is_int(val.dtype)
+  if cond.op is Ops.CMPLT:
+    lhs, rhs = (_where_arg(x) for x in cond.src)
+    if lhs is None or rhs is None: return None
+    return (_emit_where_stage(total, t0, rhs, lhs, Ops.SUB),
+            _emit_where_stage(total, mask, (t0,0), (t0,0), Ops.MAX, compare=True),
+            _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
+            _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, out, (t0,0), (selected_false,0), Ops.ADD, broadcast_inputs=broadcasts, int32_output=int_out))
+  if cond.op is Ops.INDEX and (mask_arg := _where_arg(cond)) is not None:
+    bool_slots = (mask_arg[0],)
+    return (_emit_where_stage(total, t0, true, mask_arg, Ops.MUL, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, scratch, one, mask_arg, Ops.SUB, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
+            _emit_where_stage(total, out, (t0,0), (selected_false,0), Ops.ADD, bool_inputs=bool_slots,
+                              broadcast_inputs=broadcasts, int32_output=int_out))
+  return None
+
 def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """DPU elementwise op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy. Register sequence from elementwise.py."""
-  cmds, relocs = [], []
+  cmds:list[RKCmd] = []
+  relocs:list[RKReloc] = []
   sink = plan.sink
   store = _store_node(sink)
   assert store is not None, "dpu: no STORE node"
@@ -618,13 +712,14 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   is_copy = vu.op is Ops.INDEX
   is_fill = vu.op is Ops.CONST
   lut_result = _try_lut(val)
-  lut_slot = lut_result[0] if lut_result is not None else None
   sub_slots, scalar = (None, None) if (is_copy or is_fill or lut_result is not None) else (_try_sub(val), _try_scalar(val))
   reciprocal = None if (is_copy or is_fill or sub_slots is not None or scalar is not None or lut_result is not None) else _try_reciprocal(val)
-  abs_slot = _try_abs(val) if not (is_copy or is_fill or lut_result is not None or sub_slots is not None or scalar is not None or reciprocal is not None) else None
+  abs_slot = _try_abs(val) if not (is_copy or is_fill or lut_result is not None or sub_slots is not None or
+                                   scalar is not None or reciprocal is not None) else None
   layout = (total,)
   # track the EW op for FDIV-specific register emissions (OUT_CVT_SCALE, FP16TOFP32_EN=0)
-  ew_op = Ops.SUB if sub_slots else (Ops.FDIV if reciprocal else (val.op if scalar else (Ops.ADD if is_fill else (Ops.MAX if abs_slot else (None if is_copy else val.op)))))
+  ew_op = Ops.SUB if sub_slots else (Ops.FDIV if reciprocal else (val.op if scalar else
+          (Ops.ADD if is_fill else (Ops.MAX if abs_slot else (None if is_copy else val.op)))))
   # S_POINTER: re-arm ping-pong pointers (pcchain.md §ADD Reference Captures)
   # Without these, PC chain later tasks don't execute correctly.
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_S_POINTER, 0x0e)
@@ -723,7 +818,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   """DPU LUT op (EXP2). Register sequence from ref/rk3588/experimental/kernel_6_18/silu.py.
   Uses LUT table lookup with BN_MUL index scaling and OUT_CVT FP32→FP16 conversion.
   The DPU LUT always processes a full 16x8 tile (128 elements) regardless of logical size."""
-  cmds, relocs = [], []
+  cmds:list[RKCmd] = []
+  relocs:list[RKReloc] = []
   sink = plan.sink
   store = _store_node(sink)
   assert store is not None, "dpu_lut: no STORE node"
@@ -854,7 +950,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
 
 def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """CNA+CORE matmul or sum. A=(M,K), B=(K,N), output=(M,N) FP32→FP16. Transforms in __call__."""
-  cmds, relocs = [], []
+  cmds:list[RKCmd] = []
+  relocs:list[RKReloc] = []
   sink = plan.sink
   reduce = _reduce_node(sink)
   assert reduce is not None, "cmac: no REDUCE node"
@@ -981,7 +1078,8 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
 def _emit_ppu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
   """PPU globalmax. Input (H,W,C) fp16 → (C,) fp16. Raw register values per pool.py.
   PPU processes channels in groups of 8 for FP16; C is padded to a multiple of 8."""
-  cmds, relocs = [], []
+  cmds:list[RKCmd] = []
+  relocs:list[RKReloc] = []
   sink = plan.sink
   reduce = _reduce_node(sink)
   assert reduce is not None, "ppu: no REDUCE node"
@@ -1135,12 +1233,15 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   fp32_mask = (1 << 7 if task.fp32_output else 0) | sum(1 << s for s in task.fp32_inputs if s < 7)
   fp32_bytes = struct.pack("<B", fp32_mask)
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
-  task_header = struct.pack("<IIIIIIIIi", n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout, task.out_slot, 0, 0)
+  dtype_flags = int(task.int32_output) | sum(1 << (8+s) for s in task.bool_inputs if s < 16)
+  input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16)
+  task_header = struct.pack("<IIIIIIIIi", n_cmds, n_relocs, task.enable_mask, task.int_mask, task.op_idx, kind_layout,
+                            task.out_slot, input_flags, dtype_flags)
   return task_header + struct.pack(f"<{n_cmds}Q", *cmds) + reloc_bytes + layout + const_bytes + fp32_bytes
 
 def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKReloc], int]:
   """Decode a single task from offset. Returns (cmds, task, relocs, new_offset)."""
-  n_cmds, n_relocs, emask, imask, op_idx, kl, out_slot, _, _ = struct.unpack_from("<IIIIIIIIi", data, off)
+  n_cmds, n_relocs, emask, imask, op_idx, kl, out_slot, input_flags, dtype_flags = struct.unpack_from("<IIIIIIIIi", data, off)
   off += 36
   ki = (kl >> 24) & 0xFF
   is_copy = bool((kl >> 23) & 1)
@@ -1151,6 +1252,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
   relocs = []
   for i in range(n_relocs):
     wi, gs, add, sh, mask, fsh = struct.unpack_from("<IIIIII", data, off + i * 24)
+    if gs >= 1 << 31: gs -= 1 << 32
     relocs.append(RKReloc(wi, gs, add, sh, mask, fsh))
   off += n_relocs * 24
   layout = struct.unpack_from(f"<{n_layout}i", data, off) if n_layout else ()
@@ -1161,8 +1263,12 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
   off += 1
   fp32_output = bool(fp32_mask & (1 << 7))
   fp32_inputs = tuple(s for s in range(7) if fp32_mask & (1 << s))
+  bool_inputs = tuple(s for s in range(16) if dtype_flags & (1 << (8+s)))
+  broadcast_inputs = tuple(s for s in range(16) if input_flags & (1 << s))
   return cmds, RKTask(emask, imask, op_idx, _RK_KINDS[ki], layout, out_slot, is_copy, is_fill,
-                      const_val=const_val, fp32_inputs=fp32_inputs, fp32_output=fp32_output), relocs, off
+                      const_val=const_val, fp32_inputs=fp32_inputs, fp32_output=fp32_output,
+                      bool_inputs=bool_inputs, broadcast_inputs=broadcast_inputs,
+                      int32_output=bool(dtype_flags & 1)), relocs, off
 
 def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
   """Pack multiple tasks into one image (version 4 = PC chain).
@@ -1193,6 +1299,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str): raise RuntimeError(plan)  # reject — preserve reason, no fallback
   cmds, task, relocs = emit_rk(plan)

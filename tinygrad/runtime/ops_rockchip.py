@@ -15,7 +15,7 @@ from tinygrad.uop.ops import UOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.support.rockchip import (build_native_program, build_native_program_multi,
+from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask, _CONST_SLOT, _ZERO_SLOT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
@@ -45,6 +45,20 @@ def _convert_fp16_to_fp32_buf(src, dst, n):
   """Convert n fp16 elements at src to fp32 at dst (buffer-level cast, not NPU compute)."""
   import numpy as np
   arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.float32)
+  ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
+
+def _convert_bool_to_fp16_buf(src, dst, n):
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n), dtype=np.bool_).astype(np.float16)
+  ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
+def _broadcast_fp16_buf(src, dst, src_n, n):
+  data = ctypes.string_at(src, src_n * 2)
+  ctypes.memmove(dst, (data * ((n + src_n - 1) // src_n))[:n*2], n * 2)
+
+def _convert_fp16_to_int32_buf(src, dst, n):
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.int32)
   ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
 
 def _unpack_cmac_out(src, dst, M, N, align_out):
@@ -246,9 +260,56 @@ class RockchipProgram(Program['RockchipDevice']):
     _T_PC = 0x0081
     subtasks = self.subtasks
     assert subtasks is not None
+    # The custom comparison stage leaves DPU state that makes a full WHERE chain unstable.
+    # Submit those programs stage-by-stage with resets, retaining shared scratch allocations.
+    def is_cmp(st): return any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
+                               ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds)
+    if len(subtasks) > 1 and any(is_cmp(st) for st in subtasks):
+      ext, shared, original = list(bufs), [], self.subtasks
+      max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                     default=len(ext)-1)
+      total = max(st.task.layout[0] for st in subtasks)
+      if getenv("DEBUG") >= 2: print(f"WHERE stages: bufs={len(ext)} max_slot={max_slot} total={total}")
+      try:
+        while len(ext) <= max_slot:
+          shared.append(b := dev._gpu_alloc(max(total * 2, 4096), 0))
+          ext.append(b)
+        for st in subtasks:
+          dev.reset_npu()
+          self.subtasks = [st]
+          self._submit_multi(tuple(ext))
+      finally:
+        self.subtasks = original
+        for b in shared: dev._gpu_free(b)
+      return
     temp:list[HCQBuffer] = []
+    prepared = list(bufs)
+    total = max(st.task.layout[0] for st in subtasks)
+    max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                   default=len(prepared)-1)
+    while len(prepared) <= max_slot:
+      temp.append(scratch := dev._gpu_alloc(max(total * 2, 4096), 0))
+      prepared.append(scratch)
+    for slot in {s for st in subtasks for s in st.task.bool_inputs}:
+      converted = dev._gpu_alloc(max(total * 2, 4096), 0)
+      temp.append(converted)
+      _convert_bool_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, total)
+      prepared[slot] = converted
+    for slot in {s for st in subtasks for s in st.task.broadcast_inputs}:
+      converted = dev._gpu_alloc(max(total * 2, 4096), 0)
+      temp.append(converted)
+      _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, prepared[slot].size // 2, total)
+      prepared[slot] = converted
+    int_output = next((st.task.out_slot for st in subtasks if st.task.int32_output), None)
+    int_output_conversion = None
+    if int_output is not None:
+      converted = dev._gpu_alloc(max(total * 2, 4096), 0)
+      temp.append(converted)
+      int_output_conversion = (prepared[int_output], converted, total)
+      prepared[int_output] = converted
+    bufs = tuple(prepared)
     try:
-      buf_map:dict[int, HCQBuffer] = {i: b for i, b in enumerate(bufs)}
+      buf_map:dict[int, HCQBuffer] = dict(enumerate(bufs))
       n_tasks = len(subtasks)
       # Emitters already end each command stream with PC_OPERATION_ENABLE. For a chain that
       # word is the final word of the four-qword PC tail, not part of the register body.
@@ -336,7 +397,8 @@ class RockchipProgram(Program['RockchipDevice']):
       if getenv("DEBUG") >= 2:
         for idx in range(n_tasks):
           t = tasks[idx]
-          print(f"  task_buf[{idx}]: op_idx={t.op_idx}, enable_mask={t.enable_mask:#x}, regcfg_amount={t.regcfg_amount}, regcmd_addr={t.regcmd_addr:#x}")
+          print(f"  task_buf[{idx}]: op_idx={t.op_idx}, enable_mask={t.enable_mask:#x}, "
+                f"regcfg_amount={t.regcfg_amount}, regcmd_addr={t.regcmd_addr:#x}")
           base = offsets[idx]
           for j in range(len(subtasks[idx].cmds) + 4):
             print(f"    [{base+j}] = {regcmd[base+j]:#018x}")
@@ -353,6 +415,9 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=n_tasks, task_number=0),
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
           rk.struct_rknpu_subcore_task(task_start=0, task_number=0))))
+      if int_output_conversion is not None:
+        original_out, converted, n = int_output_conversion
+        _convert_fp16_to_int32_buf(converted.va_addr, original_out.va_addr, n)
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: PC chain {n_tasks} tasks")
     finally:
       for b in temp: dev._gpu_free(b)

@@ -1,5 +1,37 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — `Ops.WHERE` hardware lowering
+
+### Implementation
+- Added an eight-stage fp16 lowering for `WHERE(CMPLT(x,y), a, b)`:
+  `diff`, hardware comparison mask, `a*mask`, `1-mask`, `b*(1-mask)`, and
+  final ADD. The duplicate MUL stages are the RK3588 stale-state workaround
+  proven by `experimental/where.py`.
+- The custom BS/BN comparison was validated on this NPU without the reference
+  script's emulator/fallback path.
+- A full eight-stage PC chain is not stable on RK3588. WHERE therefore submits
+  reset-separated DPU stages while retaining shared NPU scratch allocations;
+  ordinary multi-task programs still use the PC-chain path.
+- Added direct boolean-mask WHERE support, fp16 mask conversion, int32 result
+  conversion, and host-side expansion of scalar/vector broadcast inputs before
+  the NPU arithmetic.
+- Fixed multi-task relocation decoding for signed sentinel slots and extended
+  the version-4 task metadata with boolean-input, broadcast-input, and int32
+  output flags.
+
+### Verification
+- `TestOps.test_where` — **PASS**, including boolean input, int32 output,
+  scalar branches, `(1,)` broadcast, row-vector broadcast, and same-shape
+  1D/2D inputs.
+- `test/backend/test_ops.py::TestOps::test_where` plus
+  `test/rockchip/test_hw.py` — **40 passed**.
+- `python -m mypy tinygrad/` — **PASS** (215 source files).
+- `ruff check tinygrad/runtime/ops_rockchip.py tinygrad/runtime/support/rockchip.py`
+  — **PASS**. Full `ruff check .` is polluted by thousands of findings in the
+  untracked `ref/` repositories and generated `runtime/autogen/rockchip.py`.
+- `test_where_permute` remains a separate int32 strided-copy/layout failure;
+  the WHERE computation itself completes before that copy.
+
 ## 2026-07-28 — PC-chain execution fixed
 
 ### Root causes and fix
