@@ -1,5 +1,23 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — finite/NaN predicate milestone
+
+### Implementation
+- Comparison constants at `±inf` are normalized to the same fp16 finite
+  endpoints as comparison-only input buffers, so equality-based `isinf` and
+  `isfinite` retain their intended semantics after subtraction lowering.
+- Logical NOT of a direct bool tensor now carries bool-input conversion and
+  broadcast metadata through both stale-read workaround stages.
+- NaNs remain unmodified in comparison temporaries, allowing `x != x` to
+  implement `isnan`.
+
+### Verification
+- `test_isfinite`, `test_isinf`, `test_isnan`, and `test_logical_not` —
+  **PASS**.
+- Full hardware plus abs/WHERE/clip/uint8/predicate regression —
+  **51 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — direct comparison output milestone
 
 ### Implementation

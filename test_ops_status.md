@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 108 PASS, 308 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 112 PASS, 304 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,9 +17,9 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 108 | Core fp16 arithmetic, comparisons, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
+| PASS | 112 | Core fp16 arithmetic, comparisons/predicates, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 79 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
-| FAIL: unsupported dtype | 45 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
+| FAIL: unsupported dtype | 41 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
 | FAIL: numeric mismatch | 33 | LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 14 | Elementwise graphs still outside the staged planner |
@@ -29,7 +29,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 56 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 108 passing methods are:
+The 112 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -42,7 +42,8 @@ The 108 passing methods are:
 `test_expand`, `test_eye`, `test_flatten`, `test_flip`, `test_flip_eye_crash`,
 `test_gemm`, `test_gemm_fp16`, `test_gemm_with_zeros_shape`,
 `test_hardsigmoid`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
-`test_leaky_relu`, `test_matmul`, `test_matmul_simple`, `test_matvec`,
+`test_isfinite`, `test_isinf`, `test_isnan`, `test_leaky_relu`,
+`test_logical_not`, `test_matmul`, `test_matmul_simple`, `test_matvec`,
 `test_matvecmat`, `test_mean`, `test_mean_zero_axis`, `test_meshgrid`,
 `test_mul`, `test_mul_naninf`, `test_neg`, `test_negative_dims`,
 `test_negative_dims_eye`, `test_negative_dims_full`,

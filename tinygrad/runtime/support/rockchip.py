@@ -758,16 +758,25 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot + 1
     return ret
 
-  def dependent(out:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, bool_output=False) -> None:
+  def dependent(out:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, bool_output=False,
+                bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(),
+                broadcast_inputs:tuple[int,...]=()) -> None:
     # The first DPU task consuming a freshly materialized comparison mask can
     # observe stale lanes. Repeat the identical read, as in the proven WHERE path.
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out, lhs, rhs, op, bool_output=bool_output))
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op, bool_inputs=bool_inputs,
+                                   int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs))
+    tasks.append(_emit_where_stage(total, out, lhs, rhs, op, bool_inputs=bool_inputs,
+                                   int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
+                                   bool_output=bool_output))
 
   def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
     u = _unwrap(u)
     if (arg := _where_arg(u)) is None: return None
-    if u.op is Ops.CONST: return arg, (), (), ()
+    if u.op is Ops.CONST:
+      if isinstance(u.arg, (float, np.floating)) and math.isinf(float(u.arg)):
+        normalized = math.copysign(65504.0, float(u.arg))
+        arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', normalized))[0])
+      return arg, (), (), ()
     slot, source_n = arg[0], int(u.src[0].src[0].arg)
     return arg, ((slot,) if u.dtype is dtypes.bool else ()), \
       ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ())
@@ -790,9 +799,19 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       # tinygrad represents logical NOT(x) as CMPNE(x, True).
       for logical, const in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
         if const.op is Ops.CONST and const.dtype is dtypes.bool and bool(const.arg):
-          if (arg := lower(logical)) is None: return None
+          logical_u = _unwrap(logical)
+          if logical_u.op is Ops.INDEX and logical_u.dtype is dtypes.bool:
+            logical_info = data_arg(logical_u)
+            if logical_info is None: return None
+            mask_arg, bool_inputs, int32_inputs, broadcasts = logical_info
+          else:
+            lowered_mask = lower(logical)
+            if lowered_mask is None: return None
+            mask_arg = lowered_mask
+            bool_inputs, int32_inputs, broadcasts = (), (), ()
           result = alloc()
-          dependent(result, one, arg, Ops.SUB)
+          dependent(result, one, mask_arg, Ops.SUB, bool_inputs=bool_inputs,
+                    int32_inputs=int32_inputs, broadcast_inputs=broadcasts)
           return (result, 0)
       lhs_data, rhs_data = (data_arg(x) for x in u.src)
       if lhs_data is None or rhs_data is None: return None
