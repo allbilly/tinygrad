@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 124 PASS, 292 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 126 PASS, 290 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,11 +17,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 124 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
+| PASS | 126 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions/activations, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 36 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
-| FAIL: numeric mismatch | 32 | LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: numeric mismatch | 30 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 14 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
@@ -29,7 +29,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 124 passing methods are:
+The 126 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -61,17 +61,18 @@ The 124 passing methods are:
 `test_slice_negative_strides`, `test_slice_on_0dim_tensor`,
 `test_slice_one_endpoint_out_of_bounds`, `test_slice_start_gt_end`,
 `test_slice_stride_gt_one`, `test_slice_with_none`, `test_slice_zero_in_shape`,
-`test_small_gemm`, `test_split`, `test_squeeze`, `test_stack_slice`,
+`test_silu`, `test_small_gemm`, `test_split`, `test_squeeze`, `test_stack_slice`,
 `test_std_mean_loaded_nan`, `test_std_zero_in_axis`, `test_sub`,
 `test_sum_collapse_neg`, `test_sum_fake`, `test_sum_simple`,
 `test_sum_with_zeros_shape`, `test_tiny_add`, `test_tiny_mul`,
 `test_topo_sort`, `test_transpose`, `test_trunc`, `test_unflatten`, `test_unfold`,
 `test_unsqueeze`, `test_var_zero_in_axis`, `test_view`, `test_where`,
-`test_where_permute`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
+`test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Targeted regression through the native roundoff milestone: **64 passed**.
-`python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` pass.
+Current SiLU milestone regression: full hardware **47 passed** plus both
+official activation methods. `lut.md` records the tuning procedure and the
+remaining one-ULP dense-grid diagnostic.
 
 ## Historical detailed baseline — 2026-07-27, commit 993ea1197
 

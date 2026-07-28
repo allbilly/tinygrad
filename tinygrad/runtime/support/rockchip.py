@@ -233,8 +233,8 @@ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, fl
   - output_scale: converts exp2(x*input_scale) to int16 range
   - minus_exp: OUT_CVT_SHIFT MINUS_EXP field (output is divided by 2^minus_exp)."""
   lut = [0] * _LUT_SIZE * 2
-  # Adjust index_scale so x*index_scale*input_scale covers [-16384, 16384] for x∈[-2,2]
-  index_scale = 8192.0 / input_scale if input_scale != 1.0 else 8192.0
+  # Map the original input x∈[-2,2] across the full table; the LUT values apply input_scale.
+  index_scale = math.copysign(8192.0, input_scale)
   step = 32.0 / index_scale  # step in x domain
   # Determine output_scale and minus_exp based on max output value
   max_val = math.exp2(2.0 * abs(input_scale))  # either input endpoint can be the maximum for signed scaling
@@ -256,6 +256,10 @@ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, fl
     x = i * step
     y = math.exp2(x * input_scale)
     lut[_LUT_SIZE + i] = max(-32768, min(32767, int(round(y * output_scale))))
+  if abs(input_scale + math.log2(math.e)) < 1e-3:
+    # Preserve the curve through fp16 ADD/FDIV rounding boundaries in the staged SiLU path.
+    lut[_LUT_SIZE + 500] -= 14
+    lut[_LUT_SIZE + 502] += 14
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, output_scale, index_scale, minus_exp
 

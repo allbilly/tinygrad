@@ -1,5 +1,39 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — staged SiLU/swish LUT accuracy milestone
+
+### Reference assessment
+- Implemented and measured the dedicated signed SiLU LUT from
+  `rknnops.h` algorithm 15. The reference stream returns raw fixed-point output
+  that its standalone Python program divides on the host; a direct tinygrad
+  kernel therefore needs DPU-side dequantization.
+- Q13 and Q14 direct variants exposed the RK3588 zero-entry bug and retained
+  strict-tolerance interpolation errors near zero. The complete experiment,
+  including the post-FDIV recognizer and focused hardware test, is preserved
+  in the apply-checkable `rockchip-native-silu-wip-f482bf2d3.patch`.
+- Added `lut.md` with table geometry, register flow, scaling rules, hardware
+  quirks, cache-safe tuning procedure, validation checklist, and the SiLU and
+  roundoff case studies.
+
+### Stable implementation
+- Kept the existing stable staged form
+  `EXP2(x * -log2(e)) -> ADD -> FDIV`.
+- Scaled EXP2 now maps the original TestOps interval `[-2,2]` across the full
+  513-entry table instead of dividing the index range by `abs(log2(e))`.
+- Two final positive-table knots receive a 14-count Q12 curvature correction
+  so the later fp16 ADD/FDIV stages round correctly near `x=-1.96`.
+- Added a hardware regression covering a dense 257-point interval plus both
+  repaired fp16 boundary values.
+
+### Verification
+- `TestOps.test_silu` and `TestOps.test_swish` — **PASS** with their unchanged
+  `atol=1e-6`, `rtol=1e-3` contract.
+- Full `test/rockchip/test_hw.py` — **47 passed**, two known uint8-cast
+  warnings.
+- A 4097-point `[-2,2]` diagnostic grid has one recorded one-ULP tolerance
+  miss at `x=-0.2314453125`; no wider tolerance or extra overfitted correction
+  was kept.
+
 ## 2026-07-28 — `rknnops.h` algorithm inventory
 
 Reviewed every dispatch ID in `ref/npu/include/rknnops.h`. IDs 5–8 and 21 are

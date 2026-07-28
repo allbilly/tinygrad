@@ -133,6 +133,13 @@ class TestDPU(unittest.TestCase):
                          (a.round, np.round(a_np))):
       np.testing.assert_array_equal(op().realize().numpy(), expected)
 
+  def test_dpu_silu_staged(self):
+    a_np = np.concatenate((np.linspace(-2, 2, 257, dtype=np.float16),
+                           np.array([-1.9599609375, -1.9541015625], dtype=np.float16)))
+    a = Tensor(a_np, device="ROCKCHIP").realize()
+    expected = (a_np.astype(np.float32) / (1.0 + np.exp(-a_np.astype(np.float32)))).astype(np.float16)
+    np.testing.assert_allclose(a.silu().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_comparison_outputs(self):
     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
     b_np = np.array([-1,0,0,2,2], dtype=np.float16)
