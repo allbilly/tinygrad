@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 114 PASS, 302 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 118 PASS, 298 FAIL, 8 SKIP (424 unique tests).**
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -17,9 +17,9 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 114 | Core fp16 arithmetic/casts, comparisons/predicates, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
+| PASS | 118 | Core fp16 arithmetic/casts/fills, comparisons/predicates, WHERE/clip/abs, affine copies, GEMM subsets, selected reductions, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 79 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
-| FAIL: unsupported dtype | 40 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
+| FAIL: unsupported dtype | 36 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
 | FAIL: numeric mismatch | 32 | LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 14 | Elementwise graphs still outside the staged planner |
@@ -29,7 +29,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 56 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 114 passing methods are:
+The 118 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -40,6 +40,7 @@ The 114 passing methods are:
 `test_diagonal`, `test_div`, `test_double_slice`, `test_einsum_arity_check1`,
 `test_einsum_arity_check2`, `test_einsum_shape_check`, `test_empty_0`,
 `test_expand`, `test_eye`, `test_flatten`, `test_flip`, `test_flip_eye_crash`,
+`test_full`, `test_full_like`,
 `test_gemm`, `test_gemm_fp16`, `test_gemm_with_zeros_shape`,
 `test_hardsigmoid`, `test_hardtanh`, `test_idiv_shift_rewrite_negative`,
 `test_isfinite`, `test_isinf`, `test_isnan`, `test_leaky_relu`,
@@ -47,7 +48,7 @@ The 114 passing methods are:
 `test_matvecmat`, `test_mean`, `test_mean_zero_axis`, `test_meshgrid`,
 `test_mul`, `test_mul_naninf`, `test_neg`, `test_negative_dims`,
 `test_negative_dims_eye`, `test_negative_dims_full`,
-`test_negative_dims_kaiming`, `test_ones`, `test_permute`,
+`test_negative_dims_kaiming`, `test_ones`, `test_ones_like`, `test_permute`,
 `test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,
 `test_relu_maximum_exact`, `test_reshape`, `test_scalar_div`,
 `test_scalar_mul`, `test_scalar_rsub`, `test_scalar_sub`,
@@ -65,7 +66,7 @@ The 114 passing methods are:
 `test_sum_with_zeros_shape`, `test_tiny_add`, `test_tiny_mul`,
 `test_topo_sort`, `test_transpose`, `test_unflatten`, `test_unfold`,
 `test_unsqueeze`, `test_var_zero_in_axis`, `test_view`, `test_where`,
-`test_where_permute`, `test_zeros`, `TestOpsUint8::test_cast`, and
+`test_where_permute`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
 Targeted regression after the PC-chain, WHERE, nested-elementwise, arithmetic

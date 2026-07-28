@@ -77,6 +77,12 @@ class TestDPU(unittest.TestCase):
     c = Tensor.full((2,4), 3.5, dtype=dtypes.half, device="ROCKCHIP").realize()
     np.testing.assert_allclose(c.numpy(), np.full((2,4), 3.5, dtype=np.float16), rtol=1e-3, atol=1e-3)
 
+  def test_dpu_typed_fills(self):
+    for dtype, np_dtype, value in ((dtypes.float, np.float32, 3.5), (dtypes.int, np.int32, 4),
+                                   (dtypes.bool, np.bool_, True), (dtypes.uint8, np.uint8, 7)):
+      c = Tensor.full((2,4), value, dtype=dtype, device="ROCKCHIP").realize()
+      np.testing.assert_array_equal(c.numpy(), np.full((2,4), value, dtype=np_dtype))
+
   def test_dpu_scalar_add(self):
     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()

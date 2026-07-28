@@ -1,5 +1,19 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — typed constant fill milestone
+
+### Implementation
+- Non-fp16 constant outputs now use a DPU zero-plus-constant fill stage followed
+  by the same fp32/int32/bool/uint8 boundary conversion as direct casts.
+- Added hardware coverage for typed fp32, int32, bool, and uint8 fills.
+
+### Verification
+- `test_full`, `test_full_like`, `test_ones_like`, and `test_zeros_like` —
+  **PASS**.
+- Clean `test/rockchip/test_hw.py` — **44 passed**; explicit typed-fill→CMAC
+  transition — **2 passed**.
+- `python -m mypy tinygrad/`, targeted Ruff, and `git diff --check` — **PASS**.
+
 ## 2026-07-28 — direct cast milestone
 
 ### Implementation

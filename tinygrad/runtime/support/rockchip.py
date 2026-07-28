@@ -745,6 +745,18 @@ def _try_cast_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
                             fp32_output=cast.dtype is dtypes.float, int32_output=cast.dtype is dtypes.int,
                             uint8_output=cast.dtype is dtypes.uint8, bool_output=cast.dtype is dtypes.bool),)
 
+def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
+  """Fill non-fp16 outputs through the DPU, then convert the fp16 result buffer."""
+  store = _store_node(sink)
+  if store is None or store.src[1].op is not Ops.CONST: return None
+  output_dtype = store.src[0].dtype
+  if output_dtype not in (dtypes.float, dtypes.int, dtypes.bool, dtypes.uint8): return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  value = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(store.src[1].arg)))[0])
+  return (_emit_where_stage(total, info.outs[0], (_ZERO_SLOT, 0), value, Ops.ADD,
+                            fp32_output=output_dtype is dtypes.float, int32_output=output_dtype is dtypes.int,
+                            uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool),)
+
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
 
@@ -1633,6 +1645,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
+  if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)
