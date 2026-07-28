@@ -1,5 +1,15 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — zero-axis boolean reduction census milestone
+
+- Re-ran the historical boolean reduction failures under
+  `DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+- `TestOps.test_any_zero_axis` and `TestOps.test_all_zero_axis` both **PASS**
+  through the existing empty-reduction path; no backend change was required.
+- Nonempty `test_any` and `test_all` still reject `unsupported_dtype` and
+  remain in the bool-reduction implementation group.
+- Incremental census: **134 PASS, 282 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — nested LOG2 special-value milestone
 
 ### Implementation

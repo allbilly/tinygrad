@@ -8,7 +8,7 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 132 PASS, 284 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 134 PASS, 282 FAIL, 8 SKIP (424 unique tests).**
 
 This is the previous complete hardware census plus the independently rerun
 SQRT and RSQRT milestones: both methods moved from numeric mismatch to PASS.
@@ -26,9 +26,9 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 132 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+| PASS | 134 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
-| FAIL: unsupported dtype | 35 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
+| FAIL: unsupported dtype | 33 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
 | FAIL: numeric mismatch | 26 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 13 | Elementwise graphs still outside the staged planner |
@@ -38,9 +38,9 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 132 passing methods are:
+The 134 passing methods are:
 
-`test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
+`test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`, `test_all_zero_axis`, `test_any_zero_axis`,
 `test_arange_4096`, `test_arange_big`,
 `test_big_gemm`, `test_broadcastdot`, `test_cast`, `test_ceil`, `test_chunk`, `test_clip`,
 `test_cmp_eq`, `test_cmp_ge`, `test_cmp_gt`, `test_cmp_le`, `test_cmp_lt`,
