@@ -885,7 +885,7 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or store.src[0].dtype is not dtypes.bool: return None
   val, info = _unwrap(store.src[1]), ProgramInfo.from_sink(sink)
-  if val.op not in (Ops.CMPLT, Ops.CMPNE, Ops.OR, Ops.AND): return None
+  if val.op not in (Ops.CMPLT, Ops.CMPNE, Ops.OR, Ops.AND, Ops.MAX): return None
   total, out_slot, next_slot = prod(_shape_of_store(sink)), info.outs[0], max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
@@ -917,6 +917,19 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     slot, source_n = arg[0], int(u.src[0].src[0].arg)
     return arg, ((slot,) if u.dtype is dtypes.bool else ()), \
       ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ())
+
+  # Direct boolean OR/AND (including maximum lowered to OR) operates on
+  # byte-packed buffers rather than freshly materialized comparison masks.
+  # Convert inputs to fp16 0/1, run native MAX/MUL, then pack back to bool.
+  if val.op in (Ops.OR, Ops.AND, Ops.MAX):
+    lhs_info, rhs_info = (data_arg(x) for x in val.src)
+    if lhs_info is not None and rhs_info is not None:
+      bool_inputs, int32_inputs, broadcasts = \
+        (tuple(dict.fromkeys(lhs_info[i] + rhs_info[i])) for i in range(1, 4))
+      op = Ops.MUL if val.op is Ops.AND else Ops.MAX
+      return (_emit_where_stage(total, out_slot, lhs_info[0], rhs_info[0], op,
+                                bool_inputs=bool_inputs, int32_inputs=int32_inputs,
+                                broadcast_inputs=broadcasts, bool_output=True),)
 
   def lower(u:UOp) -> tuple[int,int]|None:
     u = _unwrap(u)

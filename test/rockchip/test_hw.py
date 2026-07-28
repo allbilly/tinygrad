@@ -169,6 +169,7 @@ class TestDPU(unittest.TestCase):
     a = Tensor(bool_a, device="ROCKCHIP").realize()
     b = Tensor(bool_b, device="ROCKCHIP").realize()
     np.testing.assert_array_equal(a.minimum(b).realize().numpy(), np.minimum(bool_a, bool_b))
+    np.testing.assert_array_equal(a.maximum(b).realize().numpy(), np.maximum(bool_a, bool_b))
     expected = np.minimum(int_np.astype(np.float16), np.float16(1.2))
     np.testing.assert_array_equal(ints.minimum(Tensor(1.2, dtype=dtypes.half, device="ROCKCHIP")).realize().numpy(), expected)
 

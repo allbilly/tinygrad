@@ -1,5 +1,36 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — typed boolean maximum milestone
+
+### Implementation
+- Direct bool OR/AND operands now use the typed comparison boundary instead of
+  being mistaken for comparison-generated masks.
+- Tinygrad lowers bool `maximum(a, b)` to `OR(a, b)`. The backend converts both
+  byte-packed bool buffers to fp16 0/1 masks, executes DPU MAX (boolean OR),
+  and packs the output back to bool.
+- Added bool maximum coverage beside the existing typed minimum boundary
+  coverage.
+
+### Verification
+- `TestOps.test_maximum` — **PASS** across fp16 tensor/scalar, int32 extrema,
+  bool scalar, and bool-vector cases.
+- Focused bool maximum hardware test — **PASS**.
+- All **48** Rockchip hardware tests pass when run in isolated sequential
+  subprocesses, the same safe execution model used by the hardware census.
+- A monolithic hardware-suite process still reproduces the pre-existing
+  sequence-sensitive `SiLU → SUB` timeout. `test_dpu_silu_staged` and
+  `test_dpu_sub` both pass independently; this is tracked separately from the
+  typed maximum result.
+- `python -m mypy tinygrad/` and Ruff on the changed files — **PASS**.
+
+### Reference-branch policy for remaining groups
+- Before implementing each remaining failure group, search
+  `rockchip/backend-consideration`, `rockchip/wip`, `rockchip_addmul`, `recip`,
+  `lrshift`, and `codex/nested-where` for proven recognizers, command streams,
+  and hardware tests.
+- Record the source branch/commit for any ported logic. Emulator-only passes do
+  not count as Rockchip hardware evidence.
+
 ## 2026-07-28 — typed minimum milestone
 
 ### Implementation
