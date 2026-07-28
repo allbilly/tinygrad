@@ -8,10 +8,10 @@ were run serially in 20-test subprocess batches because one physical NPU cannot
 safely serve 12 concurrent pytest workers. The batch containing methods 400–419
 segfaulted, so those methods were rerun individually.
 
-**Current summary: 130 PASS, 286 FAIL, 8 SKIP (424 unique tests).**
+**Current summary: 131 PASS, 285 FAIL, 8 SKIP (424 unique tests).**
 
 This is the previous complete hardware census plus the independently rerun
-SQRT milestone: `TestOps.test_sqrt` moved from numeric mismatch to PASS.
+SQRT and RSQRT milestones: both methods moved from numeric mismatch to PASS.
 
 The census originally found one reproducible crash in
 `TestOpsUint8::test_cast_relu`. It is now fixed: version-4 task metadata
@@ -20,11 +20,11 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 
 | Result group | Count | Main current causes |
 |---|---:|---|
-| PASS | 130 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
+| PASS | 131 | Core fp16 arithmetic/casts/fills/rounding, comparisons/predicates/sign, WHERE/clip/abs/minimum/maximum, affine copies, GEMM subsets, selected reductions/activations/LUT special values, and uint8 ReLU cast |
 | FAIL: unsupported WHERE | 74 | Remaining WHERE graphs include reductions, padding/index generation, or unsupported operands/layouts |
 | FAIL: unsupported dtype | 35 | Remaining bool, fp32, int/uint, and dtype-changing kernels |
 | FAIL: unsupported layout | 47 | Broadcast/RANGE, convolution, pooling, batched matmul, and reduction layouts |
-| FAIL: numeric mismatch | 28 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
+| FAIL: numeric mismatch | 27 | Remaining LUT/activation precision, fp16 accumulation/rounding, and special values |
 | FAIL: non-index operand | 13 | Elementwise graphs still outside the staged planner |
 | FAIL: fused epilogue | 13 | Convolution/reduction output stages |
 | FAIL: dtype mismatch | 12 | Incorrect result dtype or special-value representation |
@@ -32,7 +32,7 @@ uint8 element instead of overrunning the allocation with four-byte writes.
 | FAIL: other | 55 | Other unsupported ops, assertions, layouts, and framework-side failures |
 | SKIP | 8 | Upstream slow/redundant/broken/platform-specific skips |
 
-The 130 passing methods are:
+The 131 passing methods are:
 
 `test_9_gemm`, `test_abs`, `test_abs_exact`, `test_add`, `test_add3`,
 `test_arange_4096`, `test_arange_big`,
@@ -53,7 +53,7 @@ The 130 passing methods are:
 `test_negative_dims_eye`, `test_negative_dims_full`,
 `test_negative_dims_kaiming`, `test_ones`, `test_ones_like`, `test_permute`,
 `test_prod_dtype_arg`, `test_relu`, `test_relu6`, `test_relu_exact`,
-`test_relu_maximum_exact`, `test_reshape`, `test_round`, `test_scalar_div`,
+`test_relu_maximum_exact`, `test_reshape`, `test_round`, `test_rsqrt`, `test_scalar_div`,
 `test_scalar_mul`, `test_scalar_rsub`, `test_scalar_sub`,
 `test_scaled_dot_product_attention_gqa_errors`,
 `test_scatter_no_reduce_tensor_src`, `test_sigmoid`,
@@ -74,12 +74,12 @@ The 130 passing methods are:
 `test_where_permute`, `test_swish`, `test_zeros`, `test_zeros_like`, `TestOpsUint8::test_cast`, and
 `TestOpsUint8::test_cast_relu`.
 
-Current SQRT milestone regression: all **50 hardware tests pass in isolated
-sequential subprocesses**, including the EXP2 and SQRT special-value assertions,
-and the official `TestOps.test_exp2` and `TestOps.test_sqrt` pass. A single-process run retains the
+Current RSQRT milestone regression: all **51 hardware tests pass in isolated
+sequential subprocesses**, including the EXP2, SQRT, and RSQRT special-value
+assertions, and the corresponding official TestOps methods pass. A single-process run retains the
 sequence-sensitive SiLU→SUB timeout; both tests pass in isolation. `lut.md`
-records the LUT tuning, Newton refinement, and special-value procedures plus
-the remaining SiLU one-ULP dense-grid diagnostic.
+records the LUT tuning, range reduction, Newton refinement, and special-value
+procedures plus the remaining SiLU one-ULP dense-grid diagnostic.
 
 ## Historical detailed baseline — 2026-07-27, commit 993ea1197
 

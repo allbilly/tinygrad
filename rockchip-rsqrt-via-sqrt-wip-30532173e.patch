@@ -1,0 +1,72 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index eec7ce17f..bbce2e711 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -152,0 +153,7 @@ class TestDPU(unittest.TestCase):
++  def test_dpu_rsqrt_special_values(self):
++    # DPU FDIV does not preserve the sign of a zero denominator, so -0 is
++    # tracked separately from the TestOps contract covered here.
++    a_np = np.array([np.inf, -np.inf, np.nan, -2, 0, 0.25, 4], dtype=np.float16)
++    actual = Tensor(a_np, device="ROCKCHIP").rsqrt().realize().numpy()
++    np.testing.assert_allclose(actual, 1 / np.sqrt(a_np), rtol=1e-3, atol=1e-6)
++
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 9ee605c3c..bccf735af 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1143,0 +1144,53 @@ def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower reciprocal(sqrt(x)) through the refined IEEE-correct SQRT path."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  val = _unwrap(store.src[1])
++  if val.op is not Ops.RECIPROCAL or len(val.src) != 1: return None
++  sqrt = _unwrap(val.src[0])
++  if sqrt.op is not Ops.SQRT or len(sqrt.src) != 1 or (source := _unwrap(sqrt.src[0])).op is not Ops.INDEX: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  out, sqrt_slot = info.outs[0], max(info.globals, default=-1) + 1
++  out_idx = store.src[0]
++  sqrt_idx = out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(sqrt_slot), *out_idx.src[1:]))
++  sqrt_sink = sink.substitute({store:store.replace(src=(sqrt_idx, sqrt))})
++  if (sqrt_tasks := _try_sqrt_special_subtasks(sqrt_sink)) is None: return None
++  used_slots = [sqrt_slot] + [st.task.out_slot for st in sqrt_tasks] + \
++    [r.globals_slot for st in sqrt_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  next_slot, tasks = max(used_slots) + 1, list(sqrt_tasks)
++  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++  source_arg = (source.src[0].buf_uop.arg.slot, 0)
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot + 1
++    return ret
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
++
++  nonzero_slot = alloc()
++  mask_idx = out_idx.replace(dtype=dtypes.bool, src=(out_idx.src[0].param_like(nonzero_slot), *out_idx.src[1:]))
++  mask_val = UOp(Ops.CMPNE, dtypes.bool, (source, UOp.const(dtypes.half, 0.0)))
++  mask_sink = sink.substitute({store:store.replace(src=(mask_idx, mask_val))})
++  if (mask_tasks := _try_comparison_subtasks(mask_sink)) is None: return None
++  last = mask_tasks[-1]
++  mask_tasks = (*mask_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
++  tasks.extend(mask_tasks)
++  mask_slots = [st.task.out_slot for st in mask_tasks] + \
++    [r.globals_slot for st in mask_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  next_slot = max(next_slot, max(mask_slots, default=-1) + 1)
++
++  # Use sqrt+1 for zero lanes before reciprocal, keeping the normal branch
++  # finite. A direct 1/x then carries the sign of ±0 into the selected result.
++  zero_mask, safe_sqrt, normal, finite, direct, signed_zero = (alloc() for _ in range(6))
++  dependent(zero_mask, one, (nonzero_slot, 0), Ops.SUB)
++  dependent(safe_sqrt, (sqrt_slot, 0), (zero_mask, 0), Ops.ADD)
++  dependent(normal, one, (safe_sqrt, 0), Ops.FDIV)
++  dependent(finite, (normal, 0), (nonzero_slot, 0), Ops.MUL)
++  dependent(direct, one, source_arg, Ops.FDIV)
++  dependent(signed_zero, (direct, 0), (zero_mask, 0), Ops.MUL)
++  dependent(out, (finite, 0), (signed_zero, 0), Ops.ADD)
++  return tuple(tasks)
++
+@@ -1961,0 +2015 @@ def build_native_program(sink: UOp) -> UOp|None:
++  if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)

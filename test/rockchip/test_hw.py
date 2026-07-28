@@ -150,6 +150,13 @@ class TestDPU(unittest.TestCase):
     actual = Tensor(a_np, device="ROCKCHIP").sqrt().realize().numpy()
     np.testing.assert_allclose(actual, np.sqrt(a_np), rtol=1e-3, atol=1e-6)
 
+  def test_dpu_rsqrt_special_values(self):
+    # DPU FDIV does not preserve the sign of a zero denominator, so -0 is
+    # tracked separately from the TestOps contract covered here.
+    a_np = np.array([np.inf, -np.inf, np.nan, -2, 0, 0.25, 4], dtype=np.float16)
+    actual = Tensor(a_np, device="ROCKCHIP").rsqrt().realize().numpy()
+    np.testing.assert_allclose(actual, 1 / np.sqrt(a_np), rtol=1e-3, atol=1e-6)
+
   def test_dpu_comparison_outputs(self):
     a_np = np.array([-2,-0.0,0,1,3], dtype=np.float16)
     b_np = np.array([-1,0,0,2,2], dtype=np.float16)

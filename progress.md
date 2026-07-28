@@ -1,5 +1,30 @@
 # Rockchip NPU backend — test_ops.py progress
 
+## 2026-07-28 — RSQRT range-reduction milestone
+
+### Implementation
+- `RECIPROCAL(SQRT(x))` keeps its dedicated RK3588 RSQRT LUT rather than
+  dividing by the rounded direct-SQRT result.
+- Two exact conditional ×16 input scalings move positive values below `1/16`
+  into the LUT domain; matching ×4 output factors restore RSQRT magnitude.
+- One NPU-only inverse-square-root Newton step,
+  `y = y * (1.5 - 0.5*x*y*y)`, removes the remaining interpolation error.
+- Comparison-mask epilogues produce `+inf` for zero, zero for `+inf`, and NaN
+  for negative inputs, `-inf`, and NaN. RK3588 FDIV loses the denominator sign
+  for `-0`, so `rsqrt(-0)` remains a separately documented hardware limitation.
+- The rejected reciprocal-of-refined-SQRT route is preserved in
+  `rockchip-rsqrt-via-sqrt-wip-30532173e.patch`; it fixed special placement but
+  left 96/2925 strict numeric mismatches due to extra rounding.
+
+### Verification
+- `TestOps.test_rsqrt` — **PASS** for the random tensor, zero, and scalar cases
+  at unchanged upstream tolerance.
+- `test_sqrt`, `test_scalar_div`, and `test_sigmoid` — **PASS** beside RSQRT.
+- All **51** Rockchip hardware methods — **PASS** in isolated sequential
+  subprocesses.
+- `python -m mypy tinygrad/` and Ruff on the changed source/test — **PASS**.
+- Incremental test_ops census: **131 PASS, 285 FAIL, 8 SKIP**.
+
 ## 2026-07-28 — SQRT refinement and IEEE special-value milestone
 
 ### Implementation

@@ -265,6 +265,37 @@ special-value epilogue after refinement:
 The negative/NaN lanes may contain meaningless intermediate Newton results;
 the final invalid factor replaces them without host-side computation.
 
+### RSQRT range reduction and refinement
+
+The dedicated RSQRT table covers `[1/16, 4]` and clips lower positive inputs
+to 4. TestOps reaches roughly `0.002`, where the correct result is above 20.
+Use exact power-of-two range reduction before indexing the table:
+
+```text
+low1 = (0 < x) and (x < 1/16)
+low2 = (0 < x) and (x < 1/256)
+scaled_x = x * (1 + 15*low1) * (1 + 15*low2)
+y = rsqrt_lut(scaled_x)
+y = y * (1.5 - 0.5*scaled_x*y*y)
+result = y * (1 + 3*low1) * (1 + 3*low2)
+```
+
+Each active input step multiplies by 16, so the matching RSQRT output step is
+exactly 4. One Newton step then corrects linear interpolation without repeated
+nonlinear LUT evaluation. Clamp the Newton input to four for `+inf` lanes so
+the intermediate stays finite until the special-value epilogue forces zero.
+
+Two rejected baselines are useful tuning references:
+
+- the raw dedicated LUT fixed special values but left 56/2925 mismatches,
+  including large errors from lower-bound clipping;
+- `1 / refined_sqrt(x)` removed clipping but left 96/2925 strict one-ULP
+  mismatches from the extra rounded SQRT and FDIV stages. That implementation
+  is saved in `rockchip-rsqrt-via-sqrt-wip-30532173e.patch`.
+
+RK3588 FDIV returns positive infinity for both `1/+0` and `1/-0`; the latter
+signed-zero case cannot be recovered with numeric comparison masks.
+
 ### LOG2 range reduction
 
 The current linear LOG2 table is accurate only over approximately

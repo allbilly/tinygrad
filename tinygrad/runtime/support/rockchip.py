@@ -1141,6 +1141,124 @@ def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (zero_result, 0), (invalid_factor, 0), Ops.MUL)
   return tuple(tasks)
 
+def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve RSQRT zero, infinity, and NaN semantics around its dedicated LUT."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.RECIPROCAL or len(val.src) != 1: return None
+  sqrt = _unwrap(val.src[0])
+  if sqrt.op is not Ops.SQRT or len(sqrt.src) != 1 or (source := _unwrap(sqrt.src[0])).op is not Ops.INDEX: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  zero = UOp.const(dtypes.half, 0.0)
+  out_idx = store.src[0]
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot), *out_idx.src[1:]))
+
+  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
+    nonlocal next_slot
+    mask_slot = alloc()
+    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
+    if cmp_tasks is None: return None
+    last = cmp_tasks[-1]
+    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+    tasks.extend(cmp_tasks)
+    used_slots = [st.task.out_slot for st in cmp_tasks] + \
+      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+    return (mask_slot, 0)
+
+  hi = UOp.const(dtypes.half, 65472.0)
+  positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
+  negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, zero)))
+  nonzero = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, zero)))
+  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
+  greater_zero = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (zero, source)))
+  below_1 = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, UOp.const(dtypes.half, 0.0625))))
+  below_2 = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, UOp.const(dtypes.half, 0.00390625))))
+  if positive is None or negative is None or nonzero is None or not_number is None or \
+     greater_zero is None or below_1 is None or below_2 is None: return None
+
+  source_arg = (source.src[0].buf_uop.arg.slot, 0)
+  fifteen = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 15.0))[0])
+  three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
+  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+  negative_four = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -4.0))[0])
+  half = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 0.5))[0])
+  one_half = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.5))[0])
+
+  # Exact powers-of-16 move small positive inputs into the LUT's [1/16, 4]
+  # domain. The output is scaled back by the corresponding powers of four.
+  low_1, low_2 = alloc(), alloc()
+  dependent(low_1, greater_zero, below_1, Ops.MUL)
+  dependent(low_2, greater_zero, below_2, Ops.MUL)
+  factor_1_delta, factor_1, scaled_1 = alloc(), alloc(), alloc()
+  dependent(factor_1_delta, (low_1, 0), fifteen, Ops.MUL)
+  dependent(factor_1, one, (factor_1_delta, 0), Ops.ADD)
+  dependent(scaled_1, source_arg, (factor_1, 0), Ops.MUL)
+  factor_2_delta, factor_2, scaled_2 = alloc(), alloc(), alloc()
+  dependent(factor_2_delta, (low_2, 0), fifteen, Ops.MUL)
+  dependent(factor_2, one, (factor_2_delta, 0), Ops.ADD)
+  dependent(scaled_2, (scaled_1, 0), (factor_2, 0), Ops.MUL)
+
+  scaled_source = temp_index(scaled_2)
+  scaled_val = val.substitute({source:scaled_source})
+  lut_slot = alloc()
+  lut_plan = plan_rk(stage_sink(scaled_val, lut_slot))
+  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(lut_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  # One inverse-square-root Newton step removes residual linear interpolation
+  # error. Clamp the refinement input at four so +inf stays a finite zero case.
+  neg_scaled, clamped_neg, safe_scaled = alloc(), alloc(), alloc()
+  dependent(neg_scaled, (scaled_2, 0), negative_one, Ops.MUL)
+  dependent(clamped_neg, (neg_scaled, 0), negative_four, Ops.MAX)
+  dependent(safe_scaled, (clamped_neg, 0), negative_one, Ops.MUL)
+  square, product, half_product, correction, refined = (alloc() for _ in range(5))
+  dependent(square, (lut_slot, 0), (lut_slot, 0), Ops.MUL)
+  dependent(product, (safe_scaled, 0), (square, 0), Ops.MUL)
+  dependent(half_product, (product, 0), half, Ops.MUL)
+  dependent(correction, one_half, (half_product, 0), Ops.SUB)
+  dependent(refined, (lut_slot, 0), (correction, 0), Ops.MUL)
+
+  out_factor_1_delta, out_factor_1, scaled_out_1 = alloc(), alloc(), alloc()
+  dependent(out_factor_1_delta, (low_1, 0), three, Ops.MUL)
+  dependent(out_factor_1, one, (out_factor_1_delta, 0), Ops.ADD)
+  dependent(scaled_out_1, (refined, 0), (out_factor_1, 0), Ops.MUL)
+  out_factor_2_delta, out_factor_2, scaled_out_2 = alloc(), alloc(), alloc()
+  dependent(out_factor_2_delta, (low_2, 0), three, Ops.MUL)
+  dependent(out_factor_2, one, (out_factor_2_delta, 0), Ops.ADD)
+  dependent(scaled_out_2, (scaled_out_1, 0), (out_factor_2, 0), Ops.MUL)
+
+  zero_result = alloc()
+  dependent(zero_result, (scaled_out_2, 0), nonzero, Ops.FDIV)
+  positive_denom, finite = alloc(), alloc()
+  dependent(positive_denom, one, positive, Ops.SUB)
+  dependent(finite, (zero_result, 0), (positive_denom, 0), Ops.MUL)
+  invalid, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
+  dependent(invalid, negative, not_number, Ops.MAX)
+  dependent(invalid_denom, one, (invalid, 0), Ops.SUB)
+  dependent(invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV)
+  dependent(out, (finite, 0), (invalid_factor, 0), Ops.MUL)
+  return tuple(tasks)
+
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
@@ -1959,6 +2077,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
+  if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   plan = plan_rk(sink)
