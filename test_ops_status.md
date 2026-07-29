@@ -14,7 +14,9 @@ supersedes the older 182-passing census below.
 failed in the census have not yet been folded into another full-suite count,
 so 257/165 remains the honest complete baseline. Product reduction and the
 product subcase of `const_reduce` now also pass incrementally. The expanded
-DPU hardware class is separately **60/60 passing in 393.71 seconds**.
+DPU hardware class is separately **60/60 passing in 319.36 seconds**.
+The complete official `test_min` method now passes incrementally, including
+floating, exact int32 boundary, and bool cases.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -673,3 +675,40 @@ Exact int32 MIN is not claimed: tinygrad uses XOR order reversal so
 overflow. Bool MIN likewise needs its exact ALL-pattern selection.
 
 Recovery patch: `rockchip-native-global-extrema-d8238da2d.patch`.
+
+### Exact typed-MIN milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| floating `min` | **passing** | **passing** |
+| int32 two-lane `min`, including `INT_MIN` both orders | **passing** | **passing** |
+| bool `min`, including singleton and multi-lane | **passing** | **passing** |
+| general int32 MIN windows larger than two | not claimed | matcher deliberately rejects |
+
+The complete official `TestOps.test_min` passes in **65.09 seconds**.
+
+For the exact official int32 boundary, host movement gathers and packs raw
+int32 bytes into native four-lane atoms. DPU ADD, MAX, and SUB evaluate
+`a+b-max(a,b)`, an exact two's-complement identity for two operands. A
+three-lane probe exposed incorrect iterative native behavior, so the matcher
+is intentionally limited to window two pending a separate investigation.
+
+Bool MIN's scheduled inverted-MAX graph is recognized as ALL. The runtime
+widens the byte-wide bool ABI to fp16 `0/1`, static movement gathers each
+lane, and DPU MUL computes the result before it is packed back to bool. Host
+code performs only typed ABI conversion and byte layout; it does not perform
+the runtime reduction.
+
+The permanent typed-extrema regression passes twice consecutively in **12.44
+and 11.65 seconds**. Extra singleton/multi-lane bool and both `INT_MIN`
+operand-order probes pass. The complete DPU class passes **60/60 in 319.36
+seconds**, and the hardware-free contract passes **79/79 in 6.53 seconds**.
+
+No timing sleep is used. A repeated stress ordering consisting of the full
+million-element boolean-reduction method immediately followed by extrema can
+still intermittently time out in the driver despite explicit NPU resets;
+standalone extrema and the complete DPU-class validation passed. Keep this
+ordering as a device-state reproducer rather than hiding it with host math or
+delays.
+
+Recovery patch: `rockchip-native-typed-min-fa8192487.patch`.

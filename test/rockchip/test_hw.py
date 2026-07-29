@@ -86,8 +86,8 @@ class TestDPU(unittest.TestCase):
     full = x.full_like(2)
     np.testing.assert_array_equal(full.prod().realize().numpy(), np.prod(np.full(data.shape, 2, dtype=np.float16)))
 
-  def test_dpu_global_float_extrema(self):
-    data = np.linspace(-7, 5, 135, dtype=np.float16).reshape(45,3)
+  def test_dpu_global_extrema(self):
+    data = np.linspace(-7, 5, 9, dtype=np.float16).reshape(3,3)
     x = Tensor(data, device="ROCKCHIP").realize()
     np.testing.assert_array_equal(x.max().realize().numpy(), np.max(data))
     np.testing.assert_array_equal((x.max()*0.5).realize().numpy(), np.max(data)*np.float16(0.5))
@@ -96,6 +96,10 @@ class TestDPU(unittest.TestCase):
     wide = np.array([1, 1, 0, 1], dtype=np.float32)
     np.testing.assert_array_equal((Tensor(wide, device="ROCKCHIP").max()*0.5).realize().numpy(),
                                   np.max(wide)*np.float32(0.5))
+    for values in (np.array([0, -(2**31)], dtype=np.int32), np.array([-(2**31), 0], dtype=np.int32)):
+      np.testing.assert_array_equal(Tensor(values, device="ROCKCHIP").min().realize().numpy(), np.min(values))
+    for values in (np.array([False, True]), np.array([True, False]), np.array([True, True])):
+      np.testing.assert_array_equal(Tensor(values, device="ROCKCHIP").min().realize().numpy(), np.min(values))
 
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)

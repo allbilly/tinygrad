@@ -21,7 +21,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
   _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
-  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
+  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
@@ -87,6 +87,11 @@ def _convert_bool_to_fp16_buf(src, dst, n):
   import numpy as np
   arr = np.frombuffer(ctypes.string_at(src, n), dtype=np.bool_).astype(np.float16)
   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+
+def _run_host_bool_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  total, tag = task.layout
+  assert tag == _HOST_BOOL_HALF_LAYOUT and len(relocs) == 2
+  _convert_bool_to_fp16_buf(bufs[relocs[1].globals_slot].va_addr, bufs[relocs[0].globals_slot].va_addr, total)
 
 def _broadcast_fp16_buf(src, dst, src_n, n):
   data = ctypes.string_at(src, src_n * 2)
@@ -1097,6 +1102,9 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
           _unpack_half_bits(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
+          _run_host_bool_half(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
           _run_host_scatter(task, st.relocs, bufs)
           continue
@@ -1196,6 +1204,9 @@ class RockchipProgram(Program['RockchipDevice']):
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
             _pack_static_gather(st.task, st.relocs, tuple(ext))
             continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
+            _run_host_bool_half(st.task, st.relocs, tuple(ext))
+            continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
           # stages also stay single-task for reset stability, with the typed
@@ -1221,6 +1232,7 @@ class RockchipProgram(Program['RockchipDevice']):
                 stage_ext[st.task.out_slot] = converted
                 bool_output = (original_out, converted, out_n)
               self.subtasks = None
+              dev.reset_npu()
               self(*tuple(stage_ext))
               if bool_output is not None:
                 original_out, converted, out_n = bool_output
@@ -1289,6 +1301,7 @@ class RockchipProgram(Program['RockchipDevice']):
           pending.append(st)
           if len(pending) == 64: flush_pending()
         flush_pending()
+        if any(st.task.native_int32_input or st.task.native_int32_output for st in subtasks): dev.reset_npu()
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
@@ -1347,6 +1360,9 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
             _unpack_half_bits(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
+            _run_host_bool_half(task, st.relocs, tuple(ext))
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
             _run_host_bitwise(task, st.relocs, tuple(ext))

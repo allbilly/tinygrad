@@ -6237,3 +6237,75 @@ remain absent from `.venv`.
 
 The standalone recovery artifact is
 `rockchip-native-global-extrema-d8238da2d.patch`, based on `d8238da2d`.
+
+## 2026-07-29 — exact typed MIN
+
+The remaining official `test_min` failures were not floating reductions.
+They were the exact int32 and byte-wide bool cases:
+
+```text
+int32: XOR(MAX(XOR(x, -1)), -1)
+bool:  CMPNE(MAX(CMPNE(x, True)), True)
+```
+
+### Exact two-lane int32 MIN
+
+The official signed boundary cases reduce exactly two lanes and include
+`INT_MIN` in both operand orders. The matcher retains tinygrad's XOR-order
+recognizer, gathers each lane as raw int32 bytes, and packs four-lane native
+int32 DPU atoms. For two signed operands,
+
+```text
+min(a, b) = (a + b) - max(a, b)
+```
+
+is evaluated with native DPU ADD, MAX, and SUB. Arithmetic wraps in the same
+two's-complement domain as the int32 representation, so the identity remains
+exact at `INT_MIN`. Host callbacks only gather, pack, and unpack bytes.
+
+This lowering is deliberately restricted to reduction window `2`. A
+three-lane experimental chain returned `-3` instead of `-7`; the native
+iterative behavior must be understood before widening the matcher. The old
+XOR graph is left intact for every unsupported shape rather than silently
+using host arithmetic.
+
+### Bool MIN as NPU product
+
+Bool MIN is logical ALL. Reusing the CMAC-count ALL path was numerically
+correct but exposed a repeatable CMAC-to-comparison state transition timeout.
+The exact bool-MIN pattern now widens the byte-wide bool ABI to fp16 `0/1`,
+gathers each static reduction lane by byte movement, and multiplies the lanes
+on DPU. The final NPU result is packed back to one-byte bool storage. A
+single-lane window uses an NPU ADD-zero identity.
+
+The host work here is the same narrow accelerator precedent used elsewhere:
+typed ABI conversion and byte movement. It never selects, compares, adds,
+multiplies, or otherwise evaluates runtime tensor values. No timing sleep was
+introduced.
+
+The mixed CMAC/DPU runner retains an explicit reset immediately before typed
+post-CMAC DPU submission. Removing it made the boolean-reduction to extrema
+sequence time out. Additional pre/post resets did not eliminate all repeated
+heavy-stress timeouts, so no speculative reset or sleep was added. Standalone
+typed-extrema runs and one complete DPU-class run are clean; the focused
+heavy bool-reduction followed immediately by extrema remains a useful
+intermittent driver-state reproducer.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_min`: **passing in 65.09 seconds**;
+- permanent typed-extrema regression: **passing twice consecutively in 12.44
+  and 11.65 seconds**;
+- extra bool singleton/multi-lane and both `INT_MIN` operand-order probes:
+  **passing**;
+- complete DPU hardware class: **60/60 passing in 319.36 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.53 seconds**;
+- pycompile and `git diff --check`: passing.
+
+Mypy remains at the same **13 pre-existing findings**. Ruff and pytest-xdist
+remain absent from `.venv`.
+
+The standalone recovery artifact is
+`rockchip-native-typed-min-fa8192487.patch`, based on `fa8192487`.

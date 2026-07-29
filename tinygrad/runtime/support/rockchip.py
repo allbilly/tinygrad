@@ -192,6 +192,7 @@ _HOST_COMPACT_NATIVE_HALF_LAYOUT = -1016  # remove padding lanes after native in
 _HOST_ASSEMBLE_INT_BYTES_LAYOUT = -1017  # compose native 0..255 digits as int32 bytes
 _HOST_PACK_HALF_BITS_LAYOUT = -1018  # widen raw fp16 representations into int32 lanes
 _HOST_UNPACK_HALF_BITS_LAYOUT = -1019  # compact selected raw fp16 representations
+_HOST_BOOL_HALF_LAYOUT = -1020  # widen byte-wide bool ABI storage to fp16 0/1 lanes
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -7333,6 +7334,75 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     accumulator = out_slot
   return tuple(tasks)
 
+def _try_native_int_min_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower signed int32 MIN's XOR-order graph with native integer DPU stages."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MAX or reduce.dtype is not dtypes.int or \
+     store.src[0].dtype is not dtypes.int: return None
+
+  def xor_minus_one(u:UOp, expected:UOp|None=None) -> UOp|None:
+    if u.op is not Ops.XOR or len(u.src) != 2: return None
+    for value, mask in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
+      if mask.op is Ops.CONST and int(mask.arg) == -1 and (expected is None or value is expected): return value
+    return None
+
+  if xor_minus_one(store.src[1], reduce) is None: return None
+  source = xor_minus_one(reduce.src[0])
+  if source is None or source.op is not Ops.INDEX or source.dtype is not dtypes.int or source.src[0].op is not Ops.PARAM: return None
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  loop_extents = [int(u.src[0].arg) for u in loops]
+  reduce_extents = [int(u.src[0].arg) for u in reductions]
+  total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
+  if prod(loop_extents) != total or window != 2: return None
+
+  info = ProgramInfo.from_sink(sink)
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  gathered_slots:list[int] = []
+  for linear in range(window):
+    rem, fixed = linear, {}
+    for reduce_axis in range(len(reductions)-1, -1, -1):
+      rem, coord = divmod(rem, reduce_extents[reduce_axis])
+      fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
+    gathered = source.substitute(fixed)
+    scratch_slot, next_slot = next_slot, next_slot+1
+    scratch = UOp.param(scratch_slot, dtypes.int, (total,), device=store.src[0].src[0].device)
+    scratch_index = store.src[0].replace(dtype=dtypes.int, src=(scratch, *store.src[0].src[1:]))
+    movement_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(scratch_index, gathered)), *loops)))
+    movement_tasks = _try_movement_host_subtasks(movement_sink)
+    if movement_tasks is None or len(movement_tasks) != 1: return None
+    tasks.extend(movement_tasks)
+    gathered_slots.append(scratch_slot)
+
+  for start in range(0, total, 4):
+    count = min(4, total-start)
+    packed_slots:list[int] = []
+    for source_slot in gathered_slots:
+      packed_slot, next_slot = next_slot, next_slot+1
+      layout = (count, _HOST_PACK_INT32_CHUNK_LAYOUT, start)
+      relocs = (RKReloc(0, packed_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", layout, packed_slot, is_copy=True), relocs))
+      packed_slots.append(packed_slot)
+    accumulator = packed_slots[0]
+    for operand in packed_slots[1:]:
+      summed, maximum, selected = next_slot, next_slot+1, next_slot+2
+      next_slot += 3
+      tasks.extend((_emit_where_stage(4, summed, (accumulator, 0), (operand, 0), Ops.ADD,
+                                      native_int32_input=True, native_int32_output=True),
+                    _emit_where_stage(4, maximum, (accumulator, 0), (operand, 0), Ops.MAX,
+                                      native_int32_input=True, native_int32_output=True),
+                    # Variable-variable SUB evaluates EW-RDMA, hence sum-max.
+                    _emit_where_stage(4, selected, (maximum, 0), (summed, 0), Ops.SUB,
+                                      native_int32_input=True, native_int32_output=True)))
+      accumulator = selected
+    layout = (count, _HOST_UNPACK_INT_CHUNK_LAYOUT, start)
+    relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, accumulator, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True), relocs))
+  return tuple(tasks)
+
 def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower bool ALL/ANY to native DPU masks followed by a CMAC count.
 
@@ -7343,12 +7413,25 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """
   reduce, store = _reduce_node(sink), _store_node(sink)
   if reduce is None or store is None or reduce.dtype is not dtypes.bool or store.src[0].dtype is not dtypes.bool or \
-     store.src[1] is not reduce or reduce.arg[0] not in (Ops.MAX, Ops.MUL): return None
+     reduce.arg[0] not in (Ops.MAX, Ops.MUL): return None
+  outer_all = False
+  store_value = store.src[1]
+  if store_value is not reduce:
+    if store_value.op is not Ops.CMPNE or len(store_value.src) != 2 or reduce.arg[0] is not Ops.MAX: return None
+    outer_all = any(value is reduce and truth.op is Ops.CONST and bool(truth.arg)
+                    for value, truth in ((store_value.src[0], store_value.src[1]), (store_value.src[1], store_value.src[0])))
+    if not outer_all: return None
+  semantic_op = Ops.MUL if outer_all else reduce.arg[0]
   if not reduce.src[1:] or any(r.src[0].op is not Ops.CONST for r in reduce.src[1:]): return None
 
   body = reduce.src[0]
   source:UOp|None = None
-  if body.op is Ops.INDEX and body.dtype is dtypes.bool:
+  if outer_all and body.op is Ops.CMPNE and len(body.src) == 2:
+    for candidate, truth in ((body.src[0], body.src[1]), (body.src[1], body.src[0])):
+      if truth.op is Ops.CONST and bool(truth.arg) and candidate.op is Ops.INDEX and candidate.dtype is dtypes.bool:
+        source = candidate
+        break
+  elif body.op is Ops.INDEX and body.dtype is dtypes.bool:
     source = body
   elif body.op is Ops.CMPNE and len(body.src) == 2:
     for candidate, zero in ((body.src[0], body.src[1]), (body.src[1], body.src[0])):
@@ -7370,6 +7453,45 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
+  if outer_all:
+    widened = alloc()
+    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    widen_layout = (input_total, _HOST_BOOL_HALF_LAYOUT)
+    widen_relocs = (RKReloc(0, widened, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", widen_layout, widened, is_copy=True), widen_relocs))
+    loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+    reductions = list(reduce.src[1:])
+    if any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+    reduce_extents = [int(u.src[0].arg) for u in reductions]
+    window = prod(reduce_extents)
+    gathered_slots:list[int] = []
+    widened_param = source.src[0].param_like(widened).replace(dtype=dtypes.half)
+    widened_index = source.replace(dtype=dtypes.half, src=(widened_param, *source.src[1:]))
+    for linear in range(window):
+      rem, fixed = linear, {}
+      for reduce_axis in range(len(reductions)-1, -1, -1):
+        rem, coord = divmod(rem, reduce_extents[reduce_axis])
+        fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
+      gathered = widened_index.substitute(fixed)
+      scratch_slot = alloc()
+      scratch = UOp.param(scratch_slot, dtypes.half, (output_total,), device=store.src[0].src[0].device)
+      scratch_index = store.src[0].replace(dtype=dtypes.half, src=(scratch, *store.src[0].src[1:]))
+      movement_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(scratch_index, gathered)), *loops)))
+      movement_tasks = _try_movement_host_subtasks(movement_sink)
+      if movement_tasks is None or len(movement_tasks) != 1: return None
+      tasks.extend(movement_tasks)
+      gathered_slots.append(scratch_slot)
+    accumulator = gathered_slots[0]
+    if len(gathered_slots) == 1:
+      tasks.append(_emit_where_stage(output_total, info.outs[0], (accumulator, 0), (_ZERO_SLOT, 0), Ops.ADD, bool_output=True))
+      return tuple(tasks)
+    for index, operand in enumerate(gathered_slots[1:], 1):
+      final = index == len(gathered_slots)-1
+      out_slot = info.outs[0] if final else alloc()
+      tasks.append(_emit_where_stage(output_total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL, bool_output=final))
+      accumulator = out_slot
+    return tuple(tasks)
+
   # Buffers at the RK3588 GEM mmap boundary cannot be submitted directly.
   # Stage large predicates through reusable 32K-lane DMA tiles, then copy the
   # exact fp16 mask bytes into one host-mapped tensor for tiled CMAC gathering.
@@ -7390,7 +7512,7 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                     _emit_where_stage(count, magnitude_tile, (input_tile, 0), (negative_tile, 0), Ops.MAX),
                     _emit_where_stage(count, nonzero_tile, (magnitude_tile, 0), (magnitude_tile, 0), Ops.MAX, compare=True)))
       tile_result = nonzero_tile
-      if reduce.arg[0] is Ops.MUL:
+      if semantic_op is Ops.MUL:
         tile_result = negative_tile
         tasks.append(_emit_where_stage(count, tile_result, (_CONST_SLOT, 0x3f800000), (nonzero_tile, 0), Ops.SUB))
       result_layout = (count, _HOST_MOVEMENT_LAYOUT, 2, 1, count,
@@ -7404,8 +7526,10 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # predicate arithmetic and both reductions execute on the NPU.
   elif source.dtype is dtypes.bool:
     nonzero = alloc()
-    tasks.append(_emit_where_stage(input_total, nonzero, (source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
-                                   bool_inputs=(source_slot,)))
+    layout = (input_total, _HOST_BOOL_HALF_LAYOUT)
+    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    host_relocs = (RKReloc(0, nonzero, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", layout, nonzero, is_copy=True), host_relocs))
   else:
     negative, magnitude, nonzero = (alloc() for _ in range(3))
     # WIP reference: separate positive/negative comparisons also produce an
@@ -7418,7 +7542,7 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   if not (source.dtype is dtypes.half and input_total*2 >= 2*1024*1024):
     counted = nonzero
-    if reduce.arg[0] is Ops.MUL:
+    if semantic_op is Ops.MUL:
       counted = negative if source.dtype is dtypes.half else alloc()
       tasks.append(_emit_where_stage(input_total, counted, (_CONST_SLOT, 0x3f800000), (nonzero, 0), Ops.SUB))
 
@@ -7444,10 +7568,10 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmds, task, relocs = emit_rk(sum_plan)
     tasks.append(RKSubTask(cmds, task, relocs))
 
-  positive = info.outs[0] if reduce.arg[0] is Ops.MAX else alloc()
+  positive = info.outs[0] if semantic_op is Ops.MAX else alloc()
   tasks.append(_emit_where_stage(output_total, positive, (sum_slot, 0), (sum_slot, 0), Ops.MAX, compare=True,
-                                 bool_output=reduce.arg[0] is Ops.MAX))
-  if reduce.arg[0] is Ops.MUL:
+                                 bool_output=semantic_op is Ops.MAX))
+  if semantic_op is Ops.MUL:
     tasks.append(_emit_where_stage(output_total, info.outs[0], (_CONST_SLOT, 0x3f800000), (positive, 0), Ops.SUB,
                                    bool_output=True))
   return tuple(tasks)
@@ -7957,6 +8081,8 @@ def build_native_program(sink: UOp) -> UOp|None:
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
   if (product_tasks := _try_local_product_subtasks(sink)) is not None:
     return build_native_program_multi(sink, product_tasks)
+  if (int_min_tasks := _try_native_int_min_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, int_min_tasks)
   if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
     return build_native_program_multi(sink, bool_reduce_tasks)
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
