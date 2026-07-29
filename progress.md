@@ -6903,3 +6903,33 @@ that non-finite scale reach the generic LUT builder.  It is a special
 semantic lowering, not a four-band accuracy issue.
 
 Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
+
+## 2026-07-30 — zero-base POW semantics
+
+Tinygrad expands `0**x` as
+`WHERE(x != 0, EXP2(x * -inf), 1)`.  Sending the non-finite scale to the
+generic EXP2 builder caused host-side table construction to encounter NaN.
+A strict matcher now derives the result directly on DPU:
+
+- positive exponent mask → `0`;
+- zero/signed-zero mask → `1`;
+- negative exponent mask divided by its complement → `+inf`;
+- `CMPNE(x,x)` plus a `0/0` denominator → NaN for NaN exponent.
+
+This also handles `±inf` exponents correctly and never constructs a LUT with
+a non-finite scale.  It uses only DPU comparisons, ADD/SUB, and FDIV; no
+host operator fallback is involved.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- permanent `[-inf,-2,-1,-0,+0,1,2,3,+inf,NaN]` regression:
+  **10/10 passing in 4.29 seconds**;
+- official `TestOps.test_pow_const`: zero-base case passes and the method
+  reaches the final `0.7**x` exponent-3 range failure in **77.93 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.55 seconds**;
+- pycompile and `git diff --check`: passing;
+- mypy remains at the same 13 pre-existing Rockchip errors.
+
+Recovery patch: `rockchip-zero-base-pow-4804f8bc5.patch`.

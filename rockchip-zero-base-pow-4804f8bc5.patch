@@ -1,0 +1,184 @@
+diff --git a/progress.md b/progress.md
+index 6f6696ddd..aa2c4b831 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6903,3 +6903,33 @@ that non-finite scale reach the generic LUT builder.  It is a special
+ semantic lowering, not a four-band accuracy issue.
+ 
+ Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
++
++## 2026-07-30 — zero-base POW semantics
++
++Tinygrad expands `0**x` as
++`WHERE(x != 0, EXP2(x * -inf), 1)`.  Sending the non-finite scale to the
++generic EXP2 builder caused host-side table construction to encounter NaN.
++A strict matcher now derives the result directly on DPU:
++
++- positive exponent mask → `0`;
++- zero/signed-zero mask → `1`;
++- negative exponent mask divided by its complement → `+inf`;
++- `CMPNE(x,x)` plus a `0/0` denominator → NaN for NaN exponent.
++
++This also handles `±inf` exponents correctly and never constructs a LUT with
++a non-finite scale.  It uses only DPU comparisons, ADD/SUB, and FDIV; no
++host operator fallback is involved.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- permanent `[-inf,-2,-1,-0,+0,1,2,3,+inf,NaN]` regression:
++  **10/10 passing in 4.29 seconds**;
++- official `TestOps.test_pow_const`: zero-base case passes and the method
++  reaches the final `0.7**x` exponent-3 range failure in **77.93 seconds**;
++- hardware-free PR1 contract: **79/79 passing in 6.55 seconds**;
++- pycompile and `git diff --check`: passing;
++- mypy remains at the same 13 pre-existing Rockchip errors.
++
++Recovery patch: `rockchip-zero-base-pow-4804f8bc5.patch`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 06d7dce1d..0bc4f5ce0 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -354,6 +354,13 @@ class TestDPU(unittest.TestCase):
+     expected = np.power(np.float32(8.0), exponent.astype(np.float32)).astype(np.float16)
+     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+ 
++  def test_dpu_zero_base_pow_special(self):
++    exponent = np.array([-np.inf, -2, -1, -0.0, 0.0, 1, 2, 3, np.inf, np.nan], dtype=np.float16)
++    actual = (0 ** Tensor(exponent, device="ROCKCHIP")).realize().numpy()
++    with np.errstate(all="ignore"):
++      expected = np.power(np.float32(0.0), exponent.astype(np.float32)).astype(np.float16)
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
++
+   def test_dpu_log2_two_lut_normalization(self):
+     boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
+                            0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 7984b3db8..9fc43ae81 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1003,3 +1003,20 @@ reaching only `0**x` in 77.35 seconds, and PR1 remains **79/79 in 6.53
+ seconds**.  No host operator fallback is used.
+ 
+ Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
++
++### Zero-base POW milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `0**x`, official values | **passing** | DPU sign/zero/NaN masks |
++| infinities, signed zero, NaN regression | **10/10 passing** | **passing** |
++| final `0.7**x` | exponent 3 outside generic LUT range | next POW subgroup |
++
++The strict lowering avoids `EXP2(x*-inf)` entirely.  DPU masks select zero
++or one, FDIV synthesizes positive infinity for negative exponents, and a
++comparison-derived `0/0` restores NaN.  The permanent regression passes in
++4.29 seconds and the official method advances to its final 0.7-base case in
++77.93 seconds.  PR1 remains **79/79 in 6.55 seconds**.  No host operator
++fallback is used.
++
++Recovery patch: `rockchip-zero-base-pow-4804f8bc5.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index da429160f..3fd0855d1 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -5224,6 +5224,89 @@ def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   dependent(out, (signed,0), (valid_factor,0), Ops.MUL)
+   return tuple(tasks)
+ 
++def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate 0**x directly from exponent sign, zero, infinity, and NaN masks."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++  value = _unwrap(store.src[1])
++  if value.op is not Ops.WHERE or len(value.src) != 3: return None
++  condition, nonzero_value, zero_value = map(_unwrap, value.src)
++  if condition.op is not Ops.CMPNE or zero_value.op is not Ops.CONST or float(zero_value.arg) != 1.0: return None
++  source = next((_unwrap(u) for u in condition.src if _unwrap(u).op is Ops.INDEX), None)
++  zero = next((u for u in condition.src if u.op is Ops.CONST and float(u.arg) == 0.0), None)
++  if source is None or zero is None or source.dtype is not dtypes.half: return None
++  if nonzero_value.op is not Ops.EXP2 or len(nonzero_value.src) != 1: return None
++  product = _unwrap(nonzero_value.src[0])
++  if product.op is not Ops.MUL or source not in product.toposort(): return None
++  scales = [float(u.arg) for u in product.src if u.op is Ops.CONST]
++  if len(scales) != 1 or scales[0] != -math.inf: return None
++
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  if int(source.src[0].src[0].arg) != total: return None
++  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
++  next_slot = max(info.globals, default=-1)+1
++  tasks:list[RKSubTask] = []
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++
++  def scalar(number:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
++
++  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
++    diff, mask = alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
++                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
++    return mask, 0
++
++  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
++    out_index = store.src[0]
++    return out_index.replace(dtype=dtype,
++      src=(out_index.src[0].param_like(slot).replace(dtype=dtype), *out_index.src[1:]))
++
++  def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
++    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
++
++  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
++    nonlocal next_slot
++    mask_slot = alloc()
++    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
++    if cmp_tasks is None: return None
++    last = cmp_tasks[-1]
++    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
++    tasks.extend(cmp_tasks)
++    used_slots = [task.task.out_slot for task in cmp_tasks] + \
++      [reloc.globals_slot for task in cmp_tasks for reloc in task.relocs
++       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++    next_slot = max(next_slot, max(used_slots, default=-1)+1)
++    return mask_slot, 0
++
++  source_arg, one = (source_slot,0), scalar(1.0)
++  positive = positive_mask(source_arg, (_ZERO_SLOT,0))
++  negative = positive_mask((_ZERO_SLOT,0), source_arg)
++  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
++  if not_number is None: return None
++  nonzero, zero_or_nan, zero_result = alloc(), alloc(), alloc()
++  dependent(nonzero, positive, negative, Ops.ADD)
++  dependent(zero_or_nan, one, (nonzero,0), Ops.SUB)
++  dependent(zero_result, (zero_or_nan,0), not_number, Ops.SUB)
++
++  infinity_denom, infinity = alloc(), alloc()
++  dependent(infinity_denom, one, negative, Ops.SUB)
++  dependent(infinity, negative, (infinity_denom,0), Ops.FDIV)
++  normal, nan_denom, nan_numerator = alloc(), alloc(), alloc()
++  dependent(normal, (zero_result,0), (infinity,0), Ops.ADD)
++  dependent(nan_denom, one, not_number, Ops.SUB)
++  dependent(nan_numerator, (normal,0), (nan_denom,0), Ops.MUL)
++  dependent(out, (nan_numerator,0), (nan_denom,0), Ops.FDIV)
++  return tuple(tasks)
++
+ def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower fractional x**c through staged abs, LOG2, scale, and EXP2.
+ 
+@@ -9522,6 +9605,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, pow_base8_tasks)
+   if (pow_neg_base55_tasks := _try_pow_neg_base55_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, pow_neg_base55_tasks)
++  if (zero_base_pow_tasks := _try_zero_base_pow_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, zero_base_pow_tasks)
+   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fractional_pow_tasks)
+   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)

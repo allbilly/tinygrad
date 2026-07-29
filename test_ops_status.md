@@ -1003,3 +1003,20 @@ reaching only `0**x` in 77.35 seconds, and PR1 remains **79/79 in 6.53
 seconds**.  No host operator fallback is used.
 
 Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
+
+### Zero-base POW milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `0**x`, official values | **passing** | DPU sign/zero/NaN masks |
+| infinities, signed zero, NaN regression | **10/10 passing** | **passing** |
+| final `0.7**x` | exponent 3 outside generic LUT range | next POW subgroup |
+
+The strict lowering avoids `EXP2(x*-inf)` entirely.  DPU masks select zero
+or one, FDIV synthesizes positive infinity for negative exponents, and a
+comparison-derived `0/0` restores NaN.  The permanent regression passes in
+4.29 seconds and the official method advances to its final 0.7-base case in
+77.93 seconds.  PR1 remains **79/79 in 6.55 seconds**.  No host operator
+fallback is used.
+
+Recovery patch: `rockchip-zero-base-pow-4804f8bc5.patch`.
