@@ -7130,3 +7130,57 @@ Using `. .venv/bin/activate`, `CACHELEVEL=0 CCACHE=0`,
 precision-heavy group: its sequential fp16 multiply misses 23/600 official
 values, while the reference behavior is consistent with fp32 prefix
 accumulation followed by fp16 output rounding.
+
+## 2026-07-30 — native stable Argsort
+
+The unchanged Argsort method now passes without a host sort.  Tinygrad lowers
+stable sorting along an axis into three distinct graph families, each handled
+by a narrow Rockchip recognizer:
+
+1. bitonic compare/swap kernels statically gather each wire pair, compute
+   MAX and `-MAX(-a,-b)` on DPU, and use a compile-time lane-direction mask
+   for the DPU selection;
+2. stable occurrence-count reductions compare each value with the preceding
+   candidates, form DPU equality masks, sum them, and convert the small exact
+   counts to native int32;
+3. the final selector combines occurrence-count compatibility with the
+   closest original value and carries the winning reduction coordinate
+   through DPU comparisons before native int32 byte assembly.
+
+The third step deliberately uses closest compatible value rather than raw
+fp16 equality.  RK3588 compare/swap preserves ordering but can perturb a
+selected fp16 value by a few ULPs as it passes through MAX/negation stages.  A
+bitwise probe of the official-shape graph found 155/384 sorted representations
+different from the original source representation even though the numerical
+sort order and both occurrence-count tensors were correct.  Exact equality
+therefore lost 137/384 indices.  Minimizing `abs(original-sorted)` among
+candidates with the same occurrence count recovers source identity and keeps
+stable duplicate ordering.
+
+All runtime values remain on the accelerator.  Host copy tasks only apply
+precomputed address maps, create static 0/1 or coordinate tensors, pack
+four-lane ABI atoms, and assemble representation bytes.  They do not compare,
+sort, count, or select data, and `run_host` is not used for Argsort arithmetic.
+
+Useful debug procedure:
+
+- set `ROCKCHIP_DEBUG_ARGSORT=1`; expected markers are
+  `RK_ARGSORT_COMPARE`, `RK_ARGSORT_INDEX`, and `RK_ARGSORT_SELECTED`;
+- first compare the public sorted values numerically and bitwise: correct
+  order with small bit differences indicates DPU pass-through roundoff rather
+  than a wire-map error;
+- expose `count_orig` and `count_sorted` from `Tensor.sort`; their mismatch
+  counts separate equality-map faults from final source matching;
+- equality of arbitrary operands must use
+  `max(a-b, b-a)`, because the proven DPU compare mask only detects a positive
+  difference;
+- test close fp16 values and an explicit duplicate together so nearest-value
+  recovery cannot hide a broken stable occurrence count.
+
+### Validation
+
+Using `. .venv/bin/activate`, disabled caches, half defaults, and forward-only:
+
+- unchanged official `TestOps.test_argsort`: **passing in 93.62 seconds**;
+- permanent close-value/stable-tie Argsort plus general ArgMax/ArgMin:
+  **2/2 passing in 73.10 seconds**.

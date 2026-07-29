@@ -1126,3 +1126,36 @@ With `. .venv/bin/activate`, disabled caches, half defaults, and forward-only:
 
 Debug with `ROCKCHIP_DEBUG_ARG_EXTREMA=1`, then isolate axis/tie, int32
 `INT_MIN`, and bool truth-pair probes as documented in `progress.md`.
+
+### Native stable Argsort milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| descending stable `argsort(axis=1)` | **passing** | DPU bitonic compare/select |
+| occurrence counts | **passing** | DPU equality/sum + native int32 output |
+| close fp16 source recovery | **passing** | DPU nearest compatible candidate |
+| explicit duplicate stability | **passing** | occurrence-count tie identity |
+
+Tinygrad's Argsort graph consists of bitonic MAX/MIN compare/swap stages, two
+prefix occurrence-count reductions, and a final value/count match.  The
+Rockchip path lowers all three to task chains.  Static host work is limited to
+wire address maps, lane-direction/count masks, ABI packing, and output-byte
+assembly; no callback evaluates values or performs a sort.
+
+RK3588 compare/swap can move a forwarded fp16 value a few ULPs while retaining
+the correct order.  On the official-shape debug graph 155/384 sorted bit
+patterns changed and exact final equality lost 137 indices, while both count
+tensors were exact.  The final selector now chooses the minimum absolute
+distance among candidates whose occurrence counts match.  DPU comparisons
+carry that winning original coordinate, preserving stable duplicates.
+
+Validation with `. .venv/bin/activate`, caches disabled,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged official `test_argsort`: **passing in 93.62 seconds**;
+- permanent close-value/stable-tie Argsort and ArgMax/ArgMin regression:
+  **2/2 passing in 73.10 seconds**.
+
+Use `ROCKCHIP_DEBUG_ARGSORT=1` to distinguish compare/swap, count, and final
+selector kernels.  The full bitwise/count isolation procedure is recorded in
+`progress.md`.

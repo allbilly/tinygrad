@@ -114,6 +114,15 @@ class TestDPU(unittest.TestCase):
       np.testing.assert_array_equal(y.argmax().realize().numpy(), np.argmax(values).astype(np.int32))
       np.testing.assert_array_equal(y.argmin().realize().numpy(), np.argmin(values).astype(np.int32))
 
+  def test_dpu_argsort_stable(self):
+    # Close fp16 values exercise the few-ULP roundoff of DPU bitonic
+    # compare/swap, while the explicit duplicate checks stable occurrence IDs.
+    values = np.random.default_rng(0).uniform(-2, 2, size=(1,8,2)).astype(np.float16)
+    values[0,6,0] = values[0,1,0]
+    actual = Tensor(values, device="ROCKCHIP").argsort(1, True).realize().numpy()
+    expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
+    np.testing.assert_array_equal(actual, expected)
+
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
