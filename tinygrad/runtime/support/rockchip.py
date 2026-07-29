@@ -70,6 +70,7 @@ class RKPlan:
   epilogue_scale: float = 1.0         # scale factor for "scale" epilogue (BS MUL operand)
   epilogue_bias_slot: int = -1        # host fp32-accumulator channel bias, before final fp16 rounding
   epilogue_bias_axis: int = -1        # output LOOP axis used to index the bias tensor
+  cmac_materialization: tuple[int, ...] = () # serialized non-contiguous A/B/output indexing for CMAC
 
 @dataclass(frozen=True)
 class RKTask:
@@ -173,6 +174,7 @@ _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-index
 _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
 _HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
 _HOST_ELEMENTWISE_LAYOUT = -1004  # is_copy task layout tag for serialized fused elementwise graphs
+_CMAC_MATERIALIZED_LAYOUT = -1005  # CMAC layout tag for host-gathered A/B matrices
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -1594,6 +1596,152 @@ def _is_cmac_matmul_layout(sink: UOp, reduce: UOp) -> bool:
            (_is_2d_index(a_idx.src[1], "LOOP", "REDUCE", K) is not None and _is_1d_index(b_idx.src[1], "REDUCE"))
   return False
 
+def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
+  """Map a separable indexed dot product to CMAC by serializing only its A/B gathers.
+  Output LOOP axes used by A form M; axes used by B form N. All multiplication and
+  fp32 accumulation remain on CNA/CORE."""
+  body = _reduce_body(reduce)
+  outer_conditions:list[UOp] = []
+  while body.op is Ops.WHERE and body.dtype is dtypes.float and body.src[2].op is Ops.CONST and body.src[2].arg is Invalid:
+    outer_conditions.append(body.src[0])
+    body = body.src[1]
+    while body.op is Ops.CAST: body = body.src[0]
+  if body.op is Ops.MUL: a_val, b_val = (_unwrap(x) for x in body.src)
+  elif body.op is Ops.WHERE and body.dtype is dtypes.half:
+    true, false = (_unwrap(x) for x in body.src[1:])
+    if true.op is not Ops.MUL or false.op is not Ops.MUL: return None
+    common = next((x for x in true.src if any(x is y for y in false.src)), None)
+    if common is None: return None
+    true_value = next(x for x in true.src if x is not common)
+    false_value = next(x for x in false.src if x is not common)
+    a_val = UOp(Ops.WHERE, dtypes.half, (body.src[0], true_value, false_value))
+    b_val = _unwrap(common)
+  elif body.dtype is dtypes.half: a_val, b_val = body, None
+  else: return None
+  for condition in reversed(outer_conditions):
+    a_val = UOp(Ops.WHERE, dtypes.half, (condition, a_val, UOp.const(dtypes.half, 0.0)))
+  store = _store_node(sink)
+  if store is None or store.src[0].op is not Ops.INDEX: return None
+  if a_val.dtype is not dtypes.half or (b_val is not None and b_val.dtype is not dtypes.half) or store.src[0].dtype is not dtypes.half: return None
+  value_indexes = [[u for u in val.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.half]
+                   for val in (a_val, b_val) if val is not None]
+  if not value_indexes[0] or any(len({u.src[0].buf_uop.arg.slot for u in indexes}) != 1 for indexes in value_indexes): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  if not loops or not reductions or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  loop_extents, reduce_extents = tuple(int(u.src[0].arg) for u in loops), tuple(int(u.src[0].arg) for u in reductions)
+  a_nodes, b_nodes = set(a_val.toposort()), set(b_val.toposort()) if b_val is not None else set()
+  a_axes = {i for i,u in enumerate(loops) if u in a_nodes}
+  b_axes = {i for i,u in enumerate(loops) if u in b_nodes}
+  shared_axes = tuple(i for i in range(len(loops)) if i in a_axes and i in b_axes)
+  m_axes = tuple(i for i in range(len(loops)) if i in a_axes or i not in b_axes)
+  n_axes = tuple(i for i in range(len(loops)) if i in b_axes)
+  if set(m_axes) | set(n_axes) != set(range(len(loops))): return None
+  range_ids = {u:i for i,u in enumerate((*loops, *reductions))}
+  op_codes = {Ops.ADD:2, Ops.MUL:3, Ops.FLOORDIV:4, Ops.FLOORMOD:5,
+              Ops.CMPLT:6, Ops.CMPNE:7, Ops.AND:8, Ops.OR:9}
+
+  def emit_int(u:UOp, code:list[int]) -> bool:
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.CONST:
+      try: value = 0 if u.arg is Invalid else int(u.arg)
+      except (TypeError, ValueError): return False
+      code.extend((0, value))
+      return True
+    if u.op is Ops.RANGE and u in range_ids:
+      code.extend((1, range_ids[u]))
+      return True
+    if u.op in op_codes and len(u.src) == 2:
+      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code): return False
+      code.extend((op_codes[u.op], 0))
+      return True
+    if u.op is Ops.WHERE and len(u.src) == 3:
+      if not all(emit_int(x, code) for x in u.src): return False
+      code.extend((11, 0))
+      return True
+    return False
+
+  def emit_value(u:UOp, code:list[int]) -> bool:
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.INDEX and u.dtype is dtypes.half:
+      if not emit_int(u.src[1], code): return False
+      code.extend((10, 0))
+      return True
+    if u.op is Ops.CONST and u.dtype is dtypes.half:
+      code.extend((12, struct.unpack('<H', struct.pack('<e', float(u.arg)))[0]))
+      return True
+    if u.op is Ops.WHERE and len(u.src) == 3:
+      if not emit_int(u.src[0], code) or not emit_value(u.src[1], code) or not emit_value(u.src[2], code): return False
+      code.extend((11, 0))
+      return True
+    return False
+
+  out_code:list[int] = []
+  a_code:list[int] = []
+  b_code:list[int] = []
+  if not emit_int(store.src[0].src[1], out_code) or not emit_value(a_val, a_code): return None
+  if b_val is None: b_code.extend((12, struct.unpack('<H', struct.pack('<e', 1.0))[0]))
+  elif not emit_value(b_val, b_code): return None
+  # CMAC accumulation is sensitive to K packing order.  tinygrad's ordinary
+  # convolution exposes (input-channel, kernel...) reduction axes, while
+  # conv_transpose exposes (kernel..., input-channel).  Pack K in the source
+  # weight's row-major address order, as conv_grok/gemm_npu.py does, so both
+  # graph forms accumulate products in the same order.
+  def index_strides(indexes:list[UOp]) -> tuple[int, ...]:
+    candidates:list[tuple[int, ...]] = []
+    for index in indexes:
+      code:list[int] = []
+      if not emit_int(index.src[1], code): continue
+      def evaluate(coords:list[int]) -> int:
+        stack:list[int] = []
+        for pos in range(0, len(code), 2):
+          op, arg = code[pos], code[pos+1]
+          if op == 0: stack.append(arg)
+          elif op == 1: stack.append(coords[arg])
+          elif op == 11:
+            false, true, cond = stack.pop(), stack.pop(), stack.pop()
+            stack.append(true if cond else false)
+          else:
+            rhs, lhs = stack.pop(), stack.pop()
+            if op == 2: stack.append(lhs + rhs)
+            elif op == 3: stack.append(lhs * rhs)
+            elif op == 4: stack.append(lhs // rhs)
+            elif op == 5: stack.append(lhs % rhs)
+            elif op == 6: stack.append(int(lhs < rhs))
+            elif op == 7: stack.append(int(lhs != rhs))
+            elif op == 8: stack.append(int(bool(lhs) and bool(rhs)))
+            elif op == 9: stack.append(int(bool(lhs) or bool(rhs)))
+            else: return 0
+        return stack[0] if len(stack) == 1 else 0
+      base_coords = [0] * len(range_ids)
+      base = evaluate(base_coords)
+      strides = []
+      for axis, extent in enumerate(reduce_extents):
+        coords = base_coords.copy()
+        if extent > 1: coords[len(loops)+axis] = 1
+        strides.append(evaluate(coords)-base)
+      candidates.append(tuple(strides))
+    return max(candidates, key=lambda x:(sum(v != 0 for v in x), max((abs(v) for v in x), default=0),
+                                         sum(abs(v) for v in x)), default=tuple(0 for _ in reductions))
+
+  weight_indexes = value_indexes[1] if b_val is not None else value_indexes[0]
+  weight_strides = index_strides(weight_indexes)
+  reduce_order = tuple(sorted(range(len(reductions)), key=lambda axis:(-abs(weight_strides[axis]), axis)))
+  # A flipped weight kernel is tinygrad's conv_transpose signature.  PyTorch's
+  # CPU fp16 reference rounds each per-kernel-position channel dot before
+  # col2im adds it to the output; retain those axes so emission can reproduce
+  # the same boundaries with multiple CMAC and DPU tasks.
+  rounding_axes = tuple(axis for axis, stride in enumerate(weight_strides) if stride < 0)
+  batches = prod(loop_extents[i] for i in shared_axes)
+  M, N, K = prod(loop_extents[i] for i in m_axes), prod(loop_extents[i] for i in n_axes), prod(reduce_extents) * batches
+  a_slot = value_indexes[0][0].src[0].buf_uop.arg.slot
+  b_slot = _CONST_SLOT if b_val is None else value_indexes[1][0].src[0].buf_uop.arg.slot
+  return (M, N, K, a_slot, b_slot, len(loops), *loop_extents, len(reductions), *reduce_extents,
+          len(m_axes), *m_axes, len(n_axes), *n_axes, len(shared_axes), *shared_axes,
+          len(reduce_order), *reduce_order,
+          len(out_code), *out_code, len(a_code), *a_code, len(b_code), *b_code,
+          0, len(reduce_order), *reduce_order, len(rounding_axes), *rounding_axes)
+
 def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
   """REDUCE(ADD, INDEX) or REDUCE(ADD, MUL(INDEX, CONST(c))) → (input_slot, M, N, K, const_val) for CMAC, or None.
   A-pattern (axis=1): a@ones(K,1), M=out[0], N=1, ones=B.
@@ -1684,6 +1832,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
   abs_slot = None  # set in DPU path only
   epilogue, epilogue_scale = "none", 1.0  # set in CMAC path only
   epilogue_bias_slot, epilogue_bias_axis = -1, -1
+  cmac_materialization:tuple[int, ...] = ()
   # R3 DPU: no REDUCE, single STORE with binary EW op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy
   if reduce is None:
     store = _store_node(sink)
@@ -1721,8 +1870,14 @@ def plan_rk(sink: UOp) -> RKPlan|str:
         if epi is None:
           return "RKPLAN_REJECT:unsupported_op:fused_epilogue"
         epilogue, epilogue_scale, epilogue_bias_slot, epilogue_bias_axis = epi
-    if body.op is Ops.MUL and all(s.op is Ops.INDEX or (s.op is Ops.CAST and s.src[0].op is Ops.INDEX) for s in body.src):
-      if not _is_cmac_matmul_layout(sink, reduce): return "RKPLAN_REJECT:unsupported_layout"
+    materialization = _try_cmac_materialization(sink, reduce)
+    direct_cmac = body.op is Ops.MUL and all(s.op is Ops.INDEX or (s.op is Ops.CAST and s.src[0].op is Ops.INDEX) for s in body.src) and \
+      _is_cmac_matmul_layout(sink, reduce)
+    if materialization is not None:
+      if not direct_cmac or tuple(materialization[:2]) != _shape_of_store(sink): cmac_materialization = materialization
+      kind = "cmac"
+    elif body.op is Ops.MUL and all(s.op is Ops.INDEX or (s.op is Ops.CAST and s.src[0].op is Ops.INDEX) for s in body.src):
+      if not direct_cmac: return "RKPLAN_REJECT:unsupported_layout"
       kind = "cmac"
     elif body.op is Ops.INDEX:
       # For epilogue fusion, _try_sum may reject because store.src[1] != reduce.
@@ -1774,7 +1929,8 @@ def plan_rk(sink: UOp) -> RKPlan|str:
   return RKPlan(kind, sink, out_slots[0], in_slots, input_scale=input_scale, output_scale=output_scale, lut_op=lut_op,
                 fp32_inputs=fp32_inputs, fp32_output=fp32_output, is_abs=abs_slot is not None,
                 epilogue=epilogue, epilogue_scale=epilogue_scale,
-                epilogue_bias_slot=epilogue_bias_slot, epilogue_bias_axis=epilogue_bias_axis)
+                epilogue_bias_slot=epilogue_bias_slot, epilogue_bias_axis=epilogue_bias_axis,
+                cmac_materialization=cmac_materialization)
 
 # ---- geometry extraction ----
 def _loop_extents(sink: UOp) -> list[int]:
@@ -5111,6 +5267,12 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
         [r.globals_slot for st in special_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
       next_slot = max(next_slot, max(used_slots, default=-1) + 1)
       return out_idx
+    if (broadcast_tasks := _try_broadcast_subtasks(stage_sink)) is not None:
+      tasks.extend(broadcast_tasks)
+      used_slots = [st.task.out_slot for st in broadcast_tasks] + \
+        [r.globals_slot for st in broadcast_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+      next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+      return out_idx
     plan = plan_rk(stage_sink)
     if isinstance(plan, str) or plan.kind not in ("dpu", "dpu_lut"): return None
     cmds, task, relocs = emit_rk(plan)
@@ -5133,9 +5295,16 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       slot = alloc()
       if u.op is Ops.WHERE:
         stage_sink, idx = make_stage_sink(u, slot)
-        if (where_tasks := _try_where_subtasks(stage_sink)) is None: return None
-        tasks.extend(where_tasks)
-        used_slots = [r.globals_slot for st in where_tasks for r in st.relocs
+        if (movement_tasks := _try_movement_host_subtasks(stage_sink)) is not None:
+          tasks.extend(movement_tasks)
+          used_slots = [r.globals_slot for st in movement_tasks for r in st.relocs
+                        if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+        elif (where_tasks := _try_where_subtasks(stage_sink)) is not None:
+          tasks.extend(where_tasks)
+          used_slots = [r.globals_slot for st in where_tasks for r in st.relocs
+                        if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+        else: return None
+        used_slots = [r.globals_slot for st in tasks for r in st.relocs
                       if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
         next_slot = max(next_slot, max(used_slots, default=-1) + 1)
       else:
@@ -5641,7 +5810,9 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   body = _reduce_body(reduce)
   is_sum = body.op is Ops.INDEX or (body.op is Ops.MUL and _try_sum(sink, reduce) is not None)  # sum or scaled sum
   cv = 1.0
-  if is_sum:
+  if plan.cmac_materialization:
+    M, N, K, a_slot, b_slot = plan.cmac_materialization[:5]
+  elif is_sum:
     sum_info = _try_sum(sink, reduce)
     assert sum_info is not None, "cmac: sum classification failed"
     input_slot, M_sum, N_sum, _, cv = sum_info
@@ -5650,13 +5821,14 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
     a_idx_node, b_idx_node = _unwrap(body.src[0]), _unwrap(body.src[1])
     a_slot, b_slot = a_idx_node.src[0].buf_uop.arg.slot, b_idx_node.src[0].buf_uop.arg.slot
   out_shape = _shape_of_store(sink)
-  if is_sum: M, N = M_sum, N_sum
+  if plan.cmac_materialization: pass
+  elif is_sum: M, N = M_sum, N_sum
   elif len(out_shape) == 2: M, N = int(out_shape[0]), int(out_shape[1])
   else:  # GEMV: vector is A (M=1) or B (N=1)
     M, N = (1, int(out_shape[0])) if _is_1d_index(a_idx_node.src[1], "REDUCE") else (int(out_shape[0]), 1)  # type: ignore[union-attr]
-  K = _reduce_extent(reduce)
+  K = K if plan.cmac_materialization else _reduce_extent(reduce)
   if K < 0: raise RuntimeError("cmac: K must be compile-time constant")
-  if not is_sum:
+  if not is_sum and not plan.cmac_materialization:
     # Detect transposed pattern (1x1 conv): A has REDUCE outer, B has LOOP outer
     if len(out_shape) == 2 and _is_2d_index(a_idx_node.src[1], "REDUCE", "LOOP", N) and \
        _is_2d_index(b_idx_node.src[1], "LOOP", "REDUCE", K):
@@ -5672,14 +5844,18 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   align_in = max(aligned_k, align_out)
   eff_k = align_in if align_in != aligned_k else K
   input_row_bytes = align_in * 2
+  tile_m = min(M, max(1, min(2048, 10 * CBUF_BANK_SIZE // input_row_bytes))) if plan.cmac_materialization else M
   # feature grains and line stride from gemm.py
   even_rows_per_two_banks = (ceildiv(2 * CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
   feature_grains = max(80, even_rows_per_two_banks)
   line_stride = 4 * min(ceildiv(eff_k, MIN_CHANNEL_TILE), RK_LINE_STRIDE_GROUP_CAP)
   notch_val = 8 * min(align_out // MIN_CHANNEL_TILE, RK_LINE_STRIDE_GROUP_CAP) - 1
-  data_banks = max(1, ceildiv(M * input_row_bytes, CBUF_BANK_SIZE))
+  required_data_banks = max(1, ceildiv(tile_m * input_row_bytes, CBUF_BANK_SIZE))
+  if not plan.cmac_materialization and required_data_banks >= RK_CBUF_BANKS:
+    raise RuntimeError("RKPLAN_REJECT:cmac_exceeds_cbuf")
+  data_banks = min(RK_CBUF_BANKS-1, required_data_banks)
   wt_banks = RK_CBUF_BANKS - data_banks
-  if data_banks > RK_CBUF_BANKS-1 or input_row_bytes*align_out > wt_banks*CBUF_BANK_SIZE:
+  if input_row_bytes*align_out > wt_banks*CBUF_BANK_SIZE:
     raise RuntimeError("RKPLAN_REJECT:cmac_exceeds_cbuf")
   # --- exact register sequence from gemm.py make_gemm_regs ---
   # 1. DPU S_POINTER
@@ -5691,10 +5867,10 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   # 4. CNA CONV_CON3: CONV_Y_STRIDE=1, CONV_X_STRIDE=1
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_CONV_CON3, (1<<3)|1)
   # 5-8. CNA data sizes
-  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE0, (1<<16)|M)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE0, (1<<16)|tile_m)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE1, ((align_in-1)<<16)|align_in)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE2, 1)
-  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE3, M)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_DATA_SIZE3, tile_m)
   # 9-11. CNA weight sizes
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes * align_out)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes)
@@ -5712,14 +5888,14 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_DMA_CON0, (15<<16)|15)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_DMA_CON1, line_stride)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_DMA_CON2, 0)
-  emitter_emit(cmds, _T_CNA, rk.REG_CNA_FC_DATA_SIZE0, (1<<16)|M)
+  emitter_emit(cmds, _T_CNA, rk.REG_CNA_FC_DATA_SIZE0, (1<<16)|tile_m)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_in)
   # 25. CNA DCOMP_ADDR0 (relocated — weight B, NO 0x4000 offset)
   emitter_emit(cmds, _T_CNA, rk.REG_CNA_DCOMP_ADDR0, 0)
   emitter_reloc(cmds, relocs, b_slot)
   # 26-29. CORE config
   emitter_emit(cmds, _T_CORE, rk.REG_CORE_MISC_CFG, (2<<8)|1)
-  emitter_emit(cmds, _T_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((M-1)<<16)|0)
+  emitter_emit(cmds, _T_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((tile_m-1)<<16)|0)
   emitter_emit(cmds, _T_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out-1)
   emitter_emit(cmds, _T_CORE, 0x3030, 0)  # CORE_RESERVED_3030
   # 30-45. DPU output config (FP32 output: OUT_PRECISION=5, size_e=3)
@@ -5729,7 +5905,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   emitter_reloc(cmds, relocs, plan.out_slot)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_DST_SURF_STRIDE, (1<<4))
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, M-1)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, tile_m-1)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch_val<<16)|notch_val)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((align_out-1)<<16)|(align_out-1))
   # BS/BN epilogue fusion: configure BS for relu or scale after CMAC reduce.
@@ -5747,15 +5923,19 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1<<6)|(1<<4)|(1<<1)|1)  # 0x53 all bypassed
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_OW_CFG, (3<<8)|(3<<5)|(3<<2)|(1<<1))
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1)
-  emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_1, ((M-1)<<16)|0)
+  emitter_emit(cmds, _T_DPU, rk.REG_DPU_WDMA_SIZE_1, ((tile_m-1)<<16)|0)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_BN_CFG, (1<<6)|(1<<4)|(1<<1)|1)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_EW_CFG, (1<<9)|(1<<8)|(1<<7)|(1<<1)|1)
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0)  # FP32 output, no conversion
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, (4<<4))
   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
-  layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
-            int(plan.epilogue == "bias_relu"))
+  if plan.cmac_materialization:
+    layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
+              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), *plan.cmac_materialization[5:])
+  else:
+    layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
+              int(plan.epilogue == "bias_relu"))
   return tuple(c.pack() for c in cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot, const_val=cv,
                                                fp32_inputs=plan.fp32_inputs, fp32_output=plan.fp32_output), tuple(relocs)
 
@@ -6571,6 +6751,89 @@ def _try_cat_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(tuple(c.pack() for c in cmds), task, relocs))
   return tuple(tasks)
 
+def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+  """Split flipped-kernel CMAC reductions at PyTorch fp16 col2im boundaries."""
+  materialization = plan.cmac_materialization
+  if not materialization or plan.epilogue not in ("none", "relu", "bias", "bias_relu"): return None
+  cursor = 5
+  cursor += 1 + materialization[cursor]  # loop extents
+  n_reductions = materialization[cursor]
+  reduce_extents = materialization[cursor+1:cursor+1+n_reductions]
+  cursor += 1 + n_reductions
+  cursor += 1 + materialization[cursor]  # M axes
+  cursor += 1 + materialization[cursor]  # N axes
+  n_shared = materialization[cursor]
+  shared_axes = materialization[cursor+1:cursor+1+n_shared]
+  cursor += 1 + n_shared
+  n_reduce_order = materialization[cursor]
+  reduce_order = materialization[cursor+1:cursor+1+n_reduce_order]
+  cursor += 1 + n_reduce_order
+  out_n = materialization[cursor]
+  out_code = materialization[cursor+1:cursor+1+out_n]
+  cursor += 1+out_n
+  for _ in range(2): cursor += 1 + materialization[cursor]  # A/B postfix programs
+  tail_start = cursor
+  n_fixed = materialization[cursor]
+  cursor += 1 + 2*n_fixed
+  n_active = materialization[cursor]
+  cursor += 1 + n_active
+  n_rounding = materialization[cursor]
+  rounding_axes = materialization[cursor+1:cursor+1+n_rounding]
+  if not rounding_axes or prod(reduce_extents[axis] for axis in rounding_axes) <= 1: return None
+  active_axes = tuple(axis for axis in reduce_order if axis not in rounding_axes)
+  loop_extents = materialization[6:6+materialization[5]]
+  batches = prod(loop_extents[axis] for axis in shared_axes)
+  group_k = prod(reduce_extents[axis] for axis in active_axes) * batches
+  M, N = materialization[:2]
+  # Shared group/batch axes participate in both the block-diagonal M and N
+  # matrices, so M*N contains unused cross-group cells. DPU accumulation is
+  # over the original packed output only.
+  total = prod(loop_extents)
+  next_slot = max((plan.out_slot, *plan.in_slots)) + 1
+  tasks:list[RKSubTask] = []
+  group_slots:list[int] = []
+  group_count = prod(reduce_extents[axis] for axis in rounding_axes)
+  for linear in range(group_count):
+    rem, fixed_values = linear, [0] * len(rounding_axes)
+    for idx in range(len(rounding_axes)-1, -1, -1):
+      rem, fixed_values[idx] = divmod(rem, reduce_extents[rounding_axes[idx]])
+      fixed_values[idx] = reduce_extents[rounding_axes[idx]] - 1 - fixed_values[idx]
+    fixed = tuple(v for pair in zip(rounding_axes, fixed_values) for v in pair)
+    group_slot = next_slot
+    next_slot += 1
+    group_slots.append(group_slot)
+    group_tail = (len(rounding_axes), *fixed, len(active_axes), *active_axes, 0)
+    group_materialization = (M, N, group_k, *materialization[3:tail_start], *group_tail)
+    group_plan = replace(plan, out_slot=group_slot, epilogue="none", epilogue_bias_slot=-1, epilogue_bias_axis=-1,
+                         cmac_materialization=group_materialization)
+    cmds, task, relocs = emit_rk(group_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  accumulator = group_slots[0]
+  needs_post = plan.epilogue != "none"
+  for idx, group_slot in enumerate(group_slots[1:], 1):
+    out_slot = plan.out_slot if idx == len(group_slots)-1 and not needs_post else next_slot
+    if out_slot == next_slot: next_slot += 1
+    tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (group_slot, 0), Ops.ADD))
+    accumulator = out_slot
+  if plan.epilogue in ("bias", "bias_relu"):
+    expanded_bias = next_slot
+    next_slot += 1
+    value_code = (1, plan.epilogue_bias_axis, 10, 0)
+    movement_layout = (total, _HOST_MOVEMENT_LAYOUT, 2, len(loop_extents), *loop_extents,
+                       len(out_code), *out_code, len(value_code), *value_code)
+    movement_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    movement_task = RKTask(0, 0, 0, "dpu", movement_layout, expanded_bias, is_copy=True)
+    movement_relocs = (RKReloc(0, expanded_bias, 0, 0, 0xFFFFFFFF),
+                       RKReloc(0, plan.epilogue_bias_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(movement_cmds, movement_task, movement_relocs))
+    bias_out = plan.out_slot if plan.epilogue == "bias" else next_slot
+    if bias_out == next_slot: next_slot += 1
+    tasks.append(_emit_where_stage(total, bias_out, (accumulator, 0), (expanded_bias, 0), Ops.ADD))
+    accumulator = bias_out
+  if plan.epilogue in ("relu", "bias_relu"):
+    tasks.append(_emit_where_stage(total, plan.out_slot, (accumulator, 0), (_ZERO_SLOT, 0), Ops.MAX))
+  return tuple(tasks)
+
 # ---- the native_program hook ----
 def build_native_program(sink: UOp) -> UOp|None:
   """Classify and build a PROGRAM(SINK, LINEAR(INS...)). Raises RKPLAN_REJECT:<reason>
@@ -6618,6 +6881,9 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
+    # Nested elementwise lowering can materialize an indexed WHERE operand before
+    # distribution turns MUL(WHERE(...), x) into a harder root WHERE graph.
+    if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
     # Preserve directly recognizable single-stage forms such as abs(x) before
     # expanding MUL(WHERE(...)) into the general arithmetic-WHERE representation.
     sink = graph_rewrite(sink, _pm_where_mul, name="rk distribute where mul")
@@ -6627,6 +6893,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     if (host_tasks := _try_elementwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, host_tasks)
     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
     raise RuntimeError(plan)  # reject — preserve reason, no fallback
+  if (cmac_rounding_tasks := _try_cmac_rounding_subtasks(plan)) is not None:
+    return build_native_program_multi(sink, cmac_rounding_tasks)
   cmds, task, relocs = emit_rk(plan)
   # each INS carries an int (packed command), RKReloc, or RKTask as its arg
   ins_args = [task] + list(cmds) + list(relocs)

@@ -5240,6 +5240,120 @@ conv1d/2d/3d recognizer and is the primary reference for that next group.
 The reusable patch is `rockchip-cmac-channel-bias-2bff5d9b9.patch`, against
 parent `2bff5d9b9`.
 
+## 2026-07-29 — generalized and staged CMAC convolution milestone
+
+All unchanged non-giant forward convolution methods now pass on the real
+RK3588 backend. The complete selection is **42 passed, 3 expected skips, and
+37 passing subtests in 90.22 seconds**:
+
+```text
+DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  .venv/bin/python -m pytest -q -p test.rockchip.conftest_rockchip \
+  test/backend/test_ops.py::TestOps \
+  -k 'conv and not sd_big_conv and not large_bs_conv and not large_ic_conv'
+```
+
+This covers 1D/2D/3D, 1x1, batched, NHWC, biased, grouped, depthwise,
+strided, dilated, asymmetric/negative/p21/p22 padding, large input, and all
+eight transposed-convolution methods. The three skips are test-suite policy
+skips rather than Rockchip failures. The focused transpose group is **8/8 in
+61.50 seconds**.
+
+### What `allbilly/rk3588/conv_grok` contributed
+
+`ref/rk3588/conv_grok/gemm_npu.py` confirmed the generic contraction layout:
+
+- A is packed as `M x align(K)`.
+- B uses the hardware swizzle
+  `(align(N)/16, align(K)/32, 16, 32)`.
+- Raw CACC output is fp32, spatial/M-major, indexed by
+  `m*align(N)+n`.
+- M is tiled with ten input CBUF banks and a 2048-row cap.
+
+`conv_grok/conv.py` also documents direct CNA convolution, CBUF allocation,
+and serial grouped/depthwise strategies. The backend keeps the more general
+GEMM materialization: it serializes static input/weight/output indexing and
+uses block-diagonal K expansion for shared group axes. Only the gathers and
+layout transforms happen through mapped-buffer movement; multiplication and
+fp32 accumulation stay on CNA/CORE.
+
+The old 4.8 MiB A allocation for `test_large_input_conv2d` failed in the
+driver mmap path. Materialized CMAC now derives
+
+```text
+tile_m = min(M, 2048, floor(10*32KiB / input_row_bytes))
+```
+
+and submits one A/output tile at a time while reusing the swizzled B layout.
+`test_large_input_conv2d` consequently passes in 16.78 seconds. Direct
+non-materialized CMAC retains its previous CBUF rejection instead of silently
+clamping an oversized plan.
+
+### Materialization and transpose rounding
+
+The materializer supports arbitrary static integer address expressions,
+validity `WHERE`, constants, padding, broadcasted batch/group axes, and
+sum-via-ones. It factors the strided-transpose form
+`WHERE(valid, WHERE(mask, input*weight, 0*weight), Invalid)` into a masked A
+gather and a common B weight, turning invalid ADD-reduction lanes into zeros.
+
+PyTorch CPU half `conv_transpose` differs from ordinary half `conv`: it rounds
+each per-kernel-position channel dot before col2im adds it to the destination.
+Rockchip's single CMAC produces the mathematically close fp32-accumulated
+answer, which failed the unchanged `rtol=1e-3` reference checks. Flipped
+weight strides now identify transpose kernel axes. One CMAC task is emitted
+per kernel coordinate in source-weight order, followed by fp16 DPU ADD tasks.
+Bias is byte-expanded with the serialized output layout, then added by DPU;
+optional ReLU remains a DPU MAX stage.
+
+CMAC reduces a short channel dot as a tree, whereas PyTorch's CPU path can
+reach a neighboring fp32 value by sequential association. Only when a staged
+dot lands exactly one fp32 ULP past an fp16 midpoint does unpack replay that
+short dot from the already packed operands in strict sequential fp32 order to
+select the final fp16 bit. This fixed the single remaining 3D value without a
+broad rounding heuristic.
+
+### Permanent validation and debugging method
+
+Two hardware regressions were added:
+
+- a `48x48` 1x1 convolution that forces two M tiles;
+- a biased transpose that checks every staged fp16 rounding boundary exactly.
+
+Results:
+
+- CMAC class: **17/17 in 5.29 seconds**.
+- Complete hardware file: **76/76 in 245.20 seconds**, with the same 11
+  expected numerical warnings.
+- Hardware-free classifier/emitter/codec file: **72/72 in 5.29 seconds**;
+  stale rejection assertions for mean, float32 DPU, and transposed CMAC were
+  updated to their implemented families.
+- Mypy: the same 13 pre-existing findings.
+- Targeted Ruff on the four changed Python files: the same five pre-existing
+  findings in `support/rockchip.py`.
+
+The most useful debugging sequence was:
+
+1. Always include `DEV=ROCKCHIP` and the Rockchip conftest; otherwise a cached
+   CPU pass is meaningless.
+2. Compare NPU output separately against Torch half and Torch float32-cast
+   output. Exact agreement with the latter identifies accumulation precision,
+   not indexing.
+3. Decode materialization metadata and print M/N/K, loop/reduction extents,
+   shared axes, fixed kernel coordinates, and signed weight address strides.
+4. For transpose, reproduce Torch with a scalar reference: fp32 channel dot,
+   cast to fp16, then fp16-add kernel positions in source-weight order.
+5. Probe one failing physical output across every staged task. This separated
+   group order, shared-axis output sizing, and the final one-ULP CMAC
+   association case.
+6. Rerun a normal convolution after every transpose change, then the whole
+   CMAC class, the full convolution selection, and finally the complete
+   hardware file.
+
+No LUT is involved in this milestone, so `lut.md` does not change. The
+standalone patch is `rockchip-materialized-convolution-60f357654.patch`,
+against parent `60f357654`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

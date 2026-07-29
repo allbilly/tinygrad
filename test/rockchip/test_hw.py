@@ -563,6 +563,41 @@ class TestCMAC(unittest.TestCase):
           expected[0, co, oy, ox] = np.maximum(np.float32(acc + np.float32(b_np[co])), np.float32(0))
     np.testing.assert_array_equal(c.numpy(), expected)
 
+  def test_cmac_tiled_materialized_conv(self):
+    # M=48*48 exceeds the 2048-row conv_grok tile, so this submits two
+    # materialized CMAC tasks while retaining one logical convolution.
+    np.random.seed(321)
+    x_np = np.random.randn(1, 8, 48, 48).astype(np.float16)
+    w_np = np.random.randn(4, 8, 1, 1).astype(np.float16)
+    x, w = (Tensor(v, device="ROCKCHIP").realize() for v in (x_np, w_np))
+    c = x.conv2d(w).realize()
+    expected = np.einsum("nchw,oc->nohw", x_np.astype(np.float32), w_np[:, :, 0, 0].astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(c.numpy(), expected, rtol=1e-3, atol=1e-6)
+
+  def test_cmac_staged_conv_transpose_bias(self):
+    # PyTorch CPU fp16 conv_transpose rounds each per-kernel channel dot before
+    # col2im accumulation; the backend reproduces that with CMAC+ADD stages.
+    np.random.seed(654)
+    x_np = np.random.randn(1, 4, 3, 3).astype(np.float16)
+    w_np = np.random.randn(4, 4, 3, 3).astype(np.float16)
+    b_np = np.random.randn(4).astype(np.float16)
+    x, w, b = (Tensor(v, device="ROCKCHIP").realize() for v in (x_np, w_np, b_np))
+    c = x.conv_transpose2d(w, b).realize()
+    expected = np.zeros((1, 4, 5, 5), dtype=np.float16)
+    for co in range(4):
+      for oy in range(5):
+        for ox in range(5):
+          acc = np.float16(0)
+          for ky in range(3):
+            for kx in range(3):
+              iy, ix = oy-ky, ox-kx
+              if 0 <= iy < 3 and 0 <= ix < 3:
+                dot = np.float16(np.sum(x_np[0, :, iy, ix].astype(np.float32) *
+                                        w_np[:, co, ky, kx].astype(np.float32), dtype=np.float32))
+                acc = np.float16(np.float32(acc) + np.float32(dot))
+          expected[0, co, oy, ox] = np.float16(np.float32(acc) + np.float32(b_np[co]))
+    np.testing.assert_array_equal(c.numpy(), expected)
+
   def test_cmac_fp32_to_fp16_rounding(self):
     # Judge's test case: 0.5180664 * 0.5258789 should give FP16 bits 0x345c, not 0x345b
     # The old conversion truncated (mt >> 13) without round-to-nearest-even

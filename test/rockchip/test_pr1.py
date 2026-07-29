@@ -139,19 +139,18 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,4,dtype=dtypes.half).realize().cast(dtypes.int)
     self.assertTrue(_classify(_get_sink(a+b)).startswith("RKPLAN_REJECT"))
 
-  def test_reject_float32(self):
+  def test_float32_dpu(self):
     a = Tensor.rand(4,4,dtype=dtypes.float).realize()
     b = Tensor.rand(4,4,dtype=dtypes.float).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a+b)))
+    self.assertEqual(_classify(_get_sink(a+b)), "dpu")
 
   def test_sum_full(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.sum())), "cmac")  # full sum → M=1,N=1 via ones-vector
 
-  def test_mean_full_rejected(self):
-    # Mean (sum with post-reduce scalar MUL) is rejected in PR1 — no host-side scaling
+  def test_mean_full(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a.mean())))
+    self.assertEqual(_classify(_get_sink(a.mean())), "cmac")
 
   def test_sum_axis1(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
@@ -161,13 +160,13 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.sum(axis=0))), "cmac")
 
-  def test_mean_axis1_rejected(self):
+  def test_mean_axis1(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a.mean(axis=1))))
+    self.assertEqual(_classify(_get_sink(a.mean(axis=1))), "cmac")
 
-  def test_mean_axis0_rejected(self):
+  def test_mean_axis0(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a.mean(axis=0))))
+    self.assertEqual(_classify(_get_sink(a.mean(axis=0))), "cmac")
 
   def test_broadcast_row_rejected(self):
     # Broadcast is rejected in PR1 — no host-side materialization
@@ -199,15 +198,15 @@ class TestClassifier(unittest.TestCase):
     a = Tensor.rand(8,4,dtype=dtypes.half).realize()
     self.assertIn("REJECT", _classify(_get_sink(a.max(axis=1))))
 
-  def test_reject_cmac_transposed_b(self):
+  def test_cmac_transposed_b(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a@b.T)))
+    self.assertEqual(_classify(_get_sink(a@b.T)), "cmac")
 
-  def test_reject_cmac_transposed_a(self):
+  def test_cmac_transposed_a(self):
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(a.T@b)))
+    self.assertEqual(_classify(_get_sink(a.T@b)), "cmac")
 
   def test_cmac_gemv_vector_a(self):
     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1

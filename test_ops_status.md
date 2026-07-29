@@ -188,9 +188,11 @@ hardcoded fp32; backend code cannot safely override that semantic policy.
 
 ## Failure Categories
 
-### 1. Conv/Pool/MatMul (unsupported_layout) — ~80 tests
-All conv2d, conv3d, conv_transpose, pool2d, matmul_batched tests fail with `unsupported_layout`.
-These need DPU conv/channel layout support.
+### 1. Conv/Pool/MatMul (historical unsupported_layout) — convolution fixed
+The historical census had all conv2d, conv3d, conv_transpose, pool2d, and
+batched matmul methods failing with `unsupported_layout`. Forward convolution
+is now fixed through generalized/tiled CMAC materialization and staged
+transpose accumulation. Pooling and batched matmul remain separate groups.
 
 **Tests:** test_simple_conv2d, test_padded_conv2d_*, test_strided_conv*, test_max_pool2d_*, test_avg_pool2d*, test_matmul_batched, test_dot, test_einsum, etc.
 
@@ -297,5 +299,42 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)
 - matmul (simple 2D cases)
+- convolution: 1D/2D/3D, biased, grouped/depthwise, strided/dilated,
+  arbitrary tested padding, large-input tiling, and transposed 2D/3D
 - reshape, permute, transpose, slice (basic)
 - contiguous, realize
+
+## 2026-07-29 real-Rockchip convolution refresh
+
+The summary counts above remain the original broad census and must not be
+treated as current failure counts. With the mandatory command environment
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1` and
+`-p test.rockchip.conftest_rockchip`, the current convolution group is:
+
+| Selection | Result |
+|---|---:|
+| All non-giant `TestOps` convolution methods | **42 passed, 3 skipped** |
+| Passing subtests inside those methods | **37** |
+| Transposed convolution methods | **8/8 passed** |
+| Rockchip CMAC hardware class | **17/17 passed** |
+| Complete Rockchip hardware file | **76/76 passed** |
+| Hardware-free PR1 contract file | **72/72 passed** |
+
+The three intentionally excluded giant methods are `test_sd_big_conv`,
+`test_large_bs_conv`, and `test_large_ic_conv`; they were not claimed as
+passes. The three reported skips come from upstream test policy.
+
+The fixed implementation includes:
+
+- serialized static CMAC gathers for non-contiguous convolution indexing;
+- block-diagonal shared batch/group axes;
+- zero-valued invalid/padded lanes and strided-transpose factoring;
+- `conv_grok`-derived ten-bank/2048-row M tiling;
+- fp32 CMAC channel bias for ordinary convolution;
+- staged per-kernel CMAC plus fp16 DPU ADD, bias, and ReLU for transpose;
+- a narrow exact sequential-dot decision at the rare fp16 midpoint where
+  CMAC tree association differs by one fp32 ULP.
+
+The next low-hanging layout group is pooling or batched matmul/einsum, not
+convolution. Before choosing, refresh those groups on the real backend rather
+than trusting the historical `unsupported_layout` totals.
