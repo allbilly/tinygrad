@@ -2,7 +2,7 @@
 # NVDLA compiled backend: direct MMIO register programming via /dev/mem.
 # No KMD needed — registers are written directly to NVDLA's MMIO space.
 # Port of the rockchip backend, replacing RKNPU ioctl submit with direct MMIO writes.
-# PR 1 scope: SDP elementwise (ADD/SUB/MUL/MAX), scalar operand, BDMA copy, constant fill.
+# Current VP-tested scope: native SDP elementwise ADD/MUL.
 # fp16 only. No LUT, no CMAC, no PDP in this first pass.
 #
 # Memory model: buffers are allocated from a DRAM region mmap'd via /dev/mem.
@@ -62,6 +62,7 @@ class NVDLAProgram(Program['NVDLADevice']):
     try:
       buf_map: dict[int, HCQBuffer] = dict(enumerate(bufs))  # type: ignore[assignment]
       total = task.layout[0]
+      sdp_group = dev.sdp_group
       # fp32 buffer-level conversion: NPU processes fp16 internally
       if task.kind == "sdp" and not task.is_copy:
         for slot in task.fp32_inputs:
@@ -110,6 +111,9 @@ class NVDLAProgram(Program['NVDLADevice']):
       for i, cmd in enumerate(img.cmds):
         offset = cmd & 0xFFFFFFFF
         value = (cmd >> 32) & 0xFFFFFFFF
+        if task.kind == "sdp":
+          if offset in (nv.NVDLA_SDP_S_POINTER_0, nv.NVDLA_SDP_RDMA_S_POINTER_0): value = sdp_group
+          elif offset == nv.NVDLA_GLB_S_INTR_STATUS_0: value = 1 << sdp_group
         # Apply relocs that reference this command
         for rel in self.relocs:
           if rel.cmd_index == i:
@@ -123,7 +127,8 @@ class NVDLAProgram(Program['NVDLADevice']):
         mmio.write(struct.pack('<I', value))
       # Poll for completion
       if task.kind == "sdp":
-        dev._poll_sdp_done()
+        dev._poll_sdp_done(sdp_group)
+        dev.sdp_group ^= 1
       elif task.kind == "bdma":
         dev._poll_bdma_done()
       # fp32 output: convert fp16 → fp32
@@ -171,6 +176,7 @@ class NVDLADevice(Compiled):
     self.dram_base = nv.NVDLA_DRAM_BASE
     self.dram_size = nv.NVDLA_DRAM_SIZE
     self.dram_offset = 0  # current allocation offset within DRAM region
+    self.sdp_group = 0
     self.dram_mmap = mmap.mmap(self.fd_mem, self.dram_size, mmap.MAP_SHARED,
                                mmap.PROT_READ | mmap.PROT_WRITE, offset=self.dram_base)
     self.dram_allocs: list[tuple[int, int]] = []  # (offset, size) for free tracking
@@ -194,13 +200,17 @@ class NVDLADevice(Compiled):
     """No-op for PR1 (bump allocator doesn't free)."""
     pass
 
-  def _poll_sdp_done(self) -> None:
-    """Poll SDP status register for completion."""
-    status_off = nv.NVDLA_SDP_D_STATUS_0
-    for _ in range(10000000):
+  def _poll_sdp_done(self, group:int) -> None:
+    """Poll and acknowledge the selected SDP producer group's GLB completion interrupt."""
+    status_off = nv.NVDLA_GLB_S_INTR_STATUS_0
+    done_mask = 1 << group
+    for _ in range(100000):
       self.mmio_base.seek(status_off)
       status = struct.unpack('<I', self.mmio_base.read(4))[0]
-      if status & 0x1: return
+      if status & done_mask:
+        self.mmio_base.seek(status_off)
+        self.mmio_base.write(struct.pack('<I', done_mask))
+        return
     raise RuntimeError("nvdla: SDP poll timeout")
 
   def _poll_bdma_done(self) -> None:
