@@ -6469,3 +6469,47 @@ boolean-reduction → extrema ordering without a timeout.
 
 The standalone recovery artifact is
 `rockchip-native-softsign-abcd0aa1e.patch`, based on `abcd0aa1e`.
+
+## 2026-07-29 — fp32-accumulating lerp
+
+The generic four-stage decomposition of `x + (y-x)*weight` stopped returning
+zeros after strict ordering, but still rounded after every DPU stage. It
+missed official tolerance in **120/1575** lanes with maximum absolute error
+`0.00390625`.
+
+A numerical comparison against Torch fp16 proves that its result is exactly
+the final-half rounding of:
+
+```text
+x*1 + x*(-weight) + y*weight
+```
+
+when accumulated in that order in fp32. The native path therefore:
+
+1. negates `weight` on DPU; fp16 sign negation is exact;
+2. uses static movement tasks to pack `[x,x,y]` and
+   `[1,-weight,weight]` triples without examining values;
+3. submits one `K=3` CMAC dot per output lane;
+4. rounds the fp32 accumulator only at the final fp16 output boundary.
+
+Both tensor and broadcast-scalar weights use the same path. The rejected
+four-stage DPU implementation remains as WIP comments for future fused-DPU
+experiments.
+
+The current shared-axis CMAC implementation emits one serial dot submission
+per output. Consequently, the 1,575-lane official method takes **187.14
+seconds**. This is a performance issue, not an accuracy issue; batching
+pre-materialized CMAC groups is future work.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_lerp`: **passing in 187.14 seconds**;
+- permanent exact tensor-weight and scalar-weight regression: **passing in
+  1.58 seconds**;
+- complete CMAC hardware class: **27/27 in 11.63 seconds**;
+- hardware-free PR1 contract: **79/79 in 6.51 seconds**.
+
+The standalone recovery artifact is
+`rockchip-native-lerp-506ffb537.patch`, based on `506ffb537`.

@@ -599,6 +599,18 @@ class TestCMAC(unittest.TestCase):
     expected = np.sum(np.concatenate((a_np, b_np), axis=1).astype(np.float32), axis=1).astype(np.float16)
     np.testing.assert_array_equal(got, expected)
 
+  def test_cmac_lerp(self):
+    x_np = np.array([-3,-1,0,0.25,1,2,4], dtype=np.float16)
+    y_np = np.array([4,2,1,-0.5,0,-2,-3], dtype=np.float16)
+    w_np = np.array([-0.5,0,0.125,0.5,0.75,1,1.5], dtype=np.float16)
+    x, y, weight = (Tensor(v, device="ROCKCHIP").realize() for v in (x_np, y_np, w_np))
+    got = x.lerp(y, weight).realize().numpy()
+    expected = (x_np.astype(np.float32) - x_np.astype(np.float32)*w_np.astype(np.float32) +
+                y_np.astype(np.float32)*w_np.astype(np.float32)).astype(np.float16)
+    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(x.lerp(y, 0.5).realize().numpy(),
+                                  (x_np.astype(np.float32)*0.5 + y_np.astype(np.float32)*0.5).astype(np.float16))
+
   def test_cmac_scaled_sum_full(self):
     # Scaled full sum: (a * 2).sum() → ones @ (a*2)
     a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)

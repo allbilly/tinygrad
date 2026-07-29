@@ -806,3 +806,25 @@ it still fails the reference dtype comparison; returning fp16 would violate
 the requested tinygrad semantics.
 
 Recovery patch: `rockchip-native-softsign-abcd0aa1e.patch`.
+
+### fp32-accumulating lerp milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `lerp`, tensor weight | **passing** | **DPU negation + CMAC K=3** |
+| `lerp`, scalar weight | **passing** | **passing with static broadcast packing** |
+
+The stable result is represented as the ordered fp32 dot
+`x*1 + x*(-w) + y*w`. DPU performs the exact weight negation, static movement
+packs the three half operands, and CMAC performs multiplication and fp32
+accumulation before one final half rounding. Host callbacks choose only
+compile-time addresses and copy bytes; they do not evaluate lerp arithmetic.
+
+The complete official method passes in **187.14 seconds**. Its 1,575 output
+lanes currently become independent shared-axis CMAC submissions, so batching
+is a known performance follow-up. A compact permanent tensor/scalar-weight
+regression passes in **1.58 seconds**. The complete CMAC class is **27/27 in
+11.63 seconds**, and the hardware-free contract remains **79/79 in 6.51
+seconds**.
+
+Recovery patch: `rockchip-native-lerp-506ffb537.patch`.

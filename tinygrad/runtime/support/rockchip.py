@@ -4378,6 +4378,101 @@ def _try_softsign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
           _emit_where_stage(total, positive_denominator, (absolute, 0), positive_one, Ops.ADD),
           _emit_where_stage(total, info.outs[0], (source_slot, 0), (positive_denominator, 0), Ops.FDIV))
 
+def _try_lerp_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower x + (y-x)*weight as four ordered DPU stages."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.ADD or len(value.src) != 2: return None
+  source, product = value.src
+  if _unwrap(source).op is not Ops.INDEX: source, product = product, source
+  source = _unwrap(source)
+  product = _unwrap(product)
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.half or product.op is not Ops.MUL: return None
+  delta, weight = product.src
+  if _unwrap(delta).op is not Ops.ADD: delta, weight = weight, delta
+  delta = _unwrap(delta)
+  if delta.op is not Ops.ADD or (weight_arg := _where_arg(weight)) is None: return None
+  target, negative_source = delta.src
+  if _unwrap(target).op is not Ops.INDEX: target, negative_source = negative_source, target
+  target = _unwrap(target)
+  negative_source = _unwrap(negative_source)
+  if target.op is not Ops.INDEX or target.dtype is not dtypes.half or negative_source.op is not Ops.MUL: return None
+  neg_input, neg_one = negative_source.src
+  if neg_one.op is not Ops.CONST: neg_input, neg_one = neg_one, neg_input
+  neg_input = _unwrap(neg_input)
+  if neg_input is not source or neg_one.op is not Ops.CONST or float(neg_one.arg) != -1.0: return None
+
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  source_slot, target_slot = source.src[0].buf_uop.arg.slot, target.src[0].buf_uop.arg.slot
+  negative, difference, scaled = (max(info.globals, default=-1) + offset for offset in range(1, 4))
+  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+  def broadcasts(*nodes:UOp) -> tuple[int, ...]:
+    return tuple(node.src[0].buf_uop.arg.slot for node in nodes
+                 if node.op is Ops.INDEX and int(node.src[0].src[0].arg) < total)
+  weight_u = _unwrap(weight)
+  weight_broadcast = broadcasts(weight_u) if weight_u.op is Ops.INDEX else ()
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if len(loops) != 1 or int(loops[0].src[0].arg) != total: return None
+  output_axis = loops[0]
+  device = store.src[0].src[0].device
+  negative_param = UOp.param(negative, dtypes.half, (total,), device=device)
+  negative_index = UOp(Ops.INDEX, dtypes.half, (negative_param, output_axis))
+  packing_axis = UOp.range(3, 1000)
+  first = UOp.const(packing_axis.dtype, 1)
+  second = UOp.const(packing_axis.dtype, 2)
+  packed_index = output_axis*3 + packing_axis
+  a_param = UOp.param(difference, dtypes.half, (total*3,), device=device)
+  a_out = UOp(Ops.INDEX, dtypes.half, (a_param, packed_index))
+  a_value = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (packing_axis, second)), source, target))
+  a_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(a_out, a_value)), output_axis, packing_axis)))
+  a_tasks = _try_movement_host_subtasks(a_sink)
+  if a_tasks is None: return None
+  b_param = UOp.param(scaled, dtypes.half, (total*3,), device=device)
+  b_out = UOp(Ops.INDEX, dtypes.half, (b_param, packed_index))
+  b_value = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (packing_axis, first)),
+                                        UOp.const(dtypes.half, 1.0),
+                                        UOp(Ops.WHERE, dtypes.half,
+                                            (UOp(Ops.CMPLT, dtypes.bool, (packing_axis, second)),
+                                             negative_index, weight_u))))
+  b_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(b_out, b_value)), output_axis, packing_axis)))
+  b_tasks = _try_movement_host_subtasks(b_sink)
+  if b_tasks is None: return None
+
+  reduction_axis = UOp.range(3, 1001, AxisType.REDUCE)
+  cmac_index = output_axis*3 + reduction_axis
+  a_index = UOp(Ops.INDEX, dtypes.half, (a_param, cmac_index))
+  b_index = UOp(Ops.INDEX, dtypes.half, (b_param, cmac_index))
+  product = UOp(Ops.MUL, dtypes.half, (a_index, b_index))
+  accumulator = UOp(Ops.REDUCE, dtypes.float,
+                    (UOp(Ops.CAST, dtypes.float, (product,), arg=dtypes.float), reduction_axis), arg=(Ops.ADD, 0))
+  stage_store = store.replace(src=(store.src[0], UOp(Ops.CAST, dtypes.half, (accumulator,), arg=dtypes.half)))
+  stage_sink = UOp.sink(UOp(Ops.END, src=(stage_store, *loops)))
+  stage_plan = plan_rk(stage_sink)
+  if isinstance(stage_plan, str) or stage_plan.kind != "cmac":
+    if getenv("ROCKCHIP_DEBUG_LERP"): print("RK_LERP_CMAC_REJECT", stage_plan, stage_sink)
+    return None
+  tasks:list[RKSubTask] = [_emit_where_stage(total, negative, weight_arg, negative_one, Ops.MUL,
+                                             broadcast_inputs=weight_broadcast), *a_tasks, *b_tasks]
+  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(stage_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  return tuple(tasks)
+
+  # WIP reference: the direct graph decomposition is structurally correct but
+  # rounds after every DPU stage and misses official tolerance in 120/1575
+  # lanes. Keep it for future single-task fused-DPU experiments.
+  # return (_emit_where_stage(total, negative, (source_slot, 0), negative_one, Ops.MUL,
+  #                           broadcast_inputs=broadcasts(source)),
+  #         _emit_where_stage(total, difference, (target_slot, 0), (negative, 0), Ops.ADD,
+  #                           broadcast_inputs=broadcasts(target)),
+  #         _emit_where_stage(total, scaled, (difference, 0), weight_arg, Ops.MUL,
+  #                           broadcast_inputs=weight_broadcast),
+  #         _emit_where_stage(total, info.outs[0], (source_slot, 0), (scaled, 0), Ops.ADD,
+  #                           broadcast_inputs=broadcasts(source)))
+
 def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Materialize CMPLT/CMPNE boolean expressions as fp16 0/1 masks, then pack to bool."""
   store = _store_node(sink)
@@ -8278,6 +8373,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   if (softsign_tasks := _try_softsign_subtasks(sink)) is not None: return build_native_program_multi(sink, softsign_tasks)
+  if (lerp_tasks := _try_lerp_subtasks(sink)) is not None: return build_native_program_multi(sink, lerp_tasks)
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
