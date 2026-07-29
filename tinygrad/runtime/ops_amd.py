@@ -133,7 +133,11 @@ class AMDComputeQueue(HWQueue):
     else:
       # SI/CIK/VI ACQUIRE_MEM has 40-bit base/size fields. Feeding the generic
       # 64-bit all-ones default wedges a VMID0 Polaris queue before DISPATCH.
-      addr, sz = addr & ((1 << 40) - 1), sz & ((1 << 40) - 1)
+      if self.dev.target[0] == 8:
+        addr, sz = (addr >> 8) & ((1 << 40) - 1), \
+          ((1 << 40) - 1 if sz == (1 << 64) - 1 else ceildiv(sz, 0x100) & ((1 << 40) - 1))
+      else:
+        addr, sz = addr & ((1 << 40) - 1), sz & ((1 << 40) - 1)
       cp_coher_cntl = self.pm4.PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_SH_ICACHE_ACTION_ENA(gli) | \
                       self.pm4.PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_SH_KCACHE_ACTION_ENA(glk) | \
                       self.pm4.PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_TC_ACTION_ENA(gl2) | \
@@ -155,9 +159,9 @@ class AMDComputeQueue(HWQueue):
                 | self.pm4.PACKET3_RELEASE_MEM_DST_SEL(0)
     else:
       gfx8_direct = self.dev.target[0] == 8 and self.dev.is_am()
-      cache_flags_dw = 0 if not cache_flush else (
-        self.pm4.EOP_TC_WB_ACTION_EN |
-        (self.pm4.EOP_TC_ACTION_EN if self.dev.target[0] == 8 and not gfx8_direct else self.pm4.EOP_TC_NC_ACTION_EN) |
+      cache_flags_dw = 0 if not cache_flush else (self.pm4.EOP_TC_WB_ACTION_EN |
+        (self.pm4.EOP_TC_ACTION_EN if self.dev.target[0] == 8 else self.pm4.EOP_TC_NC_ACTION_EN) |
+        (self.pm4.EOP_TCL1_ACTION_EN if gfx8_direct else 0) |
         ((2 << 25) if self.dev.target[0] == 8 and not gfx8_direct else 0))
 
       event_dw = self.pm4.EVENT_TYPE(self.pm4.CACHE_FLUSH_AND_INV_TS_EVENT) | self.pm4.EVENT_INDEX(self.pm4.event_index__mec_release_mem__end_of_pipe)
@@ -177,10 +181,8 @@ class AMDComputeQueue(HWQueue):
     return self
 
   def memory_barrier(self):
-    # Direct Polaris uses UC VMID0 GART mappings plus CPU/HDP barriers. Its
-    # ACQUIRE_MEM packet wedges MEC, and the proven gfx8 path emits no such
-    # packet. KFD queues keep their normal shader/cache barrier.
-    if self.dev.target[0] == 8: return self if self.dev.is_am() else self.acquire_mem()
+    # GFX8 compute queues use the full-range ACQUIRE_MEM sequence from gfx_v8_0_emit_mem_sync_compute.
+    if self.dev.target[0] == 8: return self.acquire_mem()
     pf = '0' if self.nbio.version[:2] != (7, 11) else '1'
     self.wait_reg_mem(reg=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ').addr[0],
                       reg_done=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE').addr[0], value=0xffffffff)

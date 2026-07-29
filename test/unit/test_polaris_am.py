@@ -75,8 +75,18 @@ class TestPolarisAM(unittest.TestCase):
                       int_sel=pm4_soc15.int_sel__mec_release_mem__none, cache_flush=True)
     self.assertEqual(len(queue._q), 7)
     self.assertEqual(queue._q[0], pm4_soc15.PACKET3(pm4_soc15.PACKET3_RELEASE_MEM, 5))
-    self.assertTrue(queue._q[1] & pm4_soc15.EOP_TC_NC_ACTION_EN)
+    self.assertTrue(queue._q[1] & pm4_soc15.EOP_TCL1_ACTION_EN)
+    self.assertTrue(queue._q[1] & pm4_soc15.EOP_TC_ACTION_EN)
     self.assertEqual(queue._q[2], pm4_soc15.DATA_SEL(1))
+
+  def test_gfx8_direct_barrier_matches_linux_compute_sync(self):
+    queue = AMDComputeQueue.__new__(AMDComputeQueue)
+    queue.dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True)
+    queue.pm4, queue._q, queue.binded_device = pm4_soc15, [], None
+    queue.memory_barrier()
+    self.assertEqual(len(queue._q), 7)
+    self.assertEqual(queue._q[2:4], [0xffffffff, 0xff])
+    self.assertEqual(queue._q[4:6], [0, 0])
 
   def test_hot_takeover_and_hqd(self):
     dev = PolarisAMDev(FakePCI())  # type: ignore[arg-type]
