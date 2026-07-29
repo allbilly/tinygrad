@@ -1058,6 +1058,7 @@ class PCIIface(PCIIfaceBase):
     if self.dev_impl.is_err_state: raise RuntimeError("Device is in error state")
 
   def on_device_hang(self):
+    if isinstance(self.dev_impl, PolarisAMDev): self.dev_impl.quiesce()
     self._collect_interrupts(reset=True)
     raise RuntimeError("Device hang detected")
 

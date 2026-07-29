@@ -60,5 +60,9 @@ class TestPolarisAM(unittest.TestCase):
     self.assertEqual(mqd[MQD_HQD_WORD + mmCP_HQD_ACTIVE - 0x3245], 1)
     self.assertEqual(len(ViMqd().to_bytes()), VI_MQD_ALLOC_DWORDS * 4)
 
+    dev.quiesce(timeout_s=0)
+    self.assertEqual(dev.rreg(mmCP_MEC_CNTL), (1 << 30) | (1 << 28))
+    self.assertEqual(dev.rreg(mmVM_CONTEXT0_CNTL), 0)
+
 if __name__ == "__main__":
   unittest.main()

@@ -271,4 +271,12 @@ class PolarisAMDev:
     self.gfx.reset_mec()
     return True
 
-  def fini(self): self.deactivate_hqd()
+  def quiesce(self, timeout_s:float=0.1):
+    """Stop every direct DMA source before process exit or driver rebind."""
+    self.deactivate_hqd(timeout_s)
+    self.wreg(mmCP_MEC_CNTL, self.rreg(mmCP_MEC_CNTL) | 0x40000000)  # halt ME1; ME2 is already halted
+    self.wreg(mmVM_CONTEXT0_CNTL, 0)
+    self.wreg(mmVM_INVALIDATE_REQUEST, 1)
+    self.rreg(mmVM_INVALIDATE_REQUEST)
+
+  def fini(self): self.quiesce()
