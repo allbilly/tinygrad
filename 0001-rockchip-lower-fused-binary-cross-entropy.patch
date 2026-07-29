@@ -1,0 +1,247 @@
+From 817371c4923f27688f2ce4d2f9c23a86c7fc8153 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 05:22:40 +0800
+Subject: [PATCH] rockchip: lower fused binary cross entropy
+
+---
+ progress.md                          | 55 ++++++++++++++++++
+ test_ops_status.md                   | 23 ++++++++
+ tinygrad/runtime/support/rockchip.py | 85 ++++++++++++++++++++++++++--
+ 3 files changed, 158 insertions(+), 5 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 90c884896..21f2ed5a2 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7271,3 +7271,58 @@ task chains can still abort during the driver reset ioctl.  Debug this
+ separately from sorting by launching one axis/direction per process; a
+ numerical or lowering fault will reproduce there, while reset-state
+ accumulation will not.
++
++## 2026-07-30 — fused BCE reductions and nested softplus
++
++The default-reduction `TestOps.test_binary_crossentropy` now passes all four
++ordinary BCE/BCE-with-logits formulations.  The rejected kernel was a fused
++fp16 elementwise loss body inside an fp32 ADD reduction.  The backend now
++materializes that body with ordinary DPU/LUT tasks, preserves the fp16
++boundary, and feeds the intermediate to CMAC.  Static host work constructs
++only the flat intermediate addresses; it performs no loss arithmetic.
++
++BCE-with-logits exposed a second, independent dispatcher problem.  Compiler
++reassociation expresses the loss as weighted `softplus(x)` and
++`softplus(-x)`.  Nested elementwise lowering did not try the existing
++softplus/logsigmoid special builders, and the negative softplus matcher did
++not retain its effective `-x` input.  It consequently expanded into roughly
++200 primitive tasks with unsafe fp32 scratch conversions.  Nested special
++dispatch is now enabled, and `-x` is first materialized by one DPU task before
++reusing the proven two-LUT softplus path.  An eight-lane deterministic
++BCE-with-logits probe is bit-exact against its fp16 reference.
++
++Useful debug procedure:
++
++- set `ROCKCHIP_DEBUG_ELEMENTWISE_SUM=1` to distinguish body materialization
++  from final CMAC rejection;
++- set `RK_TRACE_MATCH=1` to confirm that inner softplus/logsigmoid graphs use
++  their special builders;
++- set `ROCKCHIP_DEBUG_SUBTASKS=1` to print output slots, task kinds,
++  fp32-conversion flags, and relocated input slots.  Unexpectedly long chains
++  or fp32 scratch flags identify a missed special match;
++- test `reduction="none"` separately from mean/sum.  Reduction averaging can
++  hide per-element LUT error even when the lowering is correct.
++
++Validation with `. .venv/bin/activate`, disabled caches,
++`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
++
++- unchanged official `TestOps.test_binary_crossentropy`: **passing in
++  130.98 seconds** (all four formulations);
++- `test/rockchip/test_pr1.py`: **79/79 passing** after narrowing the new path
++  so direct MUL reductions remain with CMAC/multifactor lowering;
++- the reduction-mode method passed both mean cases and both sum cases, then
++  ordinary unreduced BCE missed 68/320 elements at 0.1% tolerance
++  (max relative error 0.434%, max absolute error 0.004883);
++- positive-weight logits remains a distinct broadcast-vector
++  `RKPLAN_REJECT:unsupported_op:Ops.ADD`.
++
++Python compilation and `git diff --check` pass.  Mypy remains at the same 13
++pre-existing errors in `rockchip.py`; this milestone introduced no new type
++errors.  Ruff is not installed in `.venv`.
++
++Next loss work is therefore split cleanly: tune or add a second NPU LUT task
++for unreduced BCE accuracy, then lower the `pos_weight` broadcast.  The
++accumulation drift reported in
++[RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
++supports caution around long fp16 CMAC/reduction chains, but it does not
++explain the unreduced elementwise LUT error or the broadcast rejection.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index b7b1cc8b0..83d880e94 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1209,3 +1209,26 @@ repeated-value case in a fresh process passed exactly, so Sort correctness is
+ complete while long-process RK reset stability remains an infrastructure
+ issue.  Do not count that ioctl abort as a failed Sort algorithm unless the
+ same subcase fails in isolation.
++
++### Native BCE mean/sum milestone
++
++| Loss coverage | Result |
++|---|---:|
++| official BCE/BCE-with-logits default mean, four formulations | **4/4 passing** |
++| explicit mean and sum, ordinary and logits | **4/4 passing before next mode** |
++| ordinary BCE `reduction="none"` | **68/320 outside tolerance** |
++| logits with vector `pos_weight` | **broadcast ADD rejection** |
++
++Fused elementwise ADD-reduction bodies now materialize through DPU/LUT tasks
++and reduce through CMAC.  Nested lowering also recognizes inner
++softplus/logsigmoid, including `softplus(-x)` after one native negation stage;
++this replaces the incorrect roughly 200-task primitive expansion.  No
++operator arithmetic uses `run_host`.
++
++Validation used `. .venv/bin/activate`, caches disabled, half defaults, and
++forward-only.  The unchanged default BCE method passed in 130.98 seconds.
++The non-hardware PR1 suite remains **79/79 passing**, Python compilation and
++diff whitespace checks pass, and mypy remains at its pre-existing 13-error
++Rockchip baseline.  Ruff is unavailable in `.venv`.
++Unreduced ordinary BCE is the next LUT-accuracy task (max relative error
++0.434%); vector positive weights are a separate broadcast-lowering task.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b1653605d..498b7e8fc 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -420,7 +420,14 @@ def _try_softplus(val:UOp) -> tuple[UOp,float]|None:
+   scaled_source_ok = maximum_value is source or (maximum_value is not None and maximum_value.op is Ops.MUL and
+     any(_unwrap(x) is source for x in maximum_value.src) and
+     any(x.op is Ops.CONST and math.isclose(float(x.arg), beta) for x in maximum_value.src))
+-  return (source, beta) if logarithm is not None and scaled_source_ok and \
++  # BCE-with-logits exposes softplus(-x) after the outer negation distributes.
++  # Preserve that effective input so the subtask builder can materialize -x
++  # before applying the same NPU-native softplus LUT path.
++  negative_source = maximum_value if maximum_value is not None and maximum_value.op is Ops.MUL and \
++    any(_unwrap(x) is source for x in maximum_value.src) and \
++    any(x.op is Ops.CONST and math.isclose(float(x.arg), -beta) for x in maximum_value.src) else None
++  effective_source = source if scaled_source_ok else negative_source
++  return (effective_source, beta) if logarithm is not None and effective_source is not None and \
+     any(_unwrap(x).op is Ops.LOG2 for x in logarithm.src) and all(u.op in allowed for u in nodes) and \
+     sum(u.op is Ops.EXP2 for u in nodes) == 2 and sum(u.op is Ops.LOG2 for u in nodes) == 1 and \
+     sum(u.op is Ops.MAX for u in nodes) == 1 else None
+@@ -2969,8 +2976,16 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   def scalar(value:float) -> tuple[int,int]:
+     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+ 
+-  source_arg = (source.src[0].buf_uop.arg.slot, 0)
+   tasks:list[RKSubTask] = []
++  if source.op is not Ops.INDEX:
++    materialized_source = alloc()
++    source_store = store.replace(src=(temp_index(materialized_source), source))
++    source_plan = plan_rk(sink.substitute({store:source_store}))
++    if isinstance(source_plan, str) or source_plan.kind != "dpu": return None
++    cmds, task, relocs = emit_rk(source_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++    source = temp_index(materialized_source)
++  source_arg = (source.src[0].buf_uop.arg.slot, 0)
+   if beta < 1.0:
+     correction, positive, raw_output = alloc(), alloc(), alloc()
+     far_diff, far_mask, finite_mask, finite_output = (alloc() for _ in range(4))
+@@ -2979,7 +2994,7 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     wide_plan = plan_rk(sink.substitute({store:wide_store}))
+     if isinstance(wide_plan, str) or wide_plan.kind != "dpu_lut": return None
+     cmds, task, relocs = emit_rk(wide_plan)
+-    return (RKSubTask(cmds, task, relocs),
++    return (*tasks, RKSubTask(cmds, task, relocs),
+             _emit_where_stage(total, positive, source_arg, (_ZERO_SLOT, 0), Ops.MAX),
+             _emit_where_stage(total, raw_output, (positive, 0), (correction, 0), Ops.SUB),
+             _emit_where_stage(total, far_diff, scalar(-100.0), source_arg, Ops.SUB),
+@@ -6755,8 +6770,8 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
+     nonlocal next_slot
+     stage_sink, out_idx = make_stage_sink(stage_val, out_slot)
+-    for special in (_try_exp_correction_subtasks, _try_sigmoid_special_subtasks, _try_exp2_special_subtasks, _try_log2_special_subtasks,
+-                    _try_rsqrt_special_subtasks, _try_sqrt_special_subtasks):
++    for special in (_try_logsigmoid_subtasks, _try_softplus_subtasks, _try_exp_correction_subtasks, _try_sigmoid_special_subtasks,
++                    _try_exp2_special_subtasks, _try_log2_special_subtasks, _try_rsqrt_special_subtasks, _try_sqrt_special_subtasks):
+       if (special_tasks := special(stage_sink)) is None: continue
+       tasks.extend(special_tasks)
+       used_slots = [st.task.out_slot for st in special_tasks] + \
+@@ -9681,6 +9696,61 @@ def _try_movement_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _try_elementwise_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Materialize a fused fp16 elementwise reduction body, then sum it on CMAC."""
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.half or \
++     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
++  body = _reduce_body(reduce)
++  # Direct INDEX/MUL reductions belong to CMAC and multifactor lowering.  This
++  # path is only for a genuinely fused additive elementwise body such as BCE.
++  if body.op is not Ops.ADD: return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  reductions = list(reduce.src[1:])
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++
++  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
++    flat = axes[0]
++    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
++    return flat
++
++  info = ProgramInfo.from_sink(sink)
++  intermediate_slot = max(info.globals, default=-1) + 1
++  reduction_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in reductions]
++  stage_axes = [*loops, *reduction_loops]
++  stage_extents = [int(u.src[0].arg) for u in stage_axes]
++  stage_total = prod(stage_extents)
++  stage_body = body.substitute(dict(zip(reductions, reduction_loops)))
++  device = store.src[0].src[0].device
++  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=device)
++  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
++  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_body)), *stage_axes)))
++
++  # The reduction body is deliberately lowered as an ordinary elementwise graph:
++  # every arithmetic operation remains an NPU DPU/LUT task and only the static
++  # address calculation above is performed while constructing the command chain.
++  elementwise_tasks = _try_elementwise_subtasks(stage_sink)
++  if elementwise_tasks is None:
++    if getenv("ROCKCHIP_DEBUG_ELEMENTWISE_SUM"): print("RK_ELEMENTWISE_SUM_BODY_REJECT", stage_sink)
++    return None
++  tasks = list(elementwise_tasks)
++
++  final_axes = [*loops, *reductions]
++  final_extents = [int(u.src[0].arg) for u in final_axes]
++  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
++  final_acc = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (intermediate_index,), arg=dtypes.float), *reductions))
++  final_sink = sink.substitute({reduce:final_acc})
++  final_plan = plan_rk(final_sink)
++  if isinstance(final_plan, str) or final_plan.kind != "cmac":
++    if getenv("ROCKCHIP_DEBUG_ELEMENTWISE_SUM"): print("RK_ELEMENTWISE_SUM_CMAC_REJECT", final_plan, final_sink)
++    return None
++  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(final_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  return tuple(tasks)
++
+ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run a half-input CMAC sum, then widen its fp16 output through a DPU ABI stage."""
+   store, reduce = _store_node(sink), _reduce_node(sink)
+@@ -10613,6 +10683,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, variable_scale_tasks)
+   if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, movement_sum_tasks)
++  if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, elementwise_sum_tasks)
+   # WIP: this produces the explicitly requested float32 result correctly, but
+   # the DEFAULT_FLOAT=HALF test harness compares it against a Torch fp16 sum.
+   # if (fp32_sum_tasks := _wip_try_fp32_sum_output_subtasks(sink)) is not None:
+@@ -10650,6 +10722,9 @@ def build_native_program(sink: UOp) -> UOp|None:
+ def build_native_program_multi(sink: UOp, subtasks: tuple[RKSubTask, ...]) -> UOp|None:
+   """Build a multi-task PROGRAM for PC chain. The first INS carries a tuple of RKSubTask,
+   followed by all cmds and relocs from all subtasks (flattened)."""
++  if getenv("ROCKCHIP_DEBUG_SUBTASKS"):
++    print("RK_SUBTASKS", [(st.task.out_slot, st.task.kind, st.task.fp32_inputs, st.task.fp32_output,
++                           tuple(r.globals_slot for r in st.relocs)) for st in subtasks])
+   ins_args: list = [subtasks]  # first INS carries the subtask list
+   for st in subtasks:
+     ins_args.extend(st.cmds)
+-- 
+2.34.1
+
