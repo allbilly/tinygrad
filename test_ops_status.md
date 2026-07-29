@@ -114,6 +114,14 @@ layout uses separate physical table halves for origin/endpoint, `[0,2]`,
 inverse-function hardware method passes in **35.93 seconds**.
 The complete hardware file remains **71/71 passing in 242.13 seconds**.
 
+`test_trunc` is now fixed. Its scalar, random fp16, and explicit float32
+subcases pass unchanged; the combined official and permanent hardware
+regression is **2/2 in 8.11 seconds**. A tagged root-only host task truncates
+the original mapped fp16/fp32 data, avoiding the old fp32→fp16 overflow and
+two-byte write into a four-byte output. The legacy staged NPU truncation is
+preserved for nested expressions. The full hardware file remains **71/71
+passing in 244.55 seconds**.
+
 ## Summary
 
 | Status | Count |
@@ -246,7 +254,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - ELU (alpha 1 and 0.1) and SELU, including dense finite/negative-special coverage
 - Erf, including dense `[-4,4]`, ±400, infinities, NaN, and zero
 - Exact and tanh GELU, including all official extreme ranges
-- abs, sign, round, inf_div (fp32 inputs)
+- abs, sign, trunc, round, inf_div (fp32 inputs)
 - ceil, floor, clip (WHERE CMPNE + fp32)
 - relu, sigmoid (basic)
 - matmul (simple 2D cases)

@@ -132,6 +132,11 @@ class TestDPU(unittest.TestCase):
     for op, expected in ((a.trunc, np.trunc(a_np)), (a.floor, np.floor(a_np)), (a.ceil, np.ceil(a_np)),
                          (a.round, np.round(a_np))):
       np.testing.assert_array_equal(op().realize().numpy(), expected)
+    fp32_np = np.array([1.499,1.5,1.501,1,2.1,0,-0.0,-5,-2.499,-2.5,-2.501,
+                        1e12,-1e12,np.inf,-np.inf,np.nan], dtype=np.float32)
+    fp32_actual = Tensor(fp32_np, device="ROCKCHIP").trunc().realize().numpy()
+    np.testing.assert_array_equal(fp32_actual, np.trunc(fp32_np))
+    np.testing.assert_array_equal(np.signbit(fp32_actual), np.signbit(np.trunc(fp32_np)))
 
   def test_dpu_silu_staged(self):
     a_np = np.concatenate((np.linspace(-2, 2, 257, dtype=np.float16),

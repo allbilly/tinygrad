@@ -5106,6 +5106,29 @@ layout. The standalone patch is
 The complete hardware file remains **71/71 passing in 242.13 seconds** with
 the same 11 expected numerical warnings.
 
+## 2026-07-29 — exact root truncation milestone
+
+Unchanged forward-only `TestOps.test_trunc` now passes, including the explicit
+float32 values `±1e12`. The focused official plus hardware run is **2/2
+passing in 8.11 seconds**, and the complete Rockchip hardware file remains
+**71/71 passing in 244.55 seconds** with the same 11 expected numerical
+warnings.
+
+The old `_emit_trunc_stage` remains available for nested NPU expressions. Its
+buffer post-processing is inherently fp16: a root float32 truncation first
+converted the input to fp16 (overflowing `1e12`), then `_truncate_fp16_buf`
+wrote two-byte results into a four-byte output. A strict root-only classifier
+now emits the tagged `_HOST_TRUNC_LAYOUT` task before generic elementwise
+lowering. The runtime applies `numpy.trunc` directly to the original mapped
+fp16 or fp32 bytes, preserving large finite values, infinities, NaNs, and the
+sign of zero without an fp16 boundary.
+
+The permanent rounding hardware regression now covers both fp16 rounding
+operations and exact float32 truncation special/range values. Mypy remains at
+13 pre-existing findings and targeted Ruff at five pre-existing findings.
+The reusable patch for this milestone is
+`rockchip-exact-trunc-1a2cd5724.patch`, against parent `1a2cd5724`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

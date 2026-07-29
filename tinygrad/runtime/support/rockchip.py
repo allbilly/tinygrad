@@ -168,6 +168,7 @@ _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
 _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
 _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
 _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
+_HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
 
 def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
@@ -6003,6 +6004,24 @@ def _try_bitwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_trunc_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Truncate a contiguous root fp16/fp32 tensor without an fp16 conversion boundary."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  output, val = store.src
+  if val.op is not Ops.TRUNC or len(val.src) != 1: return None
+  source = _unwrap(val.src[0])
+  if output.op is not Ops.INDEX or source.op is not Ops.INDEX: return None
+  if val.dtype not in (dtypes.half, dtypes.float) or source.dtype is not val.dtype or output.dtype is not val.dtype: return None
+  if not _is_flat_contiguous(output.src[1]) or not _is_flat_contiguous(source.src[1]): return None
+  total, out_slot, in_slot = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink).outs[0], source.src[0].buf_uop.arg.slot
+  dtype_code = 0 if val.dtype is dtypes.half else 1
+  layout = (total, _HOST_TRUNC_LAYOUT, dtype_code)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, in_slot, 0, 0, 0xFFFFFFFF))
+  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
+
 def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
   store = _store_node(sink)
@@ -6388,6 +6407,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
+  if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)

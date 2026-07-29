@@ -17,7 +17,7 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT)
+  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -142,6 +142,18 @@ def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
     elif out_dtype == 0:
       ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_int32))[i] = result if result < 1 << 31 else result-(1 << 32)
     else: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint32))[i] = result
+
+def _run_host_trunc(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Execute exact fp16/fp32 truncation on the original mapped buffers."""
+  total, tag, dtype_code = task.layout
+  assert tag == _HOST_TRUNC_LAYOUT and len(relocs) == 2
+  import numpy as np
+  dtype = np.float16 if dtype_code == 0 else np.float32
+  itemsize = 2 if dtype_code == 0 else 4
+  source = bufs[relocs[1].globals_slot]
+  output = bufs[relocs[0].globals_slot]
+  result = np.trunc(np.frombuffer(ctypes.string_at(source.va_addr, total * itemsize), dtype=dtype))
+  ctypes.memmove(output.va_addr, result.ctypes.data, total * itemsize)  # type: ignore[arg-type]
 
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute a compact postfix integer-index program and copy exact element bytes."""
@@ -446,6 +458,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
           _run_host_bitwise(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
+          _run_host_trunc(task, st.relocs, bufs)
           continue
         if task.is_fill:
           total = task.layout[0]
