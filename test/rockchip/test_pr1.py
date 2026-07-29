@@ -466,6 +466,11 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(len(subtasks), 2)
     self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
 
+  def test_k_tiled_dot_produces_binary(self):
+    a = Tensor.rand(5000,dtype=dtypes.half).realize()
+    b = Tensor.rand(5000,dtype=dtypes.half).realize()
+    self.assertIsNotNone(self._compile(a.dot(b)))
+
   def test_max_produces_binary(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
     binary = self._compile(a.max(axis=0))

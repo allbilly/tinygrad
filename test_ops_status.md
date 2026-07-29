@@ -385,3 +385,27 @@ The sole remaining refreshed failure is `test_einsum_ellipsis`, whose final
 case has a per-output `K=13,824` dot and still rejects with
 `cmac_exceeds_cbuf`. It needs K segmentation without introducing fp16 partial
 sum rounding.
+
+### K-tiled einsum completion
+
+The remaining ellipsis contraction is fixed. The real-backend refresh now
+passes **14/14 einsum/dot/matmul methods**.
+
+| Selection | Result |
+|---|---:|
+| Refreshed einsum/dot/matmul methods | **14/14 passed in 178.75s** |
+| `test_einsum_ellipsis` | **1/1 passed in 137.34s** |
+| CMAC hardware class | **21/21 passed** |
+| Complete Rockchip hardware file | **80/80 passed** |
+| Hardware-free PR1 file | **76/76 passed** |
+
+K is tiled at 4096 for materialized CMAC. Each tile remains an NPU
+CNA/CORE dot. Raw fp32 CACC partials are accumulated before one final fp16
+conversion; converting every partial to fp16 and using DPU ADD failed the
+official tolerance. Logical allocations above 4 MiB use host mappings because
+the RK GEM mmap path rejects the 6.19 MiB inputs, while all submitted tile
+buffers remain DMA-backed.
+
+The historical `cmac_exceeds_cbuf` failure group must now be refreshed before
+using its old count: N tiling, shared-axis serialization, and K tiling cover
+the complete current dot/einsum selection.

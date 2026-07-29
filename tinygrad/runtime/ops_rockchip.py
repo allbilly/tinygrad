@@ -20,6 +20,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
   _HOST_ELEMENTWISE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
+_ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
+
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
   """Copy M rows of K fp16 elements into a zeroed (M, align_in) buffer."""
@@ -134,7 +136,7 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
     d[i] = _fp32_to_fp16(raw)
 
 def _decode_materialized_cmac_layout(layout):
-  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, tile_n, *meta = layout
+  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, tile_n, tile_k, *meta = layout
   assert tag == _CMAC_MATERIALIZED_LAYOUT
   cursor = 0
   n_loops = meta[cursor]
@@ -170,7 +172,7 @@ def _decode_materialized_cmac_layout(layout):
   cursor += 1+n_rounding
   n_fixed_loops = meta[cursor]
   fixed_loops = tuple((meta[cursor+1+2*i], meta[cursor+2+2*i]) for i in range(n_fixed_loops))
-  return (tile_m, tile_n, bias_slot, bias_axis, bool(relu), loop_extents, reduce_extents, m_axes, n_axes, shared_axes,
+  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), loop_extents, reduce_extents, m_axes, n_axes, shared_axes,
           active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
 
 def _eval_static_index(code, coords):
@@ -227,11 +229,12 @@ def _set_linear_axes(coords, linear, axes, extents):
   for axis in reversed(axes): linear, coords[axis] = divmod(linear, extents[axis])
 
 def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded,
-                             m_start=0, rows=None, n_start=0, cols=None):
-  _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
+                             m_start=0, rows=None, n_start=0, cols=None, k_start=0, k_count=None):
+  _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
     _, fixed_loops, _, a_code, b_code = decoded
   rows = M if rows is None else rows
   cols = N if cols is None else cols
+  k_count = K if k_count is None else k_count
   ctypes.memset(a_dst, 0, rows * align_in * 2)
   ctypes.memset(b_dst, 0, align_out * align_in * 2)
   a_in = ctypes.cast(a_src, ctypes.POINTER(ctypes.c_uint16))
@@ -255,10 +258,11 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
     for axis, value in fixed_loops: coords[axis] = value
     for axis, value in fixed_reductions: coords[n_loops+axis] = value
     _set_linear_axes(coords, m, m_axes, loop_extents)
-    for k in range(K):
+    for local_k in range(k_count):
+      k = k_start + local_k
       if k // base_k != batch_index(coords): continue
       _set_linear_axes(coords, k % base_k, reduce_coord_axes, all_extents)
-      a_out[local_m*align_in+k] = _eval_static_value(a_code, coords, a_in)
+      a_out[local_m*align_in+local_k] = _eval_static_value(a_code, coords, a_in)
   for local_n in range(cols):
     n = n_start + local_n
     if n >= N: continue
@@ -266,15 +270,17 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
     for axis, value in fixed_loops: coords[axis] = value
     for axis, value in fixed_reductions: coords[n_loops+axis] = value
     _set_linear_axes(coords, n, n_axes, loop_extents)
-    for k in range(K):
+    for local_k in range(k_count):
+      k = k_start + local_k
       if k // base_k != batch_index(coords): continue
       _set_linear_axes(coords, k % base_k, reduce_coord_axes, all_extents)
-      dst_index = (((local_n//16)*(align_in//32)+(k//32))*16+(local_n%16))*32+(k%32)
+      dst_index = (((local_n//16)*(align_in//32)+(local_k//32))*16+(local_n%16))*32+(local_k%32)
       b_out[dst_index] = _eval_static_value(b_code, coords, b_in)
 
 def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
                                   n_start=0, cols=None, packed_inputs=None):
-  _, _, bias_slot, bias_axis, relu, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, _, fixed_loops, out_code, _, _ = decoded
+  _, _, _, bias_slot, bias_axis, relu, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
+    _, fixed_loops, out_code, _, _ = decoded
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
   total = 1
@@ -303,7 +309,7 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
 def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
   M, N, K, align_in, align_out = task.layout[:5]
   decoded = _decode_materialized_cmac_layout(task.layout)
-  tile_m, tile_n, bias_slot = decoded[:3]
+  tile_m, tile_n, tile_k, bias_slot = decoded[:4]
   a_s, b_s = relocs[0].globals_slot, relocs[1].globals_slot
   temp:list[HCQBuffer] = []
   try:
@@ -315,36 +321,50 @@ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
     regcmd = ctypes.cast(dev.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * dev.cmd_buf_size)).contents  # type: ignore[arg-type]
     for n_start in range(0, N, tile_n):
       for m_start in range(0, M, tile_m):
-        dev.reset_npu()
-        b_src = None if b_s == _CONST_SLOT else bufs[b_s].va_addr
-        _materialize_cmac_inputs(bufs[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
-                                 M, N, K, align_in, align_out, decoded, m_start, tile_m, n_start, tile_n)
-        for i, cmd in enumerate(cmds): regcmd[i] = cmd
-        for i, r in enumerate(relocs):
-          dma = (a_buf, b_buf, o_buf)[i].meta.dma_addr
-          v = ((dma + r.addend) >> r.shift) & r.mask
-          fm = (r.mask << r.field_shift) & 0xFFFFFFFF if r.field_shift else r.mask
-          if r.field_shift: v = (v << r.field_shift) & 0xFFFFFFFF
-          regcmd[r.word_index] = (regcmd[r.word_index] & ~(fm << 16)) | ((v & fm) << 16)
-        t = ctypes.cast(dev.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents[0]  # type: ignore[arg-type]
-        t.flags, t.op_idx, t.enable_mask, t.int_mask = 0, task.op_idx, task.enable_mask, task.int_mask
-        t.int_clear, t.int_status, t.regcfg_amount, t.regcfg_offset = 0x1ffff, 0, n_cmds, 0
-        t.regcmd_addr = dev.cmd_buf.meta.dma_addr
-        rk.DRM_IOCTL_RKNPU_SUBMIT(dev.fd_ctl, __payload=rk.struct_rknpu_submit(
-          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
-          task_start=0, task_number=1, task_counter=0, priority=0,
-          task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
-          user_data=0, core_mask=1, fence_fd=-1,
-          subcore_task=(rk.struct_rknpu_subcore_task*5)(
-            rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
-            rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
-            rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
-        if getenv("DEBUG") >= 1:
-          print(f"submit {name}: materialized CMAC rows {m_start}:{min(M, m_start+tile_m)} cols {n_start}:{min(N, n_start+tile_n)}")
+        rows, cols = min(tile_m, M-m_start), min(tile_n, N-n_start)
+        accumulator:list[float]|None = None
+        for k_start in range(0, K, tile_k):
+          k_count = min(tile_k, K-k_start)
+          dev.reset_npu()
+          b_src = None if b_s == _CONST_SLOT else bufs[b_s].va_addr
+          _materialize_cmac_inputs(bufs[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
+                                   M, N, K, align_in, align_out, decoded, m_start, rows, n_start, cols, k_start, k_count)
+          for i, cmd in enumerate(cmds): regcmd[i] = cmd
+          for i, r in enumerate(relocs):
+            dma = (a_buf, b_buf, o_buf)[i].meta.dma_addr
+            v = ((dma + r.addend) >> r.shift) & r.mask
+            fm = (r.mask << r.field_shift) & 0xFFFFFFFF if r.field_shift else r.mask
+            if r.field_shift: v = (v << r.field_shift) & 0xFFFFFFFF
+            regcmd[r.word_index] = (regcmd[r.word_index] & ~(fm << 16)) | ((v & fm) << 16)
+          t = ctypes.cast(dev.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents[0]  # type: ignore[arg-type]
+          t.flags, t.op_idx, t.enable_mask, t.int_mask = 0, task.op_idx, task.enable_mask, task.int_mask
+          t.int_clear, t.int_status, t.regcfg_amount, t.regcfg_offset = 0x1ffff, 0, n_cmds, 0
+          t.regcmd_addr = dev.cmd_buf.meta.dma_addr
+          rk.DRM_IOCTL_RKNPU_SUBMIT(dev.fd_ctl, __payload=rk.struct_rknpu_submit(
+            flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
+            task_start=0, task_number=1, task_counter=0, priority=0,
+            task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
+            user_data=0, core_mask=1, fence_fd=-1,
+            subcore_task=(rk.struct_rknpu_subcore_task*5)(
+              rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+              rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
+              rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
+          raw = ctypes.cast(o_buf.va_addr, ctypes.POINTER(ctypes.c_float))
+          partial = [float(raw[row*align_out+col]) for row in range(rows) for col in range(cols)]
+          if accumulator is None: accumulator = partial
+          else:
+            accumulator = [struct.unpack('<f', struct.pack('<f', x+y))[0] for x, y in zip(accumulator, partial)]
+          if getenv("DEBUG") >= 1:
+            print(f"submit {name}: materialized CMAC rows {m_start}:{m_start+rows} cols {n_start}:{n_start+cols} "
+                  f"K {k_start}:{k_start+k_count}")
+        assert accumulator is not None
+        raw = ctypes.cast(o_buf.va_addr, ctypes.POINTER(ctypes.c_float))
+        for row in range(rows):
+          for col in range(cols): raw[row*align_out+col] = accumulator[row*cols+col]
         bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
         _unpack_materialized_cmac_out(o_buf.va_addr, bufs[task.out_slot].va_addr, M, N, align_out,
-                                      decoded, bias, m_start, min(tile_m, M-m_start), n_start, min(tile_n, N-n_start),
-                                      (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]))
+                                      decoded, bias, m_start, rows, n_start, cols,
+                                      (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]) if tile_k >= K else None)
   finally:
     for b in temp: dev._gpu_free(b)
 
@@ -620,10 +640,12 @@ class RockchipProgram(Program['RockchipDevice']):
     try:
       decoded_tile = _decode_materialized_cmac_layout(task.layout) if \
         task.kind == "cmac" and len(task.layout) > 5 and task.layout[5] == _CMAC_MATERIALIZED_LAYOUT else None
-      if decoded_tile is not None and (decoded_tile[0] < task.layout[0] or decoded_tile[1] < task.layout[1]):
+      if decoded_tile is not None and (decoded_tile[0] < task.layout[0] or decoded_tile[1] < task.layout[1] or
+                                       decoded_tile[2] < task.layout[2]):
         _run_tiled_materialized_cmac(dev, self.name, self.cmds, task, self.relocs, bufs)
         self.submit_count += ((task.layout[0] + decoded_tile[0] - 1) // decoded_tile[0]) * \
-                             ((task.layout[1] + decoded_tile[1] - 1) // decoded_tile[1])
+                             ((task.layout[1] + decoded_tile[1] - 1) // decoded_tile[1]) * \
+                             ((task.layout[2] + decoded_tile[2] - 1) // decoded_tile[2])
         self.last_enable_mask = task.enable_mask
         dev.submitted_masks.add(task.enable_mask)
         return
@@ -827,7 +849,7 @@ class RockchipProgram(Program['RockchipDevice']):
         M, N, _, _, align_out = task.layout[:5]
         if len(task.layout) > 5 and task.layout[5] == _CMAC_MATERIALIZED_LAYOUT:
           decoded = _decode_materialized_cmac_layout(task.layout)
-          bias = bufs[decoded[2]].va_addr if decoded[2] >= 0 else None
+          bias = bufs[decoded[3]].va_addr if decoded[3] >= 0 else None
           _unpack_materialized_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, decoded, bias,
                                         packed_inputs=(cmac_bufs[0].va_addr, cmac_bufs[1].va_addr, task.layout[2], task.layout[3]))
         else:
@@ -1262,6 +1284,13 @@ class RockchipDevice(Compiled):
     return fr.name
 
   def _gpu_alloc(self, size:int, flags, name:str="") -> HCQBuffer:
+    # The RK3588 GEM mmap path rejects multi-megabyte BOs. Generalized CMAC
+    # gathers logical tensors through their CPU mapping and submits compact
+    # DMA-backed tiles, so large logical buffers can safely remain host-backed.
+    if size > _ROCKCHIP_MAX_MAPPABLE_BO:
+      va = FileIOInterface.anon_mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE,
+                                     mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS, 0)
+      return HCQBuffer(va_addr=va, size=size)
     mc = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags|rk.RKNPU_MEM_NON_CACHEABLE)
     mm = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mc.handle, offset=0)
     va = self.fd_ctl.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mm.offset)
@@ -1270,6 +1299,7 @@ class RockchipDevice(Compiled):
 
   def _gpu_free(self, buf:HCQBuffer) -> None:
     FileIOInterface.munmap(buf.va_addr, buf.size)
+    if buf.meta is None: return
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, __payload=rk.struct_rknpu_mem_destroy(handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr))
 
   def reset_npu(self):

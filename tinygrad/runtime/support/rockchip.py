@@ -5838,14 +5838,20 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   RK_CBUF_BANKS = 12
   MIN_CHANNEL_TILE = 32
   RK_LINE_STRIDE_GROUP_CAP = 13
-  # layout: align K and N to 32
+  # Keep one materialized K tile small enough to reserve CBUF banks for both
+  # features and its 32-channel weight atom. Runtime accumulates raw fp32 CACC
+  # partials before the single output conversion.
+  tile_k = min(K, 4096) if plan.cmac_materialization else K
   tile_n = min(N, MIN_CHANNEL_TILE) if plan.cmac_materialization else N
-  aligned_k = max(MIN_CHANNEL_TILE, round_up(K, MIN_CHANNEL_TILE))
+  aligned_k = max(MIN_CHANNEL_TILE, round_up(tile_k, MIN_CHANNEL_TILE))
   align_out = max(MIN_CHANNEL_TILE, round_up(tile_n, MIN_CHANNEL_TILE))
   align_in = max(aligned_k, align_out)
-  eff_k = align_in if align_in != aligned_k else K
+  eff_k = align_in if align_in != aligned_k else tile_k
   input_row_bytes = align_in * 2
-  tile_m = min(M, max(1, min(2048, 10 * CBUF_BANK_SIZE // input_row_bytes))) if plan.cmac_materialization else M
+  weight_banks = max(1, ceildiv(input_row_bytes*align_out, CBUF_BANK_SIZE))
+  materialized_data_banks = max(1, RK_CBUF_BANKS-weight_banks)
+  tile_m = min(M, max(1, min(2048, materialized_data_banks*CBUF_BANK_SIZE//input_row_bytes))) \
+    if plan.cmac_materialization else M
   # feature grains and line stride from gemm.py
   even_rows_per_two_banks = (ceildiv(2 * CBUF_BANK_SIZE, input_row_bytes) + 1) & ~1
   feature_grains = max(80, even_rows_per_two_banks)
@@ -5933,7 +5939,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
   if plan.cmac_materialization:
     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), tile_n, *plan.cmac_materialization[5:])
+              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), tile_n, tile_k, *plan.cmac_materialization[5:])
   else:
     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
               int(plan.epilogue == "bias_relu"))

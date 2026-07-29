@@ -5469,3 +5469,62 @@ CMAC stages. Validation:
 
 No LUT is used. The standalone patch is
 `rockchip-cmac-multifactor-f09be028b.patch`, against parent `f09be028b`.
+
+## 2026-07-29 — CMAC K tiling and complete dot/einsum milestone
+
+All **14/14** refreshed forward-only einsum/dot/matmul methods now pass on the
+real Rockchip backend in **178.75 seconds**. The final unchanged
+`test_einsum_ellipsis` passes in **137.34 seconds**; its hard case computes
+224 independent dots of `K=13,824`.
+
+### Why K tiling needs raw fp32 partials
+
+`allbilly/rk3588/conv_grok` and `examples/conv_gemm.py` confirm that DPU
+overwrites the output surface for each task: CACC does not persist across
+submits. An unchanged `conv_grok/gemm_npu.py` probe at `K=13,824` timed out,
+confirming that the 884 KiB swizzled weight image cannot simply stream through
+the configured 11 weight banks.
+
+Splitting into three legal CMAC tasks and converting each partial to fp16
+before DPU ADD is not accurate enough: only 206/224 seeded outputs meet the
+official tolerance at the best natural `K=5632` tile. Smaller tiles are worse.
+In contrast, keeping the partials as raw CACC fp32, adding them in fp32 tile
+order, and performing one final fp16 conversion matches all 224 Torch values
+exactly for the official seed.
+
+Materialized CMAC therefore has an explicit `tile_k`, currently capped at
+4096. Emission reserves enough CBUF weight banks for the local
+`align(K) x 32` atom and derives M capacity from the remaining data banks.
+Runtime materialization maps each local K coordinate back to its global
+serialized reduction coordinate. CNA/CORE performs every product and partial
+dot; the mapped-buffer runtime performs only the narrow fp32 partial
+accumulation that the hardware cannot retain across submits, then reuses the
+normal bias/ReLU/final-round unpack.
+
+The RK driver also rejects mmap of each 6.19 MiB logical input BO. Since
+materialized CMAC reads logical sources through CPU mappings and submits only
+compact DMA-backed tiles, allocations above 4 MiB are host-backed. Actual A,
+B, and CACC task buffers remain driver DMA BOs.
+
+### Validation
+
+- all refreshed einsum/dot/matmul methods: **14/14 in 178.75 seconds**;
+- unchanged `test_einsum_ellipsis`: **1/1 in 137.34 seconds**;
+- new fast `K=5000` hardware regression: **1/1 in 1.20 seconds**;
+- CMAC hardware class: **21/21 in 7.62 seconds**;
+- PR1 contract/pipeline file: **76/76 in 6.34 seconds**;
+- complete hardware file: **80/80 in 248.47 seconds**, with the same 11
+  expected warnings;
+- mypy: the same 13 pre-existing findings;
+- targeted Ruff: the same five pre-existing findings;
+- `git diff --check`: clean.
+
+After the three-minute dot sweep, one broad convolution run had a late ioctl
+timeout in `test_padded_conv_transpose2d` after 41 other methods and all 37
+subtests passed. The timed-out method passed alone in 11.65 seconds, and the
+subsequent complete 80-test hardware file was clean. This matches the
+previously documented sustained-load device timeout pattern rather than a
+layout or numerical regression.
+
+No LUT is involved. The standalone patch is
+`rockchip-cmac-k-3ab3f3291.patch`, against parent `3ab3f3291`.
