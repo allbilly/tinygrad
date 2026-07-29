@@ -67,6 +67,10 @@ The group also exposed and fixed missing `fp32_inputs` metadata in generic
 comparison stages; explicit Torch/NumPy values were otherwise read as
 alternating fp16 words. The complete hardware file remains **68 passed, 2
 failed in 206.54 seconds**, with only fill-full and fill-zero failing.
+Those final fill failures are now fixed: `_emit_dpu` propagates the constant
+into `RKTask.const_val` instead of leaving the default `1.0`. The focused fill
+group passes 4/4, and the complete hardware regression is **70/70 passing in
+207.22 seconds**.
 
 ## Summary
 
@@ -176,6 +180,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - exp and exp2, including integer scalar typing and IEEE specials
 - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
+- fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values

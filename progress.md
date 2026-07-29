@@ -4854,6 +4854,29 @@ Ruff remains at the same five pre-existing findings; `.venv` still has no Ruff
 module. `rockchip-bitwise-host-80cf9f8e0.patch` is the standalone,
 reverse-apply-checked patch against parent `80cf9f8e0`.
 
+## 2026-07-29 — constant fill metadata milestone
+
+The complete Rockchip hardware regression is now green: **70 passed in 207.22
+seconds**. The focused zero/one/full/typed fill group passes **4/4 in 1.58
+seconds**.
+
+The half-precision constant path was already classified as `is_fill`, and the
+runtime intentionally handles such tasks with a direct write to the mapped
+output buffer. `_emit_dpu`, however, constructed the `RKTask` without copying
+the store constant into `task.const_val`; the dataclass default is `1.0`.
+Consequently zeros and `full(..., 3.5)` both became ones, while the separate
+typed-fill lowering happened to pass.
+
+The emitter now stores `float(vu.arg)` for fill tasks and retains `1.0` for
+non-fill tasks. This keeps the existing DPU fill command stream preserved for
+reference while making the already-selected host execution path use the
+requested value. No fill-specific register tuning was required.
+
+Mypy remains at the 13-finding baseline, targeted Ruff at the five-finding
+baseline, and the classifier test at 68 passed with its four stale rejection
+expectations. `rockchip-fill-constant-fe76debd7.patch` is the standalone patch
+against parent `fe76debd7`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

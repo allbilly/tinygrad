@@ -4541,6 +4541,7 @@ def _emit_dpu(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]
   cmds = [cmd for _, cmd in ordered]
   relocs = [RKReloc(old_to_new[r.word_index], r.globals_slot, r.addend, r.shift, r.mask, r.field_shift) for r in relocs]
   return tuple(c.pack() for c in cmds), RKTask(0x18, 0x300, 4, "dpu", layout, plan.out_slot, is_copy=is_copy, is_fill=is_fill,
+                                               const_val=float(vu.arg) if is_fill else 1.0,
                                                fp32_inputs=plan.fp32_inputs, fp32_output=plan.fp32_output), tuple(relocs)
 
 def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]]:
