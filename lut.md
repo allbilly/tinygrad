@@ -75,6 +75,19 @@ only values that remain distinct after fp16 conversion:
 bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
 ```
 
+Generate the table coordinates from the same quantized multiplier:
+
+```python
+hardware_index_scale = float(np.float16(index_scale))
+step = 32 / abs(hardware_index_scale)
+```
+
+Using `32/index_scale` with a non-representable nominal scale shifts the knots
+relative to the addresses selected by hardware. Tangent exposed this at
+`index_scale=16384/1.05`: the nominal value is about `15603.81`, but the DPU
+receives fp16 `15600`. The drift caused a repeatable `0.001953` output error
+near the upper table edge; quantized-scale knot generation removed it.
+
 Negative input scaling is supported by using a negative BN multiplier and
 building the tables in the corresponding direction. Check both sides on
 hardware; reasoning from the positive table alone is not sufficient.
@@ -1413,6 +1426,56 @@ result = normal * factor
 Duplicate invalid-mask, denominator, factor, and final-consumer tasks are
 intentional hardware visibility workarounds. Omitting them produced stale
 zero masks or `-inf` instead of NaN.
+
+### Tangent: two direct levels plus a pole path
+
+A single tangent LUT cannot cover both strict near-zero absolute tolerance and
+the growth at odd multiples of `pi/2`. The passing implementation uses two
+direct tangent levels:
+
+```text
+level 1:
+  selected domain  0.04 < abs(r) <= 0.45
+  index_scale      32768
+  table value      round(tan(r) * 32768)
+  decode           Q15
+
+level 2:
+  selected domain  0.45 < abs(r) <= 1.05
+  index_scale      16384/1.05, stored as fp16 15600
+  table value      round((tan(r)/2) * 32768)
+  decode           table * 2
+```
+
+For `abs(r)<=0.04`, returning `r` is more accurate than either table. Beyond
+`1.05`, the backend divides a sine table by the amplified local cosine table.
+Within `0.05` of a pole, denominator errors are too strongly amplified, so the
+original fp16 magnitude is used to form a split distance `d`.
+
+Two details are necessary at the pole:
+
+1. Bias `abs(x/pi)` downward by `0.0005` before round-to-nearest period
+   selection. The fp16 `1/pi` multiplier otherwise creates false exact `.5`
+   ties and selects the wrong side of the pole.
+2. Use a split pole constant and cancel sine-table magnitude:
+
+```text
+q = sin(r) / (abs(d) * abs(sin(r)))     # sign(r) / abs(d)
+q = q * (1 - d*d/3)                    # cotangent correction
+```
+
+For the first and third positive-magnitude poles, the split constants are:
+
+```text
+pi/2 = 1.5 + 0.0703125 + (pi/2 - 1.5703125)
+3*pi/2 = 4.5 + 0.2109375
+               + ((pi/2 - 1.5703125) + (pi - 3.140625))
+```
+
+Do not combine different tangent gains in one table without a guard band.
+Hardware interpolation crosses the gain discontinuity and creates errors on
+both sides. The rejected bounded transform `tan/(1+abs(tan))` also loses too
+much precision when inverted for large tangent values.
 
 ## Commit checklist
 

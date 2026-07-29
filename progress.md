@@ -4662,3 +4662,74 @@ tasks are required for stable scratch visibility.
 - `.venv` has no `pytest-xdist` or Ruff module, so `-n12` and
   `python -m ruff` cannot run there. NPU tests remain serial by hardware
   necessity.
+
+## 2026-07-29 — piecewise tangent milestone
+
+`TestOps.test_tan` now passes unchanged with
+`DEFAULT_FLOAT=HALF FORWARD_ONLY=1`: **1 passed in 39.61 seconds**. A combined
+serial trig run passes sine, cosine, and tangent **3/3 in 78.68 seconds**.
+Coverage includes both seeded `(45,65)` tensors (`[-1.5,1.5]` and `[-5,5]`),
+scalar forms, NaN, both infinities, zero, and the float32 angles through
+`±1,000,000`.
+
+Tinygrad represents tangent as `sin(x)/cos(x)`, sometimes after rewriting a
+reciprocal multiply to `FDIV`. `_try_tan` recognizes both forms only when both
+operands use the same input buffer. The production program has 78 fp16 tasks
+and 85 fp32/special-value tasks, with four function-table tasks:
+
+| reduced interval | evaluation |
+|---|---|
+| `abs(r)<=0.04` | first-order identity `tan(r)≈r` |
+| `0.04<abs(r)<=0.45` | direct Q15 tangent LUT |
+| `0.45<abs(r)<=1.05` | direct Q15 `tan(r)/2` LUT, decoded by `*2` |
+| `abs(r)>1.05` | sine divided by amplified local cosine |
+| distance to an odd-pi/2 pole `<=0.05` | split pole distance and corrected cotangent |
+
+### Period and pole debugging
+
+The reducer computes `n=round(x/pi)` and subtracts `n*3.140625` followed by
+`n*(pi-3.140625)`. The fp16 representation of `1/pi` can turn an input just
+below an odd multiple of `pi/2` into an exact `.5` period tie. This caused
+wrong signs at `1.5703125` and `-4.7109375`, including a 4112-unit error.
+Subtracting `0.0005` from `abs(x/pi)` before the `+0.5`/truncate step selects
+the correct lower-magnitude period; no fp16 number is exactly `pi/2`.
+
+Near a pole, performing the same reduction first loses the low bits needed by
+a large reciprocal. The denominator is instead reconstructed from the
+original fp16 magnitude:
+
+```text
+first pole: d = ((1.5 - abs(x)) + 0.0703125)
+                + (pi/2 - 1.5703125)
+third pole: d = ((4.5 - abs(x)) + 0.2109375)
+                + ((pi/2 - 1.5703125) + (pi - 3.140625))
+```
+
+The closest band cancels sine-LUT quantization by dividing
+`sin(r)` by `abs(d)*abs(sin(r))`, then applies the cotangent factor
+`1-d*d/3`. This reduced the deterministic `[-5,5]` tensor from 30 misses
+(including two period/sign catastrophes) to two identical edge misses.
+
+Those last misses exposed an LUT-address calibration error. The wide table
+used nominal `index_scale=16384/1.05`, but the NPU stores its BN multiplier as
+fp16 (`15600`). Generating table knots with
+`step=32/float(fp16(index_scale))` aligns software knots with hardware
+addresses and produces **0/2925 misses** on the wide tensor.
+
+### Preserved rejected paths and verification
+
+- The first sine/cosine quotient had 129/2925 misses; adding a direct central
+  LUT reduced it to 37/2925.
+- A discontinuous piecewise-gain LUT interpolated across the gain boundary.
+- The bounded transform `tan/(1+abs(tan))` was stable but its inverse amplified
+  Q15 error: 446/2925 misses, worsening to 695 with a `0.9996` table bias.
+- `_try_tan_trig_quotient_wip` retains the earlier quotient implementation for
+  reference; Rockchip WIP was not deleted.
+- The complete hardware file matches baseline at **68 passed, 2 failed in
+  208.47 seconds**. Only fill-full and fill-zero fail, both returning ones.
+- `test/rockchip/test_pr1.py` remains at **68 passed, 4 failed** because its
+  four rejection expectations are stale. The codec test path mentioned in
+  older notes is absent from this checkout.
+- Mypy remains at the same 13 pre-existing findings. System Ruff now reports
+  the same five pre-existing findings after the tangent-local semicolon was
+  reformatted. `.venv` still lacks Ruff and pytest-xdist; NPU tests are serial.

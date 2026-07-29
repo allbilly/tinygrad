@@ -1,6 +1,6 @@
 # test_ops.py Status — Rockchip NPU Backend
 
-**Last run:** 2026-07-29 (parent `00f113a15` + two-LUT tanh working tree)
+**Last focused run:** 2026-07-29 (parent `690de0764` + tangent working tree)
 **Command:** `PYTHONPATH=. DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 .venv/bin/python -m pytest test/backend/test_ops.py -q --tb=line`
 
 The run completed in 586.59 seconds. Ordinary and extreme tanh pass in focused
@@ -40,10 +40,17 @@ seconds.
 hardware run: **2 passed in 42.45 seconds**. The 56-task sine and 60-task
 cosine programs each use two LUT tasks, explicit periodic reduction, fp32
 large-angle preprocessing, and IEEE-special restoration. Integer cosine now
-returns float32, matching the scalar reference. `test_tan` remains the next
-member of the trigonometric group. The complete hardware file remains at
+returns float32, matching the scalar reference. Tangent is tracked in the next
+paragraph. The complete hardware file remains at
 **68 passed, 2 failed** in 207.43 seconds; only the two established fill
 failures remain.
+`TestOps.test_tan` now passes unchanged: **1 passed in 39.61 seconds**. The
+piecewise 78-task fp16/85-task fp32 path combines direct local and wide tangent
+tables with a sine/local-cosine quotient and a split-distance cotangent path at
+odd-`pi/2` poles. A combined sine/cosine/tangent run passes **3/3 in 78.68
+seconds**, and the deterministic wide tangent tensor has **0/2925 misses**.
+The complete hardware file remains at **68 passed, 2 failed in 208.47
+seconds**; only fill-full and fill-zero fail, both returning ones.
 
 ## Summary
 
@@ -63,7 +70,7 @@ failures remain.
 | `RKPLAN_REJECT:unsupported_layout` | 138 | 2D/3D layouts not supported (conv, pool, matmul) |
 | `RKPLAN_REJECT:unsupported_dtype` | 58 | fp32/int32 dtype not supported |
 | `RKPLAN_REJECT:unsupported_op:fused_epilogue` | 36 | Fused epilogue not supported |
-| `TimeoutError` | 21 | Historical census: NPU timeout (sin, tan, sinh, etc.; Softplus and Mish were fixed post-census) |
+| `TimeoutError` | 21 | Historical census: NPU timeout (sin, tan, sinh, etc.; sin, tan, Softplus, and Mish were fixed post-census) |
 | `RKPLAN_REJECT:unsupported_op:non_index_operand` | 20 | Non-index operand in store |
 | `RKPLAN_REJECT:cmac_exceeds_cbuf` | 18 | CMAC exceeds circular buffer |
 | `AssertionError: dtype` | 15 | dtype mismatch (fp16 vs fp32) |
@@ -90,10 +97,10 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
-### 4. Transcendental ops — ~12 tests
-Exp, tan, sinh, cosh, sigmoid_extreme.
+### 4. Remaining transcendental ops — ~11 tests
+Exp, sinh, cosh, sigmoid_extreme.
 
-**Tests:** test_exp, test_tan, test_sinh, test_cosh, test_sigmoid*
+**Tests:** test_exp, test_sinh, test_cosh, test_sigmoid*
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -148,6 +155,8 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - Cat dim=0: host-side memmove
 - SQRT, EXP2, quick_gelu (fp32 fixes)
 - tanh, including ordinary interior precision and extreme/special values
+- tangent, including both ordinary ranges, scalar, IEEE specials, and float32
+  periodic angles through `±1,000,000`
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
