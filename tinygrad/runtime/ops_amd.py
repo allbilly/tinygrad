@@ -64,6 +64,15 @@ class GFX8GC:
     self.regCOMPUTE_DISPATCH_INITIATOR = reg('regCOMPUTE_DISPATCH_INITIATOR', 0,
                                              {'compute_shader_en':(0,0), 'force_start_at_000':(2,2)})
 
+def _kfd_doorbell_params(queue, gfx_target_version:int) -> tuple[int, int, int]:
+  if gfx_target_version == 80003:
+    # Pre-SOC15 KFD returns only the mmap token. The in-page doorbell slot is
+    # derived from queue_id (libhsakmt queues.c), and VI doorbells are 32-bit.
+    return queue.doorbell_offset, 0x1000, queue.queue_id * 4
+  doorbell_size = 0x2000
+  base = queue.doorbell_offset & -doorbell_size
+  return base, doorbell_size, queue.doorbell_offset - base
+
 class AMDSignal(HCQSignal):
   def __init__(self, *args, **kwargs): super().__init__(*args, **{**kwargs, 'timestamp_divider': 100})
 
@@ -145,15 +154,24 @@ class AMDComputeQueue(HWQueue):
       memsel_dw = self.pm4.PACKET3_RELEASE_MEM_DATA_SEL(data_sel) | self.pm4.PACKET3_RELEASE_MEM_INT_SEL(int_sel) \
                 | self.pm4.PACKET3_RELEASE_MEM_DST_SEL(0)
     else:
-      cache_flags_dw = 0 if not cache_flush else (self.pm4.EOP_TC_WB_ACTION_EN | self.pm4.EOP_TC_NC_ACTION_EN)
+      cache_flags_dw = 0 if not cache_flush else (
+        self.pm4.EOP_TC_WB_ACTION_EN | (self.pm4.EOP_TC_ACTION_EN if self.dev.target[0] == 8 else self.pm4.EOP_TC_NC_ACTION_EN) |
+        ((2 << 25) if self.dev.target[0] == 8 else 0))
 
       event_dw = self.pm4.EVENT_TYPE(self.pm4.CACHE_FLUSH_AND_INV_TS_EVENT) | self.pm4.EVENT_INDEX(self.pm4.event_index__mec_release_mem__end_of_pipe)
 
+      if self.dev.target[0] == 8 and data_sel and int_sel == self.pm4.int_sel__mec_release_mem__none:
+        int_sel = self.pm4.int_sel__mec_release_mem__send_data_after_write_confirm
       memsel_dw = self.pm4.DATA_SEL(data_sel) | self.pm4.INT_SEL(int_sel)
 
       ctxid = 0
 
-    self.pkt3(self.pm4.PACKET3_RELEASE_MEM, event_dw | cache_flags_dw, memsel_dw, *data64_le(address), *data64_le(value), ctxid)
+    if self.dev.target[0] == 8:
+      self.q(self.pm4.PACKET3(self.pm4.PACKET3_RELEASE_MEM, 5) | (1 << 1),
+             event_dw | cache_flags_dw, memsel_dw, *data64_le(address), *data64_le(value))
+    else:
+      self.q(self.pm4.PACKET3(self.pm4.PACKET3_RELEASE_MEM, 6),
+             event_dw | cache_flags_dw, memsel_dw, *data64_le(address), *data64_le(value), ctxid)
     return self
 
   def memory_barrier(self):
@@ -466,7 +484,7 @@ class AMDComputeQueue(HWQueue):
 
     # gfx_v8_0_ring_commit pads native VI MEC rings to a 256-dword boundary.
     # Polaris firmware fetches commits on this granularity.
-    if dev.target[0] == 8:
+    if dev.target[0] == 8 and dev.is_am():
       pad = (-(dev.compute_queue.put_value + len(cmds))) & 0xff
       cmds = [*cmds, *([self.pm4.PACKET3(self.pm4.PACKET3_NOP, 0x3fff)] * pad)]
 
@@ -746,11 +764,11 @@ class AMDQueueDesc:
   def signal_doorbell(self, dev, doorbell_value:int|None=None):
     try:
       self.write_ptr[0] = self.put_value
+      System.memory_barrier()
 
       # No mapped access with usb
       if dev.is_am() and not dev.is_usb():
         # Ensure all prior writes are visible to the GPU.
-        System.memory_barrier()
         dev.iface.dev_impl.gmc.flush_hdp()
 
       self.doorbell[0] = self.put_value if doorbell_value is None else doorbell_value
@@ -869,6 +887,28 @@ class KFDIface:
       if mem.va_addr: FileIOInterface.munmap(mem.va_addr, mem.size)
       kfd.AMDKFD_IOC_FREE_MEMORY_OF_GPU(self.kfd, handle=mem.meta.handle)
 
+  def _map_gfx8_doorbells(self, size:int, mmap_offset:int) -> int:
+    # libhsakmt maps dGPU doorbells through a KFD DOORBELL allocation in the
+    # GPUVM aperture. A plain /dev/kfd mmap is only its APU/fallback path.
+    size = round_up(size, mmap.PAGESIZE)
+    addr = KFDIface.gfx8_va_allocator.alloc(size, mmap.PAGESIZE)
+    FileIOInterface.anon_mmap(addr, size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, 0)
+    flags = kfd.KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL | kfd.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
+    try:
+      mem = kfd.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU(self.kfd, va_addr=addr, size=size, gpu_id=self.gpu_id, flags=flags)
+      mapped = cast(FileIOInterface, KFDIface.kfd).mmap(
+        addr, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | MAP_FIXED, mmap_offset)
+      if mapped != addr: raise RuntimeError(f"failed to map GFX8 doorbell at {addr:#x}")
+      gpus = (ctypes.c_int32 * 1)(self.gpu_id)
+      stm = kfd.AMDKFD_IOC_MAP_MEMORY_TO_GPU(self.kfd, handle=mem.handle,
+                                             device_ids_array_ptr=ctypes.addressof(gpus), n_devices=1)
+      if stm.n_success != 1: raise RuntimeError("failed to map GFX8 doorbell into GPUVM")
+    except Exception:
+      FileIOInterface.munmap(addr, size)
+      raise
+    self.gfx8_doorbell_buf = HCQBuffer(addr, size, meta=mem, view=MMIOInterface(addr, size), owner=self.dev)
+    return addr
+
   def map(self, mem):
     if mem.owner is not None and mem.owner._is_cpu(): return self.alloc(mem.size, host=True, cpu_addr=mem.va_addr)
 
@@ -886,14 +926,16 @@ class KFDIface:
       write_pointer_address=gart.va_addr+wptr, read_pointer_address=gart.va_addr+rptr+8*xcc_id)
 
     if not hasattr(self, 'doorbells'):
-      doorbell_size = 0x1000 if self.props['gfx_target_version'] == 80003 else 0x2000
-      self.doorbells_base = queue.doorbell_offset & -doorbell_size
-      self.doorbells = cast(FileIOInterface, KFDIface.kfd).mmap(
-        0, doorbell_size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.doorbells_base)
+      self.doorbells_base, doorbell_size, _ = _kfd_doorbell_params(queue, self.props['gfx_target_version'])
+      self.doorbells = self._map_gfx8_doorbells(doorbell_size, self.doorbells_base) if self.props['gfx_target_version'] == 80003 else \
+        cast(FileIOInterface, KFDIface.kfd).mmap(0, doorbell_size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.doorbells_base)
+    _, doorbell_size, doorbell_offset = _kfd_doorbell_params(queue, self.props['gfx_target_version'])
+    if DEBUG >= 2:
+      print(f"KFD queue id={queue.queue_id} doorbell_mmap={self.doorbells_base:#x} doorbell_offset={doorbell_offset:#x}")
 
     return AMDQueueDesc(ring=MMIOInterface(ring.va_addr, ring.size, fmt='I'), read_ptr=MMIOInterface(queue.read_pointer_address, 8, fmt='Q'),
                         write_ptr=MMIOInterface(queue.write_pointer_address, 8, fmt='Q'),
-                        doorbell=MMIOInterface(self.doorbells + queue.doorbell_offset - self.doorbells_base,
+                        doorbell=MMIOInterface(self.doorbells + doorbell_offset,
                                               4 if doorbell_size == 0x1000 else 8, fmt='I' if doorbell_size == 0x1000 else 'Q'))
 
   def sleep(self, tm:int):
