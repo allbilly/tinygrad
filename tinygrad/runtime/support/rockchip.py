@@ -1740,7 +1740,7 @@ def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
           len(m_axes), *m_axes, len(n_axes), *n_axes, len(shared_axes), *shared_axes,
           len(reduce_order), *reduce_order,
           len(out_code), *out_code, len(a_code), *a_code, len(b_code), *b_code,
-          0, len(reduce_order), *reduce_order, len(rounding_axes), *rounding_axes)
+          0, len(reduce_order), *reduce_order, len(rounding_axes), *rounding_axes, 0)
 
 def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
   """REDUCE(ADD, INDEX) or REDUCE(ADD, MUL(INDEX, CONST(c))) → (input_slot, M, N, K, const_val) for CMAC, or None.
@@ -5839,8 +5839,9 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   MIN_CHANNEL_TILE = 32
   RK_LINE_STRIDE_GROUP_CAP = 13
   # layout: align K and N to 32
+  tile_n = min(N, MIN_CHANNEL_TILE) if plan.cmac_materialization else N
   aligned_k = max(MIN_CHANNEL_TILE, round_up(K, MIN_CHANNEL_TILE))
-  align_out = max(MIN_CHANNEL_TILE, round_up(N, MIN_CHANNEL_TILE))
+  align_out = max(MIN_CHANNEL_TILE, round_up(tile_n, MIN_CHANNEL_TILE))
   align_in = max(aligned_k, align_out)
   eff_k = align_in if align_in != aligned_k else K
   input_row_bytes = align_in * 2
@@ -5932,7 +5933,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
   if plan.cmac_materialization:
     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), *plan.cmac_materialization[5:])
+              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), tile_n, *plan.cmac_materialization[5:])
   else:
     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
               int(plan.epilogue == "bias_relu"))
@@ -6802,7 +6803,7 @@ def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
     group_slot = next_slot
     next_slot += 1
     group_slots.append(group_slot)
-    group_tail = (len(rounding_axes), *fixed, len(active_axes), *active_axes, 0)
+    group_tail = (len(rounding_axes), *fixed, len(active_axes), *active_axes, 0, 0)
     group_materialization = (M, N, group_k, *materialization[3:tail_start], *group_tail)
     group_plan = replace(plan, out_slot=group_slot, epilogue="none", epilogue_bias_slot=-1, epilogue_bias_axis=-1,
                          cmac_materialization=group_materialization)
@@ -6832,6 +6833,82 @@ def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
     accumulator = bias_out
   if plan.epilogue in ("relu", "bias_relu"):
     tasks.append(_emit_where_stage(total, plan.out_slot, (accumulator, 0), (_ZERO_SLOT, 0), Ops.MAX))
+  return tuple(tasks)
+
+def _try_cmac_shared_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+  """Submit shared batch/group axes serially instead of block-diagonal K expansion."""
+  materialization = plan.cmac_materialization
+  if not materialization: return None
+  cursor = 5
+  n_loops = materialization[cursor]
+  loop_extents = materialization[cursor+1:cursor+1+n_loops]
+  cursor += 1+n_loops
+  n_reductions = materialization[cursor]
+  reduce_extents = materialization[cursor+1:cursor+1+n_reductions]
+  cursor += 1+n_reductions
+  n_m_axes = materialization[cursor]
+  m_axes = materialization[cursor+1:cursor+1+n_m_axes]
+  cursor += 1+n_m_axes
+  n_n_axes = materialization[cursor]
+  n_axes = materialization[cursor+1:cursor+1+n_n_axes]
+  cursor += 1+n_n_axes
+  n_shared = materialization[cursor]
+  shared_axes = materialization[cursor+1:cursor+1+n_shared]
+  cursor += 1+n_shared
+  n_reduce_order = materialization[cursor]
+  reduce_order = materialization[cursor+1:cursor+1+n_reduce_order]
+  cursor += 1+n_reduce_order
+  codes:list[tuple[int, ...]] = []
+  for _ in range(3):
+    code_n = materialization[cursor]
+    codes.append(materialization[cursor+1:cursor+1+code_n])
+    cursor += 1+code_n
+  n_fixed = materialization[cursor]
+  fixed_reductions = materialization[cursor+1:cursor+1+2*n_fixed]
+  cursor += 1+2*n_fixed
+  n_active = materialization[cursor]
+  active_reduce_order = materialization[cursor+1:cursor+1+n_active]
+  cursor += 1+n_active
+  n_rounding = materialization[cursor]
+  rounding_axes = materialization[cursor+1:cursor+1+n_rounding]
+  cursor += 1+n_rounding
+  n_fixed_loops = materialization[cursor]
+  prior_fixed_loops = materialization[cursor+1:cursor+1+2*n_fixed_loops]
+  if not shared_axes or rounding_axes: return None
+  # Keep the compact block-diagonal form when it already fits. Serial shared
+  # tasks are needed when output-channel tiling would otherwise mix batches, or
+  # when the expanded KxN weight image cannot fit the remaining CBUF banks.
+  base_m, base_n, base_k = materialization[:3]
+  cbuf_bank_size, min_channel_tile, cbuf_banks = 256*128, 32, 12
+  aligned_k = max(min_channel_tile, round_up(base_k, min_channel_tile))
+  align_out = max(min_channel_tile, round_up(min(base_n, min_channel_tile), min_channel_tile))
+  align_in = max(aligned_k, align_out)
+  input_row_bytes = align_in*2
+  tile_m = min(base_m, max(1, min(2048, 10*cbuf_bank_size//input_row_bytes)))
+  data_banks = min(cbuf_banks-1, max(1, ceildiv(tile_m*input_row_bytes, cbuf_bank_size)))
+  if base_n <= min_channel_tile and input_row_bytes*align_out <= (cbuf_banks-data_banks)*cbuf_bank_size: return None
+  active_m_axes = tuple(axis for axis in m_axes if axis not in shared_axes)
+  active_n_axes = tuple(axis for axis in n_axes if axis not in shared_axes)
+  M = prod(loop_extents[axis] for axis in active_m_axes)
+  N = prod(loop_extents[axis] for axis in active_n_axes)
+  K = prod(reduce_extents[axis] for axis in active_reduce_order)
+  tasks:list[RKSubTask] = []
+  group_count = prod(loop_extents[axis] for axis in shared_axes)
+  for linear in range(group_count):
+    rem, fixed_values = linear, [0] * len(shared_axes)
+    for idx in range(len(shared_axes)-1, -1, -1):
+      rem, fixed_values[idx] = divmod(rem, loop_extents[shared_axes[idx]])
+    fixed_loops = (*prior_fixed_loops, *(v for pair in zip(shared_axes, fixed_values) for v in pair))
+    rebuilt = (M, N, K, materialization[3], materialization[4],
+               len(loop_extents), *loop_extents, len(reduce_extents), *reduce_extents,
+               len(active_m_axes), *active_m_axes, len(active_n_axes), *active_n_axes, 0,
+               len(reduce_order), *reduce_order,
+               *(v for code in codes for v in (len(code), *code)),
+               n_fixed, *fixed_reductions, n_active, *active_reduce_order, n_rounding, *rounding_axes,
+               len(fixed_loops)//2, *fixed_loops)
+    group_plan = replace(plan, cmac_materialization=rebuilt)
+    cmds, task, relocs = emit_rk(group_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
 # ---- the native_program hook ----
@@ -6893,6 +6970,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     if (host_tasks := _try_elementwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, host_tasks)
     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
     raise RuntimeError(plan)  # reject — preserve reason, no fallback
+  if (cmac_shared_tasks := _try_cmac_shared_subtasks(plan)) is not None:
+    return build_native_program_multi(sink, cmac_shared_tasks)
   if (cmac_rounding_tasks := _try_cmac_rounding_subtasks(plan)) is not None:
     return build_native_program_multi(sink, cmac_rounding_tasks)
   cmds, task, relocs = emit_rk(plan)

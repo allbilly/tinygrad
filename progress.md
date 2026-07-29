@@ -5372,3 +5372,58 @@ against parent `ebb9b595a`.
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+
+## 2026-07-29 — CMAC N tiling and shared-axis milestone
+
+The unchanged forward-only `TestOps.test_dot` and `test_multidot` now pass on
+the real Rockchip backend. Together with the earlier scalar fix, the refreshed
+einsum/dot/matmul group is **12/14 methods passing**. The two remaining
+methods are now cleanly separated:
+
+- `test_einsum` gets past its former large binary-contraction CBUF failure and
+  later rejects the three-factor reduction
+  `ik,jkl,il->ij` as `unsupported_op:Ops.MUL`;
+- `test_einsum_ellipsis` serializes its shared `i,j` axes, then rejects the
+  remaining `K=13,824` dot as `cmac_exceeds_cbuf`.
+
+Materialized CMAC now tiles logical N in 32-channel `conv_grok` units as well
+as tiling M. Input B is swizzled using the local tile column while the
+serialized output code retains the global N coordinate. The mapped-buffer
+unpack therefore writes each tile into its original tensor position.
+
+Batch/group axes shared by M and N cannot remain in a block-diagonal expanded
+K when N is tiled: the local N tile would mix independent batches. The
+materialization metadata can now fix LOOP coordinates, and the program builder
+emits one CMAC task per shared coordinate when N tiling or expanded-weight
+CBUF pressure requires it. This matches `allbilly/rk3588/conv_grok`'s advice
+to submit grouped/depthwise work serially. When the compact block-diagonal
+form already fits, it is retained; this avoids unnecessary task growth in
+ordinary batched/grouped convolution.
+
+A permanent hardware regression uses `(3,4,5) @ (3,5,40)`, simultaneously
+forcing three fixed batch tasks and two N tiles. A matching classifier
+regression confirms the plan remains CMAC.
+
+Validation after the shared-task gating:
+
+- focused batched dot, multidot, grouped convolution, and both previously
+  timed-out transpose methods: **6/6 in 49.12 seconds**;
+- CMAC hardware class: **19/19 in 6.70 seconds**;
+- hardware-free PR1 contract file: **74/74 in 5.62 seconds**;
+- all non-giant convolution methods: **42 passed, 3 skipped, 37 passing
+  subtests in 92.00 seconds**;
+- complete hardware file: **78/78 in 248.13 seconds**, with the same 11
+  expected numerical warnings.
+
+Two earlier ungated broad-convolution attempts each had one late ioctl timeout
+in a different transpose method; both methods passed alone. Restricting
+shared-axis serialization to N-tiling/CBUF cases restored the clean full
+selection and is the important debugging lesson: task-count regressions can
+look like unrelated register failures late in a device sweep.
+
+Mypy remains at the same 13 pre-existing findings. Targeted Ruff has the same
+five pre-existing `support/rockchip.py` findings; the venv does not contain the
+Ruff module, so the installed `ruff` executable was used after activating it.
+`git diff --check` is clean. No LUT participates in this milestone, so
+`lut.md` does not change. The standalone patch is
+`rockchip-cmac-n-shared-51a962599.patch`, against parent `51a962599`.

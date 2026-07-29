@@ -1,0 +1,465 @@
+diff --git a/progress.md b/progress.md
+index 0145c96d4..e604f2ce5 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5372,3 +5372,58 @@ against parent `ebb9b595a`.
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
++
++## 2026-07-29 — CMAC N tiling and shared-axis milestone
++
++The unchanged forward-only `TestOps.test_dot` and `test_multidot` now pass on
++the real Rockchip backend. Together with the earlier scalar fix, the refreshed
++einsum/dot/matmul group is **12/14 methods passing**. The two remaining
++methods are now cleanly separated:
++
++- `test_einsum` gets past its former large binary-contraction CBUF failure and
++  later rejects the three-factor reduction
++  `ik,jkl,il->ij` as `unsupported_op:Ops.MUL`;
++- `test_einsum_ellipsis` serializes its shared `i,j` axes, then rejects the
++  remaining `K=13,824` dot as `cmac_exceeds_cbuf`.
++
++Materialized CMAC now tiles logical N in 32-channel `conv_grok` units as well
++as tiling M. Input B is swizzled using the local tile column while the
++serialized output code retains the global N coordinate. The mapped-buffer
++unpack therefore writes each tile into its original tensor position.
++
++Batch/group axes shared by M and N cannot remain in a block-diagonal expanded
++K when N is tiled: the local N tile would mix independent batches. The
++materialization metadata can now fix LOOP coordinates, and the program builder
++emits one CMAC task per shared coordinate when N tiling or expanded-weight
++CBUF pressure requires it. This matches `allbilly/rk3588/conv_grok`'s advice
++to submit grouped/depthwise work serially. When the compact block-diagonal
++form already fits, it is retained; this avoids unnecessary task growth in
++ordinary batched/grouped convolution.
++
++A permanent hardware regression uses `(3,4,5) @ (3,5,40)`, simultaneously
++forcing three fixed batch tasks and two N tiles. A matching classifier
++regression confirms the plan remains CMAC.
++
++Validation after the shared-task gating:
++
++- focused batched dot, multidot, grouped convolution, and both previously
++  timed-out transpose methods: **6/6 in 49.12 seconds**;
++- CMAC hardware class: **19/19 in 6.70 seconds**;
++- hardware-free PR1 contract file: **74/74 in 5.62 seconds**;
++- all non-giant convolution methods: **42 passed, 3 skipped, 37 passing
++  subtests in 92.00 seconds**;
++- complete hardware file: **78/78 in 248.13 seconds**, with the same 11
++  expected numerical warnings.
++
++Two earlier ungated broad-convolution attempts each had one late ioctl timeout
++in a different transpose method; both methods passed alone. Restricting
++shared-axis serialization to N-tiling/CBUF cases restored the clean full
++selection and is the important debugging lesson: task-count regressions can
++look like unrelated register failures late in a device sweep.
++
++Mypy remains at the same 13 pre-existing findings. Targeted Ruff has the same
++five pre-existing `support/rockchip.py` findings; the venv does not contain the
++Ruff module, so the installed `ruff` executable was used after activating it.
++`git diff --check` is clean. No LUT participates in this milestone, so
++`lut.md` does not change. The standalone patch is
++`rockchip-cmac-n-shared-51a962599.patch`, against parent `51a962599`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 127e74c7b..3521d9f39 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -489,6 +489,17 @@ class TestCMAC(unittest.TestCase):
+     c = a.dot(b).realize()
+     np.testing.assert_array_equal(c.numpy(), np.dot(a_np, b_np))
+ 
++  def test_cmac_batched_n_tiled_matmul(self):
++    # Batch is serialized into independent NPU tasks and N=40 requires two
++    # conv_grok-sized 32-channel output tiles.
++    np.random.seed(753)
++    a_np = np.random.randn(3, 4, 5).astype(np.float16)
++    b_np = np.random.randn(3, 5, 40).astype(np.float16)
++    a, b = (Tensor(v, device="ROCKCHIP").realize() for v in (a_np, b_np))
++    c = (a @ b).realize()
++    expected = np.matmul(a_np.astype(np.float32), b_np.astype(np.float32)).astype(np.float16)
++    np.testing.assert_allclose(c.numpy(), expected, rtol=1e-3, atol=1e-6)
++
+   def test_cmac_gemv_vector_a(self):
+     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
+     a_np = np.array([1,2,3,4], dtype=np.float16)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 7e843bd73..e49f0edbb 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -219,6 +219,11 @@ class TestClassifier(unittest.TestCase):
+     b = Tensor.rand(5,dtype=dtypes.half).realize()
+     self.assertEqual(_classify(_get_sink(a.dot(b))), "cmac")
+ 
++  def test_cmac_batched_n_tiled_matmul(self):
++    a = Tensor.rand(3,4,5,dtype=dtypes.half).realize()
++    b = Tensor.rand(3,5,40,dtype=dtypes.half).realize()
++    self.assertEqual(_classify(_get_sink(a@b)), "cmac")
++
+   def test_cmac_gemv_vector_b(self):
+     # GEMV: (M,K) @ (K,) → (M,) — vector is B, N=1
+     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 0819e2098..c22239bd2 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -347,3 +347,23 @@ materialized CMAC contractions, raising the refreshed group to 10/14.
+ The four remaining failures are large contractions rejected by
+ `cmac_exceeds_cbuf`; they need N/K/weight tiling rather than another
+ classifier exception.
++
++### N tiling and batched contraction refresh
++
++Materialized CMAC now tiles N in 32-channel units and can serialize fixed
++shared batch/group LOOP coordinates. `test_dot` and `test_multidot` pass on
++the real backend, raising the refreshed einsum/dot/matmul selection from
++10/14 to **12/14 methods passing**.
++
++| Remaining method | Current first failure | Required next work |
++|---|---|---|
++| `test_einsum` | three-input `ik,jkl,il->ij`: `unsupported_op:Ops.MUL` | stage/generalize a three-factor contraction |
++| `test_einsum_ellipsis` | per-`i,j` `K=13,824`: `cmac_exceeds_cbuf` | K tiling with correct fp32 accumulation semantics |
++
++The earlier large binary einsum contraction now passes far enough for
++`test_einsum` to reach its later three-input case. Shared-axis serialization
++is gated to cases that need N tiling or would overflow the expanded CMAC
++weight CBUF; otherwise the lower-submit-count block-diagonal layout remains.
++That gating keeps the non-giant convolution selection clean at **42 passed,
++3 skipped, 37 passing subtests**. Current permanent checks are **19/19 CMAC
++hardware**, **78/78 complete hardware**, and **74/74 PR1 contract**.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 38de537f7..0af257763 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -134,7 +134,7 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
+     d[i] = _fp32_to_fp16(raw)
+ 
+ def _decode_materialized_cmac_layout(layout):
+-  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, *meta = layout
++  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, tile_n, *meta = layout
+   assert tag == _CMAC_MATERIALIZED_LAYOUT
+   cursor = 0
+   n_loops = meta[cursor]
+@@ -167,8 +167,11 @@ def _decode_materialized_cmac_layout(layout):
+   cursor += 1+n_active
+   n_rounding = meta[cursor]
+   rounding_axes = meta[cursor+1:cursor+1+n_rounding]
+-  return (tile_m, bias_slot, bias_axis, bool(relu), loop_extents, reduce_extents, m_axes, n_axes, shared_axes,
+-          active_reduce_order, fixed_reductions, rounding_axes, *codes)
++  cursor += 1+n_rounding
++  n_fixed_loops = meta[cursor]
++  fixed_loops = tuple((meta[cursor+1+2*i], meta[cursor+2+2*i]) for i in range(n_fixed_loops))
++  return (tile_m, tile_n, bias_slot, bias_axis, bool(relu), loop_extents, reduce_extents, m_axes, n_axes, shared_axes,
++          active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
+ 
+ def _eval_static_index(code, coords):
+   stack:list[int] = []
+@@ -223,9 +226,12 @@ def _eval_static_value(code, coords, source):
+ def _set_linear_axes(coords, linear, axes, extents):
+   for axis in reversed(axes): linear, coords[axis] = divmod(linear, extents[axis])
+ 
+-def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded, m_start=0, rows=None):
+-  _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, _, _, a_code, b_code = decoded
++def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded,
++                             m_start=0, rows=None, n_start=0, cols=None):
++  _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
++    _, fixed_loops, _, a_code, b_code = decoded
+   rows = M if rows is None else rows
++  cols = N if cols is None else cols
+   ctypes.memset(a_dst, 0, rows * align_in * 2)
+   ctypes.memset(b_dst, 0, align_out * align_in * 2)
+   a_in = ctypes.cast(a_src, ctypes.POINTER(ctypes.c_uint16))
+@@ -246,24 +252,29 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
+     m = m_start + local_m
+     if m >= M: continue
+     coords = [0] * (n_loops + len(reduce_extents))
++    for axis, value in fixed_loops: coords[axis] = value
+     for axis, value in fixed_reductions: coords[n_loops+axis] = value
+     _set_linear_axes(coords, m, m_axes, loop_extents)
+     for k in range(K):
+       if k // base_k != batch_index(coords): continue
+       _set_linear_axes(coords, k % base_k, reduce_coord_axes, all_extents)
+       a_out[local_m*align_in+k] = _eval_static_value(a_code, coords, a_in)
+-  for n in range(N):
++  for local_n in range(cols):
++    n = n_start + local_n
++    if n >= N: continue
+     coords = [0] * (n_loops + len(reduce_extents))
++    for axis, value in fixed_loops: coords[axis] = value
+     for axis, value in fixed_reductions: coords[n_loops+axis] = value
+     _set_linear_axes(coords, n, n_axes, loop_extents)
+     for k in range(K):
+       if k // base_k != batch_index(coords): continue
+       _set_linear_axes(coords, k % base_k, reduce_coord_axes, all_extents)
+-      dst_index = (((n//16)*(align_in//32)+(k//32))*16+(n%16))*32+(k%32)
++      dst_index = (((local_n//16)*(align_in//32)+(k//32))*16+(local_n%16))*32+(k%32)
+       b_out[dst_index] = _eval_static_value(b_code, coords, b_in)
+ 
+-def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None, packed_inputs=None):
+-  _, bias_slot, bias_axis, relu, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, _, out_code, _, _ = decoded
++def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
++                                  n_start=0, cols=None, packed_inputs=None):
++  _, _, bias_slot, bias_axis, relu, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, _, fixed_loops, out_code, _, _ = decoded
+   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
+   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
+   total = 1
+@@ -271,11 +282,13 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
+   for linear in range(total):
+     rem, coords = linear, [0] * len(loop_extents)
+     for axis in range(len(loop_extents)-1, -1, -1): rem, coords[axis] = divmod(rem, loop_extents[axis])
++    if any(coords[axis] != value for axis, value in fixed_loops): continue
+     m = n = 0
+     for axis in m_axes: m = m*loop_extents[axis] + coords[axis]
+     for axis in n_axes: n = n*loop_extents[axis] + coords[axis]
+     if m < m_start or (rows is not None and m >= m_start+rows): continue
+-    raw = s[(m-m_start)*align_out+n]
++    if n < n_start or (cols is not None and n >= n_start+cols): continue
++    raw = s[(m-m_start)*align_out+n-n_start]
+     if b is not None:
+       value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[coords[bias_axis]]))[0]
+       value = struct.unpack('<f', struct.pack('<f', value))[0]
+@@ -283,14 +296,14 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
+       raw = struct.unpack('<I', struct.pack('<f', value))[0]
+     if fixed_reductions and packed_inputs is not None:
+       a_addr, b_addr, K, align_in = packed_inputs
+-      converted = _fp32_to_fp16_group(raw, a_addr, b_addr, m-m_start, n, K, align_in)
++      converted = _fp32_to_fp16_group(raw, a_addr, b_addr, m-m_start, n-n_start, K, align_in)
+     else: converted = _fp32_to_fp16(raw)
+     d[_eval_static_index(out_code, coords)] = converted
+ 
+ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
+   M, N, K, align_in, align_out = task.layout[:5]
+   decoded = _decode_materialized_cmac_layout(task.layout)
+-  tile_m, bias_slot = decoded[:2]
++  tile_m, tile_n, bias_slot = decoded[:3]
+   a_s, b_s = relocs[0].globals_slot, relocs[1].globals_slot
+   temp:list[HCQBuffer] = []
+   try:
+@@ -300,35 +313,38 @@ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
+     temp.extend((a_buf, b_buf, o_buf))
+     n_cmds = len(cmds)
+     regcmd = ctypes.cast(dev.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * dev.cmd_buf_size)).contents  # type: ignore[arg-type]
+-    for m_start in range(0, M, tile_m):
+-      dev.reset_npu()
+-      b_src = None if b_s == _CONST_SLOT else bufs[b_s].va_addr
+-      _materialize_cmac_inputs(bufs[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
+-                               M, N, K, align_in, align_out, decoded, m_start, tile_m)
+-      for i, cmd in enumerate(cmds): regcmd[i] = cmd
+-      for i, r in enumerate(relocs):
+-        dma = (a_buf, b_buf, o_buf)[i].meta.dma_addr
+-        v = ((dma + r.addend) >> r.shift) & r.mask
+-        fm = (r.mask << r.field_shift) & 0xFFFFFFFF if r.field_shift else r.mask
+-        if r.field_shift: v = (v << r.field_shift) & 0xFFFFFFFF
+-        regcmd[r.word_index] = (regcmd[r.word_index] & ~(fm << 16)) | ((v & fm) << 16)
+-      t = ctypes.cast(dev.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents[0]  # type: ignore[arg-type]
+-      t.flags, t.op_idx, t.enable_mask, t.int_mask = 0, task.op_idx, task.enable_mask, task.int_mask
+-      t.int_clear, t.int_status, t.regcfg_amount, t.regcfg_offset = 0x1ffff, 0, n_cmds, 0
+-      t.regcmd_addr = dev.cmd_buf.meta.dma_addr
+-      rk.DRM_IOCTL_RKNPU_SUBMIT(dev.fd_ctl, __payload=rk.struct_rknpu_submit(
+-        flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
+-        task_start=0, task_number=1, task_counter=0, priority=0,
+-        task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
+-        user_data=0, core_mask=1, fence_fd=-1,
+-        subcore_task=(rk.struct_rknpu_subcore_task*5)(
+-          rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+-          rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
+-          rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
+-      if getenv("DEBUG") >= 1: print(f"submit {name}: materialized CMAC rows {m_start}:{min(M, m_start+tile_m)}")
+-      bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
+-      _unpack_materialized_cmac_out(o_buf.va_addr, bufs[task.out_slot].va_addr, M, N, align_out,
+-                                    decoded, bias, m_start, min(tile_m, M-m_start), (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]))
++    for n_start in range(0, N, tile_n):
++      for m_start in range(0, M, tile_m):
++        dev.reset_npu()
++        b_src = None if b_s == _CONST_SLOT else bufs[b_s].va_addr
++        _materialize_cmac_inputs(bufs[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
++                                 M, N, K, align_in, align_out, decoded, m_start, tile_m, n_start, tile_n)
++        for i, cmd in enumerate(cmds): regcmd[i] = cmd
++        for i, r in enumerate(relocs):
++          dma = (a_buf, b_buf, o_buf)[i].meta.dma_addr
++          v = ((dma + r.addend) >> r.shift) & r.mask
++          fm = (r.mask << r.field_shift) & 0xFFFFFFFF if r.field_shift else r.mask
++          if r.field_shift: v = (v << r.field_shift) & 0xFFFFFFFF
++          regcmd[r.word_index] = (regcmd[r.word_index] & ~(fm << 16)) | ((v & fm) << 16)
++        t = ctypes.cast(dev.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents[0]  # type: ignore[arg-type]
++        t.flags, t.op_idx, t.enable_mask, t.int_mask = 0, task.op_idx, task.enable_mask, task.int_mask
++        t.int_clear, t.int_status, t.regcfg_amount, t.regcfg_offset = 0x1ffff, 0, n_cmds, 0
++        t.regcmd_addr = dev.cmd_buf.meta.dma_addr
++        rk.DRM_IOCTL_RKNPU_SUBMIT(dev.fd_ctl, __payload=rk.struct_rknpu_submit(
++          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
++          task_start=0, task_number=1, task_counter=0, priority=0,
++          task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
++          user_data=0, core_mask=1, fence_fd=-1,
++          subcore_task=(rk.struct_rknpu_subcore_task*5)(
++            rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
++            rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
++            rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
++        if getenv("DEBUG") >= 1:
++          print(f"submit {name}: materialized CMAC rows {m_start}:{min(M, m_start+tile_m)} cols {n_start}:{min(N, n_start+tile_n)}")
++        bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
++        _unpack_materialized_cmac_out(o_buf.va_addr, bufs[task.out_slot].va_addr, M, N, align_out,
++                                      decoded, bias, m_start, min(tile_m, M-m_start), n_start, min(tile_n, N-n_start),
++                                      (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]))
+   finally:
+     for b in temp: dev._gpu_free(b)
+ 
+@@ -602,11 +618,12 @@ class RockchipProgram(Program['RockchipDevice']):
+     task = self.task
+     temp:list[HCQBuffer] = []
+     try:
+-      if task.kind == "cmac" and len(task.layout) > 5 and task.layout[5] == _CMAC_MATERIALIZED_LAYOUT and \
+-         _decode_materialized_cmac_layout(task.layout)[0] < task.layout[0]:
++      decoded_tile = _decode_materialized_cmac_layout(task.layout) if \
++        task.kind == "cmac" and len(task.layout) > 5 and task.layout[5] == _CMAC_MATERIALIZED_LAYOUT else None
++      if decoded_tile is not None and (decoded_tile[0] < task.layout[0] or decoded_tile[1] < task.layout[1]):
+         _run_tiled_materialized_cmac(dev, self.name, self.cmds, task, self.relocs, bufs)
+-        self.submit_count += (task.layout[0] + _decode_materialized_cmac_layout(task.layout)[0] - 1) // \
+-                             _decode_materialized_cmac_layout(task.layout)[0]
++        self.submit_count += ((task.layout[0] + decoded_tile[0] - 1) // decoded_tile[0]) * \
++                             ((task.layout[1] + decoded_tile[1] - 1) // decoded_tile[1])
+         self.last_enable_mask = task.enable_mask
+         dev.submitted_masks.add(task.enable_mask)
+         return
+@@ -810,7 +827,7 @@ class RockchipProgram(Program['RockchipDevice']):
+         M, N, _, _, align_out = task.layout[:5]
+         if len(task.layout) > 5 and task.layout[5] == _CMAC_MATERIALIZED_LAYOUT:
+           decoded = _decode_materialized_cmac_layout(task.layout)
+-          bias = bufs[decoded[1]].va_addr if decoded[1] >= 0 else None
++          bias = bufs[decoded[2]].va_addr if decoded[2] >= 0 else None
+           _unpack_materialized_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, decoded, bias,
+                                         packed_inputs=(cmac_bufs[0].va_addr, cmac_bufs[1].va_addr, task.layout[2], task.layout[3]))
+         else:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 037605ee3..555f26607 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1740,7 +1740,7 @@ def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
+           len(m_axes), *m_axes, len(n_axes), *n_axes, len(shared_axes), *shared_axes,
+           len(reduce_order), *reduce_order,
+           len(out_code), *out_code, len(a_code), *a_code, len(b_code), *b_code,
+-          0, len(reduce_order), *reduce_order, len(rounding_axes), *rounding_axes)
++          0, len(reduce_order), *reduce_order, len(rounding_axes), *rounding_axes, 0)
+ 
+ def _try_sum(sink: UOp, reduce: UOp) -> tuple[int, int, int, int, float]|None:
+   """REDUCE(ADD, INDEX) or REDUCE(ADD, MUL(INDEX, CONST(c))) → (input_slot, M, N, K, const_val) for CMAC, or None.
+@@ -5839,8 +5839,9 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
+   MIN_CHANNEL_TILE = 32
+   RK_LINE_STRIDE_GROUP_CAP = 13
+   # layout: align K and N to 32
++  tile_n = min(N, MIN_CHANNEL_TILE) if plan.cmac_materialization else N
+   aligned_k = max(MIN_CHANNEL_TILE, round_up(K, MIN_CHANNEL_TILE))
+-  align_out = max(MIN_CHANNEL_TILE, round_up(N, MIN_CHANNEL_TILE))
++  align_out = max(MIN_CHANNEL_TILE, round_up(tile_n, MIN_CHANNEL_TILE))
+   align_in = max(aligned_k, align_out)
+   eff_k = align_in if align_in != aligned_k else K
+   input_row_bytes = align_in * 2
+@@ -5932,7 +5933,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
+   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
+   if plan.cmac_materialization:
+     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
+-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), *plan.cmac_materialization[5:])
++              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), tile_n, *plan.cmac_materialization[5:])
+   else:
+     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
+               int(plan.epilogue == "bias_relu"))
+@@ -6802,7 +6803,7 @@ def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+     group_slot = next_slot
+     next_slot += 1
+     group_slots.append(group_slot)
+-    group_tail = (len(rounding_axes), *fixed, len(active_axes), *active_axes, 0)
++    group_tail = (len(rounding_axes), *fixed, len(active_axes), *active_axes, 0, 0)
+     group_materialization = (M, N, group_k, *materialization[3:tail_start], *group_tail)
+     group_plan = replace(plan, out_slot=group_slot, epilogue="none", epilogue_bias_slot=-1, epilogue_bias_axis=-1,
+                          cmac_materialization=group_materialization)
+@@ -6834,6 +6835,82 @@ def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+     tasks.append(_emit_where_stage(total, plan.out_slot, (accumulator, 0), (_ZERO_SLOT, 0), Ops.MAX))
+   return tuple(tasks)
+ 
++def _try_cmac_shared_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
++  """Submit shared batch/group axes serially instead of block-diagonal K expansion."""
++  materialization = plan.cmac_materialization
++  if not materialization: return None
++  cursor = 5
++  n_loops = materialization[cursor]
++  loop_extents = materialization[cursor+1:cursor+1+n_loops]
++  cursor += 1+n_loops
++  n_reductions = materialization[cursor]
++  reduce_extents = materialization[cursor+1:cursor+1+n_reductions]
++  cursor += 1+n_reductions
++  n_m_axes = materialization[cursor]
++  m_axes = materialization[cursor+1:cursor+1+n_m_axes]
++  cursor += 1+n_m_axes
++  n_n_axes = materialization[cursor]
++  n_axes = materialization[cursor+1:cursor+1+n_n_axes]
++  cursor += 1+n_n_axes
++  n_shared = materialization[cursor]
++  shared_axes = materialization[cursor+1:cursor+1+n_shared]
++  cursor += 1+n_shared
++  n_reduce_order = materialization[cursor]
++  reduce_order = materialization[cursor+1:cursor+1+n_reduce_order]
++  cursor += 1+n_reduce_order
++  codes:list[tuple[int, ...]] = []
++  for _ in range(3):
++    code_n = materialization[cursor]
++    codes.append(materialization[cursor+1:cursor+1+code_n])
++    cursor += 1+code_n
++  n_fixed = materialization[cursor]
++  fixed_reductions = materialization[cursor+1:cursor+1+2*n_fixed]
++  cursor += 1+2*n_fixed
++  n_active = materialization[cursor]
++  active_reduce_order = materialization[cursor+1:cursor+1+n_active]
++  cursor += 1+n_active
++  n_rounding = materialization[cursor]
++  rounding_axes = materialization[cursor+1:cursor+1+n_rounding]
++  cursor += 1+n_rounding
++  n_fixed_loops = materialization[cursor]
++  prior_fixed_loops = materialization[cursor+1:cursor+1+2*n_fixed_loops]
++  if not shared_axes or rounding_axes: return None
++  # Keep the compact block-diagonal form when it already fits. Serial shared
++  # tasks are needed when output-channel tiling would otherwise mix batches, or
++  # when the expanded KxN weight image cannot fit the remaining CBUF banks.
++  base_m, base_n, base_k = materialization[:3]
++  cbuf_bank_size, min_channel_tile, cbuf_banks = 256*128, 32, 12
++  aligned_k = max(min_channel_tile, round_up(base_k, min_channel_tile))
++  align_out = max(min_channel_tile, round_up(min(base_n, min_channel_tile), min_channel_tile))
++  align_in = max(aligned_k, align_out)
++  input_row_bytes = align_in*2
++  tile_m = min(base_m, max(1, min(2048, 10*cbuf_bank_size//input_row_bytes)))
++  data_banks = min(cbuf_banks-1, max(1, ceildiv(tile_m*input_row_bytes, cbuf_bank_size)))
++  if base_n <= min_channel_tile and input_row_bytes*align_out <= (cbuf_banks-data_banks)*cbuf_bank_size: return None
++  active_m_axes = tuple(axis for axis in m_axes if axis not in shared_axes)
++  active_n_axes = tuple(axis for axis in n_axes if axis not in shared_axes)
++  M = prod(loop_extents[axis] for axis in active_m_axes)
++  N = prod(loop_extents[axis] for axis in active_n_axes)
++  K = prod(reduce_extents[axis] for axis in active_reduce_order)
++  tasks:list[RKSubTask] = []
++  group_count = prod(loop_extents[axis] for axis in shared_axes)
++  for linear in range(group_count):
++    rem, fixed_values = linear, [0] * len(shared_axes)
++    for idx in range(len(shared_axes)-1, -1, -1):
++      rem, fixed_values[idx] = divmod(rem, loop_extents[shared_axes[idx]])
++    fixed_loops = (*prior_fixed_loops, *(v for pair in zip(shared_axes, fixed_values) for v in pair))
++    rebuilt = (M, N, K, materialization[3], materialization[4],
++               len(loop_extents), *loop_extents, len(reduce_extents), *reduce_extents,
++               len(active_m_axes), *active_m_axes, len(active_n_axes), *active_n_axes, 0,
++               len(reduce_order), *reduce_order,
++               *(v for code in codes for v in (len(code), *code)),
++               n_fixed, *fixed_reductions, n_active, *active_reduce_order, n_rounding, *rounding_axes,
++               len(fixed_loops)//2, *fixed_loops)
++    group_plan = replace(plan, cmac_materialization=rebuilt)
++    cmds, task, relocs = emit_rk(group_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  return tuple(tasks)
++
+ # ---- the native_program hook ----
+ def build_native_program(sink: UOp) -> UOp|None:
+   """Classify and build a PROGRAM(SINK, LINEAR(INS...)). Raises RKPLAN_REJECT:<reason>
+@@ -6893,6 +6970,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     if (host_tasks := _try_elementwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, host_tasks)
+     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
+     raise RuntimeError(plan)  # reject — preserve reason, no fallback
++  if (cmac_shared_tasks := _try_cmac_shared_subtasks(plan)) is not None:
++    return build_native_program_multi(sink, cmac_shared_tasks)
+   if (cmac_rounding_tasks := _try_cmac_rounding_subtasks(plan)) is not None:
+     return build_native_program_multi(sink, cmac_rounding_tasks)
+   cmds, task, relocs = emit_rk(plan)

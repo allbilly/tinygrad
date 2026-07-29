@@ -347,3 +347,23 @@ materialized CMAC contractions, raising the refreshed group to 10/14.
 The four remaining failures are large contractions rejected by
 `cmac_exceeds_cbuf`; they need N/K/weight tiling rather than another
 classifier exception.
+
+### N tiling and batched contraction refresh
+
+Materialized CMAC now tiles N in 32-channel units and can serialize fixed
+shared batch/group LOOP coordinates. `test_dot` and `test_multidot` pass on
+the real backend, raising the refreshed einsum/dot/matmul selection from
+10/14 to **12/14 methods passing**.
+
+| Remaining method | Current first failure | Required next work |
+|---|---|---|
+| `test_einsum` | three-input `ik,jkl,il->ij`: `unsupported_op:Ops.MUL` | stage/generalize a three-factor contraction |
+| `test_einsum_ellipsis` | per-`i,j` `K=13,824`: `cmac_exceeds_cbuf` | K tiling with correct fp32 accumulation semantics |
+
+The earlier large binary einsum contraction now passes far enough for
+`test_einsum` to reach its later three-input case. Shared-axis serialization
+is gated to cases that need N tiling or would overflow the expanded CMAC
+weight CBUF; otherwise the lower-submit-count block-diagonal layout remains.
+That gating keeps the non-giant convolution selection clean at **42 passed,
+3 skipped, 37 passing subtests**. Current permanent checks are **19/19 CMAC
+hardware**, **78/78 complete hardware**, and **74/74 PR1 contract**.

@@ -489,6 +489,17 @@ class TestCMAC(unittest.TestCase):
     c = a.dot(b).realize()
     np.testing.assert_array_equal(c.numpy(), np.dot(a_np, b_np))
 
+  def test_cmac_batched_n_tiled_matmul(self):
+    # Batch is serialized into independent NPU tasks and N=40 requires two
+    # conv_grok-sized 32-channel output tiles.
+    np.random.seed(753)
+    a_np = np.random.randn(3, 4, 5).astype(np.float16)
+    b_np = np.random.randn(3, 5, 40).astype(np.float16)
+    a, b = (Tensor(v, device="ROCKCHIP").realize() for v in (a_np, b_np))
+    c = (a @ b).realize()
+    expected = np.matmul(a_np.astype(np.float32), b_np.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(c.numpy(), expected, rtol=1e-3, atol=1e-6)
+
   def test_cmac_gemv_vector_a(self):
     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
     a_np = np.array([1,2,3,4], dtype=np.float16)
