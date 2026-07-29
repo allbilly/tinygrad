@@ -510,8 +510,9 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
           elif dtype_code == 12: value = struct.unpack('<d', struct.pack('<Q', bits))[0]
           else:
             width = np.dtype(np_dtypes[dtype_code]).itemsize * 8
+            bits &= (1 << width)-1
             if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
-            value = bits & ((1 << width)-1) if np.issubdtype(np_dtypes[dtype_code], np.unsignedinteger) else bits
+            value = bits
           stack.append(cast(value, dtype_code))
           continue
         if op == 1:
@@ -1011,7 +1012,8 @@ class RockchipProgram(Program['RockchipDevice']):
       total = max(st.task.layout[0] for st in subtasks)
       try:
         while len(ext) <= max_slot:
-          shared.append(b := dev._gpu_alloc(max(total * 2, 4096), 0))
+          # Movement tasks may gather int32 windows before DPU converts them to fp16.
+          shared.append(b := dev._gpu_alloc(max(total * 4, 4096), 0))
           ext.append(b)
         # Handle copy tasks host-side
         for st in copy_tasks:

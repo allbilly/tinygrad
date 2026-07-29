@@ -469,3 +469,31 @@ Current pooling work remaining:
 
 No LUT is involved. See `progress.md` for the exact matcher probe, rounding
 diagnosis, layout contract, validation commands, and standalone patch name.
+
+### Pooling refresh: value-only local maximum
+
+All current forward value-only local max-pool cases now pass:
+
+| Passing selection | Result |
+|---|---:|
+| Ordinary, simple, padded, stride, dilation, unit-stride, and ceil-mode max pools | **11 methods, 33 subtests** |
+| Integer padded max pool | **1 method** |
+| Complete value-only `max_pool2d` selection | **12 methods, 33 subtests** |
+| DPU hardware class | **53/53** |
+| Hardware-free PR1 file | **79/79** |
+
+Static window positions are gathered without arithmetic, including `-inf`
+padding, and reduced by sequential NPU DPU-MAX tasks. Unit reduction axes and
+fully collapsed outputs are handled. Integer candidates follow the graph's
+cast order, enter homogeneous fp16 DPU stages, and convert back to int32 only
+at the final output.
+
+Remaining pooling failures are now the separate index/scatter family:
+
+- `max_pool2d(return_indices=True)`;
+- `max_unpool2d`;
+- `max_unpool2d` special values;
+- `avg_pool3d`, blocked in the Torch half reference before backend execution.
+
+This staged DPU implementation prioritizes complete forward correctness.
+Direct local PPU programming can later reduce the number of submissions.

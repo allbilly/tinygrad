@@ -5665,3 +5665,84 @@ are local max-pool PPU layout and max-pool indices/max-unpool scatter.
 
 The standalone patch is
 `rockchip-avg-pool-variable-acbf038c4.patch`, against parent `acbf038c4`.
+
+## 2026-07-29 — value-only local max-pooling milestone
+
+The post-average-pool refresh reported **42 pooling failures, 16 passes, and
+26 passing subtests**. One failure is the unchanged Torch-side
+`avg_pool3d(Half)` block. The rest separated into local max values versus
+returned indices/max-unpool scatter. All value-only forward `max_pool2d`
+groups now pass:
+
+- ordinary and simple pools;
+- standard and asymmetric padding;
+- integer padding;
+- larger and smaller strides;
+- stride plus dilation and dilation-only;
+- unit stride;
+- ceil mode and its output-size edge.
+
+This is **12 methods and 33 parameterized subtests**.
+
+### Why the existing PPU path rejected local pools
+
+The PR1 PPU path implements a global reduction shaped as `(K, C) -> (C,)`
+with at most eight live channels. A local pool instead lowers to one or two
+static REDUCE axes plus many output LOOP coordinates, for example:
+
+```text
+REDUCE(MAX, WHERE(valid, INDEX(input, window_index), -inf), ky, kx)
+```
+
+The old classifier consequently rejected layouts such as
+`unsupported_layout:(64, 5, 14):2`. Directly expanding the PPU register
+contract is still a useful optimization, but is not required for correctness.
+
+### Passing staged implementation
+
+For each compile-time window coordinate, the compiler substitutes the
+reduction RANGE values and builds an exact movement task that gathers one
+candidate per output. Padding predicates and index arithmetic are preserved;
+invalid candidates become fp16 `-inf`. It then emits a sequential DPU MAX
+reduction:
+
+```text
+host gather window[0..K-1] -> K fp16 scratch tensors
+DPU MAX(scratch0, scratch1) -> ...
+DPU MAX(accumulator, scratchK-1) -> output
+```
+
+All maximum arithmetic therefore executes on the NPU. A `(2,2)` window
+serializes four movement tasks and three DPU tasks; `(5,5)` serializes 25 and
+24. A unit-size kernel dimension may disappear during simplification, so the
+matcher accepts either one or two surviving reduction axes. It also accepts
+a fully collapsed one-element output while leaving ordinary one-axis global
+max reductions on the existing PPU path.
+
+Integer pooling first applies the graph's half-to-int cast in the exact host
+gather evaluator, converts that typed candidate to fp16 scratch, performs
+homogeneous DPU MAX stages, then converts the final result to int32. An
+earlier int32-scratch attempt is retained in comments: separate DPU
+submissions made its mixed-width intermediates unstable. The stronger
+permanent regression uses nontrivial positive and negative integers because
+the official random case truncates many inputs to zero.
+
+That regression also exposed a generic serialized-constant bug: negative
+32-bit constants were sign-extended into the stored 64-bit fields, but the
+runtime applied signed conversion before masking back to the declared width.
+Constants are now width-masked first, so `INT32_MIN` padding decodes exactly.
+Mixed movement/DPU scratch allocations reserve four bytes per element, which
+also prevents typed gather overflow.
+
+### Validation
+
+- all value-only `max_pool2d`: **12 methods, 33 subtests passing**;
+- new exact fp16 plus integer padded local-pool hardware regression: passing;
+- complete DPU hardware class: **53/53** in 240.14 seconds;
+- hardware-free PR1: **79/79** in 6.71 seconds;
+- pycompile and `git diff --check`: clean.
+
+Mypy remains at the same 13 pre-existing findings and targeted Ruff at the
+same five pre-existing findings. No LUT is involved. Returned max indices
+and max-unpool scatter remain the next pooling milestone. The standalone patch is
+`rockchip-local-max-0447540a6.patch`, against parent `0447540a6`.

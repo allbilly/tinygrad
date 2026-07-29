@@ -481,6 +481,15 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(n_counts, 4)
     self.assertEqual(set(layout[12:12+n_counts]), {4, 6, 9})
 
+  def test_local_max_pool_gathers_then_reduces_on_dpu(self):
+    x = Tensor.rand(1,1,4,5,dtype=dtypes.half).realize()
+    prg = build_native_program(_get_sink(x.max_pool2d(kernel_size=(2,2))))
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 7)
+    self.assertEqual(sum(st.task.is_copy for st in subtasks), 4)
+    self.assertTrue(all(st.task.kind == "dpu" for st in subtasks))
+    self.assertEqual(subtasks[-1].task.out_slot, 0)
+
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()
     b = Tensor.rand(5000,dtype=dtypes.half).realize()

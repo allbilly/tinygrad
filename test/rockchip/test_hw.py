@@ -58,6 +58,16 @@ class TestDPU(unittest.TestCase):
     c = a.maximum(b).realize()
     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, b_np), rtol=1e-3, atol=1e-3)
 
+  def test_dpu_local_max_pool(self):
+    x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
+    padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
+    expected = np.empty((1,1,2,3), dtype=np.float16)
+    for oy in range(2):
+      for ox in range(3): expected[:, :, oy, ox] = padded[:, :, oy*2:oy*2+3, ox*2:ox*2+3].max(axis=(2,3))
+    x = Tensor(x_np, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(x.max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected)
+    np.testing.assert_array_equal(x.int().max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected.astype(np.int32))
+
   def test_dpu_copy(self):
     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()

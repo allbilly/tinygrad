@@ -1,0 +1,284 @@
+diff --git a/progress.md b/progress.md
+index bcb8632ae..13138282e 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5665,3 +5665,84 @@ are local max-pool PPU layout and max-pool indices/max-unpool scatter.
+ 
+ The standalone patch is
+ `rockchip-avg-pool-variable-acbf038c4.patch`, against parent `acbf038c4`.
++
++## 2026-07-29 — value-only local max-pooling milestone
++
++The post-average-pool refresh reported **42 pooling failures, 16 passes, and
++26 passing subtests**. One failure is the unchanged Torch-side
++`avg_pool3d(Half)` block. The rest separated into local max values versus
++returned indices/max-unpool scatter. All value-only forward `max_pool2d`
++groups now pass:
++
++- ordinary and simple pools;
++- standard and asymmetric padding;
++- integer padding;
++- larger and smaller strides;
++- stride plus dilation and dilation-only;
++- unit stride;
++- ceil mode and its output-size edge.
++
++This is **12 methods and 33 parameterized subtests**.
++
++### Why the existing PPU path rejected local pools
++
++The PR1 PPU path implements a global reduction shaped as `(K, C) -> (C,)`
++with at most eight live channels. A local pool instead lowers to one or two
++static REDUCE axes plus many output LOOP coordinates, for example:
++
++```text
++REDUCE(MAX, WHERE(valid, INDEX(input, window_index), -inf), ky, kx)
++```
++
++The old classifier consequently rejected layouts such as
++`unsupported_layout:(64, 5, 14):2`. Directly expanding the PPU register
++contract is still a useful optimization, but is not required for correctness.
++
++### Passing staged implementation
++
++For each compile-time window coordinate, the compiler substitutes the
++reduction RANGE values and builds an exact movement task that gathers one
++candidate per output. Padding predicates and index arithmetic are preserved;
++invalid candidates become fp16 `-inf`. It then emits a sequential DPU MAX
++reduction:
++
++```text
++host gather window[0..K-1] -> K fp16 scratch tensors
++DPU MAX(scratch0, scratch1) -> ...
++DPU MAX(accumulator, scratchK-1) -> output
++```
++
++All maximum arithmetic therefore executes on the NPU. A `(2,2)` window
++serializes four movement tasks and three DPU tasks; `(5,5)` serializes 25 and
++24. A unit-size kernel dimension may disappear during simplification, so the
++matcher accepts either one or two surviving reduction axes. It also accepts
++a fully collapsed one-element output while leaving ordinary one-axis global
++max reductions on the existing PPU path.
++
++Integer pooling first applies the graph's half-to-int cast in the exact host
++gather evaluator, converts that typed candidate to fp16 scratch, performs
++homogeneous DPU MAX stages, then converts the final result to int32. An
++earlier int32-scratch attempt is retained in comments: separate DPU
++submissions made its mixed-width intermediates unstable. The stronger
++permanent regression uses nontrivial positive and negative integers because
++the official random case truncates many inputs to zero.
++
++That regression also exposed a generic serialized-constant bug: negative
++32-bit constants were sign-extended into the stored 64-bit fields, but the
++runtime applied signed conversion before masking back to the declared width.
++Constants are now width-masked first, so `INT32_MIN` padding decodes exactly.
++Mixed movement/DPU scratch allocations reserve four bytes per element, which
++also prevents typed gather overflow.
++
++### Validation
++
++- all value-only `max_pool2d`: **12 methods, 33 subtests passing**;
++- new exact fp16 plus integer padded local-pool hardware regression: passing;
++- complete DPU hardware class: **53/53** in 240.14 seconds;
++- hardware-free PR1: **79/79** in 6.71 seconds;
++- pycompile and `git diff --check`: clean.
++
++Mypy remains at the same 13 pre-existing findings and targeted Ruff at the
++same five pre-existing findings. No LUT is involved. Returned max indices
++and max-unpool scatter remain the next pooling milestone. The standalone patch is
++`rockchip-local-max-0447540a6.patch`, against parent `0447540a6`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index b84f6712a..3a24dade6 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -58,6 +58,16 @@ class TestDPU(unittest.TestCase):
+     c = a.maximum(b).realize()
+     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, b_np), rtol=1e-3, atol=1e-3)
+ 
++  def test_dpu_local_max_pool(self):
++    x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
++    padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
++    expected = np.empty((1,1,2,3), dtype=np.float16)
++    for oy in range(2):
++      for ox in range(3): expected[:, :, oy, ox] = padded[:, :, oy*2:oy*2+3, ox*2:ox*2+3].max(axis=(2,3))
++    x = Tensor(x_np, device="ROCKCHIP").realize()
++    np.testing.assert_array_equal(x.max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected)
++    np.testing.assert_array_equal(x.int().max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected.astype(np.int32))
++
+   def test_dpu_copy(self):
+     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
+     a = Tensor(a_np, device="ROCKCHIP").realize()
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index ae123ac97..4d69d894e 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -481,6 +481,15 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(n_counts, 4)
+     self.assertEqual(set(layout[12:12+n_counts]), {4, 6, 9})
+ 
++  def test_local_max_pool_gathers_then_reduces_on_dpu(self):
++    x = Tensor.rand(1,1,4,5,dtype=dtypes.half).realize()
++    prg = build_native_program(_get_sink(x.max_pool2d(kernel_size=(2,2))))
++    subtasks = prg.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 7)
++    self.assertEqual(sum(st.task.is_copy for st in subtasks), 4)
++    self.assertTrue(all(st.task.kind == "dpu" for st in subtasks))
++    self.assertEqual(subtasks[-1].task.out_slot, 0)
++
+   def test_k_tiled_dot_produces_binary(self):
+     a = Tensor.rand(5000,dtype=dtypes.half).realize()
+     b = Tensor.rand(5000,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index ce09c03ee..1c6448736 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -469,3 +469,31 @@ Current pooling work remaining:
+ 
+ No LUT is involved. See `progress.md` for the exact matcher probe, rounding
+ diagnosis, layout contract, validation commands, and standalone patch name.
++
++### Pooling refresh: value-only local maximum
++
++All current forward value-only local max-pool cases now pass:
++
++| Passing selection | Result |
++|---|---:|
++| Ordinary, simple, padded, stride, dilation, unit-stride, and ceil-mode max pools | **11 methods, 33 subtests** |
++| Integer padded max pool | **1 method** |
++| Complete value-only `max_pool2d` selection | **12 methods, 33 subtests** |
++| DPU hardware class | **53/53** |
++| Hardware-free PR1 file | **79/79** |
++
++Static window positions are gathered without arithmetic, including `-inf`
++padding, and reduced by sequential NPU DPU-MAX tasks. Unit reduction axes and
++fully collapsed outputs are handled. Integer candidates follow the graph's
++cast order, enter homogeneous fp16 DPU stages, and convert back to int32 only
++at the final output.
++
++Remaining pooling failures are now the separate index/scatter family:
++
++- `max_pool2d(return_indices=True)`;
++- `max_unpool2d`;
++- `max_unpool2d` special values;
++- `avg_pool3d`, blocked in the Torch half reference before backend execution.
++
++This staged DPU implementation prioritizes complete forward correctness.
++Direct local PPU programming can later reduce the number of submissions.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 4ca5f9c24..f638eaa3d 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -510,8 +510,9 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+           elif dtype_code == 12: value = struct.unpack('<d', struct.pack('<Q', bits))[0]
+           else:
+             width = np.dtype(np_dtypes[dtype_code]).itemsize * 8
++            bits &= (1 << width)-1
+             if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
+-            value = bits & ((1 << width)-1) if np.issubdtype(np_dtypes[dtype_code], np.unsignedinteger) else bits
++            value = bits
+           stack.append(cast(value, dtype_code))
+           continue
+         if op == 1:
+@@ -1011,7 +1012,8 @@ class RockchipProgram(Program['RockchipDevice']):
+       total = max(st.task.layout[0] for st in subtasks)
+       try:
+         while len(ext) <= max_slot:
+-          shared.append(b := dev._gpu_alloc(max(total * 2, 4096), 0))
++          # Movement tasks may gather int32 windows before DPU converts them to fp16.
++          shared.append(b := dev._gpu_alloc(max(total * 4, 4096), 0))
+           ext.append(b)
+         # Handle copy tasks host-side
+         for st in copy_tasks:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 29d1b71f6..8eaa44154 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -6328,7 +6328,7 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
+-def _try_elementwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTask, ...]|None:
+   """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
+   store = _store_node(sink)
+   if store is None or _reduce_node(sink) is not None: return None
+@@ -6337,7 +6337,7 @@ def _try_elementwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
+   # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
+   # gather/fancy-index kernels whose data INDEX address loads an index tensor.
+-  if not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
++  if not allow_plain and not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
+   ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+   range_ids = {u:i for i,u in enumerate(ranges)}
+   extents = tuple(int(u.src[0].arg) for u in ranges)
+@@ -6833,6 +6833,62 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Gather static local-reduction windows, then compute their maximum on DPU."""
++  reduce, store = _reduce_node(sink), _store_node(sink)
++  if reduce is None or store is None or reduce.arg[0] is not Ops.MAX or store.src[1] is not reduce: return None
++  value_dtype = reduce.dtype
++  if value_dtype not in (dtypes.half, dtypes.int) or store.src[0].dtype is not value_dtype: return None
++  reductions = list(reduce.src[1:])
++  out_shape = _shape_of_store(sink)
++  if not reductions or (len(reductions) == 1 and len(out_shape) < 2) or any(u.src[0].op is not Ops.CONST for u in reductions): return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if any(u.src[0].op is not Ops.CONST for u in loops): return None
++  loop_extents = [int(u.src[0].arg) for u in loops]
++  reduce_extents = [int(u.src[0].arg) for u in reductions]
++  total, window = prod(out_shape), prod(reduce_extents)
++  if prod(loop_extents) != total or window < 2: return None
++  info = ProgramInfo.from_sink(sink)
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++
++  flat = UOp.const(dtypes.weakint, 0)
++  if loops:
++    flat = loops[0]
++    for axis, extent in zip(loops[1:], loop_extents[1:]): flat = flat*extent + axis
++
++  gathered_slots:list[int] = []
++  for linear in range(window):
++    rem, fixed = linear, {}
++    for reduce_axis in range(len(reductions)-1, -1, -1):
++      rem, coord = divmod(rem, reduce_extents[reduce_axis])
++      fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
++    scratch_slot, next_slot = next_slot, next_slot+1
++    scratch = UOp.param(scratch_slot, dtypes.half, (total,), device=store.src[0].src[0].device)
++    gathered = reduce.src[0].substitute(fixed)
++    if value_dtype is dtypes.int: gathered = UOp(Ops.CAST, dtypes.half, (gathered,), arg=dtypes.half)
++    movement_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, dtypes.half, (scratch, flat)), gathered))
++    movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
++    movement_tasks = _try_movement_host_subtasks(movement_sink)
++    if movement_tasks is None and value_dtype is dtypes.int:
++      movement_tasks = _try_elementwise_host_subtasks(movement_sink, allow_plain=True)
++    if movement_tasks is None or len(movement_tasks) != 1: return None
++    tasks.extend(movement_tasks)
++    gathered_slots.append(scratch_slot)
++
++  accumulator = gathered_slots[0]
++  for i, operand in enumerate(gathered_slots[1:]):
++    final = i == len(gathered_slots)-2
++    out_slot = info.outs[0] if final else next_slot
++    if out_slot == next_slot: next_slot += 1
++    # The retired int32-scratch path marked the first accumulator and every
++    # gathered operand as int32_inputs. Separate DPU submissions made those
++    # mixed-width intermediates unstable, so typed windows now enter as fp16.
++    tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX,
++                                   int32_output=final and value_dtype is dtypes.int))
++    accumulator = out_slot
++  return tuple(tasks)
++
+ def _try_cmac_variable_scale_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Apply a static output-dependent reciprocal to raw fp32 CMAC sums."""
+   reduce, store = _reduce_node(sink), _store_node(sink)
+@@ -7119,6 +7175,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
++  if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
+   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, variable_scale_tasks)
+   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:

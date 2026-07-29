@@ -6328,7 +6328,7 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
-def _try_elementwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTask, ...]|None:
   """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None: return None
@@ -6337,7 +6337,7 @@ def _try_elementwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
   # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
   # gather/fancy-index kernels whose data INDEX address loads an index tensor.
-  if not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
+  if not allow_plain and not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
   ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
   range_ids = {u:i for i,u in enumerate(ranges)}
   extents = tuple(int(u.src[0].arg) for u in ranges)
@@ -6833,6 +6833,62 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
+def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Gather static local-reduction windows, then compute their maximum on DPU."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MAX or store.src[1] is not reduce: return None
+  value_dtype = reduce.dtype
+  if value_dtype not in (dtypes.half, dtypes.int) or store.src[0].dtype is not value_dtype: return None
+  reductions = list(reduce.src[1:])
+  out_shape = _shape_of_store(sink)
+  if not reductions or (len(reductions) == 1 and len(out_shape) < 2) or any(u.src[0].op is not Ops.CONST for u in reductions): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if any(u.src[0].op is not Ops.CONST for u in loops): return None
+  loop_extents = [int(u.src[0].arg) for u in loops]
+  reduce_extents = [int(u.src[0].arg) for u in reductions]
+  total, window = prod(out_shape), prod(reduce_extents)
+  if prod(loop_extents) != total or window < 2: return None
+  info = ProgramInfo.from_sink(sink)
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+
+  flat = UOp.const(dtypes.weakint, 0)
+  if loops:
+    flat = loops[0]
+    for axis, extent in zip(loops[1:], loop_extents[1:]): flat = flat*extent + axis
+
+  gathered_slots:list[int] = []
+  for linear in range(window):
+    rem, fixed = linear, {}
+    for reduce_axis in range(len(reductions)-1, -1, -1):
+      rem, coord = divmod(rem, reduce_extents[reduce_axis])
+      fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
+    scratch_slot, next_slot = next_slot, next_slot+1
+    scratch = UOp.param(scratch_slot, dtypes.half, (total,), device=store.src[0].src[0].device)
+    gathered = reduce.src[0].substitute(fixed)
+    if value_dtype is dtypes.int: gathered = UOp(Ops.CAST, dtypes.half, (gathered,), arg=dtypes.half)
+    movement_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, dtypes.half, (scratch, flat)), gathered))
+    movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
+    movement_tasks = _try_movement_host_subtasks(movement_sink)
+    if movement_tasks is None and value_dtype is dtypes.int:
+      movement_tasks = _try_elementwise_host_subtasks(movement_sink, allow_plain=True)
+    if movement_tasks is None or len(movement_tasks) != 1: return None
+    tasks.extend(movement_tasks)
+    gathered_slots.append(scratch_slot)
+
+  accumulator = gathered_slots[0]
+  for i, operand in enumerate(gathered_slots[1:]):
+    final = i == len(gathered_slots)-2
+    out_slot = info.outs[0] if final else next_slot
+    if out_slot == next_slot: next_slot += 1
+    # The retired int32-scratch path marked the first accumulator and every
+    # gathered operand as int32_inputs. Separate DPU submissions made those
+    # mixed-width intermediates unstable, so typed windows now enter as fp16.
+    tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX,
+                                   int32_output=final and value_dtype is dtypes.int))
+    accumulator = out_slot
+  return tuple(tasks)
+
 def _try_cmac_variable_scale_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Apply a static output-dependent reciprocal to raw fp32 CMAC sums."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -7119,6 +7175,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+  if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variable_scale_tasks)
   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
