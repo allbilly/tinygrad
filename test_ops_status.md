@@ -1034,3 +1034,18 @@ interval, and it evaluates the half-rounded base `0.7001953125`.  Using
 mathematical 0.7 instead missed 113/1,025 values.  The permanent regression
 passes in 3.64 seconds; the official method passes this subgroup and reaches
 `(-2)**x` in 81.88 seconds.  No host operator fallback is used.
+
+### Negative base-two and constant-POW closure
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `(-2)**x`, dense half sweep `[-2,3]` | **1,025/1,025 passing** | two magnitude LUTs + roundoff parity |
+| `(-5.5)**x` regression | **passing** | unchanged |
+| full `TestOps.test_pow_const` | **passing** | all subgroups complete |
+
+Direct EXP2 previously produced `6.008` at exponent 3.  Two shifted Q15
+magnitude tables store low results directly and positive results divided by
+eight; DPU decodes them before the existing validity/parity lowering.  The
+two negative-base regressions pass in 22.71 seconds and the unchanged
+official constant-POW method passes completely in 7.38 seconds with caches
+disabled.  No host operator fallback is used.

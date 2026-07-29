@@ -1971,6 +1971,24 @@ systematic error: 113/1,025 dense half inputs exceed `rtol=1e-3`, with
 maximum relative error `0.001422`.  Using `float(np.float16(0.7))` reduces
 the maximum to `0.0009756`, and all 1,025 values pass.
 
+## Base two through exponent three: shifted two-level magnitude
+
+The generic EXP2 table only models `[-2,2]`; its extrapolated hardware value
+at exponent 3 is `6.008`, not 8.  For the `(-2)**x` parity graph, use the
+same shifted coordinate `z=x-0.5` as constant-base 0.7, but split output
+scale into two Q15 tasks:
+
+| Task | Stored function | Range | Decode |
+|---|---|---:|---:|
+| low | `2**min(x,0)` | `[1/4,1]` | direct |
+| high | `2**max(x,0)/8` | `[1/8,1]` | multiply by 8 |
+
+The split avoids Q11/Q12 endpoint loss from representing eight directly and
+keeps at least 4,096 raw Q15 units at the smallest stored value.  DPU masks
+select the decoded high task for `x>0`.  The result feeds the same roundoff
+LUT validity/parity pipeline documented above; a dense half sweep therefore
+also verifies that all noninteger exponents remain NaN.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

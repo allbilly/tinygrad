@@ -6963,3 +6963,36 @@ Using `. .venv/bin/activate`:
 The next subgroup is negative constant-base two.  It has the same
 integer-validity/parity structure as `(-5.5)**x`, but needs a magnitude path
 covering exponent 3.
+
+## 2026-07-30 — negative base-two parity and POW-constant closure
+
+`(-2)**x` has the same three-WHERE integer-validity/parity expansion as
+`(-5.5)**x`, but its magnitude is direct `EXP2(x)`.  Reusing the old bounded
+EXP2 table was not sufficient: a hardware probe returned `6.008` for
+`EXP2(3)` instead of `8`.
+
+The negative-base lowering now accepts this strict direct-EXP2 form and
+reuses the existing native roundoff/parity stages.  Its magnitude uses two
+shifted Q15 LUT tasks over `z=x-0.5`:
+
+- low task stores `2**min(x,0)`;
+- high task stores `2**max(x,0)/8`, then DPU multiplies by eight.
+
+Both stored ranges stay between `1/8` and `1`, and DPU masks select at zero
+and restrict correction to `x∈[-2,3]`.  Fractional exponents still become
+NaN through the proven DPU validity factor.  No host cast, truncation, or
+operator arithmetic is used.
+
+### Validation
+
+Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
+
+- permanent 1,025-point negative-base-two sweep plus the existing
+  negative-base-5.5 sweep: **2/2 passing in 22.71 seconds**;
+- unchanged official `TestOps.test_pow_const`: **passing completely in 7.38
+  seconds**, including all following `±sqrt(2)` and `-1` cases;
+- integer spot results include `[-2,-1,0,1,2,3] →
+  [0.25,-0.5,0.999,-2,4,-7.996]`, all within the official fp16 tolerance,
+  while half-integers are NaN.
+
+This closes the forward constant-power group.
