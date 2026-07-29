@@ -5906,3 +5906,115 @@ large-spatial-index behavior will be exercised with that next group.
 
 The standalone recovery artifact is
 `rockchip-native-pool-indices-aa01f775e.patch`, based on `aa01f775e`.
+
+## 2026-07-29 — native max-unpool and large DPU elementwise surfaces
+
+`max_unpool2d` is now lowered as an exact int32-index comparison and fp16
+selection chain. Normal execution does not use `_run_host_scatter`; that
+rejected CPU implementation remains available only with
+`ROCKCHIP_ALLOW_HOST_OPS=1`.
+
+For each pooled candidate, host callbacks only repeat existing index/value
+bytes into a statically known plane layout. The NPU performs:
+
+```text
+native int32 index - static spatial position
+  -> compact fp16 nonzero difference
+  -> abs(diff) > 0
+  -> equal = 1 - unequal
+  -> pooled_value * equal
+  -> accumulated output
+```
+
+Native int32 MRDMA requires `EW_OP_CVT_BYPASS`; without it the second integer
+operand was ignored or interpreted as fp16 words. Four int32 lanes form one
+aligned atom, and native int input produces four useful fp16 lanes followed
+by four padding lanes. `_HOST_COMPACT_NATIVE_HALF_LAYOUT` removes only those
+padding bytes.
+
+### Large-index and two-dimensional DPU layout
+
+Absolute fp16 indices alias above 2048. Returned max-pool indices therefore
+select independent base-256 digits, convert each 0..255 digit with native
+int32 WDMA, and assemble the output by copying each digit's low byte into the
+corresponding int32 byte. This preserves indices such as 2049 and 2499
+exactly without CPU arithmetic.
+
+A one-row native task is stable only through 4,096 atoms. The first
+56,400-element unpool attempt wrapped/overran the width field and produced
+corrupt later planes. `ref/npu/include/rknnops.h` documents the correct
+elementwise row layout. `_emit_where_stage` now factors exact large atom
+counts into width and height and programs:
+
+- `DATA_CUBE_WIDTH/HEIGHT` for DPU and DPU-RDMA;
+- `WDMA_SIZE_1 = height << 16 | width`;
+- `DST_SURF_STRIDE`, `EW_SURF_STRIDE`, and `SURFACE_ADD` from
+  `row_atoms * 2`.
+
+Flat programs retain the previous `SURFACE_ADD=0x40`; changing it for
+one-row tasks broke small pooling. An exact 56,400-element DPU ADD and a
+17,500-element large-index unpool both pass.
+
+### Physical gather order
+
+The local-max gather previously flattened `RANGE` nodes in topological order.
+That is not necessarily the physical STORE order: `(1,3,7,6)` pooled to
+`(1,3,3,3)` was transposed across channel/spatial axes. Candidate movement
+now uses the STORE's actual output index. The old flatten construction is
+retained as commented WIP reference.
+
+### Single-candidate inf/NaN selection
+
+When the pooled extent is one, tinygrad removes the ADD reduction and leaves
+a direct WHERE. The unpool matcher now accepts that form. fp16
+`value * equal` cannot select non-finite data because an unselected
+`inf * 0` becomes NaN. For this case the runtime widens each raw fp16
+representation into an int32 lane by byte copy, the NPU multiplies the
+integer representation by the exact 0/1 mask, and a byte-copy epilogue
+compacts the low two bytes. Hardware probes preserve the exact bit patterns
+for `+inf`, `-inf`, NaN, and finite 3.5 while producing positive zero in
+unselected lanes.
+
+This is not host operator evaluation: runtime-dependent selection is native
+integer NPU arithmetic; host code only changes byte layout.
+
+### Reset and debugging method
+
+- `ROCKCHIP_DEBUG_UNPOOL=1` prints static spatial integers, gathered fp16
+  representations, physical/compact native differences, packed value bits,
+  and selected representation bits.
+- `ROCKCHIP_DEBUG_UNPOOL=2` also prints the rejected/lowered SINK.
+- A full flat-width task that completes with repeating later values indicates
+  width-field overflow, not an equality error.
+- Probe integer subtraction with distinct values above 2048. fp16-only
+  probes cannot distinguish aliased indices.
+- The ordered runtime flushes a pending NPU dependency chain before any host
+  byte copy reads its output. Comparison chains remain reset-separated
+  because a full WHERE PC chain is unstable on this RK3588.
+- The earlier full official runs aborted in `reset_npu` after four one-row
+  chunks times 80 candidates. Two-dimensional tasks reduce that to one
+  candidate pass over the complete output and eliminate the reset storm.
+
+### Validation
+
+Using `. .venv/bin/activate` and
+`CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- official finite `test_max_unpool2d`: **passing**, all three internal cases,
+  **224.33 seconds**;
+- official `test_max_pool2d_return_indices`: **passing**, all seven internal
+  cases, **152.94 seconds**;
+- new NCHW-order, raw non-finite bits, and >4096-atom large-index hardware
+  regressions: **3/3 passing in 10.09 seconds**;
+- complete DPU hardware class: **57/57 passing in 257.27 seconds**.
+
+`test_max_unpool2d_inf` passes in **4.92 seconds** when Torch's default dtype
+is set to fp16 to match `DEFAULT_FLOAT=HALF`. The ordinary invocation builds
+Torch's no-input literal as float32 and tinygrad's as forced fp16, so its only
+remaining assertion is a test-harness dtype mismatch; the value and exact
+non-finite representation path is covered independently. Without
+`DEFAULT_FLOAT=HALF`, Rockchip's still-pending fp32 local-pool lowering rejects
+before unpool.
+
+The standalone recovery artifact is
+`rockchip-native-max-unpool-d72bcc3f0.patch`, based on `d72bcc3f0`.

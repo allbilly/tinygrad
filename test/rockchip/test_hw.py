@@ -84,6 +84,45 @@ class TestDPU(unittest.TestCase):
     self.assertEqual(got.dtype, np.int32)
     np.testing.assert_array_equal(got, np.array([[[[1,1,2], [4,5,6]]]], dtype=np.int32))
 
+  def test_dpu_local_max_pool_nchw_order(self):
+    # RANGE traversal order is not physical NCHW order when channel and output
+    # spatial extents coincide; gather through the STORE index.
+    rng = np.random.default_rng(123)
+    x_np = rng.standard_normal((1,3,7,6)).astype(np.float16)
+    expected = np.empty((1,3,3,3), dtype=np.float16)
+    expected_indices = np.empty((1,3,3,3), dtype=np.int32)
+    for channel in range(3):
+      for oy in range(3):
+        for ox in range(3):
+          window = x_np[0,channel,oy*2:oy*2+2,ox*2:ox*2+2]
+          local = int(np.argmax(window))
+          expected[0,channel,oy,ox] = window.reshape(-1)[local]
+          expected_indices[0,channel,oy,ox] = (oy*2+local//2)*6 + ox*2+local%2
+    values, indices = Tensor(x_np, device="ROCKCHIP").realize().max_pool2d(2, return_indices=True)
+    np.testing.assert_array_equal(values.realize().numpy(), expected)
+    np.testing.assert_array_equal(indices.realize().numpy(), expected_indices)
+
+  def test_dpu_max_unpool_nonfinite_bits(self):
+    for index, value in enumerate((math.inf, -math.inf, math.nan, 3.5)):
+      values = np.array([[[[value]]]], dtype=np.float16)
+      indices = np.array([[[[index]]]], dtype=np.int32)
+      expected = np.zeros((1,1,2,2), dtype=np.float16)
+      expected.reshape(-1)[index] = values.reshape(-1)[0]
+      got = Tensor(values, device="ROCKCHIP").max_unpool2d(Tensor(indices, device="ROCKCHIP"), 2).realize().numpy()
+      np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
+  def test_dpu_max_unpool_large_indices(self):
+    # More than 4,096 native int32 atoms exercises the 2-D DPU surface layout.
+    values = np.arange(1, 15, dtype=np.float16).reshape(7,1,1,2)
+    indices = np.array([[2049,2499]] * 7, dtype=np.int32).reshape(7,1,1,2)
+    expected = np.zeros((7,1,50,50), dtype=np.float16)
+    for plane in range(7):
+      expected.reshape(7,2500)[plane,2049] = values.reshape(7,2)[plane,0]
+      expected.reshape(7,2500)[plane,2499] = values.reshape(7,2)[plane,1]
+    got = Tensor(values, device="ROCKCHIP").max_unpool2d(
+      Tensor(indices, device="ROCKCHIP"), (1,2), output_size=(50,50)).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+
   def test_dpu_copy(self):
     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()

@@ -1,0 +1,840 @@
+diff --git a/progress.md b/progress.md
+index 473e0f96f..6fa5bf904 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5906,3 +5906,115 @@ large-spatial-index behavior will be exercised with that next group.
+ 
+ The standalone recovery artifact is
+ `rockchip-native-pool-indices-aa01f775e.patch`, based on `aa01f775e`.
++
++## 2026-07-29 — native max-unpool and large DPU elementwise surfaces
++
++`max_unpool2d` is now lowered as an exact int32-index comparison and fp16
++selection chain. Normal execution does not use `_run_host_scatter`; that
++rejected CPU implementation remains available only with
++`ROCKCHIP_ALLOW_HOST_OPS=1`.
++
++For each pooled candidate, host callbacks only repeat existing index/value
++bytes into a statically known plane layout. The NPU performs:
++
++```text
++native int32 index - static spatial position
++  -> compact fp16 nonzero difference
++  -> abs(diff) > 0
++  -> equal = 1 - unequal
++  -> pooled_value * equal
++  -> accumulated output
++```
++
++Native int32 MRDMA requires `EW_OP_CVT_BYPASS`; without it the second integer
++operand was ignored or interpreted as fp16 words. Four int32 lanes form one
++aligned atom, and native int input produces four useful fp16 lanes followed
++by four padding lanes. `_HOST_COMPACT_NATIVE_HALF_LAYOUT` removes only those
++padding bytes.
++
++### Large-index and two-dimensional DPU layout
++
++Absolute fp16 indices alias above 2048. Returned max-pool indices therefore
++select independent base-256 digits, convert each 0..255 digit with native
++int32 WDMA, and assemble the output by copying each digit's low byte into the
++corresponding int32 byte. This preserves indices such as 2049 and 2499
++exactly without CPU arithmetic.
++
++A one-row native task is stable only through 4,096 atoms. The first
++56,400-element unpool attempt wrapped/overran the width field and produced
++corrupt later planes. `ref/npu/include/rknnops.h` documents the correct
++elementwise row layout. `_emit_where_stage` now factors exact large atom
++counts into width and height and programs:
++
++- `DATA_CUBE_WIDTH/HEIGHT` for DPU and DPU-RDMA;
++- `WDMA_SIZE_1 = height << 16 | width`;
++- `DST_SURF_STRIDE`, `EW_SURF_STRIDE`, and `SURFACE_ADD` from
++  `row_atoms * 2`.
++
++Flat programs retain the previous `SURFACE_ADD=0x40`; changing it for
++one-row tasks broke small pooling. An exact 56,400-element DPU ADD and a
++17,500-element large-index unpool both pass.
++
++### Physical gather order
++
++The local-max gather previously flattened `RANGE` nodes in topological order.
++That is not necessarily the physical STORE order: `(1,3,7,6)` pooled to
++`(1,3,3,3)` was transposed across channel/spatial axes. Candidate movement
++now uses the STORE's actual output index. The old flatten construction is
++retained as commented WIP reference.
++
++### Single-candidate inf/NaN selection
++
++When the pooled extent is one, tinygrad removes the ADD reduction and leaves
++a direct WHERE. The unpool matcher now accepts that form. fp16
++`value * equal` cannot select non-finite data because an unselected
++`inf * 0` becomes NaN. For this case the runtime widens each raw fp16
++representation into an int32 lane by byte copy, the NPU multiplies the
++integer representation by the exact 0/1 mask, and a byte-copy epilogue
++compacts the low two bytes. Hardware probes preserve the exact bit patterns
++for `+inf`, `-inf`, NaN, and finite 3.5 while producing positive zero in
++unselected lanes.
++
++This is not host operator evaluation: runtime-dependent selection is native
++integer NPU arithmetic; host code only changes byte layout.
++
++### Reset and debugging method
++
++- `ROCKCHIP_DEBUG_UNPOOL=1` prints static spatial integers, gathered fp16
++  representations, physical/compact native differences, packed value bits,
++  and selected representation bits.
++- `ROCKCHIP_DEBUG_UNPOOL=2` also prints the rejected/lowered SINK.
++- A full flat-width task that completes with repeating later values indicates
++  width-field overflow, not an equality error.
++- Probe integer subtraction with distinct values above 2048. fp16-only
++  probes cannot distinguish aliased indices.
++- The ordered runtime flushes a pending NPU dependency chain before any host
++  byte copy reads its output. Comparison chains remain reset-separated
++  because a full WHERE PC chain is unstable on this RK3588.
++- The earlier full official runs aborted in `reset_npu` after four one-row
++  chunks times 80 candidates. Two-dimensional tasks reduce that to one
++  candidate pass over the complete output and eliminate the reset storm.
++
++### Validation
++
++Using `. .venv/bin/activate` and
++`CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
++
++- official finite `test_max_unpool2d`: **passing**, all three internal cases,
++  **224.33 seconds**;
++- official `test_max_pool2d_return_indices`: **passing**, all seven internal
++  cases, **152.94 seconds**;
++- new NCHW-order, raw non-finite bits, and >4096-atom large-index hardware
++  regressions: **3/3 passing in 10.09 seconds**;
++- complete DPU hardware class: **57/57 passing in 257.27 seconds**.
++
++`test_max_unpool2d_inf` passes in **4.92 seconds** when Torch's default dtype
++is set to fp16 to match `DEFAULT_FLOAT=HALF`. The ordinary invocation builds
++Torch's no-input literal as float32 and tinygrad's as forced fp16, so its only
++remaining assertion is a test-harness dtype mismatch; the value and exact
++non-finite representation path is covered independently. Without
++`DEFAULT_FLOAT=HALF`, Rockchip's still-pending fp32 local-pool lowering rejects
++before unpool.
++
++The standalone recovery artifact is
++`rockchip-native-max-unpool-d72bcc3f0.patch`, based on `d72bcc3f0`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 83192d723..a00d80459 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -84,6 +84,45 @@ class TestDPU(unittest.TestCase):
+     self.assertEqual(got.dtype, np.int32)
+     np.testing.assert_array_equal(got, np.array([[[[1,1,2], [4,5,6]]]], dtype=np.int32))
+ 
++  def test_dpu_local_max_pool_nchw_order(self):
++    # RANGE traversal order is not physical NCHW order when channel and output
++    # spatial extents coincide; gather through the STORE index.
++    rng = np.random.default_rng(123)
++    x_np = rng.standard_normal((1,3,7,6)).astype(np.float16)
++    expected = np.empty((1,3,3,3), dtype=np.float16)
++    expected_indices = np.empty((1,3,3,3), dtype=np.int32)
++    for channel in range(3):
++      for oy in range(3):
++        for ox in range(3):
++          window = x_np[0,channel,oy*2:oy*2+2,ox*2:ox*2+2]
++          local = int(np.argmax(window))
++          expected[0,channel,oy,ox] = window.reshape(-1)[local]
++          expected_indices[0,channel,oy,ox] = (oy*2+local//2)*6 + ox*2+local%2
++    values, indices = Tensor(x_np, device="ROCKCHIP").realize().max_pool2d(2, return_indices=True)
++    np.testing.assert_array_equal(values.realize().numpy(), expected)
++    np.testing.assert_array_equal(indices.realize().numpy(), expected_indices)
++
++  def test_dpu_max_unpool_nonfinite_bits(self):
++    for index, value in enumerate((math.inf, -math.inf, math.nan, 3.5)):
++      values = np.array([[[[value]]]], dtype=np.float16)
++      indices = np.array([[[[index]]]], dtype=np.int32)
++      expected = np.zeros((1,1,2,2), dtype=np.float16)
++      expected.reshape(-1)[index] = values.reshape(-1)[0]
++      got = Tensor(values, device="ROCKCHIP").max_unpool2d(Tensor(indices, device="ROCKCHIP"), 2).realize().numpy()
++      np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
++
++  def test_dpu_max_unpool_large_indices(self):
++    # More than 4,096 native int32 atoms exercises the 2-D DPU surface layout.
++    values = np.arange(1, 15, dtype=np.float16).reshape(7,1,1,2)
++    indices = np.array([[2049,2499]] * 7, dtype=np.int32).reshape(7,1,1,2)
++    expected = np.zeros((7,1,50,50), dtype=np.float16)
++    for plane in range(7):
++      expected.reshape(7,2500)[plane,2049] = values.reshape(7,2)[plane,0]
++      expected.reshape(7,2500)[plane,2499] = values.reshape(7,2)[plane,1]
++    got = Tensor(values, device="ROCKCHIP").max_unpool2d(
++      Tensor(indices, device="ROCKCHIP"), (1,2), output_size=(50,50)).realize().numpy()
++    np.testing.assert_array_equal(got, expected)
++
+   def test_dpu_copy(self):
+     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
+     a = Tensor(a_np, device="ROCKCHIP").realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 1d0157f59..564e9cdcd 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -551,3 +551,37 @@ The audit of other accelerator backends found no precedent for host evaluation
+ of ordinary tensor operators. Host transfers, address generation, packing,
+ cache maintenance, and command construction are allowed; `run_host` arithmetic
+ is not counted as a Rockchip operator pass.
++
++### Native max-unpool milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `max_unpool2d`, three official finite cases | **passing** | **passing** |
++| large spatial indices 2049/2499 | **passing** | **passing** |
++| single-candidate `+inf`, `-inf`, NaN, finite raw bits | **passing** | **passing** |
++| `max_unpool2d_inf`, Torch/tinygrad both fp16 | **passing** | **passing** |
++| ordinary half-mode `max_unpool2d_inf` invocation | dtype-only mismatch | values passing; Torch literal remains float32 |
++
++The finite official method passes in **224.33 seconds**. Returned max-pool
++indices still pass all seven official cases in **152.94 seconds**, and the
++expanded DPU hardware class passes **57/57 in 257.27 seconds**.
++
++The implementation compares compact int32 indices with static spatial
++positions on the NPU and accumulates selected fp16 values. Large exact atom
++counts use the two-dimensional DPU surface layout from `rknnops.h`, avoiding
++the 4,096-atom one-row limit. Indices above fp16's exact range are assembled
++from NPU-selected base-256 digits. Single-candidate non-finite values are
++selected by native int32 multiplication of their raw fp16 representation
++bits, so host callbacks remain byte-layout operations rather than tensor
++arithmetic.
++
++Permanent regressions cover:
++
++- physical NCHW local-max gather order for `(1,3,7,6)`;
++- exact raw-bit unpool selection for `+inf`, `-inf`, NaN, and 3.5;
++- a 17,500-output two-dimensional DPU task with indices 2049 and 2499.
++
++The rejected `_run_host_scatter` compatibility path remains disabled unless
++`ROCKCHIP_ALLOW_HOST_OPS=1`.
++
++Recovery patch: `rockchip-native-max-unpool-d72bcc3f0.patch`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 8b35c2473..1aecd826d 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -20,6 +20,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
+   _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
+   _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
++  _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
++  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
+   _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
+@@ -631,6 +633,14 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+   output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
+   for i, value in enumerate(values): output[i] = value
+ 
++def _run_host_static_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Materialize compile-time int32 constants for a later NPU task."""
++  total, tag, *values = task.layout
++  assert tag == _HOST_STATIC_INT_LAYOUT and len(values) == total and len(relocs) == 1
++  output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_int32))
++  for i, value in enumerate(values): output[i] = value
++  if getenv("ROCKCHIP_DEBUG_UNPOOL"): print("RK_UNPOOL_STATIC_INT", [output[i] for i in range(min(total, 16))])
++
+ def _pack_static_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Pack an address-only typed gather; no runtime tensor value is evaluated."""
+   total, tag, itemsize, *addresses = task.layout
+@@ -641,6 +651,19 @@ def _pack_static_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], b
+     if source_index < 0: ctypes.memmove(output.va_addr + out_index*itemsize, invalid, itemsize)  # type: ignore[arg-type]
+     else: ctypes.memmove(output.va_addr + out_index*itemsize, source.va_addr + source_index*itemsize, itemsize)  # type: ignore[arg-type]
+ 
++def _pack_plane_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Repeat one compact candidate across each plane's output; byte copies only."""
++  total, tag, itemsize, pooled, out_spatial, candidate, *offset = task.layout
++  start = offset[0] if offset else 0
++  assert tag == _HOST_PLANE_GATHER_LAYOUT and out_spatial > 0 and 0 <= candidate < pooled and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  for out_index in range(total):
++    source_index = ((start+out_index) // out_spatial)*pooled + candidate
++    ctypes.memmove(output.va_addr + out_index*itemsize, source.va_addr + source_index*itemsize, itemsize)  # type: ignore[arg-type]
++  if getenv("ROCKCHIP_DEBUG_UNPOOL") and itemsize == 2:
++    values = ctypes.cast(output.va_addr, ctypes.POINTER(ctypes.c_uint16))
++    print("RK_UNPOOL_GATHER_HALF_BITS", [hex(values[i]) for i in range(min(total, 32))])
++
+ def _pack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Copy at most four fp16 values into an aligned atom after an NPU stage."""
+   count, tag, start = task.layout
+@@ -671,6 +694,54 @@ def _unpack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+   output, source = (bufs[r.globals_slot] for r in relocs)
+   ctypes.memmove(output.va_addr + start*2, source.va_addr, count*2)  # type: ignore[arg-type]
+ 
++def _compact_native_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Remove the four padding fp16 lanes emitted after each four-lane int32 atom."""
++  total, tag = task.layout
++  assert tag == _HOST_COMPACT_NATIVE_HALF_LAYOUT and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  for start in range(0, total, 4):
++    count = min(4, total-start)
++    ctypes.memmove(output.va_addr + start*2, source.va_addr + (start//4)*16, count*2)  # type: ignore[arg-type]
++  if getenv("ROCKCHIP_DEBUG_UNPOOL"):
++    import numpy as np
++    physical = np.frombuffer(ctypes.string_at(source.va_addr, total*4), dtype=np.float16)
++    compact = np.frombuffer(ctypes.string_at(output.va_addr, total*2), dtype=np.float16)
++    print("RK_UNPOOL_INT_DIFF", physical[:min(total*2, 32)].tolist(), "->", compact[:min(total, 16)].tolist())
++
++def _assemble_int_bytes(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Assemble native 0..255 int32 digits by copying their low bytes."""
++  count, tag, start, nbytes = task.layout
++  assert tag == _HOST_ASSEMBLE_INT_BYTES_LAYOUT and 0 < count <= 4 and 0 < nbytes <= 4 and len(relocs) == nbytes+1
++  output = bufs[relocs[0].globals_slot]
++  digits = [bufs[r.globals_slot] for r in relocs[1:]]
++  ctypes.memset(output.va_addr + start*4, 0, count*4)  # type: ignore[arg-type]
++  for element in range(count):
++    for byte, digit in enumerate(digits):
++      ctypes.memmove(output.va_addr + (start+element)*4 + byte, digit.va_addr + element*4, 1)  # type: ignore[arg-type]
++
++def _pack_half_bits(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Widen raw fp16 representations into int32 lanes without evaluating them."""
++  count, tag, start = task.layout
++  assert tag == _HOST_PACK_HALF_BITS_LAYOUT and 0 < count <= 4 and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  ctypes.memset(output.va_addr, 0, 16)  # type: ignore[arg-type]
++  for element in range(count):
++    ctypes.memmove(output.va_addr + element*4, source.va_addr + (start+element)*2, 2)  # type: ignore[arg-type]
++  if getenv("ROCKCHIP_DEBUG_UNPOOL"):
++    values = ctypes.cast(output.va_addr, ctypes.POINTER(ctypes.c_uint32))
++    print("RK_UNPOOL_PACK_HALF_BITS", [hex(values[i]) for i in range(4)])
++
++def _unpack_half_bits(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Compact low fp16 representation bytes from native int32 lanes."""
++  count, tag, start = task.layout
++  assert tag == _HOST_UNPACK_HALF_BITS_LAYOUT and 0 < count <= 4 and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  if getenv("ROCKCHIP_DEBUG_UNPOOL"):
++    values = ctypes.cast(source.va_addr, ctypes.POINTER(ctypes.c_uint32))
++    print("RK_UNPOOL_SELECTED_HALF_BITS", [hex(values[i]) for i in range(4)])
++  for element in range(count):
++    ctypes.memmove(output.va_addr + (start+element)*2, source.va_addr + element*4, 2)  # type: ignore[arg-type]
++
+ def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Scatter pooled fp16 values by per-plane int32 indices, summing duplicates in fp32."""
+   import numpy as np
+@@ -990,9 +1061,15 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+           _run_host_static_half(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
++          _run_host_static_int(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+           _pack_static_gather(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
++          _pack_plane_gather(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
+           _pack_fp16_chunk(task, st.relocs, bufs)
+           continue
+@@ -1005,6 +1082,18 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
+           _unpack_fp16_chunk(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
++          _compact_native_half(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
++          _assemble_int_bytes(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
++          _pack_half_bits(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
++          _unpack_half_bits(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
+           _run_host_scatter(task, st.relocs, bufs)
+           continue
+@@ -1110,8 +1199,10 @@ class RockchipProgram(Program['RockchipDevice']):
+     # happens after the preceding DPU selection chain, so preserve subtask
+     # order instead of hoisting every copy ahead of every DPU submission.
+     if any(st.task.is_copy and len(st.task.layout) > 1 and
+-           st.task.layout[1] in (_HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
+-                                 _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT) for st in subtasks):
++           st.task.layout[1] in (_HOST_STATIC_INT_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
++                                 _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
++                                 _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
++                                 _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT) for st in subtasks):
+       ext, shared, original = list(bufs), [], self.subtasks
+       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                      default=len(ext)-1)
+@@ -1120,21 +1211,40 @@ class RockchipProgram(Program['RockchipDevice']):
+         while len(ext) <= max_slot:
+           shared.append(b := dev._gpu_alloc(max(total*4, 4096), 0))
+           ext.append(b)
++        pending:list[RKSubTask] = []
++        def flush_pending() -> None:
++          if not pending: return
++          if any(st.task.native_int32_input or st.task.native_int32_output for st in pending): dev.reset_npu()
++          self.subtasks = list(pending)
++          self._submit_multi(tuple(ext))
++          pending.clear()
+         for st in subtasks:
+           task = st.task
+           if task.is_copy:
++            copy_inputs = {r.globals_slot for r in st.relocs
++                           if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, task.out_slot)}
++            pending_inputs = {r.globals_slot for p in pending for r in p.relocs
++                              if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, p.task.out_slot)}
++            pending_outputs = {p.task.out_slot for p in pending}
++            if copy_inputs & pending_outputs or task.out_slot in pending_inputs or task.out_slot in pending_outputs: flush_pending()
+             if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT: _run_host_static_int(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT: _compact_native_half(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT: _assemble_int_bytes(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits(task, st.relocs, tuple(ext))
+             else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
+             continue
+-          dev.reset_npu()
+-          self.subtasks = [st]
+-          self._submit_multi(tuple(ext))
++          pending.append(st)
++          if len(pending) == 64: flush_pending()
++        flush_pending()
+       finally:
+         self.subtasks = original
+         for b in shared: dev._gpu_free(b)
+@@ -1161,9 +1271,15 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+             _run_host_static_half(task, st.relocs, tuple(ext))
+             continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
++            _run_host_static_int(task, st.relocs, tuple(ext))
++            continue
+           if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+             _pack_static_gather(task, st.relocs, tuple(ext))
+             continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
++            _pack_plane_gather(task, st.relocs, tuple(ext))
++            continue
+           if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
+             _pack_fp16_chunk(task, st.relocs, tuple(ext))
+             continue
+@@ -1176,6 +1292,18 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
+             _unpack_fp16_chunk(task, st.relocs, tuple(ext))
+             continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
++            _compact_native_half(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
++            _assemble_int_bytes(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
++            _pack_half_bits(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
++            _unpack_half_bits(task, st.relocs, tuple(ext))
++            continue
+           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+             _run_host_bitwise(task, st.relocs, tuple(ext))
+             continue
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 99a6faf46..f8b5f4a9f 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -186,6 +186,12 @@ _HOST_PACK_CHUNK_LAYOUT = -1010  # post-DPU alignment pack, value-preserving onl
+ _HOST_UNPACK_INT_CHUNK_LAYOUT = -1011  # compact native int32 atom, value-preserving only
+ _HOST_PACK_INT32_CHUNK_LAYOUT = -1012  # align compact int32 input atom, value-preserving only
+ _HOST_UNPACK_HALF_CHUNK_LAYOUT = -1013  # compact native fp16 atom, value-preserving only
++_HOST_STATIC_INT_LAYOUT = -1014  # compile-time int32 tensor used by a later NPU stage
++_HOST_PLANE_GATHER_LAYOUT = -1015  # repeated per-plane candidate gather, value-preserving only
++_HOST_COMPACT_NATIVE_HALF_LAYOUT = -1016  # remove padding lanes after native int32 MRDMA
++_HOST_ASSEMBLE_INT_BYTES_LAYOUT = -1017  # compose native 0..255 digits as int32 bytes
++_HOST_PACK_HALF_BITS_LAYOUT = -1018  # widen raw fp16 representations into int32 lanes
++_HOST_UNPACK_HALF_BITS_LAYOUT = -1019  # compact selected raw fp16 representations
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -1986,7 +1992,8 @@ def _where_arg(u: UOp) -> tuple[int, int]|None:
+ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
+                       bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
+                       uint8_output=False, bool_output=False, trunc_output=False, comparison_inputs:tuple[int,...]=(),
+-                      fp32_inputs:tuple[int,...]=(), fp32_output=False, native_int32_output=False, native_int32_input=False) -> RKSubTask:
++                      fp32_inputs:tuple[int,...]=(), fp32_output=False, native_int32_output=False, native_int32_input=False,
++                      native_int32_offset=0) -> RKSubTask:
+   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
+   cmds:list[RKCmd] = []
+   relocs:list[RKReloc] = []
+@@ -1994,7 +2001,19 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+   # Native int32 MRDMA uses a four-lane atom.  Ordinary fp16 input remains an
+   # eight-lane atom, including when WDMA writes four usable int32 lanes.
+   lanes = 4 if native_int32_input else 8
+-  width = (total+lanes-1)//lanes-1
++  atoms = (total+lanes-1)//lanes
++  # The width field is only 13 bits.  Follow rknnops.h's elementwise row
++  # layout for larger exact atoms instead of silently wrapping a flat width.
++  # Partial final atoms stay one-row because a rectangular multi-row launch
++  # would otherwise evaluate padding between logical elements.
++  row_atoms = atoms
++  rows = 1
++  if atoms > 4096 and total % lanes == 0:
++    row_atoms = min(atoms, 4096)
++    while atoms % row_atoms: row_atoms -= 1
++    rows = atoms // row_atoms
++  width, height = row_atoms-1, rows-1
++  stride_field = row_atoms * 2
+   channel = (lanes-1 << 16) | (lanes-1)
+   e(_T_DPU, rk.REG_DPU_S_POINTER, 0xe)
+   e(_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
+@@ -2002,8 +2021,9 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+   # int32 result through fp16 and a CPU conversion.
+   data_format = (4 if native_int32_output else 2) << 29 | (4 if native_int32_input else 2) << 26 | (4 if native_int32_input else 2)
+   e(_T_DPU, rk.REG_DPU_DATA_FORMAT, data_format)
++  if rows > 1: e(_T_DPU, rk.REG_DPU_DST_SURF_STRIDE, stride_field << 4)
+   e(_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width)
+-  e(_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0)
++  e(_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, height)
+   e(_T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+   e(_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, channel)
+   e(_T_DPU, rk.REG_DPU_BS_CFG, 0x53)
+@@ -2012,7 +2032,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+   e(_T_DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+   e(_T_DPU, rk.REG_DPU_BS_OW_CFG, 2)
+   e(_T_DPU, rk.REG_DPU_WDMA_SIZE_0, lanes-1)
+-  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_1, width)
++  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_1, (height << 16) | width)
+   e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+   e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+   if compare:
+@@ -2022,18 +2042,24 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+     e(_T_DPU, rk.REG_DPU_BN_CFG, 0x40082)
+     e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0x7c000000)
+     e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0x3f800000)
+-  ew_cfg = ((_DPU_EW_CFGS[op] & ~(3 << 22)) | (3 << 22)) if native_int32_input else \
++  ew_cfg = ((_DPU_EW_CFGS[op] & ~(3 << 22)) | (3 << 22) | (1 << 8)) if native_int32_input else \
+     (_EW_BASE | 1 if compare else _DPU_EW_CFGS[op])
+   e(_T_DPU, rk.REG_DPU_EW_CFG, ew_cfg)
+-  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if op is Ops.FDIV or native_int32_output else 0x10001)
++  e(_T_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1)
++  e(_T_DPU, rk.REG_DPU_OUT_CVT_OFFSET, native_int32_offset if native_int32_output else 0)
++  out_cvt_scale = 0x10001 if native_int32_input and native_int32_output else \
++    (1 if op is Ops.FDIV or native_int32_output else 0x10001)
++  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, out_cvt_scale)
+   # WIP reference: setting CVT_ROUND (1 << 30) was probed for native int32
+   # output, but both modes round fp16 to nearest on RK3588.  Explicit NPU
+   # roundoff correction is required for truncation toward zero.
+   e(_T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+-  e(_T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40)
++  # Preserve the hardware-proven flat-stage value.  rknnops.h only needs the
++  # row stride here when DATA_CUBE_HEIGHT is nonzero.
++  e(_T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40 if rows == 1 else stride_field << 4)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width)
+-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0)
++  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, height)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, lanes-1)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x4000000c if native_int32_input else 0x40000008)
+   for target, reg, arg in ((_T_DPU, rk.REG_DPU_DST_BASE_ADDR, (out_slot, 0)),
+@@ -2041,6 +2067,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+                            (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, b)):
+     e(target, reg, 0)
+     emitter_reloc(cmds, relocs, arg[0], arg[1])
++  if rows > 1: e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_SURF_STRIDE, stride_field << 4)
+   rdma_feature = 0x27881 if native_int32_input else (0x17841 if op is Ops.FDIV else 0x17849)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature)
+   emitter_pc_op_en(cmds, 12)
+@@ -6598,7 +6625,9 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   # return (RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", host_layout, out_slot, is_copy=True), host_relocs),)
+ 
+   candidate_slots:list[int] = []
+-  index_slots:list[int] = []
++  index_bytes = max(1, ((input_spatial-1).bit_length()+7)//8)
++  if index_bytes > 4: return None
++  index_slots:list[list[int]] = []
+   valid_slots:list[int|None] = []
+   for candidate in range(window):
+     addresses = tuple(mapping[out_index*window+candidate] for out_index in range(total))
+@@ -6608,13 +6637,16 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered, is_copy=True), gather_relocs))
+     candidate_slots.append(native_int_to_half(gathered) if data.dtype is dtypes.int else gathered)
+ 
+-    indices = tuple(0 if address < 0 else address % input_spatial for address in addresses)
+-    index_slot, next_slot = next_slot, next_slot+1
+-    index_bits = tuple(struct.unpack('<H', struct.pack('<e', float(index)))[0] for index in indices)
+-    index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *index_bits)
+-    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", index_layout, index_slot, is_copy=True),
+-                           (RKReloc(0, index_slot, 0, 0, 0xFFFFFFFF),)))
+-    index_slots.append(index_slot)
++    candidate_index_slots:list[int] = []
++    for byte in range(index_bytes):
++      indices = tuple(0 if address < 0 else (address % input_spatial >> (8*byte)) & 0xFF for address in addresses)
++      index_slot, next_slot = next_slot, next_slot+1
++      index_bits = tuple(struct.unpack('<H', struct.pack('<e', float(index)))[0] for index in indices)
++      index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *index_bits)
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", index_layout, index_slot, is_copy=True),
++                             (RKReloc(0, index_slot, 0, 0, 0xFFFFFFFF),)))
++      candidate_index_slots.append(index_slot)
++    index_slots.append(candidate_index_slots)
+ 
+     if any(address < 0 for address in addresses):
+       valid_slot, next_slot = next_slot, next_slot+1
+@@ -6626,12 +6658,12 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     else: valid_slots.append(None)
+ 
+   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+-  selected:tuple[int,int] = (_ZERO_SLOT, 0)
++  selected:list[tuple[int,int]] = [(_ZERO_SLOT, 0)] * index_bytes
+   # Visit the window backwards: a matching earlier candidate overwrites a
+   # matching later one, which gives PyTorch's first-index tie rule.
+   for candidate in range(window-1, -1, -1):
+-    diff, less, equal, delta, weighted = range(next_slot, next_slot+5)
+-    next_slot += 5
++    diff, less, equal = range(next_slot, next_slot+3)
++    next_slot += 3
+     tasks.append(_emit_where_stage(total, diff, (maximum_value_slot, 0), (candidate_slots[candidate], 0), Ops.SUB))
+     tasks.append(_emit_where_stage(total, less, (diff, 0), (diff, 0), Ops.MAX, compare=True))
+     tasks.append(_emit_where_stage(total, equal, one, (less, 0), Ops.SUB))
+@@ -6640,38 +6672,45 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       valid_equal, next_slot = next_slot, next_slot+1
+       tasks.append(_emit_where_stage(total, valid_equal, (equal, 0), (candidate_valid_slot, 0), Ops.MUL))
+       equal = valid_equal
+-    tasks.append(_emit_where_stage(total, delta, (index_slots[candidate], 0), selected, Ops.SUB))
+-    tasks.append(_emit_where_stage(total, weighted, (equal, 0), (delta, 0), Ops.MUL))
+-    selected_out, next_slot = next_slot, next_slot+1
+-    tasks.append(_emit_where_stage(total, selected_out, selected, (weighted, 0), Ops.ADD))
+-    selected = (selected_out, 0)
+-  # RK3588's 32-bit elementwise WDMA layout is compact only for one four-lane
+-  # atom. Emit four indices per task and relocate each atom directly into the
+-  # compact int32 destination; this is the same native conversion path probed
+-  # above, without a CPU dtype conversion.
++    for byte in range(index_bytes):
++      delta, weighted, selected_out = range(next_slot, next_slot+3)
++      next_slot += 3
++      tasks.append(_emit_where_stage(total, delta, (index_slots[candidate][byte], 0), selected[byte], Ops.SUB))
++      tasks.append(_emit_where_stage(total, weighted, (equal, 0), (delta, 0), Ops.MUL))
++      tasks.append(_emit_where_stage(total, selected_out, selected[byte], (weighted, 0), Ops.ADD))
++      selected[byte] = (selected_out, 0)
++  # RK3588's 32-bit WDMA layout is compact only for one four-lane atom. Convert
++  # each selected 0..255 digit, then compose the final int32 representation by
++  # moving its low byte into the corresponding output byte.
++  #
++  # WIP reference: window-relative selection followed by native int32 EW ADD,
++  # and OUT_CVT_OFFSET reconstruction, both still rounded above 2048 because
++  # those stages precede the fp16 boundary.
+   for start in range(0, total, 4):
+     count = min(4, total-start)
+-    packed_slot, next_slot = next_slot, next_slot+1
+-    pack_layout = (count, _HOST_PACK_CHUNK_LAYOUT, start)
+-    pack_relocs = (RKReloc(0, packed_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, selected[0], 0, 0, 0xFFFFFFFF))
+-    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed_slot, is_copy=True), pack_relocs))
+-    native_slot, next_slot = next_slot, next_slot+1
+-    stage = _emit_where_stage(4, native_slot, (packed_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+-                              native_int32_output=True)
+-    tasks.append(stage)
+-    unpack_layout = (count, _HOST_UNPACK_INT_CHUNK_LAYOUT, start)
+-    unpack_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, native_slot, 0, 0, 0xFFFFFFFF))
+-    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, out_slot, is_copy=True), unpack_relocs))
++    native_digits:list[int] = []
++    for byte in range(index_bytes):
++      packed_slot, next_slot = next_slot, next_slot+1
++      pack_layout = (count, _HOST_PACK_CHUNK_LAYOUT, start)
++      pack_relocs = (RKReloc(0, packed_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, selected[byte][0], 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed_slot, is_copy=True), pack_relocs))
++      native_slot, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(4, native_slot, (packed_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_output=True))
++      native_digits.append(native_slot)
++    assemble_layout = (count, _HOST_ASSEMBLE_INT_BYTES_LAYOUT, start, index_bytes)
++    assemble_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *native_digits))
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", assemble_layout, out_slot, is_copy=True), assemble_relocs))
+   return tuple(tasks)
+ 
+ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Recognize max-unpool's static plane reduction and serialize a typed scatter."""
++  """Reformulate max-unpool scatter as exact int32 DPU comparisons and fp16 accumulation."""
++  if getenv("ROCKCHIP_DEBUG_UNPOOL") >= 2: print("RK_UNPOOL_SINK", sink)
+   store = _store_node(sink)
+   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+-  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) != 1: return None
+-  reduce = reductions[0]
+-  if reduce.arg[0] is not Ops.ADD or _unwrap(store.src[1]) is not reduce: return None
+-  body = _reduce_body(reduce)
++  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) > 1: return None
++  reduce = reductions[0] if reductions else None
++  if reduce is not None and (reduce.arg[0] is not Ops.ADD or _unwrap(store.src[1]) is not reduce): return None
++  body = _reduce_body(reduce) if reduce is not None else _unwrap(store.src[1])
+   if body.op is not Ops.WHERE or body.src[0].op not in (Ops.CMPNE, Ops.CMPEQ): return None
+   zero = lambda u: u.op is Ops.CONST and float(u.arg) == 0.0
+   if zero(body.src[1]): value, select_equal = _unwrap(body.src[2]), body.src[0].op is Ops.CMPNE
+@@ -6679,9 +6718,29 @@ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   else: return None
+   if not select_equal or value.op is not Ops.INDEX or value.dtype is not dtypes.half: return None
+   index = next((_unwrap(x) for x in body.src[0].src if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.int), None)
++  if index is None:
++    index = next((_unwrap(x) for x in body.src[0].toposort() if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.int), None)
+   if index is None or index.src[1] is not value.src[1]: return None
+-  if any(r.src[0].op is not Ops.CONST for r in reduce.src[1:]): return None
+-  pooled = prod(int(r.src[0].arg) for r in reduce.src[1:])
++  if reduce is not None and any(r.src[0].op is not Ops.CONST for r in reduce.src[1:]): return None
++  pooled = prod(int(r.src[0].arg) for r in reduce.src[1:]) if reduce is not None else 1
++  # A fused max-pool producer can leave the public `spatial-index` affine
++  # correction in this consumer (for example raw_index + input_spatial).
++  # Move that compile-time offset to the static comparison operand.
++  def affine_offset(u:UOp) -> int|None:
++    u = _unwrap(u)
++    if u is index: return 0
++    if u.op is Ops.ADD:
++      for expression, constant in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
++        cu = _unwrap(constant)
++        if cu.op is Ops.CONST and (offset := affine_offset(expression)) is not None: return offset + int(cu.arg)
++    if u.op is Ops.SUB and _unwrap(u.src[1]).op is Ops.CONST and (offset := affine_offset(u.src[0])) is not None:
++      return offset - int(_unwrap(u.src[1]).arg)
++    return None
++  # WIP reference: applying this visible affine offset compared against -6
++  # for the single-window max-pool case.  The scheduled PARAM already exposes
++  # the public zero-based index buffer, so compare that buffer directly.
++  # index_offset = next((offset for operand in body.src[0].src if (offset := affine_offset(operand)) is not None), 0)
++  index_offset = 0
+   index_total = int(index.src[0].src[0].arg)
+   value_total = int(value.src[0].src[0].arg)
+   total = prod(_shape_of_store(sink))
+@@ -6691,10 +6750,97 @@ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   out_spatial = total // planes
+   info = ProgramInfo.from_sink(sink)
+   out_slot, index_slot, value_slot = info.outs[0], index.src[0].buf_uop.arg.slot, value.src[0].buf_uop.arg.slot
+-  layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled)
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, index_slot, value_slot))
+-  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++  # Rejected compatibility path, retained only for explicit diagnostics.
++  if getenv("ROCKCHIP_ALLOW_HOST_OPS"):
++    layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled)
++    relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, index_slot, value_slot))
++    return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++
++  next_slot = max(info.globals, default=-1) + 1
++  spatial_slot, gathered_index, gathered_value = range(next_slot, next_slot+3)
++  physical_diff, diff_slot, neg_slot, magnitude_slot, unequal_slot, equal_slot, selected_slot = range(next_slot+3, next_slot+10)
++  accumulator_slots = (next_slot+10, next_slot+11)
++  tasks:list[RKSubTask] = []
++
++  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++  # Native int32 MRDMA uses four lanes.  Exact four-lane tensors can use the
++  # height/surface-stride layout above; retain the proven one-row limit only
++  # for a partial final atom.
++  chunk_limit = total if total % 4 == 0 else 16384
++  for chunk_start in range(0, total, chunk_limit):
++    chunk = min(chunk_limit, total-chunk_start)
++    spatial = tuple((chunk_start+i) % out_spatial - index_offset for i in range(chunk))
++    spatial_layout = (chunk, _HOST_STATIC_INT_LAYOUT, *spatial)
++    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", spatial_layout, spatial_slot, is_copy=True),
++                           (RKReloc(0, spatial_slot, 0, 0, 0xFFFFFFFF),)))
++    accumulator:tuple[int,int] = (_ZERO_SLOT, 0)
++    for candidate in range(pooled):
++      index_layout = (chunk, _HOST_PLANE_GATHER_LAYOUT, 4, pooled, out_spatial, candidate, chunk_start)
++      index_relocs = (RKReloc(0, gathered_index, 0, 0, 0xFFFFFFFF), RKReloc(0, index_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", index_layout, gathered_index, is_copy=True), index_relocs))
++      value_layout = (chunk, _HOST_PLANE_GATHER_LAYOUT, 2, pooled, out_spatial, candidate, chunk_start)
++      value_relocs = (RKReloc(0, gathered_value, 0, 0, 0xFFFFFFFF), RKReloc(0, value_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", value_layout, gathered_value, is_copy=True), value_relocs))
++      # WIP reference: prepacking every raw-value atom here made the following
++      # native diff read stale data on RK3588.  Pack immediately before each
++      # native selector instead.
++
++      # Integer subtraction happens before the fp16 output boundary. Although
++      # a large nonzero difference can round in fp16, it cannot become zero,
++      # so the following magnitude comparison is an exact equality test.
++      tasks.append(_emit_where_stage(chunk, physical_diff, (gathered_index, 0), (spatial_slot, 0), Ops.SUB, native_int32_input=True))
++      compact_layout = (chunk, _HOST_COMPACT_NATIVE_HALF_LAYOUT)
++      compact_relocs = (RKReloc(0, diff_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, physical_diff, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", compact_layout, diff_slot, is_copy=True), compact_relocs))
++      tasks.extend((_emit_where_stage(chunk, neg_slot, (_ZERO_SLOT, 0), (diff_slot, 0), Ops.SUB),
++                    _emit_where_stage(chunk, magnitude_slot, (diff_slot, 0), (neg_slot, 0), Ops.MAX),
++                    _emit_where_stage(chunk, unequal_slot, (magnitude_slot, 0), (magnitude_slot, 0), Ops.MAX, compare=True),
++                    _emit_where_stage(chunk, equal_slot, one, (unequal_slot, 0), Ops.SUB)))
++      if pooled == 1:
++        # Select raw fp16 representation bits with native int32 MUL.  Unlike
++        # fp16 `value*mask`, this preserves selected +/-inf and NaN while
++        # producing exact +0 for unselected lanes.  Host stages only widen and
++        # compact bytes; the value-dependent selection remains on the NPU.
++        for start in range(0, chunk, 4):
++          count = min(4, chunk-start)
++          value_bits, mask_half, mask_int, selected_bits = range(next_slot, next_slot+4)
++          next_slot += 4
++          bits_layout = (count, _HOST_PACK_HALF_BITS_LAYOUT, start)
++          value_relocs = (RKReloc(0, value_bits, 0, 0, 0xFFFFFFFF), RKReloc(0, gathered_value, 0, 0, 0xFFFFFFFF))
++          tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", bits_layout, value_bits, is_copy=True), value_relocs))
++          mask_layout = (count, _HOST_PACK_CHUNK_LAYOUT, start)
++          mask_relocs = (RKReloc(0, mask_half, 0, 0, 0xFFFFFFFF), RKReloc(0, equal_slot, 0, 0, 0xFFFFFFFF))
++          tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", mask_layout, mask_half, is_copy=True), mask_relocs))
++          tasks.append(_emit_where_stage(4, mask_int, (mask_half, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_output=True))
++          tasks.append(_emit_where_stage(4, selected_bits, (value_bits, 0), (mask_int, 0), Ops.MUL,
++                                         native_int32_input=True, native_int32_output=True))
++          unpack_layout = (count, _HOST_UNPACK_HALF_BITS_LAYOUT, chunk_start+start)
++          unpack_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, selected_bits, 0, 0, 0xFFFFFFFF))
++          tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", unpack_layout, out_slot, is_copy=True), unpack_relocs))
++        continue
++      final = candidate == pooled-1
++      selected_out = accumulator_slots[0] if candidate == 0 else selected_slot
++      tasks.append(_emit_where_stage(chunk, selected_out, (gathered_value, 0), (equal_slot, 0), Ops.MUL))
++      if candidate == 0:
++        accumulator = (selected_out, 0)
++      else:
++        accumulate_out = out_slot if final else accumulator_slots[candidate & 1]
++        stage = _emit_where_stage(chunk, accumulate_out, accumulator, (selected_out, 0), Ops.ADD)
++        if final and chunk_start:
++          stage = replace(stage, relocs=tuple(replace(r, addend=r.addend+chunk_start*2) if r.globals_slot == out_slot else r
++                                                for r in stage.relocs))
++        tasks.append(stage)
++        accumulator = (accumulate_out, 0)
++    # WIP reference: the former fp16 single-candidate finalizer overwrote the
++    # raw-bit selector above and could not preserve inf/NaN in any case.
++    # if pooled == 1:
++    #   stage = _emit_where_stage(chunk, out_slot, accumulator, (_ZERO_SLOT, 0), Ops.ADD)
++    #   if chunk_start:
++    #     stage = replace(stage, relocs=tuple(replace(r, addend=r.addend+chunk_start*2) if r.globals_slot == out_slot else r
++    #                                           for r in stage.relocs))
++    #   tasks.append(stage)
++  return tuple(tasks)
+ 
+ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
+@@ -7236,10 +7382,13 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, result, (truncated_abs, 0), (sign, 0), Ops.MUL)))
+     return result
+ 
+-  flat = UOp.const(dtypes.weakint, 0)
+-  if loops:
+-    flat = loops[0]
+-    for axis, extent in zip(loops[1:], loop_extents[1:]): flat = flat*extent + axis
++  # WIP reference: flattening RANGE nodes in toposort order is not equivalent
++  # to the STORE's physical output order.  In particular, NCHW (1,3,3,3)
++  # local pools were transposed across channel/spatial axes.
++  # flat = UOp.const(dtypes.weakint, 0)
++  # if loops:
++  #   flat = loops[0]
++  #   for axis, extent in zip(loops[1:], loop_extents[1:]): flat = flat*extent + axis
+ 
+   gathered_slots:list[int] = []
+   needs_trunc = False
+@@ -7255,7 +7404,8 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     scratch_dtype = dtypes.half if gathered_half is not None or value_dtype is dtypes.half else dtypes.int
+     scratch = UOp.param(scratch_slot, scratch_dtype, (total,), device=store.src[0].src[0].device)
+     movement_value = gathered_half if gathered_half is not None else gathered
+-    movement_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, scratch_dtype, (scratch, flat)), movement_value))
++    scratch_index = store.src[0].replace(dtype=scratch_dtype, src=(scratch, *store.src[0].src[1:]))
++    movement_store = UOp(Ops.STORE, src=(scratch_index, movement_value))
+     movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
+     movement_tasks = _try_movement_host_subtasks(movement_sink)
+     if movement_tasks is None or len(movement_tasks) != 1:
+@@ -7576,8 +7726,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
+-  if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
+-     (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
++  if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
+   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
+   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
+      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)

@@ -20,6 +20,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
   _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
   _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
+  _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
@@ -631,6 +633,14 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
   for i, value in enumerate(values): output[i] = value
 
+def _run_host_static_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Materialize compile-time int32 constants for a later NPU task."""
+  total, tag, *values = task.layout
+  assert tag == _HOST_STATIC_INT_LAYOUT and len(values) == total and len(relocs) == 1
+  output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_int32))
+  for i, value in enumerate(values): output[i] = value
+  if getenv("ROCKCHIP_DEBUG_UNPOOL"): print("RK_UNPOOL_STATIC_INT", [output[i] for i in range(min(total, 16))])
+
 def _pack_static_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Pack an address-only typed gather; no runtime tensor value is evaluated."""
   total, tag, itemsize, *addresses = task.layout
@@ -640,6 +650,19 @@ def _pack_static_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], b
   for out_index, source_index in enumerate(addresses):
     if source_index < 0: ctypes.memmove(output.va_addr + out_index*itemsize, invalid, itemsize)  # type: ignore[arg-type]
     else: ctypes.memmove(output.va_addr + out_index*itemsize, source.va_addr + source_index*itemsize, itemsize)  # type: ignore[arg-type]
+
+def _pack_plane_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Repeat one compact candidate across each plane's output; byte copies only."""
+  total, tag, itemsize, pooled, out_spatial, candidate, *offset = task.layout
+  start = offset[0] if offset else 0
+  assert tag == _HOST_PLANE_GATHER_LAYOUT and out_spatial > 0 and 0 <= candidate < pooled and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  for out_index in range(total):
+    source_index = ((start+out_index) // out_spatial)*pooled + candidate
+    ctypes.memmove(output.va_addr + out_index*itemsize, source.va_addr + source_index*itemsize, itemsize)  # type: ignore[arg-type]
+  if getenv("ROCKCHIP_DEBUG_UNPOOL") and itemsize == 2:
+    values = ctypes.cast(output.va_addr, ctypes.POINTER(ctypes.c_uint16))
+    print("RK_UNPOOL_GATHER_HALF_BITS", [hex(values[i]) for i in range(min(total, 32))])
 
 def _pack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Copy at most four fp16 values into an aligned atom after an NPU stage."""
@@ -670,6 +693,54 @@ def _unpack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
   assert tag == _HOST_UNPACK_HALF_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
   output, source = (bufs[r.globals_slot] for r in relocs)
   ctypes.memmove(output.va_addr + start*2, source.va_addr, count*2)  # type: ignore[arg-type]
+
+def _compact_native_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Remove the four padding fp16 lanes emitted after each four-lane int32 atom."""
+  total, tag = task.layout
+  assert tag == _HOST_COMPACT_NATIVE_HALF_LAYOUT and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  for start in range(0, total, 4):
+    count = min(4, total-start)
+    ctypes.memmove(output.va_addr + start*2, source.va_addr + (start//4)*16, count*2)  # type: ignore[arg-type]
+  if getenv("ROCKCHIP_DEBUG_UNPOOL"):
+    import numpy as np
+    physical = np.frombuffer(ctypes.string_at(source.va_addr, total*4), dtype=np.float16)
+    compact = np.frombuffer(ctypes.string_at(output.va_addr, total*2), dtype=np.float16)
+    print("RK_UNPOOL_INT_DIFF", physical[:min(total*2, 32)].tolist(), "->", compact[:min(total, 16)].tolist())
+
+def _assemble_int_bytes(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Assemble native 0..255 int32 digits by copying their low bytes."""
+  count, tag, start, nbytes = task.layout
+  assert tag == _HOST_ASSEMBLE_INT_BYTES_LAYOUT and 0 < count <= 4 and 0 < nbytes <= 4 and len(relocs) == nbytes+1
+  output = bufs[relocs[0].globals_slot]
+  digits = [bufs[r.globals_slot] for r in relocs[1:]]
+  ctypes.memset(output.va_addr + start*4, 0, count*4)  # type: ignore[arg-type]
+  for element in range(count):
+    for byte, digit in enumerate(digits):
+      ctypes.memmove(output.va_addr + (start+element)*4 + byte, digit.va_addr + element*4, 1)  # type: ignore[arg-type]
+
+def _pack_half_bits(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Widen raw fp16 representations into int32 lanes without evaluating them."""
+  count, tag, start = task.layout
+  assert tag == _HOST_PACK_HALF_BITS_LAYOUT and 0 < count <= 4 and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  ctypes.memset(output.va_addr, 0, 16)  # type: ignore[arg-type]
+  for element in range(count):
+    ctypes.memmove(output.va_addr + element*4, source.va_addr + (start+element)*2, 2)  # type: ignore[arg-type]
+  if getenv("ROCKCHIP_DEBUG_UNPOOL"):
+    values = ctypes.cast(output.va_addr, ctypes.POINTER(ctypes.c_uint32))
+    print("RK_UNPOOL_PACK_HALF_BITS", [hex(values[i]) for i in range(4)])
+
+def _unpack_half_bits(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Compact low fp16 representation bytes from native int32 lanes."""
+  count, tag, start = task.layout
+  assert tag == _HOST_UNPACK_HALF_BITS_LAYOUT and 0 < count <= 4 and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  if getenv("ROCKCHIP_DEBUG_UNPOOL"):
+    values = ctypes.cast(source.va_addr, ctypes.POINTER(ctypes.c_uint32))
+    print("RK_UNPOOL_SELECTED_HALF_BITS", [hex(values[i]) for i in range(4)])
+  for element in range(count):
+    ctypes.memmove(output.va_addr + (start+element)*2, source.va_addr + element*4, 2)  # type: ignore[arg-type]
 
 def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Scatter pooled fp16 values by per-plane int32 indices, summing duplicates in fp32."""
@@ -990,8 +1061,14 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
           _run_host_static_half(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
+          _run_host_static_int(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
           _pack_static_gather(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
+          _pack_plane_gather(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
           _pack_fp16_chunk(task, st.relocs, bufs)
@@ -1004,6 +1081,18 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
           _unpack_fp16_chunk(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
+          _compact_native_half(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
+          _assemble_int_bytes(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
+          _pack_half_bits(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
+          _unpack_half_bits(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
           _run_host_scatter(task, st.relocs, bufs)
@@ -1110,8 +1199,10 @@ class RockchipProgram(Program['RockchipDevice']):
     # happens after the preceding DPU selection chain, so preserve subtask
     # order instead of hoisting every copy ahead of every DPU submission.
     if any(st.task.is_copy and len(st.task.layout) > 1 and
-           st.task.layout[1] in (_HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
-                                 _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT) for st in subtasks):
+           st.task.layout[1] in (_HOST_STATIC_INT_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
+                                 _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
+                                 _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+                                 _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT) for st in subtasks):
       ext, shared, original = list(bufs), [], self.subtasks
       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                      default=len(ext)-1)
@@ -1120,21 +1211,40 @@ class RockchipProgram(Program['RockchipDevice']):
         while len(ext) <= max_slot:
           shared.append(b := dev._gpu_alloc(max(total*4, 4096), 0))
           ext.append(b)
+        pending:list[RKSubTask] = []
+        def flush_pending() -> None:
+          if not pending: return
+          if any(st.task.native_int32_input or st.task.native_int32_output for st in pending): dev.reset_npu()
+          self.subtasks = list(pending)
+          self._submit_multi(tuple(ext))
+          pending.clear()
         for st in subtasks:
           task = st.task
           if task.is_copy:
+            copy_inputs = {r.globals_slot for r in st.relocs
+                           if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, task.out_slot)}
+            pending_inputs = {r.globals_slot for p in pending for r in p.relocs
+                              if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, p.task.out_slot)}
+            pending_outputs = {p.task.out_slot for p in pending}
+            if copy_inputs & pending_outputs or task.out_slot in pending_inputs or task.out_slot in pending_outputs: flush_pending()
             if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT: _run_host_static_int(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT: _compact_native_half(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT: _assemble_int_bytes(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits(task, st.relocs, tuple(ext))
             else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
             continue
-          dev.reset_npu()
-          self.subtasks = [st]
-          self._submit_multi(tuple(ext))
+          pending.append(st)
+          if len(pending) == 64: flush_pending()
+        flush_pending()
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
@@ -1161,8 +1271,14 @@ class RockchipProgram(Program['RockchipDevice']):
           if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
             _run_host_static_half(task, st.relocs, tuple(ext))
             continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
+            _run_host_static_int(task, st.relocs, tuple(ext))
+            continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
             _pack_static_gather(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
+            _pack_plane_gather(task, st.relocs, tuple(ext))
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
             _pack_fp16_chunk(task, st.relocs, tuple(ext))
@@ -1175,6 +1291,18 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
             _unpack_fp16_chunk(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
+            _compact_native_half(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
+            _assemble_int_bytes(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
+            _pack_half_bits(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
+            _unpack_half_bits(task, st.relocs, tuple(ext))
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
             _run_host_bitwise(task, st.relocs, tuple(ext))

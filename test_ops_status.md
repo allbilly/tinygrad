@@ -551,3 +551,37 @@ The audit of other accelerator backends found no precedent for host evaluation
 of ordinary tensor operators. Host transfers, address generation, packing,
 cache maintenance, and command construction are allowed; `run_host` arithmetic
 is not counted as a Rockchip operator pass.
+
+### Native max-unpool milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `max_unpool2d`, three official finite cases | **passing** | **passing** |
+| large spatial indices 2049/2499 | **passing** | **passing** |
+| single-candidate `+inf`, `-inf`, NaN, finite raw bits | **passing** | **passing** |
+| `max_unpool2d_inf`, Torch/tinygrad both fp16 | **passing** | **passing** |
+| ordinary half-mode `max_unpool2d_inf` invocation | dtype-only mismatch | values passing; Torch literal remains float32 |
+
+The finite official method passes in **224.33 seconds**. Returned max-pool
+indices still pass all seven official cases in **152.94 seconds**, and the
+expanded DPU hardware class passes **57/57 in 257.27 seconds**.
+
+The implementation compares compact int32 indices with static spatial
+positions on the NPU and accumulates selected fp16 values. Large exact atom
+counts use the two-dimensional DPU surface layout from `rknnops.h`, avoiding
+the 4,096-atom one-row limit. Indices above fp16's exact range are assembled
+from NPU-selected base-256 digits. Single-candidate non-finite values are
+selected by native int32 multiplication of their raw fp16 representation
+bits, so host callbacks remain byte-layout operations rather than tensor
+arithmetic.
+
+Permanent regressions cover:
+
+- physical NCHW local-max gather order for `(1,3,7,6)`;
+- exact raw-bit unpool selection for `+inf`, `-inf`, NaN, and 3.5;
+- a 17,500-output two-dimensional DPU task with indices 2049 and 2499.
+
+The rejected `_run_host_scatter` compatibility path remains disabled unless
+`ROCKCHIP_ALLOW_HOST_OPS=1`.
+
+Recovery patch: `rockchip-native-max-unpool-d72bcc3f0.patch`.
