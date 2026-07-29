@@ -1286,6 +1286,7 @@ class RockchipProgram(Program['RockchipDevice']):
             if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT: _run_host_static_int(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT: _run_host_bool_half(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))

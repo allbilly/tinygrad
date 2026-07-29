@@ -1093,3 +1093,36 @@ The unchanged official cummin pair passes **2/2 in 68.12 seconds**.  The
 permanent two-axis cummin/cummax regressions plus returned max-pool indices
 pass **3/3 in 26.73 seconds**.  No host callback evaluates a runtime minimum
 or selected index.
+
+### Native general ArgMax/ArgMin milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `argmax`, half/float/int/bool | **passing** | DPU MAX/equality/select |
+| `argmin`, half/float/int/bool | **passing** | DPU negate/MAX/equality/select |
+| first-tie and axis-coordinate semantics | **passing** | reverse DPU candidate selection |
+| `argsort` | unsupported | separate ordered-index group |
+
+The backend recognizes the pair of MAX reductions emitted for general
+ArgMax/ArgMin, statically maps every reduction coordinate to its source
+address, and leaves all value-dependent work to DPU tasks.  Host callbacks
+only gather a predetermined layout, widen bool storage for the NPU ABI, and
+assemble the selected coordinate's representation bytes.  They never inspect
+values or compute extrema, masks, or indices; `run_host` is therefore not an
+operator fallback.
+
+ArgMin is implemented as DPU `MAX(-x)`.  Int32 conversion is clamped to the
+finite half range before equality selection so `INT_MIN` cases cannot create
+ambiguous `inf-inf` comparisons.  Backward candidate visitation preserves
+Tinygrad/PyTorch's first-index tie rule.  This differs intentionally from
+cumulative extrema, which prefix-mask candidates and select the latest tie.
+
+With `. .venv/bin/activate`, disabled caches, half defaults, and forward-only:
+
+- unchanged official `test_argmax`: **passing in 192.00 seconds**;
+- unchanged official `test_argmin`: **passing in 246.76 seconds**;
+- permanent general extrema plus cummax, cummin, and max-pool index
+  regressions: **4/4 passing in 54.96 seconds**.
+
+Debug with `ROCKCHIP_DEBUG_ARG_EXTREMA=1`, then isolate axis/tie, int32
+`INT_MIN`, and bool truth-pair probes as documented in `progress.md`.

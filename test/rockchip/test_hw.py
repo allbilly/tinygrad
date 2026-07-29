@@ -101,6 +101,19 @@ class TestDPU(unittest.TestCase):
     for values in (np.array([False, True]), np.array([True, False]), np.array([True, True])):
       np.testing.assert_array_equal(Tensor(values, device="ROCKCHIP").min().realize().numpy(), np.min(values))
 
+  def test_dpu_arg_extrema(self):
+    # General axis reductions return a reduction coordinate, preserve the first
+    # tie, and keep runtime comparison/index selection on the DPU.
+    data = np.array([[4,1,4,0], [2,5,3,5], [4,-1,6,2]], dtype=np.float16)
+    x = Tensor(data, device="ROCKCHIP").realize()
+    for axis in (0, 1):
+      np.testing.assert_array_equal(x.argmax(axis=axis).realize().numpy(), np.argmax(data, axis=axis).astype(np.int32))
+      np.testing.assert_array_equal(x.argmin(axis=axis).realize().numpy(), np.argmin(data, axis=axis).astype(np.int32))
+    for values in (np.array([0, -(2**31)], dtype=np.int32), np.array([True, False]), np.array([False, True])):
+      y = Tensor(values, device="ROCKCHIP").realize()
+      np.testing.assert_array_equal(y.argmax().realize().numpy(), np.argmax(values).astype(np.int32))
+      np.testing.assert_array_equal(y.argmin().realize().numpy(), np.argmin(values).astype(np.int32))
+
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)

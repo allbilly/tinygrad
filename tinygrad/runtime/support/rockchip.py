@@ -7967,6 +7967,193 @@ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
   expanded = sink.substitute({store:store.replace(src=(store.src[0], value))})
   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
 
+def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower general static-axis argmax/argmin with DPU comparison and index selection."""
+  store = _store_node(sink)
+  max_reduces = [u for u in sink.toposort() if u.op is Ops.REDUCE and u.arg[0] is Ops.MAX]
+  if store is None or store.src[0].dtype is not dtypes.int or len(max_reduces) != 2: return None
+  value_reduce = next((u for u in max_reduces if
+                       sum(x.op is Ops.INDEX and x.dtype in (dtypes.bool, dtypes.half, dtypes.float, dtypes.int)
+                           for x in u.src[0].toposort()) == 1), None)
+  if value_reduce is None: return None
+  body = _unwrap(value_reduce.src[0])
+  sources = [u for u in body.toposort() if u.op is Ops.INDEX and u.dtype in (dtypes.bool, dtypes.half, dtypes.float, dtypes.int)]
+  if len(sources) != 1 or (source := sources[0]).src[0].op is not Ops.PARAM: return None
+  is_min = any(u.op in (Ops.MUL, Ops.XOR) and source in u.src and
+               any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src) for u in body.toposort())
+  is_min = is_min or (source.dtype is dtypes.bool and any(
+    u.op is Ops.CMPNE and source in u.src and any(x.op is Ops.CONST and bool(x.arg) for x in u.src)
+    for u in body.toposort()))
+  if body is not source and not is_min: return None
+  reductions = list(value_reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  loop_extents = [int(u.src[0].arg) for u in loops]
+  reduce_extents = [int(u.src[0].arg) for u in reductions]
+  total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
+  if prod(loop_extents) != total or not 2 <= window <= 65536: return None
+  if getenv("ROCKCHIP_DEBUG_ARG_EXTREMA"):
+    print("RK_ARG_EXTREMA", "min" if is_min else "max", source.dtype, total, window)
+
+  def evaluate(u:UOp, coords:dict[UOp,int]):
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+    if u.op is Ops.RANGE and u in coords: return coords[u]
+    if u.op is Ops.WHERE:
+      condition = evaluate(u.src[0], coords)
+      return evaluate(u.src[1] if condition else u.src[2], coords)
+    values = [evaluate(x, coords) for x in u.src]
+    if any(x is Invalid for x in values): return Invalid
+    if u.op is Ops.ADD: return values[0]+values[1]
+    if u.op is Ops.MUL: return values[0]*values[1]
+    if u.op is Ops.SUB: return values[0]-values[1]
+    if u.op is Ops.FLOORDIV: return values[0]//values[1]
+    if u.op is Ops.FLOORMOD: return values[0]%values[1]
+    if u.op is Ops.CMPLT: return values[0] < values[1]
+    if u.op is Ops.CMPNE: return values[0] != values[1]
+    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
+    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
+    if u.op is Ops.NEG: return -values[0]
+    raise ValueError(u.op)
+
+  mappings:list[tuple[int,...]] = []
+  try:
+    for candidate in range(window):
+      rem, fixed = candidate, {}
+      for axis in range(len(reductions)-1, -1, -1):
+        rem, coord = divmod(rem, reduce_extents[axis])
+        fixed[reductions[axis]] = coord
+      addresses = [-1]*total
+      for output_linear in range(total):
+        rem, coords = output_linear, dict(fixed)
+        for axis in range(len(loops)-1, -1, -1):
+          rem, coord = divmod(rem, loop_extents[axis])
+          coords[loops[axis]] = coord
+        output_index = int(evaluate(store.src[0].src[1], coords))
+        source_index = evaluate(source.src[1], coords)
+        if not 0 <= output_index < total or source_index is Invalid: return None
+        addresses[output_index] = int(source_index)
+      if any(address < 0 for address in addresses): return None
+      mappings.append(tuple(addresses))
+  except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+    return None
+
+  info = ProgramInfo.from_sink(sink)
+  out_slot, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+  host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+
+  def alloc() -> int:
+    nonlocal next_slot
+    result, next_slot = next_slot, next_slot+1
+    return result
+
+  def native_int_to_half(input_slot:int) -> int:
+    if is_min:
+      result = alloc()
+      tasks.append(_emit_where_stage(total, result, (input_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                     int32_inputs=(input_slot,)))
+      return result
+    result = alloc()
+    for start in range(0, total, 4):
+      count = min(4, total-start)
+      packed = alloc()
+      pack_layout = (count, _HOST_PACK_INT32_CHUNK_LAYOUT, start)
+      pack_relocs = (RKReloc(0, packed, 0, 0, 0xFFFFFFFF), RKReloc(0, input_slot, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed, is_copy=True), pack_relocs))
+      half_atom = alloc()
+      tasks.append(_emit_where_stage(4, half_atom, (packed, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_input=True))
+      unpack_layout = (count, _HOST_UNPACK_HALF_CHUNK_LAYOUT, start)
+      unpack_relocs = (RKReloc(0, result, 0, 0, 0xFFFFFFFF), RKReloc(0, half_atom, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, result, is_copy=True), unpack_relocs))
+    return result
+
+  gathered_source_slot, gathered_itemsize = source_slot, source.dtype.itemsize
+  if source.dtype is dtypes.bool:
+    gathered_source_slot, gathered_itemsize = alloc(), 2
+    widen_layout = (int(source.src[0].src[0].arg), _HOST_BOOL_HALF_LAYOUT)
+    widen_relocs = (RKReloc(0, gathered_source_slot, 0, 0, 0xFFFFFFFF),
+                     RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", widen_layout, gathered_source_slot, is_copy=True), widen_relocs))
+  elif source.dtype is dtypes.int and is_min:
+    gathered_source_slot, gathered_itemsize = alloc(), 2
+    tasks.append(_emit_where_stage(int(source.src[0].src[0].arg), gathered_source_slot, (source_slot, 0),
+                                   (_ZERO_SLOT, 0), Ops.ADD, int32_inputs=(source_slot,)))
+
+  candidate_slots:list[int] = []
+  for mapping in mappings:
+    gathered = alloc()
+    gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, gathered_itemsize, *mapping)
+    gather_relocs = (RKReloc(0, gathered, 0, 0, 0xFFFFFFFF),
+                     RKReloc(0, gathered_source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered, is_copy=True), gather_relocs))
+    candidate = native_int_to_half(gathered) if source.dtype is dtypes.int and not is_min else gathered
+    if source.dtype is dtypes.float:
+      converted = alloc()
+      tasks.append(_emit_where_stage(total, converted, (gathered, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_inputs=(gathered,)))
+      candidate = converted
+    if is_min:
+      warm, negated = alloc(), alloc()
+      tasks.append(_emit_where_stage(total, warm, (candidate, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL))
+      tasks.append(_emit_where_stage(total, negated, (candidate, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL))
+      candidate = negated
+      if source.dtype is dtypes.int:
+        lower, negative, upper_negative, clamped = alloc(), alloc(), alloc(), alloc()
+        finite_min = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -65504.0))[0])
+        tasks.append(_emit_where_stage(total, lower, (candidate, 0), finite_min, Ops.MAX))
+        tasks.append(_emit_where_stage(total, negative, (lower, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL))
+        tasks.append(_emit_where_stage(total, upper_negative, (negative, 0), finite_min, Ops.MAX))
+        tasks.append(_emit_where_stage(total, clamped, (upper_negative, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL))
+        candidate = clamped
+    candidate_slots.append(candidate)
+
+  maximum = candidate_slots[0]
+  for operand in candidate_slots[1:]:
+    result = alloc()
+    tasks.append(_emit_where_stage(total, result, (maximum, 0), (operand, 0), Ops.MAX))
+    maximum = result
+
+  index_bytes = max(1, ((window-1).bit_length()+7)//8)
+  if index_bytes > 4: return None
+  selected:list[tuple[int,int]] = [(_ZERO_SLOT, 0)]*index_bytes
+  one = (_CONST_SLOT, 0x3f800000)
+  # Visit backwards so an earlier equal value overwrites a later one.
+  for candidate in range(window-1, -1, -1):
+    diff, less, equal_warm, equal = alloc(), alloc(), alloc(), alloc()
+    tasks.append(_emit_where_stage(total, diff, (maximum, 0), (candidate_slots[candidate], 0), Ops.SUB))
+    tasks.append(_emit_where_stage(total, less, (diff, 0), (diff, 0), Ops.MAX, compare=True))
+    tasks.append(_emit_where_stage(total, equal_warm, one, (less, 0), Ops.SUB))
+    tasks.append(_emit_where_stage(total, equal, one, (less, 0), Ops.SUB))
+    for byte in range(index_bytes):
+      index_slot = alloc()
+      index = (candidate >> (8*byte)) & 0xFF
+      index_bits = struct.unpack('<H', struct.pack('<e', float(index)))[0]
+      index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *(index_bits for _ in range(total)))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", index_layout, index_slot, is_copy=True),
+                             (RKReloc(0, index_slot, 0, 0, 0xFFFFFFFF),)))
+      delta, weighted, selected_out = alloc(), alloc(), alloc()
+      tasks.append(_emit_where_stage(total, delta, (index_slot, 0), selected[byte], Ops.SUB))
+      tasks.append(_emit_where_stage(total, weighted, (equal, 0), (delta, 0), Ops.MUL))
+      tasks.append(_emit_where_stage(total, selected_out, selected[byte], (weighted, 0), Ops.ADD))
+      selected[byte] = (selected_out, 0)
+
+  for start in range(0, total, 4):
+    count = min(4, total-start)
+    native_digits:list[int] = []
+    for byte in range(index_bytes):
+      packed = alloc()
+      pack_layout = (count, _HOST_PACK_CHUNK_LAYOUT, start)
+      pack_relocs = (RKReloc(0, packed, 0, 0, 0xFFFFFFFF), RKReloc(0, selected[byte][0], 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed, is_copy=True), pack_relocs))
+      native = alloc()
+      tasks.append(_emit_where_stage(4, native, (packed, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_output=True))
+      native_digits.append(native)
+    assemble_layout = (count, _HOST_ASSEMBLE_INT_BYTES_LAYOUT, start, index_bytes)
+    assemble_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *native_digits))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", assemble_layout, out_slot, is_copy=True), assemble_relocs))
+  return tuple(tasks)
+
 def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Compile max-pool's static candidate addresses without unrolling its argmax expression."""
   store = _store_node(sink)
@@ -7983,8 +8170,12 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   maximum = next((u for u in value_indexes if u is not data and u.dtype is data.dtype and int(u.src[0].src[0].arg) == total), None) \
     if data is not None else None
   if data is None or maximum is None: return None
-  negated_data = any(u.op is Ops.MUL and u.dtype in (dtypes.half, dtypes.float) and data in u.src and
-                     any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src) for u in max_reduce.toposort())
+  negated_data = any(data in u.src and (
+    (u.op is Ops.MUL and u.dtype in (dtypes.half, dtypes.float) and
+     any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src)) or
+    (u.op is Ops.XOR and u.dtype is dtypes.int and
+     any(x.op is Ops.CONST and int(x.arg) == -1 for x in u.src))
+  ) for u in max_reduce.toposort())
   input_total = int(data.src[0].src[0].arg)
   out_shape = _shape_of_store(sink)
   planes = prod(out_shape[:-2]) if len(out_shape) >= 3 else 1
@@ -7994,8 +8185,9 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # the final int cast (half under DEFAULT_FLOAT=HALF). Max-pool instead
   # encodes the absolute spatial address in an int MAX. Both share this
   # equality/index-selection graph.
-  relative_index = store.src[1].op is Ops.CAST and store.src[1].dtype is dtypes.int and \
+  cumulative_index = store.src[1].op is Ops.CAST and store.src[1].dtype is dtypes.int and \
     store.src[1].src[0].dtype in (dtypes.half, dtypes.float)
+  relative_index = cumulative_index or (len(reductions) == 1 and input_total == total*window)
 
   def evaluate(u:UOp, coords:dict[UOp, int]):
     while u.op is Ops.CAST: u = u.src[0]
@@ -8039,7 +8231,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
         # carries its prefix mask outside the INDEX address, so also reject
         # candidates beyond the current reduction-axis coordinate.
         # if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
-        if source_index is not Invalid and (not relative_index or reduce_linear <= out_index % window):
+        if source_index is not Invalid and (not cumulative_index or reduce_linear <= out_index % window):
           mapping[out_index*window+reduce_linear] = int(source_index)
   except (TypeError, ValueError, OverflowError, ZeroDivisionError): return None
 
@@ -8060,6 +8252,14 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def native_int_to_half(source_slot:int) -> int:
     """Convert compact nonnegative int32 values through aligned four-lane MRDMA atoms."""
     nonlocal next_slot
+    if negated_data:
+      # Argmin's XOR-ordered int32 values include INT_MIN/INT_MAX. Use the
+      # established ABI conversion before DPU negation; the native four-lane
+      # arithmetic mode is only exact for the compact nonnegative pool indices.
+      result, next_slot = next_slot, next_slot+1
+      tasks.append(_emit_where_stage(total, result, (source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                     int32_inputs=(source_slot,)))
+      return result
     result, next_slot = next_slot, next_slot+1
     for start in range(0, total, 4):
       count = min(4, total-start)
@@ -8177,7 +8377,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   selected:list[tuple[int,int]] = [(_ZERO_SLOT, 0)] * index_bytes
   # Max-pool uses the first matching spatial index, while cummax uses the most
   # recent matching reduction-axis coordinate.
-  candidate_order = range(window) if relative_index else range(window-1, -1, -1)
+  candidate_order = range(window) if cumulative_index else range(window-1, -1, -1)
   for candidate in candidate_order:
     diff, less, equal = range(next_slot, next_slot+3)
     next_slot += 3
@@ -9868,6 +10068,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
   if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
+  if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, arg_extrema_tasks)
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)

@@ -7076,3 +7076,57 @@ Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
 
 The forward cumulative sum/min/max family is now complete except for the
 separately tracked cumulative-product precision behavior.
+
+## 2026-07-30 — native general ArgMax and ArgMin
+
+The general selected-index lowering now handles static-axis `argmax` and
+`argmin` for half, float, int32, and bool inputs.  Tinygrad expresses these as
+two MAX reductions: one finds the extreme value and the other selects the
+first coordinate matching that value.  The Rockchip recognizer reconstructs
+each reduction candidate's static address map and emits:
+
+1. host copy/layout tasks that gather those addresses without inspecting or
+   evaluating runtime values;
+2. DPU MAX chains for the extreme value;
+3. DPU subtract/compare masks for equality;
+4. reverse candidate selection so the first equal coordinate wins;
+5. the existing NPU-native half-to-int byte conversion and int32 assembly.
+
+ArgMin keeps the same path by negating candidates before MAX.  Int32 sources
+use the established DPU ABI conversion before negation, with a finite
+`[-65504,65504]` clamp after the half conversion.  This prevents converted
+`INT_MIN` and neighboring negative values from degenerating into an
+`inf-inf = NaN` equality test.  Bool inputs use a host byte-to-half layout
+widening before DPU comparison.  Both conversions are representation
+transport only: no host callback computes a maximum, minimum, equality mask,
+or selected index, and `run_host` is not used for operator arithmetic.
+
+Useful debug procedure:
+
+- set `ROCKCHIP_DEBUG_ARG_EXTREMA=1` to confirm the recognizer reports
+  operation kind, dtype, output count, and reduction window;
+- first probe small tied arrays along every axis, because a wrong candidate
+  traversal direction changes first-tie semantics without changing the
+  extreme value;
+- probe int32 with both `[0, INT_MIN]` and `[INT_MIN, 0]`; these distinguish
+  ordering/conversion faults from coordinate assembly faults;
+- probe bool with `[False, True]`, `[True, False]`, and equal pairs to cover
+  both extrema and first-tie behavior;
+- compare general axis indices with cumulative indices separately: ArgMax and
+  ArgMin return a candidate coordinate with first-tie semantics, while
+  CumMax/CumMin use a prefix mask and latest-tie semantics.
+
+### Validation
+
+Using `. .venv/bin/activate`, `CACHELEVEL=0 CCACHE=0`,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged official `TestOps.test_argmax`: **passing in 192.00 seconds**;
+- unchanged official `TestOps.test_argmin`: **passing in 246.76 seconds**;
+- permanent ArgMax/ArgMin dtype/tie regression plus cumulative max/min and
+  returned max-pool index regressions: **4/4 passing in 54.96 seconds**.
+
+`argsort` remains a separate ordered-index lowering.  Cumprod remains a
+precision-heavy group: its sequential fp16 multiply misses 23/600 official
+values, while the reference behavior is consistent with fp32 prefix
+accumulation followed by fp16 output rounding.
