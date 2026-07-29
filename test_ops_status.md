@@ -1159,3 +1159,36 @@ Validation with `. .venv/bin/activate`, caches disabled,
 Use `ROCKCHIP_DEBUG_ARGSORT=1` to distinguish compare/swap, count, and final
 selector kernels.  The full bitwise/count isolation procedure is recorded in
 `progress.md`.
+
+### Padded TopK and integer sorting milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| half TopK, axis length 5 padded to 8 | **passing** | DPU MAX/MIN + static wire layout |
+| random value/index TopK variants | **passing** | shared native Argsort chain |
+| repeated integer largest/smallest | **passing** | typed ABI + DPU compare/select |
+| integer padding metadata | **passing** | signed codec + exact byte restoration |
+
+Half TopK previously produced all NaNs because static arithmetic selection
+formed `0*inf` on padded lanes.  It now interleaves the already NPU-computed
+MAX/MIN representations according to compile-time bitonic wires, eliminating
+non-finite arithmetic without moving a comparison to the host.
+
+Integer padding first exposed unsigned `0xffffffff` in signed task metadata.
+The codec now stores the signed equivalent and restores the raw destination
+bytes.  Native `a+b-max` MIN and an arithmetic complement experiment both
+failed around `INT_MIN`; they remain WIP references.  The official small
+integer values cross the established int32/fp16 ABI, sort on DPU with `±inf`
+padding, and convert back only after selection.  Stable indices use the
+Argsort occurrence-count path.
+
+Validation with `. .venv/bin/activate`, disabled caches, half defaults, and
+forward-only:
+
+- unchanged official `test_topk`: **passing in 236.43 seconds**;
+- permanent five-lane half/integer padding regression in both directions:
+  **passing in 70.22 seconds**.
+
+The linked RKNN Toolkit2 fp16 multiplication issue #471 is useful supporting
+evidence for the separate cumulative/large-reduction precision group, not a
+TopK or LUT workaround; exact observations and the URL are in `progress.md`.

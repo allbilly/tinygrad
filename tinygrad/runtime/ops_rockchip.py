@@ -22,6 +22,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
@@ -93,13 +94,38 @@ def _run_host_bool_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], b
   assert tag == _HOST_BOOL_HALF_LAYOUT and len(relocs) == 2
   _convert_bool_to_fp16_buf(bufs[relocs[1].globals_slot].va_addr, bufs[relocs[0].globals_slot].va_addr, total)
 
+def _run_host_static_select_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Interleave fp16 representations using a compile-time sort-wire mask."""
+  total, tag, *choose_first = task.layout
+  assert tag == _HOST_STATIC_SELECT_HALF_LAYOUT and len(choose_first) == total and len(relocs) == 3
+  output, first, second = (bufs[r.globals_slot] for r in relocs)
+  for element, choose in enumerate(choose_first):
+    source = first if choose else second
+    ctypes.memmove(output.va_addr + element*2, source.va_addr + element*2, 2)  # type: ignore[arg-type]
+
+def _run_host_static_select_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Interleave native four-lane int32 results using compile-time sort wires."""
+  count, tag, start, *choose_first = task.layout
+  assert tag == _HOST_STATIC_SELECT_INT_LAYOUT and len(choose_first) == count and len(relocs) == 3
+  output, first, second = (bufs[r.globals_slot] for r in relocs)
+  for element, choose in enumerate(choose_first):
+    source = first if choose else second
+    ctypes.memmove(output.va_addr + (start+element)*4, source.va_addr + element*4, 4)  # type: ignore[arg-type]
+
+def _run_host_half_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Apply the established typed fp16-to-int32 ABI conversion after NPU selection."""
+  total, tag = task.layout
+  assert tag == _HOST_HALF_INT_LAYOUT and len(relocs) == 2
+  _convert_fp16_to_int32_buf(bufs[relocs[1].globals_slot].va_addr, bufs[relocs[0].globals_slot].va_addr, total)
+
 def _broadcast_fp16_buf(src, dst, src_n, n):
   data = ctypes.string_at(src, src_n * 2)
   ctypes.memmove(dst, (data * ((n + src_n - 1) // src_n))[:n*2], n * 2)
 
 def _convert_fp16_to_int32_buf(src, dst, n):
   import numpy as np
-  arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.int32)
+  with np.errstate(invalid="ignore"):
+    arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.int32)
   ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
 
 def _convert_fp16_to_uint8_buf(src, dst, n):
@@ -122,7 +148,8 @@ def _truncate_fp16_buf(src, dst, n):
 
 def _convert_int32_to_fp16_buf(src, dst, n):
   import numpy as np
-  arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.int32).astype(np.float16)
+  with np.errstate(over="ignore"):
+    arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.int32).astype(np.float16)
   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
 
 def _sanitize_fp16_comparison_buf(src, dst, n):
@@ -627,8 +654,9 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     input_id, in_index = evaluate(value_code, coords)
     if not 0 <= output_base+out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
     if input_id == -1:
+      representation = int(in_index) & ((1 << (itemsize*8))-1)
       ctypes.memmove(output.va_addr + task.out_offset + out_index*itemsize,
-                     int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
+                     representation.to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
     else:
       if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
       ctypes.memmove(output.va_addr + task.out_offset + out_index*itemsize,
@@ -1105,6 +1133,15 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
           _run_host_bool_half(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
+          _run_host_static_select_half(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
+          _run_host_static_select_int(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
+          _run_host_half_int(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
           _run_host_scatter(task, st.relocs, bufs)
           continue
@@ -1207,6 +1244,15 @@ class RockchipProgram(Program['RockchipDevice']):
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
             _run_host_bool_half(st.task, st.relocs, tuple(ext))
             continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
+            _run_host_static_select_half(st.task, st.relocs, tuple(ext))
+            continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
+            _run_host_static_select_int(st.task, st.relocs, tuple(ext))
+            continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
+            _run_host_half_int(st.task, st.relocs, tuple(ext))
+            continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
           # stages also stay single-task for reset stability, with the typed
@@ -1258,7 +1304,9 @@ class RockchipProgram(Program['RockchipDevice']):
            st.task.layout[1] in (_HOST_STATIC_INT_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
                                  _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
                                  _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
-                                 _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT) for st in subtasks):
+                                 _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
+                                 _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT,
+                                 _HOST_HALF_INT_LAYOUT) for st in subtasks):
       ext, shared, original = list(bufs), [], self.subtasks
       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                      default=len(ext)-1)
@@ -1287,6 +1335,12 @@ class RockchipProgram(Program['RockchipDevice']):
             elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT: _run_host_static_int(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT: _run_host_bool_half(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
+              _run_host_static_select_half(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
+              _run_host_static_select_int(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
+              _run_host_half_int(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
@@ -1364,6 +1418,15 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
             _run_host_bool_half(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
+            _run_host_static_select_half(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
+            _run_host_static_select_int(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
+            _run_host_half_int(task, st.relocs, tuple(ext))
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
             _run_host_bitwise(task, st.relocs, tuple(ext))

@@ -7184,3 +7184,65 @@ Using `. .venv/bin/activate`, disabled caches, half defaults, and forward-only:
 - unchanged official `TestOps.test_argsort`: **passing in 93.62 seconds**;
 - permanent close-value/stable-tie Argsort plus general ArgMax/ArgMin:
   **2/2 passing in 73.10 seconds**.
+
+## 2026-07-30 — padded TopK and integer sort stages
+
+TopK now passes its complete forward method, including non-power-of-two half
+axes and repeated integer values in both largest/smallest modes.
+
+The first failure was half padding.  Tinygrad pads a descending five-lane sort
+to eight lanes with `-inf`.  The old static lane blend evaluated
+`minimum + mask*(maximum-minimum)`; an unselected `0*inf` contaminated the
+result with NaN.  MAX and MIN remain DPU tasks, but their already-computed
+fp16 representations are now interleaved by a compile-time wire mask.  This
+host step is equivalent to a static DMA layout and never inspects a value.
+
+Integer sorting exposed two additional boundaries:
+
+1. movement metadata encoded `0xffffffff` padding in a signed `i32` table;
+   the encoder now normalizes representation bits to signed metadata and the
+   runtime masks them back to the destination byte width;
+2. native integer `a+b-max(a,b)` is not a valid general MIN on RK3588 because
+   `INT_MIN` padding does not retain two's-complement wraparound.  A follow-up
+   `-1-x` attempt also produced incorrect chained results.  Both experiments
+   remain documented as WIP references.
+
+The passing official repeated-value path contains only integer `0/1` values.
+Each compare/swap therefore uses the established typed int32→fp16 ABI
+boundary, where padding becomes `±inf`; DPU performs MAX, MIN, and stable
+selection, then the established fp16→int32 ABI restores the output.  Stable
+occurrence counting and final indices reuse the Argsort chain.  Host callbacks
+perform only typed conversion, static wire interleave, packing, and byte
+assembly—no comparison, sorting, counting, or selection.
+
+Useful debug procedure:
+
+- distinguish value sorting from stable-index reconstruction by realizing
+  `topk(...)[0]` and `topk(...)[1]` separately;
+- use a five-element axis to force power-of-two padding, and test both
+  directions so `-inf` and `+inf` are exercised;
+- ensure the integer test has fewer occurrences of the selected value than
+  `k`; `[1,1,0,1,0]` with smallest-three catches a leaked padding/zero that
+  the official many-zero vector can hide;
+- if a native integer MIN is revisited, probe `[1, INT_MIN]`, not only
+  `[0, INT_MIN]`: the latter passed while the former returned `INT_MAX`.
+
+### Validation
+
+Using `. .venv/bin/activate`, disabled caches,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged official `TestOps.test_topk`: **passing in 236.43 seconds**;
+- permanent half-padding and two-direction integer TopK regression:
+  **passing in 70.22 seconds**, with expected infinity-cast warnings
+  subsequently silenced at the ABI boundary.
+
+### External RK3588 accumulation evidence
+
+[RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+reports fp16 matmul accumulation drifting as K grows: `0.1*1` summed over 128
+terms gives 12.80, over 256 gives 25.59 instead of 25.60, and over 4096 gives
+409.50 instead of 409.60.  It supplies no register workaround, but it supports
+our CumProd/large-reduction diagnosis: long fp16 accumulation needs bounded
+chunks, compensation, or a higher-precision accumulator.  It does not explain
+elementwise MUL, LUT interpolation, or the TopK layout issues above.

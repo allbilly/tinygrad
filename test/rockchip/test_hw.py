@@ -123,6 +123,21 @@ class TestDPU(unittest.TestCase):
     expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
     np.testing.assert_array_equal(actual, expected)
 
+  def test_dpu_topk_padded_sort(self):
+    # Non-power-of-two half sorting uses -inf padding without 0*inf blending.
+    values = np.array([0.2, 1.7, -0.4, 0.8, 1.1], dtype=np.float16)
+    actual_values, actual_indices = Tensor(values, device="ROCKCHIP").topk(4)
+    expected_indices = np.argsort(-values, kind="stable")[:4].astype(np.int32)
+    np.testing.assert_array_equal(actual_values.realize().numpy(), values[expected_indices])
+    np.testing.assert_array_equal(actual_indices.realize().numpy(), expected_indices)
+    # Integer MIN/MAX stays in native int32, including INT_MIN sort padding.
+    repeated = np.array([1,1,0,1,0], dtype=np.int32)
+    for largest in (True, False):
+      result_values, result_indices = Tensor(repeated, device="ROCKCHIP").topk(3, largest=largest)
+      order = np.argsort(-repeated if largest else repeated, kind="stable")[:3].astype(np.int32)
+      np.testing.assert_array_equal(result_values.realize().numpy(), repeated[order])
+      np.testing.assert_array_equal(result_indices.realize().numpy(), order)
+
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
