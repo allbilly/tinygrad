@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast
+from typing import Any, cast
 import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit
 assert sys.platform != 'win32'
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, BumpAllocator, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
+from tinygrad.renderer import Renderer
 from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, lo32, hi32, colored, prod, ContextVar, TracingKey
 from tinygrad.helpers import VIZ, ceildiv, unwrap, pluralize
 from tinygrad.renderer.cstyle import HIPRenderer, HIPCCRenderer
@@ -15,10 +16,12 @@ from tinygrad.runtime.autogen import kfd, hsa, sqtt, amdgpu_kd, amdgpu_drm
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager
+from tinygrad.runtime.support.am.polaris import PolarisAMDev
 from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, import_pmc
-from tinygrad.runtime.support.system import System, PCIIfaceBase, PCIAllocationMeta, USBPCIDevice, MAP_FIXED, MAP_NORESERVE
+from tinygrad.runtime.support.system import System, PCIDevice, PCIIfaceBase, PCIAllocationMeta, USBPCIDevice
+from tinygrad.runtime.support.system import MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_NORESERVE
 from tinygrad.runtime.support.usb import USB3
-from tinygrad.runtime.support.memory import AddrSpace
+from tinygrad.runtime.support.memory import AddrSpace, TLSFAllocator
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 
 SQTT = ContextVar("SQTT", abs(VIZ.value)>=2)
@@ -40,6 +43,26 @@ class PMCSample: name:str; block:str; xcc:int; inst:int; se:int; sa:int; wgp:int
 
 @dataclass(frozen=True)
 class ProfilePMCEvent(ProfileEvent): device:str; kern:int; sched:list[PMCSample]; blob:bytes; exec_tag:int # noqa: E702
+
+@dataclass
+class PolarisAllocationMeta:
+  off:int
+  cpu_addr:int
+
+class GFX8GC:
+  """Minimal Polaris compute register map used by the KFD PM4 path."""
+  version = (8, 0, 3)
+  def __init__(self):
+    def reg(name, offset, fields=None): return AMDReg(name, offset, 0, fields or {}, {0:(0,)})
+    self.regCOMPUTE_START_X = reg('regCOMPUTE_START_X', 0x2e04)
+    self.regCOMPUTE_PGM_LO = reg('regCOMPUTE_PGM_LO', 0x2e0c)
+    self.regCOMPUTE_PGM_RSRC1 = reg('regCOMPUTE_PGM_RSRC1', 0x2e12)
+    self.regCOMPUTE_RESOURCE_LIMITS = reg('regCOMPUTE_RESOURCE_LIMITS', 0x2e15, {'waves_per_sh':(0,5)})
+    self.regCOMPUTE_PGM_RSRC3 = reg('regCOMPUTE_PGM_RSRC3', 0x2e16)
+    self.regCOMPUTE_TMPRING_SIZE = reg('regCOMPUTE_TMPRING_SIZE', 0x2e18)
+    self.regCOMPUTE_USER_DATA_0 = reg('regCOMPUTE_USER_DATA_0', 0x2e40)
+    self.regCOMPUTE_DISPATCH_INITIATOR = reg('regCOMPUTE_DISPATCH_INITIATOR', 0,
+                                             {'compute_shader_en':(0,0), 'force_start_at_000':(2,2)})
 
 class AMDSignal(HCQSignal):
   def __init__(self, *args, **kwargs): super().__init__(*args, **{**kwargs, 'timestamp_divider': 100})
@@ -90,7 +113,7 @@ class AMDComputeQueue(HWQueue):
     return self
 
   def acquire_mem(self, addr=0x0, sz=(1 << 64)-1, gli=1, glm=1, glk=1, glv=1, gl1=1, gl2=1):
-    if self.dev.target[0] != 9:
+    if self.dev.target[0] > 9:
       cache_flags_dw = self.pm4.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLI_INV(gli) \
                      | self.pm4.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_INV(glm) | self.pm4.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_WB(glm) \
                      | self.pm4.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLK_INV(glk) | self.pm4.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLK_WB(glk) \
@@ -99,6 +122,9 @@ class AMDComputeQueue(HWQueue):
 
       self.pkt3(self.pm4.PACKET3_ACQUIRE_MEM, 0, *data64_le(sz), *data64_le(addr), 0, cache_flags_dw)
     else:
+      # SI/CIK/VI ACQUIRE_MEM has 40-bit base/size fields. Feeding the generic
+      # 64-bit all-ones default wedges a VMID0 Polaris queue before DISPATCH.
+      addr, sz = addr & ((1 << 40) - 1), sz & ((1 << 40) - 1)
       cp_coher_cntl = self.pm4.PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_SH_ICACHE_ACTION_ENA(gli) | \
                       self.pm4.PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_SH_KCACHE_ACTION_ENA(glk) | \
                       self.pm4.PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_TC_ACTION_ENA(gl2) | \
@@ -108,7 +134,7 @@ class AMDComputeQueue(HWQueue):
     return self
 
   def release_mem(self, address=0x0, value=0, data_sel=0, int_sel=2, ctxid=0, cache_flush=False):
-    if self.dev.target[0] != 9:
+    if self.dev.target[0] > 9:
       cache_flags_dw = 0 if not cache_flush else (self.pm4.PACKET3_RELEASE_MEM_GCR_GLV_INV | self.pm4.PACKET3_RELEASE_MEM_GCR_GL1_INV \
                      | self.pm4.PACKET3_RELEASE_MEM_GCR_GL2_INV | self.pm4.PACKET3_RELEASE_MEM_GCR_GLM_WB \
                      | self.pm4.PACKET3_RELEASE_MEM_GCR_GLM_INV | self.pm4.PACKET3_RELEASE_MEM_GCR_GL2_WB | self.pm4.PACKET3_RELEASE_MEM_GCR_SEQ)
@@ -131,6 +157,10 @@ class AMDComputeQueue(HWQueue):
     return self
 
   def memory_barrier(self):
+    # Direct Polaris uses UC VMID0 GART mappings plus CPU/HDP barriers. Its
+    # ACQUIRE_MEM packet wedges MEC, and the proven gfx8 path emits no such
+    # packet. KFD queues keep their normal shader/cache barrier.
+    if self.dev.target[0] == 8: return self if self.dev.is_am() else self.acquire_mem()
     pf = '0' if self.nbio.version[:2] != (7, 11) else '1'
     self.wait_reg_mem(reg=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ').addr[0],
                       reg_done=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE').addr[0], value=0xffffffff)
@@ -320,7 +350,10 @@ class AMDComputeQueue(HWQueue):
   def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
     self.bind_args_state(args_state)
 
-    self.acquire_mem(gli=0, gl2=0)
+    # The direct VI VMID0 path uses UC GART mappings and CPU-side barriers.
+    # Its ACQUIRE_MEM hangs before DISPATCH, while the gfx8 reference path does
+    # not emit this packet. KFD queues retain the normal barrier.
+    if self.dev.target[0] != 8 or not self.dev.is_am(): self.acquire_mem(gli=0, gl2=0)
 
     user_regs = []
     if prg.enable_private_segment_sgpr:
@@ -328,7 +361,15 @@ class AMDComputeQueue(HWQueue):
       scratch_hilo = data64_le(prg.dev.scratch.va_addr)
       # sgpr word1 bit31 enables swizzle
       # sgpr word3 = 0x14 << 12 | 2 << 28 | 2 << 21 | 1 << 23
-      user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x20c14000]
+      if prg.dev.target[0] == 8 and prg.private_segment_size == 0:
+        user_regs = [0, 0, 0, 0]
+      elif prg.dev.target[0] == 8:
+        rsrc3 = hsa.union_SQ_BUF_RSRC_WORD3_bitfields(DST_SEL_X=hsa.SQ_SEL_X, DST_SEL_Y=hsa.SQ_SEL_Y, DST_SEL_Z=hsa.SQ_SEL_Z,
+          DST_SEL_W=hsa.SQ_SEL_W, NUM_FORMAT=hsa.BUF_NUM_FORMAT_UINT, DATA_FORMAT=hsa.BUF_DATA_FORMAT_32,
+          ELEMENT_SIZE=1, INDEX_STRIDE=3, ADD_TID_ENABLE=1, TYPE=hsa.SQ_RSRC_BUF)
+        user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, int.from_bytes(rsrc3, 'little')]
+      else:
+        user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x20c14000]
 
     if prg.enable_dispatch_ptr:
       dp = (dp_t:=hsa.hsa_kernel_dispatch_packet_t).from_address(int((disp_buf:=args_state.buf.offset(prg.kernargs_segment_size)).va_addr))
@@ -346,22 +387,25 @@ class AMDComputeQueue(HWQueue):
     self.wreg(self.gc.regCOMPUTE_PGM_LO, *data64_le(prg.prog_addr >> 8))
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, prg.rsrc1, prg.rsrc2)
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, prg.rsrc3)
-    self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, prg.dev.tmpring_size)
+    self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, 0 if prg.dev.target[0] == 8 else prg.dev.tmpring_size)
 
     # this is what llvm refers to as "architected flat scratch"
-    for xcc_id in range(self.dev.xccs):
-      with self.pred_exec(xcc_mask=1<<xcc_id):
-        scratch_base = prg.dev.scratch.va_addr + (prg.dev.scratch.size // self.dev.xccs * xcc_id)
-        self.wreg(self.gc.regCOMPUTE_DISPATCH_SCRATCH_BASE_LO, *data64_le(scratch_base >> 8))
+    if self.dev.target[0] > 8:
+      for xcc_id in range(self.dev.xccs):
+        with self.pred_exec(xcc_mask=1<<xcc_id):
+          scratch_base = prg.dev.scratch.va_addr + (prg.dev.scratch.size // self.dev.xccs * xcc_id)
+          self.wreg(self.gc.regCOMPUTE_DISPATCH_SCRATCH_BASE_LO, *data64_le(scratch_base >> 8))
 
-    self.wreg(self.gc.regCOMPUTE_RESTART_X, 0, 0, 0)
+    if self.dev.target[0] > 8: self.wreg(self.gc.regCOMPUTE_RESTART_X, 0, 0, 0)
     self.wreg(self.gc.regCOMPUTE_USER_DATA_0, *user_regs)
     self.wreg(self.gc.regCOMPUTE_RESOURCE_LIMITS, waves_per_sh=getenv("WAVES_PER_SH"))
-    self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *local_size, 0, 0)
+    self.wreg(self.gc.regCOMPUTE_START_X, 0, 0, 0, *local_size, *((0, 0) if self.dev.target[0] > 8 else ()))
 
-    self.pkt3(self.pm4.PACKET3_DISPATCH_DIRECT, *global_size,
-              self.gc.regCOMPUTE_DISPATCH_INITIATOR.encode(**({'cs_w32_en': int(prg.wave32)} if prg.dev.target[0] != 9 else {}),
-                                                           force_start_at_000=1, compute_shader_en=1))
+    dispatch_header = self.pm4.PACKET3(self.pm4.PACKET3_DISPATCH_DIRECT, 3)
+    if prg.dev.target[0] == 8: dispatch_header |= 1 << 1  # PACKET3_SHADER_TYPE_S: compute on GFX8
+    self.q(dispatch_header, *global_size,
+           self.gc.regCOMPUTE_DISPATCH_INITIATOR.encode(**({'cs_w32_en': int(prg.wave32)} if prg.dev.target[0] > 9 else {}),
+                                                        force_start_at_000=1, compute_shader_en=1))
 
     if prg.dev.sqtt_enabled: self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.THREAD_TRACE_MARKER) | self.pm4.EVENT_INDEX(0))
     self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
@@ -373,7 +417,7 @@ class AMDComputeQueue(HWQueue):
     with self.pred_exec(xcc_mask=0b1):
       self.release_mem(cache_flush=False) # ensure all prior writes are done
       self.release_mem(signal.timestamp_addr, 0, self.pm4.data_sel__mec_release_mem__send_gpu_clock_counter, self.pm4.int_sel__mec_release_mem__none)
-      self.acquire_mem() # ensure timestamp is written
+      if self.dev.target[0] != 8 or not self.dev.is_am(): self.acquire_mem() # ensure timestamp is written
     return self
 
   def write(self, b:HCQBuffer, val:sint, b64:bool=False):
@@ -413,6 +457,12 @@ class AMDComputeQueue(HWQueue):
       ib_ptr = dev.compute_queue.ring.addr + ((dev.compute_queue.put_value + 5 + ib_pad) % len(dev.compute_queue.ring)) * 4
       cmds = [self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), *data64_le(ib_ptr), len(cmds) | self.pm4.INDIRECT_BUFFER_VALID,
               self.pm4.PACKET3(self.pm4.PACKET3_NOP, ib_pad + len(cmds) - 1), *((0,) * ib_pad), *cmds]
+
+    # gfx_v8_0_ring_commit pads native VI MEC rings to a 256-dword boundary.
+    # Polaris firmware fetches commits on this granularity.
+    if dev.target[0] == 8:
+      pad = (-(dev.compute_queue.put_value + len(cmds))) & 0xff
+      cmds = [*cmds, *([self.pm4.PACKET3(self.pm4.PACKET3_NOP, 0x3fff)] * pad)]
 
     for i, value in enumerate(cmds): dev.compute_queue.ring[(dev.compute_queue.put_value + i) % len(dev.compute_queue.ring)] = value
 
@@ -650,7 +700,21 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
 
   def _do_map(self, buf:HCQBuffer): return self.dev.iface.map(buf._base if buf._base is not None else buf)
 
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    if isinstance(getattr(self.dev.iface, 'dev_impl', None), PolarisAMDev):
+      self.dev.synchronize()
+      dest.cpu_view().view(size=len(src), fmt='B')[:] = src.cast('B')
+      System.memory_barrier()
+      self.dev.iface.dev_impl.gmc.flush_hdp()
+      return
+    return super()._copyin(dest, src)
+
   def _copyout(self, dest:memoryview, src:HCQBuffer):
+    if isinstance(getattr(self.dev.iface, 'dev_impl', None), PolarisAMDev):
+      self.dev.synchronize()
+      self.dev.iface.dev_impl.gmc.flush_hdp()
+      dest.cast('B')[:] = src.cpu_view().view(size=len(dest), fmt='B')[:]
+      return
     if not self.dev.is_usb(): return super()._copyout(dest, src)
     self.dev.synchronize()
 
@@ -693,6 +757,7 @@ class KFDIface:
   event_page:HCQBuffer|None = None
   gpus:list[FileIOInterface] = []
   count:int = 0
+  gfx8_va_allocator = BumpAllocator(size=(1 << 36) - (1 << 32), base=1 << 32, wrap=False)
 
   def _is_usable_gpu(self, gpu_id):
     with contextlib.suppress(OSError): return int(gpu_id.read()) != 0
@@ -716,9 +781,17 @@ class KFDIface:
     self.props = {(p:=l.split())[0]: int(p[1]) for l in FileIOInterface(f"{kfd_topo_path}/{KFDIface.gpus[device_id]}/properties").read().splitlines()}
     self.dev_sysfs_path = f"/sys/class/drm/renderD{self.props['drm_render_minor']}/device"
     ip_base = f"{self.dev_sysfs_path}/ip_discovery/die/0"
-    id2ip = {am.GC_HWID: am.GC_HWIP, am.SDMA0_HWID: am.SDMA0_HWIP, am.NBIF_HWID: am.NBIF_HWIP}
-    ip_hw = [(id2ip[int(hwid)], int(hwid)) for hwid in FileIOInterface(ip_base).listdir() if hwid.isnumeric() and int(hwid) in id2ip]
-    self.ip_versions = {ip:tuple(int(FileIOInterface(f'{ip_base}/{hw}/0/{part}').read()) for part in ['major','minor','revision']) for ip,hw in ip_hw}
+    if FileIOInterface.exists(ip_base):
+      id2ip = {am.GC_HWID: am.GC_HWIP, am.SDMA0_HWID: am.SDMA0_HWIP, am.NBIF_HWID: am.NBIF_HWIP}
+      ip_hw = [(id2ip[int(hwid)], int(hwid)) for hwid in FileIOInterface(ip_base).listdir() if hwid.isnumeric() and int(hwid) in id2ip]
+      self.ip_versions = {
+        ip:tuple(int(FileIOInterface(f'{ip_base}/{hw}/0/{part}').read()) for part in ['major','minor','revision']) for ip,hw in ip_hw}
+    elif self.props['gfx_target_version'] == 80003:
+      # Polaris10 (RX 470/480/570/580) has no ip_discovery sysfs tree. These versions
+      # come from the gfx8 kernel driver and are only used to select legacy packet layouts.
+      self.ip_versions = {am.GC_HWIP:(8,0,3), am.SDMA0_HWIP:(3,0,0), am.NBIF_HWIP:(5,0,0)}
+    else:
+      raise RuntimeError(f"AMD IP discovery is unavailable for gfx target {self.props['gfx_target_version']}")
     self.drm_fd = FileIOInterface(f"/dev/dri/renderD{self.props['drm_render_minor']}", os.O_RDWR)
 
     self.kfd_ver = ((ver_st:=kfd.AMDKFD_IOC_GET_VERSION(KFDIface.kfd)).major_version, ver_st.minor_version)
@@ -746,7 +819,10 @@ class KFDIface:
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, cpu_addr=None) -> HCQBuffer:
     flags = kfd.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
 
-    if uncached: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | kfd.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED | kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT
+    # Polaris generally has no host-visible VRAM BAR. Keep CPU-visible buffers in coherent GTT;
+    # this also supplies the compute-copy fallback while SDMA3 packet support is unavailable.
+    if uncached or (self.props['gfx_target_version'] == 80003 and cpu_access):
+      flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | kfd.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED | kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT
     else: flags |= (kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR if host else kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
 
     # Make mapped cpu address to be uncachable
@@ -754,9 +830,15 @@ class KFDIface:
 
     if cpu_access or host: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
 
+    # GFX8 KFD only accepts the low 64 GiB GPUVM aperture. Reserve exact, non-overlapping
+    # addresses there instead of letting Linux fall back from a low hint to its usual high VA.
+    is_gfx8 = self.props['gfx_target_version'] == 80003 and cpu_addr is None
+    va_hint = KFDIface.gfx8_va_allocator.alloc(round_up(size, mmap.PAGESIZE), mmap.PAGESIZE) if is_gfx8 else 0
+    mmap_flags = MAP_FIXED_NOREPLACE if is_gfx8 else 0
     if flags & kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR:
-      buf = addr = cpu_addr or FileIOInterface.anon_mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS, 0)
-    else: buf, addr = 0, FileIOInterface.anon_mmap(0, size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_NORESERVE, 0)
+      buf = addr = cpu_addr or FileIOInterface.anon_mmap(va_hint, size, mmap.PROT_READ | mmap.PROT_WRITE,
+                                                        mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | mmap_flags, 0)
+    else: buf, addr = 0, FileIOInterface.anon_mmap(va_hint, size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_NORESERVE | mmap_flags, 0)
 
     try: mem = kfd.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU(self.kfd, va_addr=addr, size=size, gpu_id=self.gpu_id, flags=flags, mmap_offset=buf)
     except OSError as e:
@@ -798,12 +880,15 @@ class KFDIface:
       write_pointer_address=gart.va_addr+wptr, read_pointer_address=gart.va_addr+rptr+8*xcc_id)
 
     if not hasattr(self, 'doorbells'):
-      self.doorbells_base = queue.doorbell_offset & (~0x1fff) # doorbell is two pages
-      self.doorbells = cast(FileIOInterface, KFDIface.kfd).mmap(0, 0x2000, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.doorbells_base)
+      doorbell_size = 0x1000 if self.props['gfx_target_version'] == 80003 else 0x2000
+      self.doorbells_base = queue.doorbell_offset & -doorbell_size
+      self.doorbells = cast(FileIOInterface, KFDIface.kfd).mmap(
+        0, doorbell_size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.doorbells_base)
 
     return AMDQueueDesc(ring=MMIOInterface(ring.va_addr, ring.size, fmt='I'), read_ptr=MMIOInterface(queue.read_pointer_address, 8, fmt='Q'),
                         write_ptr=MMIOInterface(queue.write_pointer_address, 8, fmt='Q'),
-                        doorbell=MMIOInterface(self.doorbells + queue.doorbell_offset - self.doorbells_base, 8, fmt='Q'))
+                        doorbell=MMIOInterface(self.doorbells + queue.doorbell_offset - self.doorbells_base,
+                                              4 if doorbell_size == 0x1000 else 8, fmt='I' if doorbell_size == 0x1000 else 'Q'))
 
   def sleep(self, tm:int):
     kfd.AMDKFD_IOC_WAIT_EVENTS(KFDIface.kfd, events_ptr=self.queue_event_arr_ptr, num_events=3, wait_for_all=0, timeout=tm)
@@ -843,11 +928,31 @@ class KFDIface:
 
 class PCIIface(PCIIfaceBase):
   def __init__(self, dev, dev_id):
-    super().__init__(dev, dev_id, vendor=0x1002, devices=((0xffff, (0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0)),), vram_bar=0,
-      va_start=AMMemoryManager.va_allocator.base, va_size=AMMemoryManager.va_allocator.size, dev_impl_t=AMDev)
+    devices = ((0xffff, (0x67df,0x74a1,0x744c,0x7480,0x7550,0x7551,0x7590,0x75a0)),)
+    try: pci_cls, pcibus = (visible:=hcq_filter_visible_devices(System.list_devices(0x1002, devices), "AMD"))[dev_id]
+    except IndexError: raise RuntimeError(f"AMD:{dev_id} does not exist ({pluralize('device', len(visible))} available)")
+    is_polaris = not pcibus.startswith("remote:") and \
+      int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/device").read(), 16) == 0x67df
+    if is_polaris and not getenv("AMD_POLARIS_EXPERIMENTAL"):
+      raise RuntimeError("Direct Polaris AM is experimental and its HQD ring fetch is not yet safe; "
+                         "use the default KFD interface, or set AMD_POLARIS_EXPERIMENTAL=1 for bring-up only")
+    self.pci_dev = pci_cls("AM", pcibus, remove_siblings=False) if is_polaris and pci_cls is PCIDevice else pci_cls("AM", pcibus)
+    self.dev, self.vram_bar, self.count = dev, 0, len(visible)
+    if is_polaris:
+      self.dev_impl = PolarisAMDev(self.pci_dev)
+      # Reuse Linux's hot-boot GART with fresh host pages. The passing allbilly
+      # RX570 path likewise uses host-backed ring, shader and data allocations.
+      gart_base = self.dev_impl.gart_size // 2
+      self._polaris_alloc = TLSFAllocator(self.dev_impl.gart_size - gart_base, base=gart_base)
+      self._polaris_internal:list[HCQBuffer] = []
+    else:
+      if self.is_local(): System.reserve_va(AMMemoryManager.va_allocator.base, AMMemoryManager.va_allocator.size)
+      with contextlib.suppress(Exception): self.pci_dev.resize_bar(0)
+      self.dev_impl = AMDev(self.pci_dev)
     self._compute_props()
 
   def p2p_paddrs(self, paddrs:list[tuple[int,int]]) -> tuple[list[tuple[int,int]], AddrSpace]:
+    if isinstance(self.dev_impl, PolarisAMDev): raise RuntimeError("P2P is not supported on the Polaris small-BAR backend")
     return ([(self.dev_impl.paddr2xgmi(p), sz) for p, sz in paddrs], AddrSpace.PEER) if self.dev_impl.is_hive() else super().p2p_paddrs(paddrs)
 
   def require_profile_mode(self): return True
@@ -855,6 +960,13 @@ class PCIIface(PCIIfaceBase):
 
   def _compute_props(self):
     self.ip_versions = self.dev_impl.ip_ver
+    if isinstance(self.dev_impl, PolarisAMDev):
+      # Polaris10 has four shader arrays with eight CUs each. Each CU has four
+      # SIMD16s, represented in KFD's legacy topology as two SIMD pairs.
+      self.props = {'cu_per_simd_array':8, 'simd_count':64, 'simd_per_cu':2, 'array_count':4,
+        'max_slots_scratch_cu':32, 'max_waves_per_simd':10, 'simd_arrays_per_engine':2,
+        'lds_size_in_kb':64, 'num_xcc':1, 'gfx_target_version':80003}
+      return
 
     gfxver = int(f"{self.dev_impl.ip_ver[am.GC_HWIP][0]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][1]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][2]:02d}")
     if self.dev_impl.gc_info.header.version_major == 2:
@@ -875,6 +987,16 @@ class PCIIface(PCIIfaceBase):
     assert cwsr_buffer is None, "no cwsr buffer for am"
 
     rcvr_params: tuple
+    if isinstance(self.dev_impl, PolarisAMDev):
+      if queue_type == kfd.KFD_IOC_QUEUE_TYPE_SDMA: raise RuntimeError("Polaris SDMA3 is not implemented")
+      mqd = self.alloc(0x1000, uncached=True, cpu_access=True)
+      self._polaris_internal.append(mqd)
+      doorbell_index = self.dev_impl.gfx.setup_ring(*(rcvr_params:=(int(ring.va_addr), ring.size, int(gart.va_addr)+rptr,
+        int(gart.va_addr)+wptr, int(eop_buffer.va_addr), eop_buffer.size, False, False, int(mqd.va_addr), mqd.cpu_view())))
+      return AMDQueueDesc(ring=ring.cpu_view().view(fmt='I'),
+        doorbell=self.dev_impl.doorbell32.view(doorbell_index * 4, 4, fmt='I'), put_value=0,
+        read_ptr=gart.cpu_view().view(offset=rptr, size=8, fmt='Q'),
+        write_ptr=gart.cpu_view().view(offset=wptr, size=8, fmt='Q'), params=rcvr_params)
     if queue_type == kfd.KFD_IOC_QUEUE_TYPE_SDMA:
       doorbell_index = self.dev_impl.sdma.setup_ring(*(rcvr_params:=(ring.va_addr, ring.size, gart.va_addr+rptr, gart.va_addr+wptr, idx)))
     else:
@@ -884,7 +1006,28 @@ class PCIIface(PCIIfaceBase):
     return AMDQueueDesc(ring=ring.cpu_view().view(fmt='I'), doorbell=self.dev_impl.doorbell64.view(doorbell_index * 8, 8, fmt='Q'), put_value=0,
       read_ptr=gart.cpu_view().view(offset=rptr, size=8, fmt='Q'), write_ptr=gart.cpu_view().view(offset=wptr, size=8, fmt='Q'), params=rcvr_params)
 
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
+    if not isinstance(self.dev_impl, PolarisAMDev):
+      return super().alloc(size, host=host, uncached=uncached, cpu_access=cpu_access, contiguous=contiguous, force_devmem=force_devmem, **kwargs)
+    size = round_up(size, 0x1000)
+    off = self._polaris_alloc.alloc(size, 0x1000)
+    view, paddrs = self.pci_dev.alloc_sysmem(size)
+    self.dev_impl.map_gart(off, paddrs)
+    return HCQBuffer(self.dev_impl.gart_start + off, size, meta=PolarisAllocationMeta(off, view.addr), view=view, owner=self.dev)
+
+  def free(self, mem):
+    if not isinstance(self.dev_impl, PolarisAMDev): return super().free(mem)
+    self.dev_impl.unmap_gart(mem.meta.off, mem.size)
+    self._polaris_alloc.free(mem.meta.off)
+    FileIOInterface.munmap(mem.meta.cpu_addr, mem.size)
+
+  def map(self, mem):
+    if not isinstance(self.dev_impl, PolarisAMDev): return super().map(mem)
+    if mem.owner is self.dev: return mem
+    raise RuntimeError("External mappings are not supported on the Polaris small-BAR backend")
+
   def _collect_interrupts(self, reset=False, drain_only=False):
+    if isinstance(self.dev_impl, PolarisAMDev): return
     devs:list[AMDDevice] = [d for pg in HCQCompiled.peer_groups.values() for d in pg if isinstance(d, AMDDevice) and d.is_am()]
     for d in devs:
       if drain_only: d.iface.dev_impl.ih.drain()
@@ -897,6 +1040,12 @@ class PCIIface(PCIIfaceBase):
         d.error_state = None
 
   def sleep(self, timeout):
+    if isinstance(self.dev_impl, PolarisAMDev):
+      # Polaris interrupts remain owned by Linux's boot path. HCQ waits poll its
+      # timeline signal, so a short sleep avoids a busy loop without using IH.
+      import time
+      time.sleep(min(timeout, 1) / 1000)
+      return
     if hasattr(self.pci_dev, 'irq_poller') and self.pci_dev.irq_poller is not None and (events_cnt:=len(self.pci_dev.irq_poller.poll(timeout))):
       self.pci_dev.irq_fd.read(8 * events_cnt)
     self._collect_interrupts()
@@ -951,34 +1100,36 @@ class AMDDevice(HCQCompiled):
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
-    assert (self.target in ((9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
+    assert (self.target in ((8,0,3),(9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 
     self.xccs = self.iface.props.get('num_xcc', 1)
     self.se_cnt = self.iface.props['array_count'] // self.iface.props['simd_arrays_per_engine'] // self.xccs
     self.cu_cnt = self.iface.props['simd_count'] // self.iface.props['simd_per_cu'] // self.xccs
     self.waves_per_cu = self.iface.props['max_waves_per_simd'] * self.iface.props['simd_per_cu']
-    self.wave_cnt = (self.cu_cnt * self.waves_per_cu) if self.target[0] != 9 else min(self.cu_cnt * 40, self.se_cnt * self.xccs * 512)
+    self.wave_cnt = (self.cu_cnt * self.waves_per_cu) if self.target[0] > 9 else min(self.cu_cnt * 40, self.se_cnt * self.xccs * 512)
 
     # https://gitlab.freedesktop.org/agd5f/linux/-/blob/a1fc9f584c4aaf8bc1ebfa459fc57a3f26a290d8/drivers/gpu/drm/amd/amdkfd/kfd_queue.c#L391
     sgrp_size_per_cu, hwreg_size_per_cu = 0x4000, 0x1000
     lds_size_per_cu = self.iface.props["lds_size_in_kb"] << 10 if self.target[:2] == (9,5) else 0x10000
     vgpr_size_per_cu = 0x60000 if self.target in {(11,0,0), (11,0,1), (11,5,1), (12,0,0), (12,0,1)} else 0x80000 if self.target[0] == 9 else 0x40000
     wg_data_size = round_up((vgpr_size_per_cu + sgrp_size_per_cu + lds_size_per_cu + hwreg_size_per_cu) * self.cu_cnt, mmap.PAGESIZE)
-    ctl_stack_size = round_up((12 if self.target[0] != 9 else 8) * self.wave_cnt + 8 + 40, mmap.PAGESIZE)
+    ctl_stack_size = round_up((12 if self.target[0] > 9 else 8) * self.wave_cnt + 8 + 40, mmap.PAGESIZE)
     debug_memory_size = round_up(self.wave_cnt * 32, 64)
 
-    self.ip_off = importlib.import_module(f"tinygrad.runtime.autogen.am.{'vega' if self.target[0] == 9 else 'navi'}_offsets")
-    self.soc = import_soc(self.target)
-    self.pm4 = importlib.import_module(f"tinygrad.runtime.autogen.am.pm4_{'soc15' if self.target[0] == 9 else 'nv'}")
-    self.sdma = import_module('sdma', min(self.iface.ip_versions[am.SDMA0_HWIP], (6, 0, 0)))
-    self.gc = AMDIP('gc', self.iface.ip_versions[am.GC_HWIP],
-                    bases={i: tuple(getattr(self.ip_off, f'GC_BASE__INST{i}_SEG{s}', 0) for s in range(6)) for i in range(6)})
+    self.ip_off = importlib.import_module(f"tinygrad.runtime.autogen.am.{'vega' if self.target[0] <= 9 else 'navi'}_offsets")
+    self.soc = import_soc((9,0,0) if self.target[0] == 8 else self.target)
+    self.pm4 = importlib.import_module(f"tinygrad.runtime.autogen.am.pm4_{'soc15' if self.target[0] <= 9 else 'nv'}")
+    # The bundled SDMA packet definitions start at SDMA4/GFX9. Polaris copies use compute until SDMA3 is generated.
+    self.sdma = None if self.target[0] == 8 else import_module('sdma', min(self.iface.ip_versions[am.SDMA0_HWIP], (6, 0, 0)))
+    self.gc:Any = GFX8GC() if self.target[0] == 8 else AMDIP('gc', self.iface.ip_versions[am.GC_HWIP],
+      bases={i: tuple(getattr(self.ip_off, f'GC_BASE__INST{i}_SEG{s}', 0) for s in range(6)) for i in range(6)})
 
     self.nbio = AMDIP('nbio' if self.target[0] < 12 else 'nbif', self.iface.ip_versions[am.NBIF_HWIP],
                       bases={i: tuple(getattr(self.ip_off, f'NBIO_BASE__INST{i}_SEG{s}', 0) for s in range(9)) for i in range(6)})
 
-    self.is_aql = getenv("AMD_AQL", int(self.xccs > 1))
+    # GFX8 uses the native compute queue: its firmware does not support the newer vendor AQL PM4 packets.
+    self.is_aql = False if self.target[0] == 8 else getenv("AMD_AQL", int(self.xccs > 1))
     if self.is_aql:
       self.pm4_ibs = self.iface.alloc(0x2000 if self.is_usb() else (16 << 20), uncached=True, cpu_access=True)
       self.pm4_ib_alloc = BumpAllocator(self.pm4_ibs.size, wrap=True)
@@ -991,7 +1142,8 @@ class AMDDevice(HCQCompiled):
     self.sdma_queues:dict = {}
     self.has_sdma_queue = self.sdma_queue(0) is not None
 
-    super().__init__(device, AMDAllocator(self), [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer], AMDProgram, AMDSignal,
+    renderers:list[type[Renderer]] = [AMDLLVMRenderer] if self.target[0] == 8 else [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer]
+    super().__init__(device, AMDAllocator(self), renderers, AMDProgram, AMDSignal,
                      functools.partial(AMDComputeAQLQueue if self.is_aql else AMDComputeQueue, self),
                      functools.partial(AMDCopyQueue, self, max_copy_size=self.max_copy_size) if self.has_sdma_queue else None,
                      kernargs_size=(8 << 10) if self.is_usb() else (16 << 20), sigalloc_size=0x100 if self.is_usb() else 0x1000,
@@ -1001,7 +1153,7 @@ class AMDDevice(HCQCompiled):
     self.max_private_segment_size = 0
     self._ensure_has_local_memory(128) # set default scratch size to 128 bytes per thread
 
-    self.pmc_enabled:bool = PROFILE > 0 and PMC > 0
+    self.pmc_enabled:bool = self.target[0] >= 9 and PROFILE > 0 and PMC > 0
     if self.pmc_enabled:
       self.iface.require_profile_mode()
 
@@ -1019,7 +1171,7 @@ class AMDDevice(HCQCompiled):
       self.allocator._copyin(self.pmc_buffer, memoryview(bytearray(self.pmc_buffer.size))) # zero pmc buffers, some counters have only lo part.
 
     # SQTT is disabled by default because of runtime overhead and big file sizes (~200mb to Tensor.full() two 4096x4096 tensors and matmul them)
-    self.sqtt_enabled:bool = PROFILE > 0 and SQTT > 0
+    self.sqtt_enabled:bool = self.target[0] >= 9 and PROFILE > 0 and SQTT > 0
     if self.sqtt_enabled:
       self.iface.require_profile_mode()
 
@@ -1048,7 +1200,7 @@ class AMDDevice(HCQCompiled):
             ctx_save_restore_size=ctx_save_restore_size, ctl_stack_size=ctl_stack_size, idx=idx))
 
   def sdma_queue(self, idx:int):
-    if getenv("AMD_DISABLE_SDMA"): return None
+    if self.target[0] == 8 or getenv("AMD_DISABLE_SDMA"): return None
     if idx in self.sdma_queues: return self.sdma_queues[idx]
     with contextlib.suppress(OSError):
       self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x200 if self.is_usb() else (16 << 20), idx=idx)
@@ -1058,7 +1210,7 @@ class AMDDevice(HCQCompiled):
     if self.max_private_segment_size >= private_segment_size: return
 
     lanes_per_wave = 64 # wave64
-    mem_alignment_size = 256 if self.target[0] != 9 else 1024
+    mem_alignment_size = 256 if self.target[0] > 9 else 1024
     size_per_thread = round_up(private_segment_size, mem_alignment_size // lanes_per_wave)
     size_per_xcc = size_per_thread * lanes_per_wave * self.iface.props['max_slots_scratch_cu'] * self.cu_cnt
     self.scratch, ok = self._realloc(getattr(self, 'scratch', None), size_per_xcc * self.xccs)
@@ -1066,18 +1218,18 @@ class AMDDevice(HCQCompiled):
       # NOTE: xcc logic is correct only for GFX9.
       max_scratch_waves = self.cu_cnt * self.iface.props['max_slots_scratch_cu'] * self.xccs
       wave_scratch = ceildiv(lanes_per_wave * size_per_thread, mem_alignment_size)
-      num_waves = (size_per_xcc // (wave_scratch * mem_alignment_size)) // (self.se_cnt if self.target[0] != 9 else 1)
+      num_waves = (size_per_xcc // (wave_scratch * mem_alignment_size)) // (self.se_cnt if self.target[0] > 9 else 1)
 
-      tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
+      tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] > 9 else ""}_bitfields')
       self.tmpring_size = int.from_bytes(tmpring_t(WAVES=min(num_waves, max_scratch_waves), WAVESIZE=wave_scratch), 'little')
       self.max_private_segment_size = private_segment_size
 
       if hasattr(self, 'aql_desc'):
         gfx9_rsrc = {'NUM_FORMAT':hsa.BUF_NUM_FORMAT_UINT, 'DATA_FORMAT':hsa.BUF_DATA_FORMAT_32, 'ELEMENT_SIZE':1, 'INDEX_STRIDE':3}
         rsrc = {'DST_SEL_X':hsa.SQ_SEL_X, 'DST_SEL_Y':hsa.SQ_SEL_Y, 'DST_SEL_Z':hsa.SQ_SEL_Z, 'DST_SEL_W':hsa.SQ_SEL_W, 'ADD_TID_ENABLE':1,
-                'TYPE':hsa.SQ_RSRC_BUF, **(gfx9_rsrc if self.target[0] == 9 else {'FORMAT':hsa.BUF_FORMAT_32_UINT, 'OOB_SELECT':2})}
-        rsrc1_t = getattr(hsa, f'union_SQ_BUF_RSRC_WORD1{"_GFX11" if self.target[0] != 9 else ""}_bitfields')
-        rsrc3_t = getattr(hsa, f'union_SQ_BUF_RSRC_WORD3{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
+                'TYPE':hsa.SQ_RSRC_BUF, **(gfx9_rsrc if self.target[0] <= 9 else {'FORMAT':hsa.BUF_FORMAT_32_UINT, 'OOB_SELECT':2})}
+        rsrc1_t = getattr(hsa, f'union_SQ_BUF_RSRC_WORD1{"_GFX11" if self.target[0] > 9 else ""}_bitfields')
+        rsrc3_t = getattr(hsa, f'union_SQ_BUF_RSRC_WORD3{"_GFX"+str(self.target[0]) if self.target[0] > 9 else ""}_bitfields')
 
         self.aql_desc.scratch_backing_memory_location = int(self.scratch.va_addr)
         self.aql_desc.scratch_wave64_lane_byte_size = self.max_private_segment_size * lanes_per_wave // 64

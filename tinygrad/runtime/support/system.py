@@ -1,5 +1,6 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, select, contextlib, dataclasses, sys, itertools, struct, socket, subprocess, time, enum, atexit
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, itertools
+import struct, socket, subprocess, time, enum, atexit
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, unwrap, fetch, system, _ensure_downloads_dir, DEBUG, flatten, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio, iokit, corefoundation
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, HCQBuffer, hcq_filter_visible_devices
@@ -154,7 +155,7 @@ System = _System()
 # *** PCI Devices
 
 class PCIDevice:
-  def __init__(self, devpref:str, pcibus:str):
+  def __init__(self, devpref:str, pcibus:str, remove_siblings:bool=True):
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
     self.pcibus, self.irq_poller = pcibus, None
 
@@ -165,9 +166,11 @@ class PCIDevice:
       FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver/unbind", os.O_WRONLY).write(self.pcibus)
     if FileIOInterface.exists(f"/sys/bus/pci/devices/{self.pcibus}/driver"): raise RuntimeError(f"Driver is bound to {pcibus}")
 
-    # remove sibling functions of the gpu, if any
-    for fn in range(1, 8):
-      if FileIOInterface.exists(sib:=f"/sys/bus/pci/devices/{self.pcibus[:-1]}{fn}"): FileIOInterface(f"{sib}/remove", os.O_WRONLY).write("1")
+    # Some reset-oriented backends need the whole slot. Hot-takeover backends can
+    # preserve unrelated sibling functions (for example the Polaris HDMI audio function).
+    if remove_siblings:
+      for fn in range(1, 8):
+        if FileIOInterface.exists(sib:=f"/sys/bus/pci/devices/{self.pcibus[:-1]}{fn}"): FileIOInterface(f"{sib}/remove", os.O_WRONLY).write("1")
 
     if getenv("VFIO", 0) and (vfio_fd:=System.vfio) is not None:
       FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver_override", os.O_WRONLY).write("vfio-pci")
