@@ -51,6 +51,10 @@ odd-`pi/2` poles. A combined sine/cosine/tangent run passes **3/3 in 78.68
 seconds**, and the deterministic wide tangent tensor has **0/2925 misses**.
 The complete hardware file remains at **68 passed, 2 failed in 208.47
 seconds**; only fill-full and fill-zero fail, both returning ones.
+`TestOps.test_exp` now passes unchanged: **1 passed in 12.93 seconds**.
+Integer inputs are promoted to float32 before the exponential decomposition,
+and the existing two-LUT IEEE restoration path now accepts fp32 source indexes.
+A combined exp/exp2 run passes **2/2 in 19.95 seconds**.
 
 ## Summary
 
@@ -97,10 +101,10 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
-### 4. Remaining transcendental ops — ~11 tests
-Exp, sinh, cosh, sigmoid_extreme.
+### 4. Remaining transcendental ops — ~10 tests
+Sinh, cosh, sigmoid_extreme.
 
-**Tests:** test_exp, test_sinh, test_cosh, test_sigmoid*
+**Tests:** test_sinh, test_cosh, test_sigmoid_extreme (gradient-only failure)
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -157,6 +161,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - tanh, including ordinary interior precision and extreme/special values
 - tangent, including both ordinary ranges, scalar, IEEE specials, and float32
   periodic angles through `±1,000,000`
+- exp and exp2, including integer scalar typing and IEEE specials
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values

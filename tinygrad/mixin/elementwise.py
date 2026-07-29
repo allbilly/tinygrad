@@ -506,7 +506,7 @@ class ElementwiseMixin(CreationMixin):
     """
     if self.is_floating_point():
       return self.cast(least_upper_dtype(self.dtype, dtypes.float32)).mul(1/math.log(2)).exp2().cast(self.dtype)
-    return self.mul(1/math.log(2)).exp2()
+    return self.cast(dtypes.float).exp()
 
   def log2(self) -> Self:
     """

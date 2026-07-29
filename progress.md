@@ -4733,3 +4733,21 @@ addresses and produces **0/2925 misses** on the wide tensor.
 - Mypy remains at the same 13 pre-existing findings. System Ruff now reports
   the same five pre-existing findings after the tangent-local semicolon was
   reformatted. `.venv` still lacks Ruff and pytest-xdist; NPU tests are serial.
+
+## 2026-07-29 — exponential forward milestone
+
+`TestOps.test_exp` now passes unchanged: **1 passed in 12.93 seconds**. The
+ordinary tensor already used the existing two-LUT Q12-plus-residual path; two
+later subcases had been hidden by the first assertion:
+
+- `Tensor(2).exp()` returned fp16 while PyTorch's floating scalar reference is
+  float32. Like the earlier integer-cosine fix, integer exponential now casts
+  to `dtypes.float` before recursively applying the floating implementation.
+- Explicit fp32 `+inf`, `-inf`, and NaN bypassed
+  `_try_exp_correction_subtasks` because it accepted only fp16 source indexes.
+  The existing comparison repair, IEEE restoration, and fp32 output finalizer
+  already support float indexes, so the recognizer now accepts both.
+
+A combined Rockchip exp/exp2 regression passes **2/2 in 19.95 seconds**. A CPU
+check with `DEFAULT_FLOAT=HALF` confirms that integer exponential returns the
+backend-independent float32 value `7.389056`.

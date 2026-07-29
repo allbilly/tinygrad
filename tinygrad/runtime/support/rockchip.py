@@ -3415,7 +3415,7 @@ def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   inner = _unwrap(val.src[0])
   if inner.op is not Ops.MUL: return None
   source = next((_unwrap(x) for x in inner.src if _unwrap(x).op is Ops.INDEX), None)
-  if source is None or source.dtype is not dtypes.half: return None
+  if source is None or source.dtype not in (dtypes.half, dtypes.float): return None
   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
