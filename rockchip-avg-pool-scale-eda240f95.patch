@@ -1,0 +1,229 @@
+diff --git a/progress.md b/progress.md
+index 41c2c60d9..551af5f39 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5528,3 +5528,54 @@ layout or numerical regression.
+ 
+ No LUT is involved. The standalone patch is
+ `rockchip-cmac-k-3ab3f3291.patch`, against parent `3ab3f3291`.
++
++## 2026-07-29 — constant-divisor average-pooling milestone
++
++The real-device pooling refresh initially reported 12 passing cases and 71
++parameterized failures. The failures separated into average-pool rounding,
++local max-pool layout, and unpool/index scatter. Constant-divisor average
++pooling is now fixed as the first pooling milestone.
++
++The reduction was already a valid materialized CMAC sum, but the hardware BS
++scale path rounded the accumulator before multiplying by the reciprocal.
++That produced one-fp16-bit differences in roughly a third of outputs under
++the official strict `rtol=1e-5`. Materialized scale epilogues now bypass BS:
++the serialized task carries the fp32 scale, unpack multiplies the raw CACC
++fp32 value, and only then performs the final fp16 conversion.
++
++Padded average reductions appear in both forms:
++
++```text
++WHERE(valid, input, 0)
++WHERE(invalid, 0, input)
++```
++
++The materializer now normalizes either zero branch into a masked fp16 gather.
++The mask and index movement remain host-side; summation stays on CNA/CORE.
++This covers standard and asymmetric zero padding without adding arithmetic to
++the movement path.
++
++Current passing official methods/cases include:
++
++- all five ordinary `avg_pool2d` kernel variants plus its `(1,2)` padded
++  regression;
++- all nine standard-padding subtests;
++- all three asymmetric-padding subtests;
++- both ceil-mode output-size-reduction methods;
++- global average pooling.
++
++Focused validation is **6 official methods passing with 17 passing
++subtests**. The new exact padded-scale hardware regression passes, the CMAC
++class is **22/22 in 7.96 seconds**, and PR1 is **77/77 in 6.61 seconds**.
++Mypy remains at the same 13 pre-existing findings, targeted Ruff at the same
++five pre-existing findings, and `git diff --check` is clean.
++
++The remaining average-pool cases use output-dependent divisors:
++`padding_not_counted`, general `ceil_mode`, and their combination. They
++currently reject as `unsupported_op:fused_epilogue` and are the next
++average-pooling work. `avg_pool3d` cannot be evaluated in this configuration
++because Torch CPU itself raises `NotImplementedError` for half input before
++tinygrad executes.
++
++No LUT is used. The standalone patch is
++`rockchip-avg-pool-scale-eda240f95.patch`, against parent `eda240f95`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 98f7c1130..e553332a3 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -474,6 +474,19 @@ class TestCMAC(unittest.TestCase):
+     c = (a * 3).sum(axis=0).realize()
+     np.testing.assert_allclose(c.numpy(), (a_np * 3).sum(axis=0), rtol=1e-2, atol=1e-2)
+ 
++  def test_cmac_avg_pool_scale_and_padding(self):
++    np.random.seed(852)
++    x_np = np.random.uniform(-2, 2, size=(1, 2, 5, 6)).astype(np.float16)
++    x = Tensor(x_np, device="ROCKCHIP").realize()
++    actual = x.avg_pool2d(kernel_size=(3, 2), padding=(1, 0)).realize().numpy()
++    padded = np.pad(x_np, ((0, 0), (0, 0), (1, 1), (0, 0)))
++    expected = np.empty((1, 2, 2, 3), dtype=np.float16)
++    for oy in range(2):
++      for ox in range(3):
++        window = padded[:, :, oy*3:oy*3+3, ox*2:ox*2+2].astype(np.float32)
++        expected[:, :, oy, ox] = np.sum(window, axis=(2, 3), dtype=np.float32) * np.float32(1/6)
++    np.testing.assert_array_equal(actual, expected)
++
+   def test_cmac_matmul_non_identity(self):
+     a_np = np.array([[1,2],[3,4]], dtype=np.float16)
+     b_np = np.array([[5,6],[7,8]], dtype=np.float16)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 344b24156..b912e8c8b 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -105,6 +105,10 @@ class TestClassifier(unittest.TestCase):
+     b = Tensor.rand(4,dtype=dtypes.half).realize()
+     self.assertEqual(_classify(_get_sink(x.conv2d(w, b))), "cmac")
+ 
++  def test_cmac_avg_pool_scale_and_padding(self):
++    x = Tensor.rand(1,2,5,6,dtype=dtypes.half).realize()
++    self.assertEqual(_classify(_get_sink(x.avg_pool2d(kernel_size=(3,2), padding=(1,0)))), "cmac")
++
+   def test_ppu_max(self):
+     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+     self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index fc25eca21..9b96a4c58 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -409,3 +409,30 @@ buffers remain DMA-backed.
+ The historical `cmac_exceeds_cbuf` failure group must now be refreshed before
+ using its old count: N tiling, shared-axis serialization, and K tiling cover
+ the complete current dot/einsum selection.
++
++### Pooling refresh: constant-divisor average pooling
++
++The first current pooling run had 12 passing cases and 71 parameterized
++failures. Constant-divisor average pooling is now fixed:
++
++| Passing selection | Result |
++|---|---:|
++| Ordinary, standard/asymmetric padded, global, and two output-size edge methods | **6 methods** |
++| Passing parameterized subtests inside those methods | **17** |
++| CMAC hardware class | **22/22** |
++| Hardware-free PR1 file | **77/77** |
++
++Materialized CMAC applies reciprocal scale to raw fp32 CACC output before the
++single fp16 conversion. Zero-padded reduction bodies are accepted whether
++the zero is the true or false WHERE branch.
++
++Remaining average-pool work:
++
++- `padding_not_counted`;
++- general `ceil_mode`;
++- `ceil_mode` plus `count_include_pad=False`.
++
++Those use an output-dependent divisor and reject as
++`unsupported_op:fused_epilogue`. `avg_pool3d` is blocked earlier by Torch
++CPU's missing half implementation, independent of the Rockchip backend.
++Local max pooling and max-unpool/index scatter remain separate groups.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index d69978427..d84f4af98 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -136,7 +136,7 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
+     d[i] = _fp32_to_fp16(raw)
+ 
+ def _decode_materialized_cmac_layout(layout):
+-  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, tile_n, tile_k, *meta = layout
++  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, tile_n, tile_k, *meta = layout
+   assert tag == _CMAC_MATERIALIZED_LAYOUT
+   cursor = 0
+   n_loops = meta[cursor]
+@@ -172,8 +172,9 @@ def _decode_materialized_cmac_layout(layout):
+   cursor += 1+n_rounding
+   n_fixed_loops = meta[cursor]
+   fixed_loops = tuple((meta[cursor+1+2*i], meta[cursor+2+2*i]) for i in range(n_fixed_loops))
+-  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), loop_extents, reduce_extents, m_axes, n_axes, shared_axes,
+-          active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
++  scale = struct.unpack('<f', struct.pack('<I', scale_bits))[0]
++  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), scale, loop_extents, reduce_extents, m_axes, n_axes,
++          shared_axes, active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
+ 
+ def _eval_static_index(code, coords):
+   stack:list[int] = []
+@@ -230,7 +231,7 @@ def _set_linear_axes(coords, linear, axes, extents):
+ 
+ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded,
+                              m_start=0, rows=None, n_start=0, cols=None, k_start=0, k_count=None):
+-  _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
++  _, _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
+     _, fixed_loops, _, a_code, b_code = decoded
+   rows = M if rows is None else rows
+   cols = N if cols is None else cols
+@@ -279,7 +280,7 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
+ 
+ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
+                                   n_start=0, cols=None, packed_inputs=None):
+-  _, _, _, bias_slot, bias_axis, relu, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
++  _, _, _, bias_slot, bias_axis, relu, scale, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
+     _, fixed_loops, out_code, _, _ = decoded
+   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
+   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
+@@ -295,6 +296,9 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
+     if m < m_start or (rows is not None and m >= m_start+rows): continue
+     if n < n_start or (cols is not None and n >= n_start+cols): continue
+     raw = s[(m-m_start)*align_out+n-n_start]
++    if scale != 1.0:
++      value = struct.unpack('<f', struct.pack('<f', struct.unpack('<f', struct.pack('<I', raw))[0] * scale))[0]
++      raw = struct.unpack('<I', struct.pack('<f', value))[0]
+     if b is not None:
+       value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[coords[bias_axis]]))[0]
+       value = struct.unpack('<f', struct.pack('<f', value))[0]
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 253fe2791..c240f2e91 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1602,9 +1602,15 @@ def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
+   fp32 accumulation remain on CNA/CORE."""
+   body = _reduce_body(reduce)
+   outer_conditions:list[UOp] = []
+-  while body.op is Ops.WHERE and body.dtype is dtypes.float and body.src[2].op is Ops.CONST and body.src[2].arg is Invalid:
+-    outer_conditions.append(body.src[0])
+-    body = body.src[1]
++  def is_zero(u:UOp) -> bool:
++    return u.op is Ops.CONST and (u.arg is Invalid or float(u.arg) == 0.0)
++  while body.op is Ops.WHERE and body.dtype is dtypes.float and (is_zero(body.src[1]) or is_zero(body.src[2])):
++    if is_zero(body.src[2]):
++      outer_conditions.append(body.src[0])
++      body = body.src[1]
++    else:
++      outer_conditions.append(UOp(Ops.CMPNE, dtypes.bool, (body.src[0], UOp.const(dtypes.bool, True))))
++      body = body.src[2]
+     while body.op is Ops.CAST: body = body.src[0]
+   if body.op is Ops.MUL: a_val, b_val = (_unwrap(x) for x in body.src)
+   elif body.op is Ops.WHERE and body.dtype is dtypes.half:
+@@ -5920,7 +5926,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
+   if plan.epilogue == "relu":
+     # BS enabled, ReLU enabled (not bypassed), MUL bypassed, ALU bypassed
+     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1<<4)|(1<<1))  # 0x12
+-  elif plan.epilogue == "scale":
++  elif plan.epilogue == "scale" and not plan.cmac_materialization:
+     # BS enabled, ReLU bypassed, MUL enabled (not bypassed), ALU bypassed
+     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1<<6)|(1<<1))  # 0x42
+     # BS_MUL_OPERAND: fp16 scale at bits 16-31
+@@ -5938,8 +5944,9 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
+   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
+   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
+   if plan.cmac_materialization:
++    scale_bits = struct.unpack('<I', struct.pack('<f', plan.epilogue_scale if plan.epilogue == "scale" else 1.0))[0]
+     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
+-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), tile_n, tile_k, *plan.cmac_materialization[5:])
++              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), scale_bits, tile_n, tile_k, *plan.cmac_materialization[5:])
+   else:
+     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
+               int(plan.epilogue == "bias_relu"))

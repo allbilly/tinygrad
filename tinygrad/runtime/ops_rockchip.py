@@ -136,7 +136,7 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
     d[i] = _fp32_to_fp16(raw)
 
 def _decode_materialized_cmac_layout(layout):
-  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, tile_n, tile_k, *meta = layout
+  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, tile_n, tile_k, *meta = layout
   assert tag == _CMAC_MATERIALIZED_LAYOUT
   cursor = 0
   n_loops = meta[cursor]
@@ -172,8 +172,9 @@ def _decode_materialized_cmac_layout(layout):
   cursor += 1+n_rounding
   n_fixed_loops = meta[cursor]
   fixed_loops = tuple((meta[cursor+1+2*i], meta[cursor+2+2*i]) for i in range(n_fixed_loops))
-  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), loop_extents, reduce_extents, m_axes, n_axes, shared_axes,
-          active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
+  scale = struct.unpack('<f', struct.pack('<I', scale_bits))[0]
+  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), scale, loop_extents, reduce_extents, m_axes, n_axes,
+          shared_axes, active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
 
 def _eval_static_index(code, coords):
   stack:list[int] = []
@@ -230,7 +231,7 @@ def _set_linear_axes(coords, linear, axes, extents):
 
 def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded,
                              m_start=0, rows=None, n_start=0, cols=None, k_start=0, k_count=None):
-  _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
+  _, _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
     _, fixed_loops, _, a_code, b_code = decoded
   rows = M if rows is None else rows
   cols = N if cols is None else cols
@@ -279,7 +280,7 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
 
 def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
                                   n_start=0, cols=None, packed_inputs=None):
-  _, _, _, bias_slot, bias_axis, relu, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
+  _, _, _, bias_slot, bias_axis, relu, scale, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
     _, fixed_loops, out_code, _, _ = decoded
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
@@ -295,6 +296,9 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
     if m < m_start or (rows is not None and m >= m_start+rows): continue
     if n < n_start or (cols is not None and n >= n_start+cols): continue
     raw = s[(m-m_start)*align_out+n-n_start]
+    if scale != 1.0:
+      value = struct.unpack('<f', struct.pack('<f', struct.unpack('<f', struct.pack('<I', raw))[0] * scale))[0]
+      raw = struct.unpack('<I', struct.pack('<f', value))[0]
     if b is not None:
       value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[coords[bias_axis]]))[0]
       value = struct.unpack('<f', struct.pack('<f', value))[0]

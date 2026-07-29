@@ -105,6 +105,10 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(x.conv2d(w, b))), "cmac")
 
+  def test_cmac_avg_pool_scale_and_padding(self):
+    x = Tensor.rand(1,2,5,6,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(x.avg_pool2d(kernel_size=(3,2), padding=(1,0)))), "cmac")
+
   def test_ppu_max(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a.max(axis=0))), "ppu")

@@ -5528,3 +5528,54 @@ layout or numerical regression.
 
 No LUT is involved. The standalone patch is
 `rockchip-cmac-k-3ab3f3291.patch`, against parent `3ab3f3291`.
+
+## 2026-07-29 — constant-divisor average-pooling milestone
+
+The real-device pooling refresh initially reported 12 passing cases and 71
+parameterized failures. The failures separated into average-pool rounding,
+local max-pool layout, and unpool/index scatter. Constant-divisor average
+pooling is now fixed as the first pooling milestone.
+
+The reduction was already a valid materialized CMAC sum, but the hardware BS
+scale path rounded the accumulator before multiplying by the reciprocal.
+That produced one-fp16-bit differences in roughly a third of outputs under
+the official strict `rtol=1e-5`. Materialized scale epilogues now bypass BS:
+the serialized task carries the fp32 scale, unpack multiplies the raw CACC
+fp32 value, and only then performs the final fp16 conversion.
+
+Padded average reductions appear in both forms:
+
+```text
+WHERE(valid, input, 0)
+WHERE(invalid, 0, input)
+```
+
+The materializer now normalizes either zero branch into a masked fp16 gather.
+The mask and index movement remain host-side; summation stays on CNA/CORE.
+This covers standard and asymmetric zero padding without adding arithmetic to
+the movement path.
+
+Current passing official methods/cases include:
+
+- all five ordinary `avg_pool2d` kernel variants plus its `(1,2)` padded
+  regression;
+- all nine standard-padding subtests;
+- all three asymmetric-padding subtests;
+- both ceil-mode output-size-reduction methods;
+- global average pooling.
+
+Focused validation is **6 official methods passing with 17 passing
+subtests**. The new exact padded-scale hardware regression passes, the CMAC
+class is **22/22 in 7.96 seconds**, and PR1 is **77/77 in 6.61 seconds**.
+Mypy remains at the same 13 pre-existing findings, targeted Ruff at the same
+five pre-existing findings, and `git diff --check` is clean.
+
+The remaining average-pool cases use output-dependent divisors:
+`padding_not_counted`, general `ceil_mode`, and their combination. They
+currently reject as `unsupported_op:fused_epilogue` and are the next
+average-pooling work. `avg_pool3d` cannot be evaluated in this configuration
+because Torch CPU itself raises `NotImplementedError` for half input before
+tinygrad executes.
+
+No LUT is used. The standalone patch is
+`rockchip-avg-pool-scale-eda240f95.patch`, against parent `eda240f95`.

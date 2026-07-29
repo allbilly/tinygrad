@@ -1602,9 +1602,15 @@ def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
   fp32 accumulation remain on CNA/CORE."""
   body = _reduce_body(reduce)
   outer_conditions:list[UOp] = []
-  while body.op is Ops.WHERE and body.dtype is dtypes.float and body.src[2].op is Ops.CONST and body.src[2].arg is Invalid:
-    outer_conditions.append(body.src[0])
-    body = body.src[1]
+  def is_zero(u:UOp) -> bool:
+    return u.op is Ops.CONST and (u.arg is Invalid or float(u.arg) == 0.0)
+  while body.op is Ops.WHERE and body.dtype is dtypes.float and (is_zero(body.src[1]) or is_zero(body.src[2])):
+    if is_zero(body.src[2]):
+      outer_conditions.append(body.src[0])
+      body = body.src[1]
+    else:
+      outer_conditions.append(UOp(Ops.CMPNE, dtypes.bool, (body.src[0], UOp.const(dtypes.bool, True))))
+      body = body.src[2]
     while body.op is Ops.CAST: body = body.src[0]
   if body.op is Ops.MUL: a_val, b_val = (_unwrap(x) for x in body.src)
   elif body.op is Ops.WHERE and body.dtype is dtypes.half:
@@ -5920,7 +5926,7 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   if plan.epilogue == "relu":
     # BS enabled, ReLU enabled (not bypassed), MUL bypassed, ALU bypassed
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1<<4)|(1<<1))  # 0x12
-  elif plan.epilogue == "scale":
+  elif plan.epilogue == "scale" and not plan.cmac_materialization:
     # BS enabled, ReLU bypassed, MUL enabled (not bypassed), ALU bypassed
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_BS_CFG, (1<<6)|(1<<1))  # 0x42
     # BS_MUL_OPERAND: fp16 scale at bits 16-31
@@ -5938,8 +5944,9 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
   if plan.cmac_materialization:
+    scale_bits = struct.unpack('<I', struct.pack('<f', plan.epilogue_scale if plan.epilogue == "scale" else 1.0))[0]
     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), tile_n, tile_k, *plan.cmac_materialization[5:])
+              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), scale_bits, tile_n, tile_k, *plan.cmac_materialization[5:])
   else:
     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
               int(plan.epilogue == "bias_relu"))

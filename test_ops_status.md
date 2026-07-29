@@ -409,3 +409,30 @@ buffers remain DMA-backed.
 The historical `cmac_exceeds_cbuf` failure group must now be refreshed before
 using its old count: N tiling, shared-axis serialization, and K tiling cover
 the complete current dot/einsum selection.
+
+### Pooling refresh: constant-divisor average pooling
+
+The first current pooling run had 12 passing cases and 71 parameterized
+failures. Constant-divisor average pooling is now fixed:
+
+| Passing selection | Result |
+|---|---:|
+| Ordinary, standard/asymmetric padded, global, and two output-size edge methods | **6 methods** |
+| Passing parameterized subtests inside those methods | **17** |
+| CMAC hardware class | **22/22** |
+| Hardware-free PR1 file | **77/77** |
+
+Materialized CMAC applies reciprocal scale to raw fp32 CACC output before the
+single fp16 conversion. Zero-padded reduction bodies are accepted whether
+the zero is the true or false WHERE branch.
+
+Remaining average-pool work:
+
+- `padding_not_counted`;
+- general `ceil_mode`;
+- `ceil_mode` plus `count_include_pad=False`.
+
+Those use an output-dependent divisor and reject as
+`unsupported_op:fused_epilogue`. `avg_pool3d` is blocked earlier by Torch
+CPU's missing half implementation, independent of the Rockchip backend.
+Local max pooling and max-unpool/index scatter remain separate groups.
