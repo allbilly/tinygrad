@@ -14,7 +14,7 @@ supersedes the older 182-passing census below.
 failed in the census have not yet been folded into another full-suite count,
 so 257/165 remains the honest complete baseline. Product reduction and the
 product subcase of `const_reduce` now also pass incrementally. The expanded
-DPU hardware class is separately **59/59 passing in 288.81 seconds**.
+DPU hardware class is separately **60/60 passing in 393.71 seconds**.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -643,3 +643,33 @@ accumulation. It is deliberately tracked separately rather than claimed by
 this milestone.
 
 Recovery patch: `rockchip-native-product-reductions-03bad6205.patch`.
+
+### Global floating extrema milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `max`, complete official method | **passing in 51.02 s** | **passing** |
+| floating `min` subcases | **passing** | **passing** |
+| int32/bool `min` subcases | still failing | exact native integer selection required |
+
+Scalar-output reductions no longer require a PPU-compatible `(H,W,C)`
+factorization. Static windows are gathered by exact byte movement and reduced
+with DPU MAX. fp32 candidates cross into half once before the stable MAX
+chain, and the final result crosses back to fp32.
+
+Positive post-scales commute into every candidate before MAX. Floating MIN is
+recognized as tinygrad's `-MAX(-x)` graph: negative candidate scaling occurs
+before MAX and one final DPU negation restores MIN. This preserves the old
+post-MAX implementation as WIP comments because that transition was unstable
+after long global chains.
+
+The complete official `test_max` method passes in **51.02 seconds**. A
+permanent half/fp32 max/min regression passes in **105.93 seconds**, the
+complete DPU class is **60/60 in 393.71 seconds**, and the hardware-free
+contract remains **79/79 in 6.56 seconds**.
+
+Exact int32 MIN is not claimed: tinygrad uses XOR order reversal so
+`INT_MIN` remains correct, and replacing that with ordinary negation would
+overflow. Bool MIN likewise needs its exact ALL-pattern selection.
+
+Recovery patch: `rockchip-native-global-extrema-d8238da2d.patch`.

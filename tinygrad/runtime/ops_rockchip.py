@@ -1382,6 +1382,15 @@ class RockchipProgram(Program['RockchipDevice']):
           dev.reset_npu()
           self.subtasks = [st]
           self._submit_multi(tuple(ext))
+          if getenv("ROCKCHIP_DEBUG_LOCAL_MAX") >= 2:
+            out = ext[st.task.out_slot]
+            if st.task.fp32_output:
+              count = min(out.size//4, 4)
+              values = struct.unpack(f"<{count}f", ctypes.string_at(out.va_addr, count*4))
+            else:
+              count = min(out.size//2, 4)
+              values = struct.unpack(f"<{count}e", ctypes.string_at(out.va_addr, count*2))
+            print("RK_LOCAL_MAX_STAGE", st.task.out_slot, values)
       finally:
         self.subtasks = subtasks
         for b in shared: dev._gpu_free(b)
@@ -1410,6 +1419,7 @@ class RockchipProgram(Program['RockchipDevice']):
       return
     temp:list[HCQBuffer] = []
     prepared = list(bufs)
+    original_prepared = list(bufs)
     total = max(st.task.layout[0] for st in subtasks)
     max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                    default=len(prepared)-1)
@@ -1458,10 +1468,10 @@ class RockchipProgram(Program['RockchipDevice']):
       # max across subtasks and may be larger than the real output for broadcast/pad ops)
       # fp32/int32 outputs are 4 bytes; uint8/bool are 1 byte; fp16/trunc are 2 bytes
       out_itemsize = 4 if is_fp32 else (1 if (is_uint8 or is_bool) else (2 if is_trunc else 4))
-      out_n = prepared[output_slot].size // out_itemsize
+      out_n = original_prepared[output_slot].size // out_itemsize
       converted = dev._gpu_alloc(max(total * 2, out_n * 2, 4096), 0)
       temp.append(converted)
-      output_conversion = (prepared[output_slot], converted, out_n, is_fp32, is_uint8, is_bool, is_trunc)
+      output_conversion = (original_prepared[output_slot], converted, out_n, is_fp32, is_uint8, is_bool, is_trunc)
       prepared[output_slot] = converted
     bufs = tuple(prepared)
     try:

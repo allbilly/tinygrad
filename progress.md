@@ -6163,3 +6163,77 @@ from `.venv`.
 
 The standalone recovery artifact is
 `rockchip-native-product-reductions-03bad6205.patch`, based on `03bad6205`.
+
+## 2026-07-29 — scalar global MAX and floating MIN
+
+Global `max` over `(45,3)` reduced 135 lanes to a scalar. PPU rejected that
+extent because it cannot be expressed by the current hardware pooling
+factorization, while the existing static-window DPU MAX path rejected every
+single-axis scalar output before attempting its already-proven gather.
+
+The artificial scalar restriction is removed. Static output coordinates now
+work for global and local MAX alike. The complete official `test_max` method
+passes, including:
+
+- 135-lane half reductions and positive `0.5` epilogues;
+- an explicit float32 four-lane reduction and scale;
+- axis reductions and scalars;
+- int32 boundary inputs containing `INT_MIN`;
+- bool inputs.
+
+### fp32 boundary and positive scale
+
+Chaining fp32 scratch buffers through repeated typed conversions was unstable:
+one `.5`/zero MAX stage returned zero after a correct preceding scratch. fp32
+candidates are now converted once into compact fp16 buffers before MAX. The
+last MAX stage alone marks fp32 output, preserving the requested ABI.
+
+A positive scalar commutes with MAX, so the scale is applied to every compact
+candidate before reduction. This avoids the unstable scalar transition after
+134 reset-separated MAX stages.
+
+The mixed runner also now keeps the original output buffer separately from
+typed input preparation. Previously an aliased fp32 input/output slot changed
+the object recorded for final conversion and could copy far beyond the
+logical output count.
+
+`ROCKCHIP_DEBUG_LOCAL_MAX=2` prints the first four values after each DPU stage
+in mixed movement/DPU programs.
+
+### Floating MIN and exact integer boundary
+
+tinygrad lowers floating MIN as `-MAX(-x)`. The matcher recognizes the paired
+negative candidate and output scales, gathers the original values, applies
+the candidate scale on DPU, runs MAX, and performs one final DPU negation.
+The floating subcases of `test_min` pass.
+
+Exact int32 MIN remains separate. Its graph uses XOR with `-1` before and
+after MAX to reverse signed ordering while preserving `INT_MIN`; ordinary
+negation would overflow. Bool MIN similarly lowers to an inverted boolean
+MAX/ALL form. Neither is replaced with host arithmetic.
+
+### Cumprod investigation
+
+Other Rockchip branches contain no cumprod implementation. A direct numerical
+probe proves Torch fp16 cumprod maintains a float32 prefix accumulator and
+casts each emitted prefix to half. Sequential half multiplication differs in
+274/600 raw values for the first 2-D case; the official tolerance reports
+23/600 failures with maximum absolute error `0.001953125`. Cumprod therefore
+needs a higher-precision NPU representation and remains active work.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_max`: **passing in 51.02 seconds**;
+- permanent half/fp32 global max/min regression: **1/1 passing in 105.93
+  seconds**;
+- complete DPU hardware class: **60/60 passing in 393.71 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.56 seconds**;
+- pycompile and `git diff --check`: passing.
+
+Mypy remains at the same **13 pre-existing findings**. Ruff and pytest-xdist
+remain absent from `.venv`.
+
+The standalone recovery artifact is
+`rockchip-native-global-extrema-d8238da2d.patch`, based on `d8238da2d`.

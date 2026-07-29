@@ -7455,12 +7455,30 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Gather static local-reduction windows, then compute their maximum on DPU."""
   reduce, store = _reduce_node(sink), _store_node(sink)
-  if reduce is None or store is None or reduce.arg[0] is not Ops.MAX or store.src[1] is not reduce: return None
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MAX: return None
+  post_scale:float|None = None
+  store_value = _unwrap(store.src[1])
+  if store_value is not reduce:
+    if store_value.op is not Ops.MUL or len(store_value.src) != 2: return None
+    for value, factor_node in ((store_value.src[0], store_value.src[1]), (store_value.src[1], store_value.src[0])):
+      if _unwrap(value) is reduce and factor_node.op is Ops.CONST:
+        post_scale = float(factor_node.arg)
+        break
+    if post_scale is None: return None
   value_dtype = reduce.dtype
-  if value_dtype not in (dtypes.half, dtypes.int) or store.src[0].dtype is not value_dtype: return None
+  min_source:UOp|None = None
+  reduce_body = _unwrap(reduce.src[0])
+  if post_scale is not None and post_scale < 0 and reduce_body.op is Ops.MUL and len(reduce_body.src) == 2:
+    for source_value, scale in ((reduce_body.src[0], reduce_body.src[1]), (reduce_body.src[1], reduce_body.src[0])):
+      if scale.op is Ops.CONST and float(scale.arg) == -1.0:
+        min_source = source_value
+        break
+  is_min = min_source is not None
+  if value_dtype not in (dtypes.half, dtypes.float, dtypes.int) or store.src[0].dtype is not value_dtype or \
+     (post_scale is not None and value_dtype not in (dtypes.half, dtypes.float)) or (is_min and value_dtype is dtypes.int): return None
   reductions = list(reduce.src[1:])
   out_shape = _shape_of_store(sink)
-  if not reductions or (len(reductions) == 1 and len(out_shape) < 2) or any(u.src[0].op is not Ops.CONST for u in reductions): return None
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in reductions): return None
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
   if any(u.src[0].op is not Ops.CONST for u in loops): return None
   loop_extents = [int(u.src[0].arg) for u in loops]
@@ -7559,16 +7577,20 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   gathered_slots:list[int] = []
   needs_trunc = False
+  gather_source = reduce.src[0]
+  if is_min:
+    assert min_source is not None
+    gather_source = min_source
   for linear in range(window):
     rem, fixed = linear, {}
     for reduce_axis in range(len(reductions)-1, -1, -1):
       rem, coord = divmod(rem, reduce_extents[reduce_axis])
       fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
-    gathered = reduce.src[0].substitute(fixed)
+    gathered = gather_source.substitute(fixed)
     gathered_half = casted_half_source(gathered) if value_dtype is dtypes.int else None
     needs_trunc = needs_trunc or gathered_half is not None
     scratch_slot, next_slot = next_slot, next_slot+1
-    scratch_dtype = dtypes.half if gathered_half is not None or value_dtype is dtypes.half else dtypes.int
+    scratch_dtype = dtypes.half if gathered_half is not None or value_dtype is dtypes.half else value_dtype
     scratch = UOp.param(scratch_slot, scratch_dtype, (total,), device=store.src[0].src[0].device)
     movement_value = gathered_half if gathered_half is not None else gathered
     scratch_index = store.src[0].replace(dtype=scratch_dtype, src=(scratch, *store.src[0].src[1:]))
@@ -7581,12 +7603,38 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.extend(movement_tasks)
     gathered_slots.append(native_int_to_half(scratch_slot) if scratch_dtype is dtypes.int else scratch_slot)
 
+  if value_dtype is dtypes.float:
+    half_slots:list[int] = []
+    for source_slot in gathered_slots:
+      half_slot, next_slot = next_slot, next_slot+1
+      tasks.append(_emit_where_stage(total, half_slot, (source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                     fp32_inputs=(source_slot,)))
+      half_slots.append(half_slot)
+    gathered_slots = half_slots
+
+  # Positive scaling commutes with MAX. Applying it to each compact candidate
+  # avoids the unstable scalar-DPU transition after a long global MAX chain.
+  # The older post-reduction scale path remains below for reference.
+  if post_scale is not None:
+    if post_scale < 0 and not is_min: return None
+    scale_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', post_scale))[0])
+    scaled_slots:list[int] = []
+    for source_slot in gathered_slots:
+      scaled_slot, next_slot = next_slot, next_slot+1
+      tasks.append(_emit_where_stage(total, scaled_slot, (source_slot, 0), scale_arg, Ops.MUL))
+      scaled_slots.append(scaled_slot)
+    gathered_slots = scaled_slots
+    post_scale = None
+
   accumulator = gathered_slots[0]
   for i, operand in enumerate(gathered_slots[1:]):
     final = i == len(gathered_slots)-2
-    out_slot = info.outs[0] if final and value_dtype is dtypes.half else next_slot
+    out_slot = info.outs[0] if final and value_dtype in (dtypes.half, dtypes.float) and post_scale is None and not is_min else next_slot
     if out_slot == next_slot: next_slot += 1
-    tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX))
+    if value_dtype is dtypes.float:
+      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX, fp32_output=final))
+    else:
+      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX))
     accumulator = out_slot
   if value_dtype is dtypes.int:
     if needs_trunc:
@@ -7604,6 +7652,16 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       unpack_layout = (count, _HOST_UNPACK_INT_CHUNK_LAYOUT, start)
       unpack_relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, native_slot, 0, 0, 0xFFFFFFFF))
       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, info.outs[0], is_copy=True), unpack_relocs))
+  # WIP reference: a post-MAX scalar task was previously emitted here. The
+  # long global chain made that transition unstable, so nonnegative scaling
+  # is now commuted into candidates above.
+  # elif post_scale is not None:
+  #   scale_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', post_scale))[0])
+  #   tasks.append(_emit_where_stage(total, info.outs[0], (accumulator, 0), scale_arg, Ops.MUL))
+  elif is_min:
+    negative_one = (_CONST_SLOT, 0xbf800000)
+    tasks.append(_emit_where_stage(total, info.outs[0], (accumulator, 0), negative_one, Ops.MUL,
+                                   fp32_output=value_dtype is dtypes.float))
   return tuple(tasks)
 
 def _try_cmac_variable_scale_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:

@@ -86,6 +86,17 @@ class TestDPU(unittest.TestCase):
     full = x.full_like(2)
     np.testing.assert_array_equal(full.prod().realize().numpy(), np.prod(np.full(data.shape, 2, dtype=np.float16)))
 
+  def test_dpu_global_float_extrema(self):
+    data = np.linspace(-7, 5, 135, dtype=np.float16).reshape(45,3)
+    x = Tensor(data, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(x.max().realize().numpy(), np.max(data))
+    np.testing.assert_array_equal((x.max()*0.5).realize().numpy(), np.max(data)*np.float16(0.5))
+    np.testing.assert_array_equal(x.min().realize().numpy(), np.min(data))
+    np.testing.assert_array_equal((x.min()*0.5).realize().numpy(), np.min(data)*np.float16(0.5))
+    wide = np.array([1, 1, 0, 1], dtype=np.float32)
+    np.testing.assert_array_equal((Tensor(wide, device="ROCKCHIP").max()*0.5).realize().numpy(),
+                                  np.max(wide)*np.float32(0.5))
+
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
