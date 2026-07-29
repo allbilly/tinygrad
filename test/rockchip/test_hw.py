@@ -346,6 +346,14 @@ class TestDPU(unittest.TestCase):
       expected = np.power(np.float32(-5.5), exponent.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_pow_base8_four_level_lut(self):
+    rng = np.random.RandomState(0)
+    exponent = np.concatenate((np.linspace(-2, 2, 513, dtype=np.float32).astype(np.float16),
+                               rng.uniform(-2, 2, 513).astype(np.float16)))
+    actual = (8.0 ** Tensor(exponent, device="ROCKCHIP")).realize().numpy()
+    expected = np.power(np.float32(8.0), exponent.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_log2_two_lut_normalization(self):
     boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
                            0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,

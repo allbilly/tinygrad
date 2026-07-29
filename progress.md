@@ -6856,3 +6856,50 @@ scaled EXP2 table clips many positive lanes at 32 and misses 1,340/2,925
 values, with maximum relative error `0.5`.
 
 Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.
+
+## 2026-07-30 — four-level constant-base POW8
+
+`8.0**x` initially used the generic scaled EXP2 table and clipped positive
+outputs at 32.  A first two-table Q15 design stored the negative half
+directly and the positive half divided by 64.  It passed exact LUT knots,
+but its 64:1 output range left only 512 raw units at each lower endpoint:
+78/2,925 official off-grid values still missed tolerance.  A global `+1`
+Q15 bias made this worse at 178 failures and remains recorded as rejected
+WIP.
+
+The passing implementation divides the exponent interval into four 8:1
+output bands:
+
+| Exponent band | Q15 stored function | DPU decode |
+|---:|---|---:|
+| `[-2,-1]` | `8**x * 8` | `* 1/8` |
+| `[-1,0]` | `8**x` | direct |
+| `[0,1]` | `8**x / 8` | `* 8` |
+| `[1,2]` | `8**x / 64` | `* 64` |
+
+All stored values lie in `[1/8,1]`, so Q15 provides at least 4,096 raw units
+at every lower endpoint.  Four LUT tasks run on the original exponent; DPU
+comparison masks select a band, apply its decode factor, and combine the
+finite candidates.  The generic scaled-EXP2 result remains an out-of-range
+and special-value fallback.  No host arithmetic is used.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- exact official 2,925-value random tensor: **2,925/2,925 passing**, maximum
+  relative error `0.0009718`;
+- permanent 513-knot plus 513 deterministic off-grid regression and the
+  positive-base-5.5 sweep: **2/2 passing in 10.29 seconds**;
+- official `TestOps.test_pow_const`: `8.0**x`, all subsequent square/base-two
+  tensor and scalar cases pass, and the method reaches only its final
+  `0**x` special case in **77.35 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.53 seconds**;
+- pycompile and `git diff --check`: passing;
+- mypy remains at the same 13 pre-existing Rockchip errors.
+
+The remaining zero-base graph contains `EXP2(x * -inf)` and currently lets
+that non-finite scale reach the generic LUT builder.  It is a special
+semantic lowering, not a four-band accuracy issue.
+
+Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.

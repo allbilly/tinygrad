@@ -1916,6 +1916,38 @@ for fractional exponents without placing a literal NaN in an arithmetic
 selector.  A 513-point sweep across `[-2,2]` covers all integer transitions
 in the official range and passes unchanged.
 
+## Constant base eight: four output-scale levels
+
+The obvious two-table design mirrors constant-base 5.5:
+
+- store `8**x` directly below zero;
+- store `8**x/64` above zero and decode by 64.
+
+It is not accurate enough between table knots.  Each half spans 64:1, so its
+lower endpoint is only 512 Q15 units.  Exact-knot tests hide the DPU
+interpolation shift; the official off-grid tensor exposed 78 failures.  A
+global `+1` raw-unit bias overcorrected neighboring phases and raised the
+failure count to 178.
+
+Split at integer exponents where the output changes by exactly eight:
+
+| Band | Stored range | Decode |
+|---:|---:|---:|
+| `[-2,-1]`, store `8**x*8` | `[1/8,1]` | `1/8` |
+| `[-1,0]`, store `8**x` | `[1/8,1]` | `1` |
+| `[0,1]`, store `8**x/8` | `[1/8,1]` | `8` |
+| `[1,2]`, store `8**x/64` | `[1/8,1]` | `64` |
+
+Every table now has at least 4,096 Q15 units at its lower endpoint, leaving
+ample margin for interpolation and final fp16 rounding.  Boundary values
+agree from both adjacent tables, so strict `x>-1`, `x>0`, and `x>1` masks
+do not introduce discontinuities.
+
+The permanent regression deliberately combines 513 exact knots with 513
+deterministic random half inputs.  This prevents the false confidence of a
+knot-only sweep.  All 1,026 values pass, and the full official random tensor
+has maximum relative error `0.0009718`.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

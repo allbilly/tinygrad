@@ -1,0 +1,337 @@
+diff --git a/lut.md b/lut.md
+index 699af0e75..f9701a0f9 100644
+--- a/lut.md
++++ b/lut.md
+@@ -1916,6 +1916,38 @@ for fractional exponents without placing a literal NaN in an arithmetic
+ selector.  A 513-point sweep across `[-2,2]` covers all integer transitions
+ in the official range and passes unchanged.
+ 
++## Constant base eight: four output-scale levels
++
++The obvious two-table design mirrors constant-base 5.5:
++
++- store `8**x` directly below zero;
++- store `8**x/64` above zero and decode by 64.
++
++It is not accurate enough between table knots.  Each half spans 64:1, so its
++lower endpoint is only 512 Q15 units.  Exact-knot tests hide the DPU
++interpolation shift; the official off-grid tensor exposed 78 failures.  A
++global `+1` raw-unit bias overcorrected neighboring phases and raised the
++failure count to 178.
++
++Split at integer exponents where the output changes by exactly eight:
++
++| Band | Stored range | Decode |
++|---:|---:|---:|
++| `[-2,-1]`, store `8**x*8` | `[1/8,1]` | `1/8` |
++| `[-1,0]`, store `8**x` | `[1/8,1]` | `1` |
++| `[0,1]`, store `8**x/8` | `[1/8,1]` | `8` |
++| `[1,2]`, store `8**x/64` | `[1/8,1]` | `64` |
++
++Every table now has at least 4,096 Q15 units at its lower endpoint, leaving
++ample margin for interpolation and final fp16 rounding.  Boundary values
++agree from both adjacent tables, so strict `x>-1`, `x>0`, and `x>1` masks
++do not introduce discontinuities.
++
++The permanent regression deliberately combines 513 exact knots with 513
++deterministic random half inputs.  This prevents the false confidence of a
++knot-only sweep.  All 1,026 values pass, and the full official random tensor
++has maximum relative error `0.0009718`.
++
+ ## Commit checklist
+ 
+ - The intended graph is recognized after all pre-rewrites.
+diff --git a/progress.md b/progress.md
+index 64800995f..6f6696ddd 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6856,3 +6856,50 @@ scaled EXP2 table clips many positive lanes at 32 and misses 1,340/2,925
+ values, with maximum relative error `0.5`.
+ 
+ Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.
++
++## 2026-07-30 — four-level constant-base POW8
++
++`8.0**x` initially used the generic scaled EXP2 table and clipped positive
++outputs at 32.  A first two-table Q15 design stored the negative half
++directly and the positive half divided by 64.  It passed exact LUT knots,
++but its 64:1 output range left only 512 raw units at each lower endpoint:
++78/2,925 official off-grid values still missed tolerance.  A global `+1`
++Q15 bias made this worse at 178 failures and remains recorded as rejected
++WIP.
++
++The passing implementation divides the exponent interval into four 8:1
++output bands:
++
++| Exponent band | Q15 stored function | DPU decode |
++|---:|---|---:|
++| `[-2,-1]` | `8**x * 8` | `* 1/8` |
++| `[-1,0]` | `8**x` | direct |
++| `[0,1]` | `8**x / 8` | `* 8` |
++| `[1,2]` | `8**x / 64` | `* 64` |
++
++All stored values lie in `[1/8,1]`, so Q15 provides at least 4,096 raw units
++at every lower endpoint.  Four LUT tasks run on the original exponent; DPU
++comparison masks select a band, apply its decode factor, and combine the
++finite candidates.  The generic scaled-EXP2 result remains an out-of-range
++and special-value fallback.  No host arithmetic is used.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- exact official 2,925-value random tensor: **2,925/2,925 passing**, maximum
++  relative error `0.0009718`;
++- permanent 513-knot plus 513 deterministic off-grid regression and the
++  positive-base-5.5 sweep: **2/2 passing in 10.29 seconds**;
++- official `TestOps.test_pow_const`: `8.0**x`, all subsequent square/base-two
++  tensor and scalar cases pass, and the method reaches only its final
++  `0**x` special case in **77.35 seconds**;
++- hardware-free PR1 contract: **79/79 passing in 6.53 seconds**;
++- pycompile and `git diff --check`: passing;
++- mypy remains at the same 13 pre-existing Rockchip errors.
++
++The remaining zero-base graph contains `EXP2(x * -inf)` and currently lets
++that non-finite scale reach the generic LUT builder.  It is a special
++semantic lowering, not a four-band accuracy issue.
++
++Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 3234cb592..06d7dce1d 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -346,6 +346,14 @@ class TestDPU(unittest.TestCase):
+       expected = np.power(np.float32(-5.5), exponent.astype(np.float32)).astype(np.float16)
+     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+ 
++  def test_dpu_pow_base8_four_level_lut(self):
++    rng = np.random.RandomState(0)
++    exponent = np.concatenate((np.linspace(-2, 2, 513, dtype=np.float32).astype(np.float16),
++                               rng.uniform(-2, 2, 513).astype(np.float16)))
++    actual = (8.0 ** Tensor(exponent, device="ROCKCHIP")).realize().numpy()
++    expected = np.power(np.float32(8.0), exponent.astype(np.float32)).astype(np.float16)
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
++
+   def test_dpu_log2_two_lut_normalization(self):
+     boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
+                            0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 9af2fb7e8..7984b3db8 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -982,3 +982,24 @@ seconds**.  The official method advances to `8.0**x` in 63.69 seconds, and
+ PR1 remains **79/79 in 6.51 seconds**.
+ 
+ Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.
++
++### Four-level constant-base eight milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `8.0**x`, official tensor | **2,925/2,925 passing** | four Q15 LUT bands |
++| knot + off-grid permanent regression | **1,026/1,026 passing** | maximum relative error `0.0009718` |
++| later square/base-two tensor/scalar cases | **passing** | existing native paths |
++| final `0**x` | non-finite LUT scale failure | next POW subgroup |
++
++The rejected two-band design had a 64:1 output range in each Q15 table and
++missed 78 interpolated values despite passing exact knots.  A global one-unit
++bias increased the failures to 178.  The passing four bands each cover only
++8:1 and decode by `1/8`, `1`, `8`, or `64` on DPU.
++
++The base-eight and base-5.5 permanent sweeps pass **2/2 in 10.29 seconds**.
++The official method passes base eight and every later ordinary case before
++reaching only `0**x` in 77.35 seconds, and PR1 remains **79/79 in 6.53
++seconds**.  No host operator fallback is used.
++
++Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 28e32a709..da429160f 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -729,6 +729,10 @@ _LUT_POW_NEG55_LOW = Ops.CONTIGUOUS_BACKWARD
+ _LUT_POW_NEG55_HIGH = Ops.CUSTOM_FUNCTION
+ _LUT_POW_BASE55_LOW = Ops.SOURCE
+ _LUT_POW_BASE55_HIGH = Ops.BINARY
++_LUT_POW_BASE8_LOW = Ops.PROGRAM
++_LUT_POW_BASE8_HIGH = Ops.LINEAR
++_LUT_POW_BASE8_FAR_LOW = Ops.SINK
++_LUT_POW_BASE8_FAR_HIGH = Ops.LOAD
+ _LUT_SIZE = 513
+ 
+ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
+@@ -886,6 +890,23 @@ def _build_pow_base55_lut(high:bool) -> tuple[list[int], int, float, float, int]
+       lut[offset+i] = max(-32768, min(32767, int(round(target*output_scale))))
+   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+ 
++def _build_pow_base8_lut(region:int) -> tuple[list[int], int, float, float, int]:
++  """Four Q15 bands for 8**x over [-2,-1], [-1,0], [0,1], and [1,2]."""
++  index_scale, output_scale, step = 8192.0, 32768.0, 32.0/8192.0
++  lut = [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      x = (-(512-i) if table == 0 else i) * step
++      if region == 0: target = 8.0**max(-2.0, min(-1.0, x))*8.0
++      elif region == 1: target = 8.0**max(-1.0, min(0.0, x))
++      elif region == 2: target = 8.0**max(0.0, min(1.0, x))/8.0
++      else: target = 8.0**max(1.0, min(2.0, x))/64.0
++      # Rejected two-band WIP stored direct below zero and /64 above zero.
++      # It passed exact knots but missed 78 interpolated official values; a
++      # global +1 Q15 bias increased that count to 178.
++      lut[offset+i] = max(-32768, min(32767, int(round(target*output_scale))))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
+ def _build_hardswish_lut() -> tuple[list[int], int, float, float, int]:
+   """Q14 hardswish over [-2,2], with nonzero entries for the LUT zero erratum."""
+   index_scale = 8192.0
+@@ -1533,6 +1554,14 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE55_LOW)
+   if val.op is Ops.CUSTOM and val.arg == "rk_pow_base55_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE55_HIGH)
++  if val.op is Ops.CUSTOM and val.arg == "rk_pow_base8_low" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE8_LOW)
++  if val.op is Ops.CUSTOM and val.arg == "rk_pow_base8_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE8_HIGH)
++  if val.op is Ops.CUSTOM and val.arg == "rk_pow_base8_far_low" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE8_FAR_LOW)
++  if val.op is Ops.CUSTOM and val.arg == "rk_pow_base8_far_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE8_FAR_HIGH)
+   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_celu" and \
+      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_CELU)
+@@ -4987,6 +5016,104 @@ def _try_pow_base55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   dependent(out, (selected,0), (fallback,0), Ops.ADD)
+   return tuple(tasks)
+ 
++def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate 8**x with separate Q15 tables below and above zero."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++  value = _unwrap(store.src[1])
++  if value.op is not Ops.EXP2 or len(value.src) != 1: return None
++  product = _unwrap(value.src[0])
++  if product.op is not Ops.MUL or len(product.src) != 2: return None
++  source, scale = None, None
++  for lhs, rhs in (product.src, product.src[::-1]):
++    if (candidate := _unwrap(lhs)).op is Ops.INDEX and rhs.op is Ops.CONST:
++      source, scale = candidate, float(rhs.arg)
++      break
++  if source is None or scale is None or source.dtype is not dtypes.half or abs(scale-3.0) > 1e-3: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  if int(source.src[0].src[0].arg) != total: return None
++  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
++  next_slot = max(info.globals, default=-1)+1
++  tasks:list[RKSubTask] = []
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++
++  def scalar(number:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
++
++  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
++    diff, mask = alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
++                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
++    return mask, 0
++
++  def temp_index(slot:int) -> UOp:
++    out_index = store.src[0]
++    return out_index.replace(dtype=dtypes.half,
++      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
++
++  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
++    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
++
++  fallback_slot = alloc()
++  fallback_plan = plan_rk(stage_sink(value, fallback_slot))
++  if isinstance(fallback_plan, str) or fallback_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(fallback_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++
++  region_specs = (("rk_pow_base8_far_low", _LUT_POW_BASE8_FAR_LOW),
++                  ("rk_pow_base8_low", _LUT_POW_BASE8_LOW),
++                  ("rk_pow_base8_high", _LUT_POW_BASE8_HIGH),
++                  ("rk_pow_base8_far_high", _LUT_POW_BASE8_FAR_HIGH))
++  region_slots:list[int] = []
++  for name, marker in region_specs:
++    slot = alloc()
++    custom = UOp(Ops.CUSTOM, dtypes.half, (temp_index(source_slot),), arg=name)
++    plan = RKPlan("dpu_lut", stage_sink(custom, slot), slot, (source_slot,), lut_op=marker)
++    cmds, task, relocs = emit_rk(plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++    region_slots.append(slot)
++
++  one, source_arg = scalar(1.0), (source_slot,0)
++  above_negative_one = positive_mask(source_arg, scalar(-1.0))
++  above_zero = positive_mask(source_arg, (_ZERO_SLOT,0))
++  above_one = positive_mask(source_arg, one)
++  masks = [alloc() for _ in range(4)]
++  dependent(masks[0], one, above_negative_one, Ops.SUB)
++  dependent(masks[1], above_negative_one, above_zero, Ops.SUB)
++  dependent(masks[2], above_zero, above_one, Ops.SUB)
++  dependent(masks[3], above_one, (_ZERO_SLOT,0), Ops.ADD)
++
++  decoded = [alloc() for _ in range(4)]
++  for slot, decoded_slot, factor in zip(region_slots, decoded, (0.125, 1.0, 8.0, 64.0)):
++    dependent(decoded_slot, (slot,0), scalar(factor), Ops.MUL)
++  chosen = [alloc() for _ in range(4)]
++  for out_slot, decoded_slot, mask in zip(chosen, decoded, masks):
++    dependent(out_slot, (decoded_slot,0), (mask,0), Ops.MUL)
++  low_sum, high_sum, corrected = alloc(), alloc(), alloc()
++  dependent(low_sum, (chosen[0],0), (chosen[1],0), Ops.ADD)
++  dependent(high_sum, (chosen[2],0), (chosen[3],0), Ops.ADD)
++  dependent(corrected, (low_sum,0), (high_sum,0), Ops.ADD)
++
++  lower = float(np.nextafter(np.float16(-2.0), np.float16(-np.inf), dtype=np.float16))
++  upper = float(np.nextafter(np.float16(2.0), np.float16(np.inf), dtype=np.float16))
++  above_lower = positive_mask(source_arg, scalar(lower))
++  below_upper = positive_mask(scalar(upper), source_arg)
++  valid, selected, inverse, fallback = (alloc() for _ in range(4))
++  dependent(valid, above_lower, below_upper, Ops.MUL)
++  dependent(selected, (corrected,0), (valid,0), Ops.MUL)
++  dependent(inverse, one, (valid,0), Ops.SUB)
++  dependent(fallback, (fallback_slot,0), (inverse,0), Ops.MUL)
++  dependent(out, (selected,0), (fallback,0), Ops.ADD)
++  return tuple(tasks)
++
+ def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Evaluate (-5.5)**x with DPU truncation, integer validity, and parity."""
+   store = _store_node(sink)
+@@ -6790,6 +6917,22 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base55_lut(True)
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_POW_BASE8_LOW:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(1)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_POW_BASE8_HIGH:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(2)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_POW_BASE8_FAR_LOW:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(0)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_POW_BASE8_FAR_HIGH:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(3)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+   elif lut_op is _LUT_TAN_LOCAL:
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_local_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+@@ -9375,6 +9518,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, pow_neg55_tasks)
+   if (pow_base55_tasks := _try_pow_base55_lut_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, pow_base55_tasks)
++  if (pow_base8_tasks := _try_pow_base8_lut_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, pow_base8_tasks)
+   if (pow_neg_base55_tasks := _try_pow_neg_base55_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, pow_neg_base55_tasks)
+   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:

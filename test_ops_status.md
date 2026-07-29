@@ -982,3 +982,24 @@ seconds**.  The official method advances to `8.0**x` in 63.69 seconds, and
 PR1 remains **79/79 in 6.51 seconds**.
 
 Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.
+
+### Four-level constant-base eight milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `8.0**x`, official tensor | **2,925/2,925 passing** | four Q15 LUT bands |
+| knot + off-grid permanent regression | **1,026/1,026 passing** | maximum relative error `0.0009718` |
+| later square/base-two tensor/scalar cases | **passing** | existing native paths |
+| final `0**x` | non-finite LUT scale failure | next POW subgroup |
+
+The rejected two-band design had a 64:1 output range in each Q15 table and
+missed 78 interpolated values despite passing exact knots.  A global one-unit
+bias increased the failures to 178.  The passing four bands each cover only
+8:1 and decode by `1/8`, `1`, `8`, or `64` on DPU.
+
+The base-eight and base-5.5 permanent sweeps pass **2/2 in 10.29 seconds**.
+The official method passes base eight and every later ordinary case before
+reaching only `0**x` in 77.35 seconds, and PR1 remains **79/79 in 6.53
+seconds**.  No host operator fallback is used.
+
+Recovery patch: `rockchip-pow-base8-four-level-52089b962.patch`.
