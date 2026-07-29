@@ -1,0 +1,192 @@
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 7c7b67e98..c2af2dc95 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -546,6 +546,23 @@ class TestCMAC(unittest.TestCase):
+           expected[0, co, oy, ox] = np.sum(x_np[0, :, oy, ox].astype(np.float32) * w_np[co, :, 0, 0].astype(np.float32))
+     np.testing.assert_allclose(c.numpy(), expected, rtol=1e-2, atol=1e-1)
+ 
++  def test_cmac_channel_bias_relu(self):
++    # Bias is applied to the raw fp32 CMAC accumulator before its final fp16 cast.
++    np.random.seed(123)
++    C, H, W = 4, 3, 3
++    x_np = np.random.randn(1, C, H, W).astype(np.float16)
++    w_np = np.random.randn(C, C, 1, 1).astype(np.float16)
++    b_np = np.random.randn(C).astype(np.float16)
++    x, w, b = (Tensor(v, device="ROCKCHIP").realize() for v in (x_np, w_np, b_np))
++    c = x.conv2d(w, b).relu().realize()
++    expected = np.zeros((1, C, H, W), dtype=np.float16)
++    for co in range(C):
++      for oy in range(H):
++        for ox in range(W):
++          acc = np.sum(x_np[0, :, oy, ox].astype(np.float32) * w_np[co, :, 0, 0].astype(np.float32))
++          expected[0, co, oy, ox] = np.maximum(np.float32(acc + np.float32(b_np[co])), np.float32(0))
++    np.testing.assert_array_equal(c.numpy(), expected)
++
+   def test_cmac_fp32_to_fp16_rounding(self):
+     # Judge's test case: 0.5180664 * 0.5258789 should give FP16 bits 0x345c, not 0x345b
+     # The old conversion truncated (mt >> 13) without round-to-nearest-even
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 43b2146a5..d88046408 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -98,12 +98,12 @@ class TestClassifier(unittest.TestCase):
+     w = Tensor.rand(4,4,1,1,dtype=dtypes.half).realize()
+     self.assertEqual(_classify(_get_sink(x.conv2d(w))), "cmac")
+ 
+-  def test_reject_fused_bias_conv(self):
+-    # Fused conv+bias is rejected in PR1 (epilogue fusion is PR2)
++  def test_cmac_fused_bias_conv(self):
++    # Channel bias is applied to the raw fp32 CMAC accumulator before fp16 rounding.
+     x = Tensor.rand(1,4,3,3,dtype=dtypes.half).realize()
+     w = Tensor.rand(4,4,1,1,dtype=dtypes.half).realize()
+     b = Tensor.rand(4,dtype=dtypes.half).realize()
+-    self.assertIn("REJECT", _classify(_get_sink(x.conv2d(w, b))))
++    self.assertEqual(_classify(_get_sink(x.conv2d(w, b))), "cmac")
+ 
+   def test_ppu_max(self):
+     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 643f6e143..c6b1fbf9f 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -102,10 +102,18 @@ def _sanitize_fp16_comparison_buf(src, dst, n):
+   np.nan_to_num(arr, copy=False, nan=float("nan"), posinf=65504.0, neginf=-65504.0)
+   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+ 
+-def _unpack_cmac_out(src, dst, M, N, align_out):
++def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=False):
+   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
++  b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias is not None else None
+   for i in range(M * N):
+-    d[i] = _fp32_to_fp16(s[(i // N) * align_out + i % N])
++    raw = s[(i // N) * align_out + i % N]
++    if b is not None:
++      bias_index = i // N if bias_axis == 0 else i % N
++      value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[bias_index]))[0]
++      value = struct.unpack('<f', struct.pack('<f', value))[0]
++      if relu: value = value if value > 0.0 else 0.0
++      raw = struct.unpack('<I', struct.pack('<f', value))[0]
++    d[i] = _fp32_to_fp16(raw)
+ 
+ def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute a tagged exact int32/uint32/bool bitwise task on mapped buffers."""
+@@ -565,8 +573,10 @@ class RockchipProgram(Program['RockchipDevice']):
+           rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
+       if getenv("DEBUG") >= 1: print(f"submit {self.name}: mask={task.enable_mask:#x} kind={task.kind}")
+       if task.kind == "cmac":
+-        M, N, _, _, align_out = task.layout
+-        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out)
++        M, N, _, _, align_out = task.layout[:5]
++        bias_slot, bias_axis, relu = task.layout[5:] if len(task.layout) >= 8 else (-1, -1, 0)
++        bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
++        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, bias, bias_axis, bool(relu))
+       elif task.kind == "ppu" and ppu_padded is not None:
+         channels, chan_padded, out_padded = ppu_padded
+         ctypes.memmove(bufs[task.out_slot].va_addr, out_padded.va_addr, channels * 2)  # type: ignore[arg-type]
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 441358cf1..831dc9847 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -68,6 +68,8 @@ class RKPlan:
+   is_abs: bool = False                # abs(x) via BN negate + EW max (both operands same buffer)
+   epilogue: str = "none"              # CMAC BS/BN epilogue: "none", "relu", "scale"
+   epilogue_scale: float = 1.0         # scale factor for "scale" epilogue (BS MUL operand)
++  epilogue_bias_slot: int = -1        # host fp32-accumulator channel bias, before final fp16 rounding
++  epilogue_bias_axis: int = -1        # output LOOP axis used to index the bias tensor
+ 
+ @dataclass(frozen=True)
+ class RKTask:
+@@ -1632,29 +1634,46 @@ def _check_dpu_layout(sink: UOp, allow_2d: bool, require_uniform: bool) -> str|N
+       return f"RKPLAN_REJECT:unsupported_layout:{n.src[1].op}"
+   return None
+ 
+-def _try_cmac_epilogue(sink: UOp, reduce: UOp) -> tuple[str, float]|None:
++def _try_cmac_epilogue(sink: UOp, reduce: UOp) -> tuple[str, float, int, int]|None:
+   """Detect BS-fusable epilogue after CMAC reduce. Returns (epilogue_type, scale) or None.
+-  Supported: "relu" (WHERE(CMPLT(0,x), x, 0)), "scale" (MUL(x, const) or MUL(const, x)).
++  Supported: "relu" (WHERE(CMPLT(0,x), x, 0)), "scale" (MUL(x, const) or MUL(const, x)),
++  and channel bias with optional ReLU. Bias is added to the raw fp32 CMAC accumulator
++  by the mapped-buffer runtime before its one final fp16 rounding.
+   The epilogue sits between the reduce and the store: store.src[1] = epilogue(reduce)."""
+   store = _store_node(sink)
+   if store is None: return None
+   sv = _unwrap(store.src[1])
+-  if sv is reduce: return ("none", 1.0)
++  if sv is reduce: return ("none", 1.0, -1, -1)
+   # Scale: MUL(CAST(reduce), CONST(c)) or MUL(CONST(c), CAST(reduce))
+   if sv.op is Ops.MUL and len(sv.src) == 2:
+     a, b = _unwrap(sv.src[0]), _unwrap(sv.src[1])
+-    if a is reduce and b.op is Ops.CONST: return ("scale", float(b.arg))
+-    if b is reduce and a.op is Ops.CONST: return ("scale", float(a.arg))
++    if a is reduce and b.op is Ops.CONST: return ("scale", float(b.arg), -1, -1)
++    if b is reduce and a.op is Ops.CONST: return ("scale", float(a.arg), -1, -1)
++  relu = False
+   # ReLU: WHERE(CMPLT(CONST(0), CAST(reduce)), CAST(reduce), CONST(0))
+   if sv.op is Ops.WHERE and len(sv.src) == 3:
+     cond, t, f = sv.src
+     cond_u, t_u, f_u = _unwrap(cond), _unwrap(t), _unwrap(f)
+     # WHERE(CMPLT(0, x), x, 0) = relu(x)
+-    if cond_u.op is Ops.CMPLT and t_u is reduce and f_u.op is Ops.CONST and float(f_u.arg) == 0.0:
+-      return ("relu", 1.0)
++    if cond_u.op is Ops.CMPLT and f_u.op is Ops.CONST and float(f_u.arg) == 0.0 and \
++       len(cond_u.src) == 2 and _unwrap(cond_u.src[0]).op is Ops.CONST and float(_unwrap(cond_u.src[0]).arg) == 0.0 and \
++       _unwrap(cond_u.src[1]) is t_u:
++      if t_u is reduce: return ("relu", 1.0, -1, -1)
++      sv, relu = t_u, True
+     # WHERE(CMPLT(x, 0), 0, x) = relu(x) (alternative form)
+-    if cond_u.op is Ops.CMPLT and f_u is reduce and t_u.op is Ops.CONST and float(t_u.arg) == 0.0:
+-      return ("relu", 1.0)
++    elif cond_u.op is Ops.CMPLT and t_u.op is Ops.CONST and float(t_u.arg) == 0.0 and \
++         len(cond_u.src) == 2 and _unwrap(cond_u.src[1]).op is Ops.CONST and float(_unwrap(cond_u.src[1]).arg) == 0.0 and \
++         _unwrap(cond_u.src[0]) is f_u:
++      if f_u is reduce: return ("relu", 1.0, -1, -1)
++      sv, relu = f_u, True
++  # ADD(CAST(REDUCE), INDEX(bias, RANGE(loop_axis))) with optional outer ReLU.
++  if sv.op is Ops.ADD and len(sv.src) == 2:
++    a, b = _unwrap(sv.src[0]), _unwrap(sv.src[1])
++    bias = b if a is reduce and b.op is Ops.INDEX else a if b is reduce and a.op is Ops.INDEX else None
++    if bias is not None and bias.src[0].op is Ops.PARAM:
++      loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++      if bias.src[1] in loops:
++        return ("bias_relu" if relu else "bias", 1.0, bias.src[0].buf_uop.arg.slot, loops.index(bias.src[1]))
+   return None
+ 
+ def plan_rk(sink: UOp) -> RKPlan|str:
+@@ -1664,6 +1683,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
+   lut_result = None  # set in DPU path only
+   abs_slot = None  # set in DPU path only
+   epilogue, epilogue_scale = "none", 1.0  # set in CMAC path only
++  epilogue_bias_slot, epilogue_bias_axis = -1, -1
+   # R3 DPU: no REDUCE, single STORE with binary EW op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy
+   if reduce is None:
+     store = _store_node(sink)
+@@ -1700,7 +1720,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
+         epi = _try_cmac_epilogue(sink, reduce)
+         if epi is None:
+           return "RKPLAN_REJECT:unsupported_op:fused_epilogue"
+-        epilogue, epilogue_scale = epi
++        epilogue, epilogue_scale, epilogue_bias_slot, epilogue_bias_axis = epi
+     if body.op is Ops.MUL and all(s.op is Ops.INDEX or (s.op is Ops.CAST and s.src[0].op is Ops.INDEX) for s in body.src):
+       if not _is_cmac_matmul_layout(sink, reduce): return "RKPLAN_REJECT:unsupported_layout"
+       kind = "cmac"
+@@ -1753,7 +1773,8 @@ def plan_rk(sink: UOp) -> RKPlan|str:
+     return f"RKPLAN_REJECT:unsupported_dtype:fp32_{kind}"
+   return RKPlan(kind, sink, out_slots[0], in_slots, input_scale=input_scale, output_scale=output_scale, lut_op=lut_op,
+                 fp32_inputs=fp32_inputs, fp32_output=fp32_output, is_abs=abs_slot is not None,
+-                epilogue=epilogue, epilogue_scale=epilogue_scale)
++                epilogue=epilogue, epilogue_scale=epilogue_scale,
++                epilogue_bias_slot=epilogue_bias_slot, epilogue_bias_axis=epilogue_bias_axis)
+ 
+ # ---- geometry extraction ----
+ def _loop_extents(sink: UOp) -> list[int]:
+@@ -5733,7 +5754,8 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
+   emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, (4<<4))
+   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
+   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
+-  layout = (M, N, K, align_in, align_out)
++  layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
++            int(plan.epilogue == "bias_relu"))
+   return tuple(c.pack() for c in cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot, const_val=cv,
+                                                fp32_inputs=plan.fp32_inputs, fp32_output=plan.fp32_output), tuple(relocs)
+ 

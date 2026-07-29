@@ -68,6 +68,8 @@ class RKPlan:
   is_abs: bool = False                # abs(x) via BN negate + EW max (both operands same buffer)
   epilogue: str = "none"              # CMAC BS/BN epilogue: "none", "relu", "scale"
   epilogue_scale: float = 1.0         # scale factor for "scale" epilogue (BS MUL operand)
+  epilogue_bias_slot: int = -1        # host fp32-accumulator channel bias, before final fp16 rounding
+  epilogue_bias_axis: int = -1        # output LOOP axis used to index the bias tensor
 
 @dataclass(frozen=True)
 class RKTask:
@@ -1632,29 +1634,46 @@ def _check_dpu_layout(sink: UOp, allow_2d: bool, require_uniform: bool) -> str|N
       return f"RKPLAN_REJECT:unsupported_layout:{n.src[1].op}"
   return None
 
-def _try_cmac_epilogue(sink: UOp, reduce: UOp) -> tuple[str, float]|None:
+def _try_cmac_epilogue(sink: UOp, reduce: UOp) -> tuple[str, float, int, int]|None:
   """Detect BS-fusable epilogue after CMAC reduce. Returns (epilogue_type, scale) or None.
-  Supported: "relu" (WHERE(CMPLT(0,x), x, 0)), "scale" (MUL(x, const) or MUL(const, x)).
+  Supported: "relu" (WHERE(CMPLT(0,x), x, 0)), "scale" (MUL(x, const) or MUL(const, x)),
+  and channel bias with optional ReLU. Bias is added to the raw fp32 CMAC accumulator
+  by the mapped-buffer runtime before its one final fp16 rounding.
   The epilogue sits between the reduce and the store: store.src[1] = epilogue(reduce)."""
   store = _store_node(sink)
   if store is None: return None
   sv = _unwrap(store.src[1])
-  if sv is reduce: return ("none", 1.0)
+  if sv is reduce: return ("none", 1.0, -1, -1)
   # Scale: MUL(CAST(reduce), CONST(c)) or MUL(CONST(c), CAST(reduce))
   if sv.op is Ops.MUL and len(sv.src) == 2:
     a, b = _unwrap(sv.src[0]), _unwrap(sv.src[1])
-    if a is reduce and b.op is Ops.CONST: return ("scale", float(b.arg))
-    if b is reduce and a.op is Ops.CONST: return ("scale", float(a.arg))
+    if a is reduce and b.op is Ops.CONST: return ("scale", float(b.arg), -1, -1)
+    if b is reduce and a.op is Ops.CONST: return ("scale", float(a.arg), -1, -1)
+  relu = False
   # ReLU: WHERE(CMPLT(CONST(0), CAST(reduce)), CAST(reduce), CONST(0))
   if sv.op is Ops.WHERE and len(sv.src) == 3:
     cond, t, f = sv.src
     cond_u, t_u, f_u = _unwrap(cond), _unwrap(t), _unwrap(f)
     # WHERE(CMPLT(0, x), x, 0) = relu(x)
-    if cond_u.op is Ops.CMPLT and t_u is reduce and f_u.op is Ops.CONST and float(f_u.arg) == 0.0:
-      return ("relu", 1.0)
+    if cond_u.op is Ops.CMPLT and f_u.op is Ops.CONST and float(f_u.arg) == 0.0 and \
+       len(cond_u.src) == 2 and _unwrap(cond_u.src[0]).op is Ops.CONST and float(_unwrap(cond_u.src[0]).arg) == 0.0 and \
+       _unwrap(cond_u.src[1]) is t_u:
+      if t_u is reduce: return ("relu", 1.0, -1, -1)
+      sv, relu = t_u, True
     # WHERE(CMPLT(x, 0), 0, x) = relu(x) (alternative form)
-    if cond_u.op is Ops.CMPLT and f_u is reduce and t_u.op is Ops.CONST and float(t_u.arg) == 0.0:
-      return ("relu", 1.0)
+    elif cond_u.op is Ops.CMPLT and t_u.op is Ops.CONST and float(t_u.arg) == 0.0 and \
+         len(cond_u.src) == 2 and _unwrap(cond_u.src[1]).op is Ops.CONST and float(_unwrap(cond_u.src[1]).arg) == 0.0 and \
+         _unwrap(cond_u.src[0]) is f_u:
+      if f_u is reduce: return ("relu", 1.0, -1, -1)
+      sv, relu = f_u, True
+  # ADD(CAST(REDUCE), INDEX(bias, RANGE(loop_axis))) with optional outer ReLU.
+  if sv.op is Ops.ADD and len(sv.src) == 2:
+    a, b = _unwrap(sv.src[0]), _unwrap(sv.src[1])
+    bias = b if a is reduce and b.op is Ops.INDEX else a if b is reduce and a.op is Ops.INDEX else None
+    if bias is not None and bias.src[0].op is Ops.PARAM:
+      loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+      if bias.src[1] in loops:
+        return ("bias_relu" if relu else "bias", 1.0, bias.src[0].buf_uop.arg.slot, loops.index(bias.src[1]))
   return None
 
 def plan_rk(sink: UOp) -> RKPlan|str:
@@ -1664,6 +1683,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
   lut_result = None  # set in DPU path only
   abs_slot = None  # set in DPU path only
   epilogue, epilogue_scale = "none", 1.0  # set in CMAC path only
+  epilogue_bias_slot, epilogue_bias_axis = -1, -1
   # R3 DPU: no REDUCE, single STORE with binary EW op (ADD/SUB/MUL/MAX), scalar operand, or DMA copy
   if reduce is None:
     store = _store_node(sink)
@@ -1700,7 +1720,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
         epi = _try_cmac_epilogue(sink, reduce)
         if epi is None:
           return "RKPLAN_REJECT:unsupported_op:fused_epilogue"
-        epilogue, epilogue_scale = epi
+        epilogue, epilogue_scale, epilogue_bias_slot, epilogue_bias_axis = epi
     if body.op is Ops.MUL and all(s.op is Ops.INDEX or (s.op is Ops.CAST and s.src[0].op is Ops.INDEX) for s in body.src):
       if not _is_cmac_matmul_layout(sink, reduce): return "RKPLAN_REJECT:unsupported_layout"
       kind = "cmac"
@@ -1753,7 +1773,8 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     return f"RKPLAN_REJECT:unsupported_dtype:fp32_{kind}"
   return RKPlan(kind, sink, out_slots[0], in_slots, input_scale=input_scale, output_scale=output_scale, lut_op=lut_op,
                 fp32_inputs=fp32_inputs, fp32_output=fp32_output, is_abs=abs_slot is not None,
-                epilogue=epilogue, epilogue_scale=epilogue_scale)
+                epilogue=epilogue, epilogue_scale=epilogue_scale,
+                epilogue_bias_slot=epilogue_bias_slot, epilogue_bias_axis=epilogue_bias_axis)
 
 # ---- geometry extraction ----
 def _loop_extents(sink: UOp) -> list[int]:
@@ -5733,7 +5754,8 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   emitter_emit(cmds, _T_DPU, rk.REG_DPU_SURFACE_ADD, (4<<4))
   # 46. PC_OPERATION_ENABLE: CNA+CORE+DPU (reserved_0=6, op_en=1)
   emitter_emit(cmds, _T_PC, rk.REG_PC_OPERATION_ENABLE, (6<<1)|1)
-  layout = (M, N, K, align_in, align_out)
+  layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
+            int(plan.epilogue == "bias_relu"))
   return tuple(c.pack() for c in cmds), RKTask(0xd, 0x300, 0, "cmac", layout, plan.out_slot, const_val=cv,
                                                fp32_inputs=plan.fp32_inputs, fp32_output=plan.fp32_output), tuple(relocs)
 

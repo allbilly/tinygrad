@@ -102,10 +102,18 @@ def _sanitize_fp16_comparison_buf(src, dst, n):
   np.nan_to_num(arr, copy=False, nan=float("nan"), posinf=65504.0, neginf=-65504.0)
   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
 
-def _unpack_cmac_out(src, dst, M, N, align_out):
+def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=False):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
+  b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias is not None else None
   for i in range(M * N):
-    d[i] = _fp32_to_fp16(s[(i // N) * align_out + i % N])
+    raw = s[(i // N) * align_out + i % N]
+    if b is not None:
+      bias_index = i // N if bias_axis == 0 else i % N
+      value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[bias_index]))[0]
+      value = struct.unpack('<f', struct.pack('<f', value))[0]
+      if relu: value = value if value > 0.0 else 0.0
+      raw = struct.unpack('<I', struct.pack('<f', value))[0]
+    d[i] = _fp32_to_fp16(raw)
 
 def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute a tagged exact int32/uint32/bool bitwise task on mapped buffers."""
@@ -565,8 +573,10 @@ class RockchipProgram(Program['RockchipDevice']):
           rk.struct_rknpu_subcore_task(task_start=2, task_number=0))))
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: mask={task.enable_mask:#x} kind={task.kind}")
       if task.kind == "cmac":
-        M, N, _, _, align_out = task.layout
-        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out)
+        M, N, _, _, align_out = task.layout[:5]
+        bias_slot, bias_axis, relu = task.layout[5:] if len(task.layout) >= 8 else (-1, -1, 0)
+        bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
+        _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, bias, bias_axis, bool(relu))
       elif task.kind == "ppu" and ppu_padded is not None:
         channels, chan_padded, out_padded = ppu_padded
         ctypes.memmove(bufs[task.out_slot].va_addr, out_padded.va_addr, channels * 2)  # type: ignore[arg-type]

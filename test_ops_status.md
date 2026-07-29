@@ -136,6 +136,21 @@ handles nested index-tensor loads and their validity masks only after native
 classifiers reject the graph. The complete hardware file is now **73/73
 passing in 244.61 seconds**.
 
+`test_biased_conv2d` now passes on Rockchip through a narrow CMAC channel-bias
+epilogue. Bias and optional ReLU are applied to the raw fp32 CNA/CORE
+accumulator before its one final fp16 conversion, matching the reference
+branch's useful precision ordering. The focused official plus exact hardware
+run is **2/2 in 1.65 seconds**, all CMAC hardware tests are **15/15 in 2.58
+seconds**, and the full hardware file is **74/74 in 244.21 seconds**.
+
+Important census correction: several post-runtime-index convolution/cache
+probes were run without `DEV=ROCKCHIP`, so their apparent CPU passes are not
+Rockchip results and have been discarded. Isolated official tests must use
+both `DEV=ROCKCHIP` and `-p test.rockchip.conftest_rockchip`. With the correct
+command, general 3x3 and transposed convolution are still unsupported; branch
+commit `e0c38901b` is the next implementation reference. The reusable patch
+is `rockchip-cmac-channel-bias-2bff5d9b9.patch`.
+
 A cache refresh also cleared historical failures for all/any, several
 sum/max/min/mean and dot/GEMM methods, one-hot, fixed-size masked select and
 nonzero, reflect/replicate pad, padding-add, nearest/bilinear interpolation,

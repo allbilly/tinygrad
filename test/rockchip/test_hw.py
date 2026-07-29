@@ -546,6 +546,23 @@ class TestCMAC(unittest.TestCase):
           expected[0, co, oy, ox] = np.sum(x_np[0, :, oy, ox].astype(np.float32) * w_np[co, :, 0, 0].astype(np.float32))
     np.testing.assert_allclose(c.numpy(), expected, rtol=1e-2, atol=1e-1)
 
+  def test_cmac_channel_bias_relu(self):
+    # Bias is applied to the raw fp32 CMAC accumulator before its final fp16 cast.
+    np.random.seed(123)
+    C, H, W = 4, 3, 3
+    x_np = np.random.randn(1, C, H, W).astype(np.float16)
+    w_np = np.random.randn(C, C, 1, 1).astype(np.float16)
+    b_np = np.random.randn(C).astype(np.float16)
+    x, w, b = (Tensor(v, device="ROCKCHIP").realize() for v in (x_np, w_np, b_np))
+    c = x.conv2d(w, b).relu().realize()
+    expected = np.zeros((1, C, H, W), dtype=np.float16)
+    for co in range(C):
+      for oy in range(H):
+        for ox in range(W):
+          acc = np.sum(x_np[0, :, oy, ox].astype(np.float32) * w_np[co, :, 0, 0].astype(np.float32))
+          expected[0, co, oy, ox] = np.maximum(np.float32(acc + np.float32(b_np[co])), np.float32(0))
+    np.testing.assert_array_equal(c.numpy(), expected)
+
   def test_cmac_fp32_to_fp16_rounding(self):
     # Judge's test case: 0.5180664 * 0.5258789 should give FP16 bits 0x345c, not 0x345b
     # The old conversion truncated (mt >> 13) without round-to-nearest-even

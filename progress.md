@@ -5196,6 +5196,50 @@ linspace, integer true division, several constant reductions, meshgrid,
 scalar stack, and fancy-index special values; changing the Rockchip backend
 cannot alter that framework-level dtype policy safely.
 
+## 2026-07-29 — CMAC channel-bias epilogue milestone
+
+The unchanged forward-only `TestOps.test_biased_conv2d` now passes on the
+actual Rockchip backend. Together with its new exact hardware regression the
+focused run is **2/2 passing in 1.65 seconds**. All **15/15 CMAC hardware
+tests pass in 2.58 seconds**, and the complete hardware suite is now **74/74
+passing in 244.21 seconds**, with the same 11 expected numerical warnings.
+
+The failing 1x1 convolution was already a valid CMAC matrix reduction, but its
+post-reduction graph was `relu(fp32_accumulator + fp16_channel_bias)`. The old
+classifier only accepted bare ReLU or constant scale epilogues and rejected
+the bias ADD as `unsupported_op:fused_epilogue`.
+
+The passing path recognizes a bias INDEX driven directly by either output
+LOOP axis. CNA/CORE still performs the multiply-accumulate on the NPU. The
+mapped-buffer unpack then adds the channel bias to the raw fp32 CMAC result,
+optionally applies ReLU, and performs the single final fp16 round. This follows
+the useful bias handling in reference branch `e0c38901b`, while avoiding an
+incorrect fp16 round before the bias. Existing hardware ReLU/scale epilogues
+remain intact.
+
+The classifier regression now expects fused 1x1 bias convolution to classify
+as CMAC. Its complete file is **68 passing with four stale rejection
+expectations** (mean and fp32 support), down from five. Mypy remains at the
+same 13 pre-existing findings and targeted Ruff at the same five pre-existing
+findings.
+
+Correction to the immediately preceding exploratory notes: a batch of
+convolution/cache probes was accidentally run without `DEV=ROCKCHIP` and
+therefore exercised tinygrad CPU. Those probes must not be counted as
+Rockchip passes. Every milestone result above uses the documented command
+shape:
+
+```text
+DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  .venv/bin/python -m pytest ... -p test.rockchip.conftest_rockchip
+```
+
+General 3x3 and transposed convolution remain real backend work. The
+neighboring `rockchip_addmul` commit `e0c38901b` contains a broader CNA
+conv1d/2d/3d recognizer and is the primary reference for that next group.
+The reusable patch is `rockchip-cmac-channel-bias-2bff5d9b9.patch`, against
+parent `2bff5d9b9`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

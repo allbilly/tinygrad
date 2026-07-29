@@ -98,12 +98,12 @@ class TestClassifier(unittest.TestCase):
     w = Tensor.rand(4,4,1,1,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(x.conv2d(w))), "cmac")
 
-  def test_reject_fused_bias_conv(self):
-    # Fused conv+bias is rejected in PR1 (epilogue fusion is PR2)
+  def test_cmac_fused_bias_conv(self):
+    # Channel bias is applied to the raw fp32 CMAC accumulator before fp16 rounding.
     x = Tensor.rand(1,4,3,3,dtype=dtypes.half).realize()
     w = Tensor.rand(4,4,1,1,dtype=dtypes.half).realize()
     b = Tensor.rand(4,dtype=dtypes.half).realize()
-    self.assertIn("REJECT", _classify(_get_sink(x.conv2d(w, b))))
+    self.assertEqual(_classify(_get_sink(x.conv2d(w, b))), "cmac")
 
   def test_ppu_max(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
