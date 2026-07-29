@@ -6996,3 +6996,46 @@ Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
   while half-integers are NaN.
 
 This closes the forward constant-power group.
+
+## 2026-07-30 — native cumulative-maximum axis indices
+
+The cumulative forward refresh found that `cumsum`, both cumulative zero-axis
+methods, and cummax values already passed.  Cummax indices were numerically
+wrong for multidimensional inputs: the shared max-index path returned a
+flattened source address (`row*stride+column`) instead of the coordinate along
+the cumulative axis.
+
+Cummax and max-pool share the same equality-based selected-index lowering but
+encode different index meanings.  The classifier now distinguishes cummax's
+floating reduction-coordinate encoding before its final int cast from
+max-pool's integer spatial-address encoding.  For cummax it:
+
+1. marks candidates beyond the current prefix coordinate invalid;
+2. emits the reduction candidate number rather than its source address;
+3. visits candidates forward so the most recent equal maximum wins.
+
+Max-pool retains backward visitation and its first-spatial-index tie rule.
+Static mappings and fp16/int32 byte assembly remain host-side layout work;
+all runtime equality masks, validity masks, and index selection are DPU tasks.
+No `run_host` operator arithmetic is used.
+
+### Validation
+
+Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
+
+- unchanged official `test_cummax` plus `test_cummax_zero_axis`: **2/2
+  passing in 48.27 seconds**;
+- permanent two-axis tie regression plus existing native returned-max-pool
+  index regression: **2/2 passing in 13.77 seconds**;
+- `cumsum` and `cumsum_zero_axis` were refreshed before the change and remain
+  passing.
+
+Current isolated census notes:
+
+- `argmax`, `argmin`, and `argsort` remain genuine `unsupported_dtype`
+  failures and form a larger general selected-index group;
+- the remaining `test_arange` mismatch reproduces identically on CPU with
+  `DEFAULT_FLOAT=HALF`, so it is a Tinygrad/Torch half-arange semantic
+  difference rather than a Rockchip backend failure;
+- long shared-process runs can still hit an RK ioctl timeout; the implicated
+  method must be rerun in isolation before classifying it as failed.

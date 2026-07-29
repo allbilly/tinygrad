@@ -1,0 +1,172 @@
+diff --git a/progress.md b/progress.md
+index 9179d2a35..f62924ba4 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6996,3 +6996,46 @@ Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
+   while half-integers are NaN.
+ 
+ This closes the forward constant-power group.
++
++## 2026-07-30 — native cumulative-maximum axis indices
++
++The cumulative forward refresh found that `cumsum`, both cumulative zero-axis
++methods, and cummax values already passed.  Cummax indices were numerically
++wrong for multidimensional inputs: the shared max-index path returned a
++flattened source address (`row*stride+column`) instead of the coordinate along
++the cumulative axis.
++
++Cummax and max-pool share the same equality-based selected-index lowering but
++encode different index meanings.  The classifier now distinguishes cummax's
++floating reduction-coordinate encoding before its final int cast from
++max-pool's integer spatial-address encoding.  For cummax it:
++
++1. marks candidates beyond the current prefix coordinate invalid;
++2. emits the reduction candidate number rather than its source address;
++3. visits candidates forward so the most recent equal maximum wins.
++
++Max-pool retains backward visitation and its first-spatial-index tie rule.
++Static mappings and fp16/int32 byte assembly remain host-side layout work;
++all runtime equality masks, validity masks, and index selection are DPU tasks.
++No `run_host` operator arithmetic is used.
++
++### Validation
++
++Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
++
++- unchanged official `test_cummax` plus `test_cummax_zero_axis`: **2/2
++  passing in 48.27 seconds**;
++- permanent two-axis tie regression plus existing native returned-max-pool
++  index regression: **2/2 passing in 13.77 seconds**;
++- `cumsum` and `cumsum_zero_axis` were refreshed before the change and remain
++  passing.
++
++Current isolated census notes:
++
++- `argmax`, `argmin`, and `argsort` remain genuine `unsupported_dtype`
++  failures and form a larger general selected-index group;
++- the remaining `test_arange` mismatch reproduces identically on CPU with
++  `DEFAULT_FLOAT=HALF`, so it is a Tinygrad/Torch half-arange semantic
++  difference rather than a Rockchip backend failure;
++- long shared-process runs can still hit an RK ioctl timeout; the implicated
++  method must be rerun in isolation before classifying it as failed.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index df2b55f93..438b57ce5 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -374,6 +374,16 @@ class TestDPU(unittest.TestCase):
+     expected = np.power(np.float32(np.float16(0.7)), exponent.astype(np.float32)).astype(np.float16)
+     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+ 
++  def test_dpu_cummax_axis_indices(self):
++    values = np.array([[1,5,2,4], [3,0,6,4], [2,7,1,8]], dtype=np.float16)
++    expected = (
++      np.array([[0,0,0,0], [1,0,1,1], [1,2,1,2]], dtype=np.int32),
++      np.array([[0,1,1,1], [0,0,2,2], [0,1,1,3]], dtype=np.int32),
++    )
++    for axis in (0, 1):
++      actual = Tensor(values, device="ROCKCHIP").cummax(axis=axis)[1].realize().numpy()
++      np.testing.assert_array_equal(actual, expected[axis])
++
+   def test_dpu_log2_two_lut_normalization(self):
+     boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
+                            0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,
+diff --git a/test_ops_status.md b/test_ops_status.md
+index e1ede6f0f..6233e15ac 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1049,3 +1049,29 @@ eight; DPU decodes them before the existing validity/parity lowering.  The
+ two negative-base regressions pass in 22.71 seconds and the unchanged
+ official constant-POW method passes completely in 7.38 seconds with caches
+ disabled.  No host operator fallback is used.
++
++### Native cumulative-maximum index milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `cummax` values and indices | **passing** | DPU compare/select |
++| `cummax_zero_axis` | **passing** | static identity handling |
++| `cumsum`, `cumsum_zero_axis` | **passing** | unchanged |
++| `cummin` | values still reject | separate negative-MAX subgroup |
++
++The shared max-index path previously returned flattened input addresses for
++multidimensional cummax.  It now recognizes the floating coordinate encoding,
++masks candidates outside each prefix, writes the reduction-axis coordinate,
++and uses the latest-match tie rule.  Max-pool retains absolute spatial
++addresses and first-match ties.
++
++The unchanged official cummax pair passes **2/2 in 48.27 seconds**.  A
++permanent two-axis tie regression and the existing max-pool returned-index
++regression pass **2/2 in 13.77 seconds**.  Host callbacks only materialize
++static mappings and assemble representation bytes; runtime selection remains
++on NPU.
++
++Refresh caveats: general `argmax`/`argmin`/`argsort` remain unsupported, while
++the observed half `arange` tolerance mismatch reproduces on CPU and is not a
++Rockchip-specific failure.  RK ioctl timeouts in a long shared process are
++rerun in isolation before being counted.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 5f470ddf6..e1c508549 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -7988,6 +7988,12 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   planes = prod(out_shape[:-2]) if len(out_shape) >= 3 else 1
+   if planes <= 0 or input_total % planes: return None
+   input_spatial = input_total // planes
++  # Cummax encodes a reduction-axis coordinate through a floating MAX before
++  # the final int cast (half under DEFAULT_FLOAT=HALF). Max-pool instead
++  # encodes the absolute spatial address in an int MAX. Both share this
++  # equality/index-selection graph.
++  relative_index = store.src[1].op is Ops.CAST and store.src[1].dtype is dtypes.int and \
++    store.src[1].src[0].dtype in (dtypes.half, dtypes.float)
+ 
+   def evaluate(u:UOp, coords:dict[UOp, int]):
+     while u.op is Ops.CAST: u = u.src[0]
+@@ -8027,7 +8033,12 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+           rem, coord = divmod(rem, reduce_extents[reduce_axis])
+           coords[reductions[reduce_axis]] = coord
+         source_index = evaluate(data.src[1], coords)
+-        if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
++        # Original max-pool mapping accepted every valid source address. Cummax
++        # carries its prefix mask outside the INDEX address, so also reject
++        # candidates beyond the current reduction-axis coordinate.
++        # if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
++        if source_index is not Invalid and (not relative_index or reduce_linear <= out_index % window):
++          mapping[out_index*window+reduce_linear] = int(source_index)
+   except (TypeError, ValueError, OverflowError, ZeroDivisionError): return None
+ 
+   info = ProgramInfo.from_sink(sink)
+@@ -8132,7 +8143,8 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+     candidate_index_slots:list[int] = []
+     for byte in range(index_bytes):
+-      indices = tuple(0 if address < 0 else (address % input_spatial >> (8*byte)) & 0xFF for address in addresses)
++      indices = tuple(0 if address < 0 else ((candidate if relative_index else address % input_spatial) >> (8*byte)) & 0xFF
++                      for address in addresses)
+       index_slot, next_slot = next_slot, next_slot+1
+       index_bits = tuple(struct.unpack('<H', struct.pack('<e', float(index)))[0] for index in indices)
+       index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *index_bits)
+@@ -8152,9 +8164,10 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+   selected:list[tuple[int,int]] = [(_ZERO_SLOT, 0)] * index_bytes
+-  # Visit the window backwards: a matching earlier candidate overwrites a
+-  # matching later one, which gives PyTorch's first-index tie rule.
+-  for candidate in range(window-1, -1, -1):
++  # Max-pool uses the first matching spatial index, while cummax uses the most
++  # recent matching reduction-axis coordinate.
++  candidate_order = range(window) if relative_index else range(window-1, -1, -1)
++  for candidate in candidate_order:
+     diff, less, equal = range(next_slot, next_slot+3)
+     next_slot += 3
+     tasks.append(_emit_where_stage(total, diff, (maximum_value_slot, 0), (candidate_slots[candidate], 0), Ops.SUB))
+@@ -8162,7 +8175,9 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(_emit_where_stage(total, equal, one, (less, 0), Ops.SUB))
+     candidate_valid_slot = valid_slots[candidate]
+     if candidate_valid_slot is not None:
+-      valid_equal, next_slot = next_slot, next_slot+1
++      valid_warm, valid_equal = next_slot, next_slot+1
++      next_slot += 2
++      tasks.append(_emit_where_stage(total, valid_warm, (equal, 0), (candidate_valid_slot, 0), Ops.MUL))
+       tasks.append(_emit_where_stage(total, valid_equal, (equal, 0), (candidate_valid_slot, 0), Ops.MUL))
+       equal = valid_equal
+     for byte in range(index_bytes):

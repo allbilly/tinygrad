@@ -1049,3 +1049,29 @@ eight; DPU decodes them before the existing validity/parity lowering.  The
 two negative-base regressions pass in 22.71 seconds and the unchanged
 official constant-POW method passes completely in 7.38 seconds with caches
 disabled.  No host operator fallback is used.
+
+### Native cumulative-maximum index milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `cummax` values and indices | **passing** | DPU compare/select |
+| `cummax_zero_axis` | **passing** | static identity handling |
+| `cumsum`, `cumsum_zero_axis` | **passing** | unchanged |
+| `cummin` | values still reject | separate negative-MAX subgroup |
+
+The shared max-index path previously returned flattened input addresses for
+multidimensional cummax.  It now recognizes the floating coordinate encoding,
+masks candidates outside each prefix, writes the reduction-axis coordinate,
+and uses the latest-match tie rule.  Max-pool retains absolute spatial
+addresses and first-match ties.
+
+The unchanged official cummax pair passes **2/2 in 48.27 seconds**.  A
+permanent two-axis tie regression and the existing max-pool returned-index
+regression pass **2/2 in 13.77 seconds**.  Host callbacks only materialize
+static mappings and assemble representation bytes; runtime selection remains
+on NPU.
+
+Refresh caveats: general `argmax`/`argmin`/`argsort` remain unsupported, while
+the observed half `arange` tolerance mismatch reproduces on CPU and is not a
+Rockchip-specific failure.  RK ioctl timeouts in a long shared process are
+rerun in isolation before being counted.

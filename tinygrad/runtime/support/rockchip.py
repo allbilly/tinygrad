@@ -7988,6 +7988,12 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   planes = prod(out_shape[:-2]) if len(out_shape) >= 3 else 1
   if planes <= 0 or input_total % planes: return None
   input_spatial = input_total // planes
+  # Cummax encodes a reduction-axis coordinate through a floating MAX before
+  # the final int cast (half under DEFAULT_FLOAT=HALF). Max-pool instead
+  # encodes the absolute spatial address in an int MAX. Both share this
+  # equality/index-selection graph.
+  relative_index = store.src[1].op is Ops.CAST and store.src[1].dtype is dtypes.int and \
+    store.src[1].src[0].dtype in (dtypes.half, dtypes.float)
 
   def evaluate(u:UOp, coords:dict[UOp, int]):
     while u.op is Ops.CAST: u = u.src[0]
@@ -8027,7 +8033,12 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
           rem, coord = divmod(rem, reduce_extents[reduce_axis])
           coords[reductions[reduce_axis]] = coord
         source_index = evaluate(data.src[1], coords)
-        if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
+        # Original max-pool mapping accepted every valid source address. Cummax
+        # carries its prefix mask outside the INDEX address, so also reject
+        # candidates beyond the current reduction-axis coordinate.
+        # if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
+        if source_index is not Invalid and (not relative_index or reduce_linear <= out_index % window):
+          mapping[out_index*window+reduce_linear] = int(source_index)
   except (TypeError, ValueError, OverflowError, ZeroDivisionError): return None
 
   info = ProgramInfo.from_sink(sink)
@@ -8132,7 +8143,8 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
     candidate_index_slots:list[int] = []
     for byte in range(index_bytes):
-      indices = tuple(0 if address < 0 else (address % input_spatial >> (8*byte)) & 0xFF for address in addresses)
+      indices = tuple(0 if address < 0 else ((candidate if relative_index else address % input_spatial) >> (8*byte)) & 0xFF
+                      for address in addresses)
       index_slot, next_slot = next_slot, next_slot+1
       index_bits = tuple(struct.unpack('<H', struct.pack('<e', float(index)))[0] for index in indices)
       index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *index_bits)
@@ -8152,9 +8164,10 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
   selected:list[tuple[int,int]] = [(_ZERO_SLOT, 0)] * index_bytes
-  # Visit the window backwards: a matching earlier candidate overwrites a
-  # matching later one, which gives PyTorch's first-index tie rule.
-  for candidate in range(window-1, -1, -1):
+  # Max-pool uses the first matching spatial index, while cummax uses the most
+  # recent matching reduction-axis coordinate.
+  candidate_order = range(window) if relative_index else range(window-1, -1, -1)
+  for candidate in candidate_order:
     diff, less, equal = range(next_slot, next_slot+3)
     next_slot += 3
     tasks.append(_emit_where_stage(total, diff, (maximum_value_slot, 0), (candidate_slots[candidate], 0), Ops.SUB))
@@ -8162,7 +8175,9 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(_emit_where_stage(total, equal, one, (less, 0), Ops.SUB))
     candidate_valid_slot = valid_slots[candidate]
     if candidate_valid_slot is not None:
-      valid_equal, next_slot = next_slot, next_slot+1
+      valid_warm, valid_equal = next_slot, next_slot+1
+      next_slot += 2
+      tasks.append(_emit_where_stage(total, valid_warm, (equal, 0), (candidate_valid_slot, 0), Ops.MUL))
       tasks.append(_emit_where_stage(total, valid_equal, (equal, 0), (candidate_valid_slot, 0), Ops.MUL))
       equal = valid_equal
     for byte in range(index_bytes):
