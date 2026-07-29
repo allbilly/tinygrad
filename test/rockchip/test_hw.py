@@ -222,6 +222,13 @@ class TestDPU(unittest.TestCase):
     c = a.relu().realize()
     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, 0), rtol=1e-3, atol=1e-3)
 
+  def test_dpu_softsign(self):
+    a_np = np.linspace(-4, 4, 257, dtype=np.float16)
+    expected = a_np.astype(np.float32) / (1.0 + np.abs(a_np.astype(np.float32)))
+    got = Tensor(a_np, device="ROCKCHIP").realize().softsign().realize().numpy()
+    np.testing.assert_allclose(got, expected.astype(np.float16), rtol=1e-3, atol=1e-3)
+    np.testing.assert_array_equal(got[[96,128,160]], np.array([-0.5, 0.0, 0.5], dtype=np.float16))
+
   def test_dpu_abs(self):
     # Preserve the sign-WHERE pattern for the stable staged max(x, -x) path.
     a_np = np.array([[-8,-2,-0.0,4],[5,-6,-7,8]], dtype=np.float16)

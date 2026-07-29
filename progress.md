@@ -6422,3 +6422,50 @@ Using `. .venv/bin/activate`:
 
 The standalone recovery artifact is
 `rockchip-native-movement-sum-cc377ca33.patch`, based on `cc377ca33`.
+
+## 2026-07-29 — native softsign
+
+The generic nested elementwise path produced zeros for every negative
+softsign input. A strict matcher now recognizes only tinygrad's exact
+`x / (1 + abs(x))` expansion and emits four ordered DPU stages:
+
+```text
+negative = x * -1
+magnitude = max(x, negative)
+denominator = magnitude + 1
+output = x / denominator
+```
+
+This reuses the hardware-proven staged absolute-value sequence and keeps sign
+through the final variable division. Runtime tensor arithmetic is entirely
+NPU-executed.
+
+### Inactive fp32 SUM WIP
+
+`test_sum_dtype_arg` requests `dtype=float32` on tinygrad, but under the
+required `DEFAULT_FLOAT=HALF` harness its Torch reference calls plain
+`x.sum()` and therefore returns fp16. A staged CMAC-half-output → DPU fp32-ABI
+lowering computes the explicitly requested float32 tensor, but the test still
+fails solely on `float32 != float16`.
+
+That correct semantic lowering is retained as the inactive
+`_wip_try_fp32_sum_output_subtasks`; its dispatch remains commented. Enabling
+it and returning fp16 merely to satisfy this harness configuration would
+violate the requested dtype.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `test_softsign` and `test_softsign_exact`: **2/2 in 1.91
+  seconds**;
+- official pair plus 257-point signed permanent regression: **3/3 in 1.98
+  seconds**;
+- complete DPU hardware class: **61/61 in 316.93 seconds**;
+- hardware-free PR1 contract: **79/79 in 6.74 seconds**.
+
+The full DPU run also passed the previously intermittent heavy
+boolean-reduction → extrema ordering without a timeout.
+
+The standalone recovery artifact is
+`rockchip-native-softsign-abcd0aa1e.patch`, based on `abcd0aa1e`.

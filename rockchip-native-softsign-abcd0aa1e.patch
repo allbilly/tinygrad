@@ -1,0 +1,199 @@
+diff --git a/progress.md b/progress.md
+index cd089b54d..3250823c7 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6422,3 +6422,50 @@ Using `. .venv/bin/activate`:
+ 
+ The standalone recovery artifact is
+ `rockchip-native-movement-sum-cc377ca33.patch`, based on `cc377ca33`.
++
++## 2026-07-29 — native softsign
++
++The generic nested elementwise path produced zeros for every negative
++softsign input. A strict matcher now recognizes only tinygrad's exact
++`x / (1 + abs(x))` expansion and emits four ordered DPU stages:
++
++```text
++negative = x * -1
++magnitude = max(x, negative)
++denominator = magnitude + 1
++output = x / denominator
++```
++
++This reuses the hardware-proven staged absolute-value sequence and keeps sign
++through the final variable division. Runtime tensor arithmetic is entirely
++NPU-executed.
++
++### Inactive fp32 SUM WIP
++
++`test_sum_dtype_arg` requests `dtype=float32` on tinygrad, but under the
++required `DEFAULT_FLOAT=HALF` harness its Torch reference calls plain
++`x.sum()` and therefore returns fp16. A staged CMAC-half-output → DPU fp32-ABI
++lowering computes the explicitly requested float32 tensor, but the test still
++fails solely on `float32 != float16`.
++
++That correct semantic lowering is retained as the inactive
++`_wip_try_fp32_sum_output_subtasks`; its dispatch remains commented. Enabling
++it and returning fp16 merely to satisfy this harness configuration would
++violate the requested dtype.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- complete official `test_softsign` and `test_softsign_exact`: **2/2 in 1.91
++  seconds**;
++- official pair plus 257-point signed permanent regression: **3/3 in 1.98
++  seconds**;
++- complete DPU hardware class: **61/61 in 316.93 seconds**;
++- hardware-free PR1 contract: **79/79 in 6.74 seconds**.
++
++The full DPU run also passed the previously intermittent heavy
++boolean-reduction → extrema ordering without a timeout.
++
++The standalone recovery artifact is
++`rockchip-native-softsign-abcd0aa1e.patch`, based on `abcd0aa1e`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index d4581e39a..ff842eaad 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -222,6 +222,13 @@ class TestDPU(unittest.TestCase):
+     c = a.relu().realize()
+     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, 0), rtol=1e-3, atol=1e-3)
+ 
++  def test_dpu_softsign(self):
++    a_np = np.linspace(-4, 4, 257, dtype=np.float16)
++    expected = a_np.astype(np.float32) / (1.0 + np.abs(a_np.astype(np.float32)))
++    got = Tensor(a_np, device="ROCKCHIP").realize().softsign().realize().numpy()
++    np.testing.assert_allclose(got, expected.astype(np.float16), rtol=1e-3, atol=1e-3)
++    np.testing.assert_array_equal(got[[96,128,160]], np.array([-0.5, 0.0, 0.5], dtype=np.float16))
++
+   def test_dpu_abs(self):
+     # Preserve the sign-WHERE pattern for the stable staged max(x, -x) path.
+     a_np = np.array([[-8,-2,-0.0,4],[5,-6,-7,8]], dtype=np.float16)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 9b6db9650..09b0df5c0 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -14,7 +14,7 @@ supersedes the older 182-passing census below.
+ failed in the census have not yet been folded into another full-suite count,
+ so 257/165 remains the honest complete baseline. Product reduction and the
+ product subcase of `const_reduce` now also pass incrementally. The expanded
+-DPU hardware class is separately **60/60 passing in 319.36 seconds**.
++DPU hardware class is separately **61/61 passing in 316.93 seconds**.
+ The complete official `test_min` method now passes incrementally, including
+ floating, exact int32 boundary, and bool cases.
+ `TestOps.test_sum_twice` now also passes through two ordered CMAC tasks that
+@@ -781,3 +781,28 @@ hardware-free contract remains **79/79 in 6.62 seconds**.
+ or CMAC planning fails.
+ 
+ Recovery patch: `rockchip-native-movement-sum-cc377ca33.patch`.
++
++### Native-softsign milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `softsign` | **passing** | **four ordered DPU stages** |
++| `softsign_exact` (`-1,0,1`) | **passing** | **passing** |
++| 257-point `[-4,4]` regression | **passing** | **passing** |
++
++The exact `x/(1+abs(x))` graph lowers to DPU negation, MAX magnitude,
++denominator ADD, and variable FDIV. The official pair passes **2/2 in 1.91
++seconds**, and the pair plus permanent signed regression passes **3/3 in 1.98
++seconds**.
++
++The complete DPU class is **61/61 in 316.93 seconds**, including the formerly
++intermittent boolean-reduction → extrema sequence. The hardware-free contract
++remains **79/79 in 6.74 seconds**.
++
++`test_sum_dtype_arg` is not claimed. With `DEFAULT_FLOAT=HALF`, its tinygrad
++side explicitly asks for float32 while its Torch side performs a plain fp16
++sum. A correct fp32 ABI lowering is preserved as inactive WIP, but enabling
++it still fails the reference dtype comparison; returning fp16 would violate
++the requested tinygrad semantics.
++
++Recovery patch: `rockchip-native-softsign-abcd0aa1e.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index dd6ee04a9..cbd5f3900 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4356,6 +4356,28 @@ def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
+   return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL, **fp32_args),
+           _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX, **fp32_args, **fp32_out))
+ 
++def _try_softsign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower x/(1+abs(x)) as four ordered DPU stages."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++  value = _unwrap(store.src[1])
++  if value.op is not Ops.FDIV or len(value.src) != 2: return None
++  source, denominator = _unwrap(value.src[0]), _unwrap(value.src[1])
++  if source.op is not Ops.INDEX or source.dtype is not dtypes.half or denominator.op is not Ops.ADD: return None
++  one, magnitude = denominator.src
++  if one.op is not Ops.CONST: one, magnitude = magnitude, one
++  source_slot = source.src[0].buf_uop.arg.slot
++  if one.op is not Ops.CONST or float(one.arg) != 1.0 or _try_abs(_unwrap(magnitude)) != source_slot: return None
++
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  negative, absolute, positive_denominator = (max(info.globals, default=-1) + offset for offset in range(1, 4))
++  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
++  positive_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++  return (_emit_where_stage(total, negative, (source_slot, 0), negative_one, Ops.MUL),
++          _emit_where_stage(total, absolute, (source_slot, 0), (negative, 0), Ops.MAX),
++          _emit_where_stage(total, positive_denominator, (absolute, 0), positive_one, Ops.ADD),
++          _emit_where_stage(total, info.outs[0], (source_slot, 0), (positive_denominator, 0), Ops.FDIV))
++
+ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Materialize CMPLT/CMPNE boolean expressions as fp16 0/1 masks, then pack to bool."""
+   store = _store_node(sink)
+@@ -7444,6 +7466,31 @@ def _try_movement_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Run a half-input CMAC sum, then widen its fp16 output through a DPU ABI stage."""
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
++     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
++  source = _unwrap(reduce.src[0])
++  if source.op is not Ops.INDEX or source.dtype is not dtypes.half: return None
++  info, output_total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  scratch_slot = max(info.globals, default=-1) + 1
++  device = store.src[0].src[0].device
++  scratch_param = UOp.param(scratch_slot, dtypes.half, (output_total,), device=device)
++  scratch_index = store.src[0].replace(dtype=dtypes.half, src=(scratch_param, *store.src[0].src[1:]))
++  stage_store = store.replace(src=(scratch_index, UOp(Ops.CAST, dtypes.half, (reduce,), arg=dtypes.half)))
++  stage_sink = sink.substitute({store:stage_store})
++  stage_plan = plan_rk(stage_sink)
++  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
++  tasks:list[RKSubTask] = []
++  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(stage_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
++  return tuple(tasks)
++
+ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Gather a small static float reduction window, then multiply it on DPU."""
+   reduce, store = _reduce_node(sink), _store_node(sink)
+@@ -8230,6 +8277,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
+   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
+   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
++  if (softsign_tasks := _try_softsign_subtasks(sink)) is not None: return build_native_program_multi(sink, softsign_tasks)
+   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+@@ -8249,6 +8297,10 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, variable_scale_tasks)
+   if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, movement_sum_tasks)
++  # WIP: this produces the explicitly requested float32 result correctly, but
++  # the DEFAULT_FLOAT=HALF test harness compares it against a Torch fp16 sum.
++  # if (fp32_sum_tasks := _wip_try_fp32_sum_output_subtasks(sink)) is not None:
++  #   return build_native_program_multi(sink, fp32_sum_tasks)
+   if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, relu_sum_tasks)
+   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:

@@ -14,7 +14,7 @@ supersedes the older 182-passing census below.
 failed in the census have not yet been folded into another full-suite count,
 so 257/165 remains the honest complete baseline. Product reduction and the
 product subcase of `const_reduce` now also pass incrementally. The expanded
-DPU hardware class is separately **60/60 passing in 319.36 seconds**.
+DPU hardware class is separately **61/61 passing in 316.93 seconds**.
 The complete official `test_min` method now passes incrementally, including
 floating, exact int32 boundary, and bool cases.
 `TestOps.test_sum_twice` now also passes through two ordered CMAC tasks that
@@ -781,3 +781,28 @@ hardware-free contract remains **79/79 in 6.62 seconds**.
 or CMAC planning fails.
 
 Recovery patch: `rockchip-native-movement-sum-cc377ca33.patch`.
+
+### Native-softsign milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `softsign` | **passing** | **four ordered DPU stages** |
+| `softsign_exact` (`-1,0,1`) | **passing** | **passing** |
+| 257-point `[-4,4]` regression | **passing** | **passing** |
+
+The exact `x/(1+abs(x))` graph lowers to DPU negation, MAX magnitude,
+denominator ADD, and variable FDIV. The official pair passes **2/2 in 1.91
+seconds**, and the pair plus permanent signed regression passes **3/3 in 1.98
+seconds**.
+
+The complete DPU class is **61/61 in 316.93 seconds**, including the formerly
+intermittent boolean-reduction → extrema sequence. The hardware-free contract
+remains **79/79 in 6.74 seconds**.
+
+`test_sum_dtype_arg` is not claimed. With `DEFAULT_FLOAT=HALF`, its tinygrad
+side explicitly asks for float32 while its Torch side performs a plain fp16
+sum. A correct fp32 ABI lowering is preserved as inactive WIP, but enabling
+it still fails the reference dtype comparison; returning fp16 would violate
+the requested tinygrad semantics.
+
+Recovery patch: `rockchip-native-softsign-abcd0aa1e.patch`.
