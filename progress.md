@@ -5746,3 +5746,163 @@ Mypy remains at the same 13 pre-existing findings and targeted Ruff at the
 same five pre-existing findings. No LUT is involved. Returned max indices
 and max-unpool scatter remain the next pooling milestone. The standalone patch is
 `rockchip-local-max-0447540a6.patch`, against parent `0447540a6`.
+
+## 2026-07-29 — strict NPU execution audit and pooling correction
+
+The passing count above measures numerical conformance, but it is **not yet
+an NPU-only conformance count**. A review prompted by the explicit question
+"is run host cheating by CPU?" found two different classes of host work:
+
+1. address calculation, DMA packing/unpacking, and static tensor movement;
+2. evaluation of tensor values (arithmetic, comparison, reduction, or
+   selection).
+
+Only the first class is acceptable for this backend. Any `_run_host_*`
+callback that performs the second class is a CPU fallback even though its
+buffers belong to the Rockchip allocator and `DEV=ROCKCHIP` remains selected.
+Passing a reference comparison through such a callback must not be called an
+NPU operator pass.
+
+### Rejected returned-index/max-unpool experiment
+
+The uncommitted returned-index experiment added `_run_host_argmax`, which
+read every fp16 window on the CPU, compared it with the maximum, selected the
+first matching input coordinate, and wrote int32 indices. The companion
+`_run_host_scatter` read those indices on the CPU and accumulated pooled
+values into the unpooled output. Both are full CPU implementations of the
+missing operators. Their lowering hooks are disabled and retained only as
+commented WIP/reference; they will not be committed or counted as passes.
+
+The RK3588 TRM was checked before discarding the experiment. DPU-RDMA
+`UNPOOLING_EN` is configured only by kernel size, stride, and top/left pad.
+It is fixed geometric upsampling and has no index input, so it cannot
+implement `max_unpool2d`. The available `rknnops.h` PPU examples implement
+value-only max/average pooling and expose no ArgMax index-output sequence.
+
+### Previously committed pooling paths requiring replacement
+
+The same audit changes the interpretation of the two preceding milestones:
+
+- output-dependent `avg_pool2d` currently multiplies raw fp32 CACC values by
+  the reciprocal divisor inside `_unpack_materialized_cmac_out`; that
+  multiplication is CPU arithmetic;
+- local fp16 max-pool performs all MAX comparisons in DPU tasks, but its
+  candidate window is gathered by a CPU-mapped movement callback;
+- integer local max-pool additionally casts candidate values on the CPU
+  before the DPU MAX chain.
+
+Consequently the 9/9 average-pool and 12/12 value-max figures remain useful
+numerical regression results, but are no longer accepted as proof that those
+complete operators execute only on the NPU. The integer local-max and
+variable-divisor average cases specifically require native replacements.
+Static movement may remain only if it is reduced to value-preserving DMA
+packing with no dtype conversion or tensor arithmetic.
+
+### Strict acceptance rule going forward
+
+A forward case is reported in two columns:
+
+- **numerically passing**: output matches the official reference;
+- **NPU-native passing**: every value-dependent arithmetic, comparison,
+  reduction, and selection operation is submitted to RK3588 hardware.
+
+CPU generation of register lists, static LUT/constant data, addresses, and
+DMA layouts is allowed. CPU evaluation of runtime tensor values is not.
+The immediate work is to move variable average scaling to a hardware
+epilogue/stage and to build returned indices from NPU comparisons. Native
+max-unpool remains a separate scatter/reformulation problem; the fixed
+`UNPOOLING_EN` bit is not a solution.
+
+## 2026-07-29 — native max-pool indices and integer local-max correction
+
+The strict audit was extended across the other accelerator runtimes before
+choosing an implementation boundary. No non-CPU backend uses a host callback
+to evaluate ordinary tensor arithmetic. QCOM's CPU program is only cache
+maintenance; other runtimes use CPU code for transfers, packing, and command
+construction. Therefore `run_host` is not accepted for Rockchip ArgMax,
+scatter, casts, comparisons, or pooling arithmetic. It remains acceptable to
+copy bytes according to a compile-time address map.
+
+### Native returned-index lowering
+
+`max_pool2d(return_indices=True)` now compiles each static candidate address
+and validity bit on the CPU, but only uses that information for byte-preserving
+gathers and static constants. Runtime value selection is an NPU chain:
+
+```text
+candidate bytes -> DPU compare(candidate, maximum)
+validity constant * equality mask -> valid match
+selected + match * (spatial_index - selected) -> updated index
+fp16 integral index -> native DPU int32 WDMA output
+```
+
+Candidates are processed in reverse window order, so a later update by an
+earlier candidate implements PyTorch's first-index tie rule. The DPU writes
+four compact int32 lanes from each aligned atom; host pack/unpack callbacks
+only copy those bytes. Stored int32 candidates use native four-lane int32
+MRDMA conversion before comparisons. The rejected `_run_host_argmax` path is
+still preserved behind `ROCKCHIP_ALLOW_HOST_OPS=1` for diagnostics and is not
+selected by normal execution.
+
+The complete official method passes all seven cases, covering batches and
+channels, dilation, padding, ceil mode, a 156-element global window, identical
+ties, and overlapping ties:
+
+```text
+1 passed in 154.66s
+```
+
+### Exact fused half-to-int local maximum
+
+The integer hardware regression contains a fused `half -> int -> MAX` graph,
+not a stored int32 input. Since truncation is monotone,
+`max(trunc(x)) == trunc(max(x))`; the compiler therefore gathers the original
+fp16 values, performs DPU MAX, then truncates once.
+
+RK3588 native fp16-to-int32 WDMA was probed with fractional values and rounds
+to nearest. Setting `DPU_OUT_CVT_SHIFT.CVT_ROUND` did not change that behavior.
+The passing truncation remains entirely on the NPU:
+
+1. take `abs(x)` with DPU SUB/MAX;
+2. apply the native algorithm-23 roundoff LUT;
+3. compare `rounded > abs(x)` and subtract the overshoot mask;
+4. restore the sign with DPU comparison masks;
+5. use native int32 WDMA for the exact integral result.
+
+The internal LUT stage is emitted with a flat scratch loop. Reusing the
+parent multi-axis pool index caused `unsupported_layout:Ops.ADD`, even though
+the scratch buffers were contiguous. Permanent coverage now includes
+positive and negative fractions, stored int32 local max, and overlapping
+ArgMax ties.
+
+### Debug method and validation
+
+- Set `ROCKCHIP_DEBUG_LOCAL_MAX=1` to print the rejected gathered expression
+  or internal truncation-LUT plan.
+- Probe native conversion with fractional half values; integral-only indices
+  cannot distinguish rounding from truncation.
+- Reset the NPU before each DPU subtask in a mixed chain. Without this reset,
+  native-width WDMA tasks timed out after earlier submissions.
+- Keep int32 atoms four-lane aligned and treat pack/unpack as byte copies only.
+
+Validated on RK3588 with `. .venv/bin/activate`,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 CACHELEVEL=0`:
+
+- focused local-max and returned-index hardware regressions: **2/2 passing**;
+- complete official `test_max_pool2d_return_indices`: **1/1 method, all 7
+  internal cases passing**;
+- complete DPU hardware class: **54/54 passing in 247.30 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.80 seconds**;
+- pycompile: passing.
+
+Mypy remains at the same **13 pre-existing findings**. The activated `.venv`
+does not contain Ruff (`No module named ruff`), so Ruff could not be rerun.
+`git diff --check` is clean.
+
+`max_unpool2d` remains failing: its index-driven scatter must still be
+reformulated into NPU comparisons/selections. DPU-RDMA `UNPOOLING_EN` is only
+fixed geometric upsampling and cannot consume the returned indices. NaN and
+large-spatial-index behavior will be exercised with that next group.
+
+The standalone recovery artifact is
+`rockchip-native-pool-indices-aa01f775e.patch`, based on `aa01f775e`.

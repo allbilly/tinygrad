@@ -1,0 +1,1069 @@
+diff --git a/progress.md b/progress.md
+index 13138282e..473e0f96f 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5746,3 +5746,163 @@ Mypy remains at the same 13 pre-existing findings and targeted Ruff at the
+ same five pre-existing findings. No LUT is involved. Returned max indices
+ and max-unpool scatter remain the next pooling milestone. The standalone patch is
+ `rockchip-local-max-0447540a6.patch`, against parent `0447540a6`.
++
++## 2026-07-29 — strict NPU execution audit and pooling correction
++
++The passing count above measures numerical conformance, but it is **not yet
++an NPU-only conformance count**. A review prompted by the explicit question
++"is run host cheating by CPU?" found two different classes of host work:
++
++1. address calculation, DMA packing/unpacking, and static tensor movement;
++2. evaluation of tensor values (arithmetic, comparison, reduction, or
++   selection).
++
++Only the first class is acceptable for this backend. Any `_run_host_*`
++callback that performs the second class is a CPU fallback even though its
++buffers belong to the Rockchip allocator and `DEV=ROCKCHIP` remains selected.
++Passing a reference comparison through such a callback must not be called an
++NPU operator pass.
++
++### Rejected returned-index/max-unpool experiment
++
++The uncommitted returned-index experiment added `_run_host_argmax`, which
++read every fp16 window on the CPU, compared it with the maximum, selected the
++first matching input coordinate, and wrote int32 indices. The companion
++`_run_host_scatter` read those indices on the CPU and accumulated pooled
++values into the unpooled output. Both are full CPU implementations of the
++missing operators. Their lowering hooks are disabled and retained only as
++commented WIP/reference; they will not be committed or counted as passes.
++
++The RK3588 TRM was checked before discarding the experiment. DPU-RDMA
++`UNPOOLING_EN` is configured only by kernel size, stride, and top/left pad.
++It is fixed geometric upsampling and has no index input, so it cannot
++implement `max_unpool2d`. The available `rknnops.h` PPU examples implement
++value-only max/average pooling and expose no ArgMax index-output sequence.
++
++### Previously committed pooling paths requiring replacement
++
++The same audit changes the interpretation of the two preceding milestones:
++
++- output-dependent `avg_pool2d` currently multiplies raw fp32 CACC values by
++  the reciprocal divisor inside `_unpack_materialized_cmac_out`; that
++  multiplication is CPU arithmetic;
++- local fp16 max-pool performs all MAX comparisons in DPU tasks, but its
++  candidate window is gathered by a CPU-mapped movement callback;
++- integer local max-pool additionally casts candidate values on the CPU
++  before the DPU MAX chain.
++
++Consequently the 9/9 average-pool and 12/12 value-max figures remain useful
++numerical regression results, but are no longer accepted as proof that those
++complete operators execute only on the NPU. The integer local-max and
++variable-divisor average cases specifically require native replacements.
++Static movement may remain only if it is reduced to value-preserving DMA
++packing with no dtype conversion or tensor arithmetic.
++
++### Strict acceptance rule going forward
++
++A forward case is reported in two columns:
++
++- **numerically passing**: output matches the official reference;
++- **NPU-native passing**: every value-dependent arithmetic, comparison,
++  reduction, and selection operation is submitted to RK3588 hardware.
++
++CPU generation of register lists, static LUT/constant data, addresses, and
++DMA layouts is allowed. CPU evaluation of runtime tensor values is not.
++The immediate work is to move variable average scaling to a hardware
++epilogue/stage and to build returned indices from NPU comparisons. Native
++max-unpool remains a separate scatter/reformulation problem; the fixed
++`UNPOOLING_EN` bit is not a solution.
++
++## 2026-07-29 — native max-pool indices and integer local-max correction
++
++The strict audit was extended across the other accelerator runtimes before
++choosing an implementation boundary. No non-CPU backend uses a host callback
++to evaluate ordinary tensor arithmetic. QCOM's CPU program is only cache
++maintenance; other runtimes use CPU code for transfers, packing, and command
++construction. Therefore `run_host` is not accepted for Rockchip ArgMax,
++scatter, casts, comparisons, or pooling arithmetic. It remains acceptable to
++copy bytes according to a compile-time address map.
++
++### Native returned-index lowering
++
++`max_pool2d(return_indices=True)` now compiles each static candidate address
++and validity bit on the CPU, but only uses that information for byte-preserving
++gathers and static constants. Runtime value selection is an NPU chain:
++
++```text
++candidate bytes -> DPU compare(candidate, maximum)
++validity constant * equality mask -> valid match
++selected + match * (spatial_index - selected) -> updated index
++fp16 integral index -> native DPU int32 WDMA output
++```
++
++Candidates are processed in reverse window order, so a later update by an
++earlier candidate implements PyTorch's first-index tie rule. The DPU writes
++four compact int32 lanes from each aligned atom; host pack/unpack callbacks
++only copy those bytes. Stored int32 candidates use native four-lane int32
++MRDMA conversion before comparisons. The rejected `_run_host_argmax` path is
++still preserved behind `ROCKCHIP_ALLOW_HOST_OPS=1` for diagnostics and is not
++selected by normal execution.
++
++The complete official method passes all seven cases, covering batches and
++channels, dilation, padding, ceil mode, a 156-element global window, identical
++ties, and overlapping ties:
++
++```text
++1 passed in 154.66s
++```
++
++### Exact fused half-to-int local maximum
++
++The integer hardware regression contains a fused `half -> int -> MAX` graph,
++not a stored int32 input. Since truncation is monotone,
++`max(trunc(x)) == trunc(max(x))`; the compiler therefore gathers the original
++fp16 values, performs DPU MAX, then truncates once.
++
++RK3588 native fp16-to-int32 WDMA was probed with fractional values and rounds
++to nearest. Setting `DPU_OUT_CVT_SHIFT.CVT_ROUND` did not change that behavior.
++The passing truncation remains entirely on the NPU:
++
++1. take `abs(x)` with DPU SUB/MAX;
++2. apply the native algorithm-23 roundoff LUT;
++3. compare `rounded > abs(x)` and subtract the overshoot mask;
++4. restore the sign with DPU comparison masks;
++5. use native int32 WDMA for the exact integral result.
++
++The internal LUT stage is emitted with a flat scratch loop. Reusing the
++parent multi-axis pool index caused `unsupported_layout:Ops.ADD`, even though
++the scratch buffers were contiguous. Permanent coverage now includes
++positive and negative fractions, stored int32 local max, and overlapping
++ArgMax ties.
++
++### Debug method and validation
++
++- Set `ROCKCHIP_DEBUG_LOCAL_MAX=1` to print the rejected gathered expression
++  or internal truncation-LUT plan.
++- Probe native conversion with fractional half values; integral-only indices
++  cannot distinguish rounding from truncation.
++- Reset the NPU before each DPU subtask in a mixed chain. Without this reset,
++  native-width WDMA tasks timed out after earlier submissions.
++- Keep int32 atoms four-lane aligned and treat pack/unpack as byte copies only.
++
++Validated on RK3588 with `. .venv/bin/activate`,
++`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 CACHELEVEL=0`:
++
++- focused local-max and returned-index hardware regressions: **2/2 passing**;
++- complete official `test_max_pool2d_return_indices`: **1/1 method, all 7
++  internal cases passing**;
++- complete DPU hardware class: **54/54 passing in 247.30 seconds**;
++- hardware-free PR1 contract: **79/79 passing in 6.80 seconds**;
++- pycompile: passing.
++
++Mypy remains at the same **13 pre-existing findings**. The activated `.venv`
++does not contain Ruff (`No module named ruff`), so Ruff could not be rerun.
++`git diff --check` is clean.
++
++`max_unpool2d` remains failing: its index-driven scatter must still be
++reformulated into NPU comparisons/selections. DPU-RDMA `UNPOOLING_EN` is only
++fixed geometric upsampling and cannot consume the returned indices. NaN and
++large-spatial-index behavior will be exercised with that next group.
++
++The standalone recovery artifact is
++`rockchip-native-pool-indices-aa01f775e.patch`, based on `aa01f775e`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 3a24dade6..83192d723 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -67,6 +67,22 @@ class TestDPU(unittest.TestCase):
+     x = Tensor(x_np, device="ROCKCHIP").realize()
+     np.testing.assert_array_equal(x.max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected)
+     np.testing.assert_array_equal(x.int().max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected.astype(np.int32))
++    # Fused half->int must truncate toward zero before/after the monotone MAX,
++    # rather than accepting the DPU WDMA converter's round-to-nearest default.
++    fractional = np.array([1.9, -1.9, 2.4, -2.4, 3.6, -3.6, 4.5, -4.5], dtype=np.float16).reshape(1,1,2,4)
++    fractional_out = Tensor(fractional, device="ROCKCHIP").realize().int().max_pool2d(2).realize().numpy()
++    np.testing.assert_array_equal(fractional_out, np.array([[[[3, 4]]]], dtype=np.int32))
++    stored_int = np.array([1, -9, 2, -8, 3, -7, 4, -6], dtype=np.int32).reshape(1,1,2,4)
++    np.testing.assert_array_equal(Tensor(stored_int, device="ROCKCHIP").realize().max_pool2d(2).realize().numpy(),
++                                  np.array([[[[3, 4]]]], dtype=np.int32))
++
++  def test_dpu_max_pool_return_indices(self):
++    # Overlapping ties select the first spatial index, matching PyTorch.
++    x_np = np.array([[[[1,5,5,2], [5,5,4,4], [0,3,4,4]]]], dtype=np.float16)
++    _, indices = Tensor(x_np, device="ROCKCHIP").realize().max_pool2d(kernel_size=2, stride=1, return_indices=True)
++    got = indices.realize().numpy()
++    self.assertEqual(got.dtype, np.int32)
++    np.testing.assert_array_equal(got, np.array([[[[1,1,2], [4,5,6]]]], dtype=np.int32))
+ 
+   def test_dpu_copy(self):
+     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 1c6448736..1d0157f59 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -497,3 +497,57 @@ Remaining pooling failures are now the separate index/scatter family:
+ 
+ This staged DPU implementation prioritizes complete forward correctness.
+ Direct local PPU programming can later reduce the number of submissions.
++
++### Strict execution audit correction
++
++The pooling totals above are numerical-pass totals, not proof of NPU-only
++execution. Runtime audit found:
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| constant-divisor average pool | passing | pending audit/replacement of host CACC unpack |
++| variable-divisor average pool | passing | **not accepted**: reciprocal scale is applied on CPU |
++| fp16 local max values | passing | DPU MAX, but host-mapped candidate gather remains |
++| integer local max values | passing | **not accepted**: candidate cast is performed on CPU |
++| returned max indices | rejected WIP passed numerically | **failing**: rejected CPU ArgMax |
++| max-unpool | rejected WIP | **failing**: rejected CPU scatter |
++
++The uncommitted `_run_host_argmax` and `_run_host_scatter` compiler hooks are
++disabled. RK3588 `DPU_RDMA.UNPOOLING_EN` is fixed kernel/stride upsampling,
++not index-driven max-unpool. Future status updates count a case as
++NPU-native only when runtime tensor arithmetic/comparison/reduction/selection
++is performed by submitted NPU tasks. Static register/address/DMA preparation
++does not count as operator computation.
++
++### Native returned-index milestone
++
++The strict status for returned max-pool indices is now corrected to passing:
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `max_pool2d(return_indices=True)` | **passing: all 7 official cases** | **passing** |
++| fused half-to-int local max | **passing, including fractions** | **passing** |
++| stored int32 local max | **passing** | **passing** |
++| `max_unpool2d` | failing | failing: native scatter still required |
++| `max_unpool2d_inf` | failing/not refreshed | failing: native scatter and NaN selection required |
++
++Returned indices use compile-time address maps only for value-preserving byte
++gathers. DPU comparisons, equality/validity masks, reverse-order first-tie
++selection, and native int32 WDMA produce the result. The disabled CPU ArgMax
++callback is not used. The official command:
++
++```sh
++. .venv/bin/activate
++CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
++  python -m pytest test/backend/test_ops.py::TestOps::test_max_pool2d_return_indices -q -x
++```
++
++passed in **154.66 seconds**. New Rockchip hardware regressions also cover
++fractional truncation, stored int32 local pooling, and overlapping ties.
++The complete DPU class passes **54/54** in 247.30 seconds and the hardware-free
++PR1 contract passes **79/79** in 6.80 seconds.
++
++The audit of other accelerator backends found no precedent for host evaluation
++of ordinary tensor operators. Host transfers, address generation, packing,
++cache maintenance, and command construction are allowed; `run_host` arithmetic
++is not counted as a Rockchip operator pass.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index f638eaa3d..8b35c2473 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -18,7 +18,9 @@ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.runtime.support.rockchip import (build_native_program,
+   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
+   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
+-  _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
++  _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
++  _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
+ 
+@@ -629,6 +631,84 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+   output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
+   for i, value in enumerate(values): output[i] = value
+ 
++def _pack_static_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Pack an address-only typed gather; no runtime tensor value is evaluated."""
++  total, tag, itemsize, *addresses = task.layout
++  assert tag == _HOST_GATHER_MAP_LAYOUT and len(addresses) == total and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  invalid = struct.pack('<e', float("-inf")) if itemsize == 2 else int(-(1 << 31)).to_bytes(4, 'little', signed=True)
++  for out_index, source_index in enumerate(addresses):
++    if source_index < 0: ctypes.memmove(output.va_addr + out_index*itemsize, invalid, itemsize)  # type: ignore[arg-type]
++    else: ctypes.memmove(output.va_addr + out_index*itemsize, source.va_addr + source_index*itemsize, itemsize)  # type: ignore[arg-type]
++
++def _pack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Copy at most four fp16 values into an aligned atom after an NPU stage."""
++  count, tag, start = task.layout
++  assert tag == _HOST_PACK_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  ctypes.memset(output.va_addr, 0, 8)  # type: ignore[arg-type]
++  ctypes.memmove(output.va_addr, source.va_addr + start*2, count*2)  # type: ignore[arg-type]
++
++def _unpack_int32_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Copy a native four-lane int32 atom into the compact logical output."""
++  count, tag, start = task.layout
++  assert tag == _HOST_UNPACK_INT_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  ctypes.memmove(output.va_addr + start*4, source.va_addr, count*4)  # type: ignore[arg-type]
++
++def _pack_int32_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Copy at most four compact int32 values into one aligned MRDMA atom."""
++  count, tag, start = task.layout
++  assert tag == _HOST_PACK_INT32_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  ctypes.memset(output.va_addr, 0, 16)  # type: ignore[arg-type]
++  ctypes.memmove(output.va_addr, source.va_addr + start*4, count*4)  # type: ignore[arg-type]
++
++def _unpack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Copy a native fp16 atom into its compact logical position."""
++  count, tag, start = task.layout
++  assert tag == _HOST_UNPACK_HALF_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  ctypes.memmove(output.va_addr + start*2, source.va_addr, count*2)  # type: ignore[arg-type]
++
++def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Scatter pooled fp16 values by per-plane int32 indices, summing duplicates in fp32."""
++  import numpy as np
++  total, tag, index_total, planes, out_spatial, pooled = task.layout
++  assert tag == _HOST_SCATTER_LAYOUT and index_total == planes*pooled and total == planes*out_spatial
++  output, index_buf, value_buf = (bufs[r.globals_slot] for r in relocs)
++  indices = np.frombuffer(ctypes.string_at(index_buf.va_addr, index_total*4), dtype=np.int32)
++  values = np.frombuffer(ctypes.string_at(value_buf.va_addr, index_total*2), dtype=np.float16)
++  accumulator = np.zeros(total, dtype=np.float32)
++  for plane in range(planes):
++    for update in range(pooled):
++      source = plane*pooled+update
++      spatial = int(indices[source])
++      if 0 <= spatial < out_spatial:
++        destination = plane*out_spatial+spatial
++        accumulator[destination] = np.float32(accumulator[destination] + np.float32(values[source]))
++  result = accumulator.astype(np.float16)
++  ctypes.memmove(output.va_addr, result.ctypes.data, total*2)  # type: ignore[arg-type]
++
++def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Choose the first valid static candidate equal to each max-pool output."""
++  import numpy as np
++  total, tag, window, input_spatial, *mapping = task.layout
++  assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
++  output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
++  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float16)
++  maximum = np.frombuffer(ctypes.string_at(maximum_buf.va_addr, total*2), dtype=np.float16)
++  output = np.empty(total, dtype=np.int32)
++  for out_index in range(total):
++    selected = 0
++    for candidate in mapping[out_index*window:(out_index+1)*window]:
++      if candidate < 0 or candidate >= data.size: continue
++      if data[candidate] == maximum[out_index] or (np.isnan(data[candidate]) and np.isnan(maximum[out_index])):
++        selected = candidate % input_spatial
++        break
++    output[out_index] = selected
++  ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
++
+ class RockchipProgram(Program['RockchipDevice']):
+   cmds: list[int]
+   task: RKTask
+@@ -910,6 +990,27 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+           _run_host_static_half(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++          _pack_static_gather(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
++          _pack_fp16_chunk(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
++          _unpack_int32_chunk(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
++          _pack_int32_chunk(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
++          _unpack_fp16_chunk(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
++          _run_host_scatter(task, st.relocs, bufs)
++          continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_ARGMAX_LAYOUT:
++          _run_host_argmax(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+           _run_host_bitwise(task, st.relocs, bufs)
+           continue
+@@ -995,6 +1096,9 @@ class RockchipProgram(Program['RockchipDevice']):
+           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+             _run_host_static_half(st.task, st.relocs, tuple(ext))
+             continue
++          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++            _pack_static_gather(st.task, st.relocs, tuple(ext))
++            continue
+           self.subtasks = None
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+           self(*tuple(ext))
+@@ -1002,6 +1106,39 @@ class RockchipProgram(Program['RockchipDevice']):
+         self.subtasks = original
+         for b in shared: dev._gpu_free(b)
+       return
++    # Native fp16->int32 writes use four-lane aligned atoms. Their source pack
++    # happens after the preceding DPU selection chain, so preserve subtask
++    # order instead of hoisting every copy ahead of every DPU submission.
++    if any(st.task.is_copy and len(st.task.layout) > 1 and
++           st.task.layout[1] in (_HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
++                                 _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT) for st in subtasks):
++      ext, shared, original = list(bufs), [], self.subtasks
++      max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
++                     default=len(ext)-1)
++      total = max(st.task.layout[0] for st in subtasks)
++      try:
++        while len(ext) <= max_slot:
++          shared.append(b := dev._gpu_alloc(max(total*4, 4096), 0))
++          ext.append(b)
++        for st in subtasks:
++          task = st.task
++          if task.is_copy:
++            if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk(task, st.relocs, tuple(ext))
++            else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
++            continue
++          dev.reset_npu()
++          self.subtasks = [st]
++          self._submit_multi(tuple(ext))
++      finally:
++        self.subtasks = original
++        for b in shared: dev._gpu_free(b)
++      return
+     # Mixed copy + DPU: handle copy tasks host-side, then submit DPU tasks.
+     copy_tasks = [st for st in subtasks if st.task.is_copy]
+     dpu_tasks = [st for st in subtasks if not st.task.is_copy]
+@@ -1024,6 +1161,21 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+             _run_host_static_half(task, st.relocs, tuple(ext))
+             continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++            _pack_static_gather(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
++            _pack_fp16_chunk(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
++            _unpack_int32_chunk(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
++            _pack_int32_chunk(task, st.relocs, tuple(ext))
++            continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
++            _unpack_fp16_chunk(task, st.relocs, tuple(ext))
++            continue
+           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+             _run_host_bitwise(task, st.relocs, tuple(ext))
+             continue
+@@ -1125,7 +1277,7 @@ class RockchipProgram(Program['RockchipDevice']):
+       _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_counts.get(slot, prepared[slot].size // 2), total)
+       prepared[slot] = converted
+     converted_output = next(((st.task.out_slot, st.task.fp32_output, st.task.uint8_output, st.task.bool_output, st.task.trunc_output)
+-                             for st in subtasks if st.task.fp32_output or st.task.int32_output or st.task.uint8_output or
++                             for st in subtasks if st.task.fp32_output or (st.task.int32_output and not st.task.native_int32_output) or st.task.uint8_output or
+                              st.task.bool_output or st.task.trunc_output), None)
+     output_conversion = None
+     if converted_output is not None:
+@@ -1197,9 +1349,10 @@ class RockchipProgram(Program['RockchipDevice']):
+             v = (dma >> r.shift) & r.mask
+           elif r.globals_slot == _ZERO_SLOT:
+             total = task.layout[0]
+-            zbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
++            itemsize = 4 if task.native_int32_input else 2
++            zbuf = dev._gpu_alloc(max(total * itemsize, 4096), 0)
+             temp.append(zbuf)
+-            ctypes.memset(zbuf.va_addr, 0, total * 2)  # type: ignore[arg-type]
++            ctypes.memset(zbuf.va_addr, 0, total * itemsize)  # type: ignore[arg-type]
+             dma = zbuf.meta.dma_addr
+             v = (dma >> r.shift) & r.mask
+           else:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 8eaa44154..99a6faf46 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -96,6 +96,8 @@ class RKTask:
+   bool_output: bool = False           # multi-task output converted from fp16 mask to bool
+   trunc_output: bool = False          # multi-task fp16 output truncated through an integer cast round-trip
+   periodic_input: bool = False        # reduce fp32 inputs modulo 2*pi before fp16 conversion
++  native_int32_output: bool = False   # DPU WDMA writes already-integral values directly as int32
++  native_int32_input: bool = False    # MRDMA consumes one aligned compact int32 atom directly
+   out_offset: int = 0                 # byte offset into the output buffer (for cat-like copies)
+ 
+ @dataclass(frozen=True)
+@@ -177,6 +179,13 @@ _HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp1
+ _HOST_ELEMENTWISE_LAYOUT = -1004  # is_copy task layout tag for serialized fused elementwise graphs
+ _CMAC_MATERIALIZED_LAYOUT = -1005  # CMAC layout tag for host-gathered A/B matrices
+ _HOST_STATIC_HALF_LAYOUT = -1006  # compile-time fp16 tensor used by a later NPU stage
++_HOST_SCATTER_LAYOUT = -1007  # typed index scatter used by max-unpool movement
++_HOST_ARGMAX_LAYOUT = -1008  # compact candidate map for max-pool returned indices
++_HOST_GATHER_MAP_LAYOUT = -1009  # static address-only fp16 gather for NPU reductions
++_HOST_PACK_CHUNK_LAYOUT = -1010  # post-DPU alignment pack, value-preserving only
++_HOST_UNPACK_INT_CHUNK_LAYOUT = -1011  # compact native int32 atom, value-preserving only
++_HOST_PACK_INT32_CHUNK_LAYOUT = -1012  # align compact int32 input atom, value-preserving only
++_HOST_UNPACK_HALF_CHUNK_LAYOUT = -1013  # compact native fp16 atom, value-preserving only
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -1977,25 +1986,33 @@ def _where_arg(u: UOp) -> tuple[int, int]|None:
+ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False,
+                       bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
+                       uint8_output=False, bool_output=False, trunc_output=False, comparison_inputs:tuple[int,...]=(),
+-                      fp32_inputs:tuple[int,...]=(), fp32_output=False) -> RKSubTask:
++                      fp32_inputs:tuple[int,...]=(), fp32_output=False, native_int32_output=False, native_int32_input=False) -> RKSubTask:
+   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
+   cmds:list[RKCmd] = []
+   relocs:list[RKReloc] = []
+   def e(t, r, v): emitter_emit(cmds, t, r, v)
++  # Native int32 MRDMA uses a four-lane atom.  Ordinary fp16 input remains an
++  # eight-lane atom, including when WDMA writes four usable int32 lanes.
++  lanes = 4 if native_int32_input else 8
++  width = (total+lanes-1)//lanes-1
++  channel = (lanes-1 << 16) | (lanes-1)
+   e(_T_DPU, rk.REG_DPU_S_POINTER, 0xe)
+   e(_T_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5)
+-  e(_T_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002)
+-  e(_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, (total+7)//8-1)
++  # DPU supports native int32 WDMA (OUT_PRECISION=4).  Do not bounce a final
++  # int32 result through fp16 and a CPU conversion.
++  data_format = (4 if native_int32_output else 2) << 29 | (4 if native_int32_input else 2) << 26 | (4 if native_int32_input else 2)
++  e(_T_DPU, rk.REG_DPU_DATA_FORMAT, data_format)
++  e(_T_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width)
+   e(_T_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0)
+   e(_T_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+-  e(_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007)
++  e(_T_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, channel)
+   e(_T_DPU, rk.REG_DPU_BS_CFG, 0x53)
+   e(_T_DPU, rk.REG_DPU_BN_CFG, 0x53)
+   e(_T_DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+   e(_T_DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+   e(_T_DPU, rk.REG_DPU_BS_OW_CFG, 2)
+-  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_0, 7)
+-  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_1, (total+7)//8-1)
++  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_0, lanes-1)
++  e(_T_DPU, rk.REG_DPU_WDMA_SIZE_1, width)
+   e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+   e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+   if compare:
+@@ -2005,26 +2022,33 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+     e(_T_DPU, rk.REG_DPU_BN_CFG, 0x40082)
+     e(_T_DPU, rk.REG_DPU_BN_MUL_CFG, 0x7c000000)
+     e(_T_DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0x3f800000)
+-  e(_T_DPU, rk.REG_DPU_EW_CFG, _EW_BASE | 1 if compare else _DPU_EW_CFGS[op])
+-  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if op is Ops.FDIV else 0x10001)
++  ew_cfg = ((_DPU_EW_CFGS[op] & ~(3 << 22)) | (3 << 22)) if native_int32_input else \
++    (_EW_BASE | 1 if compare else _DPU_EW_CFGS[op])
++  e(_T_DPU, rk.REG_DPU_EW_CFG, ew_cfg)
++  e(_T_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if op is Ops.FDIV or native_int32_output else 0x10001)
++  # WIP reference: setting CVT_ROUND (1 << 30) was probed for native int32
++  # output, but both modes round fp16 to nearest on RK3588.  Explicit NPU
++  # roundoff correction is required for truncation toward zero.
+   e(_T_DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+   e(_T_DPU, rk.REG_DPU_SURFACE_ADD, 0x40)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe)
+-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, (total+7)//8-1)
++  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width)
+   e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0)
+-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7)
+-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008)
++  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, lanes-1)
++  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x4000000c if native_int32_input else 0x40000008)
+   for target, reg, arg in ((_T_DPU, rk.REG_DPU_DST_BASE_ADDR, (out_slot, 0)),
+                            (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, a),
+                            (_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, b)):
+     e(target, reg, 0)
+     emitter_reloc(cmds, relocs, arg[0], arg[1])
+-  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if op is Ops.FDIV else 0x17849)
++  rdma_feature = 0x27881 if native_int32_input else (0x17841 if op is Ops.FDIV else 0x17849)
++  e(_T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature)
+   emitter_pc_op_en(cmds, 12)
+   task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot, bool_inputs=bool_inputs, int32_inputs=int32_inputs,
+                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
+                 bool_output=bool_output, trunc_output=trunc_output, comparison_inputs=comparison_inputs,
+-                fp32_inputs=fp32_inputs, fp32_output=fp32_output)
++                fp32_inputs=fp32_inputs, fp32_output=fp32_output, native_int32_output=native_int32_output,
++                native_int32_input=native_int32_input)
+   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
+ 
+ def _emit_trunc_stage(total:int, out_slot:int, source:tuple[int,int]) -> RKSubTask:
+@@ -2043,10 +2067,11 @@ def _try_cast_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
+   input_slot, out_slot = source.src[0].buf_uop.arg.slot, info.outs[0]
+   return (_emit_where_stage(total, out_slot, (input_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                             bool_inputs=((input_slot,) if source.dtype is dtypes.bool else ()),
+-                            int32_inputs=((input_slot,) if source.dtype is dtypes.int else ()),
++                            int32_inputs=((input_slot,) if source.dtype is dtypes.int and not getenv("ROCKCHIP_NATIVE_INT_CAST") else ()),
+                             fp32_inputs=((input_slot,) if source.dtype is dtypes.float else ()),
+                             fp32_output=output_dtype is dtypes.float, int32_output=output_dtype is dtypes.int,
+-                            uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool),)
++                            uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool,
++                            native_int32_input=source.dtype is dtypes.int and bool(getenv("ROCKCHIP_NATIVE_INT_CAST"))),)
+ 
+ def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
+   """Fill non-fp16 outputs through the DPU, then convert the fp16 result buffer."""
+@@ -6121,7 +6146,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
+   out_offset_bytes = struct.pack("<i", task.out_offset)
+   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
+   dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | (int(task.trunc_output) << 3) | \
+-    (int(task.periodic_input) << 4) | \
++    (int(task.periodic_input) << 4) | (int(task.native_int32_output) << 5) | (int(task.native_int32_input) << 6) | \
+     sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
+   input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16) | \
+     sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
+@@ -6165,6 +6190,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
+                       comparison_inputs=comparison_inputs,
+                       int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
+                       bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8), periodic_input=bool(dtype_flags & 16),
++                      native_int32_output=bool(dtype_flags & 32), native_int32_input=bool(dtype_flags & 64),
+                       out_offset=out_offset), relocs, off
+ 
+ def encode_rk_multi(subtasks: tuple[RKSubTask, ...]) -> bytes:
+@@ -6390,6 +6416,286 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTa
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
++def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Unroll the static integer reductions used to choose max-pool indices."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.int or not reductions: return None
++  if not any(u.arg[0] is Ops.MAX for u in reductions) or any(u.arg[0] not in (Ops.ADD, Ops.MAX) for u in reductions): return None
++  if any(r.src[0].op is not Ops.CONST for u in reductions for r in u.src[1:]): return None
++
++  def expand(u:UOp) -> UOp:
++    if u.op is Ops.REDUCE:
++      ranges = u.src[1:]
++      extents = [int(r.src[0].arg) for r in ranges]
++      terms:list[UOp] = []
++      for linear in range(prod(extents)):
++        rem, fixed = linear, {}
++        for reduce_axis in range(len(ranges)-1, -1, -1):
++          rem, coord = divmod(rem, extents[reduce_axis])
++          fixed[ranges[reduce_axis]] = UOp.const(ranges[reduce_axis].dtype, coord)
++        terms.append(expand(u.src[0].substitute(fixed)))
++      if not terms: raise ValueError("empty static reduction")
++      result = terms[0]
++      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
++      return result
++    new_src = tuple(expand(x) for x in u.src)
++    return u if new_src == u.src else u.replace(src=new_src)
++
++  try: value = expand(store.src[1])
++  except (TypeError, ValueError, OverflowError): return None
++  expanded = sink.substitute({store:store.replace(src=(store.src[0], value))})
++  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
++
++def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Compile max-pool's static candidate addresses without unrolling its argmax expression."""
++  store = _store_node(sink)
++  max_reduce = next((u for u in sink.toposort() if u.op is Ops.REDUCE and u.arg[0] is Ops.MAX), None)
++  if store is None or store.src[0].dtype is not dtypes.int or max_reduce is None: return None
++  reductions = list(max_reduce.src[1:])
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in reductions): return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if any(u.src[0].op is not Ops.CONST for u in loops): return None
++  total, window = prod(_shape_of_store(sink)), prod(int(u.src[0].arg) for u in reductions)
++  if prod(int(u.src[0].arg) for u in loops) != total: return None
++  value_indexes = [u for u in max_reduce.toposort() if u.op is Ops.INDEX and u.dtype in (dtypes.half, dtypes.int)]
++  data = next((u for u in value_indexes if any(r in set(u.src[1].toposort()) for r in reductions)), None)
++  maximum = next((u for u in value_indexes if u is not data and u.dtype is data.dtype and int(u.src[0].src[0].arg) == total), None) \
++    if data is not None else None
++  if data is None or maximum is None: return None
++  input_total = int(data.src[0].src[0].arg)
++  out_shape = _shape_of_store(sink)
++  planes = prod(out_shape[:-2]) if len(out_shape) >= 3 else 1
++  if planes <= 0 or input_total % planes: return None
++  input_spatial = input_total // planes
++
++  def evaluate(u:UOp, coords:dict[UOp, int]):
++    while u.op is Ops.CAST: u = u.src[0]
++    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
++    if u.op is Ops.RANGE and u in coords: return coords[u]
++    if u.op is Ops.WHERE:
++      condition = evaluate(u.src[0], coords)
++      return evaluate(u.src[1] if condition else u.src[2], coords)
++    values = [evaluate(x, coords) for x in u.src]
++    if any(x is Invalid for x in values): return Invalid
++    if u.op is Ops.ADD: return values[0] + values[1]
++    if u.op is Ops.MUL: return values[0] * values[1]
++    if u.op is Ops.SUB: return values[0] - values[1]
++    if u.op is Ops.FLOORDIV: return values[0] // values[1]
++    if u.op is Ops.FLOORMOD: return values[0] % values[1]
++    if u.op is Ops.CMPLT: return values[0] < values[1]
++    if u.op is Ops.CMPNE: return values[0] != values[1]
++    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
++    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
++    if u.op is Ops.NEG: return -values[0]
++    raise ValueError(u.op)
++
++  mapping = [-1] * (total*window)
++  loop_extents = [int(u.src[0].arg) for u in loops]
++  reduce_extents = [int(u.src[0].arg) for u in reductions]
++  try:
++    for out_linear in range(total):
++      rem, coords = out_linear, {}
++      for loop_axis in range(len(loops)-1, -1, -1):
++        rem, coord = divmod(rem, loop_extents[loop_axis])
++        coords[loops[loop_axis]] = coord
++      out_index = int(evaluate(store.src[0].src[1], coords))
++      if not 0 <= out_index < total: return None
++      for reduce_linear in range(window):
++        rem = reduce_linear
++        for reduce_axis in range(len(reductions)-1, -1, -1):
++          rem, coord = divmod(rem, reduce_extents[reduce_axis])
++          coords[reductions[reduce_axis]] = coord
++        source_index = evaluate(data.src[1], coords)
++        if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
++  except (TypeError, ValueError, OverflowError, ZeroDivisionError): return None
++
++  info = ProgramInfo.from_sink(sink)
++  out_slot, data_slot, maximum_slot = info.outs[0], data.src[0].buf_uop.arg.slot, maximum.src[0].buf_uop.arg.slot
++  # Rejected compatibility path, retained only for explicit diagnostics.
++  # Accelerator backends have no precedent for CPU-evaluated ArgMax being
++  # counted as a device pass. Normal execution continues into the DPU chain.
++  if getenv("ROCKCHIP_ALLOW_HOST_OPS"):
++    layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *mapping)
++    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))
++    return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++
++  def native_int_to_half(source_slot:int) -> int:
++    """Convert compact nonnegative int32 values through aligned four-lane MRDMA atoms."""
++    nonlocal next_slot
++    result, next_slot = next_slot, next_slot+1
++    for start in range(0, total, 4):
++      count = min(4, total-start)
++      packed, next_slot = next_slot, next_slot+1
++      pack_layout = (count, _HOST_PACK_INT32_CHUNK_LAYOUT, start)
++      pack_relocs = (RKReloc(0, packed, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed, is_copy=True), pack_relocs))
++      half_atom, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(4, half_atom, (packed, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_input=True))
++      unpack_layout = (count, _HOST_UNPACK_HALF_CHUNK_LAYOUT, start)
++      unpack_relocs = (RKReloc(0, result, 0, 0, 0xFFFFFFFF), RKReloc(0, half_atom, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, result, is_copy=True), unpack_relocs))
++    return result
++
++  def trunc_half(source_slot:int) -> int|None:
++    """Truncate an fp16 scratch buffer using the native roundoff LUT and DPU masks."""
++    nonlocal next_slot
++    def alloc() -> int:
++      nonlocal next_slot
++      result, next_slot = next_slot, next_slot+1
++      return result
++    def temp_index(slot:int) -> UOp:
++      out_idx = store.src[0]
++      return out_idx.replace(dtype=dtypes.half,
++        src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
++    def scalar(value:float) -> tuple[int,int]:
++      return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++
++    zero = (_ZERO_SLOT, 0)
++    negative, magnitude, rounded = alloc(), alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, negative, zero, (source_slot, 0), Ops.SUB),
++                  _emit_where_stage(total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX)))
++    # Build this internal pass with a single flat loop.  Reusing the parent
++    # pool index can expose a multi-axis ADD tree that the LUT layout checker
++    # intentionally rejects even though both scratch buffers are contiguous.
++    axis, device = UOp.range(total, 0), store.src[0].src[0].device
++    source_param = UOp.param(magnitude, dtypes.half, (total,), device=device)
++    output_param = UOp.param(rounded, dtypes.half, (total,), device=device)
++    roundoff = UOp(Ops.CUSTOM, dtypes.half, (UOp(Ops.INDEX, dtypes.half, (source_param, axis)),), arg="rk_roundoff")
++    round_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, dtypes.half, (output_param, axis)), roundoff))
++    round_sink = UOp.sink(UOp(Ops.END, src=(round_store, axis)))
++    round_plan = plan_rk(round_sink)
++    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut":
++      if getenv("ROCKCHIP_DEBUG_LOCAL_MAX"): print("RK_LOCAL_MAX_TRUNC_LUT_REJECT", round_plan)
++      return None
++    cmds, task, relocs = emit_rk(round_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++
++    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
++    positive_diff, positive, negative_diff, negative_mask, sign, result = (alloc() for _ in range(6))
++    tasks.extend((_emit_where_stage(total, overshoot_diff, (rounded, 0), (magnitude, 0), Ops.SUB),
++                  _emit_where_stage(total, overshoot, (overshoot_diff, 0), (overshoot_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, truncated_abs, (rounded, 0), (overshoot, 0), Ops.SUB),
++                  _emit_where_stage(total, positive_diff, (source_slot, 0), zero, Ops.SUB),
++                  _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, negative_diff, zero, (source_slot, 0), Ops.SUB),
++                  _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, sign, (positive, 0), (negative_mask, 0), Ops.SUB),
++                  _emit_where_stage(total, result, (truncated_abs, 0), (sign, 0), Ops.MUL)))
++    return result
++
++  maximum_value_slot = native_int_to_half(maximum_slot) if data.dtype is dtypes.int else maximum_slot
++
++  # Preserve the rejected compact CPU ArgMax task for reference.  It is not
++  # selected: runtime values below are only address-gathered, while every
++  # comparison and index selection is emitted as a DPU task.
++  # host_layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *mapping)
++  # host_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))
++  # return (RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", host_layout, out_slot, is_copy=True), host_relocs),)
++
++  candidate_slots:list[int] = []
++  index_slots:list[int] = []
++  valid_slots:list[int|None] = []
++  for candidate in range(window):
++    addresses = tuple(mapping[out_index*window+candidate] for out_index in range(total))
++    gathered, next_slot = next_slot, next_slot+1
++    gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, data.dtype.itemsize, *addresses)
++    gather_relocs = (RKReloc(0, gathered, 0, 0, 0xFFFFFFFF), RKReloc(0, data_slot, 0, 0, 0xFFFFFFFF))
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered, is_copy=True), gather_relocs))
++    candidate_slots.append(native_int_to_half(gathered) if data.dtype is dtypes.int else gathered)
++
++    indices = tuple(0 if address < 0 else address % input_spatial for address in addresses)
++    index_slot, next_slot = next_slot, next_slot+1
++    index_bits = tuple(struct.unpack('<H', struct.pack('<e', float(index)))[0] for index in indices)
++    index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *index_bits)
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", index_layout, index_slot, is_copy=True),
++                           (RKReloc(0, index_slot, 0, 0, 0xFFFFFFFF),)))
++    index_slots.append(index_slot)
++
++    if any(address < 0 for address in addresses):
++      valid_slot, next_slot = next_slot, next_slot+1
++      valid_bits = tuple(0x0000 if address < 0 else 0x3c00 for address in addresses)
++      valid_layout = (total, _HOST_STATIC_HALF_LAYOUT, *valid_bits)
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", valid_layout, valid_slot, is_copy=True),
++                             (RKReloc(0, valid_slot, 0, 0, 0xFFFFFFFF),)))
++      valid_slots.append(valid_slot)
++    else: valid_slots.append(None)
++
++  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++  selected:tuple[int,int] = (_ZERO_SLOT, 0)
++  # Visit the window backwards: a matching earlier candidate overwrites a
++  # matching later one, which gives PyTorch's first-index tie rule.
++  for candidate in range(window-1, -1, -1):
++    diff, less, equal, delta, weighted = range(next_slot, next_slot+5)
++    next_slot += 5
++    tasks.append(_emit_where_stage(total, diff, (maximum_value_slot, 0), (candidate_slots[candidate], 0), Ops.SUB))
++    tasks.append(_emit_where_stage(total, less, (diff, 0), (diff, 0), Ops.MAX, compare=True))
++    tasks.append(_emit_where_stage(total, equal, one, (less, 0), Ops.SUB))
++    candidate_valid_slot = valid_slots[candidate]
++    if candidate_valid_slot is not None:
++      valid_equal, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(total, valid_equal, (equal, 0), (candidate_valid_slot, 0), Ops.MUL))
++      equal = valid_equal
++    tasks.append(_emit_where_stage(total, delta, (index_slots[candidate], 0), selected, Ops.SUB))
++    tasks.append(_emit_where_stage(total, weighted, (equal, 0), (delta, 0), Ops.MUL))
++    selected_out, next_slot = next_slot, next_slot+1
++    tasks.append(_emit_where_stage(total, selected_out, selected, (weighted, 0), Ops.ADD))
++    selected = (selected_out, 0)
++  # RK3588's 32-bit elementwise WDMA layout is compact only for one four-lane
++  # atom. Emit four indices per task and relocate each atom directly into the
++  # compact int32 destination; this is the same native conversion path probed
++  # above, without a CPU dtype conversion.
++  for start in range(0, total, 4):
++    count = min(4, total-start)
++    packed_slot, next_slot = next_slot, next_slot+1
++    pack_layout = (count, _HOST_PACK_CHUNK_LAYOUT, start)
++    pack_relocs = (RKReloc(0, packed_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, selected[0], 0, 0, 0xFFFFFFFF))
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed_slot, is_copy=True), pack_relocs))
++    native_slot, next_slot = next_slot, next_slot+1
++    stage = _emit_where_stage(4, native_slot, (packed_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                              native_int32_output=True)
++    tasks.append(stage)
++    unpack_layout = (count, _HOST_UNPACK_INT_CHUNK_LAYOUT, start)
++    unpack_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, native_slot, 0, 0, 0xFFFFFFFF))
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, out_slot, is_copy=True), unpack_relocs))
++  return tuple(tasks)
++
++def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Recognize max-unpool's static plane reduction and serialize a typed scatter."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) != 1: return None
++  reduce = reductions[0]
++  if reduce.arg[0] is not Ops.ADD or _unwrap(store.src[1]) is not reduce: return None
++  body = _reduce_body(reduce)
++  if body.op is not Ops.WHERE or body.src[0].op not in (Ops.CMPNE, Ops.CMPEQ): return None
++  zero = lambda u: u.op is Ops.CONST and float(u.arg) == 0.0
++  if zero(body.src[1]): value, select_equal = _unwrap(body.src[2]), body.src[0].op is Ops.CMPNE
++  elif zero(body.src[2]): value, select_equal = _unwrap(body.src[1]), body.src[0].op is Ops.CMPEQ
++  else: return None
++  if not select_equal or value.op is not Ops.INDEX or value.dtype is not dtypes.half: return None
++  index = next((_unwrap(x) for x in body.src[0].src if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.int), None)
++  if index is None or index.src[1] is not value.src[1]: return None
++  if any(r.src[0].op is not Ops.CONST for r in reduce.src[1:]): return None
++  pooled = prod(int(r.src[0].arg) for r in reduce.src[1:])
++  index_total = int(index.src[0].src[0].arg)
++  value_total = int(value.src[0].src[0].arg)
++  total = prod(_shape_of_store(sink))
++  if pooled <= 0 or index_total != value_total or index_total % pooled or total == 0: return None
++  planes = index_total // pooled
++  if planes <= 0 or total % planes: return None
++  out_spatial = total // planes
++  info = ProgramInfo.from_sink(sink)
++  out_slot, index_slot, value_slot = info.outs[0], index.src[0].buf_uop.arg.slot, value.src[0].buf_uop.arg.slot
++  layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, index_slot, value_slot))
++  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++
+ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
+   store = _store_node(sink)
+@@ -6851,6 +7157,84 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   info = ProgramInfo.from_sink(sink)
+   next_slot = max(info.globals, default=-1) + 1
+   tasks:list[RKSubTask] = []
++  host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++
++  def casted_half_source(u:UOp) -> UOp|None:
++    """Undo a fused half->int cast below MAX.
++
++    Truncation is monotone, so max(trunc(x)) == trunc(max(x)); preserving the
++    original half values through the reduction allows one native roundoff-LUT
++    correction after MAX. Integer padding sentinels are translated back to
++    their half-domain equivalents.
++    """
++    if u.op is Ops.CAST and u.dtype is dtypes.int and len(u.src) == 1 and u.src[0].dtype is dtypes.half: return u.src[0]
++    if u.op is Ops.CONST and u.dtype is dtypes.int:
++      return UOp.const(dtypes.half, -math.inf if int(u.arg) == -(1 << 31) else float(u.arg))
++    if u.op is Ops.WHERE and u.dtype is dtypes.int:
++      true, false = casted_half_source(u.src[1]), casted_half_source(u.src[2])
++      if true is not None and false is not None: return UOp(Ops.WHERE, dtypes.half, (u.src[0], true, false))
++    return None
++
++  def native_int_to_half(source_slot:int) -> int:
++    nonlocal next_slot
++    result, next_slot = next_slot, next_slot+1
++    for start in range(0, total, 4):
++      count = min(4, total-start)
++      packed, next_slot = next_slot, next_slot+1
++      pack_layout = (count, _HOST_PACK_INT32_CHUNK_LAYOUT, start)
++      pack_relocs = (RKReloc(0, packed, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed, is_copy=True), pack_relocs))
++      half_atom, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(4, half_atom, (packed, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_input=True))
++      unpack_layout = (count, _HOST_UNPACK_HALF_CHUNK_LAYOUT, start)
++      unpack_relocs = (RKReloc(0, result, 0, 0, 0xFFFFFFFF), RKReloc(0, half_atom, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, result, is_copy=True), unpack_relocs))
++    return result
++
++  def trunc_half(source_slot:int) -> int|None:
++    """Truncate an fp16 scratch buffer using the native roundoff LUT and DPU masks."""
++    nonlocal next_slot
++    def alloc() -> int:
++      nonlocal next_slot
++      result, next_slot = next_slot, next_slot+1
++      return result
++    def temp_index(slot:int) -> UOp:
++      out_idx = store.src[0]
++      return out_idx.replace(dtype=dtypes.half,
++        src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
++
++    zero = (_ZERO_SLOT, 0)
++    negative, magnitude, rounded = alloc(), alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, negative, zero, (source_slot, 0), Ops.SUB),
++                  _emit_where_stage(total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX)))
++    # Build this internal pass with a single flat loop.  Reusing the parent
++    # pool index can expose a multi-axis ADD tree that the LUT layout checker
++    # intentionally rejects even though both scratch buffers are contiguous.
++    axis, device = UOp.range(total, 0), store.src[0].src[0].device
++    source_param = UOp.param(magnitude, dtypes.half, (total,), device=device)
++    output_param = UOp.param(rounded, dtypes.half, (total,), device=device)
++    roundoff = UOp(Ops.CUSTOM, dtypes.half, (UOp(Ops.INDEX, dtypes.half, (source_param, axis)),), arg="rk_roundoff")
++    round_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, dtypes.half, (output_param, axis)), roundoff))
++    round_sink = UOp.sink(UOp(Ops.END, src=(round_store, axis)))
++    round_plan = plan_rk(round_sink)
++    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut":
++      if getenv("ROCKCHIP_DEBUG_LOCAL_MAX"): print("RK_LOCAL_MAX_TRUNC_LUT_REJECT", round_plan)
++      return None
++    cmds, task, relocs = emit_rk(round_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++
++    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
++    positive_diff, positive, negative_diff, negative_mask, sign, result = (alloc() for _ in range(6))
++    tasks.extend((_emit_where_stage(total, overshoot_diff, (rounded, 0), (magnitude, 0), Ops.SUB),
++                  _emit_where_stage(total, overshoot, (overshoot_diff, 0), (overshoot_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, truncated_abs, (rounded, 0), (overshoot, 0), Ops.SUB),
++                  _emit_where_stage(total, positive_diff, (source_slot, 0), zero, Ops.SUB),
++                  _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, negative_diff, zero, (source_slot, 0), Ops.SUB),
++                  _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, sign, (positive, 0), (negative_mask, 0), Ops.SUB),
++                  _emit_where_stage(total, result, (truncated_abs, 0), (sign, 0), Ops.MUL)))
++    return result
+ 
+   flat = UOp.const(dtypes.weakint, 0)
+   if loops:
+@@ -6858,35 +7242,51 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     for axis, extent in zip(loops[1:], loop_extents[1:]): flat = flat*extent + axis
+ 
+   gathered_slots:list[int] = []
++  needs_trunc = False
+   for linear in range(window):
+     rem, fixed = linear, {}
+     for reduce_axis in range(len(reductions)-1, -1, -1):
+       rem, coord = divmod(rem, reduce_extents[reduce_axis])
+       fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
+-    scratch_slot, next_slot = next_slot, next_slot+1
+-    scratch = UOp.param(scratch_slot, dtypes.half, (total,), device=store.src[0].src[0].device)
+     gathered = reduce.src[0].substitute(fixed)
+-    if value_dtype is dtypes.int: gathered = UOp(Ops.CAST, dtypes.half, (gathered,), arg=dtypes.half)
+-    movement_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, dtypes.half, (scratch, flat)), gathered))
++    gathered_half = casted_half_source(gathered) if value_dtype is dtypes.int else None
++    needs_trunc = needs_trunc or gathered_half is not None
++    scratch_slot, next_slot = next_slot, next_slot+1
++    scratch_dtype = dtypes.half if gathered_half is not None or value_dtype is dtypes.half else dtypes.int
++    scratch = UOp.param(scratch_slot, scratch_dtype, (total,), device=store.src[0].src[0].device)
++    movement_value = gathered_half if gathered_half is not None else gathered
++    movement_store = UOp(Ops.STORE, src=(UOp(Ops.INDEX, scratch_dtype, (scratch, flat)), movement_value))
+     movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
+     movement_tasks = _try_movement_host_subtasks(movement_sink)
+-    if movement_tasks is None and value_dtype is dtypes.int:
+-      movement_tasks = _try_elementwise_host_subtasks(movement_sink, allow_plain=True)
+-    if movement_tasks is None or len(movement_tasks) != 1: return None
++    if movement_tasks is None or len(movement_tasks) != 1:
++      if getenv("ROCKCHIP_DEBUG_LOCAL_MAX"): print("RK_LOCAL_MAX_GATHER_REJECT", gathered)
++      return None
+     tasks.extend(movement_tasks)
+-    gathered_slots.append(scratch_slot)
++    gathered_slots.append(native_int_to_half(scratch_slot) if scratch_dtype is dtypes.int else scratch_slot)
+ 
+   accumulator = gathered_slots[0]
+   for i, operand in enumerate(gathered_slots[1:]):
+     final = i == len(gathered_slots)-2
+-    out_slot = info.outs[0] if final else next_slot
++    out_slot = info.outs[0] if final and value_dtype is dtypes.half else next_slot
+     if out_slot == next_slot: next_slot += 1
+-    # The retired int32-scratch path marked the first accumulator and every
+-    # gathered operand as int32_inputs. Separate DPU submissions made those
+-    # mixed-width intermediates unstable, so typed windows now enter as fp16.
+-    tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX,
+-                                   int32_output=final and value_dtype is dtypes.int))
++    tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX))
+     accumulator = out_slot
++  if value_dtype is dtypes.int:
++    if needs_trunc:
++      truncated = trunc_half(accumulator)
++      if truncated is None: return None
++      accumulator = truncated
++    for start in range(0, total, 4):
++      count = min(4, total-start)
++      packed, next_slot = next_slot, next_slot+1
++      pack_layout = (count, _HOST_PACK_CHUNK_LAYOUT, start)
++      pack_relocs = (RKReloc(0, packed, 0, 0, 0xFFFFFFFF), RKReloc(0, accumulator, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed, is_copy=True), pack_relocs))
++      native_slot, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(4, native_slot, (packed, 0), (_ZERO_SLOT, 0), Ops.ADD, native_int32_output=True))
++      unpack_layout = (count, _HOST_UNPACK_INT_CHUNK_LAYOUT, start)
++      unpack_relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, native_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, info.outs[0], is_copy=True), unpack_relocs))
+   return tuple(tasks)
+ 
+ def _try_cmac_variable_scale_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -7175,6 +7575,12 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
++  # Rejected CPU operator fallbacks remain opt-in diagnostics only.
++  if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
++     (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
++  if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
++  if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
++     (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
+   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
+   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, variable_scale_tasks)

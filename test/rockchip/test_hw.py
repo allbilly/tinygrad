@@ -67,6 +67,22 @@ class TestDPU(unittest.TestCase):
     x = Tensor(x_np, device="ROCKCHIP").realize()
     np.testing.assert_array_equal(x.max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected)
     np.testing.assert_array_equal(x.int().max_pool2d(kernel_size=3, stride=2, padding=1).realize().numpy(), expected.astype(np.int32))
+    # Fused half->int must truncate toward zero before/after the monotone MAX,
+    # rather than accepting the DPU WDMA converter's round-to-nearest default.
+    fractional = np.array([1.9, -1.9, 2.4, -2.4, 3.6, -3.6, 4.5, -4.5], dtype=np.float16).reshape(1,1,2,4)
+    fractional_out = Tensor(fractional, device="ROCKCHIP").realize().int().max_pool2d(2).realize().numpy()
+    np.testing.assert_array_equal(fractional_out, np.array([[[[3, 4]]]], dtype=np.int32))
+    stored_int = np.array([1, -9, 2, -8, 3, -7, 4, -6], dtype=np.int32).reshape(1,1,2,4)
+    np.testing.assert_array_equal(Tensor(stored_int, device="ROCKCHIP").realize().max_pool2d(2).realize().numpy(),
+                                  np.array([[[[3, 4]]]], dtype=np.int32))
+
+  def test_dpu_max_pool_return_indices(self):
+    # Overlapping ties select the first spatial index, matching PyTorch.
+    x_np = np.array([[[[1,5,5,2], [5,5,4,4], [0,3,4,4]]]], dtype=np.float16)
+    _, indices = Tensor(x_np, device="ROCKCHIP").realize().max_pool2d(kernel_size=2, stride=1, return_indices=True)
+    got = indices.realize().numpy()
+    self.assertEqual(got.dtype, np.int32)
+    np.testing.assert_array_equal(got, np.array([[[[1,1,2], [4,5,6]]]], dtype=np.int32))
 
   def test_dpu_copy(self):
     a_np = np.array([[1,2,3,4],[5,6,7,8]], dtype=np.float16)

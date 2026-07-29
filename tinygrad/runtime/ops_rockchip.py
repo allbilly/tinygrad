@@ -18,7 +18,9 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
-  _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
+  _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT,
+  _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
 
@@ -629,6 +631,84 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
   for i, value in enumerate(values): output[i] = value
 
+def _pack_static_gather(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Pack an address-only typed gather; no runtime tensor value is evaluated."""
+  total, tag, itemsize, *addresses = task.layout
+  assert tag == _HOST_GATHER_MAP_LAYOUT and len(addresses) == total and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  invalid = struct.pack('<e', float("-inf")) if itemsize == 2 else int(-(1 << 31)).to_bytes(4, 'little', signed=True)
+  for out_index, source_index in enumerate(addresses):
+    if source_index < 0: ctypes.memmove(output.va_addr + out_index*itemsize, invalid, itemsize)  # type: ignore[arg-type]
+    else: ctypes.memmove(output.va_addr + out_index*itemsize, source.va_addr + source_index*itemsize, itemsize)  # type: ignore[arg-type]
+
+def _pack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Copy at most four fp16 values into an aligned atom after an NPU stage."""
+  count, tag, start = task.layout
+  assert tag == _HOST_PACK_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  ctypes.memset(output.va_addr, 0, 8)  # type: ignore[arg-type]
+  ctypes.memmove(output.va_addr, source.va_addr + start*2, count*2)  # type: ignore[arg-type]
+
+def _unpack_int32_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Copy a native four-lane int32 atom into the compact logical output."""
+  count, tag, start = task.layout
+  assert tag == _HOST_UNPACK_INT_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  ctypes.memmove(output.va_addr + start*4, source.va_addr, count*4)  # type: ignore[arg-type]
+
+def _pack_int32_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Copy at most four compact int32 values into one aligned MRDMA atom."""
+  count, tag, start = task.layout
+  assert tag == _HOST_PACK_INT32_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  ctypes.memset(output.va_addr, 0, 16)  # type: ignore[arg-type]
+  ctypes.memmove(output.va_addr, source.va_addr + start*4, count*4)  # type: ignore[arg-type]
+
+def _unpack_fp16_chunk(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Copy a native fp16 atom into its compact logical position."""
+  count, tag, start = task.layout
+  assert tag == _HOST_UNPACK_HALF_CHUNK_LAYOUT and 0 < count <= 4 and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  ctypes.memmove(output.va_addr + start*2, source.va_addr, count*2)  # type: ignore[arg-type]
+
+def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Scatter pooled fp16 values by per-plane int32 indices, summing duplicates in fp32."""
+  import numpy as np
+  total, tag, index_total, planes, out_spatial, pooled = task.layout
+  assert tag == _HOST_SCATTER_LAYOUT and index_total == planes*pooled and total == planes*out_spatial
+  output, index_buf, value_buf = (bufs[r.globals_slot] for r in relocs)
+  indices = np.frombuffer(ctypes.string_at(index_buf.va_addr, index_total*4), dtype=np.int32)
+  values = np.frombuffer(ctypes.string_at(value_buf.va_addr, index_total*2), dtype=np.float16)
+  accumulator = np.zeros(total, dtype=np.float32)
+  for plane in range(planes):
+    for update in range(pooled):
+      source = plane*pooled+update
+      spatial = int(indices[source])
+      if 0 <= spatial < out_spatial:
+        destination = plane*out_spatial+spatial
+        accumulator[destination] = np.float32(accumulator[destination] + np.float32(values[source]))
+  result = accumulator.astype(np.float16)
+  ctypes.memmove(output.va_addr, result.ctypes.data, total*2)  # type: ignore[arg-type]
+
+def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Choose the first valid static candidate equal to each max-pool output."""
+  import numpy as np
+  total, tag, window, input_spatial, *mapping = task.layout
+  assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
+  output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
+  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float16)
+  maximum = np.frombuffer(ctypes.string_at(maximum_buf.va_addr, total*2), dtype=np.float16)
+  output = np.empty(total, dtype=np.int32)
+  for out_index in range(total):
+    selected = 0
+    for candidate in mapping[out_index*window:(out_index+1)*window]:
+      if candidate < 0 or candidate >= data.size: continue
+      if data[candidate] == maximum[out_index] or (np.isnan(data[candidate]) and np.isnan(maximum[out_index])):
+        selected = candidate % input_spatial
+        break
+    output[out_index] = selected
+  ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
+
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
   task: RKTask
@@ -910,6 +990,27 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
           _run_host_static_half(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+          _pack_static_gather(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
+          _pack_fp16_chunk(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
+          _unpack_int32_chunk(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
+          _pack_int32_chunk(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
+          _unpack_fp16_chunk(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
+          _run_host_scatter(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_ARGMAX_LAYOUT:
+          _run_host_argmax(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
           _run_host_bitwise(task, st.relocs, bufs)
           continue
@@ -995,9 +1096,45 @@ class RockchipProgram(Program['RockchipDevice']):
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
             _run_host_static_half(st.task, st.relocs, tuple(ext))
             continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+            _pack_static_gather(st.task, st.relocs, tuple(ext))
+            continue
           self.subtasks = None
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           self(*tuple(ext))
+      finally:
+        self.subtasks = original
+        for b in shared: dev._gpu_free(b)
+      return
+    # Native fp16->int32 writes use four-lane aligned atoms. Their source pack
+    # happens after the preceding DPU selection chain, so preserve subtask
+    # order instead of hoisting every copy ahead of every DPU submission.
+    if any(st.task.is_copy and len(st.task.layout) > 1 and
+           st.task.layout[1] in (_HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT,
+                                 _HOST_PACK_INT32_CHUNK_LAYOUT, _HOST_UNPACK_HALF_CHUNK_LAYOUT) for st in subtasks):
+      ext, shared, original = list(bufs), [], self.subtasks
+      max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                     default=len(ext)-1)
+      total = max(st.task.layout[0] for st in subtasks)
+      try:
+        while len(ext) <= max_slot:
+          shared.append(b := dev._gpu_alloc(max(total*4, 4096), 0))
+          ext.append(b)
+        for st in subtasks:
+          task = st.task
+          if task.is_copy:
+            if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk(task, st.relocs, tuple(ext))
+            else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
+            continue
+          dev.reset_npu()
+          self.subtasks = [st]
+          self._submit_multi(tuple(ext))
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
@@ -1023,6 +1160,21 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
             _run_host_static_half(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+            _pack_static_gather(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
+            _pack_fp16_chunk(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
+            _unpack_int32_chunk(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
+            _pack_int32_chunk(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
+            _unpack_fp16_chunk(task, st.relocs, tuple(ext))
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
             _run_host_bitwise(task, st.relocs, tuple(ext))
@@ -1125,7 +1277,7 @@ class RockchipProgram(Program['RockchipDevice']):
       _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_counts.get(slot, prepared[slot].size // 2), total)
       prepared[slot] = converted
     converted_output = next(((st.task.out_slot, st.task.fp32_output, st.task.uint8_output, st.task.bool_output, st.task.trunc_output)
-                             for st in subtasks if st.task.fp32_output or st.task.int32_output or st.task.uint8_output or
+                             for st in subtasks if st.task.fp32_output or (st.task.int32_output and not st.task.native_int32_output) or st.task.uint8_output or
                              st.task.bool_output or st.task.trunc_output), None)
     output_conversion = None
     if converted_output is not None:
@@ -1197,9 +1349,10 @@ class RockchipProgram(Program['RockchipDevice']):
             v = (dma >> r.shift) & r.mask
           elif r.globals_slot == _ZERO_SLOT:
             total = task.layout[0]
-            zbuf = dev._gpu_alloc(max(total * 2, 4096), 0)
+            itemsize = 4 if task.native_int32_input else 2
+            zbuf = dev._gpu_alloc(max(total * itemsize, 4096), 0)
             temp.append(zbuf)
-            ctypes.memset(zbuf.va_addr, 0, total * 2)  # type: ignore[arg-type]
+            ctypes.memset(zbuf.va_addr, 0, total * itemsize)  # type: ignore[arg-type]
             dma = zbuf.meta.dma_addr
             v = (dma >> r.shift) & r.mask
           else:

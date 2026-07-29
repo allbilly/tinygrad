@@ -497,3 +497,57 @@ Remaining pooling failures are now the separate index/scatter family:
 
 This staged DPU implementation prioritizes complete forward correctness.
 Direct local PPU programming can later reduce the number of submissions.
+
+### Strict execution audit correction
+
+The pooling totals above are numerical-pass totals, not proof of NPU-only
+execution. Runtime audit found:
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| constant-divisor average pool | passing | pending audit/replacement of host CACC unpack |
+| variable-divisor average pool | passing | **not accepted**: reciprocal scale is applied on CPU |
+| fp16 local max values | passing | DPU MAX, but host-mapped candidate gather remains |
+| integer local max values | passing | **not accepted**: candidate cast is performed on CPU |
+| returned max indices | rejected WIP passed numerically | **failing**: rejected CPU ArgMax |
+| max-unpool | rejected WIP | **failing**: rejected CPU scatter |
+
+The uncommitted `_run_host_argmax` and `_run_host_scatter` compiler hooks are
+disabled. RK3588 `DPU_RDMA.UNPOOLING_EN` is fixed kernel/stride upsampling,
+not index-driven max-unpool. Future status updates count a case as
+NPU-native only when runtime tensor arithmetic/comparison/reduction/selection
+is performed by submitted NPU tasks. Static register/address/DMA preparation
+does not count as operator computation.
+
+### Native returned-index milestone
+
+The strict status for returned max-pool indices is now corrected to passing:
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `max_pool2d(return_indices=True)` | **passing: all 7 official cases** | **passing** |
+| fused half-to-int local max | **passing, including fractions** | **passing** |
+| stored int32 local max | **passing** | **passing** |
+| `max_unpool2d` | failing | failing: native scatter still required |
+| `max_unpool2d_inf` | failing/not refreshed | failing: native scatter and NaN selection required |
+
+Returned indices use compile-time address maps only for value-preserving byte
+gathers. DPU comparisons, equality/validity masks, reverse-order first-tie
+selection, and native int32 WDMA produce the result. The disabled CPU ArgMax
+callback is not used. The official command:
+
+```sh
+. .venv/bin/activate
+CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  python -m pytest test/backend/test_ops.py::TestOps::test_max_pool2d_return_indices -q -x
+```
+
+passed in **154.66 seconds**. New Rockchip hardware regressions also cover
+fractional truncation, stored int32 local pooling, and overlapping ties.
+The complete DPU class passes **54/54** in 247.30 seconds and the hardware-free
+PR1 contract passes **79/79** in 6.80 seconds.
+
+The audit of other accelerator backends found no precedent for host evaluation
+of ordinary tensor operators. Host transfers, address generation, packing,
+cache maintenance, and command construction are allowed; `run_host` arithmetic
+is not counted as a Rockchip operator pass.
