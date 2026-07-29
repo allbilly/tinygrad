@@ -941,3 +941,24 @@ corrections, and both debug-stage mappings are recorded in `lut.md` and
 `progress.md`.
 
 Recovery patch: `rockchip-pow55-two-level-32d22562a.patch`.
+
+### Positive constant-base 5.5 milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `5.5**x`, official `[-2,2]` inputs | **passing** | two Q15 LUT tasks + DPU select |
+| dense 513-point sweep | **513/513 passing** | maximum relative error `0.0009284` |
+| `(-5.5)**x` | unsupported parity/NaN WHERE | next POW subgroup |
+
+The former scaled EXP2 table needed Q10 over a 30.25× result range.  The new
+strict path stores direct negative-exponent results in Q15 and stores
+positive-exponent results divided by 32 in a second Q15 table.  DPU decodes
+and selects the result; the generic table remains only as an out-of-range
+fallback.
+
+The permanent sweep and existing EXP2 regressions pass **3/3 in 12.35
+seconds**.  The official method advances to the separate negative-base
+rejection in 55.21 seconds, and PR1 remains **79/79 in 6.49 seconds**.  No
+host operator fallback is involved.
+
+Recovery patch: `rockchip-pow-base55-two-level-c9b0426f8.patch`.

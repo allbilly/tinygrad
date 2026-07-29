@@ -6770,3 +6770,44 @@ also remains a special-value follow-up; the official finite-input subgroup
 and permanent claimed domain pass.
 
 Recovery patch: `rockchip-pow55-two-level-32d22562a.patch`.
+
+## 2026-07-30 — positive constant-base POW 5.5
+
+`5.5**x` schedules as `EXP2(x*log2(5.5))`.  The generic scaled EXP2 table
+must cover outputs from `1/30.25` through `30.25` for official `x∈[-2,2]`.
+Its shared fixed-point format consequently falls to Q10, producing
+942/2,925 tolerance failures with maximum relative error `0.01668`.
+
+A strict constant-scale matcher now emits two Q15 LUT tasks:
+
+- the low task stores `5.5**min(x,0)` directly in `[1/30.25,1]`;
+- the high task stores `5.5**max(x,0)/32` in `[1/32,30.25/32]`;
+- DPU multiplies the high result by 32 and selects it for positive inputs.
+
+Both tables are continuous at zero and use the full normal address grid.
+The original generic scaled-EXP2 task remains as fallback outside the
+corrected `[-2,2]` interval and for special values.  All runtime math,
+selection, and decoding stays on DPU; no host operator fallback was added.
+`ROCKCHIP_DEBUG_POW_BASE55_STAGE=1..4` exposes low, encoded high, decoded
+high, and selected result.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- dense 513-point `[-2,2]` sweep: **513/513 passing**, maximum relative
+  error `0.0009284`;
+- the permanent sweep plus existing EXP2-special and two-LUT EXP tests:
+  **3/3 passing in 12.35 seconds**;
+- official `TestOps.test_pow_const`: `5.5**x` passes and the method reaches
+  the separate negative-base `(-5.5)**x` WHERE rejection in **55.21
+  seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.49 seconds**;
+- pycompile and `git diff --check`: passing;
+- mypy remains at the same 13 pre-existing Rockchip errors.
+
+The next subgroup requires determining whether the runtime exponent is an
+integer and whether it is odd.  It will use the existing DPU roundoff LUT
+and DPU masks rather than CPU/run_host arithmetic.
+
+Recovery patch: `rockchip-pow-base55-two-level-c9b0426f8.patch`.

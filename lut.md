@@ -1860,6 +1860,31 @@ Debug mappings:
 | `ROCKCHIP_DEBUG_POW55_STAGE` | `1=normalized`, `2=low`, `3=high`, `4=decoded high`, `5=selected power`, `6=factor`, `7=bounded` |
 | `ROCKCHIP_DEBUG_POW_NEG55_STAGE` | `1=normalized`, `2=low`, `3=high`, `4=selected power`, `5=factor`, `6=bounded` |
 
+## Constant base 5.5: split the output scale
+
+For `5.5**x`, folding `log2(5.5)` into the normal EXP2 builder is
+mathematically correct but fixed-point inefficient.  Over `x∈[-2,2]`, the
+table output spans `[1/30.25,30.25]`; representing the upper endpoint forces
+Q10 and makes one raw unit almost 3% of the lower endpoint.
+
+Use two continuous Q15 functions on the same input grid:
+
+| Task | Stored function | Stored range | Decode |
+|---|---|---:|---:|
+| low | `5.5**min(x,0)` | `[1/30.25,1]` | direct |
+| high | `5.5**max(x,0)/32` | `[1/32,30.25/32]` | multiply by 32 |
+
+Both tasks have representable Q15 outputs and meet at well-defined values at
+zero.  DPU comparison selects the decoded high task only for `x>0`.  The
+generic scaled EXP2 output remains a fallback outside `[-2,2]`; because all
+corrected-range values are finite, arithmetic selection cannot encounter
+the `0*inf` contamination seen in negative scalar exponents.
+
+A dense 513-point hardware sweep has maximum relative error `0.0009284`,
+below TestOps' `0.001` limit.  Debug with
+`ROCKCHIP_DEBUG_POW_BASE55_STAGE=1..4` for low, encoded high, decoded high,
+and the selected result.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.
