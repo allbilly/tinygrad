@@ -5649,6 +5649,166 @@ def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (nan_numerator,0), (nan_denom,0), Ops.FDIV)
   return tuple(tasks)
 
+def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate runtime tensor base/exponent POW with native magnitude and parity."""
+  store = _store_node(sink)
+  if store is None: return None
+  value = _unwrap(store.src[1])
+  nodes = value.toposort()
+  if value.op is not Ops.WHERE or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
+     sum(u.op is Ops.LOG2 for u in nodes) != 1 or sum(u.op is Ops.FLOORMOD for u in nodes) != 1: return None
+  exponential = next(u for u in nodes if u.op is Ops.EXP2)
+  scaled_log = _unwrap(exponential.src[0])
+  if scaled_log.op is not Ops.MUL or len(scaled_log.src) != 2: return None
+  logarithm = next((_unwrap(u) for u in scaled_log.src if _unwrap(u).op is Ops.LOG2), None)
+  exponent = next((_unwrap(u) for u in scaled_log.src if _unwrap(u).op is Ops.INDEX), None)
+  if logarithm is None or exponent is None: return None
+  absolute = _unwrap(logarithm.src[0])
+  if absolute.op is not Ops.WHERE: return None
+  base = next((_unwrap(u) for u in absolute.toposort() if _unwrap(u).op is Ops.INDEX and _unwrap(u) is not exponent), None)
+  if base is None or base.dtype is not dtypes.float or exponent.dtype is not dtypes.float: return None
+  if len({base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot}) != 2: return None
+
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  if total != 1 or store.src[0].src[0].dtype is not dtypes.float: return None
+  if any(int(u.src[0].src[0].arg) != total for u in (base, exponent)): return None
+  out, next_slot = info.outs[0], max(info.globals, default=-1)+1
+  base_slot, exponent_slot = base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot
+  tasks:list[RKSubTask] = []
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+
+  def scalar(number:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, **kwargs) -> None:
+    # The first write is an fp16 visibility scratch. Typed output conversion
+    # belongs only to the logical destination on the second write.
+    scratch_kwargs = {key:value for key, value in kwargs.items() if not key.endswith("_output")}
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op, **scratch_kwargs))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op, **kwargs))
+
+  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
+    diff, mask = alloc(), alloc()
+    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
+                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
+    return mask, 0
+
+  def temp_index(slot:int) -> UOp:
+    out_index = store.src[0]
+    return out_index.replace(dtype=dtypes.half,
+      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
+
+  def extend(stage_tasks:tuple[RKSubTask, ...]|None) -> bool:
+    nonlocal next_slot
+    if stage_tasks is None: return False
+    tasks.extend(stage_tasks)
+    used_slots = [task.task.out_slot for task in stage_tasks] + \
+      [reloc.globals_slot for task in stage_tasks for reloc in task.relocs
+       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1)+1)
+    return True
+
+  zero, one = (_ZERO_SLOT,0), scalar(1.0)
+  base_half = alloc() if base.dtype is dtypes.float else base_slot
+  exponent_half = alloc() if exponent.dtype is dtypes.float else exponent_slot
+  if base.dtype is dtypes.float:
+    tasks.append(_emit_where_stage(total, base_half, (base_slot,0), zero, Ops.ADD, fp32_inputs=(base_slot,)))
+  if exponent.dtype is dtypes.float:
+    tasks.append(_emit_where_stage(total, exponent_half, (exponent_slot,0), zero, Ops.ADD, fp32_inputs=(exponent_slot,)))
+
+  negative_base, absolute_base, negative_exponent, absolute_exponent = (alloc() for _ in range(4))
+  dependent(negative_base, zero, (base_half,0), Ops.SUB)
+  dependent(absolute_base, (base_half,0), (negative_base,0), Ops.MAX)
+  dependent(negative_exponent, zero, (exponent_half,0), Ops.SUB)
+  dependent(absolute_exponent, (exponent_half,0), (negative_exponent,0), Ops.MAX)
+  base_nonzero = positive_mask((absolute_base,0), zero)
+  exponent_nonzero = positive_mask((absolute_exponent,0), zero)
+  base_zero, exponent_zero, both_zero, safe_base = (alloc() for _ in range(4))
+  dependent(base_zero, one, base_nonzero, Ops.SUB)
+  dependent(exponent_zero, one, exponent_nonzero, Ops.SUB)
+  dependent(both_zero, (base_zero,0), (exponent_zero,0), Ops.MUL)
+  # LOG2 never sees zero. The final selection restores all zero-base rules:
+  # 0**positive=0, 0**0=1, and 0**negative=+inf.
+  dependent(safe_base, (absolute_base,0), (base_zero,0), Ops.ADD)
+
+  log_slot = alloc()
+  staged_log = UOp(Ops.LOG2, dtypes.half, (temp_index(safe_base),))
+  if not extend(_try_log2_special_subtasks(stage_sink(staged_log, log_slot))): return None
+  scaled_log_slot = alloc()
+  dependent(scaled_log_slot, (log_slot,0), (exponent_half,0), Ops.MUL)
+  magnitude = alloc()
+  staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(scaled_log_slot),))
+  if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude))): return None
+
+  def trunc_half(input_slot:int) -> int|None:
+    negative, absolute_value, rounded = alloc(), alloc(), alloc()
+    dependent(negative, zero, (input_slot,0), Ops.SUB)
+    dependent(absolute_value, (input_slot,0), (negative,0), Ops.MAX)
+    roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(absolute_value),), arg="rk_roundoff")
+    round_plan = plan_rk(stage_sink(roundoff, rounded))
+    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut": return None
+    cmds, task, relocs = emit_rk(round_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
+    dependent(overshoot_diff, (rounded,0), (absolute_value,0), Ops.SUB)
+    tasks.append(_emit_where_stage(total, overshoot, (overshoot_diff,0), (overshoot_diff,0), Ops.MAX, compare=True))
+    dependent(truncated_abs, (rounded,0), (overshoot,0), Ops.SUB)
+    positive = positive_mask((input_slot,0), zero)
+    negative_mask = positive_mask(zero, (input_slot,0))
+    sign, result = alloc(), alloc()
+    dependent(sign, positive, negative_mask, Ops.SUB)
+    dependent(result, (truncated_abs,0), (sign,0), Ops.MUL)
+    return result
+
+  truncated = trunc_half(exponent_half)
+  if truncated is None: return None
+  half = alloc()
+  dependent(half, (truncated,0), scalar(0.5), Ops.MUL)
+  half_truncated = trunc_half(half)
+  if half_truncated is None: return None
+  doubled, remainder, negative_remainder, odd = (alloc() for _ in range(4))
+  dependent(doubled, (half_truncated,0), scalar(2.0), Ops.MUL)
+  dependent(remainder, (truncated,0), (doubled,0), Ops.SUB)
+  dependent(negative_remainder, zero, (remainder,0), Ops.SUB)
+  dependent(odd, (remainder,0), (negative_remainder,0), Ops.MAX)
+  twice_odd, parity_sign = alloc(), alloc()
+  dependent(twice_odd, (odd,0), scalar(2.0), Ops.MUL)
+  dependent(parity_sign, one, (twice_odd,0), Ops.SUB)
+
+  exponent_above_trunc = positive_mask((exponent_half,0), (truncated,0))
+  trunc_above_exponent = positive_mask((truncated,0), (exponent_half,0))
+  noninteger, negative_mask, invalid = alloc(), positive_mask(zero, (base_half,0))[0], alloc()
+  dependent(noninteger, exponent_above_trunc, trunc_above_exponent, Ops.ADD)
+  dependent(invalid, (negative_mask,0), (noninteger,0), Ops.MUL)
+  sign_delta, selected_delta, effective_sign, signed = (alloc() for _ in range(4))
+  dependent(sign_delta, (parity_sign,0), one, Ops.SUB)
+  dependent(selected_delta, (negative_mask,0), (sign_delta,0), Ops.MUL)
+  dependent(effective_sign, one, (selected_delta,0), Ops.ADD)
+  dependent(signed, (magnitude,0), (effective_sign,0), Ops.MUL)
+  exponent_negative = positive_mask(zero, (exponent_half,0))
+  normal_result, zero_result, selected_result = (alloc() for _ in range(3))
+  dependent(normal_result, (signed,0), base_nonzero, Ops.MUL)
+  dependent(zero_result, (exponent_zero,0), (base_zero,0), Ops.MUL)
+  dependent(selected_result, (normal_result,0), (zero_result,0), Ops.ADD)
+  zero_negative, zero_numerator, zero_denom, zero_selected = (alloc() for _ in range(4))
+  dependent(zero_negative, (base_zero,0), exponent_negative, Ops.MUL)
+  dependent(zero_numerator, (selected_result,0), (zero_negative,0), Ops.ADD)
+  dependent(zero_denom, one, (zero_negative,0), Ops.SUB)
+  dependent(zero_selected, (zero_numerator,0), (zero_denom,0), Ops.FDIV)
+  valid_denom, valid_factor = alloc(), alloc()
+  dependent(valid_denom, one, (invalid,0), Ops.SUB)
+  dependent(valid_factor, (valid_denom,0), (valid_denom,0), Ops.FDIV)
+  dependent(out, (zero_selected,0), (valid_factor,0), Ops.MUL,
+            fp32_output=store.src[0].src[0].dtype is dtypes.float)
+  return tuple(tasks)
+
 def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower fractional x**c through staged abs, LOG2, scale, and EXP2.
 
@@ -11083,6 +11243,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, pow_neg_base55_tasks)
   if (zero_base_pow_tasks := _try_zero_base_pow_subtasks(sink)) is not None:
     return build_native_program_multi(sink, zero_base_pow_tasks)
+  if (tensor_pow_tasks := _try_tensor_pow_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, tensor_pow_tasks)
   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fractional_pow_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)

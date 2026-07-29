@@ -1189,9 +1189,10 @@ forward-only:
 - permanent five-lane half/integer padding regression in both directions:
   **passing in 70.22 seconds**.
 
-The linked RKNN Toolkit2 fp16 multiplication issue #471 is useful supporting
-evidence for the separate cumulative/large-reduction precision group, not a
-TopK or LUT workaround; exact observations and the URL are in `progress.md`.
+The linked RKNN Toolkit2 fp16 multiplication issue #471 is not evidence of
+accumulator drift: its values exactly follow fp16 quantization of `0.1`, and
+the reporter closed it for that reason.  It remains a useful warning to
+separate input quantization from accumulation and final conversion.
 
 ### Complete Sort subcase verification
 
@@ -1274,3 +1275,24 @@ Python compilation and whitespace checks pass.  Mypy remains at the exact
 installed in `.venv`.  Detailed knot values, interpolation modeling, timeout
 isolation, backups, and debug commands are recorded in `progress.md` and
 `lut.md`.
+
+### Scalar runtime tensor POW zero-base milestone
+
+| Coverage | Result |
+|---|---:|
+| `0**0` with runtime fp32 tensors | **passing** |
+| `0**0.3` | **passing** |
+| `0**-0.3` | **passing** |
+| unchanged `test_pow_zero_tensor` | **1 passed in 25.80s** |
+| hardware-free PR1 contract | **79/79 in 6.51s** |
+
+A strict scalar-fp32 matcher now lowers the nested POW WHERE graph into DPU
+mask/arithmetic stages plus the established LOG2, EXP2, and roundoff LUTs.
+Host work is only fp32/fp16 ABI conversion.  LOG2 sees a safe nonzero value,
+and final NPU masks restore zero-base positive, zero, and negative-exponent
+semantics.  Typed output conversion is attached only to the logical output,
+not the duplicated visibility scratch.
+
+General fp16 `test_pow_full` remains a separate accuracy failure, and
+`TestOps.test_pow` retains its pre-existing final dtype mismatch.  Detailed
+failure counts, matcher boundaries, and debugging steps are in `progress.md`.

@@ -7237,15 +7237,17 @@ Using `. .venv/bin/activate`, disabled caches,
   **passing in 70.22 seconds**, with expected infinity-cast warnings
   subsequently silenced at the ABI boundary.
 
-### External RK3588 accumulation evidence
+### External RK3588 fp16 quantization evidence
 
 [RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
-reports fp16 matmul accumulation drifting as K grows: `0.1*1` summed over 128
-terms gives 12.80, over 256 gives 25.59 instead of 25.60, and over 4096 gives
-409.50 instead of 409.60.  It supplies no register workaround, but it supports
-our CumProd/large-reduction diagnosis: long fp16 accumulation needs bounded
-chunks, compensation, or a higher-precision accumulator.  It does not explain
-elementwise MUL, LUT interpolation, or the TopK layout issues above.
+initially describes matmul accumulation drift, but the reporter closed it
+after identifying ordinary fp32-to-fp16 input quantization.  FP16 stores
+`0.1` as `0.0999755859375`; multiplying that exact value by 256 and 4096
+gives `25.59375` and `409.5`, exactly the reported results.  The issue is
+therefore useful as a diagnostic warning to separate input quantization,
+accumulator precision, and final output conversion.  It is **not** evidence
+of an RK3588 accumulation defect and supplies no register or LUT workaround
+for CumProd, reductions, or TopK.
 
 ## 2026-07-30 — complete Sort subcase verification
 
@@ -7322,10 +7324,11 @@ errors.  Ruff is not installed in `.venv`.
 
 Next loss work is therefore split cleanly: tune or add a second NPU LUT task
 for unreduced BCE accuracy, then lower the `pos_weight` broadcast.  The
-accumulation drift reported in
+numbers in
 [RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
-supports caution around long fp16 CMAC/reduction chains, but it does not
-explain the unreduced elementwise LUT error or the broadcast rejection.
+are fully explained by fp16 input quantization; they do not establish CMAC
+drift and do not explain the unreduced elementwise LUT error or broadcast
+rejection.
 
 ## 2026-07-30 — BCE-with-logits vector positive weights
 
@@ -7448,8 +7451,8 @@ No BCE arithmetic uses `run_host`.  A repository-wide search found no
 general accelerator-backend convention for evaluating an unsupported
 operator on CPU; Rockchip host helpers remain limited to static layout,
 representation selection, and dtype/ABI conversion.  RKNN Toolkit2 issue
-[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) remains useful
-evidence for long fp16 accumulation drift, but it does not supply a LUT or
+[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) demonstrates
+fp16 input quantization, not accumulation drift, and does not supply a LUT or
 elementwise workaround for this group.
 
 ### Validation
@@ -7463,6 +7466,69 @@ Using `. .venv/bin/activate`,
   **2 passed in 40.38 seconds**;
 - isolated ordinary none and logits none: **320/320 passing each**;
 - `test/rockchip/test_pr1.py`: **79/79 in 6.67 seconds**;
+- Python compilation and `git diff --check`: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline;
+- ruff and pytest-xdist remain unavailable in `.venv`.
+
+## 2026-07-30 — scalar runtime tensor POW zero-base milestone
+
+The unchanged `TestOps.test_pow_zero_tensor` now passes all scalar fp32
+runtime-tensor cases: `0**0`, `0**0.3`, and `0**-0.3`.  The original graph
+was a nested WHERE around one LOG2/EXP2 magnitude path plus integer parity
+checks and rejected as `unsupported_op:Ops.WHERE`.
+
+The new strict matcher accepts only a one-element fp32 output with distinct
+runtime fp32 base and exponent buffers.  Host work is limited to the existing
+fp32↔fp16 ABI conversions.  DPU tasks compute absolute values, zero/sign
+masks, exponent multiplication, parity, signed selection, and invalid-domain
+NaN generation.  The proven LOG2, EXP2, and round-to-nearest-even LUT tasks
+remain NPU work.
+
+LOG2 receives `abs(base)+base_zero`, so it never evaluates the unusable zero
+entry.  The final NPU masks restore:
+
+```text
+0**positive = 0
+0**0        = 1
+0**negative = +inf
+```
+
+The visibility helper duplicates DPU writes because long mixed sequences
+need explicit scratch materialization.  Initially both copies of the final
+stage carried `fp32_output`; runtime conversion therefore selected the
+scratch slot and left the logical output half-written.  Typed output metadata
+now applies only to the logical second write.  This changed the first failure
+from a garbage fp32 value to correct `0**0`, after which the explicit
+zero-base masks fixed the remaining positive and negative exponent cases.
+
+The matcher was deliberately narrowed after a broad probe captured
+`test_pow_full`: its 2,925 fp16 lanes executed but 175 missed tolerance.
+General fp16 tensor POW remains a separate LUT-accuracy group.
+`TestOps.test_pow` also retains its pre-existing final fp16/fp32 dtype
+mismatch.  Neither failure is claimed by this milestone.
+
+Useful debug sequence:
+
+1. use `ROCKCHIP_DEBUG_SINK=1` to confirm one EXP2, one LOG2, one FLOORMOD,
+   and two distinct runtime INDEX buffers;
+2. use `ROCKCHIP_DEBUG_SUBTASKS=1` and verify only the final logical output
+   slot carries `fp32_output=True`;
+3. run `0**0`, `0**positive`, and `0**negative` separately before testing
+   arbitrary bases;
+4. if a large fp32 garbage value appears, inspect typed output-slot selection
+   before changing LUT knots;
+5. if only zero-base nonzero exponents fail, verify safe LOG2 input and the
+   final zero-base masks.
+
+Backups were written under `/tmp/rockchip-tensor-pow-20260730-*` before each
+substantive edit.  No LUT coefficients changed, so `lut.md` needs no new
+tuning table for this milestone.
+
+Validation with `. .venv/bin/activate`,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged `TestOps.test_pow_zero_tensor`: **1 passed in 25.80 seconds**;
+- `test/rockchip/test_pr1.py`: **79/79 in 6.51 seconds**;
 - Python compilation and `git diff --check`: **passing**;
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
