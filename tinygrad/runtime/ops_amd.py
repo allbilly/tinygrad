@@ -985,9 +985,6 @@ class PCIIface(PCIIfaceBase):
     except IndexError: raise RuntimeError(f"AMD:{dev_id} does not exist ({pluralize('device', len(visible))} available)")
     is_polaris = not pcibus.startswith("remote:") and \
       int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/device").read(), 16) == 0x67df
-    if is_polaris and not getenv("AMD_POLARIS_EXPERIMENTAL"):
-      raise RuntimeError("Direct Polaris AM is experimental and its HQD ring fetch is not yet safe; "
-                         "use the default KFD interface, or set AMD_POLARIS_EXPERIMENTAL=1 for bring-up only")
     self.pci_dev = pci_cls("AM", pcibus, remove_siblings=False) if is_polaris and pci_cls is PCIDevice else pci_cls("AM", pcibus)
     self.dev, self.vram_bar, self.count = dev, 0, len(visible)
     if is_polaris:
