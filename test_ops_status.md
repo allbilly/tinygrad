@@ -1075,3 +1075,21 @@ Refresh caveats: general `argmax`/`argmin`/`argsort` remain unsupported, while
 the observed half `arange` tolerance mismatch reproduces on CPU and is not a
 Rockchip-specific failure.  RK ioctl timeouts in a long shared process are
 rerun in isolation before being counted.
+
+### Native cumulative-minimum milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `cummin` values and indices | **passing** | DPU negate/MAX/compare/select |
+| `cummin_zero_axis` | **passing** | static identity handling |
+| cumulative sum/min/max family | **complete** | except cumprod precision |
+
+The local extrema path now recognizes WHERE-wrapped `-MAX(-x)` prefixes.
+Static movement gathers the unnegated candidates and rewrites padding
+sentinels; DPU applies negation before MAX, restores public values, and
+selects the latest matching axis coordinate for indices.
+
+The unchanged official cummin pair passes **2/2 in 68.12 seconds**.  The
+permanent two-axis cummin/cummax regressions plus returned max-pool indices
+pass **3/3 in 26.73 seconds**.  No host callback evaluates a runtime minimum
+or selected index.

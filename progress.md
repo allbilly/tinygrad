@@ -7039,3 +7039,40 @@ Current isolated census notes:
   difference rather than a Rockchip backend failure;
 - long shared-process runs can still hit an RK ioctl timeout; the implicated
   method must be rerun in isolation before classifying it as failed.
+
+## 2026-07-30 — native cumulative-minimum values and indices
+
+Cummin lowers to `-MAX(-x)`, but its cumulative prefix masks wrap the negated
+input in two WHERE nodes.  The local MIN recognizer only understood the old
+direct `MAX(x*-1)*-1` form, so cummin values rejected.  Its index producer
+materializes the intermediate `MAX(-x)` without the final sign restoration,
+which required the same wrapped recognition as a separate stage.
+
+The extended path preserves the direct implementation and, for the wrapped
+form:
+
+1. recovers the unnegated data arm while converting invalid `-inf` padding
+   to `+inf`;
+2. gathers only static candidate addresses;
+3. applies `*-1` on DPU before the MAX chain, turning that padding back into
+   MAX-neutral `-inf`;
+4. restores the sign only for the public cummin value output;
+5. compares negated candidates with the saved `MAX(-x)` result for indices.
+
+The cumulative prefix and latest-tie coordinate rules from the preceding
+cummax milestone are shared unchanged.  Reset-separated warm reads are used
+where a freshly gathered candidate enters a DPU scale/validity stage.
+
+### Validation
+
+Using `. .venv/bin/activate` and `CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `test_cummin` and `test_cummin_zero_axis`: **2/2 passing in
+  68.12 seconds**;
+- permanent two-axis cummin values/indices, two-axis cummax indices, and
+  returned max-pool index regression: **3/3 passing in 26.73 seconds**;
+- deterministic `[3,1,2,0,4]` produces values `[3,1,1,0,0]` and indices
+  `[0,1,1,3,3]`.
+
+The forward cumulative sum/min/max family is now complete except for the
+separately tracked cumulative-product precision behavior.

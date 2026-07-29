@@ -7983,6 +7983,8 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   maximum = next((u for u in value_indexes if u is not data and u.dtype is data.dtype and int(u.src[0].src[0].arg) == total), None) \
     if data is not None else None
   if data is None or maximum is None: return None
+  negated_data = any(u.op is Ops.MUL and u.dtype in (dtypes.half, dtypes.float) and data in u.src and
+                     any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src) for u in max_reduce.toposort())
   input_total = int(data.src[0].src[0].arg)
   out_shape = _shape_of_store(sink)
   planes = prod(out_shape[:-2]) if len(out_shape) >= 3 else 1
@@ -8139,7 +8141,16 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, data.dtype.itemsize, *addresses)
     gather_relocs = (RKReloc(0, gathered, 0, 0, 0xFFFFFFFF), RKReloc(0, data_slot, 0, 0, 0xFFFFFFFF))
     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered, is_copy=True), gather_relocs))
-    candidate_slots.append(native_int_to_half(gathered) if data.dtype is dtypes.int else gathered)
+    candidate_slot = native_int_to_half(gathered) if data.dtype is dtypes.int else gathered
+    if negated_data:
+      negated_warm, negated_slot = next_slot, next_slot+1
+      next_slot += 2
+      tasks.append(_emit_where_stage(total, negated_warm, (candidate_slot, 0),
+                                     (_CONST_SLOT, 0xbf800000), Ops.MUL))
+      tasks.append(_emit_where_stage(total, negated_slot, (candidate_slot, 0),
+                                     (_CONST_SLOT, 0xbf800000), Ops.MUL))
+      candidate_slot = negated_slot
+    candidate_slots.append(candidate_slot)
 
     candidate_index_slots:list[int] = []
     for byte in range(index_bytes):
@@ -9325,6 +9336,29 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       if scale.op is Ops.CONST and float(scale.arg) == -1.0:
         min_source = source_value
         break
+  negated_only = False
+  if (post_scale is None or post_scale < 0) and min_source is None:
+    # Cumulative MIN wraps the negated input and its invalid-prefix padding in
+    # WHERE nodes. Preserve the direct pattern above, then recover the
+    # unnegated candidate graph: +inf padding becomes -inf after the existing
+    # per-candidate -1 scale, exactly matching MAX's neutral sentinel.
+    negated_values:dict[UOp,UOp] = {}
+    for node in reduce_body.toposort():
+      if node.op is not Ops.MUL or node.dtype not in (dtypes.half, dtypes.float) or len(node.src) != 2: continue
+      for source_value, scale in ((node.src[0], node.src[1]), (node.src[1], node.src[0])):
+        if scale.op is Ops.CONST and float(scale.arg) == -1.0 and any(u.op is Ops.INDEX for u in source_value.toposort()):
+          negated_values[node] = source_value
+          break
+    if negated_values:
+      min_source = reduce_body.substitute(negated_values)
+      negative_infinities = {u:UOp.const(u.dtype, math.inf) for u in min_source.toposort()
+                             if u.op is Ops.CONST and u.dtype in (dtypes.half, dtypes.float) and float(u.arg) == -math.inf}
+      min_source = min_source.substitute(negative_infinities)
+      if post_scale is None:
+        # Cummin's index producer materializes MAX(-x) without the outer
+        # negation. Scale the recovered candidates before MAX, but do not
+        # restore their sign at this stage.
+        post_scale, negated_only = -1.0, True
   is_min = min_source is not None
   if value_dtype not in (dtypes.half, dtypes.float, dtypes.int) or store.src[0].dtype is not value_dtype or \
      (post_scale is not None and value_dtype not in (dtypes.half, dtypes.float)) or (is_min and value_dtype is dtypes.int): return None
@@ -9472,7 +9506,12 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     scale_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', post_scale))[0])
     scaled_slots:list[int] = []
     for source_slot in gathered_slots:
-      scaled_slot, next_slot = next_slot, next_slot+1
+      scale_warm, scaled_slot = next_slot, next_slot+1
+      next_slot += 2
+      # Keep the original one-stage form for reference. Static gather tasks
+      # need one reset-separated warm read before this arithmetic consumer.
+      # tasks.append(_emit_where_stage(total, scaled_slot, (source_slot, 0), scale_arg, Ops.MUL))
+      tasks.append(_emit_where_stage(total, scale_warm, (source_slot, 0), scale_arg, Ops.MUL))
       tasks.append(_emit_where_stage(total, scaled_slot, (source_slot, 0), scale_arg, Ops.MUL))
       scaled_slots.append(scaled_slot)
     gathered_slots = scaled_slots
@@ -9481,7 +9520,8 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   accumulator = gathered_slots[0]
   for i, operand in enumerate(gathered_slots[1:]):
     final = i == len(gathered_slots)-2
-    out_slot = info.outs[0] if final and value_dtype in (dtypes.half, dtypes.float) and post_scale is None and not is_min else next_slot
+    out_slot = info.outs[0] if final and value_dtype in (dtypes.half, dtypes.float) and post_scale is None and \
+      (not is_min or negated_only) else next_slot
     if out_slot == next_slot: next_slot += 1
     if value_dtype is dtypes.float:
       tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX, fp32_output=final))
@@ -9510,7 +9550,7 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # elif post_scale is not None:
   #   scale_arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', post_scale))[0])
   #   tasks.append(_emit_where_stage(total, info.outs[0], (accumulator, 0), scale_arg, Ops.MUL))
-  elif is_min:
+  elif is_min and not negated_only:
     negative_one = (_CONST_SLOT, 0xbf800000)
     tasks.append(_emit_where_stage(total, info.outs[0], (accumulator, 0), negative_one, Ops.MUL,
                                    fp32_output=value_dtype is dtypes.float))
