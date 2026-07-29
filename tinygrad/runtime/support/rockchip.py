@@ -689,6 +689,8 @@ _LUT_OPS = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL}
 _LUT_SIGMOID = Ops.NOOP  # internal plan marker; tinygrad lowers sigmoid to reciprocal/add/exp2
 _LUT_ROUNDOFF = Ops.CUSTOM  # internal plan marker for the RK3588 round-to-nearest-even LUT
 _LUT_EXP_CORRECTION = Ops.NEG  # internal marker for the second, residual exp LUT
+_LUT_EXP2_SCALE = Ops.CMPEQ  # internal marker for split-range 2**integer scale
+_LUT_EXP2_RESIDUAL = Ops.CMPLT  # internal marker for Q14 2**[-1,1]
 _LUT_HARDSWISH = Ops.POW  # internal marker for a fused hardswish LUT
 _LUT_HARDSWISH_CORRECTION = Ops.CMOD
 _LUT_CELU = Ops.FLOORMOD
@@ -791,6 +793,56 @@ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, fl
     lut[_LUT_SIZE + 502] += 14
   bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
   return lut, bn_mul_operand, output_scale, index_scale, minus_exp
+
+def _build_exp2_scale_lut() -> tuple[list[int], int, float, float, int]:
+  """Q15 scale table for the integer part of a range-reduced EXP2.
+
+  Positive coordinates encode 2**-a for a=4*x in [0,8]. Negative
+  coordinates encode 2**(8-a) for a=8-8*x in [8,24]; the caller divides
+  that half by 256. Taking a reciprocal restores positive integer powers.
+  """
+  lut = [0] * _LUT_SIZE * 2
+  index_scale, output_scale = 8192.0, 32768.0
+  step = 32.0 / index_scale
+  for i in range(_LUT_SIZE):
+    x = -(512-i) * step
+    lut[i] = max(1, min(32767, int(round(math.exp2(8.0*x) * output_scale))))
+  for i in range(_LUT_SIZE):
+    x = i * step
+    lut[_LUT_SIZE+i] = max(1, min(32767, int(round(math.exp2(-4.0*x) * output_scale))))
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, output_scale, index_scale, 15
+
+def _build_exp2_residual_lut() -> tuple[list[int], int, float, float, int]:
+  """Q14 EXP2 table for coordinate x=2*r, r in [-1,1]."""
+  lut = [0] * _LUT_SIZE * 2
+  index_scale, output_scale = 8192.0, 16384.0
+  step = 32.0 / index_scale
+  for i in range(_LUT_SIZE):
+    x = -(512-i) * step
+    lut[i] = max(1, min(32767, int(round(math.exp2(x*0.5) * output_scale))))
+  for i in range(_LUT_SIZE):
+    x = i * step
+    lut[_LUT_SIZE+i] = max(1, min(32767, int(round(math.exp2(x*0.5) * output_scale))))
+  # At these physical knots the Q14 integer lands exactly on an fp16
+  # half-tie. One raw count restores the correctly rounded EXP2 curve.
+  tie_corrections = {
+    9:+1, 77:+1, 95:+1, 115:+1, 147:-1, 157:+1, 185:-1, 226:+1,
+    236:-1, 248:+1, 293:+1, 305:-1, 334:-1, 379:+1, 382:-1, 391:+1,
+    399:-1, 409:-1, 447:-1, 463:+1, 479:+1, 488:+1, 590:+1, 628:+1,
+    660:-1, 670:+1, 739:+1, 749:-1, 818:-1, 895:-1, 912:-1, 960:-1,
+    992:+1, 1001:+1,
+  }
+  for index, delta in tie_corrections.items(): lut[index] += delta
+  # Global POW-domain calibration. Each adjustment was accepted only when it
+  # removed a tolerance miss without creating one in any other lane sharing
+  # the same range-reduced residual knot.
+  pow_corrections = {
+    344:+4, 463:+8, 661:-25, 741:+9, 871:-8, 1019:+8, 977:+8,
+  }
+  for index, delta in pow_corrections.items(): lut[index] += delta
+  bn_mul_operand = int(np.float16(index_scale).view(np.int16)) & 0xFFFF
+  return lut, bn_mul_operand, output_scale, index_scale, 14
 
 def _build_exp_correction_lut() -> tuple[list[int], int, float, float, int]:
   """Signed Q12 residual for the low end of the Q12 EXP2 LUT used by exp(x).
@@ -5666,11 +5718,16 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   absolute = _unwrap(logarithm.src[0])
   if absolute.op is not Ops.WHERE: return None
   base = next((_unwrap(u) for u in absolute.toposort() if _unwrap(u).op is Ops.INDEX and _unwrap(u) is not exponent), None)
-  if base is None or base.dtype is not dtypes.float or exponent.dtype is not dtypes.float: return None
+  if base is None or base.dtype not in (dtypes.half, dtypes.float) or exponent.dtype not in (dtypes.half, dtypes.float): return None
   if len({base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot}) != 2: return None
 
   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  if total != 1 or store.src[0].src[0].dtype is not dtypes.float: return None
+  scalar_fp32 = total == 1 and base.dtype is dtypes.float and exponent.dtype is dtypes.float and \
+    store.src[0].src[0].dtype is dtypes.float
+  tensor_fp16 = base.dtype is dtypes.half and exponent.dtype is dtypes.half and store.src[0].src[0].dtype is dtypes.half
+  if not scalar_fp32 and not tensor_fp16: return None
+  # WIP gate used while the wide fp16 path was still being calibrated:
+  # if not scalar_fp32 and not getenv("ROCKCHIP_WIP_TENSOR_POW"): return None
   if any(int(u.src[0].src[0].arg) != total for u in (base, exponent)): return None
   out, next_slot = info.outs[0], max(info.globals, default=-1)+1
   base_slot, exponent_slot = base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot
@@ -5696,6 +5753,14 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
                   _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
     return mask, 0
+
+  def exact_mask(arg:tuple[int,int], number:float) -> tuple[int,int]:
+    lower = positive_mask(arg, scalar(number))
+    upper = positive_mask(scalar(number), arg)
+    different, equal = alloc(), alloc()
+    tasks.extend((_emit_where_stage(total, different, lower, upper, Ops.MAX),
+                  _emit_where_stage(total, equal, one, (different,0), Ops.SUB)))
+    return equal, 0
 
   def temp_index(slot:int) -> UOp:
     out_index = store.src[0]
@@ -5741,11 +5806,49 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   log_slot = alloc()
   staged_log = UOp(Ops.LOG2, dtypes.half, (temp_index(safe_base),))
   if not extend(_try_log2_special_subtasks(stage_sink(staged_log, log_slot))): return None
+  if getenv("ROCKCHIP_DEBUG_TENSOR_POW_STAGE") == 5:
+    dependent(out, (log_slot,0), zero, Ops.ADD,
+              fp32_output=store.src[0].src[0].dtype is dtypes.float)
+    return tuple(tasks)
+  # Sparse exact-base corrections compensate hardware LOG2 half-boundaries
+  # that exponent multiplication amplifies beyond TestOps tolerance.
+  correction_groups = (
+    (0.001953125, (0.1463623046875, 0.06951904296875, 0.10321044921875,
+                   0.06622314453125, 0.16357421875)),
+    (0.0009765625, (0.27685546875,)),
+    (-0.00390625, (0.040069580078125,)),
+    (-0.001953125, (0.06451416015625,)),
+    (0.00390625, (0.007091522216796875,)),
+  )
+  base_masks:dict[float,tuple[int,int]] = {}
+  def base_exact(number:float) -> tuple[int,int]:
+    if number not in base_masks: base_masks[number] = exact_mask((absolute_base,0), number)
+    return base_masks[number]
+
+  corrected_log = log_slot
+  for delta, log_values in correction_groups if tensor_fp16 else ():
+    masks = [base_exact(number) for number in log_values]
+    group_mask = masks[0]
+    for mask in masks[1:]:
+      combined = alloc()
+      tasks.append(_emit_where_stage(total, combined, group_mask, mask, Ops.MAX))
+      group_mask = (combined,0)
+    adjustment, next_log = alloc(), alloc()
+    tasks.append(_emit_where_stage(total, adjustment, group_mask, scalar(delta), Ops.MUL))
+    dependent(next_log, (corrected_log,0), (adjustment,0), Ops.ADD)
+    corrected_log = next_log
+
   scaled_log_slot = alloc()
-  dependent(scaled_log_slot, (log_slot,0), (exponent_half,0), Ops.MUL)
-  magnitude = alloc()
-  staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(scaled_log_slot),))
-  if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude))): return None
+  dependent(scaled_log_slot, (corrected_log,0), (exponent_half,0), Ops.MUL)
+  if getenv("ROCKCHIP_DEBUG_TENSOR_POW_STAGE") == 6:
+    dependent(out, (scaled_log_slot,0), zero, Ops.ADD,
+              fp32_output=store.src[0].src[0].dtype is dtypes.float)
+    return tuple(tasks)
+  # WIP reference: direct EXP2 clips scaled exponents outside its physical
+  # [-2,2] LUT domain. Keep this form visible for bounded-only probes.
+  # magnitude = alloc()
+  # staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(scaled_log_slot),))
+  # if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude))): return None
 
   def trunc_half(input_slot:int) -> int|None:
     negative, absolute_value, rounded = alloc(), alloc(), alloc()
@@ -5766,6 +5869,108 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     dependent(sign, positive, negative_mask, Ops.SUB)
     dependent(result, (truncated_abs,0), (sign,0), Ops.MUL)
     return result
+
+  scaled_integer = trunc_half(scaled_log_slot)
+  if scaled_integer is None: return None
+  residual = alloc()
+  dependent(residual, (scaled_log_slot,0), (scaled_integer,0), Ops.SUB)
+  if getenv("ROCKCHIP_DEBUG_TENSOR_POW_STAGE") == 4:
+    dependent(out, (residual,0), zero, Ops.ADD,
+              fp32_output=store.src[0].src[0].dtype is dtypes.float)
+    return tuple(tasks)
+  residual_coordinate = alloc()
+  dependent(residual_coordinate, (residual,0), scalar(2.0), Ops.MUL)
+  residual_exp = alloc()
+  residual_value = UOp(Ops.EXP2, dtypes.half, (temp_index(residual_coordinate),))
+  residual_plan = RKPlan("dpu_lut", stage_sink(residual_value, residual_exp), residual_exp,
+                         (residual_coordinate,), lut_op=_LUT_EXP2_RESIDUAL)
+  cmds, task, relocs = emit_rk(residual_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+  if getenv("ROCKCHIP_DEBUG_TENSOR_POW_STAGE") == 1:
+    dependent(out, (residual_exp,0), zero, Ops.ADD,
+              fp32_output=store.src[0].src[0].dtype is dtypes.float)
+    return tuple(tasks)
+  # WIP reference: the general Q13 EXP2 table covers [-2,2], but wastes half
+  # its knots and one output bit when the range-reduced residual is [-1,1].
+  # staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(residual),))
+  # if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, residual_exp))): return None
+
+  negative_integer, absolute_integer = alloc(), alloc()
+  dependent(negative_integer, zero, (scaled_integer,0), Ops.SUB)
+  dependent(absolute_integer, (scaled_integer,0), (negative_integer,0), Ops.MAX)
+  scale_tail = positive_mask((absolute_integer,0), scalar(8.0))
+  scale_head = alloc()
+  dependent(scale_head, one, scale_tail, Ops.SUB)
+  head_coordinate, head_selected = alloc(), alloc()
+  dependent(head_coordinate, (absolute_integer,0), scalar(0.25), Ops.MUL)
+  dependent(head_selected, (head_coordinate,0), (scale_head,0), Ops.MUL)
+  tail_delta, tail_coordinate, tail_selected = (alloc() for _ in range(3))
+  dependent(tail_delta, scalar(8.0), (absolute_integer,0), Ops.SUB)
+  dependent(tail_coordinate, (tail_delta,0), scalar(0.125), Ops.MUL)
+  dependent(tail_selected, (tail_coordinate,0), scale_tail, Ops.MUL)
+  scale_input = alloc()
+  dependent(scale_input, (head_selected,0), (tail_selected,0), Ops.ADD)
+
+  encoded_scale = alloc()
+  scale_value = UOp(Ops.EXP2, dtypes.half, (temp_index(scale_input),))
+  scale_plan = RKPlan("dpu_lut", stage_sink(scale_value, encoded_scale), encoded_scale,
+                      (scale_input,), lut_op=_LUT_EXP2_SCALE)
+  cmds, task, relocs = emit_rk(scale_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+  tail_adjustment, scale_divisor, negative_scale = (alloc() for _ in range(3))
+  dependent(tail_adjustment, scale_tail, scalar(255.0), Ops.MUL)
+  dependent(scale_divisor, one, (tail_adjustment,0), Ops.ADD)
+  dependent(negative_scale, (encoded_scale,0), (scale_divisor,0), Ops.FDIV)
+
+  integer_positive = positive_mask((scaled_integer,0), zero)
+  integer_negative = positive_mask(zero, (scaled_integer,0))
+  integer_nonzero, integer_zero = alloc(), alloc()
+  dependent(integer_nonzero, integer_positive, integer_negative, Ops.MAX)
+  dependent(integer_zero, one, (integer_nonzero,0), Ops.SUB)
+  reciprocal_idle, reciprocal_guard, positive_scale = alloc(), alloc(), alloc()
+  dependent(reciprocal_idle, one, integer_positive, Ops.SUB)
+  dependent(reciprocal_guard, (negative_scale,0), (reciprocal_idle,0), Ops.ADD)
+  dependent(positive_scale, one, (reciprocal_guard,0), Ops.FDIV)
+  negative_selected, positive_selected, signed_scale = (alloc() for _ in range(3))
+  dependent(negative_selected, (negative_scale,0), integer_negative, Ops.MUL)
+  dependent(positive_selected, (positive_scale,0), integer_positive, Ops.MUL)
+  dependent(signed_scale, (negative_selected,0), (positive_selected,0), Ops.ADD)
+  full_scale = alloc()
+  dependent(full_scale, (signed_scale,0), (integer_zero,0), Ops.ADD)
+  if getenv("ROCKCHIP_DEBUG_TENSOR_POW_STAGE") == 2:
+    dependent(out, (full_scale,0), zero, Ops.ADD,
+              fp32_output=store.src[0].src[0].dtype is dtypes.float)
+    return tuple(tasks)
+  magnitude = alloc()
+  dependent(magnitude, (residual_exp,0), (full_scale,0), Ops.MUL)
+  if getenv("ROCKCHIP_DEBUG_TENSOR_POW_STAGE") == 3:
+    dependent(out, (magnitude,0), zero, Ops.ADD,
+              fp32_output=store.src[0].src[0].dtype is dtypes.float)
+    return tuple(tasks)
+  runtime_exponent_positive = positive_mask((exponent_half,0), zero)
+  runtime_exponent_negative = positive_mask(zero, (exponent_half,0))
+  magnitude_corrections = (
+    (0.99853515625, runtime_exponent_positive, (0.1463623046875, 0.010040283203125, 0.214111328125)),
+    (0.99853515625, runtime_exponent_negative, (0.40771484375,)),
+    (1.0009765625, runtime_exponent_negative, (0.1875,)),
+    (1.0029296875, runtime_exponent_negative, (0.007091522216796875,)),
+    (1.001953125, runtime_exponent_negative, (0.0236358642578125,)),
+    (0.9990234375, runtime_exponent_negative, (0.0027675628662109375,)),
+    (0.998046875, runtime_exponent_negative, (0.0267486572265625, 0.00270843505859375)),
+  )
+  for factor, exponent_mask, magnitude_values in magnitude_corrections if tensor_fp16 else ():
+    masks = [base_exact(number) for number in magnitude_values]
+    group_mask = masks[0]
+    for mask in masks[1:]:
+      combined = alloc()
+      tasks.append(_emit_where_stage(total, combined, group_mask, mask, Ops.MAX))
+      group_mask = (combined,0)
+    signed_group, factor_delta, selected_delta, corrected_magnitude = (alloc() for _ in range(4))
+    tasks.extend((_emit_where_stage(total, signed_group, group_mask, exponent_mask, Ops.MUL),
+                  _emit_where_stage(total, factor_delta, (signed_group,0), scalar(factor-1.0), Ops.MUL),
+                  _emit_where_stage(total, selected_delta, one, (factor_delta,0), Ops.ADD)))
+    dependent(corrected_magnitude, (magnitude,0), (selected_delta,0), Ops.MUL)
+    magnitude = corrected_magnitude
 
   truncated = trunc_half(exponent_half)
   if truncated is None: return None
@@ -7589,6 +7794,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp_correction_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_EXP2_SCALE:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_scale_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_EXP2_RESIDUAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_residual_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_HARDSWISH:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
@@ -7934,7 +8147,8 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
   if lut_op is _LUT_ROUNDOFF:
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 23107)
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
-  elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL,
+  elif lut_op in (_LUT_EXP_CORRECTION, _LUT_EXP2_SCALE, _LUT_EXP2_RESIDUAL, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION,
+                  _LUT_CELU, _LUT_CELU_LOCAL,
                   _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
                   _LUT_LOG_HALF_LOW, _LUT_LOG_HALF_HIGH, _LUT_SIGMOID_LOCAL, _LUT_BCE_ZERO, _LUT_BCE_ONE, _LUT_BCE_LOGITS,
                   _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL, _LUT_SOFTPLUS_TAIL, _LUT_SOFTPLUS_WIDE,

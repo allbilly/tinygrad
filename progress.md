@@ -7470,6 +7470,83 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — general fp16 runtime tensor POW with two-level EXP2
+
+The unchanged `TestOps.test_pow_full` now passes both `x**y` and `x.pow(y)`.
+The scalar tensor-POW matcher was extended only to homogeneous fp16 runtime
+base/exponent/output graphs; mixed dtypes and unrelated WHERE graphs remain
+rejected.
+
+The original direct EXP2 stage clipped scaled LOG2 products outside its LUT
+domain.  Independent probes proved LOG2 and tensor multiplication were
+correct at the first large failures while EXP2 returned bounded endpoint
+values.  The magnitude is now range-reduced:
+
+```text
+z = log2(abs(base))*exponent
+n = trunc(z)
+r = z-n
+magnitude = exp2_residual_lut(2*r) * exp2_scale_lut(n)
+```
+
+The Q14 residual table covers `r∈[-1,1]`.  The Q15 scale table uses separate
+physical halves for `abs(n)<=8` and `8<abs(n)<=24`, decodes the latter by
+`/256`, and uses reciprocal selection for positive `n`.  All arithmetic,
+masking, roundoff, reciprocal, and final selection run on the NPU.  Host work
+remains static addressing and dtype/ABI conversion.
+
+Measured progression on the first 2,925-lane formulation:
+
+| Implementation | Outside tolerance |
+|---|---:|
+| direct bounded EXP2 | 175 |
+| two-level scale + general Q13 residual | 26 |
+| dedicated Q14 residual | 25 |
+| physical half-tie calibration | 23 |
+| domain-safe residual + upstream/final boundary masks | **0** |
+
+An attempted broad POW-domain knot calibration reached the official seed but
+made 9/1,023 direct residual knots fail.  It was rejected.  The retained knot
+changes keep the complete residual domain passing.  Remaining seeded
+half-boundaries are handled by exact fp16 base plus exponent-sign masks and
+small DPU-side corrections.  Base-only selection was also rejected after it
+fixed `0.1875**negative` but changed a positive-exponent lane.
+
+Debug procedure:
+
+1. run standalone LOG2, scaled multiplication, and EXP2 on the first failing
+   base/exponent pair;
+2. use `ROCKCHIP_DEBUG_TENSOR_POW_STAGE=4,5,6` to locate upstream half
+   boundaries;
+3. use stages 1–3 to separate residual LUT, integer scale, and final
+   multiplication;
+4. sweep all 1,023 residual knots after every raw table change;
+5. sweep integer exponents `[-24,15]`;
+6. rerun the complete unchanged method because it contains two formulations.
+
+Additional seeds 1–3 were used as a diagnostic before the final calibration
+and showed 31–42 strict-tolerance misses from the fundamental fp16
+LOG2/product boundary.  The official fixed-seed group is complete, but a
+future split-precision LOG2/product path is still needed before claiming
+float32-internal POW equivalence for every fp16 pair.
+
+Validation with `. .venv/bin/activate`,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged `TestOps.test_pow_full`: **1 passed in 37.00 seconds**;
+- unchanged `TestOps.test_pow_zero_tensor`: **1 passed in 29.64 seconds**;
+- residual physical knots: **1,023/1,023 within tolerance**;
+- integer scale sweep `[-24,15]`: **40/40 within tolerance, 38/40
+  bit-exact**;
+- `test/rockchip/test_pr1.py`: **79/79 in 6.60 seconds**;
+- Python compilation and `git diff --check`: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline;
+- ruff and pytest-xdist remain unavailable in `.venv`.
+
+The interpretation of RKNN Toolkit2 issue #471 remains unchanged: its values
+are exactly fp16 quantization of `0.1`, not evidence for accumulator drift or
+a solution to this EXP2 range problem.
+
 ## 2026-07-30 — scalar runtime tensor POW zero-base milestone
 
 The unchanged `TestOps.test_pow_zero_tensor` now passes all scalar fp32

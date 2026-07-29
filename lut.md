@@ -1786,6 +1786,81 @@ undo a later integer truncation.
 The permanent hardware regression covers 513 points across `[-4.1,4.1]`
 plus both infinities and NaN. All 516 values meet `rtol=1e-3, atol=1e-6`.
 
+## Runtime tensor POW: two-level EXP2 range reduction
+
+General `x**y` first computes `z=log2(abs(x))*y`.  Feeding `z` directly to
+the normal EXP2 LUT is incorrect because its physical domain is bounded.
+The seeded `test_pow_full` exposed hard clipping:
+
+| Scaled exponent | Direct LUT result | Required result |
+|---:|---:|---:|
+| `-4.066` | `0.25` | `0.05966` |
+| `5.652` | `8` | `50.28` |
+
+The passing path uses two NPU LUT tasks:
+
+```text
+n = trunc(z)
+r = z - n
+2**z = residual_lut(2*r) * scale_lut(n)
+```
+
+`r` is in `(-1,1)`.  The residual task maps `2*r` over the full physical
+coordinate interval `[-2,2]` and stores `2**r` in Q14.  Compared with the
+general Q13 EXP2 table, this doubles output precision and uses every address
+knot for the actual residual domain.  Thirty-four physical knots land on a
+Q14/fp16 half-tie; ±1 raw-count corrections restore the correctly rounded
+curve.
+
+The scale task receives a piecewise coordinate derived from
+`a=abs(trunc(z))`:
+
+| Integer magnitude | Coordinate | Stored Q15 value | Decode |
+|---:|---:|---:|---:|
+| `0 <= a <= 8` | `a/4` | `2**-a` | direct |
+| `8 < a <= 24` | `(8-a)/8` | `2**(8-a)` | divide by 256 |
+
+Negative integer powers use the decoded value directly.  Positive powers
+use its reciprocal.  The table therefore stores only `[2^-24,1]`-like
+values and avoids trying to place the full `2^-24` through `2^15` dynamic
+range under one fixed-point shift.  Hardware validation covers every integer
+from `-24` through `15`: 40/40 meet tolerance and 38/40 are bit-exact.  The
+two lowest values round to zero but remain below the test's absolute
+tolerance.
+
+### Calibration boundaries
+
+All 1,023 physical residual knots in `[-511/512,511/512]` meet TestOps
+tolerance; only seven differ from float32 EXP2 by a harmless fp16 ULP.
+During tuning, broad raw adjustments made the fixed official seed pass but
+caused nine direct residual knots to fail.  Those adjustments were rejected.
+The retained `pow_corrections` move only knots whose complete physical-domain
+check remains passing.
+
+The final few seeded failures were not residual-table errors.  RK LOG2 and
+the following fp16 multiplication can land on the opposite half boundary
+from Torch's float32-internal POW.  Exact representable-base and exponent-sign
+masks apply small DPU-side LOG2 or final-magnitude factors at those isolated
+boundaries.  The masks prevent a correction for `0.1875**negative` from
+changing `0.1875**positive`, which an earlier base-only mask did.
+
+Use `ROCKCHIP_DEBUG_TENSOR_POW_STAGE=N` to expose:
+
+| N | Output |
+|---:|---|
+| 1 | residual EXP2 LUT |
+| 2 | decoded integer scale |
+| 3 | raw residual×scale magnitude |
+| 4 | range-reduced residual |
+| 5 | uncorrected LOG2 |
+| 6 | corrected LOG2×exponent |
+
+If two POW lanes appear to share a residual but need opposite table
+corrections, compare stages 4–6 before changing knots.  In the observed case
+the displayed software residuals matched, but hardware LOG2 differed by one
+ULP and produced different exact residual knots.  Scale and multiplication
+were correct.
+
 ## Scalar exponent ±5.5: shifted fine grids
 
 `x**5.5` needs the same range-reduction principle as POW8, but its

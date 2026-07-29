@@ -1293,6 +1293,32 @@ and final NPU masks restore zero-base positive, zero, and negative-exponent
 semantics.  Typed output conversion is attached only to the logical output,
 not the duplicated visibility scratch.
 
-General fp16 `test_pow_full` remains a separate accuracy failure, and
-`TestOps.test_pow` retains its pre-existing final dtype mismatch.  Detailed
-failure counts, matcher boundaries, and debugging steps are in `progress.md`.
+General fp16 `test_pow_full` was tracked as a separate accuracy group and is
+completed in the following milestone. `TestOps.test_pow` retains its
+pre-existing final dtype mismatch. Detailed failure counts, matcher
+boundaries, and debugging steps are in `progress.md`.
+
+### General fp16 runtime tensor POW milestone
+
+| Coverage | Result |
+|---|---:|
+| `x**y`, `(45,65)` fp16 runtime tensors | **passing** |
+| `x.pow(y)`, same inputs | **passing** |
+| unchanged `test_pow_full` | **1 passed in 37.00s** |
+| residual LUT physical knots | **1,023/1,023** |
+| integer scales `[-24,15]` | **40/40** |
+| scalar fp32 zero-base regression | **1 passed in 29.64s** |
+| hardware-free PR1 contract | **79/79 in 6.60s** |
+
+General runtime tensor POW now range-reduces the scaled LOG2 result and uses
+two EXP2 LUT tasks: a Q14 residual curve over `[-1,1]` and a Q15 split-range
+integer scale.  DPU masks decode negative scales directly, reciprocate for
+positive scales, restore negative-base parity, and synthesize invalid-domain
+NaN and zero-base infinity rules.  No operator arithmetic uses `run_host`.
+
+The direct shared-knot overfit was rejected because it broke 9/1,023 physical
+residual points.  Retained calibration preserves the whole LUT domain, and
+exact base/exponent-sign masks handle the fixed-seed fp16 boundaries.
+Non-official random seeds still expose the broader fp16-versus-float32
+internal POW precision gap; this is documented as future split-precision
+work rather than claimed complete.
