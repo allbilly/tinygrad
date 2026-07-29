@@ -5,7 +5,7 @@
 from __future__ import annotations
 import struct, math, numpy as np
 from dataclasses import dataclass, replace
-from tinygrad.dtype import dtypes, DType
+from tinygrad.dtype import dtypes, DType, Invalid
 from tinygrad.helpers import ceildiv, round_up, prod, getenv
 from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
@@ -167,6 +167,7 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
 _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
 _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
 _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
+_HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
 
 def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
@@ -5233,6 +5234,73 @@ def _try_bitwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  raw = store.src[1]
+  if raw.op not in (Ops.INDEX, Ops.WHERE): return None
+  if store.src[0].dtype != raw.dtype: return None
+
+  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+  range_ids = {u:i for i,u in enumerate(ranges)}
+  extents = tuple(int(u.src[0].arg) for u in ranges)
+  total = prod(extents)
+  if total != prod(_shape_of_store(sink)): return None
+  input_slots:list[int] = []
+  int_codes = {Ops.ADD:2, Ops.MUL:3, Ops.FLOORDIV:4, Ops.FLOORMOD:5,
+               Ops.CMPLT:6, Ops.CMPNE:7, Ops.AND:8, Ops.OR:9}
+
+  def input_id(slot:int) -> int:
+    if slot not in input_slots: input_slots.append(slot)
+    return input_slots.index(slot)
+
+  def emit_int(u:UOp, code:list[int]) -> bool:
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.CONST:
+      if u.arg is Invalid:
+        code.extend((0, 0))
+        return True
+      try: value = int(u.arg)
+      except (TypeError, ValueError): return False
+      code.extend((0, value))
+      return True
+    if u.op is Ops.RANGE and u in range_ids:
+      code.extend((1, range_ids[u]))
+      return True
+    if u.op in int_codes and len(u.src) == 2:
+      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code): return False
+      code.extend((int_codes[u.op], 0))
+      return True
+    if u.op is Ops.WHERE and len(u.src) == 3:
+      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code) or not emit_int(u.src[2], code): return False
+      code.extend((11, 0))
+      return True
+    return False
+
+  def emit_value(u:UOp, code:list[int]) -> bool:
+    if u.op is Ops.INDEX and u.dtype == raw.dtype:
+      if not emit_int(u.src[1], code): return False
+      code.extend((10, input_id(u.src[0].buf_uop.arg.slot)))
+      return True
+    if u.op is Ops.WHERE and u.dtype == raw.dtype:
+      if not emit_int(u.src[0], code) or not emit_value(u.src[1], code) or not emit_value(u.src[2], code): return False
+      code.extend((11, 0))
+      return True
+    return False
+
+  out_code:list[int] = []
+  value_code:list[int] = []
+  if not emit_int(store.src[0].src[1], out_code) or not emit_value(raw, value_code): return None
+  info = ProgramInfo.from_sink(sink)
+  out_slot = info.outs[0]
+  layout = (total, _HOST_MOVEMENT_LAYOUT, raw.dtype.itemsize, len(extents), *extents,
+            len(out_code), *out_code, len(value_code), *value_code)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
+  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
+
 def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Detect binary EW with broadcast operand(s) and emit pre-expansion copy + EW tasks.
   Either or both operands may have broadcast dimensions (missing RANGE vars vs store).
@@ -5543,6 +5611,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)

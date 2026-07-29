@@ -4877,6 +4877,63 @@ baseline, and the classifier test at 68 passed with its four stale rejection
 expectations. `rockchip-fill-constant-fe76debd7.patch` is the standalone patch
 against parent `fe76debd7`.
 
+## 2026-07-29 — refreshed full TestOps census
+
+At commit `a864e9519`, the serial forward-only census completed in **918.42
+seconds: 182 passed, 333 failed, 8 skipped, and 27 subtests passed**. Pytest
+collects 424 test functions; failing unittest subtests are included separately
+in the reported failure total. This replaces the stale 140-passing census and
+confirms that the fixed bitwise cluster remains green in suite order.
+
+The remaining red methods are predominantly convolution/pooling/layout,
+reductions, indexing/movement, WHERE composites, and dtype boundary cases.
+The next focused group is tensor creation (`zeros`, `ones`, `full`, and their
+`*_like` variants), selected because it is small and the underlying fill
+metadata is now proven by the 70/70 hardware regression.
+
+The creation check passed `full`, `full_like`, `zeros_like`, and `ones_like`.
+Bare `zeros` and `ones` contain correct values but fail only their dtype
+assertion: the requested `DEFAULT_FLOAT=HALF` makes tinygrad's default fp16,
+whereas those two test references directly call Torch without selecting half
+and therefore expect float32. This is tracked as a test-policy mismatch rather
+than changing global tinygrad default-dtype semantics inside a backend fix.
+
+## 2026-07-29 — exact indexed movement milestone
+
+The unchanged movement methods now pass **6/6 in 12.86 seconds**:
+
+```text
+test_roll, test_cat, test_multicat,
+test_repeat, test_repeat_interleave, test_simple_repeat
+```
+
+The previous generic `STORE(INDEX)` classification marked non-contiguous views
+as copy tasks, but the all-host runtime implemented an unconditionally linear
+`memmove`. It therefore ignored `FLOORMOD` for roll, `FLOORDIV` for
+repeat-interleave, split loop ranges for repeat, and nested WHERE selection for
+cat.
+
+`_try_movement_host_subtasks` now accepts only pure INDEX/WHERE movement and
+serializes its integer index expressions as compact postfix programs. The
+supported instructions are constants, loop ranges, ADD, MUL, FLOORDIV,
+FLOORMOD, CMPLT, CMPNE, AND, OR, WHERE, and a source-buffer reference. At
+runtime, the Cartesian loop coordinates are evaluated into both the physical
+output index and a `(source, physical input index)` pair; the element bytes are
+then copied exactly. Dtype arithmetic is never performed.
+
+Zero-sized cat inputs produce guarded index expressions whose unused branch is
+the `Invalid` sentinel. The compiler encodes that sentinel as a harmless zero
+index: postfix WHERE selects only a source/index pair, so an unselected branch
+is never dereferenced. This completed the last `test_cat` subcase.
+
+The older specialized cat, broadcast, pad, and linear-copy implementations
+remain in the source for reference and for patterns outside the strict
+movement recognizer. The complete hardware regression remains **70/70 passing
+in 206.86 seconds**. Mypy remains at 13 pre-existing findings, targeted Ruff at
+five, and the classifier test at 68 passing plus four stale rejection
+expectations. `rockchip-indexed-movement-a864e9519.patch` is the standalone
+patch against parent `a864e9519`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

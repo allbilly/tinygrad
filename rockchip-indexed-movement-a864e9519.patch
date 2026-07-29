@@ -1,0 +1,312 @@
+diff --git a/progress.md b/progress.md
+index d74304a53..f39d92aa3 100644
+--- a/progress.md
++++ b/progress.md
+@@ -4877,6 +4877,63 @@ baseline, and the classifier test at 68 passed with its four stale rejection
+ expectations. `rockchip-fill-constant-fe76debd7.patch` is the standalone patch
+ against parent `fe76debd7`.
+ 
++## 2026-07-29 — refreshed full TestOps census
++
++At commit `a864e9519`, the serial forward-only census completed in **918.42
++seconds: 182 passed, 333 failed, 8 skipped, and 27 subtests passed**. Pytest
++collects 424 test functions; failing unittest subtests are included separately
++in the reported failure total. This replaces the stale 140-passing census and
++confirms that the fixed bitwise cluster remains green in suite order.
++
++The remaining red methods are predominantly convolution/pooling/layout,
++reductions, indexing/movement, WHERE composites, and dtype boundary cases.
++The next focused group is tensor creation (`zeros`, `ones`, `full`, and their
++`*_like` variants), selected because it is small and the underlying fill
++metadata is now proven by the 70/70 hardware regression.
++
++The creation check passed `full`, `full_like`, `zeros_like`, and `ones_like`.
++Bare `zeros` and `ones` contain correct values but fail only their dtype
++assertion: the requested `DEFAULT_FLOAT=HALF` makes tinygrad's default fp16,
++whereas those two test references directly call Torch without selecting half
++and therefore expect float32. This is tracked as a test-policy mismatch rather
++than changing global tinygrad default-dtype semantics inside a backend fix.
++
++## 2026-07-29 — exact indexed movement milestone
++
++The unchanged movement methods now pass **6/6 in 12.86 seconds**:
++
++```text
++test_roll, test_cat, test_multicat,
++test_repeat, test_repeat_interleave, test_simple_repeat
++```
++
++The previous generic `STORE(INDEX)` classification marked non-contiguous views
++as copy tasks, but the all-host runtime implemented an unconditionally linear
++`memmove`. It therefore ignored `FLOORMOD` for roll, `FLOORDIV` for
++repeat-interleave, split loop ranges for repeat, and nested WHERE selection for
++cat.
++
++`_try_movement_host_subtasks` now accepts only pure INDEX/WHERE movement and
++serializes its integer index expressions as compact postfix programs. The
++supported instructions are constants, loop ranges, ADD, MUL, FLOORDIV,
++FLOORMOD, CMPLT, CMPNE, AND, OR, WHERE, and a source-buffer reference. At
++runtime, the Cartesian loop coordinates are evaluated into both the physical
++output index and a `(source, physical input index)` pair; the element bytes are
++then copied exactly. Dtype arithmetic is never performed.
++
++Zero-sized cat inputs produce guarded index expressions whose unused branch is
++the `Invalid` sentinel. The compiler encodes that sentinel as a harmless zero
++index: postfix WHERE selects only a source/index pair, so an unselected branch
++is never dereferenced. This completed the last `test_cat` subcase.
++
++The older specialized cat, broadcast, pad, and linear-copy implementations
++remain in the source for reference and for patterns outside the strict
++movement recognizer. The complete hardware regression remains **70/70 passing
++in 206.86 seconds**. Mypy remains at 13 pre-existing findings, targeted Ruff at
++five, and the classifier test at 68 passing plus four stale rejection
++expectations. `rockchip-indexed-movement-a864e9519.patch` is the standalone
++patch against parent `a864e9519`.
++
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 95e05b20c..946d231ac 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1,13 +1,13 @@
+ # test_ops.py Status — Rockchip NPU Backend
+ 
+-**Last focused run:** 2026-07-29 (parent `690de0764` + tangent working tree)
++**Last complete census:** 2026-07-29 (commit `a864e9519`)
+ **Command:** `PYTHONPATH=. DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 .venv/bin/python -m pytest test/backend/test_ops.py -q --tb=line`
+ 
+-The run completed in 586.59 seconds. Ordinary and extreme tanh pass in focused
+-and full-suite execution. The aggregate count is unchanged from the prior
+-single-process census because NPU state/order changes which otherwise-green
+-method fails; use the method list, not only the aggregate, when measuring a
+-milestone.
++The fresh serial census completed in **918.42 seconds: 182 passed, 333 failed,
++8 skipped, and 27 subtests passed**. Pytest still collects 424 test functions;
++its failed count also includes failing unittest subtests. This supersedes the
++older 140-passing census below. The dedicated Rockchip hardware regression is
++separately **70/70 passing in 207.22 seconds**.
+ 
+ **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
+ including its float32 infinity/NaN subcase. The summary table below remains the
+@@ -71,13 +71,17 @@ Those final fill failures are now fixed: `_emit_dpu` propagates the constant
+ into `RKTask.const_val` instead of leaving the default `1.0`. The focused fill
+ group passes 4/4, and the complete hardware regression is **70/70 passing in
+ 207.22 seconds**.
++Post-census, exact indexed movement passes **6/6 in 12.86 seconds**: roll, cat,
++multicat, repeat, repeat-interleave, and simple-repeat. A strict host task
++evaluates the lowered integer index/WHERE program and copies raw element bytes.
++The complete hardware regression remains **70/70 passing in 206.86 seconds**.
+ 
+ ## Summary
+ 
+ | Status | Count |
+ |--------|-------|
+-| **Passed** | 140 |
+-| **Failed** | 276 test functions + 99 subtests = 375 total |
++| **Passed** | 182 |
++| **Failed** | 333 reported failures, including failing subtests |
+ | **Skipped** | 8 |
+ | **Subtests passed** | 27 |
+ | **Total test functions** | 424 |
+@@ -149,6 +153,11 @@ fp32 output dtype mismatch, int operations.
+ ### 10. Other — ~20 tests
+ test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stack, test_sort, test_topk, test_tril, test_triu, test_nonzero, test_gather, test_fancy_indexing*, etc.
+ 
++Post-census update: repeat, simple-repeat, repeat-interleave, roll, cat, and
++multicat are fixed by exact indexed movement. Meshgrid and scalar stack still
++have the same `DEFAULT_FLOAT=HALF` versus hardcoded Torch/NumPy float32 policy
++mismatch; stack+max remains a compute/reduction case.
++
+ ## Low-Hanging Fruit (ordered by effort/impact)
+ 
+ | Error | Count | Effort | Impact | Notes |
+@@ -181,6 +190,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are
+ - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
+ - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
+ - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
++- indexed movement for roll, cat/multicat, repeat, and repeat-interleave
+ - log2, including exact power-of-four normalization and near-one precision
+ - natural log and log10, including range reduction and IEEE special values
+ - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index c42c1a5c9..3478c5bb9 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -17,7 +17,7 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.runtime.support.rockchip import (build_native_program,
+   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
+-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT)
++  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT)
+ 
+ # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
+ def _pad_a(src, dst, M, K, align_in):
+@@ -143,6 +143,53 @@ def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
+       ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_int32))[i] = result if result < 1 << 31 else result-(1 << 32)
+     else: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint32))[i] = result
+ 
++def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Execute a compact postfix integer-index program and copy exact element bytes."""
++  total, tag, itemsize, n_ranges, *meta = task.layout
++  assert tag == _HOST_MOVEMENT_LAYOUT
++  extents = meta[:n_ranges]
++  cursor = n_ranges
++  out_n = meta[cursor]
++  out_code = meta[cursor+1:cursor+1+out_n]
++  cursor += out_n+1
++  value_n = meta[cursor]
++  value_code = meta[cursor+1:cursor+1+value_n]
++  inputs = [bufs[r.globals_slot] for r in relocs[1:]]
++  output = bufs[relocs[0].globals_slot]
++
++  def evaluate(code, coords):
++    stack:list = []
++    for pos in range(0, len(code), 2):
++      op, arg = code[pos], code[pos+1]
++      if op == 0: stack.append(arg)
++      elif op == 1: stack.append(coords[arg])
++      elif op == 10: stack.append((arg, stack.pop()))
++      elif op == 11:
++        false, true, cond = stack.pop(), stack.pop(), stack.pop()
++        stack.append(true if cond else false)
++      else:
++        rhs, lhs = stack.pop(), stack.pop()
++        if op == 2: stack.append(lhs + rhs)
++        elif op == 3: stack.append(lhs * rhs)
++        elif op == 4: stack.append(lhs // rhs)
++        elif op == 5: stack.append(lhs % rhs)
++        elif op == 6: stack.append(int(lhs < rhs))
++        elif op == 7: stack.append(int(lhs != rhs))
++        elif op == 8: stack.append(int(bool(lhs) and bool(rhs)))
++        elif op == 9: stack.append(int(bool(lhs) or bool(rhs)))
++        else: raise RuntimeError(f"rk: invalid host movement opcode {op}")
++    assert len(stack) == 1
++    return stack[0]
++
++  for linear in range(total):
++    rem, coords = linear, [0] * n_ranges
++    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
++    out_index = evaluate(out_code, coords)
++    input_id, in_index = evaluate(value_code, coords)
++    if not (0 <= out_index < output.size // itemsize and 0 <= in_index < inputs[input_id].size // itemsize):
++      raise RuntimeError(f"rk: host movement index out of bounds out={out_index} in={in_index}")
++    ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
++
+ class RockchipProgram(Program['RockchipDevice']):
+   cmds: list[int]
+   task: RKTask
+@@ -390,6 +437,9 @@ class RockchipProgram(Program['RockchipDevice']):
+     if all(st.task.is_copy or st.task.is_fill for st in subtasks):
+       for st in subtasks:
+         task = st.task
++        if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
++          _run_host_movement(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+           _run_host_bitwise(task, st.relocs, bufs)
+           continue
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index a79e0c530..4f0bb4ebf 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -5,7 +5,7 @@
+ from __future__ import annotations
+ import struct, math, numpy as np
+ from dataclasses import dataclass, replace
+-from tinygrad.dtype import dtypes, DType
++from tinygrad.dtype import dtypes, DType, Invalid
+ from tinygrad.helpers import ceildiv, round_up, prod, getenv
+ from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
+ from tinygrad.runtime.autogen import rockchip as rk
+@@ -167,6 +167,7 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
+ _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
+ _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
+ _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
++_HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
+ 
+ def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
+   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
+@@ -5233,6 +5234,73 @@ def _try_bitwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
++def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  raw = store.src[1]
++  if raw.op not in (Ops.INDEX, Ops.WHERE): return None
++  if store.src[0].dtype != raw.dtype: return None
++
++  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
++  range_ids = {u:i for i,u in enumerate(ranges)}
++  extents = tuple(int(u.src[0].arg) for u in ranges)
++  total = prod(extents)
++  if total != prod(_shape_of_store(sink)): return None
++  input_slots:list[int] = []
++  int_codes = {Ops.ADD:2, Ops.MUL:3, Ops.FLOORDIV:4, Ops.FLOORMOD:5,
++               Ops.CMPLT:6, Ops.CMPNE:7, Ops.AND:8, Ops.OR:9}
++
++  def input_id(slot:int) -> int:
++    if slot not in input_slots: input_slots.append(slot)
++    return input_slots.index(slot)
++
++  def emit_int(u:UOp, code:list[int]) -> bool:
++    while u.op is Ops.CAST: u = u.src[0]
++    if u.op is Ops.CONST:
++      if u.arg is Invalid:
++        code.extend((0, 0))
++        return True
++      try: value = int(u.arg)
++      except (TypeError, ValueError): return False
++      code.extend((0, value))
++      return True
++    if u.op is Ops.RANGE and u in range_ids:
++      code.extend((1, range_ids[u]))
++      return True
++    if u.op in int_codes and len(u.src) == 2:
++      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code): return False
++      code.extend((int_codes[u.op], 0))
++      return True
++    if u.op is Ops.WHERE and len(u.src) == 3:
++      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code) or not emit_int(u.src[2], code): return False
++      code.extend((11, 0))
++      return True
++    return False
++
++  def emit_value(u:UOp, code:list[int]) -> bool:
++    if u.op is Ops.INDEX and u.dtype == raw.dtype:
++      if not emit_int(u.src[1], code): return False
++      code.extend((10, input_id(u.src[0].buf_uop.arg.slot)))
++      return True
++    if u.op is Ops.WHERE and u.dtype == raw.dtype:
++      if not emit_int(u.src[0], code) or not emit_value(u.src[1], code) or not emit_value(u.src[2], code): return False
++      code.extend((11, 0))
++      return True
++    return False
++
++  out_code:list[int] = []
++  value_code:list[int] = []
++  if not emit_int(store.src[0].src[1], out_code) or not emit_value(raw, value_code): return None
++  info = ProgramInfo.from_sink(sink)
++  out_slot = info.outs[0]
++  layout = (total, _HOST_MOVEMENT_LAYOUT, raw.dtype.itemsize, len(extents), *extents,
++            len(out_code), *out_code, len(value_code), *value_code)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
++  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
++  return (RKSubTask(cmds, task, relocs),)
++
+ def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Detect binary EW with broadcast operand(s) and emit pre-expansion copy + EW tasks.
+   Either or both operands may have broadcast dimensions (missing RANGE vars vs store).
+@@ -5543,6 +5611,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
+   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
+   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
++  if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
+   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
+   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
+   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)

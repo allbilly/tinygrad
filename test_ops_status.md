@@ -1,13 +1,13 @@
 # test_ops.py Status — Rockchip NPU Backend
 
-**Last focused run:** 2026-07-29 (parent `690de0764` + tangent working tree)
+**Last complete census:** 2026-07-29 (commit `a864e9519`)
 **Command:** `PYTHONPATH=. DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 .venv/bin/python -m pytest test/backend/test_ops.py -q --tb=line`
 
-The run completed in 586.59 seconds. Ordinary and extreme tanh pass in focused
-and full-suite execution. The aggregate count is unchanged from the prior
-single-process census because NPU state/order changes which otherwise-green
-method fails; use the method list, not only the aggregate, when measuring a
-milestone.
+The fresh serial census completed in **918.42 seconds: 182 passed, 333 failed,
+8 skipped, and 27 subtests passed**. Pytest still collects 424 test functions;
+its failed count also includes failing unittest subtests. This supersedes the
+older 140-passing census below. The dedicated Rockchip hardware regression is
+separately **70/70 passing in 207.22 seconds**.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -71,13 +71,17 @@ Those final fill failures are now fixed: `_emit_dpu` propagates the constant
 into `RKTask.const_val` instead of leaving the default `1.0`. The focused fill
 group passes 4/4, and the complete hardware regression is **70/70 passing in
 207.22 seconds**.
+Post-census, exact indexed movement passes **6/6 in 12.86 seconds**: roll, cat,
+multicat, repeat, repeat-interleave, and simple-repeat. A strict host task
+evaluates the lowered integer index/WHERE program and copies raw element bytes.
+The complete hardware regression remains **70/70 passing in 206.86 seconds**.
 
 ## Summary
 
 | Status | Count |
 |--------|-------|
-| **Passed** | 140 |
-| **Failed** | 276 test functions + 99 subtests = 375 total |
+| **Passed** | 182 |
+| **Failed** | 333 reported failures, including failing subtests |
 | **Skipped** | 8 |
 | **Subtests passed** | 27 |
 | **Total test functions** | 424 |
@@ -149,6 +153,11 @@ fp32 output dtype mismatch, int operations.
 ### 10. Other — ~20 tests
 test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stack, test_sort, test_topk, test_tril, test_triu, test_nonzero, test_gather, test_fancy_indexing*, etc.
 
+Post-census update: repeat, simple-repeat, repeat-interleave, roll, cat, and
+multicat are fixed by exact indexed movement. Meshgrid and scalar stack still
+have the same `DEFAULT_FLOAT=HALF` versus hardcoded Torch/NumPy float32 policy
+mismatch; stack+max remains a compute/reduction case.
+
 ## Low-Hanging Fruit (ordered by effort/impact)
 
 | Error | Count | Effort | Impact | Notes |
@@ -181,6 +190,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
+- indexed movement for roll, cat/multicat, repeat, and repeat-interleave
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values

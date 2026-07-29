@@ -17,7 +17,7 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT)
+  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -142,6 +142,53 @@ def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
     elif out_dtype == 0:
       ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_int32))[i] = result if result < 1 << 31 else result-(1 << 32)
     else: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint32))[i] = result
+
+def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Execute a compact postfix integer-index program and copy exact element bytes."""
+  total, tag, itemsize, n_ranges, *meta = task.layout
+  assert tag == _HOST_MOVEMENT_LAYOUT
+  extents = meta[:n_ranges]
+  cursor = n_ranges
+  out_n = meta[cursor]
+  out_code = meta[cursor+1:cursor+1+out_n]
+  cursor += out_n+1
+  value_n = meta[cursor]
+  value_code = meta[cursor+1:cursor+1+value_n]
+  inputs = [bufs[r.globals_slot] for r in relocs[1:]]
+  output = bufs[relocs[0].globals_slot]
+
+  def evaluate(code, coords):
+    stack:list = []
+    for pos in range(0, len(code), 2):
+      op, arg = code[pos], code[pos+1]
+      if op == 0: stack.append(arg)
+      elif op == 1: stack.append(coords[arg])
+      elif op == 10: stack.append((arg, stack.pop()))
+      elif op == 11:
+        false, true, cond = stack.pop(), stack.pop(), stack.pop()
+        stack.append(true if cond else false)
+      else:
+        rhs, lhs = stack.pop(), stack.pop()
+        if op == 2: stack.append(lhs + rhs)
+        elif op == 3: stack.append(lhs * rhs)
+        elif op == 4: stack.append(lhs // rhs)
+        elif op == 5: stack.append(lhs % rhs)
+        elif op == 6: stack.append(int(lhs < rhs))
+        elif op == 7: stack.append(int(lhs != rhs))
+        elif op == 8: stack.append(int(bool(lhs) and bool(rhs)))
+        elif op == 9: stack.append(int(bool(lhs) or bool(rhs)))
+        else: raise RuntimeError(f"rk: invalid host movement opcode {op}")
+    assert len(stack) == 1
+    return stack[0]
+
+  for linear in range(total):
+    rem, coords = linear, [0] * n_ranges
+    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+    out_index = evaluate(out_code, coords)
+    input_id, in_index = evaluate(value_code, coords)
+    if not (0 <= out_index < output.size // itemsize and 0 <= in_index < inputs[input_id].size // itemsize):
+      raise RuntimeError(f"rk: host movement index out of bounds out={out_index} in={in_index}")
+    ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
 
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
@@ -390,6 +437,9 @@ class RockchipProgram(Program['RockchipDevice']):
     if all(st.task.is_copy or st.task.is_fill for st in subtasks):
       for st in subtasks:
         task = st.task
+        if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
+          _run_host_movement(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
           _run_host_bitwise(task, st.relocs, bufs)
           continue
