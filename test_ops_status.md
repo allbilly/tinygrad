@@ -1192,3 +1192,20 @@ forward-only:
 The linked RKNN Toolkit2 fp16 multiplication issue #471 is useful supporting
 evidence for the separate cumulative/large-reduction precision group, not a
 TopK or LUT workaround; exact observations and the URL are in `progress.md`.
+
+### Complete Sort subcase verification
+
+| Sort coverage | Result |
+|---|---:|
+| empty/singleton values and indices | **passing** |
+| random axes `-1`, `0`, `1`, both directions | **6/6 exact indices** |
+| repeated 18-lane integer values, both directions | **2/2 exact** |
+| repeated 18-lane stable indices, both directions | **2/2 exact** |
+
+The unchanged monolithic `test_sort` process aborted after about four minutes
+inside `reset_npu()` during an indices submission.  It emitted no operator
+rejection or numerical assertion.  Rerunning every axis/direction and
+repeated-value case in a fresh process passed exactly, so Sort correctness is
+complete while long-process RK reset stability remains an infrastructure
+issue.  Do not count that ioctl abort as a failed Sort algorithm unless the
+same subcase fails in isolation.

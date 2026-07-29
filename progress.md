@@ -7246,3 +7246,28 @@ terms gives 12.80, over 256 gives 25.59 instead of 25.60, and over 4096 gives
 our CumProd/large-reduction diagnosis: long fp16 accumulation needs bounded
 chunks, compensation, or a higher-precision accumulator.  It does not explain
 elementwise MUL, LUT interpolation, or the TopK layout issues above.
+
+## 2026-07-30 — complete Sort subcase verification
+
+The broader unchanged `TestOps.test_sort` method reached its random
+multi-axis index matrix but the process aborted after roughly four minutes
+inside `reset_npu()` during a flush.  There was no compile rejection,
+comparison failure, or Python exception from an operator.  Because long
+shared-process RK reset failures have occurred elsewhere, every remaining
+logical subcase was rerun in a fresh process.
+
+Results:
+
+- empty and singleton value/index cases passed before the monolithic abort;
+- random `(8,8,6)` stable indices passed **6/6 exactly** for axes `-1`, `0`,
+  and `1`, each ascending and descending;
+- repeated `[0,1]*9` integer values passed **2/2 exactly** ascending and
+  descending;
+- the corresponding 18-lane stable indices passed **2/2 exactly**.
+
+Thus all Sort operator cases are numerically passing.  The unchanged method
+is not yet claimed as a single-process pytest pass: accumulating many long
+task chains can still abort during the driver reset ioctl.  Debug this
+separately from sorting by launching one axis/direction per process; a
+numerical or lowering fault will reproduce there, while reset-state
+accumulation will not.
