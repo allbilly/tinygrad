@@ -1637,6 +1637,39 @@ values, avoiding the rejected pi/2 subtraction. The sign is restored only
 after all magnitude regions are combined, with signed zero classified as
 nonnegative.
 
+### Atanh: bounded singularities and IEEE staging
+
+Atanh only has finite values for `|x|<1`, so it can reuse the asin-style
+absolute-value and endpoint-distance partition without a range-reduction
+identity:
+
+| Task/table | Coordinate | Stored value | Decode/use |
+|---|---:|---:|---|
+| broad LO | `abs(x)` | `atanh(abs(x))/4` | multiply by 4 for `0.125 < abs(x) <= 0.875` |
+| detail LE | `-abs(x)` | `4*atanh(abs(x))` | multiply by 0.25 for `0.04 < abs(x) <= 0.125` |
+| detail LO | `1-abs(x)` | `atanh(1-d)/8` | multiply by 8 for `0.875 < abs(x) < 1` |
+| no LUT | `abs(x)` | identity | `abs(x)<=0.04` |
+
+The broad scale is `16384`; detail scale is `65504`. At detail distance zero,
+store the finite value for the next representable fp16 input below one. A
+separate exact-boundary mask later turns that nonzero numerator into infinity,
+so the table never needs to contain an unrepresentable value.
+
+IEEE restoration is ordered as follows:
+
+1. Clamp only the LUT address to one, retaining the original magnitude.
+2. Select and combine a finite positive magnitude.
+3. Restore the original sign while the magnitude is still finite.
+4. Divide the signed finite value by `1-is_exact_one`, producing signed
+   infinity at `±1`.
+5. Multiply by `valid/valid`, where `valid=1-(abs(x)>1)`, producing NaN
+   outside the domain.
+
+Do not create positive infinity before sign selection. An unselected
+`-infinity * 0` (or `+infinity * 0`) produces NaN, and the later ADD
+contaminates the selected lane. Signing first also preserves both exact
+endpoint signs without a WHERE instruction.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

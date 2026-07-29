@@ -99,6 +99,13 @@ in **17.11 seconds**. `asinh`, `acosh`, and `atanh` are the remaining
 inverse-hyperbolic group. The complete hardware file remains **71/71 passing
 in 223.19 seconds**.
 
+`test_atanh` now passes all three official ranges in **22.34 seconds**. The
+two-task path combines a broad table with one detail task whose LE half
+amplifies near-zero values and whose LO half resolves distance from `|x|=1`.
+The dense inverse-trig method passes in **23.82 seconds**, including exact
+`±1` infinities and out-of-domain NaNs. `asinh` and `acosh` remain.
+The complete hardware file remains **71/71 passing in 231.05 seconds**.
+
 ## Summary
 
 | Status | Count |
@@ -217,6 +224,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
 - asin and acos, including endpoint precision and out-of-domain NaN
 - atan, including ordinary `[-2,2]` and finite `±300` ranges
+- atanh, including exact domain boundaries and invalid-domain NaN
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave

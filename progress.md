@@ -5042,6 +5042,33 @@ against parent `e8858b004`.
 The complete hardware file remains **71/71 passing in 223.19 seconds** with
 the same 11 expected numerical warnings.
 
+## 2026-07-29 — bounded atanh milestone
+
+Unchanged `test_atanh` passes all three official ranges in **22.34 seconds**.
+The expanded dense inverse-trig hardware method passes in **23.82 seconds**,
+including both signed zeros, exact `±1` infinities, and out-of-domain NaNs.
+
+The direct two-task path uses `atanh(abs(x))/4` in the broad table. Its detail
+task stores amplified `4*atanh(abs(x))` in LE for the near-zero interval and
+`atanh(1-distance)/8` in LO for the singular endpoint interval. The selected
+regions are the identity through `0.04`, amplified detail through `0.125`,
+broad through `0.875`, and endpoint-distance detail above `0.875`.
+
+Inputs are clamped only for LUT addressing. A separate `abs(x)>1` mask
+restores NaN using `valid/valid`, while the only fp16 magnitude above
+`0.99975` is divided by zero to restore infinity at exactly one. The first
+endpoint implementation created unsigned infinity and then selected its sign;
+the unused opposite infinity multiplied by zero and contaminated the result
+with NaN. The passing order signs the finite numerator first and only then
+divides by zero, producing `+inf` or `-inf` directly.
+
+`lut.md` records the table geometry and IEEE ordering rule. The standalone
+patch is `rockchip-atanh-two-lut-d9d472885.patch`, against parent
+`d9d472885`.
+
+The complete hardware file remains **71/71 passing in 231.05 seconds** with
+the same 11 expected numerical warnings.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
