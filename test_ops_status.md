@@ -17,6 +17,8 @@ product subcase of `const_reduce` now also pass incrementally. The expanded
 DPU hardware class is separately **60/60 passing in 319.36 seconds**.
 The complete official `test_min` method now passes incrementally, including
 floating, exact int32 boundary, and bool cases.
+`TestOps.test_sum_twice` now also passes through two ordered CMAC tasks that
+preserve its explicit fp16 intermediate boundary.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -712,3 +714,26 @@ ordering as a device-state reproducer rather than hiding it with host math or
 delays.
 
 Recovery patch: `rockchip-native-typed-min-fa8192487.patch`.
+
+### Nested-SUM milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `sum_twice` | **passing in 2.26 s** | **two ordered CMAC tasks** |
+| fp16 intermediate rounding | **bit-exact** | **materialized in NPU scratch** |
+
+The fused scheduled graph contains an inner ADD reduction, a cast to half,
+and an outer ADD reduction. The new strict matcher materializes the inner
+CMAC result as fp16 scratch and feeds it to a second CMAC task. It does not
+flatten the reductions into one fp32 accumulation.
+
+A permanent `(4,4,4)` seed-zero regression distinguishes the correct nested
+result (`0xc0de`) from the flattened result (`0xc0df`). The official test plus
+this regression pass **2/2 in 2.41 seconds**. The complete CMAC class passes
+**24/24 in 9.43 seconds**, and the hardware-free contract remains **79/79 in
+6.48 seconds**.
+
+`ROCKCHIP_DEBUG_SINK=1` prints the rewritten scheduled SINK before native
+classification for future graph-pattern debugging.
+
+Recovery patch: `rockchip-native-nested-sum-5aef57073.patch`.

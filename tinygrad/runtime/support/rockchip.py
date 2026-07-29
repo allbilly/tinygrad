@@ -7286,6 +7286,67 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
+def _try_nested_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Materialize the fp16 boundary between two fused ADD reductions."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  outer = _unwrap(store.src[1])
+  if outer.op is not Ops.REDUCE or outer.arg[0] is not Ops.ADD or outer.dtype is not dtypes.float: return None
+  outer_input = outer.src[0]
+  if outer_input.op is not Ops.CAST or outer_input.dtype is not dtypes.float: return None
+  intermediate_value = outer_input.src[0]
+  if intermediate_value.op is not Ops.CAST or intermediate_value.dtype is not dtypes.half: return None
+  inner = intermediate_value.src[0]
+  if inner.op is not Ops.REDUCE or inner.arg[0] is not Ops.ADD or inner.dtype is not dtypes.float: return None
+
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  inner_reductions, outer_reductions = list(inner.src[1:]), list(outer.src[1:])
+  if not inner_reductions or not outer_reductions or \
+     any(u.src[0].op is not Ops.CONST for u in (*loops, *inner_reductions, *outer_reductions)): return None
+  if set(inner_reductions) & set(outer_reductions): return None
+
+  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
+    flat = axes[0]
+    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
+    return flat
+
+  info = ProgramInfo.from_sink(sink)
+  intermediate_slot = max(info.globals, default=-1) + 1
+  carry_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in outer_reductions]
+  stage_axes = [*loops, *carry_loops]
+  stage_extents = [int(u.src[0].arg) for u in stage_axes]
+  stage_total = prod(stage_extents)
+  carry_map = dict(zip(outer_reductions, carry_loops))
+  stage_value = intermediate_value.substitute(carry_map)
+  device = store.src[0].src[0].device
+  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=device)
+  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
+  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_value)), *stage_axes)))
+
+  tasks:list[RKSubTask] = []
+  stage_plan = plan_rk(stage_sink)
+  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(stage_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+  final_axes = [*loops, *outer_reductions]
+  final_extents = [int(u.src[0].arg) for u in final_axes]
+  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
+  final_acc = UOp(Ops.REDUCE, dtypes.float,
+                  (UOp(Ops.CAST, dtypes.float, (intermediate_index,), arg=dtypes.float), *outer_reductions), arg=outer.arg)
+  final_sink = sink.substitute({outer:final_acc})
+  final_plan = plan_rk(final_sink)
+  if isinstance(final_plan, str) or final_plan.kind != "cmac": return None
+  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(final_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  return tuple(tasks)
+
 def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Gather a small static float reduction window, then multiply it on DPU."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -8035,6 +8096,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
   if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
   if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
@@ -8088,6 +8150,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variable_scale_tasks)
+  if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, nested_sum_tasks)
   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
     return build_native_program_multi(sink, multifactor_tasks)
   plan = plan_rk(sink)

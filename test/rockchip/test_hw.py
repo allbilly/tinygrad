@@ -568,6 +568,15 @@ class TestCMAC(unittest.TestCase):
     c = a.sum().realize()
     np.testing.assert_allclose(c.numpy(), a_np.sum(), rtol=1e-2, atol=1e-2)
 
+  def test_cmac_nested_sum(self):
+    # This seed distinguishes the required fp16 intermediate boundary from a
+    # flattened fp32 accumulation: nested=-2.43359375, flat=-2.435546875.
+    a_np = np.random.default_rng(0).uniform(-3, 3, (4,4,4)).astype(np.float16)
+    inner = np.sum(a_np.astype(np.float32), axis=(0,1)).astype(np.float16)
+    expected = np.sum(inner.astype(np.float32), dtype=np.float32).astype(np.float16)
+    got = Tensor(a_np, device="ROCKCHIP").realize().sum((0,1)).sum().realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+
   def test_cmac_scaled_sum_full(self):
     # Scaled full sum: (a * 2).sum() → ones @ (a*2)
     a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)

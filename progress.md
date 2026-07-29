@@ -6309,3 +6309,51 @@ remain absent from `.venv`.
 
 The standalone recovery artifact is
 `rockchip-native-typed-min-fa8192487.patch`, based on `fa8192487`.
+
+## 2026-07-29 — nested SUM with an fp16 materialization boundary
+
+`TestOps.test_sum_twice` schedules
+`x.sum((0, 1)).sum()` as one fused kernel containing two ADD reductions:
+
+```text
+half(float-reduce(inner axes))
+  -> float
+  -> float-reduce(remaining axis)
+  -> half
+```
+
+The generic CMAC classifier correctly rejected the nested reduction as a
+fused epilogue. Flattening both axes into one fp32 accumulation would run, but
+would change the explicit intermediate half rounding.
+
+The strict nested-sum matcher now:
+
+1. changes only the outer reduction axes into loop axes for the first stage;
+2. submits the inner ADD reduction as CMAC and writes its result to fp16
+   scratch;
+3. indexes that scratch with the original outer reduction coordinates;
+4. submits the outer ADD reduction as a second CMAC task.
+
+Both arithmetic reductions remain NPU tasks. Host code constructs static
+indices, task metadata, and scratch allocation only.
+
+The permanent seed-zero `(4,4,4)` regression proves the boundary matters:
+the required nested result is fp16 bit pattern `0xc0de`
+(`-2.43359375`), while a flattened fp32 accumulation yields `0xc0df`
+(`-2.435546875`). The NPU result is exactly `0xc0de`.
+
+`ROCKCHIP_DEBUG_SINK=1` now prints the post-fdiv-rewrite scheduled SINK before
+classification. This is useful for separating semantic graph patterns from
+the final `RKPLAN_REJECT` reason and performs no runtime tensor work.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_sum_twice`: **passing in 2.26 seconds**;
+- official plus bit-exact permanent regression: **2/2 in 2.41 seconds**;
+- complete CMAC hardware class: **24/24 in 9.43 seconds**;
+- hardware-free PR1 contract: **79/79 in 6.48 seconds**.
+
+The standalone recovery artifact is
+`rockchip-native-nested-sum-5aef57073.patch`, based on `5aef57073`.
