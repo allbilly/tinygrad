@@ -5283,6 +5283,13 @@ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       if not emit_int(u.src[1], code): return False
       code.extend((10, input_id(u.src[0].buf_uop.arg.slot)))
       return True
+    if u.op is Ops.CONST and u.dtype == raw.dtype and u.arg is not Invalid:
+      if raw.dtype is dtypes.half: bits = struct.unpack('<H', struct.pack('<e', float(u.arg)))[0]
+      elif raw.dtype is dtypes.float: bits = struct.unpack('<I', struct.pack('<f', float(u.arg)))[0]
+      elif raw.dtype in (dtypes.int, dtypes.uint, dtypes.uint8, dtypes.bool): bits = int(u.arg) & ((1 << (raw.dtype.itemsize*8))-1)
+      else: return False
+      code.extend((12, bits))
+      return True
     if u.op is Ops.WHERE and u.dtype == raw.dtype:
       if not emit_int(u.src[0], code) or not emit_value(u.src[1], code) or not emit_value(u.src[2], code): return False
       code.extend((11, 0))

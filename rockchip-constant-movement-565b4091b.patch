@@ -1,0 +1,116 @@
+diff --git a/progress.md b/progress.md
+index f39d92aa3..fa501fdc3 100644
+--- a/progress.md
++++ b/progress.md
+@@ -4934,6 +4934,31 @@ five, and the classifier test at 68 passing plus four stale rejection
+ expectations. `rockchip-indexed-movement-a864e9519.patch` is the standalone
+ patch against parent `a864e9519`.
+ 
++## 2026-07-29 — typed constant movement milestone
++
++The strict indexed movement program now supports exact typed constant leaves.
++This makes unchanged `test_pad_reshape`, `test_pad_slice`, `test_tril`, and
++`test_triu` pass. Circular pad was already unlocked by the preceding modulo
++index support. Together with the earlier movement methods, the neighborhood
++passes **11/11 in 23.13 seconds**.
++
++Constant values are converted to their raw half, float32, int32/uint32, uint8,
++or bool bit pattern when the task is built. The postfix evaluator returns a
++sentinel `(constant, bits)` source pair, and the runtime copies those bytes
++directly into the selected output element. No floating-point arithmetic or
++round trip is performed.
++
++Reflect and replicate pad are deliberately not claimed by this path. Their
++lowered graphs sum several mutually exclusive WHERE expressions, so they are
++compute kernels rather than pure selection/copy. One-hot similarly compares
++runtime tensor values rather than loop indices. All three remain tracked for a
++later WHERE-compute milestone.
++
++The complete hardware file remains **70/70 passing in 207.21 seconds**. Mypy,
++targeted Ruff, and classifier results remain at their 13/5/four-stale-failure
++baselines. `rockchip-constant-movement-565b4091b.patch` is the standalone patch
++against parent `565b4091b`.
++
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 946d231ac..b623d5fd7 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -75,6 +75,10 @@ Post-census, exact indexed movement passes **6/6 in 12.86 seconds**: roll, cat,
+ multicat, repeat, repeat-interleave, and simple-repeat. A strict host task
+ evaluates the lowered integer index/WHERE program and copies raw element bytes.
+ The complete hardware regression remains **70/70 passing in 206.86 seconds**.
++Typed constant leaves in that movement program additionally fix pad-reshape,
++pad-slice, tril, and triu; circular pad passes through modulo indexing. The
++combined movement neighborhood is **11/11 in 23.13 seconds**, and the hardware
++regression remains **70/70 in 207.21 seconds**.
+ 
+ ## Summary
+ 
+@@ -142,6 +146,10 @@ Negative padding, fused pad+reshape, pad modes (circular/reflect/replicate).
+ 
+ **Tests:** test_pad, test_pad_reshape, test_pad_slice, test_padding_add, test_pad_circular_mode, test_pad_reflect_mode, test_pad_replicate_mode
+ 
++Post-census update: pad-reshape, pad-slice, and circular mode pass. Reflect and
++replicate lower to arithmetic sums of WHERE branches; padding-add is a fused
++elementwise case.
++
+ ### 8. Cat/multicat — ~2 tests
+ test_cat (segfault fixed, now fails with wrong results for dim=1+), test_multicat
+ 
+@@ -191,6 +199,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are
+ - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
+ - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
+ - indexed movement for roll, cat/multicat, repeat, and repeat-interleave
++- constant-valued movement for pad-reshape/slice, circular pad, tril, and triu
+ - log2, including exact power-of-four normalization and near-one precision
+ - natural log and log10, including range reduction and IEEE special values
+ - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 3478c5bb9..f53dcd71e 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -164,6 +164,7 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+       if op == 0: stack.append(arg)
+       elif op == 1: stack.append(coords[arg])
+       elif op == 10: stack.append((arg, stack.pop()))
++      elif op == 12: stack.append((-1, arg))
+       elif op == 11:
+         false, true, cond = stack.pop(), stack.pop(), stack.pop()
+         stack.append(true if cond else false)
+@@ -186,9 +187,12 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+     for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+     out_index = evaluate(out_code, coords)
+     input_id, in_index = evaluate(value_code, coords)
+-    if not (0 <= out_index < output.size // itemsize and 0 <= in_index < inputs[input_id].size // itemsize):
+-      raise RuntimeError(f"rk: host movement index out of bounds out={out_index} in={in_index}")
+-    ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
++    if not 0 <= out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
++    if input_id == -1:
++      ctypes.memmove(output.va_addr + out_index*itemsize, int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
++    else:
++      if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
++      ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
+ 
+ class RockchipProgram(Program['RockchipDevice']):
+   cmds: list[int]
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 4f0bb4ebf..1132217c4 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -5283,6 +5283,13 @@ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       if not emit_int(u.src[1], code): return False
+       code.extend((10, input_id(u.src[0].buf_uop.arg.slot)))
+       return True
++    if u.op is Ops.CONST and u.dtype == raw.dtype and u.arg is not Invalid:
++      if raw.dtype is dtypes.half: bits = struct.unpack('<H', struct.pack('<e', float(u.arg)))[0]
++      elif raw.dtype is dtypes.float: bits = struct.unpack('<I', struct.pack('<f', float(u.arg)))[0]
++      elif raw.dtype in (dtypes.int, dtypes.uint, dtypes.uint8, dtypes.bool): bits = int(u.arg) & ((1 << (raw.dtype.itemsize*8))-1)
++      else: return False
++      code.extend((12, bits))
++      return True
+     if u.op is Ops.WHERE and u.dtype == raw.dtype:
+       if not emit_int(u.src[0], code) or not emit_value(u.src[1], code) or not emit_value(u.src[2], code): return False
+       code.extend((11, 0))

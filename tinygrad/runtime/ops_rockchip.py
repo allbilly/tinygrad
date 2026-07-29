@@ -164,6 +164,7 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
       if op == 0: stack.append(arg)
       elif op == 1: stack.append(coords[arg])
       elif op == 10: stack.append((arg, stack.pop()))
+      elif op == 12: stack.append((-1, arg))
       elif op == 11:
         false, true, cond = stack.pop(), stack.pop(), stack.pop()
         stack.append(true if cond else false)
@@ -186,9 +187,12 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
     out_index = evaluate(out_code, coords)
     input_id, in_index = evaluate(value_code, coords)
-    if not (0 <= out_index < output.size // itemsize and 0 <= in_index < inputs[input_id].size // itemsize):
-      raise RuntimeError(f"rk: host movement index out of bounds out={out_index} in={in_index}")
-    ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
+    if not 0 <= out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
+    if input_id == -1:
+      ctypes.memmove(output.va_addr + out_index*itemsize, int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
+    else:
+      if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
+      ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
 
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]

@@ -75,6 +75,10 @@ Post-census, exact indexed movement passes **6/6 in 12.86 seconds**: roll, cat,
 multicat, repeat, repeat-interleave, and simple-repeat. A strict host task
 evaluates the lowered integer index/WHERE program and copies raw element bytes.
 The complete hardware regression remains **70/70 passing in 206.86 seconds**.
+Typed constant leaves in that movement program additionally fix pad-reshape,
+pad-slice, tril, and triu; circular pad passes through modulo indexing. The
+combined movement neighborhood is **11/11 in 23.13 seconds**, and the hardware
+regression remains **70/70 in 207.21 seconds**.
 
 ## Summary
 
@@ -142,6 +146,10 @@ Negative padding, fused pad+reshape, pad modes (circular/reflect/replicate).
 
 **Tests:** test_pad, test_pad_reshape, test_pad_slice, test_padding_add, test_pad_circular_mode, test_pad_reflect_mode, test_pad_replicate_mode
 
+Post-census update: pad-reshape, pad-slice, and circular mode pass. Reflect and
+replicate lower to arithmetic sums of WHERE branches; padding-add is a fused
+elementwise case.
+
 ### 8. Cat/multicat — ~2 tests
 test_cat (segfault fixed, now fails with wrong results for dim=1+), test_multicat
 
@@ -191,6 +199,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave
+- constant-valued movement for pad-reshape/slice, circular pad, tril, and triu
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values

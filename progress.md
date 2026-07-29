@@ -4934,6 +4934,31 @@ five, and the classifier test at 68 passing plus four stale rejection
 expectations. `rockchip-indexed-movement-a864e9519.patch` is the standalone
 patch against parent `a864e9519`.
 
+## 2026-07-29 — typed constant movement milestone
+
+The strict indexed movement program now supports exact typed constant leaves.
+This makes unchanged `test_pad_reshape`, `test_pad_slice`, `test_tril`, and
+`test_triu` pass. Circular pad was already unlocked by the preceding modulo
+index support. Together with the earlier movement methods, the neighborhood
+passes **11/11 in 23.13 seconds**.
+
+Constant values are converted to their raw half, float32, int32/uint32, uint8,
+or bool bit pattern when the task is built. The postfix evaluator returns a
+sentinel `(constant, bits)` source pair, and the runtime copies those bytes
+directly into the selected output element. No floating-point arithmetic or
+round trip is performed.
+
+Reflect and replicate pad are deliberately not claimed by this path. Their
+lowered graphs sum several mutually exclusive WHERE expressions, so they are
+compute kernels rather than pure selection/copy. One-hot similarly compares
+runtime tensor values rather than loop indices. All three remain tracked for a
+later WHERE-compute milestone.
+
+The complete hardware file remains **70/70 passing in 207.21 seconds**. Mypy,
+targeted Ruff, and classifier results remain at their 13/5/four-stale-failure
+baselines. `rockchip-constant-movement-565b4091b.patch` is the standalone patch
+against parent `565b4091b`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
