@@ -1020,3 +1020,17 @@ comparison-derived `0/0` restores NaN.  The permanent regression passes in
 fallback is used.
 
 Recovery patch: `rockchip-zero-base-pow-4804f8bc5.patch`.
+
+### Shifted constant-base 0.7 milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `0.7**x`, official `[-2,-1,0,1,2,3]` | **passing** | shifted Q13 LUT + DPU select |
+| dense half sweep over `[-2,3]` | **1,025/1,025 passing** | max relative error `0.0009756` |
+| final `(-2)**x` | unsupported parity/NaN WHERE | next POW subgroup |
+
+The table uses `z=x-0.5` so one symmetric LUT spans the asymmetric exponent
+interval, and it evaluates the half-rounded base `0.7001953125`.  Using
+mathematical 0.7 instead missed 113/1,025 values.  The permanent regression
+passes in 3.64 seconds; the official method passes this subgroup and reaches
+`(-2)**x` in 81.88 seconds.  No host operator fallback is used.

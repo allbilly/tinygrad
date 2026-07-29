@@ -1948,6 +1948,29 @@ deterministic random half inputs.  This prevents the false confidence of a
 knot-only sweep.  All 1,026 values pass, and the full official random tensor
 has maximum relative error `0.0009718`.
 
+## Constant base 0.7: shift an asymmetric input interval
+
+The official exponent domain is `[-2,3]`, which does not fit the generic
+EXP2 LUT's symmetric `[-2,2]` address interval.  Introduce
+`z=x-0.5`; then the requested interval becomes `[-2.5,2.5]`, and store:
+
+```text
+table(z) = fp16(0.7) ** (z + 0.5)
+```
+
+Use input scale `fp16(6553.6)`, giving a `32/index_scale` step across each
+512-entry half, and Q13 output.  The output range over the corrected domain
+is about `[0.343,2.91]`, which fits Q13 without saturation while retaining
+enough resolution for the lower endpoint.  A DPU ADD creates the shifted
+coordinate and comparison masks select the custom result only on `[-2,3]`.
+
+Always derive constant parameters from the dtype actually embedded in the
+lowered graph.  Here Tinygrad's scalar becomes half
+`0.7001953125`.  Generating the table with exact decimal 0.7 introduces a
+systematic error: 113/1,025 dense half inputs exceed `rtol=1e-3`, with
+maximum relative error `0.001422`.  Using `float(np.float16(0.7))` reduces
+the maximum to `0.0009756`, and all 1,025 values pass.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

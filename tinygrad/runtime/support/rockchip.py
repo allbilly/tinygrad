@@ -733,6 +733,7 @@ _LUT_POW_BASE8_LOW = Ops.PROGRAM
 _LUT_POW_BASE8_HIGH = Ops.LINEAR
 _LUT_POW_BASE8_FAR_LOW = Ops.SINK
 _LUT_POW_BASE8_FAR_HIGH = Ops.LOAD
+_LUT_POW_BASE07 = Ops.STORE
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -906,6 +907,18 @@ def _build_pow_base8_lut(region:int) -> tuple[list[int], int, float, float, int]
       # global +1 Q15 bias increased that count to 178.
       lut[offset+i] = max(-32768, min(32767, int(round(target*output_scale))))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_pow_base07_lut() -> tuple[list[int], int, float, float, int]:
+  """Q13 0.7**(z+0.5) for shifted exponent z in [-2.5,2.5]."""
+  index_scale, output_scale = float(np.float16(6553.6)), 8192.0
+  base = float(np.float16(0.7))
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i) * step
+      target = base**(z+0.5)
+      lut[offset+i] = max(-32768, min(32767, int(round(target*output_scale))))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 13
 
 def _build_hardswish_lut() -> tuple[list[int], int, float, float, int]:
   """Q14 hardswish over [-2,2], with nonzero entries for the LUT zero erratum."""
@@ -1562,6 +1575,8 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE8_FAR_LOW)
   if val.op is Ops.CUSTOM and val.arg == "rk_pow_base8_far_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE8_FAR_HIGH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_pow_base07" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_BASE07)
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_celu" and \
      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_CELU)
@@ -5114,6 +5129,77 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (selected,0), (fallback,0), Ops.ADD)
   return tuple(tasks)
 
+def _try_pow_base07_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate 0.7**x over [-2,3] with a shifted Q13 LUT."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.EXP2 or len(value.src) != 1: return None
+  product = _unwrap(value.src[0])
+  if product.op is not Ops.MUL or len(product.src) != 2: return None
+  source, scale = None, None
+  for lhs, rhs in (product.src, product.src[::-1]):
+    if (candidate := _unwrap(lhs)).op is Ops.INDEX and rhs.op is Ops.CONST:
+      source, scale = candidate, float(rhs.arg)
+      break
+  if source is None or scale is None or source.dtype is not dtypes.half or abs(scale-math.log2(0.7)) > 1e-3: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  if int(source.src[0].src[0].arg) != total: return None
+  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+
+  def scalar(number:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
+    diff, mask = alloc(), alloc()
+    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
+                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
+    return mask, 0
+
+  def temp_index(slot:int) -> UOp:
+    out_index = store.src[0]
+    return out_index.replace(dtype=dtypes.half,
+      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
+
+  fallback_slot = alloc()
+  fallback_plan = plan_rk(stage_sink(value, fallback_slot))
+  if isinstance(fallback_plan, str) or fallback_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(fallback_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  shifted, corrected = alloc(), alloc()
+  dependent(shifted, (source_slot,0), scalar(-0.5), Ops.ADD)
+  custom = UOp(Ops.CUSTOM, dtypes.half, (temp_index(shifted),), arg="rk_pow_base07")
+  corrected_plan = RKPlan("dpu_lut", stage_sink(custom, corrected), corrected, (shifted,), lut_op=_LUT_POW_BASE07)
+  cmds, task, relocs = emit_rk(corrected_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  lower = float(np.nextafter(np.float16(-2.0), np.float16(-np.inf), dtype=np.float16))
+  upper = float(np.nextafter(np.float16(3.0), np.float16(np.inf), dtype=np.float16))
+  above_lower = positive_mask((source_slot,0), scalar(lower))
+  below_upper = positive_mask(scalar(upper), (source_slot,0))
+  valid, selected, inverse, fallback = (alloc() for _ in range(4))
+  dependent(valid, above_lower, below_upper, Ops.MUL)
+  dependent(selected, (corrected,0), (valid,0), Ops.MUL)
+  dependent(inverse, scalar(1.0), (valid,0), Ops.SUB)
+  dependent(fallback, (fallback_slot,0), (inverse,0), Ops.MUL)
+  dependent(out, (selected,0), (fallback,0), Ops.ADD)
+  return tuple(tasks)
+
 def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate (-5.5)**x with DPU truncation, integer validity, and parity."""
   store = _store_node(sink)
@@ -7014,6 +7100,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_POW_BASE8_FAR_HIGH:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(3)
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_POW_BASE07:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base07_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_TAN_LOCAL:
@@ -9603,6 +9693,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, pow_base55_tasks)
   if (pow_base8_tasks := _try_pow_base8_lut_subtasks(sink)) is not None:
     return build_native_program_multi(sink, pow_base8_tasks)
+  if (pow_base07_tasks := _try_pow_base07_lut_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, pow_base07_tasks)
   if (pow_neg_base55_tasks := _try_pow_neg_base55_subtasks(sink)) is not None:
     return build_native_program_multi(sink, pow_neg_base55_tasks)
   if (zero_base_pow_tasks := _try_zero_base_pow_subtasks(sink)) is not None:

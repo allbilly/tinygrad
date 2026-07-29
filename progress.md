@@ -6933,3 +6933,33 @@ Using `. .venv/bin/activate`:
 - mypy remains at the same 13 pre-existing Rockchip errors.
 
 Recovery patch: `rockchip-zero-base-pow-4804f8bc5.patch`.
+
+## 2026-07-30 — shifted constant-base 0.7 POW LUT
+
+The generic scaled EXP2 LUT is centered on `[-2,2]`, while the official
+`0.7**x` case includes exponent `3`.  The strict lowering shifts the
+coordinate to `z=x-0.5`, so the existing symmetric 1,025-entry RK LUT
+addressing covers `x∈[-2,3]` as `z∈[-2.5,2.5]`.  It stores
+`0.7**(z+0.5)` in Q13 and selects that corrected result with DPU masks;
+the generic scaled EXP2 task remains the out-of-range fallback.
+
+The LUT must use the half-rounded Python scalar base seen by the TinyJit
+graph, `float(np.float16(0.7)) == 0.7001953125`.  Building it from the
+mathematical decimal 0.7 missed 113/1,025 dense values with maximum relative
+error `0.001422`.  Building it from the graph's half value passes all
+1,025/1,025 values with maximum relative error `0.0009756`.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- permanent 1,025-point `[-2,3]` regression: **passing in 3.64 seconds**;
+- official `TestOps.test_pow_const`: `0.7**x` passes and the method reaches
+  the independent final `(-2)**x` parity-WHERE rejection in **81.88
+  seconds**;
+- no host operator fallback, cast conversion, or `run_host` arithmetic is
+  used; the LUT and all range selection execute as NPU tasks.
+
+The next subgroup is negative constant-base two.  It has the same
+integer-validity/parity structure as `(-5.5)**x`, but needs a magnitude path
+covering exponent 3.
