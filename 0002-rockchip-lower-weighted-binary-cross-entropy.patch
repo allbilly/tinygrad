@@ -1,0 +1,124 @@
+From 92230249c5b7d885238a91a44927cad3041ac51b Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 05:27:50 +0800
+Subject: [PATCH] rockchip: lower weighted binary cross entropy
+
+---
+ progress.md                          | 30 ++++++++++++++++++++++++++++
+ test_ops_status.md                   | 13 ++++++++++++
+ tinygrad/runtime/support/rockchip.py | 16 ++++++++++-----
+ 3 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 21f2ed5a2..3c802961f 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7326,3 +7326,33 @@ accumulation drift reported in
+ [RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+ supports caution around long fp16 CMAC/reduction chains, but it does not
+ explain the unreduced elementwise LUT error or the broadcast rejection.
++
++## 2026-07-30 — BCE-with-logits vector positive weights
++
++The unchanged `TestOps.test_binary_crossentropy_logits_pos_weights` now
++passes.  Its two reduction axes turn the logically flat 320-element
++softplus input into the affine index `row*10+column`.  The special softplus
++matcher succeeded, but the LUT classifier rejected that uniform two-axis
++layout while ordinary DPU scalar tasks already accepted it.
++
++DPU LUT classification now permits the same uniform two-axis affine layout:
++every indexed tensor in the stage must use the compatible layout.  A
++non-flat inner softplus input is materialized by a native DPU copy before its
++two LUT tasks, after which the existing broadcast expansion multiplies the
++10-element positive-weight vector over 32 rows.  No value-dependent host
++callback and no `run_host` arithmetic are used.
++
++Validation with `. .venv/bin/activate`, disabled caches, half defaults, and
++forward-only:
++
++- unchanged official positive-weight BCE-with-logits: **passing in 12.10
++  seconds**;
++- `test/rockchip/test_pr1.py`: **79/79 passing**;
++- Python compilation and `git diff --check`: **passing**;
++- mypy: unchanged **13-error** Rockchip baseline; ruff remains unavailable in
++  `.venv`.
++
++Use `RK_TRACE_MATCH=1` when this path regresses.  A successful softplus match
++followed by `unsupported_layout:Ops.ADD` means the special function saw a
++multi-axis affine index; `ROCKCHIP_DEBUG_SUBTASKS=1` verifies the flattening
++copy and confirms scratch buffers are not incorrectly marked fp32.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 83d880e94..61c825b94 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1232,3 +1232,16 @@ diff whitespace checks pass, and mypy remains at its pre-existing 13-error
+ Rockchip baseline.  Ruff is unavailable in `.venv`.
+ Unreduced ordinary BCE is the next LUT-accuracy task (max relative error
+ 0.434%); vector positive weights are a separate broadcast-lowering task.
++
++### BCE-with-logits positive-weight milestone
++
++| Coverage | Result |
++|---|---:|
++| official `(32,10)` logits with 10-lane `pos_weight` | **passing in 12.10s** |
++| uniform two-axis softplus LUT input | **native DPU copy + LUT** |
++| PR1 regression suite | **79/79 passing** |
++
++The LUT classifier now accepts compatible uniform 2D affine layouts, matching
++the existing DPU rule.  The vector broadcast, softplus, multiplication, and
++final CMAC mean all remain NPU-native; `run_host` performs no operator
++arithmetic.  Unreduced ordinary BCE LUT accuracy remains the next loss issue.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 498b7e8fc..6f7d89da0 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -2056,7 +2056,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
+     abs_slot = _try_abs(val) if not (lut_result is not None or sub_slots is not None or scalar is not None or reciprocal is not None) else None
+     # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
+     # Broadcast and mean are rejected — no host-side tensor arithmetic.
+-    if lut_result is not None: kind, a2d, ru = "dpu_lut", False, False
++    if lut_result is not None: kind, a2d, ru = "dpu_lut", True, True
+     elif sub_slots is not None: kind, a2d, ru = "dpu", False, False
+     elif reciprocal is not None: kind, a2d, ru = "dpu", True, True
+     elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)): kind, a2d, ru = "dpu", True, True
+@@ -2977,11 +2977,13 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+ 
+   tasks:list[RKSubTask] = []
+-  if source.op is not Ops.INDEX:
++  if source.op is not Ops.INDEX or not _is_flat_contiguous(source.src[1]):
+     materialized_source = alloc()
+     source_store = store.replace(src=(temp_index(materialized_source), source))
+     source_plan = plan_rk(sink.substitute({store:source_store}))
+-    if isinstance(source_plan, str) or source_plan.kind != "dpu": return None
++    if isinstance(source_plan, str) or source_plan.kind != "dpu":
++      if getenv("RK_TRACE_MATCH"): print("rk softplus source reject", source_plan)
++      return None
+     cmds, task, relocs = emit_rk(source_plan)
+     tasks.append(RKSubTask(cmds, task, relocs))
+     source = temp_index(materialized_source)
+@@ -3007,7 +3009,9 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   broad_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_logsigmoid_correction", beta, 1/beta))
+   broad_store = store.replace(src=(temp_index(correction), broad_val))
+   broad_plan = plan_rk(sink.substitute({store:broad_store}))
+-  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
++  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut":
++    if getenv("RK_TRACE_MATCH"): print("rk softplus broad reject", broad_plan)
++    return None
+   cmds, task, relocs = emit_rk(broad_plan)
+   tasks.append(RKSubTask(cmds, task, relocs))
+ 
+@@ -3015,7 +3019,9 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tail_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_softplus_tail", beta, 1/beta))
+   tail_store = store.replace(src=(temp_index(tail), tail_val))
+   tail_plan = plan_rk(sink.substitute({store:tail_store}))
+-  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut": return None
++  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut":
++    if getenv("RK_TRACE_MATCH"): print("rk softplus tail reject", tail_plan)
++    return None
+   cmds, task, relocs = emit_rk(tail_plan)
+   tasks.append(RKSubTask(cmds, task, relocs))
+ 
+-- 
+2.34.1
+
