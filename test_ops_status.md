@@ -122,6 +122,13 @@ two-byte write into a four-byte output. The legacy staged NPU truncation is
 preserved for nested expressions. The full hardware file remains **71/71
 passing in 244.55 seconds**.
 
+`test_copysign` and `test_copysign_exact` are now fixed. The strict host
+classifier recognizes tinygrad's complete `abs(a)*signbit(b)` expansion,
+encodes all three broadcast index expressions, and transfers the sign bit
+without floating-point arithmetic. The official pair plus permanent special
+value/broadcast regression passes **3/3 in 4.93 seconds**. The complete
+hardware file is now **72/72 passing in 243.65 seconds**.
+
 ## Summary
 
 | Status | Count |
@@ -242,6 +249,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - atan, including ordinary `[-2,2]` and finite `±300` ranges
 - atanh, including exact domain boundaries and invalid-domain NaN
 - asinh and acosh, including finite ±300 and acosh domain masking
+- exact broadcast fp16/fp32 copysign, including signed zero and special values
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave

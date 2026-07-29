@@ -169,6 +169,7 @@ _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
 _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
 _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
 _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
+_HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
 
 def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
@@ -6022,6 +6023,82 @@ def _try_trunc_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Recognize tinygrad's abs(a)*signbit(b) expansion and copy the exact sign bit."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  output, val = store.src
+  if output.op is not Ops.INDEX or val.op is not Ops.MUL or val.dtype not in (dtypes.half, dtypes.float): return None
+
+  def sign_source(u:UOp) -> UOp|None:
+    u = _unwrap(u)
+    if u.op is not Ops.WHERE or len(u.src) != 3: return None
+    cond, negative, positive = u.src
+    if cond.op is not Ops.OR or negative.op is not Ops.CONST or positive.op is not Ops.CONST: return None
+    if float(negative.arg) != -1.0 or float(positive.arg) != 1.0: return None
+    direct = reciprocal = None
+    for compare in cond.src:
+      if compare.op is not Ops.CMPLT or compare.src[1].op is not Ops.CONST or float(compare.src[1].arg) != 0.0: return None
+      lhs = _unwrap(compare.src[0])
+      if lhs.op is Ops.INDEX: direct = lhs
+      elif lhs.op is Ops.RECIPROCAL and _unwrap(lhs.src[0]).op is Ops.INDEX: reciprocal = _unwrap(lhs.src[0])
+      else: return None
+    if direct is None or reciprocal is None or direct.src[0].buf_uop.arg.slot != reciprocal.src[0].buf_uop.arg.slot: return None
+    return direct if direct.src[1] is reciprocal.src[1] else None
+
+  magnitude = sign = magnitude_index = sign_index = None
+  for candidate_magnitude, candidate_sign in (val.src, val.src[::-1]):
+    if _try_abs(_unwrap(candidate_magnitude)) is None or (candidate_sign_index := sign_source(candidate_sign)) is None: continue
+    candidate_magnitude = _unwrap(candidate_magnitude)
+    candidate_magnitude_index = next((_unwrap(x) for x in candidate_magnitude.src if _unwrap(x).op is Ops.INDEX), None)
+    if candidate_magnitude_index is None: continue
+    magnitude, sign, magnitude_index, sign_index = candidate_magnitude, candidate_sign, candidate_magnitude_index, candidate_sign_index
+    break
+  if magnitude is None or sign is None or magnitude_index is None or sign_index is None: return None
+  if any(x.dtype is not val.dtype for x in (output, magnitude_index, sign_index)): return None
+
+  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+  range_ids = {u:i for i,u in enumerate(ranges)}
+  extents = tuple(int(u.src[0].arg) for u in ranges)
+  total = prod(extents)
+  if total != prod(_shape_of_store(sink)): return None
+  int_codes = {Ops.ADD:2, Ops.MUL:3, Ops.FLOORDIV:4, Ops.FLOORMOD:5,
+               Ops.CMPLT:6, Ops.CMPNE:7, Ops.AND:8, Ops.OR:9}
+
+  def emit_int(u:UOp, code:list[int]) -> bool:
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.CONST:
+      try: value = int(u.arg)
+      except (TypeError, ValueError): return False
+      code.extend((0, value))
+      return True
+    if u.op is Ops.RANGE and u in range_ids:
+      code.extend((1, range_ids[u]))
+      return True
+    if u.op in int_codes and len(u.src) == 2:
+      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code): return False
+      code.extend((int_codes[u.op], 0))
+      return True
+    if u.op is Ops.WHERE and len(u.src) == 3:
+      if not all(emit_int(x, code) for x in u.src): return False
+      code.extend((11, 0))
+      return True
+    return False
+
+  out_code:list[int] = []
+  magnitude_code:list[int] = []
+  sign_code:list[int] = []
+  if not all((emit_int(output.src[1], out_code), emit_int(magnitude_index.src[1], magnitude_code),
+              emit_int(sign_index.src[1], sign_code))): return None
+  dtype_code, out_slot = (0 if val.dtype is dtypes.half else 1), ProgramInfo.from_sink(sink).outs[0]
+  layout = (total, _HOST_COPYSIGN_LAYOUT, dtype_code, len(extents), *extents,
+            len(out_code), *out_code, len(magnitude_code), *magnitude_code, len(sign_code), *sign_code)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  slots = (out_slot, magnitude_index.src[0].buf_uop.arg.slot, sign_index.src[0].buf_uop.arg.slot)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
+  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
+
 def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
   store = _store_node(sink)
@@ -6408,6 +6485,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
   if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
+  if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)

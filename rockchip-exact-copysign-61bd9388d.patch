@@ -1,0 +1,259 @@
+diff --git a/progress.md b/progress.md
+index 7b0063a3a..f9235485a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5129,6 +5129,30 @@ operations and exact float32 truncation special/range values. Mypy remains at
+ The reusable patch for this milestone is
+ `rockchip-exact-trunc-1a2cd5724.patch`, against parent `1a2cd5724`.
+ 
++## 2026-07-29 — exact broadcast copysign milestone
++
++The unchanged forward-only `test_copysign` and `test_copysign_exact` methods
++now pass, including their three non-scalar broadcast layouts and all 49 pairs
++drawn from `-1`, signed zero, `1`, signed infinity, and NaN. Together with the
++new hardware regression they pass **3/3 in 4.93 seconds**. The complete
++Rockchip hardware file is now **72/72 passing in 243.65 seconds**, with the
++same 11 expected numerical warnings.
++
++Tinygrad lowers copysign to `abs(a) * WHERE(signbit(b), -1, 1)`, where
++`signbit(b)` tests both `b<0` and `reciprocal(b)<0` to distinguish negative
++zero. The strict root recognizer verifies this complete tree, then encodes the
++output, magnitude, and sign broadcast indices as compact postfix integer
++programs. The tagged host runtime does no floating-point work: it clears the
++fp16/fp32 magnitude sign bit and ORs in the sign operand's bit. This preserves
++signed zero, infinity, and NaN payload magnitude exactly while supporting
++real broadcasting rather than flat cyclic repetition.
++
++The path is intentionally not a generic WHERE fallback; unrelated MUL/WHERE
++graphs continue to their existing NPU classifiers. No LUT documentation
++change is needed. Mypy remains at 13 pre-existing findings and targeted Ruff
++at five pre-existing findings. The reusable patch is
++`rockchip-exact-copysign-61bd9388d.patch`, against parent `61bd9388d`.
++
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index e0345dce9..7e1ab1fd2 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -126,6 +126,14 @@ class TestDPU(unittest.TestCase):
+     a = Tensor(a_np, device="ROCKCHIP").realize()
+     np.testing.assert_array_equal(a.sign().realize().numpy(), np.sign(a_np))
+ 
++  def test_dpu_copysign_exact(self):
++    magnitude = np.array([[-np.inf],[-2.5],[-0.0],[np.nan]], dtype=np.float32)
++    sign = np.array([[0.0,-0.0,np.inf,-np.inf]], dtype=np.float32)
++    actual = Tensor(magnitude, device="ROCKCHIP").copysign(Tensor(sign, device="ROCKCHIP")).realize().numpy()
++    expected = np.copysign(magnitude, sign)
++    np.testing.assert_array_equal(actual, expected)
++    np.testing.assert_array_equal(np.signbit(actual), np.signbit(expected))
++
+   def test_dpu_rounding(self):
+     a_np = np.array([-8.75,-2,-0.5,-0.0,0,0.5,3.75,8], dtype=np.float16)
+     a = Tensor(a_np, device="ROCKCHIP").realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 6d75e1939..04c7e1d7f 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -122,6 +122,13 @@ two-byte write into a four-byte output. The legacy staged NPU truncation is
+ preserved for nested expressions. The full hardware file remains **71/71
+ passing in 244.55 seconds**.
+ 
++`test_copysign` and `test_copysign_exact` are now fixed. The strict host
++classifier recognizes tinygrad's complete `abs(a)*signbit(b)` expansion,
++encodes all three broadcast index expressions, and transfers the sign bit
++without floating-point arithmetic. The official pair plus permanent special
++value/broadcast regression passes **3/3 in 4.93 seconds**. The complete
++hardware file is now **72/72 passing in 243.65 seconds**.
++
+ ## Summary
+ 
+ | Status | Count |
+@@ -242,6 +249,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are
+ - atan, including ordinary `[-2,2]` and finite `±300` ranges
+ - atanh, including exact domain boundaries and invalid-domain NaN
+ - asinh and acosh, including finite ±300 and acosh domain masking
++- exact broadcast fp16/fp32 copysign, including signed zero and special values
+ - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
+ - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
+ - indexed movement for roll, cat/multicat, repeat, and repeat-interleave
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 0bcc41935..918afc65e 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -17,7 +17,7 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.runtime.support.rockchip import (build_native_program,
+   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
+-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT)
++  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT)
+ 
+ # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
+ def _pad_a(src, dst, M, K, align_in):
+@@ -155,6 +155,52 @@ def _run_host_trunc(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:
+   result = np.trunc(np.frombuffer(ctypes.string_at(source.va_addr, total * itemsize), dtype=dtype))
+   ctypes.memmove(output.va_addr, result.ctypes.data, total * itemsize)  # type: ignore[arg-type]
+ 
++def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Copy a broadcast sign bit onto the magnitude operand without floating-point arithmetic."""
++  total, tag, dtype_code, n_ranges, *meta = task.layout
++  assert tag == _HOST_COPYSIGN_LAYOUT and len(relocs) == 3
++  extents, cursor = meta[:n_ranges], n_ranges
++  codes = []
++  for _ in range(3):
++    code_n = meta[cursor]
++    codes.append(meta[cursor+1:cursor+1+code_n])
++    cursor += code_n+1
++
++  def evaluate(code, coords):
++    stack:list[int] = []
++    for pos in range(0, len(code), 2):
++      op, arg = code[pos], code[pos+1]
++      if op == 0: stack.append(arg)
++      elif op == 1: stack.append(coords[arg])
++      elif op == 11:
++        false, true, cond = stack.pop(), stack.pop(), stack.pop()
++        stack.append(true if cond else false)
++      else:
++        rhs, lhs = stack.pop(), stack.pop()
++        if op == 2: stack.append(lhs + rhs)
++        elif op == 3: stack.append(lhs * rhs)
++        elif op == 4: stack.append(lhs // rhs)
++        elif op == 5: stack.append(lhs % rhs)
++        elif op == 6: stack.append(int(lhs < rhs))
++        elif op == 7: stack.append(int(lhs != rhs))
++        elif op == 8: stack.append(int(bool(lhs) and bool(rhs)))
++        elif op == 9: stack.append(int(bool(lhs) or bool(rhs)))
++        else: raise RuntimeError(f"rk: invalid host copysign index opcode {op}")
++    assert len(stack) == 1
++    return stack[0]
++
++  itemsize, ctype, sign_mask = (2, ctypes.c_uint16, 0x8000) if dtype_code == 0 else (4, ctypes.c_uint32, 0x80000000)
++  output, magnitude, sign = (bufs[r.globals_slot] for r in relocs)
++  out_ptr, magnitude_ptr, sign_ptr = (ctypes.cast(buf.va_addr, ctypes.POINTER(ctype)) for buf in (output, magnitude, sign))
++  for linear in range(total):
++    rem, coords = linear, [0] * n_ranges
++    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
++    out_index, magnitude_index, sign_index = (evaluate(code, coords) for code in codes)
++    if not 0 <= out_index < output.size // itemsize: raise RuntimeError(f"rk: host copysign output index out of bounds {out_index}")
++    if not 0 <= magnitude_index < magnitude.size // itemsize: raise RuntimeError(f"rk: host copysign magnitude index out of bounds {magnitude_index}")
++    if not 0 <= sign_index < sign.size // itemsize: raise RuntimeError(f"rk: host copysign sign index out of bounds {sign_index}")
++    out_ptr[out_index] = (magnitude_ptr[magnitude_index] & ~sign_mask) | (sign_ptr[sign_index] & sign_mask)
++
+ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute a compact postfix integer-index program and copy exact element bytes."""
+   total, tag, itemsize, n_ranges, *meta = task.layout
+@@ -462,6 +508,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
+           _run_host_trunc(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
++          _run_host_copysign(task, st.relocs, bufs)
++          continue
+         if task.is_fill:
+           total = task.layout[0]
+           out_slot = st.relocs[0].globals_slot
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 67c78df4e..b4264b28b 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -169,6 +169,7 @@ _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
+ _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
+ _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
+ _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
++_HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
+ 
+ def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
+   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
+@@ -6022,6 +6023,82 @@ def _try_trunc_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
++def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Recognize tinygrad's abs(a)*signbit(b) expansion and copy the exact sign bit."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  output, val = store.src
++  if output.op is not Ops.INDEX or val.op is not Ops.MUL or val.dtype not in (dtypes.half, dtypes.float): return None
++
++  def sign_source(u:UOp) -> UOp|None:
++    u = _unwrap(u)
++    if u.op is not Ops.WHERE or len(u.src) != 3: return None
++    cond, negative, positive = u.src
++    if cond.op is not Ops.OR or negative.op is not Ops.CONST or positive.op is not Ops.CONST: return None
++    if float(negative.arg) != -1.0 or float(positive.arg) != 1.0: return None
++    direct = reciprocal = None
++    for compare in cond.src:
++      if compare.op is not Ops.CMPLT or compare.src[1].op is not Ops.CONST or float(compare.src[1].arg) != 0.0: return None
++      lhs = _unwrap(compare.src[0])
++      if lhs.op is Ops.INDEX: direct = lhs
++      elif lhs.op is Ops.RECIPROCAL and _unwrap(lhs.src[0]).op is Ops.INDEX: reciprocal = _unwrap(lhs.src[0])
++      else: return None
++    if direct is None or reciprocal is None or direct.src[0].buf_uop.arg.slot != reciprocal.src[0].buf_uop.arg.slot: return None
++    return direct if direct.src[1] is reciprocal.src[1] else None
++
++  magnitude = sign = magnitude_index = sign_index = None
++  for candidate_magnitude, candidate_sign in (val.src, val.src[::-1]):
++    if _try_abs(_unwrap(candidate_magnitude)) is None or (candidate_sign_index := sign_source(candidate_sign)) is None: continue
++    candidate_magnitude = _unwrap(candidate_magnitude)
++    candidate_magnitude_index = next((_unwrap(x) for x in candidate_magnitude.src if _unwrap(x).op is Ops.INDEX), None)
++    if candidate_magnitude_index is None: continue
++    magnitude, sign, magnitude_index, sign_index = candidate_magnitude, candidate_sign, candidate_magnitude_index, candidate_sign_index
++    break
++  if magnitude is None or sign is None or magnitude_index is None or sign_index is None: return None
++  if any(x.dtype is not val.dtype for x in (output, magnitude_index, sign_index)): return None
++
++  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
++  range_ids = {u:i for i,u in enumerate(ranges)}
++  extents = tuple(int(u.src[0].arg) for u in ranges)
++  total = prod(extents)
++  if total != prod(_shape_of_store(sink)): return None
++  int_codes = {Ops.ADD:2, Ops.MUL:3, Ops.FLOORDIV:4, Ops.FLOORMOD:5,
++               Ops.CMPLT:6, Ops.CMPNE:7, Ops.AND:8, Ops.OR:9}
++
++  def emit_int(u:UOp, code:list[int]) -> bool:
++    while u.op is Ops.CAST: u = u.src[0]
++    if u.op is Ops.CONST:
++      try: value = int(u.arg)
++      except (TypeError, ValueError): return False
++      code.extend((0, value))
++      return True
++    if u.op is Ops.RANGE and u in range_ids:
++      code.extend((1, range_ids[u]))
++      return True
++    if u.op in int_codes and len(u.src) == 2:
++      if not emit_int(u.src[0], code) or not emit_int(u.src[1], code): return False
++      code.extend((int_codes[u.op], 0))
++      return True
++    if u.op is Ops.WHERE and len(u.src) == 3:
++      if not all(emit_int(x, code) for x in u.src): return False
++      code.extend((11, 0))
++      return True
++    return False
++
++  out_code:list[int] = []
++  magnitude_code:list[int] = []
++  sign_code:list[int] = []
++  if not all((emit_int(output.src[1], out_code), emit_int(magnitude_index.src[1], magnitude_code),
++              emit_int(sign_index.src[1], sign_code))): return None
++  dtype_code, out_slot = (0 if val.dtype is dtypes.half else 1), ProgramInfo.from_sink(sink).outs[0]
++  layout = (total, _HOST_COPYSIGN_LAYOUT, dtype_code, len(extents), *extents,
++            len(out_code), *out_code, len(magnitude_code), *magnitude_code, len(sign_code), *sign_code)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  slots = (out_slot, magnitude_index.src[0].buf_uop.arg.slot, sign_index.src[0].buf_uop.arg.slot)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
++  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
++  return (RKSubTask(cmds, task, relocs),)
++
+ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
+   store = _store_node(sink)
+@@ -6408,6 +6485,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
+   if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
++  if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
+   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
+   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
+   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)

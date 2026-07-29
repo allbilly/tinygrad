@@ -5129,6 +5129,30 @@ operations and exact float32 truncation special/range values. Mypy remains at
 The reusable patch for this milestone is
 `rockchip-exact-trunc-1a2cd5724.patch`, against parent `1a2cd5724`.
 
+## 2026-07-29 — exact broadcast copysign milestone
+
+The unchanged forward-only `test_copysign` and `test_copysign_exact` methods
+now pass, including their three non-scalar broadcast layouts and all 49 pairs
+drawn from `-1`, signed zero, `1`, signed infinity, and NaN. Together with the
+new hardware regression they pass **3/3 in 4.93 seconds**. The complete
+Rockchip hardware file is now **72/72 passing in 243.65 seconds**, with the
+same 11 expected numerical warnings.
+
+Tinygrad lowers copysign to `abs(a) * WHERE(signbit(b), -1, 1)`, where
+`signbit(b)` tests both `b<0` and `reciprocal(b)<0` to distinguish negative
+zero. The strict root recognizer verifies this complete tree, then encodes the
+output, magnitude, and sign broadcast indices as compact postfix integer
+programs. The tagged host runtime does no floating-point work: it clears the
+fp16/fp32 magnitude sign bit and ORs in the sign operand's bit. This preserves
+signed zero, infinity, and NaN payload magnitude exactly while supporting
+real broadcasting rather than flat cyclic repetition.
+
+The path is intentionally not a generic WHERE fallback; unrelated MUL/WHERE
+graphs continue to their existing NPU classifiers. No LUT documentation
+change is needed. Mypy remains at 13 pre-existing findings and targeted Ruff
+at five pre-existing findings. The reusable patch is
+`rockchip-exact-copysign-61bd9388d.patch`, against parent `61bd9388d`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

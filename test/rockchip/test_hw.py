@@ -126,6 +126,14 @@ class TestDPU(unittest.TestCase):
     a = Tensor(a_np, device="ROCKCHIP").realize()
     np.testing.assert_array_equal(a.sign().realize().numpy(), np.sign(a_np))
 
+  def test_dpu_copysign_exact(self):
+    magnitude = np.array([[-np.inf],[-2.5],[-0.0],[np.nan]], dtype=np.float32)
+    sign = np.array([[0.0,-0.0,np.inf,-np.inf]], dtype=np.float32)
+    actual = Tensor(magnitude, device="ROCKCHIP").copysign(Tensor(sign, device="ROCKCHIP")).realize().numpy()
+    expected = np.copysign(magnitude, sign)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(np.signbit(actual), np.signbit(expected))
+
   def test_dpu_rounding(self):
     a_np = np.array([-8.75,-2,-0.5,-0.0,0,0.5,3.75,8], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()

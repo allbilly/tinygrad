@@ -17,7 +17,7 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT)
+  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -154,6 +154,52 @@ def _run_host_trunc(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:
   output = bufs[relocs[0].globals_slot]
   result = np.trunc(np.frombuffer(ctypes.string_at(source.va_addr, total * itemsize), dtype=dtype))
   ctypes.memmove(output.va_addr, result.ctypes.data, total * itemsize)  # type: ignore[arg-type]
+
+def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Copy a broadcast sign bit onto the magnitude operand without floating-point arithmetic."""
+  total, tag, dtype_code, n_ranges, *meta = task.layout
+  assert tag == _HOST_COPYSIGN_LAYOUT and len(relocs) == 3
+  extents, cursor = meta[:n_ranges], n_ranges
+  codes = []
+  for _ in range(3):
+    code_n = meta[cursor]
+    codes.append(meta[cursor+1:cursor+1+code_n])
+    cursor += code_n+1
+
+  def evaluate(code, coords):
+    stack:list[int] = []
+    for pos in range(0, len(code), 2):
+      op, arg = code[pos], code[pos+1]
+      if op == 0: stack.append(arg)
+      elif op == 1: stack.append(coords[arg])
+      elif op == 11:
+        false, true, cond = stack.pop(), stack.pop(), stack.pop()
+        stack.append(true if cond else false)
+      else:
+        rhs, lhs = stack.pop(), stack.pop()
+        if op == 2: stack.append(lhs + rhs)
+        elif op == 3: stack.append(lhs * rhs)
+        elif op == 4: stack.append(lhs // rhs)
+        elif op == 5: stack.append(lhs % rhs)
+        elif op == 6: stack.append(int(lhs < rhs))
+        elif op == 7: stack.append(int(lhs != rhs))
+        elif op == 8: stack.append(int(bool(lhs) and bool(rhs)))
+        elif op == 9: stack.append(int(bool(lhs) or bool(rhs)))
+        else: raise RuntimeError(f"rk: invalid host copysign index opcode {op}")
+    assert len(stack) == 1
+    return stack[0]
+
+  itemsize, ctype, sign_mask = (2, ctypes.c_uint16, 0x8000) if dtype_code == 0 else (4, ctypes.c_uint32, 0x80000000)
+  output, magnitude, sign = (bufs[r.globals_slot] for r in relocs)
+  out_ptr, magnitude_ptr, sign_ptr = (ctypes.cast(buf.va_addr, ctypes.POINTER(ctype)) for buf in (output, magnitude, sign))
+  for linear in range(total):
+    rem, coords = linear, [0] * n_ranges
+    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+    out_index, magnitude_index, sign_index = (evaluate(code, coords) for code in codes)
+    if not 0 <= out_index < output.size // itemsize: raise RuntimeError(f"rk: host copysign output index out of bounds {out_index}")
+    if not 0 <= magnitude_index < magnitude.size // itemsize: raise RuntimeError(f"rk: host copysign magnitude index out of bounds {magnitude_index}")
+    if not 0 <= sign_index < sign.size // itemsize: raise RuntimeError(f"rk: host copysign sign index out of bounds {sign_index}")
+    out_ptr[out_index] = (magnitude_ptr[magnitude_index] & ~sign_mask) | (sign_ptr[sign_index] & sign_mask)
 
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute a compact postfix integer-index program and copy exact element bytes."""
@@ -461,6 +507,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
           _run_host_trunc(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
+          _run_host_copysign(task, st.relocs, bufs)
           continue
         if task.is_fill:
           total = task.layout[0]
