@@ -962,3 +962,23 @@ rejection in 55.21 seconds, and PR1 remains **79/79 in 6.49 seconds**.  No
 host operator fallback is involved.
 
 Recovery patch: `rockchip-pow-base55-two-level-c9b0426f8.patch`.
+
+### Negative constant-base parity milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `(-5.5)**x`, official inputs | **passing** | roundoff LUT + DPU validity/parity |
+| dense 513-point `[-2,2]` sweep | **passing** | integer signs and fractional NaNs |
+| `8.0**x` | 1,340/2,925 tolerance misses | next POW subgroup |
+
+The strict matcher reuses the positive `5.5**x` magnitude, truncates `x` and
+`x/2` with the native RK roundoff LUT, and computes oddness as
+`abs(trunc(x)-2*trunc(trunc(x)/2))`.  DPU comparisons identify nonintegers,
+and a DPU `0/0` factor restores NaN.  It does not use host truncation,
+buffer-level cast arithmetic, or `run_host`.
+
+The negative- and positive-base permanent sweeps pass **2/2 in 14.62
+seconds**.  The official method advances to `8.0**x` in 63.69 seconds, and
+PR1 remains **79/79 in 6.51 seconds**.
+
+Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.

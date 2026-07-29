@@ -1,0 +1,271 @@
+diff --git a/lut.md b/lut.md
+index 2abdf0f46..699af0e75 100644
+--- a/lut.md
++++ b/lut.md
+@@ -1885,6 +1885,37 @@ below TestOps' `0.001` limit.  Debug with
+ `ROCKCHIP_DEBUG_POW_BASE55_STAGE=1..4` for low, encoded high, decoded high,
+ and the selected result.
+ 
++## Negative constant base: parity with the roundoff LUT
++
++The negative-base power expansion needs truncation for two purposes:
++integer validity and parity.  Do not use the buffer-level truncation flag;
++that converts data outside the NPU.  The RK roundoff LUT can build exact
++truncation from native tasks:
++
++1. apply the round-to-nearest-even LUT to `abs(x)`;
++2. compare `rounded > abs(x)`;
++3. subtract that boolean overshoot;
++4. restore the original sign with positive/negative DPU masks.
++
++Apply this sequence to `x` and to `trunc(x)/2`.  Then:
++
++```text
++remainder = trunc(x) - 2*trunc(trunc(x)/2)
++odd       = abs(remainder)
++sign      = 1 - 2*odd
++```
++
++For a half-representable integer, the remainder is `-1`, `0`, or `1`.
++At magnitudes where fp16 spacing exceeds one, every representable finite
++value is already an even integer, so the same construction remains valid.
++
++Two directional comparisons between `x` and `trunc(x)` form the
++`noninteger` mask.  Multiplying the signed positive-base magnitude by
++`(1-noninteger)/(1-noninteger)` preserves integer results and produces NaN
++for fractional exponents without placing a literal NaN in an arithmetic
++selector.  A 513-point sweep across `[-2,2]` covers all integer transitions
++in the official range and passes unchanged.
++
+ ## Commit checklist
+ 
+ - The intended graph is recognized after all pre-rewrites.
+diff --git a/progress.md b/progress.md
+index f08cc29cc..64800995f 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6811,3 +6811,48 @@ integer and whether it is odd.  It will use the existing DPU roundoff LUT
+ and DPU masks rather than CPU/run_host arithmetic.
+ 
+ Recovery patch: `rockchip-pow-base55-two-level-c9b0426f8.patch`.
++
++## 2026-07-30 — negative constant-base POW parity
++
++Tinygrad expands `(-5.5)**x` into three nested WHERE expressions:
++
++1. compare `x` with `cast(cast(x,int),half)` and return NaN for a
++   noninteger exponent;
++2. compute integer parity with `abs(int(x)) % 2`;
++3. select `-5.5**x` for odd integers and `+5.5**x` for even integers.
++
++The generic arithmetic-WHERE lowerer could not accept this mixed
++cast/FLOORMOD graph.  A strict matcher now reuses the proven positive
++constant-base magnitude and derives validity/parity entirely on NPU:
++
++1. truncate `x` with the native RK roundoff LUT, then subtract the one-unit
++   overshoot when round-to-nearest exceeded `abs(x)`;
++2. truncate `x/2` with the same LUT;
++3. compute `remainder = trunc(x) - 2*trunc(trunc(x)/2)`;
++4. use `abs(remainder)` as the odd mask;
++5. compare the original exponent with `trunc(x)` for integer validity;
++6. multiply the signed magnitude by
++   `(1-noninteger)/(1-noninteger)` to synthesize NaN only for fractions.
++
++This deliberately does not use `_emit_trunc_stage`, buffer conversion, CPU
++casts, or `run_host`.  Both truncations are LUT tasks and every correction,
++comparison, parity operation, sign choice, and NaN factor is a DPU task.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- permanent 513-point parity/domain sweep plus the positive-base sweep:
++  **2/2 passing in 14.62 seconds**;
++- integer spot checks `[-2,-1,0,1,2]` and half-integer NaN checks: passing;
++- official `TestOps.test_pow_const`: `(-5.5)**x` passes and the method
++  reaches the separate `8.0**x` accuracy failure in **63.69 seconds**;
++- hardware-free PR1 contract: **79/79 passing in 6.51 seconds**;
++- pycompile and `git diff --check`: passing;
++- mypy remains at the same 13 pre-existing Rockchip errors.
++
++The next subgroup is positive constant-base eight.  Its current single
++scaled EXP2 table clips many positive lanes at 32 and misses 1,340/2,925
++values, with maximum relative error `0.5`.
++
++Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index f1eb8bac5..3234cb592 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -339,6 +339,13 @@ class TestDPU(unittest.TestCase):
+     expected = np.power(np.float32(5.5), exponent.astype(np.float32)).astype(np.float16)
+     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+ 
++  def test_dpu_pow_neg_base55_parity(self):
++    exponent = np.linspace(-2, 2, 513, dtype=np.float32).astype(np.float16)
++    actual = ((-5.5) ** Tensor(exponent, device="ROCKCHIP")).realize().numpy()
++    with np.errstate(all="ignore"):
++      expected = np.power(np.float32(-5.5), exponent.astype(np.float32)).astype(np.float16)
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
++
+   def test_dpu_log2_two_lut_normalization(self):
+     boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
+                            0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 76d9fb9ff..9af2fb7e8 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -962,3 +962,23 @@ rejection in 55.21 seconds, and PR1 remains **79/79 in 6.49 seconds**.  No
+ host operator fallback is involved.
+ 
+ Recovery patch: `rockchip-pow-base55-two-level-c9b0426f8.patch`.
++
++### Negative constant-base parity milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `(-5.5)**x`, official inputs | **passing** | roundoff LUT + DPU validity/parity |
++| dense 513-point `[-2,2]` sweep | **passing** | integer signs and fractional NaNs |
++| `8.0**x` | 1,340/2,925 tolerance misses | next POW subgroup |
++
++The strict matcher reuses the positive `5.5**x` magnitude, truncates `x` and
++`x/2` with the native RK roundoff LUT, and computes oddness as
++`abs(trunc(x)-2*trunc(trunc(x)/2))`.  DPU comparisons identify nonintegers,
++and a DPU `0/0` factor restores NaN.  It does not use host truncation,
++buffer-level cast arithmetic, or `run_host`.
++
++The negative- and positive-base permanent sweeps pass **2/2 in 14.62
++seconds**.  The official method advances to `8.0**x` in 63.69 seconds, and
++PR1 remains **79/79 in 6.51 seconds**.
++
++Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 712578fd3..28e32a709 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4987,6 +4987,116 @@ def _try_pow_base55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   dependent(out, (selected,0), (fallback,0), Ops.ADD)
+   return tuple(tasks)
+ 
++def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate (-5.5)**x with DPU truncation, integer validity, and parity."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++  value = _unwrap(store.src[1])
++  if value.op is not Ops.WHERE or len(value.src) != 3: return None
++  nodes = value.toposort()
++  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
++  exponentials = [u for u in nodes if u.op is Ops.EXP2 and len(u.src) == 1]
++  if len(indexes) != 1 or len(exponentials) != 1 or sum(u.op is Ops.WHERE for u in nodes) != 3: return None
++  source, exponential = indexes[0], exponentials[0]
++  product = _unwrap(exponential.src[0])
++  scales = [float(u.arg) for u in product.src if u.op is Ops.CONST] if product.op is Ops.MUL else []
++  if len(scales) != 1 or abs(scales[0]-math.log2(5.5)) > 1e-3 or source not in product.toposort(): return None
++  outer_condition = _unwrap(value.src[0])
++  if outer_condition.op is not Ops.CMPNE or source not in outer_condition.toposort(): return None
++  if not any(u.op is Ops.CONST and isinstance(u.arg, float) and math.isnan(float(u.arg)) for u in nodes): return None
++  if not any(u.op is Ops.CONST and float(u.arg) == -1.0 for u in nodes): return None
++
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  if int(source.src[0].src[0].arg) != total: return None
++  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
++  next_slot = max(info.globals, default=-1)+1
++  tasks:list[RKSubTask] = []
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++
++  def scalar(number:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
++
++  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
++    diff, mask = alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
++                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
++    return mask, 0
++
++  def temp_index(slot:int) -> UOp:
++    out_index = store.src[0]
++    return out_index.replace(dtype=dtypes.half,
++      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
++
++  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
++    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
++
++  # Reuse the proven positive-base magnitude path in a scratch output slot.
++  magnitude_slot = alloc()
++  magnitude_tasks = _try_pow_base55_lut_subtasks(stage_sink(exponential, magnitude_slot))
++  if magnitude_tasks is None: return None
++  tasks.extend(magnitude_tasks)
++  used_slots = [task.task.out_slot for task in magnitude_tasks] + \
++    [reloc.globals_slot for task in magnitude_tasks for reloc in task.relocs
++     if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++  next_slot = max(next_slot, max(used_slots, default=-1)+1)
++
++  def trunc_half(input_slot:int) -> int|None:
++    """Truncate a half scratch slot using only the native roundoff LUT and DPU masks."""
++    negative, magnitude, rounded = alloc(), alloc(), alloc()
++    dependent(negative, (_ZERO_SLOT,0), (input_slot,0), Ops.SUB)
++    dependent(magnitude, (input_slot,0), (negative,0), Ops.MAX)
++    roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(magnitude),), arg="rk_roundoff")
++    round_plan = plan_rk(stage_sink(roundoff, rounded))
++    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut": return None
++    cmds, task, relocs = emit_rk(round_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++
++    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
++    dependent(overshoot_diff, (rounded,0), (magnitude,0), Ops.SUB)
++    tasks.append(_emit_where_stage(total, overshoot, (overshoot_diff,0), (overshoot_diff,0), Ops.MAX, compare=True))
++    dependent(truncated_abs, (rounded,0), (overshoot,0), Ops.SUB)
++    positive = positive_mask((input_slot,0), (_ZERO_SLOT,0))
++    negative_mask = positive_mask((_ZERO_SLOT,0), (input_slot,0))
++    sign, result = alloc(), alloc()
++    dependent(sign, positive, negative_mask, Ops.SUB)
++    dependent(result, (truncated_abs,0), (sign,0), Ops.MUL)
++    return result
++
++  truncated = trunc_half(source_slot)
++  if truncated is None: return None
++  half = alloc()
++  dependent(half, (truncated,0), scalar(0.5), Ops.MUL)
++  half_truncated = trunc_half(half)
++  if half_truncated is None: return None
++
++  doubled, remainder, negative_remainder, odd = (alloc() for _ in range(4))
++  dependent(doubled, (half_truncated,0), scalar(2.0), Ops.MUL)
++  dependent(remainder, (truncated,0), (doubled,0), Ops.SUB)
++  dependent(negative_remainder, (_ZERO_SLOT,0), (remainder,0), Ops.SUB)
++  dependent(odd, (remainder,0), (negative_remainder,0), Ops.MAX)
++  twice_odd, sign = alloc(), alloc()
++  dependent(twice_odd, (odd,0), scalar(2.0), Ops.MUL)
++  dependent(sign, scalar(1.0), (twice_odd,0), Ops.SUB)
++
++  source_arg, truncated_arg = (source_slot,0), (truncated,0)
++  positive_fraction = positive_mask(source_arg, truncated_arg)
++  negative_fraction = positive_mask(truncated_arg, source_arg)
++  noninteger, valid_denom, valid_factor, signed = (alloc() for _ in range(4))
++  dependent(noninteger, positive_fraction, negative_fraction, Ops.ADD)
++  dependent(valid_denom, scalar(1.0), (noninteger,0), Ops.SUB)
++  dependent(valid_factor, (valid_denom,0), (valid_denom,0), Ops.FDIV)
++  dependent(signed, (magnitude_slot,0), (sign,0), Ops.MUL)
++  dependent(out, (signed,0), (valid_factor,0), Ops.MUL)
++  return tuple(tasks)
++
+ def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower fractional x**c through staged abs, LOG2, scale, and EXP2.
+ 
+@@ -9265,6 +9375,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, pow_neg55_tasks)
+   if (pow_base55_tasks := _try_pow_base55_lut_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, pow_base55_tasks)
++  if (pow_neg_base55_tasks := _try_pow_neg_base55_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, pow_neg_base55_tasks)
+   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fractional_pow_tasks)
+   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)

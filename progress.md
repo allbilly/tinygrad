@@ -6811,3 +6811,48 @@ integer and whether it is odd.  It will use the existing DPU roundoff LUT
 and DPU masks rather than CPU/run_host arithmetic.
 
 Recovery patch: `rockchip-pow-base55-two-level-c9b0426f8.patch`.
+
+## 2026-07-30 — negative constant-base POW parity
+
+Tinygrad expands `(-5.5)**x` into three nested WHERE expressions:
+
+1. compare `x` with `cast(cast(x,int),half)` and return NaN for a
+   noninteger exponent;
+2. compute integer parity with `abs(int(x)) % 2`;
+3. select `-5.5**x` for odd integers and `+5.5**x` for even integers.
+
+The generic arithmetic-WHERE lowerer could not accept this mixed
+cast/FLOORMOD graph.  A strict matcher now reuses the proven positive
+constant-base magnitude and derives validity/parity entirely on NPU:
+
+1. truncate `x` with the native RK roundoff LUT, then subtract the one-unit
+   overshoot when round-to-nearest exceeded `abs(x)`;
+2. truncate `x/2` with the same LUT;
+3. compute `remainder = trunc(x) - 2*trunc(trunc(x)/2)`;
+4. use `abs(remainder)` as the odd mask;
+5. compare the original exponent with `trunc(x)` for integer validity;
+6. multiply the signed magnitude by
+   `(1-noninteger)/(1-noninteger)` to synthesize NaN only for fractions.
+
+This deliberately does not use `_emit_trunc_stage`, buffer conversion, CPU
+casts, or `run_host`.  Both truncations are LUT tasks and every correction,
+comparison, parity operation, sign choice, and NaN factor is a DPU task.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- permanent 513-point parity/domain sweep plus the positive-base sweep:
+  **2/2 passing in 14.62 seconds**;
+- integer spot checks `[-2,-1,0,1,2]` and half-integer NaN checks: passing;
+- official `TestOps.test_pow_const`: `(-5.5)**x` passes and the method
+  reaches the separate `8.0**x` accuracy failure in **63.69 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.51 seconds**;
+- pycompile and `git diff --check`: passing;
+- mypy remains at the same 13 pre-existing Rockchip errors.
+
+The next subgroup is positive constant-base eight.  Its current single
+scaled EXP2 table clips many positive lanes at 32 and misses 1,340/2,925
+values, with maximum relative error `0.5`.
+
+Recovery patch: `rockchip-pow-neg-base55-parity-31af99059.patch`.

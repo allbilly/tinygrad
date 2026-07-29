@@ -1885,6 +1885,37 @@ below TestOps' `0.001` limit.  Debug with
 `ROCKCHIP_DEBUG_POW_BASE55_STAGE=1..4` for low, encoded high, decoded high,
 and the selected result.
 
+## Negative constant base: parity with the roundoff LUT
+
+The negative-base power expansion needs truncation for two purposes:
+integer validity and parity.  Do not use the buffer-level truncation flag;
+that converts data outside the NPU.  The RK roundoff LUT can build exact
+truncation from native tasks:
+
+1. apply the round-to-nearest-even LUT to `abs(x)`;
+2. compare `rounded > abs(x)`;
+3. subtract that boolean overshoot;
+4. restore the original sign with positive/negative DPU masks.
+
+Apply this sequence to `x` and to `trunc(x)/2`.  Then:
+
+```text
+remainder = trunc(x) - 2*trunc(trunc(x)/2)
+odd       = abs(remainder)
+sign      = 1 - 2*odd
+```
+
+For a half-representable integer, the remainder is `-1`, `0`, or `1`.
+At magnitudes where fp16 spacing exceeds one, every representable finite
+value is already an even integer, so the same construction remains valid.
+
+Two directional comparisons between `x` and `trunc(x)` form the
+`noninteger` mask.  Multiplying the signed positive-base magnitude by
+`(1-noninteger)/(1-noninteger)` preserves integer results and produces NaN
+for fractional exponents without placing a literal NaN in an arithmetic
+selector.  A 513-point sweep across `[-2,2]` covers all integer transitions
+in the official range and passes unchanged.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.
