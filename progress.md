@@ -4791,6 +4791,69 @@ sinh currently returns NaN for input infinities, while cosh returns infinity
 for NaN. This is the root-DPU-LUT nonfinite-input behavior and is not hidden by
 the finite test result.
 
+## 2026-07-29 — exact bitwise/shift forward milestone
+
+The unchanged Rockchip `TestOps` bitwise group now passes **9/9 in 8.06
+seconds**:
+
+```text
+test_xor, test_and, test_or, test_bitwise_not,
+test_lshift, test_rshift, test_lshift_signed,
+test_rshift_signed, test_int_or
+```
+
+The DPU elementwise block is floating-point oriented and does not expose a
+verified exact 32-bit bitwise configuration. The working path therefore
+encodes XOR/AND/OR/SHL/SHR as tagged `is_copy` tasks and evaluates them on the
+CPU through the already-mapped non-cacheable Rockchip buffers. Task metadata
+contains the logical element count, opcode, constant/input flags, signedness,
+and output dtype. Relocations retain the normal output-first ABI followed by
+each non-constant input. Operations preserve 32-bit wraparound; signed right
+shift is arithmetic, unsigned right shift is logical, shift counts are masked
+to five bits, and bool buffers remain byte-packed. Tinygrad's bool NOT lowering
+(`CMPNE(mask, True)`) is recognized as XOR with one.
+
+### Comparison regression found by the group
+
+The last `test_and` subcase, `(1 < x) & (x < 2)`, initially returned the
+repeatable stale-looking mask `[False, True, False, True]`. A fresh
+`Tensor([...])` check passed, while the unchanged test helper failed. Stage
+tracing made the difference visible:
+
+```text
+expected x - 1: [0.2, 0.2, 0.2, 2.2]
+observed first stage: [-1.0029, 0.8994, -1.0029, 0.8994]
+```
+
+`helper_test_op` round-trips explicit values through Torch/NumPy and therefore
+provides a float32 buffer even under `DEFAULT_FLOAT=HALF`. The generic
+comparison path had no `fp32_inputs` metadata, so the NPU runtime consumed the
+low and high 16-bit words of each float32 value as alternating fp16 lanes.
+`data_arg` now reports fp32 slots and the first CMPLT subtraction stage requests
+the established fp32-to-fp16 buffer conversion. Constants and scratch masks
+remain fp16. This also covers comparisons between two fp32 buffers rather than
+assuming a single source.
+
+The useful debug recipe was to wrap `_submit_multi`, print each subtask's
+output slot/relocations, and decode each scratch output as fp16 immediately
+after its reset-separated submission. Printing only the final boolean output
+looked like allocator or NPU-state contamination; inspecting the first
+subtraction proved it was an input-width mismatch.
+
+The first complete hardware run after this change reported the two established
+fill failures plus one tuple-unpack regression in bool minimum (**67 passed, 3
+failed in 208.73 seconds**). The unpack was updated for the additional fp32
+metadata field, and `test_dpu_typed_minimum_boundaries` then passed in 1.31
+seconds. The clean full-file rerun returned to **68 passed, 2 failed in 206.54
+seconds**; only fill-full and fill-zero remain.
+
+The hardware-free classifier baseline remains **68 passed, 4 failed** (three
+stale mean-rejection expectations and one stale fp32-rejection expectation).
+Mypy remains at the same 13 pre-existing Rockchip findings, and targeted system
+Ruff remains at the same five pre-existing findings; `.venv` still has no Ruff
+module. `rockchip-bitwise-host-80cf9f8e0.patch` is the standalone,
+reverse-apply-checked patch against parent `80cf9f8e0`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

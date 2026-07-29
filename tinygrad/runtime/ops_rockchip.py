@@ -16,7 +16,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
-  encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask, _CONST_SLOT, _ZERO_SLOT)
+  encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
+  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -104,6 +105,43 @@ def _unpack_cmac_out(src, dst, M, N, align_out):
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   for i in range(M * N):
     d[i] = _fp32_to_fp16(s[(i // N) * align_out + i % N])
+
+def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Execute a tagged exact int32/uint32/bool bitwise task on mapped buffers."""
+  total, tag, op, lhs_const, lhs_value, lhs_dtype, rhs_const, rhs_value, rhs_dtype, out_dtype = task.layout
+  assert tag == _HOST_BITWISE_LAYOUT
+  slot_iter = iter(r.globals_slot for r in relocs[1:])
+
+  def reader(is_const:int, value:int, dtype:int):
+    if is_const: return lambda _: value & 0xFFFFFFFF
+    buf = bufs[next(slot_iter)]
+    itemsize = 1 if dtype == 2 else 4
+    count = max(1, buf.size // itemsize)
+    if dtype == 0:
+      int_ptr = ctypes.cast(buf.va_addr, ctypes.POINTER(ctypes.c_int32))
+      return lambda i: int(int_ptr[i % count]) & 0xFFFFFFFF
+    if dtype == 1:
+      uint_ptr = ctypes.cast(buf.va_addr, ctypes.POINTER(ctypes.c_uint32))
+      return lambda i: int(uint_ptr[i % count])
+    bool_ptr = ctypes.cast(buf.va_addr, ctypes.POINTER(ctypes.c_uint8))
+    return lambda i: int(bool(bool_ptr[i % count]))
+
+  lhs, rhs = reader(lhs_const, lhs_value, lhs_dtype), reader(rhs_const, rhs_value, rhs_dtype)
+  out = bufs[relocs[0].globals_slot]
+  for i in range(total):
+    a, b = lhs(i), rhs(i)
+    if op == 0: result = a ^ b
+    elif op == 1: result = a & b
+    elif op == 2: result = a | b
+    elif op == 3: result = (a << (b & 31)) & 0xFFFFFFFF
+    elif lhs_dtype == 0:
+      signed = a if a < 1 << 31 else a-(1 << 32)
+      result = (signed >> (b & 31)) & 0xFFFFFFFF
+    else: result = a >> (b & 31)
+    if out_dtype == 2: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint8))[i] = bool(result)
+    elif out_dtype == 0:
+      ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_int32))[i] = result if result < 1 << 31 else result-(1 << 32)
+    else: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint32))[i] = result
 
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
@@ -352,6 +390,9 @@ class RockchipProgram(Program['RockchipDevice']):
     if all(st.task.is_copy or st.task.is_fill for st in subtasks):
       for st in subtasks:
         task = st.task
+        if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+          _run_host_bitwise(task, st.relocs, bufs)
+          continue
         if task.is_fill:
           total = task.layout[0]
           out_slot = st.relocs[0].globals_slot

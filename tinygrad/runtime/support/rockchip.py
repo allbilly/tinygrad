@@ -166,6 +166,7 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
   return None
 _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
 _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
+_HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
 
 def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
@@ -3409,17 +3410,17 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                    int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
                                    bool_output=bool_output))
 
-  def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
+  def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
     u = _unwrap(u)
     if (arg := _where_arg(u)) is None: return None
     if u.op is Ops.CONST:
       if isinstance(u.arg, (float, np.floating)) and math.isinf(float(u.arg)):
         normalized = math.copysign(65504.0, float(u.arg))
         arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', normalized))[0])
-      return arg, (), (), ()
+      return arg, (), (), (), ()
     slot, source_n = arg[0], int(u.src[0].src[0].arg)
     return arg, ((slot,) if u.dtype is dtypes.bool else ()), \
-      ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ())
+      ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ()), ((slot,) if u.dtype is dtypes.float else ())
 
   # Direct boolean OR/AND (including maximum lowered to OR) operates on
   # byte-packed buffers rather than freshly materialized comparison masks.
@@ -3440,12 +3441,13 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       lhs_info, rhs_info = (data_arg(x) for x in u.src)
       if lhs_info is None or rhs_info is None: return None
       lhs, rhs = lhs_info[0], rhs_info[0]
-      bool_inputs, int32_inputs, broadcasts = (tuple(dict.fromkeys(lhs_info[i] + rhs_info[i])) for i in range(1, 4))
+      bool_inputs, int32_inputs, broadcasts, fp32_inputs = \
+        (tuple(dict.fromkeys(lhs_info[i] + rhs_info[i])) for i in range(1, 5))
       comparison_inputs = tuple(dict.fromkeys(x[0] for x in (lhs, rhs) if x[0] not in (_CONST_SLOT, _ZERO_SLOT)))
       diff, mask = alloc(), alloc()
       tasks.extend((_emit_where_stage(total, diff, rhs, lhs, Ops.SUB, bool_inputs=bool_inputs,
                                       int32_inputs=int32_inputs, broadcast_inputs=broadcasts,
-                                      comparison_inputs=comparison_inputs),
+                                      comparison_inputs=comparison_inputs, fp32_inputs=fp32_inputs),
                     _emit_where_stage(total, mask, (diff, 0), (diff, 0), Ops.MAX, compare=True)))
       return (mask, 0)
     if u.op is Ops.CMPNE:
@@ -3456,7 +3458,7 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
           if logical_u.op is Ops.INDEX and logical_u.dtype is dtypes.bool:
             logical_info = data_arg(logical_u)
             if logical_info is None: return None
-            mask_arg, bool_inputs, int32_inputs, broadcasts = logical_info
+            mask_arg, bool_inputs, int32_inputs, broadcasts, _ = logical_info
           else:
             lowered_mask = lower(logical)
             if lowered_mask is None: return None
@@ -5186,6 +5188,50 @@ def decode_rk_multi(data: bytes) -> list[RKSubTask]:
     result.append(RKSubTask(tuple(cmds), task, tuple(relocs)))
   return result
 
+def _try_bitwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower exact int32/uint32/bool bitwise ops to a tagged host task."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  raw, val = store.src[1], _unwrap(store.src[1])
+  op_codes = {Ops.XOR:0, Ops.AND:1, Ops.OR:2, Ops.SHL:3, Ops.SHR:4}
+  op = val.op
+  if op is Ops.CMPNE and val.dtype is dtypes.bool:
+    # bool bitwise_not lowers to CMPNE(index, True).
+    lhs, rhs = val.src
+    if rhs.op is not Ops.CONST: lhs, rhs = rhs, lhs
+    if rhs.op is not Ops.CONST or not bool(rhs.arg) or _unwrap(lhs).op is not Ops.INDEX: return None
+    val, op = UOp(Ops.XOR, dtypes.bool, (_unwrap(lhs), UOp.const(dtypes.bool, True))), Ops.XOR
+  if op not in op_codes or len(val.src) != 2: return None
+
+  def dtype_code(dtype:DType) -> int|None:
+    if dtype is dtypes.int: return 0
+    if dtype is dtypes.uint: return 1
+    if dtype is dtypes.bool: return 2
+    return None
+  operands:list[tuple[bool,int,int,int]] = []
+  for operand in val.src:
+    operand = _unwrap(operand)
+    code = dtype_code(operand.dtype)
+    if code is None: return None
+    if operand.op is Ops.CONST:
+      const = int(operand.arg) & 0xFFFFFFFF
+      if const >= 1 << 31: const -= 1 << 32
+      operands.append((True, const, code, -1))
+    elif operand.op is Ops.INDEX:
+      operands.append((False, 0, code, operand.src[0].buf_uop.arg.slot))
+    else: return None
+  out_code = dtype_code(raw.dtype)
+  if out_code is None: return None
+  total, out_slot = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink).outs[0]
+  lhs_meta, rhs_meta = operands
+  layout = (total, _HOST_BITWISE_LAYOUT, op_codes[op], int(lhs_meta[0]), lhs_meta[1], lhs_meta[2],
+            int(rhs_meta[0]), rhs_meta[1], rhs_meta[2], out_code)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  slots = (out_slot, *(x[3] for x in operands if not x[0]))
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
+  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
+
 def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Detect binary EW with broadcast operand(s) and emit pre-expansion copy + EW tasks.
   Either or both operands may have broadcast dimensions (missing RANGE vars vs store).
@@ -5496,6 +5542,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+  if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)

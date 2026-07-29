@@ -60,6 +60,13 @@ A combined exp/exp2 run passes **2/2 in 19.95 seconds**.
 tables; sinh adds an amplified Q15 local table and near-zero identity. Their
 finite ±300 overflow tensors pass. The complete hardware baseline remains
 **68 passed, 2 failed in 207.61 seconds**.
+The exact bitwise/shift group now passes unchanged: **9/9 in 8.06 seconds**.
+XOR/AND/OR/SHL/SHR and bool NOT use tagged host tasks over mapped Rockchip
+buffers, preserving 32-bit signed/unsigned behavior and byte-wide bool output.
+The group also exposed and fixed missing `fp32_inputs` metadata in generic
+comparison stages; explicit Torch/NumPy values were otherwise read as
+alternating fp16 words. The complete hardware file remains **68 passed, 2
+failed in 206.54 seconds**, with only fill-full and fill-zero failing.
 
 ## Summary
 
@@ -83,7 +90,7 @@ finite ±300 overflow tensors pass. The complete hardware baseline remains
 | `RKPLAN_REJECT:unsupported_op:non_index_operand` | 20 | Non-index operand in store |
 | `RKPLAN_REJECT:cmac_exceeds_cbuf` | 18 | CMAC exceeds circular buffer |
 | `AssertionError: dtype` | 15 | dtype mismatch (fp16 vs fp32) |
-| `RKPLAN_REJECT:unsupported_op:Ops.XOR/OR/AND/SHL/SHR` | 14 | Bitwise ops not supported |
+| ~~`RKPLAN_REJECT:unsupported_op:Ops.XOR/OR/AND/SHL/SHR`~~ | ~~14~~ | Fixed after census: exact host task path passes all 9 methods |
 | `AssertionError: cmac` | 12 | CMAC sum classification failed |
 | `RKPLAN_REJECT:unsupported_op:Ops.MUL` | 12 | `REDUCE(MUL, ...)` not supported — product/cumprod/argmax/argmin (line 919 only handles ADD and MAX) |
 | `RKPLAN_REJECT:unsupported_op:Ops.ADD` | 6 | `REDUCE(ADD, ADD(...))` — reduce body is ADD not MUL/INDEX — cross_entropy/binary_crossentropy/nll_loss (line 901) |
@@ -112,10 +119,10 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 explicit gradient assertion. Gradients are outside the current
 `FORWARD_ONLY=1` scope.
 
-### 5. Bitwise ops — ~8 tests
-AND, OR, XOR, SHL, SHR, bitwise_not.
+### 5. Bitwise ops — fixed after census
 
-**Tests:** test_and, test_or, test_xor, test_lshift*, test_rshift*, test_bitwise_not, test_int_or
+AND, OR, XOR, SHL, SHR, bitwise_not, and int_or pass through the exact tagged
+host task path. The combined unchanged group passes 9/9.
 
 ### 6. Interpolate/upsample — ~10 tests
 All interpolate variants fail.
@@ -142,7 +149,6 @@ test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stac
 
 | Error | Count | Effort | Impact | Notes |
 |-------|-------|--------|--------|-------|
-| Bitwise (AND/OR/XOR/SHL/SHR) | 14 | **Low** | Low | Simple EW ops, just need register config like other EW |
 | `non_index_operand` | 20 | **Low** | Med | Store pattern recognition — handle more cases like pad did |
 | `fused_epilogue` | 36 | **Low-Med** | Med | Split fused ops into separate tasks |
 | `unsupported_dtype` | 58 | **Med** | High | Add fp32/int32 conversion paths (already have fp16↔fp32 infra) |
@@ -154,7 +160,7 @@ test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stac
 | `Ops.WHERE` | 196 | **High** | **Highest** | Used everywhere — host-side WHERE like pad, or DPU WHERE op |
 | `unsupported_layout` | 138 | **High** | High | Conv/pool/matmul 2D/3D DPU layouts — core NPU feature |
 
-**Suggested order:** Bitwise → non_index_operand → fused_epilogue → unsupported_dtype → WHERE → unsupported_layout
+**Suggested order:** non_index_operand → fused_epilogue → unsupported_dtype → WHERE → unsupported_layout
 
 The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are the big ones but hardest.
 
@@ -169,6 +175,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
   periodic angles through `±1,000,000`
 - exp and exp2, including integer scalar typing and IEEE specials
 - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
+- exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values

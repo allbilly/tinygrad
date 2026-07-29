@@ -1,0 +1,325 @@
+diff --git a/progress.md b/progress.md
+index 4fcd8c124..952cdc12c 100644
+--- a/progress.md
++++ b/progress.md
+@@ -4791,6 +4791,69 @@ sinh currently returns NaN for input infinities, while cosh returns infinity
+ for NaN. This is the root-DPU-LUT nonfinite-input behavior and is not hidden by
+ the finite test result.
+ 
++## 2026-07-29 — exact bitwise/shift forward milestone
++
++The unchanged Rockchip `TestOps` bitwise group now passes **9/9 in 8.06
++seconds**:
++
++```text
++test_xor, test_and, test_or, test_bitwise_not,
++test_lshift, test_rshift, test_lshift_signed,
++test_rshift_signed, test_int_or
++```
++
++The DPU elementwise block is floating-point oriented and does not expose a
++verified exact 32-bit bitwise configuration. The working path therefore
++encodes XOR/AND/OR/SHL/SHR as tagged `is_copy` tasks and evaluates them on the
++CPU through the already-mapped non-cacheable Rockchip buffers. Task metadata
++contains the logical element count, opcode, constant/input flags, signedness,
++and output dtype. Relocations retain the normal output-first ABI followed by
++each non-constant input. Operations preserve 32-bit wraparound; signed right
++shift is arithmetic, unsigned right shift is logical, shift counts are masked
++to five bits, and bool buffers remain byte-packed. Tinygrad's bool NOT lowering
++(`CMPNE(mask, True)`) is recognized as XOR with one.
++
++### Comparison regression found by the group
++
++The last `test_and` subcase, `(1 < x) & (x < 2)`, initially returned the
++repeatable stale-looking mask `[False, True, False, True]`. A fresh
++`Tensor([...])` check passed, while the unchanged test helper failed. Stage
++tracing made the difference visible:
++
++```text
++expected x - 1: [0.2, 0.2, 0.2, 2.2]
++observed first stage: [-1.0029, 0.8994, -1.0029, 0.8994]
++```
++
++`helper_test_op` round-trips explicit values through Torch/NumPy and therefore
++provides a float32 buffer even under `DEFAULT_FLOAT=HALF`. The generic
++comparison path had no `fp32_inputs` metadata, so the NPU runtime consumed the
++low and high 16-bit words of each float32 value as alternating fp16 lanes.
++`data_arg` now reports fp32 slots and the first CMPLT subtraction stage requests
++the established fp32-to-fp16 buffer conversion. Constants and scratch masks
++remain fp16. This also covers comparisons between two fp32 buffers rather than
++assuming a single source.
++
++The useful debug recipe was to wrap `_submit_multi`, print each subtask's
++output slot/relocations, and decode each scratch output as fp16 immediately
++after its reset-separated submission. Printing only the final boolean output
++looked like allocator or NPU-state contamination; inspecting the first
++subtraction proved it was an input-width mismatch.
++
++The first complete hardware run after this change reported the two established
++fill failures plus one tuple-unpack regression in bool minimum (**67 passed, 3
++failed in 208.73 seconds**). The unpack was updated for the additional fp32
++metadata field, and `test_dpu_typed_minimum_boundaries` then passed in 1.31
++seconds. The clean full-file rerun returned to **68 passed, 2 failed in 206.54
++seconds**; only fill-full and fill-zero remain.
++
++The hardware-free classifier baseline remains **68 passed, 4 failed** (three
++stale mean-rejection expectations and one stale fp32-rejection expectation).
++Mypy remains at the same 13 pre-existing Rockchip findings, and targeted system
++Ruff remains at the same five pre-existing findings; `.venv` still has no Ruff
++module. `rockchip-bitwise-host-80cf9f8e0.patch` is the standalone,
++reverse-apply-checked patch against parent `80cf9f8e0`.
++
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 129f99136..3d05e3704 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -60,6 +60,13 @@ A combined exp/exp2 run passes **2/2 in 19.95 seconds**.
+ tables; sinh adds an amplified Q15 local table and near-zero identity. Their
+ finite ±300 overflow tensors pass. The complete hardware baseline remains
+ **68 passed, 2 failed in 207.61 seconds**.
++The exact bitwise/shift group now passes unchanged: **9/9 in 8.06 seconds**.
++XOR/AND/OR/SHL/SHR and bool NOT use tagged host tasks over mapped Rockchip
++buffers, preserving 32-bit signed/unsigned behavior and byte-wide bool output.
++The group also exposed and fixed missing `fp32_inputs` metadata in generic
++comparison stages; explicit Torch/NumPy values were otherwise read as
++alternating fp16 words. The complete hardware file remains **68 passed, 2
++failed in 206.54 seconds**, with only fill-full and fill-zero failing.
+ 
+ ## Summary
+ 
+@@ -83,7 +90,7 @@ finite ±300 overflow tensors pass. The complete hardware baseline remains
+ | `RKPLAN_REJECT:unsupported_op:non_index_operand` | 20 | Non-index operand in store |
+ | `RKPLAN_REJECT:cmac_exceeds_cbuf` | 18 | CMAC exceeds circular buffer |
+ | `AssertionError: dtype` | 15 | dtype mismatch (fp16 vs fp32) |
+-| `RKPLAN_REJECT:unsupported_op:Ops.XOR/OR/AND/SHL/SHR` | 14 | Bitwise ops not supported |
++| ~~`RKPLAN_REJECT:unsupported_op:Ops.XOR/OR/AND/SHL/SHR`~~ | ~~14~~ | Fixed after census: exact host task path passes all 9 methods |
+ | `AssertionError: cmac` | 12 | CMAC sum classification failed |
+ | `RKPLAN_REJECT:unsupported_op:Ops.MUL` | 12 | `REDUCE(MUL, ...)` not supported — product/cumprod/argmax/argmin (line 919 only handles ADD and MAX) |
+ | `RKPLAN_REJECT:unsupported_op:Ops.ADD` | 6 | `REDUCE(ADD, ADD(...))` — reduce body is ADD not MUL/INDEX — cross_entropy/binary_crossentropy/nll_loss (line 901) |
+@@ -112,10 +119,10 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
+ explicit gradient assertion. Gradients are outside the current
+ `FORWARD_ONLY=1` scope.
+ 
+-### 5. Bitwise ops — ~8 tests
+-AND, OR, XOR, SHL, SHR, bitwise_not.
++### 5. Bitwise ops — fixed after census
+ 
+-**Tests:** test_and, test_or, test_xor, test_lshift*, test_rshift*, test_bitwise_not, test_int_or
++AND, OR, XOR, SHL, SHR, bitwise_not, and int_or pass through the exact tagged
++host task path. The combined unchanged group passes 9/9.
+ 
+ ### 6. Interpolate/upsample — ~10 tests
+ All interpolate variants fail.
+@@ -142,7 +149,6 @@ test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stac
+ 
+ | Error | Count | Effort | Impact | Notes |
+ |-------|-------|--------|--------|-------|
+-| Bitwise (AND/OR/XOR/SHL/SHR) | 14 | **Low** | Low | Simple EW ops, just need register config like other EW |
+ | `non_index_operand` | 20 | **Low** | Med | Store pattern recognition — handle more cases like pad did |
+ | `fused_epilogue` | 36 | **Low-Med** | Med | Split fused ops into separate tasks |
+ | `unsupported_dtype` | 58 | **Med** | High | Add fp32/int32 conversion paths (already have fp16↔fp32 infra) |
+@@ -154,7 +160,7 @@ test_repeat, test_roll, test_flip_eye_crash, test_diag, test_meshgrid, test_stac
+ | `Ops.WHERE` | 196 | **High** | **Highest** | Used everywhere — host-side WHERE like pad, or DPU WHERE op |
+ | `unsupported_layout` | 138 | **High** | High | Conv/pool/matmul 2D/3D DPU layouts — core NPU feature |
+ 
+-**Suggested order:** Bitwise → non_index_operand → fused_epilogue → unsupported_dtype → WHERE → unsupported_layout
++**Suggested order:** non_index_operand → fused_epilogue → unsupported_dtype → WHERE → unsupported_layout
+ 
+ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are the big ones but hardest.
+ 
+@@ -169,6 +175,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are
+   periodic angles through `±1,000,000`
+ - exp and exp2, including integer scalar typing and IEEE specials
+ - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
++- exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
+ - log2, including exact power-of-four normalization and near-one precision
+ - natural log and log10, including range reduction and IEEE special values
+ - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 3e5994ff3..c42c1a5c9 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -16,7 +16,8 @@ from tinygrad.renderer import Renderer
+ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocatorBase
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.runtime.support.rockchip import (build_native_program,
+-  encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask, _CONST_SLOT, _ZERO_SLOT)
++  encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
++  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT)
+ 
+ # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
+ def _pad_a(src, dst, M, K, align_in):
+@@ -105,6 +106,43 @@ def _unpack_cmac_out(src, dst, M, N, align_out):
+   for i in range(M * N):
+     d[i] = _fp32_to_fp16(s[(i // N) * align_out + i % N])
+ 
++def _run_host_bitwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Execute a tagged exact int32/uint32/bool bitwise task on mapped buffers."""
++  total, tag, op, lhs_const, lhs_value, lhs_dtype, rhs_const, rhs_value, rhs_dtype, out_dtype = task.layout
++  assert tag == _HOST_BITWISE_LAYOUT
++  slot_iter = iter(r.globals_slot for r in relocs[1:])
++
++  def reader(is_const:int, value:int, dtype:int):
++    if is_const: return lambda _: value & 0xFFFFFFFF
++    buf = bufs[next(slot_iter)]
++    itemsize = 1 if dtype == 2 else 4
++    count = max(1, buf.size // itemsize)
++    if dtype == 0:
++      int_ptr = ctypes.cast(buf.va_addr, ctypes.POINTER(ctypes.c_int32))
++      return lambda i: int(int_ptr[i % count]) & 0xFFFFFFFF
++    if dtype == 1:
++      uint_ptr = ctypes.cast(buf.va_addr, ctypes.POINTER(ctypes.c_uint32))
++      return lambda i: int(uint_ptr[i % count])
++    bool_ptr = ctypes.cast(buf.va_addr, ctypes.POINTER(ctypes.c_uint8))
++    return lambda i: int(bool(bool_ptr[i % count]))
++
++  lhs, rhs = reader(lhs_const, lhs_value, lhs_dtype), reader(rhs_const, rhs_value, rhs_dtype)
++  out = bufs[relocs[0].globals_slot]
++  for i in range(total):
++    a, b = lhs(i), rhs(i)
++    if op == 0: result = a ^ b
++    elif op == 1: result = a & b
++    elif op == 2: result = a | b
++    elif op == 3: result = (a << (b & 31)) & 0xFFFFFFFF
++    elif lhs_dtype == 0:
++      signed = a if a < 1 << 31 else a-(1 << 32)
++      result = (signed >> (b & 31)) & 0xFFFFFFFF
++    else: result = a >> (b & 31)
++    if out_dtype == 2: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint8))[i] = bool(result)
++    elif out_dtype == 0:
++      ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_int32))[i] = result if result < 1 << 31 else result-(1 << 32)
++    else: ctypes.cast(out.va_addr, ctypes.POINTER(ctypes.c_uint32))[i] = result
++
+ class RockchipProgram(Program['RockchipDevice']):
+   cmds: list[int]
+   task: RKTask
+@@ -352,6 +390,9 @@ class RockchipProgram(Program['RockchipDevice']):
+     if all(st.task.is_copy or st.task.is_fill for st in subtasks):
+       for st in subtasks:
+         task = st.task
++        if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
++          _run_host_bitwise(task, st.relocs, bufs)
++          continue
+         if task.is_fill:
+           total = task.layout[0]
+           out_slot = st.relocs[0].globals_slot
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index e3c7f2c1f..25207d475 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -166,6 +166,7 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
+   return None
+ _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
+ _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
++_HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
+ 
+ def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
+   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
+@@ -3409,17 +3410,17 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                                    int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
+                                    bool_output=bool_output))
+ 
+-  def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
++  def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
+     u = _unwrap(u)
+     if (arg := _where_arg(u)) is None: return None
+     if u.op is Ops.CONST:
+       if isinstance(u.arg, (float, np.floating)) and math.isinf(float(u.arg)):
+         normalized = math.copysign(65504.0, float(u.arg))
+         arg = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', normalized))[0])
+-      return arg, (), (), ()
++      return arg, (), (), (), ()
+     slot, source_n = arg[0], int(u.src[0].src[0].arg)
+     return arg, ((slot,) if u.dtype is dtypes.bool else ()), \
+-      ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ())
++      ((slot,) if u.dtype is dtypes.int else ()), ((slot,) if source_n < total else ()), ((slot,) if u.dtype is dtypes.float else ())
+ 
+   # Direct boolean OR/AND (including maximum lowered to OR) operates on
+   # byte-packed buffers rather than freshly materialized comparison masks.
+@@ -3440,12 +3441,13 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       lhs_info, rhs_info = (data_arg(x) for x in u.src)
+       if lhs_info is None or rhs_info is None: return None
+       lhs, rhs = lhs_info[0], rhs_info[0]
+-      bool_inputs, int32_inputs, broadcasts = (tuple(dict.fromkeys(lhs_info[i] + rhs_info[i])) for i in range(1, 4))
++      bool_inputs, int32_inputs, broadcasts, fp32_inputs = \
++        (tuple(dict.fromkeys(lhs_info[i] + rhs_info[i])) for i in range(1, 5))
+       comparison_inputs = tuple(dict.fromkeys(x[0] for x in (lhs, rhs) if x[0] not in (_CONST_SLOT, _ZERO_SLOT)))
+       diff, mask = alloc(), alloc()
+       tasks.extend((_emit_where_stage(total, diff, rhs, lhs, Ops.SUB, bool_inputs=bool_inputs,
+                                       int32_inputs=int32_inputs, broadcast_inputs=broadcasts,
+-                                      comparison_inputs=comparison_inputs),
++                                      comparison_inputs=comparison_inputs, fp32_inputs=fp32_inputs),
+                     _emit_where_stage(total, mask, (diff, 0), (diff, 0), Ops.MAX, compare=True)))
+       return (mask, 0)
+     if u.op is Ops.CMPNE:
+@@ -3456,7 +3458,7 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+           if logical_u.op is Ops.INDEX and logical_u.dtype is dtypes.bool:
+             logical_info = data_arg(logical_u)
+             if logical_info is None: return None
+-            mask_arg, bool_inputs, int32_inputs, broadcasts = logical_info
++            mask_arg, bool_inputs, int32_inputs, broadcasts, _ = logical_info
+           else:
+             lowered_mask = lower(logical)
+             if lowered_mask is None: return None
+@@ -5186,6 +5188,50 @@ def decode_rk_multi(data: bytes) -> list[RKSubTask]:
+     result.append(RKSubTask(tuple(cmds), task, tuple(relocs)))
+   return result
+ 
++def _try_bitwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower exact int32/uint32/bool bitwise ops to a tagged host task."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  raw, val = store.src[1], _unwrap(store.src[1])
++  op_codes = {Ops.XOR:0, Ops.AND:1, Ops.OR:2, Ops.SHL:3, Ops.SHR:4}
++  op = val.op
++  if op is Ops.CMPNE and val.dtype is dtypes.bool:
++    # bool bitwise_not lowers to CMPNE(index, True).
++    lhs, rhs = val.src
++    if rhs.op is not Ops.CONST: lhs, rhs = rhs, lhs
++    if rhs.op is not Ops.CONST or not bool(rhs.arg) or _unwrap(lhs).op is not Ops.INDEX: return None
++    val, op = UOp(Ops.XOR, dtypes.bool, (_unwrap(lhs), UOp.const(dtypes.bool, True))), Ops.XOR
++  if op not in op_codes or len(val.src) != 2: return None
++
++  def dtype_code(dtype:DType) -> int|None:
++    if dtype is dtypes.int: return 0
++    if dtype is dtypes.uint: return 1
++    if dtype is dtypes.bool: return 2
++    return None
++  operands:list[tuple[bool,int,int,int]] = []
++  for operand in val.src:
++    operand = _unwrap(operand)
++    code = dtype_code(operand.dtype)
++    if code is None: return None
++    if operand.op is Ops.CONST:
++      const = int(operand.arg) & 0xFFFFFFFF
++      if const >= 1 << 31: const -= 1 << 32
++      operands.append((True, const, code, -1))
++    elif operand.op is Ops.INDEX:
++      operands.append((False, 0, code, operand.src[0].buf_uop.arg.slot))
++    else: return None
++  out_code = dtype_code(raw.dtype)
++  if out_code is None: return None
++  total, out_slot = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink).outs[0]
++  lhs_meta, rhs_meta = operands
++  layout = (total, _HOST_BITWISE_LAYOUT, op_codes[op], int(lhs_meta[0]), lhs_meta[1], lhs_meta[2],
++            int(rhs_meta[0]), rhs_meta[1], rhs_meta[2], out_code)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  slots = (out_slot, *(x[3] for x in operands if not x[0]))
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
++  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
++  return (RKSubTask(cmds, task, relocs),)
++
+ def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Detect binary EW with broadcast operand(s) and emit pre-expansion copy + EW tasks.
+   Either or both operands may have broadcast dimensions (missing RANGE vars vs store).
+@@ -5496,6 +5542,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
+   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
+   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
++  if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
+   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
+   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
+   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
