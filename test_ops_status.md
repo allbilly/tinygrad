@@ -856,3 +856,31 @@ also remains for reference: official small powers passed, but `46340**2`
 corrupted the high 16 bits. Neither unsafe path is dispatched.
 
 Recovery patch: `rockchip-native-one-hot-20c20c344.patch`.
+
+### Fractional scalar-POW milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `test_pow` | **passing in 48.56 s** | staged DPU LOG2/EXP2 |
+| `test_pow_zero_const` | **passing in 31.30 s** | correct zero/inf/NaN |
+| fractional signed-zero regression | **passing** | **passing** |
+| `test_pow_const` | integer `x**8` accuracy failure | separate follow-up |
+| `test_pow_zero_tensor` | runtime-exponent WHERE rejection | separate follow-up |
+
+The outer negative-base WHERE can no longer contaminate valid lanes through
+`0*NaN`. DPU computes the optional reciprocal, absolute value, corrected
+LOG2, scalar exponent scaling, corrected EXP2, and negative-input mask. The
+invalid-domain NaN is synthesized only where required through a DPU `0/0`
+factor. No host operator fallback is involved.
+
+The official zero-boundary method and permanent positive/negative exponent
+regression pass **2/2 in 61.95 seconds**. The other hardware cases pass
+**62/62 in 301.00 seconds**, the separately rerun large bool stress case
+passes in **48.07 seconds**, and PR1 remains **79/79 in 4.82 seconds**.
+
+The integer exponent-8 failure is numerical rather than a reject: 617/2,925
+lanes exceed tolerance after reset-separated DPU multiply stages, with
+maximum relative error `0.002876`. Tensor exponents still have a larger
+runtime WHERE graph and are not claimed here.
+
+Recovery patch: `rockchip-fractional-pow-32cb1cd67.patch`.

@@ -6579,3 +6579,66 @@ first timeout.
 
 The standalone recovery artifact is
 `rockchip-native-one-hot-20c20c344.patch`, based on `20c20c344`.
+
+## 2026-07-30 — fractional POW zero and invalid-domain semantics
+
+Fractional scalar powers schedule as:
+
+```text
+WHERE(base < 0, NaN, EXP2(LOG2(abs(base)) * exponent))
+```
+
+The generic arithmetic-WHERE selector multiplied the unselected literal NaN
+by a zero mask. IEEE `0*NaN` contaminated every nonnegative lane, including
+`0**0.3`, which returned NaN instead of zero. Negative exponents are first
+rewritten by tinygrad as a positive fractional power of `reciprocal(base)`.
+
+A strict matcher now:
+
+1. optionally materializes the scheduled reciprocal with DPU FDIV;
+2. computes absolute value with DPU negation and MAX;
+3. reuses the complete normalized/two-LUT LOG2 path with the exponent folded
+   into its output scale;
+4. reuses the complete special-value EXP2 path;
+5. constructs the negative-domain invalid factor as
+   `(1-negative_mask)/(1-negative_mask)`.
+
+That factor is one for nonnegative inputs and NaN for negative inputs. It
+preserves the scheduled invalid-domain behavior without ever feeding a
+literal NaN to an arithmetic mask. Zero consequently reaches the LOG2/EXP2
+special-value paths: positive exponents return zero and negative exponents
+return positive infinity.
+
+All runtime arithmetic is DPU work. There is no new host callback or
+`run_host` arithmetic. The implementation deliberately accepts only finite,
+non-integral scalar exponents and the exact scheduled graph.
+
+The corrected LOG2 and EXP2 implementations make this a long but accurate
+chain: 138 DPU stages for a direct base and 139 when a reciprocal base is
+materialized. A shortcut LUT was not used because its interpolation error
+would regress the already proven special-function tolerances.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_pow_zero_const`: **passing in 31.30
+  seconds**;
+- complete official `TestOps.test_pow`: **passing in 48.56 seconds**;
+- official zero method plus permanent signed-zero/invalid-domain regression:
+  **2/2 passing in 61.95 seconds**;
+- all other DPU hardware cases: **62/62 passing in 301.00 seconds**;
+- separately rerun million-element bool stress case: **passing in 48.07
+  seconds**;
+- hardware-free PR1 contract: **79/79 passing in 4.82 seconds**;
+- pycompile and `git diff --check`: passing.
+
+`test_pow_const` is not yet complete: it now reaches the distinct
+`x**8.0` accuracy failure, where reset-separated DPU multiplications differ
+from the reference in 617/2,925 lanes (maximum relative error `0.002876`).
+`test_pow_zero_tensor` is also separate and still rejects its
+runtime-exponent WHERE graph. Integer power WIP remains disabled because the
+native MUL high word is unsound.
+
+The standalone recovery artifact is
+`rockchip-fractional-pow-32cb1cd67.patch`, based on `32cb1cd67`.

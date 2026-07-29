@@ -4338,6 +4338,99 @@ def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, info.outs[0], (local_result, 0), (positive_selected, 0), Ops.ADD)))
   return tuple(tasks)
 
+def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower fractional x**c through staged abs, LOG2, scale, and EXP2.
+
+  tinygrad's outer negative-input WHERE contains a literal NaN.  Arithmetic
+  mask selection would evaluate 0*NaN on every nonnegative lane, so generate
+  the invalid-domain NaN with a final DPU 0/0 factor instead.
+  """
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.WHERE or len(value.src) != 3: return None
+  condition, invalid, magnitude_pow = _unwrap(value.src[0]), _unwrap(value.src[1]), _unwrap(value.src[2])
+  if condition.op is not Ops.CMPLT or invalid.op is not Ops.CONST or not math.isnan(float(invalid.arg)): return None
+  base, zero = (_unwrap(x) for x in condition.src)
+  if base.dtype is not dtypes.half or zero.op is not Ops.CONST or float(zero.arg) != 0.0: return None
+  reciprocal = base.op is Ops.RECIPROCAL and len(base.src) == 1 and _unwrap(base.src[0]).op is Ops.INDEX
+  source = _unwrap(base.src[0]) if reciprocal else base
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.half: return None
+  if magnitude_pow.op is not Ops.EXP2 or len(magnitude_pow.src) != 1: return None
+  scaled_log = _unwrap(magnitude_pow.src[0])
+  if scaled_log.op is not Ops.MUL or len(scaled_log.src) != 2: return None
+  log2_val, exponent_u = (_unwrap(x) for x in scaled_log.src)
+  if log2_val.op is not Ops.LOG2: log2_val, exponent_u = exponent_u, log2_val
+  if log2_val.op is not Ops.LOG2 or exponent_u.op is not Ops.CONST: return None
+  exponent = float(exponent_u.arg)
+  if not math.isfinite(exponent) or exponent.is_integer(): return None
+  absolute_expr = _unwrap(log2_val.src[0])
+  if absolute_expr.op is not Ops.WHERE or len(absolute_expr.src) != 3 or \
+     _unwrap(absolute_expr.src[0]) is not condition or _unwrap(absolute_expr.src[2]) is not base: return None
+  source_slot = source.src[0].buf_uop.arg.slot
+
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int) -> UOp:
+    out_index = store.src[0]
+    return out_index.replace(dtype=dtypes.half,
+      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
+
+  def extend(stage_tasks:tuple[RKSubTask, ...]|None) -> bool:
+    nonlocal next_slot
+    if stage_tasks is None: return False
+    tasks.extend(stage_tasks)
+    used_slots = [task.task.out_slot for task in stage_tasks] + \
+      [reloc.globals_slot for task in stage_tasks for reloc in task.relocs
+       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+    return True
+
+  base_slot = alloc() if reciprocal else source_slot
+  if reciprocal:
+    one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+    tasks.append(_emit_where_stage(total, base_slot, one, (source_slot, 0), Ops.FDIV))
+  negative, absolute = alloc(), alloc()
+  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
+  tasks.extend((_emit_where_stage(total, negative, (base_slot, 0), negative_one, Ops.MUL),
+                _emit_where_stage(total, absolute, (base_slot, 0), (negative, 0), Ops.MAX)))
+
+  scaled_log_slot = alloc()
+  staged_log = UOp(Ops.MUL, dtypes.half,
+                   (UOp(Ops.LOG2, dtypes.half, (temp_index(absolute),)), UOp.const(dtypes.half, exponent)))
+  if not extend(_try_log2_special_subtasks(stage_sink(staged_log, scaled_log_slot))): return None
+
+  magnitude_slot = alloc()
+  staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(scaled_log_slot),))
+  if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude_slot))): return None
+
+  # source < 0 mask, followed by (1-mask)/(1-mask).  The factor is one for
+  # the valid domain and NaN for negative inputs without ever selecting a
+  # literal NaN through arithmetic masking.
+  negative_diff, negative_mask = alloc(), alloc()
+  invalid_denom_scratch, invalid_denom, invalid_factor_scratch, invalid_factor = (alloc() for _ in range(4))
+  output_scratch = alloc()
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (base_slot, 0), Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, invalid_denom_scratch, one, (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, invalid_denom, one, (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, invalid_factor_scratch, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV),
+                _emit_where_stage(total, invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV),
+                _emit_where_stage(total, output_scratch, (magnitude_slot, 0), (invalid_factor, 0), Ops.MUL),
+                _emit_where_stage(total, out, (magnitude_slot, 0), (invalid_factor, 0), Ops.MUL)))
+  return tuple(tasks)
+
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
 
@@ -8477,6 +8570,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (log2_tasks := _try_log2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, log2_tasks)
   if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
+  if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fractional_pow_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   if (softsign_tasks := _try_softsign_subtasks(sink)) is not None: return build_native_program_multi(sink, softsign_tasks)
   if (lerp_tasks := _try_lerp_subtasks(sink)) is not None: return build_native_program_multi(sink, lerp_tasks)
