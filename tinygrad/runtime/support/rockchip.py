@@ -5202,6 +5202,74 @@ def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (finite, 0), (invalid_factor, 0), Ops.MUL)
   return _finalize_fp32_output(tasks, store)
 
+def _try_one_hot_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower one_hot's WHERE(index != class, 0, 1) with NPU comparisons.
+
+  Host tasks only expand the compact input by byte-copying it and materialize
+  the compile-time class coordinate.  Equality and int32 result generation
+  remain DPU work.
+  """
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.int: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.WHERE or len(value.src) != 3: return None
+  condition = _unwrap(value.src[0])
+  true, false = (_unwrap(x) for x in value.src[1:])
+  if condition.op is not Ops.CMPNE or true.op is not Ops.CONST or false.op is not Ops.CONST or \
+     int(true.arg) != 0 or int(false.arg) != 1: return None
+
+  indexed, coordinate = (_unwrap(x) for x in condition.src)
+  if indexed.op is not Ops.INDEX: indexed, coordinate = coordinate, indexed
+  while coordinate.op is Ops.CAST: coordinate = coordinate.src[0]
+  if indexed.op is not Ops.INDEX or indexed.dtype is not dtypes.int or coordinate.op is not Ops.RANGE: return None
+
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if coordinate not in loops or any(u.src[0].op is not Ops.CONST for u in loops): return None
+  extents = tuple(int(u.src[0].arg) for u in loops)
+  total, info = prod(extents), ProgramInfo.from_sink(sink)
+  if total != prod(_shape_of_store(sink)) or int(coordinate.src[0].arg) > 2048: return None
+  class_axis = loops.index(coordinate)
+  class_values:list[int] = []
+  for linear in range(total):
+    rem, coords = linear, [0] * len(extents)
+    for axis in range(len(extents)-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+    class_values.append(coords[class_axis])
+
+  next_slot = max(info.globals, default=-1) + 1
+  expanded, classes = next_slot, next_slot+1
+  positive_diff, positive_mask, negative_diff, negative_mask = range(next_slot+2, next_slot+6)
+  neq_scratch, neq, equal_scratch = range(next_slot+6, next_slot+9)
+
+  out_index = store.src[0]
+  expanded_index = out_index.replace(src=(out_index.src[0].param_like(expanded).replace(dtype=dtypes.int), *out_index.src[1:]))
+  movement_store = store.replace(src=(expanded_index, indexed))
+  movement_tasks = _try_movement_host_subtasks(sink.substitute({store:movement_store}))
+  if movement_tasks is None: return None
+
+  host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  class_layout = (total, _HOST_STATIC_INT_LAYOUT, *class_values)
+  class_relocs = (RKReloc(0, classes, 0, 0, 0xFFFFFFFF),)
+  class_task = RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", class_layout, classes, is_copy=True), class_relocs)
+  int_inputs = (expanded, classes)
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  tasks = [*movement_tasks, class_task,
+           _emit_where_stage(total, positive_diff, (classes, 0), (expanded, 0), Ops.SUB, int32_inputs=int_inputs),
+           _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+           _emit_where_stage(total, negative_diff, (expanded, 0), (classes, 0), Ops.SUB, int32_inputs=int_inputs),
+           _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+           # Repeat consumers at each reset-separated dependency boundary.
+           _emit_where_stage(total, neq_scratch, (positive_mask, 0), (negative_mask, 0), Ops.MAX),
+           _emit_where_stage(total, neq, (positive_mask, 0), (negative_mask, 0), Ops.MAX),
+           _emit_where_stage(total, equal_scratch, one, (neq, 0), Ops.SUB),
+           _emit_where_stage(total, info.outs[0], one, (neq, 0), Ops.SUB, int32_output=True)]
+  # WIP reference: native-int SUB is exact, but compare=True does not produce
+  # valid masks for native-int atoms.  The attempted pairs were:
+  #   _emit_where_stage(..., Ops.SUB, native_int32_input=True, native_int32_output=True)
+  #   _emit_where_stage(..., Ops.MAX, compare=True, native_int32_input=True)
+  # Keep one_hot on the proven int32-to-fp16 ABI while its class domain is
+  # exactly representable; a byte-limb equality path is needed for full int32.
+  return tuple(tasks)
+
 def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or (val := _unwrap(store.src[1])).op is not Ops.WHERE: return None
@@ -7634,6 +7702,44 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     accumulator = out_slot
   return tuple(tasks)
 
+def _wip_try_native_small_int_power_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower a repeated int32 MUL tree through packed native DPU atoms."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.int: return None
+  value = _unwrap(store.src[1])
+  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.int]
+  if len(indexes) != 1 or (source := indexes[0]).src[0].op is not Ops.PARAM: return None
+  def exponent(u:UOp) -> int|None:
+    u = _unwrap(u)
+    if u is source: return 1
+    if u.op is not Ops.MUL or len(u.src) != 2: return None
+    lhs, rhs = exponent(u.src[0]), exponent(u.src[1])
+    return None if lhs is None or rhs is None else lhs+rhs
+  power = exponent(value)
+  if power is None or not 2 <= power <= 32: return None
+  total, info = prod(_shape_of_store(sink)), ProgramInfo.from_sink(sink)
+  if int(source.src[0].src[0].arg) != total: return None
+  next_slot = max(info.globals, default=-1) + 1
+  source_slot = source.src[0].buf_uop.arg.slot
+  host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  tasks:list[RKSubTask] = []
+  for start in range(0, total, 4):
+    count = min(4, total-start)
+    packed, next_slot = next_slot, next_slot+1
+    pack_layout = (count, _HOST_PACK_INT32_CHUNK_LAYOUT, start)
+    pack_relocs = (RKReloc(0, packed, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", pack_layout, packed, is_copy=True), pack_relocs))
+    accumulator = packed
+    for _ in range(power-1):
+      multiplied, next_slot = next_slot, next_slot+1
+      tasks.append(_emit_where_stage(4, multiplied, (accumulator, 0), (packed, 0), Ops.MUL,
+                                     native_int32_input=True, native_int32_output=True))
+      accumulator = multiplied
+    unpack_layout = (count, _HOST_UNPACK_INT_CHUNK_LAYOUT, start)
+    unpack_relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, accumulator, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, info.outs[0], is_copy=True), unpack_relocs))
+  return tuple(tasks)
+
 def _try_native_int_min_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower signed int32 MIN's XOR-order graph with native integer DPU stages."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -8374,6 +8480,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
   if (softsign_tasks := _try_softsign_subtasks(sink)) is not None: return build_native_program_multi(sink, softsign_tasks)
   if (lerp_tasks := _try_lerp_subtasks(sink)) is not None: return build_native_program_multi(sink, lerp_tasks)
+  if (one_hot_tasks := _try_one_hot_subtasks(sink)) is not None: return build_native_program_multi(sink, one_hot_tasks)
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
@@ -8384,6 +8491,10 @@ def build_native_program(sink: UOp) -> UOp|None:
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
   if (product_tasks := _try_local_product_subtasks(sink)) is not None:
     return build_native_program_multi(sink, product_tasks)
+  # WIP: small official values pass, but native MUL corrupts the high word of
+  # 46340**2. Keep disabled until byte-limb multiplication is exact.
+  # if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
+  #   return build_native_program_multi(sink, int_power_tasks)
   if (int_min_tasks := _try_native_int_min_subtasks(sink)) is not None:
     return build_native_program_multi(sink, int_min_tasks)
   if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:

@@ -6513,3 +6513,69 @@ Using `. .venv/bin/activate`:
 
 The standalone recovery artifact is
 `rockchip-native-lerp-506ffb537.patch`, based on `506ffb537`.
+
+## 2026-07-30 — NPU one-hot equality and retained integer-power WIP
+
+`TestOps.test_one_hot` schedules the integer expression
+`WHERE(index != class_coordinate, 0, 1)`. The runtime index tensor has one
+fewer dimension than the output, while the class coordinate is a CAST of the
+innermost LOOP range. The general WHERE lowering could not materialize that
+coordinate and rejected the kernel.
+
+The strict one-hot matcher now:
+
+1. uses the existing movement callback to expand each runtime int32 index by
+   raw four-byte copies only;
+2. materializes the compile-time class coordinate as an int32 scratch tensor;
+3. converts both int32 inputs through the established DPU fp16 ABI;
+4. evaluates positive and negative differences and their nonzero masks on the
+   DPU;
+5. computes `1 - max(positive_mask, negative_mask)` on the DPU and writes the
+   final int32 ABI result.
+
+The class extent is deliberately capped at 2,048, so every valid class index
+is exactly representable during the fp16 comparison. Inputs outside that
+range remain unequal to every valid class. Host work is confined to static
+coordinate generation, broadcasting by byte copy, scratch allocation, and
+typed ABI conversion; it does not compare runtime values or select output
+values.
+
+This follows the same narrow `run_host` precedent used by accelerator
+backends for transfer/layout support. It does not authorize
+`_run_host_elementwise`, `_run_host_argmax`, or `_run_host_scatter` as
+operator fallbacks.
+
+### Native-int comparison experiment
+
+An exact native-int attempt used native DPU SUB followed by `compare=True`.
+SUB produced the expected int32 differences, but RK3588 compare mode emitted
+invalid masks for native-int atoms. That path remains documented as WIP
+comments. Full-range int32 equality will require a byte-limb comparison
+rather than native compare mode.
+
+The earlier repeated-MUL integer-power experiment is also retained but its
+dispatch remains commented. Official small values passed, but the boundary
+probe `46340**2` produced `0xcafaa810` instead of `0x7ffea810`: the low word
+was correct and the high word was corrupted. It must not be enabled until
+byte-limb multiplication is exact.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_one_hot`: **passing in 3.17 seconds**;
+- official plus permanent `[-1,0,5,6,2048]` out-of-range regression: **2/2
+  passing in 4.40 seconds**;
+- all other DPU hardware cases: **61/61 passing in 270.51 seconds**;
+- the separately rerun million-element bool-reduction stress case: **passing
+  in 48.23 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 4.77 seconds**;
+- pycompile and `git diff --check`: passing.
+
+The first two bool-stress attempts timed out in the driver, while a fresh
+standalone rerun passed. This is the already documented intermittent large
+bool-reduction device-state issue; no one-hot task had executed before the
+first timeout.
+
+The standalone recovery artifact is
+`rockchip-native-one-hot-20c20c344.patch`, based on `20c20c344`.

@@ -229,6 +229,20 @@ class TestDPU(unittest.TestCase):
     np.testing.assert_allclose(got, expected.astype(np.float16), rtol=1e-3, atol=1e-3)
     np.testing.assert_array_equal(got[[96,128,160]], np.array([-0.5, 0.0, 0.5], dtype=np.float16))
 
+  def wip_test_dpu_native_int_power(self):
+    for values, power in ((np.array([-46340,-2,0,2,46340], dtype=np.int32), 2),
+                          (np.array([11,12,13], dtype=np.int32), 7),
+                          (np.array([-2,0,2], dtype=np.int32), 29)):
+      got = (Tensor(values, device="ROCKCHIP").realize() ** power).realize().numpy()
+      np.testing.assert_array_equal(got, np.power(values, power, dtype=np.int32))
+
+  def test_dpu_one_hot(self):
+    values = np.array([-1,0,5,6,2048], dtype=np.int32)
+    got = Tensor(values, device="ROCKCHIP").one_hot(6).realize().numpy()
+    expected = np.eye(6, dtype=np.int32)[np.clip(values, 0, 5)]
+    expected[(values < 0) | (values >= 6)] = 0
+    np.testing.assert_array_equal(got, expected)
+
   def test_dpu_abs(self):
     # Preserve the sign-WHERE pattern for the stable staged max(x, -x) path.
     a_np = np.array([[-8,-2,-0.0,4],[5,-6,-7,8]], dtype=np.float16)

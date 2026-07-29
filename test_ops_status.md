@@ -828,3 +828,31 @@ regression passes in **1.58 seconds**. The complete CMAC class is **27/27 in
 seconds**.
 
 Recovery patch: `rockchip-native-lerp-506ffb537.patch`.
+
+### NPU one-hot milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `one_hot`, official six-class case | **passing** | **static layout + DPU equality** |
+| negative and out-of-range indices | **passing** | **all-zero rows** |
+| class counts above 2,048 | not claimed | matcher deliberately rejects |
+
+The scheduled `WHERE(index != class, 0, 1)` now expands the compact runtime
+index tensor by raw int32 byte copies and materializes the class coordinate
+from LOOP metadata. DPU subtraction/comparison produces the inequality mask,
+and DPU subtraction from one produces the final int32 tensor. The host never
+examines an index value to decide equality or write a one-hot result.
+
+The official method passes in **3.17 seconds**. It and the permanent
+`[-1,0,5,6,2048]` regression pass **2/2 in 4.40 seconds**. The other DPU
+hardware cases pass **61/61 in 270.51 seconds**, the separately rerun
+million-element bool stress case passes in **48.23 seconds**, and the
+hardware-free contract remains **79/79 in 4.77 seconds**.
+
+Native-int DPU compare mode was tested and rejected because it generated
+invalid masks even though native SUB generated int32 differences. The
+disabled experiment remains in comments. The disabled integer-power matcher
+also remains for reference: official small powers passed, but `46340**2`
+corrupted the high 16 bits. Neither unsafe path is dispatched.
+
+Recovery patch: `rockchip-native-one-hot-20c20c344.patch`.
