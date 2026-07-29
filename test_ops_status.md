@@ -19,6 +19,8 @@ The complete official `test_min` method now passes incrementally, including
 floating, exact int32 boundary, and bool cases.
 `TestOps.test_sum_twice` now also passes through two ordered CMAC tasks that
 preserve its explicit fp16 intermediate boundary.
+`TestOps.test_sum_relu` passes through an ordered DPU ReLU, CMAC reduction,
+and final DPU ReLU.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -737,3 +739,21 @@ this regression pass **2/2 in 2.41 seconds**. The complete CMAC class passes
 classification for future graph-pattern debugging.
 
 Recovery patch: `rockchip-native-nested-sum-5aef57073.patch`.
+
+### ReLU/SUM/ReLU milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `sum_relu` | **passing in 1.71 s** | **DPU → CMAC → DPU** |
+| all-negative input | **exact zero** | **passing** |
+
+The strict matcher recognizes the complete
+`ReLU(ADD-reduce(ReLU(index)))` graph. The input ReLU is DPU MAX into fp16
+scratch, CMAC performs the ADD reduction, and a final DPU MAX applies the
+scheduled output ReLU. No runtime-dependent host arithmetic is used.
+
+The official test plus permanent mixed-sign/all-negative regression pass
+**2/2 in 2.87 seconds**. The complete CMAC class is **25/25 in 10.69
+seconds**, and the hardware-free contract remains **79/79 in 6.49 seconds**.
+
+Recovery patch: `rockchip-native-relu-sum-e022b54f4.patch`.

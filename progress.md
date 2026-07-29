@@ -6357,3 +6357,34 @@ Using `. .venv/bin/activate`:
 
 The standalone recovery artifact is
 `rockchip-native-nested-sum-5aef57073.patch`, based on `5aef57073`.
+
+## 2026-07-29 — fused ReLU/SUM/ReLU
+
+`TestOps.test_sum_relu` schedules `x.relu().sum().relu()` as one graph whose
+ADD-reduction body and output epilogue are both WHERE-based ReLU expressions.
+The generic CMAC classifier rejected the fused epilogue.
+
+A strict matcher recognizes only this complete structure and emits:
+
+```text
+input half -> DPU MAX(input, 0) -> fp16 scratch
+           -> CMAC ADD reduction -> fp16 scratch
+           -> DPU MAX(sum, 0)    -> output half
+```
+
+Keeping the final ReLU stage makes the implementation follow the scheduled
+graph even though a sum of nonnegative lanes is ordinarily nonnegative. Host
+code performs no value-dependent work.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_sum_relu`: **passing in 1.71 seconds**;
+- official plus permanent mixed-sign/all-negative regression: **2/2 in 2.87
+  seconds**;
+- complete CMAC hardware class: **25/25 in 10.69 seconds**;
+- hardware-free PR1 contract: **79/79 in 6.49 seconds**.
+
+The standalone recovery artifact is
+`rockchip-native-relu-sum-e022b54f4.patch`, based on `e022b54f4`.

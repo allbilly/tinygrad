@@ -577,6 +577,13 @@ class TestCMAC(unittest.TestCase):
     got = Tensor(a_np, device="ROCKCHIP").realize().sum((0,1)).sum().realize().numpy()
     np.testing.assert_array_equal(got, expected)
 
+  def test_cmac_relu_sum(self):
+    for a_np in (np.linspace(-3, 2, 60, dtype=np.float16).reshape(3,4,5),
+                 np.full((3,4,5), -2, dtype=np.float16)):
+      expected = np.maximum(np.sum(np.maximum(a_np, 0).astype(np.float32), dtype=np.float32).astype(np.float16), 0)
+      got = Tensor(a_np, device="ROCKCHIP").realize().relu().sum().relu().realize().numpy()
+      np.testing.assert_array_equal(got, expected)
+
   def test_cmac_scaled_sum_full(self):
     # Scaled full sum: (a * 2).sum() → ones @ (a*2)
     a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)

@@ -1,0 +1,159 @@
+diff --git a/progress.md b/progress.md
+index 12aacc1cf..3e25e18ce 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6357,3 +6357,34 @@ Using `. .venv/bin/activate`:
+ 
+ The standalone recovery artifact is
+ `rockchip-native-nested-sum-5aef57073.patch`, based on `5aef57073`.
++
++## 2026-07-29 — fused ReLU/SUM/ReLU
++
++`TestOps.test_sum_relu` schedules `x.relu().sum().relu()` as one graph whose
++ADD-reduction body and output epilogue are both WHERE-based ReLU expressions.
++The generic CMAC classifier rejected the fused epilogue.
++
++A strict matcher recognizes only this complete structure and emits:
++
++```text
++input half -> DPU MAX(input, 0) -> fp16 scratch
++           -> CMAC ADD reduction -> fp16 scratch
++           -> DPU MAX(sum, 0)    -> output half
++```
++
++Keeping the final ReLU stage makes the implementation follow the scheduled
++graph even though a sum of nonnegative lanes is ordinarily nonnegative. Host
++code performs no value-dependent work.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- complete official `TestOps.test_sum_relu`: **passing in 1.71 seconds**;
++- official plus permanent mixed-sign/all-negative regression: **2/2 in 2.87
++  seconds**;
++- complete CMAC hardware class: **25/25 in 10.69 seconds**;
++- hardware-free PR1 contract: **79/79 in 6.49 seconds**.
++
++The standalone recovery artifact is
++`rockchip-native-relu-sum-e022b54f4.patch`, based on `e022b54f4`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index fc0efaf81..05092f2b0 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -577,6 +577,13 @@ class TestCMAC(unittest.TestCase):
+     got = Tensor(a_np, device="ROCKCHIP").realize().sum((0,1)).sum().realize().numpy()
+     np.testing.assert_array_equal(got, expected)
+ 
++  def test_cmac_relu_sum(self):
++    for a_np in (np.linspace(-3, 2, 60, dtype=np.float16).reshape(3,4,5),
++                 np.full((3,4,5), -2, dtype=np.float16)):
++      expected = np.maximum(np.sum(np.maximum(a_np, 0).astype(np.float32), dtype=np.float32).astype(np.float16), 0)
++      got = Tensor(a_np, device="ROCKCHIP").realize().relu().sum().relu().realize().numpy()
++      np.testing.assert_array_equal(got, expected)
++
+   def test_cmac_scaled_sum_full(self):
+     # Scaled full sum: (a * 2).sum() → ones @ (a*2)
+     a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 53e75d294..d6d601b54 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -19,6 +19,8 @@ The complete official `test_min` method now passes incrementally, including
+ floating, exact int32 boundary, and bool cases.
+ `TestOps.test_sum_twice` now also passes through two ordered CMAC tasks that
+ preserve its explicit fp16 intermediate boundary.
++`TestOps.test_sum_relu` passes through an ordered DPU ReLU, CMAC reduction,
++and final DPU ReLU.
+ 
+ **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
+ including its float32 infinity/NaN subcase. The summary table below remains the
+@@ -737,3 +739,21 @@ this regression pass **2/2 in 2.41 seconds**. The complete CMAC class passes
+ classification for future graph-pattern debugging.
+ 
+ Recovery patch: `rockchip-native-nested-sum-5aef57073.patch`.
++
++### ReLU/SUM/ReLU milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `sum_relu` | **passing in 1.71 s** | **DPU → CMAC → DPU** |
++| all-negative input | **exact zero** | **passing** |
++
++The strict matcher recognizes the complete
++`ReLU(ADD-reduce(ReLU(index)))` graph. The input ReLU is DPU MAX into fp16
++scratch, CMAC performs the ADD reduction, and a final DPU MAX applies the
++scheduled output ReLU. No runtime-dependent host arithmetic is used.
++
++The official test plus permanent mixed-sign/all-negative regression pass
++**2/2 in 2.87 seconds**. The complete CMAC class is **25/25 in 10.69
++seconds**, and the hardware-free contract remains **79/79 in 6.49 seconds**.
++
++Recovery patch: `rockchip-native-relu-sum-e022b54f4.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 7765163c7..c5a896b5e 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -7347,6 +7347,53 @@ def _try_nested_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Split ReLU(SUM(ReLU(x))) into ordered DPU, CMAC, and DPU stages."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++
++  def relu_operand(u:UOp) -> UOp|None:
++    u = _unwrap(u)
++    if u.op is not Ops.WHERE or len(u.src) != 3: return None
++    cond, selected, zero = u.src
++    if cond.op is not Ops.CMPLT or len(cond.src) != 2 or cond.src[0].op is not Ops.CONST or float(cond.src[0].arg) != 0.0 or \
++       zero.op is not Ops.CONST or float(zero.arg) != 0.0: return None
++    return _unwrap(selected) if _unwrap(selected) is _unwrap(cond.src[1]) else None
++
++  reduce = relu_operand(store.src[1])
++  if reduce is None or reduce.op is not Ops.REDUCE or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
++  source = relu_operand(reduce.src[0])
++  if source is None or source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM: return None
++  reductions = list(reduce.src[1:])
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++
++  info = ProgramInfo.from_sink(sink)
++  relu_slot = max(info.globals, default=-1) + 1
++  sum_slot = relu_slot + 1
++  input_total = int(source.src[0].src[0].arg)
++  output_total = prod(_shape_of_store(sink))
++  zero_arg = (_ZERO_SLOT, 0)
++  tasks:list[RKSubTask] = [_emit_where_stage(input_total, relu_slot, (source.src[0].buf_uop.arg.slot, 0), zero_arg, Ops.MAX)]
++
++  device = store.src[0].src[0].device
++  relu_param = UOp.param(relu_slot, dtypes.half, (input_total,), device=device)
++  relu_index = source.replace(src=(relu_param, *source.src[1:]))
++  stage_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (relu_index,), arg=dtypes.float), *reductions))
++  sum_param = UOp.param(sum_slot, dtypes.half, (output_total,), device=device)
++  sum_index = store.src[0].replace(src=(sum_param, *store.src[0].src[1:]))
++  stage_value = UOp(Ops.CAST, dtypes.half, (stage_reduce,), arg=dtypes.half)
++  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(sum_index, stage_value)), *loops)))
++  stage_plan = plan_rk(stage_sink)
++  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
++  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(stage_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  tasks.append(_emit_where_stage(output_total, info.outs[0], (sum_slot, 0), zero_arg, Ops.MAX))
++  return tuple(tasks)
++
+ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Gather a small static float reduction window, then multiply it on DPU."""
+   reduce, store = _reduce_node(sink), _store_node(sink)
+@@ -8150,6 +8197,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
+   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, variable_scale_tasks)
++  if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, relu_sum_tasks)
+   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, nested_sum_tasks)
+   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:

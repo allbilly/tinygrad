@@ -7347,6 +7347,53 @@ def _try_nested_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
+def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Split ReLU(SUM(ReLU(x))) into ordered DPU, CMAC, and DPU stages."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+
+  def relu_operand(u:UOp) -> UOp|None:
+    u = _unwrap(u)
+    if u.op is not Ops.WHERE or len(u.src) != 3: return None
+    cond, selected, zero = u.src
+    if cond.op is not Ops.CMPLT or len(cond.src) != 2 or cond.src[0].op is not Ops.CONST or float(cond.src[0].arg) != 0.0 or \
+       zero.op is not Ops.CONST or float(zero.arg) != 0.0: return None
+    return _unwrap(selected) if _unwrap(selected) is _unwrap(cond.src[1]) else None
+
+  reduce = relu_operand(store.src[1])
+  if reduce is None or reduce.op is not Ops.REDUCE or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  source = relu_operand(reduce.src[0])
+  if source is None or source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM: return None
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+
+  info = ProgramInfo.from_sink(sink)
+  relu_slot = max(info.globals, default=-1) + 1
+  sum_slot = relu_slot + 1
+  input_total = int(source.src[0].src[0].arg)
+  output_total = prod(_shape_of_store(sink))
+  zero_arg = (_ZERO_SLOT, 0)
+  tasks:list[RKSubTask] = [_emit_where_stage(input_total, relu_slot, (source.src[0].buf_uop.arg.slot, 0), zero_arg, Ops.MAX)]
+
+  device = store.src[0].src[0].device
+  relu_param = UOp.param(relu_slot, dtypes.half, (input_total,), device=device)
+  relu_index = source.replace(src=(relu_param, *source.src[1:]))
+  stage_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (relu_index,), arg=dtypes.float), *reductions))
+  sum_param = UOp.param(sum_slot, dtypes.half, (output_total,), device=device)
+  sum_index = store.src[0].replace(src=(sum_param, *store.src[0].src[1:]))
+  stage_value = UOp(Ops.CAST, dtypes.half, (stage_reduce,), arg=dtypes.half)
+  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(sum_index, stage_value)), *loops)))
+  stage_plan = plan_rk(stage_sink)
+  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(stage_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  tasks.append(_emit_where_stage(output_total, info.outs[0], (sum_slot, 0), zero_arg, Ops.MAX))
+  return tuple(tasks)
+
 def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Gather a small static float reduction window, then multiply it on DPU."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -8150,6 +8197,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variable_scale_tasks)
+  if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, relu_sum_tasks)
   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, nested_sum_tasks)
   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
