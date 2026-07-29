@@ -910,3 +910,34 @@ fractional raw bits. The detailed tuning procedure and
 `ROCKCHIP_DEBUG_POW8_STAGE` mapping are recorded in `lut.md`.
 
 Recovery patch: `rockchip-pow8-two-level-8376c0ffc.patch`.
+
+### Scalar exponent ±5.5 milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `x**5.5`, official finite inputs | **passing** | exact range reduction + two LUTs |
+| `x**-5.5`, official finite inputs | **passing** | direct-from-base DPU + two LUTs |
+| dense/boundary permanent regression | **1,047/1,047 passing** | **passing** |
+| `5.5**x` | 942/2,925 tolerance misses | next POW subgroup |
+
+The positive path splits Q11 `u**5.5` and Q15 `(u/2)**5.5` tables at the
+low table's saturation point.  The negative path is matched before the
+generic reciprocal rewrite and evaluates the original base directly,
+avoiding fp16 reciprocal error.  Its Q15 table uses `z=u-1` and address scale
+16,384 for twice the old grid density; the Q10 low table uses the same
+density near the overflow boundary.
+
+Overflow, the first finite fp16 base, finite-negative NaN, and unselected
+infinity contamination are handled with DPU arithmetic.  There is no host
+operator fallback.  The official method advances through both new subcases
+to `5.5**x` in 50.32 seconds, and the permanent regression passes in 38.67
+seconds.  The other DPU hardware cases pass **64/64 in 349.07 seconds**, the
+isolated million-element boolean stress case passes in **48.56 seconds**, and
+the hardware-free contract remains **79/79 in 6.46 seconds**.
+
+Coarse-grid global and sparse Q15 biases were rejected because they moved
+one-ULP errors to neighboring inputs.  Those results, the fine-grid tie
+corrections, and both debug-stage mappings are recorded in `lut.md` and
+`progress.md`.
+
+Recovery patch: `rockchip-pow55-two-level-32d22562a.patch`.

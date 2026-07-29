@@ -6696,3 +6696,77 @@ is not claimed by this milestone.
 
 The standalone recovery artifact is
 `rockchip-pow8-two-level-8376c0ffc.patch`, based on `8376c0ffc`.
+
+## 2026-07-30 — two-level scalar POW ±5.5
+
+The exponent-5.5 subcase was not accurate enough through the generic
+LOG2/EXP2 chain or through reset-separated multiplication.  The strict
+positive matcher now normalizes `0.25 < abs(x) < 4` into `[1,2]` with exact
+power-of-two multipliers.  A Q11 table stores `u**5.5` up to
+`16**(1/5.5)`; a Q15 table stores `(u/2)**5.5` above that split and is
+decoded by `2**5.5`.  Selecting the high table at the fp16 split avoids low
+table saturation.  One Q15 unit compensates the RK3588 interpolation shift
+at high-table ties.
+
+The negative exponent is scheduled as a 5.5 power of `RECIPROCAL(x)`.
+Running that graph literally loses too much accuracy at the reciprocal
+boundary.  Its matcher therefore recognizes the intact graph before the
+generic reciprocal-to-FDIV rewrite, but evaluates `x**-5.5` directly from
+the original input:
+
+1. DPU absolute value and exact power-of-two normalization cover
+   `0.125 < abs(x) < 8`;
+2. a Q10 low table covers normalized `[0.5,1]`;
+3. a Q15 high table receives the shifted coordinate `z=u-1` in `[0,1]`;
+4. both tables use address scale 16,384, consuming all 512 positive knots
+   rather than half the table;
+5. DPU factors restore the original magnitude interval;
+6. a DPU divide synthesizes infinity below the fp16 overflow boundary;
+7. the first finite base, `0.1331787109375`, is handled explicitly because
+   it immediately follows a saturated Q10 knot;
+8. a DPU `0/0` factor restores NaN for finite negative bases.
+
+The original elementwise result remains the fallback outside the corrected
+ranges.  It is clamped before arithmetic masking in the negative path so an
+unselected infinity cannot cause `0*inf -> NaN`.  No runtime tensor
+arithmetic uses `run_host`; host participation remains limited to transport,
+layout, static coordinates, and ABI work.
+
+### Rejected tuning WIP
+
+A global `+1` Q15 bias reduced the original negative-exponent misses but made
+74 already-correct samples high.  Sparse corrections on the original
+1/256 grid merely moved the same one-ULP errors to adjacent quarter-grid
+inputs.  That coarse-grid attempt remains described in the table builder.
+The passing design shifts the high coordinate and doubles address density;
+only four measured fine-grid tie knots need a one-unit correction.
+
+`ROCKCHIP_DEBUG_POW55_STAGE=1..7` exposes the positive normalized input,
+both LUT values, decoded high value, selected power, factor, and bounded
+result.  `ROCKCHIP_DEBUG_POW_NEG55_STAGE=1..6` exposes the corresponding
+negative-exponent stages.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- permanent dense/boundary regression: **1,047/1,047 values passing in
+  38.67 seconds**;
+- official `TestOps.test_pow_const`: both scalar-exponent `±5.5` subcases
+  pass and the method reaches the separate `5.5**x` case in **50.32
+  seconds**;
+- all other DPU hardware cases: **64/64 passing in 349.07 seconds**;
+- separately rerun million-element bool stress case: **passing in 48.56
+  seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.46 seconds**;
+- pycompile and `git diff --check`: passing;
+- mypy remains at the same 13 pre-existing Rockchip errors; Ruff is not
+  installed in `.venv`.
+
+The next failure is constant-base `5.5**x`: 942/2,925 lanes exceed tolerance,
+with maximum relative error `0.01668`.  This is an EXP2 input-scaling problem
+and is not claimed by the scalar-exponent matcher.  Positive `(-inf)**5.5`
+also remains a special-value follow-up; the official finite-input subgroup
+and permanent claimed domain pass.
+
+Recovery patch: `rockchip-pow55-two-level-32d22562a.patch`.

@@ -1786,6 +1786,80 @@ undo a later integer truncation.
 The permanent hardware regression covers 513 points across `[-4.1,4.1]`
 plus both infinities and NaN. All 516 values meet `rtol=1e-3, atol=1e-6`.
 
+## Scalar exponent ±5.5: shifted fine grids
+
+`x**5.5` needs the same range-reduction principle as POW8, but its
+half-integer exponent changes both the factors and the saturation split.
+For positive magnitude:
+
+| Magnitude range | Address multiplier | Final factor |
+|---:|---:|---:|
+| `(0.25,0.5]` | `4` | `2^-11` |
+| `(0.5,1]` | `2` | `2^-5.5` |
+| `(1,2]` | `1` | `1` |
+| `(2,4)` | `0.5` | `2^5.5` |
+
+The low table stores `u**5.5` in Q11 until
+`u=16**(1/5.5)`.  The high table stores `(u/2)**5.5` in Q15 and is decoded
+by `2**5.5`.  The high selector uses the fp16 value immediately below the
+mathematical split so the split value itself does not interpolate against
+the saturated Q11 endpoint.  RK interpolation lands just below several
+fp16 ties; adding one raw Q15 unit to the high table restores the intended
+rounding without changing its fixed-point range.
+
+Negative 5.5 is scheduled as positive 5.5 applied to `RECIPROCAL(x)`.  Do
+not normalize that rounded reciprocal.  Match before reciprocal-to-FDIV
+rewriting and address the original magnitude directly:
+
+| Magnitude range | Address multiplier | Final factor |
+|---:|---:|---:|
+| `(0.125,0.5]` | `4` | `2^11` |
+| `(0.5,1]` | `2` | `2^5.5` |
+| `(1,2]` | `1` | `1` |
+| `(2,4]` | `0.5` | `2^-5.5` |
+| `(4,8)` | `0.25` | `2^-11` |
+
+The negative low table stores `u**-5.5` in Q10.  Its output approaches 32
+at `u=0.5`, the largest value Q10 can represent.  The high table stores the
+same function in Q15, but its input is shifted to `z=u-1`.  Address scale
+16,384 maps the entire `[0,1]` coordinate to all 512 positive table knots,
+giving a `1/512` step instead of the coarse design's `1/256`.  The low table
+also uses scale 16,384.
+
+The finite/overflow transition occurs between adjacent fp16 bases:
+
+| Base | Correct half result |
+|---:|---:|
+| `0.133056640625` | `+inf` |
+| `0.1331787109375` | `65408` |
+
+Interpolation across a saturated Q10 knot cannot represent that
+discontinuity accurately.  DPU comparison/division synthesizes infinity on
+the lower side, and an exact DPU boundary selection supplies 65,408 for the
+first finite base.  The normal fine-grid LUT takes over above it.
+
+### Why coarse correction failed
+
+The first negative table used the unshifted `[1,2]` coordinate at address
+scale 8,192.  A global one-unit Q15 bias fixed 12 low results but made 74
+correct results high.  Biasing only the implicated knots fixed the original
+inputs and failed adjacent exact/quarter-grid inputs instead.  This repeats
+the POW8 lesson: a correction on the same interpolation grid cannot recover
+phase information discarded by the integer output shift.
+
+The shifted high table changes the grid itself.  It leaves only four
+fine-grid knots (`289`, `290`, `308`, `481`) that need a one-unit tie
+correction.  A dense 513-point `[-2,2]` sweep plus signed zero, NaN,
+infinities in the claimed domain, and overflow boundaries passes for both
+exponents: 1,047 checked values total.
+
+Debug mappings:
+
+| Variable | Stages |
+|---|---|
+| `ROCKCHIP_DEBUG_POW55_STAGE` | `1=normalized`, `2=low`, `3=high`, `4=decoded high`, `5=selected power`, `6=factor`, `7=bounded` |
+| `ROCKCHIP_DEBUG_POW_NEG55_STAGE` | `1=normalized`, `2=low`, `3=high`, `4=selected power`, `5=factor`, `6=bounded` |
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

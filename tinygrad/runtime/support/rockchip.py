@@ -723,6 +723,10 @@ _LUT_ACOSH_RANGE = Ops.RESHAPE
 _LUT_POW8 = Ops.MSELECT
 _LUT_POW8_CORRECTION = Ops.MSTACK
 _LUT_POW8_HIGH = Ops.MULTI
+_LUT_POW55 = Ops.REWRITE_ERROR
+_LUT_POW55_HIGH = Ops.PYLITERAL
+_LUT_POW_NEG55_LOW = Ops.CONTIGUOUS_BACKWARD
+_LUT_POW_NEG55_HIGH = Ops.CUSTOM_FUNCTION
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -834,6 +838,40 @@ def _build_pow8_high_lut() -> tuple[list[int], int, float, float, int]:
       raw = int(round((min(abs(u), 2.0)*0.5)**8 * output_scale))
       lut[offset+i] = max(-32768, min(32767, raw))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_pow55_lut(high:bool) -> tuple[list[int], int, float, float, int]:
+  """Two fixed-point halves for u**5.5 after exact power-of-two normalization."""
+  index_scale = 8192.0
+  output_scale, minus_exp = (32768.0, 15) if high else (2048.0, 11)
+  split, step, lut = 16.0**(1.0/5.5), 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      u = abs((-(512-i) if table == 0 else i) * step)
+      target = (min(u, 2.0)*0.5)**5.5 if high else min(u, split)**5.5
+      # The RK3588 LUT interpolation truncates just below several fp16 ties in
+      # the high table.  One Q15 unit restores round-to-nearest at those ties.
+      lut[offset+i] = max(-32768, min(32767, int(round(target*output_scale)) + int(high)))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
+def _build_pow_neg55_lut(high:bool) -> tuple[list[int], int, float, float, int]:
+  """Tables for u**-5.5 on the normalized half-ranges [0.5,1] and [1,2]."""
+  # The high table receives z=u-1 in [0,1].  Doubling the index scale uses all
+  # 512 positive knots for that interval instead of only 256 for u in [1,2].
+  index_scale = 16384.0
+  output_scale, minus_exp = (32768.0, 15) if high else (1024.0, 10)
+  # Rejected coarse-grid WIP: a global +1 Q15 bias made 74 correct samples high;
+  # sparse knots {400,401,410,470,471,491,492,496..500,502,503} moved the same
+  # one-ULP misses to adjacent quarter-grid inputs.
+  fine_tie_knots = {289, 290, 308, 481}
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      u = abs((-(512-i) if table == 0 else i) * step)
+      normalized = 1.0+min(1.0, u) if high else max(0.5, min(1.0, u))
+      target = min(32.0, normalized**-5.5)
+      correction = int(high and i in fine_tie_knots)
+      lut[offset+i] = max(-32768, min(32767, int(round(target*output_scale)) + correction))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
 
 def _build_hardswish_lut() -> tuple[list[int], int, float, float, int]:
   """Q14 hardswish over [-2,2], with nonzero entries for the LUT zero erratum."""
@@ -1470,6 +1508,14 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW8_CORRECTION)
   if val.op is Ops.CUSTOM and val.arg == "rk_pow8_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW8_HIGH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_pow55" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW55)
+  if val.op is Ops.CUSTOM and val.arg == "rk_pow55_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW55_HIGH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_pow_neg55_low" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_NEG55_LOW)
+  if val.op is Ops.CUSTOM and val.arg == "rk_pow_neg55_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_POW_NEG55_HIGH)
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_celu" and \
      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_CELU)
@@ -4516,6 +4562,321 @@ def _try_pow8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out, (selected, 0), (fallback, 0), Ops.ADD)
   return tuple(tasks)
 
+def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate x**±5.5 with normalized low/high LUTs and one final domain mask."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.half]
+  if len(indexes) != 1: return None
+  source = indexes[0]
+  reciprocals = [u for u in value.toposort() if u.op is Ops.RECIPROCAL and len(u.src) == 1 and _unwrap(u.src[0]) is source]
+  if len(reciprocals) != 0: return None
+  base = reciprocals[0] if reciprocals else source
+
+  def exponent(u:UOp) -> float|None:
+    u = _unwrap(u)
+    if u is base: return 1.0
+    if u.op is Ops.SQRT and len(u.src) == 1 and _unwrap(u.src[0]) is base: return 0.5
+    if u.op is not Ops.MUL or len(u.src) != 2: return None
+    lhs, rhs = exponent(u.src[0]), exponent(u.src[1])
+    return None if lhs is None or rhs is None else lhs+rhs
+
+  if exponent(value) != 5.5: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  if int(source.src[0].src[0].arg) != total: return None
+  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
+    diff, mask = alloc(), alloc()
+    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
+                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
+    return mask, 0
+
+  def temp_index(slot:int) -> UOp:
+    out_index = store.src[0]
+    return out_index.replace(dtype=dtypes.half,
+      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
+
+  fallback_slot = alloc()
+  fallback_store = store.replace(src=(temp_index(fallback_slot), store.src[1]))
+  fallback_tasks = _try_elementwise_subtasks(sink.substitute({store:fallback_store}))
+  if fallback_tasks is None: return None
+  tasks.extend(fallback_tasks)
+  used_slots = [task.task.out_slot for task in fallback_tasks] + \
+    [reloc.globals_slot for task in fallback_tasks for reloc in task.relocs
+     if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+  next_slot = max(next_slot, max(used_slots, default=-1)+1)
+
+  base_slot = alloc() if reciprocals else source_slot
+  one = scalar(1.0)
+  if reciprocals: dependent(base_slot, one, (source_slot,0), Ops.FDIV)
+  negative, absolute = alloc(), alloc()
+  dependent(negative, (base_slot,0), scalar(-1.0), Ops.MUL)
+  dependent(absolute, (base_slot,0), (negative,0), Ops.MAX)
+  abs_arg = (absolute,0)
+
+  above_half = positive_mask(abs_arg, scalar(0.5))
+  above_one = positive_mask(abs_arg, scalar(1.0))
+  above_two = positive_mask(abs_arg, scalar(2.0))
+  band0, band1, band2 = alloc(), alloc(), alloc()
+  dependent(band0, one, above_half, Ops.SUB)
+  dependent(band1, above_half, above_one, Ops.SUB)
+  dependent(band2, above_one, above_two, Ops.SUB)
+
+  def weighted_bands(weights:tuple[float,float,float,float]) -> int:
+    weighted = [alloc() for _ in range(4)]
+    for slot, band, weight in zip(weighted, ((band0,0), (band1,0), (band2,0), above_two), weights):
+      dependent(slot, band, scalar(weight), Ops.MUL)
+    low, high, result = alloc(), alloc(), alloc()
+    dependent(low, (weighted[0],0), (weighted[1],0), Ops.ADD)
+    dependent(high, (weighted[2],0), (weighted[3],0), Ops.ADD)
+    dependent(result, (low,0), (high,0), Ops.ADD)
+    return result
+
+  multiplier = weighted_bands((4.0, 2.0, 1.0, 0.5))
+  factor = weighted_bands((2.0**-11, 2.0**-5.5, 1.0, 2.0**5.5))
+  normalized = alloc()
+  dependent(normalized, abs_arg, (multiplier,0), Ops.MUL)
+
+  # Negative-5.5 fine-grid WIP uses a shifted high_input; positive 5.5 keeps
+  # the unshifted normalized coordinate.
+  low_slot, high_slot = alloc(), alloc()
+  low_value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(normalized),), arg="rk_pow55")
+  low_sink = stage_sink(low_value, low_slot)
+  low_plan = RKPlan("dpu_lut", low_sink, low_slot, (normalized,), lut_op=_LUT_POW55)
+  cmds, task, relocs = emit_rk(low_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+  high_value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(normalized),), arg="rk_pow55_high")
+  high_sink = stage_sink(high_value, high_slot)
+  high_plan = RKPlan("dpu_lut", high_sink, high_slot, (normalized,), lut_op=_LUT_POW55_HIGH)
+  cmds, task, relocs = emit_rk(high_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  high_scaled = alloc()
+  # Select high at the fp16 split itself: low Q11 is already at saturation.
+  split = np.nextafter(np.float16(16.0**(1.0/5.5)), np.float16(0.0), dtype=np.float16)
+  high_mask = positive_mask((normalized,0), scalar(float(split)))
+  low_mask = alloc()
+  dependent(high_scaled, (high_slot,0), scalar(2.0**5.5), Ops.MUL)
+  dependent(low_mask, one, high_mask, Ops.SUB)
+  low_selected, high_selected, normalized_power, scaled = (alloc() for _ in range(4))
+  dependent(low_selected, (low_slot,0), (low_mask,0), Ops.MUL)
+  dependent(high_selected, (high_scaled,0), high_mask, Ops.MUL)
+  dependent(normalized_power, (low_selected,0), (high_selected,0), Ops.ADD)
+  dependent(scaled, (normalized_power,0), (factor,0), Ops.MUL)
+  negative_scaled, bounded_negative, bounded = alloc(), alloc(), alloc()
+  dependent(negative_scaled, (scaled,0), scalar(-1.0), Ops.MUL)
+  dependent(bounded_negative, (negative_scaled,0), scalar(-65504.0), Ops.MAX)
+  dependent(bounded, (bounded_negative,0), scalar(-1.0), Ops.MUL)
+  if (debug_stage := getenv("ROCKCHIP_DEBUG_POW55_STAGE")):
+    debug_slots = {1:normalized, 2:low_slot, 3:high_slot, 4:high_scaled, 5:normalized_power, 6:factor, 7:bounded}
+    if debug_stage in debug_slots:
+      dependent(out, (debug_slots[debug_stage],0), (_ZERO_SLOT,0), Ops.ADD)
+      return tuple(tasks)
+
+  above_quarter = positive_mask(abs_arg, scalar(0.25))
+  below_four = positive_mask(scalar(4.0), abs_arg)
+  valid, selected, inverse, fallback, combined = (alloc() for _ in range(5))
+  dependent(valid, above_quarter, below_four, Ops.MUL)
+  dependent(selected, (bounded,0), (valid,0), Ops.MUL)
+  dependent(inverse, one, (valid,0), Ops.SUB)
+  dependent(fallback, (fallback_slot,0), (inverse,0), Ops.MUL)
+  dependent(combined, (selected,0), (fallback,0), Ops.ADD)
+
+  negative_mask = positive_mask((_ZERO_SLOT,0), (base_slot,0))
+  negative_inf = positive_mask(scalar(-65472.0), (base_slot,0))
+  invalid_negative, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
+  dependent(invalid_negative, negative_mask, negative_inf, Ops.SUB)
+  dependent(invalid_denom, one, (invalid_negative,0), Ops.SUB)
+  dependent(invalid_factor, (invalid_denom,0), (invalid_denom,0), Ops.FDIV)
+  dependent(out, (combined,0), (invalid_factor,0), Ops.MUL)
+  return tuple(tasks)
+
+def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate x**-5.5 directly from x, avoiding an fp16 reciprocal boundary."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.half]
+  if len(indexes) != 1: return None
+  source = indexes[0]
+  reciprocals = [u for u in value.toposort() if u.op is Ops.RECIPROCAL and len(u.src) == 1 and _unwrap(u.src[0]) is source]
+  if len(reciprocals) != 1: return None
+  reciprocal = reciprocals[0]
+
+  def exponent(u:UOp) -> float|None:
+    u = _unwrap(u)
+    if u is reciprocal: return 1.0
+    if u.op is Ops.SQRT and len(u.src) == 1 and _unwrap(u.src[0]) is reciprocal: return 0.5
+    if u.op is not Ops.MUL or len(u.src) != 2: return None
+    lhs, rhs = exponent(u.src[0]), exponent(u.src[1])
+    return None if lhs is None or rhs is None else lhs+rhs
+
+  if exponent(value) != 5.5: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  if int(source.src[0].src[0].arg) != total: return None
+  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
+  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
+    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
+
+  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
+    diff, mask = alloc(), alloc()
+    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
+                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
+    return mask, 0
+
+  def temp_index(slot:int) -> UOp:
+    out_index = store.src[0]
+    return out_index.replace(dtype=dtypes.half,
+      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
+
+  fallback_slot = alloc()
+  fallback_store = store.replace(src=(temp_index(fallback_slot), store.src[1]))
+  fallback_tasks = _try_elementwise_subtasks(sink.substitute({store:fallback_store}))
+  if fallback_tasks is None: return None
+  tasks.extend(fallback_tasks)
+  used_slots = [task.task.out_slot for task in fallback_tasks] + \
+    [reloc.globals_slot for task in fallback_tasks for reloc in task.relocs
+     if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+  next_slot = max(next_slot, max(used_slots, default=-1)+1)
+
+  source_arg, one = (source_slot,0), scalar(1.0)
+  negative, absolute = alloc(), alloc()
+  dependent(negative, source_arg, scalar(-1.0), Ops.MUL)
+  dependent(absolute, source_arg, (negative,0), Ops.MAX)
+  abs_arg = (absolute,0)
+
+  above_half = positive_mask(abs_arg, scalar(0.5))
+  above_one = positive_mask(abs_arg, scalar(1.0))
+  above_two = positive_mask(abs_arg, scalar(2.0))
+  above_four = positive_mask(abs_arg, scalar(4.0))
+  band0, band1, band2, band3 = (alloc() for _ in range(4))
+  dependent(band0, one, above_half, Ops.SUB)
+  dependent(band1, above_half, above_one, Ops.SUB)
+  dependent(band2, above_one, above_two, Ops.SUB)
+  dependent(band3, above_two, above_four, Ops.SUB)
+
+  def weighted_bands(weights:tuple[float,float,float,float,float]) -> int:
+    weighted = [alloc() for _ in range(5)]
+    for slot, band, weight in zip(weighted, ((band0,0), (band1,0), (band2,0), (band3,0), above_four), weights):
+      dependent(slot, band, scalar(weight), Ops.MUL)
+    low, middle, high, result = alloc(), alloc(), alloc(), alloc()
+    dependent(low, (weighted[0],0), (weighted[1],0), Ops.ADD)
+    dependent(middle, (weighted[2],0), (weighted[3],0), Ops.ADD)
+    dependent(high, (low,0), (middle,0), Ops.ADD)
+    dependent(result, (high,0), (weighted[4],0), Ops.ADD)
+    return result
+
+  multiplier = weighted_bands((4.0, 2.0, 1.0, 0.5, 0.25))
+  factor = weighted_bands((2.0**11, 2.0**5.5, 1.0, 2.0**-5.5, 2.0**-11))
+  normalized = alloc()
+  dependent(normalized, abs_arg, (multiplier,0), Ops.MUL)
+
+  high_input = alloc()
+  dependent(high_input, (normalized,0), one, Ops.SUB)
+  low_slot, high_slot = alloc(), alloc()
+  low_value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(normalized),), arg="rk_pow_neg55_low")
+  low_sink = stage_sink(low_value, low_slot)
+  low_plan = RKPlan("dpu_lut", low_sink, low_slot, (normalized,), lut_op=_LUT_POW_NEG55_LOW)
+  cmds, task, relocs = emit_rk(low_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+  high_value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(high_input),), arg="rk_pow_neg55_high")
+  high_sink = stage_sink(high_value, high_slot)
+  high_plan = RKPlan("dpu_lut", high_sink, high_slot, (high_input,), lut_op=_LUT_POW_NEG55_HIGH)
+  cmds, task, relocs = emit_rk(high_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  high_mask = positive_mask((normalized,0), one)
+  low_mask, low_selected, high_selected, normalized_power = (alloc() for _ in range(4))
+  dependent(low_mask, one, high_mask, Ops.SUB)
+  dependent(low_selected, (low_slot,0), (low_mask,0), Ops.MUL)
+  dependent(high_selected, (high_slot,0), high_mask, Ops.MUL)
+  dependent(normalized_power, (low_selected,0), (high_selected,0), Ops.ADD)
+  scaled = alloc()
+  dependent(scaled, (normalized_power,0), (factor,0), Ops.MUL)
+  negative_scaled, bounded_negative, bounded = alloc(), alloc(), alloc()
+  dependent(negative_scaled, (scaled,0), scalar(-1.0), Ops.MUL)
+  dependent(bounded_negative, (negative_scaled,0), scalar(-65504.0), Ops.MAX)
+  dependent(bounded, (bounded_negative,0), scalar(-1.0), Ops.MUL)
+  if (debug_stage := getenv("ROCKCHIP_DEBUG_POW_NEG55_STAGE")):
+    debug_slots = {1:normalized, 2:low_slot, 3:high_slot, 4:normalized_power, 5:factor, 6:bounded}
+    if debug_stage in debug_slots:
+      dependent(out, (debug_slots[debug_stage],0), (_ZERO_SLOT,0), Ops.ADD)
+      return tuple(tasks)
+
+  # The old direct-LUT boundary was 0.125.  Use the last fp16 input whose
+  # correctly rounded x**-5.5 overflows instead, and synthesize infinity below.
+  above_finite = positive_mask(abs_arg, scalar(float(np.float16(0.133056640625))))
+  below_eight = positive_mask(scalar(8.0), abs_arg)
+  valid, selected, inverse = (alloc() for _ in range(3))
+  dependent(valid, above_finite, below_eight, Ops.MUL)
+  dependent(selected, (bounded,0), (valid,0), Ops.MUL)
+  dependent(inverse, one, (valid,0), Ops.SUB)
+  # Clamp the generic fallback before masking so 0*inf cannot contaminate a
+  # finite direct-LUT result.  Overflow is restored explicitly just below.
+  fallback_negative, fallback_bounded_negative, fallback_bounded, fallback, combined = (alloc() for _ in range(5))
+  dependent(fallback_negative, (fallback_slot,0), scalar(-1.0), Ops.MUL)
+  dependent(fallback_bounded_negative, (fallback_negative,0), scalar(-65504.0), Ops.MAX)
+  dependent(fallback_bounded, (fallback_bounded_negative,0), scalar(-1.0), Ops.MUL)
+  dependent(fallback, (fallback_bounded,0), (inverse,0), Ops.MUL)
+  dependent(combined, (selected,0), (fallback,0), Ops.ADD)
+  overflow, overflow_numerator, overflow_combined = alloc(), alloc(), alloc()
+  dependent(overflow, one, above_finite, Ops.SUB)
+  dependent(overflow_numerator, (combined,0), (overflow,0), Ops.ADD)
+  dependent(overflow_combined, (overflow_numerator,0), above_finite, Ops.FDIV)
+  # 0.1331787 is the first positive fp16 base with a finite result.  It lies
+  # immediately after a saturated Q10 knot, so use its correctly rounded half
+  # value rather than interpolating across the infinity/finite discontinuity.
+  above_first_finite = positive_mask(abs_arg, scalar(float(np.float16(0.1331787109375))))
+  first_finite, ordinary_mask, ordinary, boundary, rounded = (alloc() for _ in range(5))
+  dependent(first_finite, above_finite, above_first_finite, Ops.SUB)
+  dependent(ordinary_mask, one, (first_finite,0), Ops.SUB)
+  dependent(ordinary, (overflow_combined,0), (ordinary_mask,0), Ops.MUL)
+  dependent(boundary, (first_finite,0), scalar(65408.0), Ops.MUL)
+  dependent(rounded, (ordinary,0), (boundary,0), Ops.ADD)
+
+  negative_mask = positive_mask((_ZERO_SLOT,0), source_arg)
+  negative_extreme = positive_mask(scalar(-65472.0), source_arg)
+  invalid_negative, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
+  dependent(invalid_negative, negative_mask, negative_extreme, Ops.SUB)
+  dependent(invalid_denom, one, (invalid_negative,0), Ops.SUB)
+  dependent(invalid_factor, (invalid_denom,0), (invalid_denom,0), Ops.FDIV)
+  dependent(out, (rounded,0), (invalid_factor,0), Ops.MUL)
+  return tuple(tasks)
+
 def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower fractional x**c through staged abs, LOG2, scale, and EXP2.
 
@@ -6183,6 +6544,22 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_POW8_HIGH:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_high_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_POW55:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow55_lut(False)
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_POW55_HIGH:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow55_lut(True)
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_POW_NEG55_LOW:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_neg55_lut(False)
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_POW_NEG55_HIGH:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_neg55_lut(True)
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_TAN_LOCAL:
@@ -8722,6 +9099,10 @@ def _try_cmac_shared_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
 def build_native_program(sink: UOp) -> UOp|None:
   """Classify and build a PROGRAM(SINK, LINEAR(INS...)). Raises RKPLAN_REJECT:<reason>
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
+  # The generic reciprocal-to-FDIV rewrite obscures the strict x**-5.5 graph,
+  # so recognize this special case while its exponent structure is intact.
+  if (pow_neg55_tasks := _try_pow_neg55_lut_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, pow_neg55_tasks)
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
@@ -8761,6 +9142,9 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
   if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
   if (pow8_tasks := _try_pow8_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, pow8_tasks)
+  if (pow55_tasks := _try_pow55_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, pow55_tasks)
+  if (pow_neg55_tasks := _try_pow_neg55_lut_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, pow_neg55_tasks)
   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fractional_pow_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
