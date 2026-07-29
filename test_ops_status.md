@@ -21,6 +21,8 @@ floating, exact int32 boundary, and bool cases.
 preserve its explicit fp16 intermediate boundary.
 `TestOps.test_sum_relu` passes through an ordered DPU ReLU, CMAC reduction,
 and final DPU ReLU.
+`TestOps.test_sum_cat_collapse` passes by byte-materializing its static
+concatenation index selection before CMAC.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -757,3 +759,25 @@ The official test plus permanent mixed-sign/all-negative regression pass
 seconds**, and the hardware-free contract remains **79/79 in 6.49 seconds**.
 
 Recovery patch: `rockchip-native-relu-sum-e022b54f4.patch`.
+
+### Indexed-movement/SUM milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `sum_cat_collapse` | **passing in 2.45 s** | **static byte movement + CMAC ADD** |
+| arbitrary runtime cat inputs followed by SUM | **passing** | **passing** |
+
+The fused concatenation is a WHERE whose condition depends only on the static
+reduction coordinate and whose two arms are tensor INDEX nodes. A tagged host
+movement task evaluates only those integer coordinates and copies raw fp16
+bytes to contiguous scratch. CMAC performs the runtime-dependent ADD
+reduction. No host callback examines tensor values or computes the sum.
+
+The official method plus permanent arbitrary-input regression pass **2/2 in
+2.56 seconds**. The complete CMAC class is **26/26 in 11.06 seconds**, and the
+hardware-free contract remains **79/79 in 6.62 seconds**.
+
+`ROCKCHIP_DEBUG_MOVEMENT_SUM=1` prints either synthesized stage when matching
+or CMAC planning fails.
+
+Recovery patch: `rockchip-native-movement-sum-cc377ca33.patch`.

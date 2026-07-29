@@ -1,0 +1,170 @@
+diff --git a/progress.md b/progress.md
+index 3e25e18ce..cd089b54d 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6388,3 +6388,37 @@ Using `. .venv/bin/activate`:
+ 
+ The standalone recovery artifact is
+ `rockchip-native-relu-sum-e022b54f4.patch`, based on `e022b54f4`.
++
++## 2026-07-29 — indexed concatenation followed by SUM
++
++`TestOps.test_sum_cat_collapse` fuses concatenation into the ADD-reduction
++body as a WHERE over the static reduction coordinate. One arm indexes the
++256-column tensor and the other indexes the 64-column tensor.
++
++The new movement-sum matcher accepts only an ADD reduction whose WHERE arms
++unwrap directly to tensor INDEX nodes. It converts the reduction coordinate
++to a loop coordinate, serializes the existing static address choice into the
++exact movement task, and writes the selected raw fp16 bytes to contiguous
++scratch. CMAC then reduces that scratch along the original axis.
++
++This is within the accepted `run_host` boundary: WHERE is used only to choose
++a compile-time address from loop coordinates. The callback copies bytes and
++never reads a value to decide which arm wins. The runtime-dependent ADD
++reduction remains on CMAC.
++
++`ROCKCHIP_DEBUG_MOVEMENT_SUM=1` prints the synthesized movement or CMAC SINK
++when either stage rejects.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- complete official `TestOps.test_sum_cat_collapse`: **passing in 2.45
++  seconds**;
++- official plus arbitrary-runtime-input cat/SUM regression: **2/2 in 2.56
++  seconds**;
++- complete CMAC hardware class: **26/26 in 11.06 seconds**;
++- hardware-free PR1 contract: **79/79 in 6.62 seconds**.
++
++The standalone recovery artifact is
++`rockchip-native-movement-sum-cc377ca33.patch`, based on `cc377ca33`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 05092f2b0..d4581e39a 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -584,6 +584,14 @@ class TestCMAC(unittest.TestCase):
+       got = Tensor(a_np, device="ROCKCHIP").realize().relu().sum().relu().realize().numpy()
+       np.testing.assert_array_equal(got, expected)
+ 
++  def test_cmac_cat_sum(self):
++    a_np = np.array([[1,2,-3,4], [5,-6,7,8], [-9,10,11,-12]], dtype=np.float16)
++    b_np = np.array([[0.5,-1.5], [2.5,-3.5], [4.5,-5.5]], dtype=np.float16)
++    a, b = Tensor(a_np, device="ROCKCHIP").realize(), Tensor(b_np, device="ROCKCHIP").realize()
++    got = Tensor.cat(a, b, dim=1).sum(axis=1).realize().numpy()
++    expected = np.sum(np.concatenate((a_np, b_np), axis=1).astype(np.float32), axis=1).astype(np.float16)
++    np.testing.assert_array_equal(got, expected)
++
+   def test_cmac_scaled_sum_full(self):
+     # Scaled full sum: (a * 2).sum() → ones @ (a*2)
+     a_np = np.array([[1,2,3,4],[5,6,7,8],[1,1,1,1],[2,2,2,2]], dtype=np.float16)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index d6d601b54..9b6db9650 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -21,6 +21,8 @@ floating, exact int32 boundary, and bool cases.
+ preserve its explicit fp16 intermediate boundary.
+ `TestOps.test_sum_relu` passes through an ordered DPU ReLU, CMAC reduction,
+ and final DPU ReLU.
++`TestOps.test_sum_cat_collapse` passes by byte-materializing its static
++concatenation index selection before CMAC.
+ 
+ **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
+ including its float32 infinity/NaN subcase. The summary table below remains the
+@@ -757,3 +759,25 @@ The official test plus permanent mixed-sign/all-negative regression pass
+ seconds**, and the hardware-free contract remains **79/79 in 6.49 seconds**.
+ 
+ Recovery patch: `rockchip-native-relu-sum-e022b54f4.patch`.
++
++### Indexed-movement/SUM milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `sum_cat_collapse` | **passing in 2.45 s** | **static byte movement + CMAC ADD** |
++| arbitrary runtime cat inputs followed by SUM | **passing** | **passing** |
++
++The fused concatenation is a WHERE whose condition depends only on the static
++reduction coordinate and whose two arms are tensor INDEX nodes. A tagged host
++movement task evaluates only those integer coordinates and copies raw fp16
++bytes to contiguous scratch. CMAC performs the runtime-dependent ADD
++reduction. No host callback examines tensor values or computes the sum.
++
++The official method plus permanent arbitrary-input regression pass **2/2 in
++2.56 seconds**. The complete CMAC class is **26/26 in 11.06 seconds**, and the
++hardware-free contract remains **79/79 in 6.62 seconds**.
++
++`ROCKCHIP_DEBUG_MOVEMENT_SUM=1` prints either synthesized stage when matching
++or CMAC planning fails.
++
++Recovery patch: `rockchip-native-movement-sum-cc377ca33.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index c5a896b5e..dd6ee04a9 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -7394,6 +7394,56 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tasks.append(_emit_where_stage(output_total, info.outs[0], (sum_slot, 0), zero_arg, Ops.MAX))
+   return tuple(tasks)
+ 
++def _try_movement_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Materialize a static indexed-WHERE reduction body, then sum it on CMAC."""
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.half or \
++     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
++  body = _unwrap(reduce.src[0])
++  if body.op is not Ops.WHERE or any(_unwrap(arm).op is not Ops.INDEX for arm in body.src[1:]): return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  reductions = list(reduce.src[1:])
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++
++  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
++    flat = axes[0]
++    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
++    return flat
++
++  info = ProgramInfo.from_sink(sink)
++  intermediate_slot = max(info.globals, default=-1) + 1
++  reduction_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in reductions]
++  stage_axes = [*loops, *reduction_loops]
++  stage_extents = [int(u.src[0].arg) for u in stage_axes]
++  stage_total = prod(stage_extents)
++  stage_body = body.substitute(dict(zip(reductions, reduction_loops)))
++  device = store.src[0].src[0].device
++  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=device)
++  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
++  stage_value = stage_body.replace(dtype=dtypes.half, src=(stage_body.src[0], *(_unwrap(arm) for arm in stage_body.src[1:])))
++  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_value)), *stage_axes)))
++  movement_tasks = _try_movement_host_subtasks(stage_sink)
++  if movement_tasks is None:
++    if getenv("ROCKCHIP_DEBUG_MOVEMENT_SUM"): print("RK_MOVEMENT_SUM_MOVEMENT_REJECT", stage_sink)
++    return None
++  tasks = list(movement_tasks)
++
++  final_axes = [*loops, *reductions]
++  final_extents = [int(u.src[0].arg) for u in final_axes]
++  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
++  final_acc = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (intermediate_index,), arg=dtypes.float), *reductions))
++  final_sink = sink.substitute({reduce:final_acc})
++  final_plan = plan_rk(final_sink)
++  if isinstance(final_plan, str) or final_plan.kind != "cmac":
++    if getenv("ROCKCHIP_DEBUG_MOVEMENT_SUM"): print("RK_MOVEMENT_SUM_CMAC_REJECT", final_plan, final_sink)
++    return None
++  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(final_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  return tuple(tasks)
++
+ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Gather a small static float reduction window, then multiply it on DPU."""
+   reduce, store = _reduce_node(sink), _store_node(sink)
+@@ -8197,6 +8247,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
+   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, variable_scale_tasks)
++  if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, movement_sum_tasks)
+   if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, relu_sum_tasks)
+   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:

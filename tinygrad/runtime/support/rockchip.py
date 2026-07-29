@@ -7394,6 +7394,56 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(output_total, info.outs[0], (sum_slot, 0), zero_arg, Ops.MAX))
   return tuple(tasks)
 
+def _try_movement_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Materialize a static indexed-WHERE reduction body, then sum it on CMAC."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.half or \
+     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  body = _unwrap(reduce.src[0])
+  if body.op is not Ops.WHERE or any(_unwrap(arm).op is not Ops.INDEX for arm in body.src[1:]): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+
+  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
+    flat = axes[0]
+    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
+    return flat
+
+  info = ProgramInfo.from_sink(sink)
+  intermediate_slot = max(info.globals, default=-1) + 1
+  reduction_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in reductions]
+  stage_axes = [*loops, *reduction_loops]
+  stage_extents = [int(u.src[0].arg) for u in stage_axes]
+  stage_total = prod(stage_extents)
+  stage_body = body.substitute(dict(zip(reductions, reduction_loops)))
+  device = store.src[0].src[0].device
+  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=device)
+  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
+  stage_value = stage_body.replace(dtype=dtypes.half, src=(stage_body.src[0], *(_unwrap(arm) for arm in stage_body.src[1:])))
+  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_value)), *stage_axes)))
+  movement_tasks = _try_movement_host_subtasks(stage_sink)
+  if movement_tasks is None:
+    if getenv("ROCKCHIP_DEBUG_MOVEMENT_SUM"): print("RK_MOVEMENT_SUM_MOVEMENT_REJECT", stage_sink)
+    return None
+  tasks = list(movement_tasks)
+
+  final_axes = [*loops, *reductions]
+  final_extents = [int(u.src[0].arg) for u in final_axes]
+  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
+  final_acc = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (intermediate_index,), arg=dtypes.float), *reductions))
+  final_sink = sink.substitute({reduce:final_acc})
+  final_plan = plan_rk(final_sink)
+  if isinstance(final_plan, str) or final_plan.kind != "cmac":
+    if getenv("ROCKCHIP_DEBUG_MOVEMENT_SUM"): print("RK_MOVEMENT_SUM_CMAC_REJECT", final_plan, final_sink)
+    return None
+  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(final_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  return tuple(tasks)
+
 def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Gather a small static float reduction window, then multiply it on DPU."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -8197,6 +8247,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variable_scale_tasks)
+  if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, movement_sum_tasks)
   if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, relu_sum_tasks)
   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:

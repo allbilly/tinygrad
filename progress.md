@@ -6388,3 +6388,37 @@ Using `. .venv/bin/activate`:
 
 The standalone recovery artifact is
 `rockchip-native-relu-sum-e022b54f4.patch`, based on `e022b54f4`.
+
+## 2026-07-29 — indexed concatenation followed by SUM
+
+`TestOps.test_sum_cat_collapse` fuses concatenation into the ADD-reduction
+body as a WHERE over the static reduction coordinate. One arm indexes the
+256-column tensor and the other indexes the 64-column tensor.
+
+The new movement-sum matcher accepts only an ADD reduction whose WHERE arms
+unwrap directly to tensor INDEX nodes. It converts the reduction coordinate
+to a loop coordinate, serializes the existing static address choice into the
+exact movement task, and writes the selected raw fp16 bytes to contiguous
+scratch. CMAC then reduces that scratch along the original axis.
+
+This is within the accepted `run_host` boundary: WHERE is used only to choose
+a compile-time address from loop coordinates. The callback copies bytes and
+never reads a value to decide which arm wins. The runtime-dependent ADD
+reduction remains on CMAC.
+
+`ROCKCHIP_DEBUG_MOVEMENT_SUM=1` prints the synthesized movement or CMAC SINK
+when either stage rejects.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- complete official `TestOps.test_sum_cat_collapse`: **passing in 2.45
+  seconds**;
+- official plus arbitrary-runtime-input cat/SUM regression: **2/2 in 2.56
+  seconds**;
+- complete CMAC hardware class: **26/26 in 11.06 seconds**;
+- hardware-free PR1 contract: **79/79 in 6.62 seconds**.
+
+The standalone recovery artifact is
+`rockchip-native-movement-sum-cc377ca33.patch`, based on `cc377ca33`.
