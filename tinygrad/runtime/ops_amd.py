@@ -154,20 +154,22 @@ class AMDComputeQueue(HWQueue):
       memsel_dw = self.pm4.PACKET3_RELEASE_MEM_DATA_SEL(data_sel) | self.pm4.PACKET3_RELEASE_MEM_INT_SEL(int_sel) \
                 | self.pm4.PACKET3_RELEASE_MEM_DST_SEL(0)
     else:
+      gfx8_direct = self.dev.target[0] == 8 and self.dev.is_am()
       cache_flags_dw = 0 if not cache_flush else (
-        self.pm4.EOP_TC_WB_ACTION_EN | (self.pm4.EOP_TC_ACTION_EN if self.dev.target[0] == 8 else self.pm4.EOP_TC_NC_ACTION_EN) |
-        ((2 << 25) if self.dev.target[0] == 8 else 0))
+        self.pm4.EOP_TC_WB_ACTION_EN |
+        (self.pm4.EOP_TC_ACTION_EN if self.dev.target[0] == 8 and not gfx8_direct else self.pm4.EOP_TC_NC_ACTION_EN) |
+        ((2 << 25) if self.dev.target[0] == 8 and not gfx8_direct else 0))
 
       event_dw = self.pm4.EVENT_TYPE(self.pm4.CACHE_FLUSH_AND_INV_TS_EVENT) | self.pm4.EVENT_INDEX(self.pm4.event_index__mec_release_mem__end_of_pipe)
 
-      if self.dev.target[0] == 8 and data_sel and int_sel == self.pm4.int_sel__mec_release_mem__none:
+      if self.dev.target[0] == 8 and not gfx8_direct and data_sel and int_sel == self.pm4.int_sel__mec_release_mem__none:
         int_sel = self.pm4.int_sel__mec_release_mem__send_data_after_write_confirm
       memsel_dw = self.pm4.DATA_SEL(data_sel) | self.pm4.INT_SEL(int_sel)
 
       ctxid = 0
 
     if self.dev.target[0] == 8:
-      self.q(self.pm4.PACKET3(self.pm4.PACKET3_RELEASE_MEM, 5) | (1 << 1),
+      self.q(self.pm4.PACKET3(self.pm4.PACKET3_RELEASE_MEM, 5) | (0 if self.dev.is_am() else 1 << 1),
              event_dw | cache_flags_dw, memsel_dw, *data64_le(address), *data64_le(value))
     else:
       self.q(self.pm4.PACKET3(self.pm4.PACKET3_RELEASE_MEM, 6),

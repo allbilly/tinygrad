@@ -59,7 +59,8 @@ class TestPolarisAM(unittest.TestCase):
 
   def test_gfx8_release_mem_uses_ci_packet_layout(self):
     queue = AMDComputeQueue.__new__(AMDComputeQueue)
-    queue.dev, queue.pm4, queue._q, queue.binded_device = SimpleNamespace(target=(8, 0, 3)), pm4_soc15, [], None
+    queue.dev = SimpleNamespace(target=(8, 0, 3), is_am=lambda: False)
+    queue.pm4, queue._q, queue.binded_device = pm4_soc15, [], None
     queue.release_mem(address=0x12345000, value=7, data_sel=pm4_soc15.data_sel__mec_release_mem__send_32_bit_low,
                       int_sel=pm4_soc15.int_sel__mec_release_mem__none, cache_flush=True)
     self.assertEqual(len(queue._q), 7)  # CI/VI has no trailing ctxid dword.
@@ -68,6 +69,14 @@ class TestPolarisAM(unittest.TestCase):
     self.assertFalse(queue._q[1] & pm4_soc15.EOP_TC_NC_ACTION_EN)
     self.assertEqual((queue._q[1] >> 25) & 3, 2)
     self.assertEqual(queue._q[2], pm4_soc15.DATA_SEL(1) | pm4_soc15.INT_SEL(3))
+
+    queue.dev, queue._q = SimpleNamespace(target=(8, 0, 3), is_am=lambda: True), []
+    queue.release_mem(address=0x12345000, value=7, data_sel=pm4_soc15.data_sel__mec_release_mem__send_32_bit_low,
+                      int_sel=pm4_soc15.int_sel__mec_release_mem__none, cache_flush=True)
+    self.assertEqual(len(queue._q), 7)
+    self.assertEqual(queue._q[0], pm4_soc15.PACKET3(pm4_soc15.PACKET3_RELEASE_MEM, 5))
+    self.assertTrue(queue._q[1] & pm4_soc15.EOP_TC_NC_ACTION_EN)
+    self.assertEqual(queue._q[2], pm4_soc15.DATA_SEL(1))
 
   def test_hot_takeover_and_hqd(self):
     dev = PolarisAMDev(FakePCI())  # type: ignore[arg-type]
