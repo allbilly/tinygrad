@@ -487,6 +487,19 @@ class TestCMAC(unittest.TestCase):
         expected[:, :, oy, ox] = np.sum(window, axis=(2, 3), dtype=np.float32) * np.float32(1/6)
     np.testing.assert_array_equal(actual, expected)
 
+  def test_cmac_avg_pool_variable_divisor(self):
+    np.random.seed(853)
+    x_np = np.random.uniform(-2, 2, size=(1, 1, 6, 6)).astype(np.float16)
+    x = Tensor(x_np, device="ROCKCHIP").realize()
+    actual = x.avg_pool2d(kernel_size=(3, 3), padding=1, count_include_pad=False).realize().numpy()
+    expected = np.empty((1, 1, 2, 2), dtype=np.float16)
+    for oy in range(2):
+      for ox in range(2):
+        y0, x0 = oy*3-1, ox*3-1
+        window = x_np[:, :, max(0, y0):min(6, y0+3), max(0, x0):min(6, x0+3)].astype(np.float32)
+        expected[:, :, oy, ox] = np.sum(window, axis=(2, 3), dtype=np.float32) * np.float32(1/window.shape[2]/window.shape[3])
+    np.testing.assert_array_equal(actual, expected)
+
   def test_cmac_matmul_non_identity(self):
     a_np = np.array([[1,2],[3,4]], dtype=np.float16)
     b_np = np.array([[5,6],[7,8]], dtype=np.float16)

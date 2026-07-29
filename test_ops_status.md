@@ -436,3 +436,36 @@ Those use an output-dependent divisor and reject as
 `unsupported_op:fused_epilogue`. `avg_pool3d` is blocked earlier by Torch
 CPU's missing half implementation, independent of the Rockchip backend.
 Local max pooling and max-unpool/index scatter remain separate groups.
+
+### Pooling refresh: output-dependent average divisors
+
+The three remaining forward `avg_pool2d` groups are now fixed:
+
+| Passing selection | Result |
+|---|---:|
+| `padding_not_counted`, general `ceil_mode`, and their combination | **3 methods, 9 subtests** |
+| Complete current `avg_pool2d` selection | **9 methods, 26 subtests** |
+| CMAC hardware class | **23/23** |
+| Hardware-free PR1 file | **78/78** |
+| Complete Rockchip hardware file | **82/82** |
+
+Rockchip lowering may preserve the average as fp16 `FDIV` or decompose it
+into `MUL(RECIPROCAL)`. Both forms are recognized. The static divisor can
+also be a product of a REDUCE and constant extent, as in ceil-mode `(3,2)`;
+the compiler recursively evaluates the complete data-independent count
+expression for every output coordinate.
+
+The rejected fp16-scratch/DPU-MUL experiment produced one-ULP errors because
+it rounded the sum before division. The passing implementation serializes
+per-output integer divisors in the materialized CMAC layout and applies each
+reciprocal to raw fp32 CACC before the sole fp16 conversion.
+
+Current pooling work remaining:
+
+- local `max_pool2d` PPU layout variants;
+- returned max-pool indices and `max_unpool2d` scatter;
+- `avg_pool3d`, whose official test is blocked before tinygrad execution by
+  Torch CPU half `NotImplementedError`.
+
+No LUT is involved. See `progress.md` for the exact matcher probe, rounding
+diagnosis, layout contract, validation commands, and standalone patch name.

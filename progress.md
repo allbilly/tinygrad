@@ -5579,3 +5579,89 @@ tinygrad executes.
 
 No LUT is used. The standalone patch is
 `rockchip-avg-pool-scale-eda240f95.patch`, against parent `eda240f95`.
+
+## 2026-07-29 — output-dependent average-pooling divisor milestone
+
+All remaining forward `avg_pool2d` groups now pass on the real RK3588:
+
+- `test_avg_pool2d_padding_not_counted`;
+- `test_avg_pool2d_ceil_mode`;
+- `test_avg_pool2d_ceil_mode_padding_not_counted`.
+
+Together these are **3 methods and 9 parameterized subtests**. The complete
+current `avg_pool2d` selection is **9 methods and 26 subtests passing**.
+
+### Debug method and failure signatures
+
+The first implementation recognized the NULL-device graph form
+`MUL(CAST(sum), RECIPROCAL(CAST(count)))`, but the real Rockchip compilation
+preserved `FDIV(CAST(sum), CAST(count))`. A temporary runtime wrapper around
+`_try_cmac_variable_scale_subtasks` printed only the root op, reduction count,
+reduction bodies, and `plan_rk` result. That exposed the structural miss
+without modifying the lowering pipeline:
+
+```text
+MISS reduces 2 root Ops.FDIV
+plan RKPLAN_REJECT:unsupported_op:fused_epilogue
+```
+
+The matcher now accepts both equivalent roots. A second edge case,
+ceil-mode `(3,2)`, represented its divisor as
+`MUL(REDUCE(valid_y), CONST(2))` rather than a single two-axis REDUCE. The
+compile-time evaluator therefore evaluates the complete static divisor
+expression recursively. It supports nested ADD reductions plus the integer,
+comparison, boolean, and WHERE operations used by pooling bounds. Any PARAM,
+INDEX, non-ADD reduction, non-integral divisor, zero divisor, or dynamic range
+still causes a conservative miss.
+
+The initial execution design used:
+
+```text
+CMAC sum -> fp16 scratch -> DPU MUL(fp16 reciprocal) -> output
+```
+
+That removed the rejection but failed strict comparison by one fp16 ULP in
+roughly 28–44% of affected outputs. The mismatch was the diagnostic:
+rounding the CMAC sum before division introduced an extra fp16 boundary.
+This discarded scratch design remains documented in the
+`_HOST_STATIC_HALF_LAYOUT` support for reference, but it is not selected.
+
+### Final layout and precision boundary
+
+The compiler evaluates the valid-element count for every physical output
+coordinate and serializes the integer divisor vector in the materialized
+CMAC task layout. Runtime unpack uses the corresponding divisor to scale the
+raw fp32 CACC value, rounds that multiplication to fp32, and performs exactly
+one final fp16 conversion:
+
+```text
+fp32 CACC * (1 / static output divisor) -> fp16 output
+```
+
+This extends the constant-divisor path from `acbf038c4` and exactly matches
+the Torch fp16 average-pool results tested here. CNA/CORE still performs every
+sum; only static indexing and the existing final output conversion path are
+host-managed. No LUT or two-level LUT is involved.
+
+### Validation
+
+Commands use `. .venv/bin/activate`, `DEV=ROCKCHIP`,
+`DEFAULT_FLOAT=HALF`, `FORWARD_ONLY=1`, and the Rockchip pytest plugin.
+
+- all `avg_pool2d` methods: **9 passed, 26 subtests passed** in 16.15 seconds;
+- new exact variable-divisor hardware regression plus constant-scale
+  regression: **2/2**;
+- complete CMAC hardware class: **23/23** in 8.06 seconds;
+- hardware-free PR1: **78/78** in 6.53 seconds.
+- complete Rockchip hardware file: **82/82** in 248.43 seconds.
+
+Pytest-xdist is absent from this `.venv`, so the requested `-n12` option
+reports `unrecognized arguments: -n12`; hardware-free tests were run
+serially and NPU tests must remain serial. Mypy has the same 13 pre-existing
+findings and targeted Ruff the same five pre-existing findings; pycompile and
+`git diff --check` are clean. `avg_pool3d` remains blocked before backend
+execution by Torch CPU half `NotImplementedError`. The next pooling groups
+are local max-pool PPU layout and max-pool indices/max-unpool scatter.
+
+The standalone patch is
+`rockchip-avg-pool-variable-acbf038c4.patch`, against parent `acbf038c4`.

@@ -470,6 +470,17 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(len(subtasks), 2)
     self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
 
+  def test_avg_pool_variable_divisor_serializes_counts(self):
+    x = Tensor.rand(1,1,6,6,dtype=dtypes.half).realize()
+    prg = build_native_program(_get_sink(x.avg_pool2d(kernel_size=(3,3), padding=1, count_include_pad=False)))
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.kind, "cmac")
+    layout = subtasks[0].task.layout
+    n_counts = layout[11]
+    self.assertEqual(n_counts, 4)
+    self.assertEqual(set(layout[12:12+n_counts]), {4, 6, 9})
+
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()
     b = Tensor.rand(5000,dtype=dtypes.half).realize()

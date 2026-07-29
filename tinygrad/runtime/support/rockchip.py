@@ -68,6 +68,7 @@ class RKPlan:
   is_abs: bool = False                # abs(x) via BN negate + EW max (both operands same buffer)
   epilogue: str = "none"              # CMAC BS/BN epilogue: "none", "relu", "scale"
   epilogue_scale: float = 1.0         # scale factor for "scale" epilogue (BS MUL operand)
+  epilogue_scale_counts: tuple[int, ...] = () # per-output divisors applied to raw fp32 CMAC results
   epilogue_bias_slot: int = -1        # host fp32-accumulator channel bias, before final fp16 rounding
   epilogue_bias_axis: int = -1        # output LOOP axis used to index the bias tensor
   cmac_materialization: tuple[int, ...] = () # serialized non-contiguous A/B/output indexing for CMAC
@@ -175,6 +176,7 @@ _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 t
 _HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
 _HOST_ELEMENTWISE_LAYOUT = -1004  # is_copy task layout tag for serialized fused elementwise graphs
 _CMAC_MATERIALIZED_LAYOUT = -1005  # CMAC layout tag for host-gathered A/B matrices
+_HOST_STATIC_HALF_LAYOUT = -1006  # compile-time fp16 tensor used by a later NPU stage
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -5946,7 +5948,8 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
   if plan.cmac_materialization:
     scale_bits = struct.unpack('<I', struct.pack('<f', plan.epilogue_scale if plan.epilogue == "scale" else 1.0))[0]
     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), scale_bits, tile_n, tile_k, *plan.cmac_materialization[5:])
+              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), scale_bits, len(plan.epilogue_scale_counts),
+              *plan.epilogue_scale_counts, tile_n, tile_k, *plan.cmac_materialization[5:])
   else:
     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
               int(plan.epilogue == "bias_relu"))
@@ -6830,6 +6833,88 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
+def _try_cmac_variable_scale_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Apply a static output-dependent reciprocal to raw fp32 CMAC sums."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.ADD: return None
+  val = _unwrap(store.src[1])
+  data_value, count = None, None
+  if val.op is Ops.MUL and len(val.src) == 2:
+    for data, scale in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
+      if _unwrap(data) is reduce and _unwrap(scale).op is Ops.RECIPROCAL:
+        data_value, count = data, _unwrap(scale).src[0]
+        break
+  elif val.op is Ops.FDIV and len(val.src) == 2 and _unwrap(val.src[0]) is reduce:
+    # Device-specific lowering may preserve half FDIV instead of spelling it
+    # MUL(RECIPROCAL(count)); both identify the same static pooling divisor.
+    data_value, count = val.src
+  if data_value is None or count is None: return None
+  while count.op is Ops.CAST: count = count.src[0]
+  count_reduces = [u for u in count.toposort() if u.op is Ops.REDUCE]
+  if not count_reduces or any(u.arg[0] is not Ops.ADD for u in count_reduces): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  count_ranges = [r for u in count_reduces for r in u.src[1:]]
+  if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *count_ranges)): return None
+  loop_extents = [int(u.src[0].arg) for u in loops]
+  total = prod(loop_extents)
+
+  def evaluate(u:UOp, coords:dict[UOp, int]):
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.CONST: return 0 if u.arg is Invalid else u.arg
+    if u.op is Ops.RANGE and u in coords: return coords[u]
+    if u.op is Ops.REDUCE:
+      ranges, result = u.src[1:], 0
+      extents = [int(x.src[0].arg) for x in ranges]
+      for linear in range(prod(extents)):
+        rem = linear
+        for axis in range(len(ranges)-1, -1, -1): rem, coords[ranges[axis]] = divmod(rem, extents[axis])
+        result += evaluate(u.src[0], coords)
+      return result
+    values = [evaluate(x, coords) for x in u.src]
+    if u.op is Ops.ADD: return values[0] + values[1]
+    if u.op is Ops.MUL: return values[0] * values[1]
+    if u.op is Ops.FLOORDIV: return values[0] // values[1]
+    if u.op is Ops.FLOORMOD: return values[0] % values[1]
+    if u.op is Ops.CMPLT: return values[0] < values[1]
+    if u.op is Ops.CMPNE: return values[0] != values[1]
+    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
+    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
+    if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
+    raise ValueError(u.op)
+
+  scale_counts = [0] * total
+  try:
+    for linear in range(total):
+      rem, coords = linear, {}
+      for axis in range(len(loops)-1, -1, -1): rem, coords[loops[axis]] = divmod(rem, loop_extents[axis])
+      raw_count = evaluate(count, coords)
+      count_value = int(raw_count)
+      if count_value <= 0 or count_value != raw_count: return None
+      out_index = int(evaluate(store.src[0].src[1], coords))
+      if not 0 <= out_index < total: return None
+      scale_counts[out_index] = count_value
+  except (ValueError, TypeError, OverflowError, ZeroDivisionError):
+    return None
+  if any(count_value == 0 for count_value in scale_counts): return None
+
+  # The retired scratch path allocated two slots after ProgramInfo.globals:
+  # one for the rounded sum and one for a host-materialized reciprocal tensor.
+  cmac_sink = sink.substitute({store:store.replace(src=(store.src[0], data_value))})
+  plan = plan_rk(cmac_sink)
+  if isinstance(plan, str) or plan.kind != "cmac": return None
+  if not plan.cmac_materialization: return None
+  plan = replace(plan, epilogue_scale_counts=tuple(scale_counts))
+  tasks:list[RKSubTask] = []
+  if (shared_tasks := _try_cmac_shared_subtasks(plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  # The earlier fp16-scratch + static reciprocal + DPU MUL design is preserved
+  # in _HOST_STATIC_HALF_LAYOUT support. It double-rounded the CMAC sum, while
+  # PyTorch scales the fp32 accumulator once before its final fp16 conversion.
+  return tuple(tasks)
+
 def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
   """Split flipped-kernel CMAC reductions at PyTorch fp16 col2im boundaries."""
   materialization = plan.cmac_materialization
@@ -7034,6 +7119,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+  if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, variable_scale_tasks)
   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
     return build_native_program_multi(sink, multifactor_tasks)
   plan = plan_rk(sink)

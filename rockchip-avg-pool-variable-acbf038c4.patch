@@ -1,0 +1,428 @@
+diff --git a/progress.md b/progress.md
+index 551af5f39..bcb8632ae 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5579,3 +5579,89 @@ tinygrad executes.
+ 
+ No LUT is used. The standalone patch is
+ `rockchip-avg-pool-scale-eda240f95.patch`, against parent `eda240f95`.
++
++## 2026-07-29 — output-dependent average-pooling divisor milestone
++
++All remaining forward `avg_pool2d` groups now pass on the real RK3588:
++
++- `test_avg_pool2d_padding_not_counted`;
++- `test_avg_pool2d_ceil_mode`;
++- `test_avg_pool2d_ceil_mode_padding_not_counted`.
++
++Together these are **3 methods and 9 parameterized subtests**. The complete
++current `avg_pool2d` selection is **9 methods and 26 subtests passing**.
++
++### Debug method and failure signatures
++
++The first implementation recognized the NULL-device graph form
++`MUL(CAST(sum), RECIPROCAL(CAST(count)))`, but the real Rockchip compilation
++preserved `FDIV(CAST(sum), CAST(count))`. A temporary runtime wrapper around
++`_try_cmac_variable_scale_subtasks` printed only the root op, reduction count,
++reduction bodies, and `plan_rk` result. That exposed the structural miss
++without modifying the lowering pipeline:
++
++```text
++MISS reduces 2 root Ops.FDIV
++plan RKPLAN_REJECT:unsupported_op:fused_epilogue
++```
++
++The matcher now accepts both equivalent roots. A second edge case,
++ceil-mode `(3,2)`, represented its divisor as
++`MUL(REDUCE(valid_y), CONST(2))` rather than a single two-axis REDUCE. The
++compile-time evaluator therefore evaluates the complete static divisor
++expression recursively. It supports nested ADD reductions plus the integer,
++comparison, boolean, and WHERE operations used by pooling bounds. Any PARAM,
++INDEX, non-ADD reduction, non-integral divisor, zero divisor, or dynamic range
++still causes a conservative miss.
++
++The initial execution design used:
++
++```text
++CMAC sum -> fp16 scratch -> DPU MUL(fp16 reciprocal) -> output
++```
++
++That removed the rejection but failed strict comparison by one fp16 ULP in
++roughly 28–44% of affected outputs. The mismatch was the diagnostic:
++rounding the CMAC sum before division introduced an extra fp16 boundary.
++This discarded scratch design remains documented in the
++`_HOST_STATIC_HALF_LAYOUT` support for reference, but it is not selected.
++
++### Final layout and precision boundary
++
++The compiler evaluates the valid-element count for every physical output
++coordinate and serializes the integer divisor vector in the materialized
++CMAC task layout. Runtime unpack uses the corresponding divisor to scale the
++raw fp32 CACC value, rounds that multiplication to fp32, and performs exactly
++one final fp16 conversion:
++
++```text
++fp32 CACC * (1 / static output divisor) -> fp16 output
++```
++
++This extends the constant-divisor path from `acbf038c4` and exactly matches
++the Torch fp16 average-pool results tested here. CNA/CORE still performs every
++sum; only static indexing and the existing final output conversion path are
++host-managed. No LUT or two-level LUT is involved.
++
++### Validation
++
++Commands use `. .venv/bin/activate`, `DEV=ROCKCHIP`,
++`DEFAULT_FLOAT=HALF`, `FORWARD_ONLY=1`, and the Rockchip pytest plugin.
++
++- all `avg_pool2d` methods: **9 passed, 26 subtests passed** in 16.15 seconds;
++- new exact variable-divisor hardware regression plus constant-scale
++  regression: **2/2**;
++- complete CMAC hardware class: **23/23** in 8.06 seconds;
++- hardware-free PR1: **78/78** in 6.53 seconds.
++- complete Rockchip hardware file: **82/82** in 248.43 seconds.
++
++Pytest-xdist is absent from this `.venv`, so the requested `-n12` option
++reports `unrecognized arguments: -n12`; hardware-free tests were run
++serially and NPU tests must remain serial. Mypy has the same 13 pre-existing
++findings and targeted Ruff the same five pre-existing findings; pycompile and
++`git diff --check` are clean. `avg_pool3d` remains blocked before backend
++execution by Torch CPU half `NotImplementedError`. The next pooling groups
++are local max-pool PPU layout and max-pool indices/max-unpool scatter.
++
++The standalone patch is
++`rockchip-avg-pool-variable-acbf038c4.patch`, against parent `acbf038c4`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index e553332a3..b84f6712a 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -487,6 +487,19 @@ class TestCMAC(unittest.TestCase):
+         expected[:, :, oy, ox] = np.sum(window, axis=(2, 3), dtype=np.float32) * np.float32(1/6)
+     np.testing.assert_array_equal(actual, expected)
+ 
++  def test_cmac_avg_pool_variable_divisor(self):
++    np.random.seed(853)
++    x_np = np.random.uniform(-2, 2, size=(1, 1, 6, 6)).astype(np.float16)
++    x = Tensor(x_np, device="ROCKCHIP").realize()
++    actual = x.avg_pool2d(kernel_size=(3, 3), padding=1, count_include_pad=False).realize().numpy()
++    expected = np.empty((1, 1, 2, 2), dtype=np.float16)
++    for oy in range(2):
++      for ox in range(2):
++        y0, x0 = oy*3-1, ox*3-1
++        window = x_np[:, :, max(0, y0):min(6, y0+3), max(0, x0):min(6, x0+3)].astype(np.float32)
++        expected[:, :, oy, ox] = np.sum(window, axis=(2, 3), dtype=np.float32) * np.float32(1/window.shape[2]/window.shape[3])
++    np.testing.assert_array_equal(actual, expected)
++
+   def test_cmac_matmul_non_identity(self):
+     a_np = np.array([[1,2],[3,4]], dtype=np.float16)
+     b_np = np.array([[5,6],[7,8]], dtype=np.float16)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index b912e8c8b..ae123ac97 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -470,6 +470,17 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(len(subtasks), 2)
+     self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
+ 
++  def test_avg_pool_variable_divisor_serializes_counts(self):
++    x = Tensor.rand(1,1,6,6,dtype=dtypes.half).realize()
++    prg = build_native_program(_get_sink(x.avg_pool2d(kernel_size=(3,3), padding=1, count_include_pad=False)))
++    subtasks = prg.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.kind, "cmac")
++    layout = subtasks[0].task.layout
++    n_counts = layout[11]
++    self.assertEqual(n_counts, 4)
++    self.assertEqual(set(layout[12:12+n_counts]), {4, 6, 9})
++
+   def test_k_tiled_dot_produces_binary(self):
+     a = Tensor.rand(5000,dtype=dtypes.half).realize()
+     b = Tensor.rand(5000,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 9b96a4c58..ce09c03ee 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -436,3 +436,36 @@ Those use an output-dependent divisor and reject as
+ `unsupported_op:fused_epilogue`. `avg_pool3d` is blocked earlier by Torch
+ CPU's missing half implementation, independent of the Rockchip backend.
+ Local max pooling and max-unpool/index scatter remain separate groups.
++
++### Pooling refresh: output-dependent average divisors
++
++The three remaining forward `avg_pool2d` groups are now fixed:
++
++| Passing selection | Result |
++|---|---:|
++| `padding_not_counted`, general `ceil_mode`, and their combination | **3 methods, 9 subtests** |
++| Complete current `avg_pool2d` selection | **9 methods, 26 subtests** |
++| CMAC hardware class | **23/23** |
++| Hardware-free PR1 file | **78/78** |
++| Complete Rockchip hardware file | **82/82** |
++
++Rockchip lowering may preserve the average as fp16 `FDIV` or decompose it
++into `MUL(RECIPROCAL)`. Both forms are recognized. The static divisor can
++also be a product of a REDUCE and constant extent, as in ceil-mode `(3,2)`;
++the compiler recursively evaluates the complete data-independent count
++expression for every output coordinate.
++
++The rejected fp16-scratch/DPU-MUL experiment produced one-ULP errors because
++it rounded the sum before division. The passing implementation serializes
++per-output integer divisors in the materialized CMAC layout and applies each
++reciprocal to raw fp32 CACC before the sole fp16 conversion.
++
++Current pooling work remaining:
++
++- local `max_pool2d` PPU layout variants;
++- returned max-pool indices and `max_unpool2d` scatter;
++- `avg_pool3d`, whose official test is blocked before tinygrad execution by
++  Torch CPU half `NotImplementedError`.
++
++No LUT is involved. See `progress.md` for the exact matcher probe, rounding
++diagnosis, layout contract, validation commands, and standalone patch name.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index d84f4af98..4ca5f9c24 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -18,7 +18,7 @@ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.runtime.support.rockchip import (build_native_program,
+   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
+   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
+-  _HOST_ELEMENTWISE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
+ 
+@@ -136,8 +136,9 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
+     d[i] = _fp32_to_fp16(raw)
+ 
+ def _decode_materialized_cmac_layout(layout):
+-  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, tile_n, tile_k, *meta = layout
++  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, n_scale_counts, *tail = layout
+   assert tag == _CMAC_MATERIALIZED_LAYOUT
++  scale_counts, (tile_n, tile_k, *meta) = tail[:n_scale_counts], tail[n_scale_counts:]
+   cursor = 0
+   n_loops = meta[cursor]
+   loop_extents = meta[cursor+1:cursor+1+n_loops]
+@@ -173,8 +174,8 @@ def _decode_materialized_cmac_layout(layout):
+   n_fixed_loops = meta[cursor]
+   fixed_loops = tuple((meta[cursor+1+2*i], meta[cursor+2+2*i]) for i in range(n_fixed_loops))
+   scale = struct.unpack('<f', struct.pack('<I', scale_bits))[0]
+-  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), scale, loop_extents, reduce_extents, m_axes, n_axes,
+-          shared_axes, active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
++  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), scale, scale_counts, loop_extents, reduce_extents, m_axes,
++          n_axes, shared_axes, active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
+ 
+ def _eval_static_index(code, coords):
+   stack:list[int] = []
+@@ -231,7 +232,7 @@ def _set_linear_axes(coords, linear, axes, extents):
+ 
+ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded,
+                              m_start=0, rows=None, n_start=0, cols=None, k_start=0, k_count=None):
+-  _, _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
++  _, _, _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
+     _, fixed_loops, _, a_code, b_code = decoded
+   rows = M if rows is None else rows
+   cols = N if cols is None else cols
+@@ -280,7 +281,7 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
+ 
+ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
+                                   n_start=0, cols=None, packed_inputs=None):
+-  _, _, _, bias_slot, bias_axis, relu, scale, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
++  _, _, _, bias_slot, bias_axis, relu, scale, scale_counts, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
+     _, fixed_loops, out_code, _, _ = decoded
+   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
+   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
+@@ -296,8 +297,10 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
+     if m < m_start or (rows is not None and m >= m_start+rows): continue
+     if n < n_start or (cols is not None and n >= n_start+cols): continue
+     raw = s[(m-m_start)*align_out+n-n_start]
+-    if scale != 1.0:
+-      value = struct.unpack('<f', struct.pack('<f', struct.unpack('<f', struct.pack('<I', raw))[0] * scale))[0]
++    out_index = _eval_static_index(out_code, coords)
++    output_scale = 1.0 / scale_counts[out_index] if scale_counts else scale
++    if output_scale != 1.0:
++      value = struct.unpack('<f', struct.pack('<f', struct.unpack('<f', struct.pack('<I', raw))[0] * output_scale))[0]
+       raw = struct.unpack('<I', struct.pack('<f', value))[0]
+     if b is not None:
+       value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[coords[bias_axis]]))[0]
+@@ -308,7 +311,7 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
+       a_addr, b_addr, K, align_in = packed_inputs
+       converted = _fp32_to_fp16_group(raw, a_addr, b_addr, m-m_start, n-n_start, K, align_in)
+     else: converted = _fp32_to_fp16(raw)
+-    d[_eval_static_index(out_code, coords)] = converted
++    d[out_index] = converted
+ 
+ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
+   M, N, K, align_in, align_out = task.layout[:5]
+@@ -618,6 +621,13 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+       if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
+       ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
+ 
++def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Materialize a compile-time fp16 tensor into a scratch buffer for a later NPU task."""
++  total, tag, *values = task.layout
++  assert tag == _HOST_STATIC_HALF_LAYOUT and len(values) == total
++  output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
++  for i, value in enumerate(values): output[i] = value
++
+ class RockchipProgram(Program['RockchipDevice']):
+   cmds: list[int]
+   task: RKTask
+@@ -896,6 +906,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
+           _run_host_movement(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++          _run_host_static_half(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+           _run_host_bitwise(task, st.relocs, bufs)
+           continue
+@@ -978,6 +991,9 @@ class RockchipProgram(Program['RockchipDevice']):
+           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
+             _run_host_movement(st.task, st.relocs, tuple(ext))
+             continue
++          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++            _run_host_static_half(st.task, st.relocs, tuple(ext))
++            continue
+           self.subtasks = None
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+           self(*tuple(ext))
+@@ -1003,6 +1019,9 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
+             _run_host_movement(task, st.relocs, tuple(ext))
+             continue
++          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++            _run_host_static_half(task, st.relocs, tuple(ext))
++            continue
+           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+             _run_host_bitwise(task, st.relocs, tuple(ext))
+             continue
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index c240f2e91..29d1b71f6 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -68,6 +68,7 @@ class RKPlan:
+   is_abs: bool = False                # abs(x) via BN negate + EW max (both operands same buffer)
+   epilogue: str = "none"              # CMAC BS/BN epilogue: "none", "relu", "scale"
+   epilogue_scale: float = 1.0         # scale factor for "scale" epilogue (BS MUL operand)
++  epilogue_scale_counts: tuple[int, ...] = () # per-output divisors applied to raw fp32 CMAC results
+   epilogue_bias_slot: int = -1        # host fp32-accumulator channel bias, before final fp16 rounding
+   epilogue_bias_axis: int = -1        # output LOOP axis used to index the bias tensor
+   cmac_materialization: tuple[int, ...] = () # serialized non-contiguous A/B/output indexing for CMAC
+@@ -175,6 +176,7 @@ _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 t
+ _HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
+ _HOST_ELEMENTWISE_LAYOUT = -1004  # is_copy task layout tag for serialized fused elementwise graphs
+ _CMAC_MATERIALIZED_LAYOUT = -1005  # CMAC layout tag for host-gathered A/B matrices
++_HOST_STATIC_HALF_LAYOUT = -1006  # compile-time fp16 tensor used by a later NPU stage
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -5946,7 +5948,8 @@ def _emit_cmac(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,...]
+   if plan.cmac_materialization:
+     scale_bits = struct.unpack('<I', struct.pack('<f', plan.epilogue_scale if plan.epilogue == "scale" else 1.0))[0]
+     layout = (M, N, K, align_in, align_out, _CMAC_MATERIALIZED_LAYOUT, tile_m, plan.epilogue_bias_slot,
+-              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), scale_bits, tile_n, tile_k, *plan.cmac_materialization[5:])
++              plan.epilogue_bias_axis, int(plan.epilogue == "bias_relu"), scale_bits, len(plan.epilogue_scale_counts),
++              *plan.epilogue_scale_counts, tile_n, tile_k, *plan.cmac_materialization[5:])
+   else:
+     layout = (M, N, K, align_in, align_out, plan.epilogue_bias_slot, plan.epilogue_bias_axis,
+               int(plan.epilogue == "bias_relu"))
+@@ -6830,6 +6833,88 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _try_cmac_variable_scale_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Apply a static output-dependent reciprocal to raw fp32 CMAC sums."""
++  reduce, store = _reduce_node(sink), _store_node(sink)
++  if reduce is None or store is None or reduce.arg[0] is not Ops.ADD: return None
++  val = _unwrap(store.src[1])
++  data_value, count = None, None
++  if val.op is Ops.MUL and len(val.src) == 2:
++    for data, scale in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
++      if _unwrap(data) is reduce and _unwrap(scale).op is Ops.RECIPROCAL:
++        data_value, count = data, _unwrap(scale).src[0]
++        break
++  elif val.op is Ops.FDIV and len(val.src) == 2 and _unwrap(val.src[0]) is reduce:
++    # Device-specific lowering may preserve half FDIV instead of spelling it
++    # MUL(RECIPROCAL(count)); both identify the same static pooling divisor.
++    data_value, count = val.src
++  if data_value is None or count is None: return None
++  while count.op is Ops.CAST: count = count.src[0]
++  count_reduces = [u for u in count.toposort() if u.op is Ops.REDUCE]
++  if not count_reduces or any(u.arg[0] is not Ops.ADD for u in count_reduces): return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  count_ranges = [r for u in count_reduces for r in u.src[1:]]
++  if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *count_ranges)): return None
++  loop_extents = [int(u.src[0].arg) for u in loops]
++  total = prod(loop_extents)
++
++  def evaluate(u:UOp, coords:dict[UOp, int]):
++    while u.op is Ops.CAST: u = u.src[0]
++    if u.op is Ops.CONST: return 0 if u.arg is Invalid else u.arg
++    if u.op is Ops.RANGE and u in coords: return coords[u]
++    if u.op is Ops.REDUCE:
++      ranges, result = u.src[1:], 0
++      extents = [int(x.src[0].arg) for x in ranges]
++      for linear in range(prod(extents)):
++        rem = linear
++        for axis in range(len(ranges)-1, -1, -1): rem, coords[ranges[axis]] = divmod(rem, extents[axis])
++        result += evaluate(u.src[0], coords)
++      return result
++    values = [evaluate(x, coords) for x in u.src]
++    if u.op is Ops.ADD: return values[0] + values[1]
++    if u.op is Ops.MUL: return values[0] * values[1]
++    if u.op is Ops.FLOORDIV: return values[0] // values[1]
++    if u.op is Ops.FLOORMOD: return values[0] % values[1]
++    if u.op is Ops.CMPLT: return values[0] < values[1]
++    if u.op is Ops.CMPNE: return values[0] != values[1]
++    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
++    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
++    if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
++    raise ValueError(u.op)
++
++  scale_counts = [0] * total
++  try:
++    for linear in range(total):
++      rem, coords = linear, {}
++      for axis in range(len(loops)-1, -1, -1): rem, coords[loops[axis]] = divmod(rem, loop_extents[axis])
++      raw_count = evaluate(count, coords)
++      count_value = int(raw_count)
++      if count_value <= 0 or count_value != raw_count: return None
++      out_index = int(evaluate(store.src[0].src[1], coords))
++      if not 0 <= out_index < total: return None
++      scale_counts[out_index] = count_value
++  except (ValueError, TypeError, OverflowError, ZeroDivisionError):
++    return None
++  if any(count_value == 0 for count_value in scale_counts): return None
++
++  # The retired scratch path allocated two slots after ProgramInfo.globals:
++  # one for the rounded sum and one for a host-materialized reciprocal tensor.
++  cmac_sink = sink.substitute({store:store.replace(src=(store.src[0], data_value))})
++  plan = plan_rk(cmac_sink)
++  if isinstance(plan, str) or plan.kind != "cmac": return None
++  if not plan.cmac_materialization: return None
++  plan = replace(plan, epilogue_scale_counts=tuple(scale_counts))
++  tasks:list[RKSubTask] = []
++  if (shared_tasks := _try_cmac_shared_subtasks(plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  # The earlier fp16-scratch + static reciprocal + DPU MUL design is preserved
++  # in _HOST_STATIC_HALF_LAYOUT support. It double-rounded the CMAC sum, while
++  # PyTorch scales the fp32 accumulator once before its final fp16 conversion.
++  return tuple(tasks)
++
+ def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+   """Split flipped-kernel CMAC reductions at PyTorch fp16 col2im boundaries."""
+   materialization = plan.cmac_materialization
+@@ -7034,6 +7119,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
++  if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, variable_scale_tasks)
+   if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, multifactor_tasks)
+   plan = plan_rk(sink)

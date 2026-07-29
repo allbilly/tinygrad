@@ -18,7 +18,7 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
   _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
-  _HOST_ELEMENTWISE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_ELEMENTWISE_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
 
@@ -136,8 +136,9 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
     d[i] = _fp32_to_fp16(raw)
 
 def _decode_materialized_cmac_layout(layout):
-  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, tile_n, tile_k, *meta = layout
+  _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, n_scale_counts, *tail = layout
   assert tag == _CMAC_MATERIALIZED_LAYOUT
+  scale_counts, (tile_n, tile_k, *meta) = tail[:n_scale_counts], tail[n_scale_counts:]
   cursor = 0
   n_loops = meta[cursor]
   loop_extents = meta[cursor+1:cursor+1+n_loops]
@@ -173,8 +174,8 @@ def _decode_materialized_cmac_layout(layout):
   n_fixed_loops = meta[cursor]
   fixed_loops = tuple((meta[cursor+1+2*i], meta[cursor+2+2*i]) for i in range(n_fixed_loops))
   scale = struct.unpack('<f', struct.pack('<I', scale_bits))[0]
-  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), scale, loop_extents, reduce_extents, m_axes, n_axes,
-          shared_axes, active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
+  return (tile_m, tile_n, tile_k, bias_slot, bias_axis, bool(relu), scale, scale_counts, loop_extents, reduce_extents, m_axes,
+          n_axes, shared_axes, active_reduce_order, fixed_reductions, rounding_axes, fixed_loops, *codes)
 
 def _eval_static_index(code, coords):
   stack:list[int] = []
@@ -231,7 +232,7 @@ def _set_linear_axes(coords, linear, axes, extents):
 
 def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, align_out, decoded,
                              m_start=0, rows=None, n_start=0, cols=None, k_start=0, k_count=None):
-  _, _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
+  _, _, _, _, _, _, _, _, loop_extents, reduce_extents, m_axes, n_axes, shared_axes, reduce_order, fixed_reductions, \
     _, fixed_loops, _, a_code, b_code = decoded
   rows = M if rows is None else rows
   cols = N if cols is None else cols
@@ -280,7 +281,7 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
 
 def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
                                   n_start=0, cols=None, packed_inputs=None):
-  _, _, _, bias_slot, bias_axis, relu, scale, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
+  _, _, _, bias_slot, bias_axis, relu, scale, scale_counts, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
     _, fixed_loops, out_code, _, _ = decoded
   s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
@@ -296,8 +297,10 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
     if m < m_start or (rows is not None and m >= m_start+rows): continue
     if n < n_start or (cols is not None and n >= n_start+cols): continue
     raw = s[(m-m_start)*align_out+n-n_start]
-    if scale != 1.0:
-      value = struct.unpack('<f', struct.pack('<f', struct.unpack('<f', struct.pack('<I', raw))[0] * scale))[0]
+    out_index = _eval_static_index(out_code, coords)
+    output_scale = 1.0 / scale_counts[out_index] if scale_counts else scale
+    if output_scale != 1.0:
+      value = struct.unpack('<f', struct.pack('<f', struct.unpack('<f', struct.pack('<I', raw))[0] * output_scale))[0]
       raw = struct.unpack('<I', struct.pack('<f', value))[0]
     if b is not None:
       value = struct.unpack('<f', struct.pack('<I', raw))[0] + struct.unpack('<e', struct.pack('<H', b[coords[bias_axis]]))[0]
@@ -308,7 +311,7 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
       a_addr, b_addr, K, align_in = packed_inputs
       converted = _fp32_to_fp16_group(raw, a_addr, b_addr, m-m_start, n-n_start, K, align_in)
     else: converted = _fp32_to_fp16(raw)
-    d[_eval_static_index(out_code, coords)] = converted
+    d[out_index] = converted
 
 def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
   M, N, K, align_in, align_out = task.layout[:5]
@@ -618,6 +621,13 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
       if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
       ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
 
+def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Materialize a compile-time fp16 tensor into a scratch buffer for a later NPU task."""
+  total, tag, *values = task.layout
+  assert tag == _HOST_STATIC_HALF_LAYOUT and len(values) == total
+  output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
+  for i, value in enumerate(values): output[i] = value
+
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
   task: RKTask
@@ -896,6 +906,9 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
           _run_host_movement(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+          _run_host_static_half(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
           _run_host_bitwise(task, st.relocs, bufs)
           continue
@@ -978,6 +991,9 @@ class RockchipProgram(Program['RockchipDevice']):
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
             _run_host_movement(st.task, st.relocs, tuple(ext))
             continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+            _run_host_static_half(st.task, st.relocs, tuple(ext))
+            continue
           self.subtasks = None
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           self(*tuple(ext))
@@ -1002,6 +1018,9 @@ class RockchipProgram(Program['RockchipDevice']):
           task = st.task
           if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
             _run_host_movement(task, st.relocs, tuple(ext))
+            continue
+          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+            _run_host_static_half(task, st.relocs, tuple(ext))
             continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
             _run_host_bitwise(task, st.relocs, tuple(ext))
