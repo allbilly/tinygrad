@@ -5354,6 +5354,21 @@ No LUT is involved in this milestone, so `lut.md` does not change. The
 standalone patch is `rockchip-materialized-convolution-60f357654.patch`,
 against parent `60f357654`.
 
+## 2026-07-29 — scalar CMAC dot milestone
+
+The unchanged `TestOps.test_dot_1d` and scalar `test_einsum_trace` now pass
+**2/2 in 2.37 seconds** on the real backend. A scalar STORE has no LOOP axes;
+the generalized CMAC materializer incorrectly required at least one, even
+though the contraction has a valid reduction range. Allowing an empty LOOP
+set naturally produces `M=N=1`, while the existing serialized output index
+stores the scalar result.
+
+The new exact hardware regression makes the CMAC class **18/18 in 5.58
+seconds**, and the hardware-free contract file is **73/73 in 6.46 seconds**.
+The remaining refreshed einsum/dot failures are distinct CBUF-weight tiling
+cases. The standalone patch is `rockchip-scalar-cmac-ebb9b595a.patch`,
+against parent `ebb9b595a`.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

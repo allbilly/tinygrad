@@ -338,3 +338,12 @@ The fixed implementation includes:
 The next low-hanging layout group is pooling or batched matmul/einsum, not
 convolution. Before choosing, refresh those groups on the real backend rather
 than trusting the historical `unsupported_layout` totals.
+
+### Scalar dot refresh
+
+The real-backend einsum/dot/matmul refresh initially passed 8/14 methods.
+`test_dot_1d` and scalar `test_einsum_trace` are now fixed as `M=N=1`
+materialized CMAC contractions, raising the refreshed group to 10/14.
+The four remaining failures are large contractions rejected by
+`cmac_exceeds_cbuf`; they need N/K/weight tiling rather than another
+classifier exception.

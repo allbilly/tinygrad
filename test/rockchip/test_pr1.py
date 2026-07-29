@@ -214,6 +214,11 @@ class TestClassifier(unittest.TestCase):
     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
     self.assertEqual(_classify(_get_sink(a@b)), "cmac")
 
+  def test_cmac_scalar_dot(self):
+    a = Tensor.rand(5,dtype=dtypes.half).realize()
+    b = Tensor.rand(5,dtype=dtypes.half).realize()
+    self.assertEqual(_classify(_get_sink(a.dot(b))), "cmac")
+
   def test_cmac_gemv_vector_b(self):
     # GEMV: (M,K) @ (K,) → (M,) — vector is B, N=1
     a = Tensor.rand(4,4,dtype=dtypes.half).realize()

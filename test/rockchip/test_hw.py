@@ -482,6 +482,13 @@ class TestCMAC(unittest.TestCase):
     c = (a @ b).realize()
     np.testing.assert_allclose(c.numpy(), a_np @ b_np, rtol=1e-2, atol=1e-1)
 
+  def test_cmac_scalar_dot(self):
+    a_np = np.array([1, -2, 3, -4, 5], dtype=np.float16)
+    b_np = np.array([2, 3, -1, 4, 0.5], dtype=np.float16)
+    a, b = (Tensor(v, device="ROCKCHIP").realize() for v in (a_np, b_np))
+    c = a.dot(b).realize()
+    np.testing.assert_array_equal(c.numpy(), np.dot(a_np, b_np))
+
   def test_cmac_gemv_vector_a(self):
     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
     a_np = np.array([1,2,3,4], dtype=np.float16)

@@ -1,0 +1,90 @@
+diff --git a/progress.md b/progress.md
+index 6601d15af..0145c96d4 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5354,6 +5354,21 @@ No LUT is involved in this milestone, so `lut.md` does not change. The
+ standalone patch is `rockchip-materialized-convolution-60f357654.patch`,
+ against parent `60f357654`.
+ 
++## 2026-07-29 — scalar CMAC dot milestone
++
++The unchanged `TestOps.test_dot_1d` and scalar `test_einsum_trace` now pass
++**2/2 in 2.37 seconds** on the real backend. A scalar STORE has no LOOP axes;
++the generalized CMAC materializer incorrectly required at least one, even
++though the contraction has a valid reduction range. Allowing an empty LOOP
++set naturally produces `M=N=1`, while the existing serialized output index
++stores the scalar result.
++
++The new exact hardware regression makes the CMAC class **18/18 in 5.58
++seconds**, and the hardware-free contract file is **73/73 in 6.46 seconds**.
++The remaining refreshed einsum/dot failures are distinct CBUF-weight tiling
++cases. The standalone patch is `rockchip-scalar-cmac-ebb9b595a.patch`,
++against parent `ebb9b595a`.
++
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 6c98d24e9..127e74c7b 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -482,6 +482,13 @@ class TestCMAC(unittest.TestCase):
+     c = (a @ b).realize()
+     np.testing.assert_allclose(c.numpy(), a_np @ b_np, rtol=1e-2, atol=1e-1)
+ 
++  def test_cmac_scalar_dot(self):
++    a_np = np.array([1, -2, 3, -4, 5], dtype=np.float16)
++    b_np = np.array([2, 3, -1, 4, 0.5], dtype=np.float16)
++    a, b = (Tensor(v, device="ROCKCHIP").realize() for v in (a_np, b_np))
++    c = a.dot(b).realize()
++    np.testing.assert_array_equal(c.numpy(), np.dot(a_np, b_np))
++
+   def test_cmac_gemv_vector_a(self):
+     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
+     a_np = np.array([1,2,3,4], dtype=np.float16)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 9eb8b9bd8..7e843bd73 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -214,6 +214,11 @@ class TestClassifier(unittest.TestCase):
+     b = Tensor.rand(4,4,dtype=dtypes.half).realize()
+     self.assertEqual(_classify(_get_sink(a@b)), "cmac")
+ 
++  def test_cmac_scalar_dot(self):
++    a = Tensor.rand(5,dtype=dtypes.half).realize()
++    b = Tensor.rand(5,dtype=dtypes.half).realize()
++    self.assertEqual(_classify(_get_sink(a.dot(b))), "cmac")
++
+   def test_cmac_gemv_vector_b(self):
+     # GEMV: (M,K) @ (K,) → (M,) — vector is B, N=1
+     a = Tensor.rand(4,4,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index e311b45b1..0819e2098 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -338,3 +338,12 @@ The fixed implementation includes:
+ The next low-hanging layout group is pooling or batched matmul/einsum, not
+ convolution. Before choosing, refresh those groups on the real backend rather
+ than trusting the historical `unsupported_layout` totals.
++
++### Scalar dot refresh
++
++The real-backend einsum/dot/matmul refresh initially passed 8/14 methods.
++`test_dot_1d` and scalar `test_einsum_trace` are now fixed as `M=N=1`
++materialized CMAC contractions, raising the refreshed group to 10/14.
++The four remaining failures are large contractions rejected by
++`cmac_exceeds_cbuf`; they need N/K/weight tiling rather than another
++classifier exception.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 5df662b73..037605ee3 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1628,7 +1628,7 @@ def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
+   if not value_indexes[0] or any(len({u.src[0].buf_uop.arg.slot for u in indexes}) != 1 for indexes in value_indexes): return None
+   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+   reductions = list(reduce.src[1:])
+-  if not loops or not reductions or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++  if not reductions or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+   loop_extents, reduce_extents = tuple(int(u.src[0].arg) for u in loops), tuple(int(u.src[0].arg) for u in reductions)
+   a_nodes, b_nodes = set(a_val.toposort()), set(b_val.toposort()) if b_val is not None else set()
+   a_axes = {i for i,u in enumerate(loops) if u in a_nodes}

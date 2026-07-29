@@ -1628,7 +1628,7 @@ def _try_cmac_materialization(sink:UOp, reduce:UOp) -> tuple[int, ...]|None:
   if not value_indexes[0] or any(len({u.src[0].buf_uop.arg.slot for u in indexes}) != 1 for indexes in value_indexes): return None
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
   reductions = list(reduce.src[1:])
-  if not loops or not reductions or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  if not reductions or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
   loop_extents, reduce_extents = tuple(int(u.src[0].arg) for u in loops), tuple(int(u.src[0].arg) for u in reductions)
   a_nodes, b_nodes = set(a_val.toposort()), set(b_val.toposort()) if b_val is not None else set()
   a_axes = {i for i,u in enumerate(loops) if u in a_nodes}
