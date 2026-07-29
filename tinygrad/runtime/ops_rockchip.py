@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
-_ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
+_ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -588,6 +588,7 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
   value_code = meta[cursor+1:cursor+1+value_n]
   inputs = [bufs[r.globals_slot] for r in relocs[1:]]
   output = bufs[relocs[0].globals_slot]
+  output_base = task.out_offset // itemsize
 
   def evaluate(code, coords):
     stack:list = []
@@ -619,12 +620,14 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
     out_index = evaluate(out_code, coords)
     input_id, in_index = evaluate(value_code, coords)
-    if not 0 <= out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
+    if not 0 <= output_base+out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
     if input_id == -1:
-      ctypes.memmove(output.va_addr + out_index*itemsize, int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
+      ctypes.memmove(output.va_addr + task.out_offset + out_index*itemsize,
+                     int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
     else:
       if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
-      ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
+      ctypes.memmove(output.va_addr + task.out_offset + out_index*itemsize,
+                     inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
 
 def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Materialize a compile-time fp16 tensor into a scratch buffer for a later NPU task."""
@@ -1173,10 +1176,15 @@ class RockchipProgram(Program['RockchipDevice']):
       ext, shared, original = list(bufs), [], self.subtasks
       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                      default=len(ext)-1)
-      total = max((st.task.layout[0]*st.task.layout[1] if st.task.kind == "cmac" else st.task.layout[0]) for st in subtasks)
+      scratch_sizes:dict[int, int] = {}
+      for st in subtasks:
+        if st.task.out_slot < len(ext): continue
+        elements = st.task.layout[0]*st.task.layout[1] if st.task.kind == "cmac" else st.task.layout[0]
+        itemsize = 4 if st.task.native_int32_output else 2
+        scratch_sizes[st.task.out_slot] = max(scratch_sizes.get(st.task.out_slot, 0), st.task.out_offset+elements*itemsize)
       try:
         while len(ext) <= max_slot:
-          shared.append(b := dev._gpu_alloc(max(total*2, 4096), 0))
+          shared.append(b := dev._gpu_alloc(max(scratch_sizes.get(len(ext), 0), 4096), 0))
           ext.append(b)
         for st in subtasks:
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
@@ -1188,9 +1196,45 @@ class RockchipProgram(Program['RockchipDevice']):
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
             _pack_static_gather(st.task, st.relocs, tuple(ext))
             continue
-          self.subtasks = None
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
-          self(*tuple(ext))
+          # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
+          # stages also stay single-task for reset stability, with the typed
+          # bool ABI boundary prepared explicitly around that submission.
+          if st.task.kind == "cmac":
+            self.subtasks = None
+            self(*tuple(ext))
+          else:
+            stage_ext, stage_temp = list(ext), []
+            try:
+              for slot in st.task.bool_inputs:
+                source_n = ext[slot].size
+                converted = dev._gpu_alloc(max(source_n*2, 4096), 0)
+                stage_temp.append(converted)
+                _convert_bool_to_fp16_buf(ext[slot].va_addr, converted.va_addr, source_n)
+                stage_ext[slot] = converted
+              bool_output = None
+              if st.task.bool_output:
+                original_out = ext[st.task.out_slot]
+                out_n = original_out.size
+                converted = dev._gpu_alloc(max(out_n*2, 4096), 0)
+                stage_temp.append(converted)
+                stage_ext[st.task.out_slot] = converted
+                bool_output = (original_out, converted, out_n)
+              self.subtasks = None
+              self(*tuple(stage_ext))
+              if bool_output is not None:
+                original_out, converted, out_n = bool_output
+                _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, out_n)
+            finally:
+              for b in stage_temp: dev._gpu_free(b)
+          if getenv("ROCKCHIP_DEBUG_BOOL_REDUCE") >= 2:
+            out = ext[st.task.out_slot]
+            if st.task.bool_output:
+              values = tuple(ctypes.string_at(out.va_addr, min(out.size, 8)))
+            else:
+              count = min(out.size//2, 8)
+              values = tuple(struct.unpack(f"<{count}e", ctypes.string_at(out.va_addr, count*2)))
+            print("RK_BOOL_REDUCE_STAGE", st.task.kind, st.task.out_slot, values)
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
@@ -1593,7 +1637,7 @@ class RockchipDevice(Compiled):
     # The RK3588 GEM mmap path rejects multi-megabyte BOs. Generalized CMAC
     # gathers logical tensors through their CPU mapping and submits compact
     # DMA-backed tiles, so large logical buffers can safely remain host-backed.
-    if size > _ROCKCHIP_MAX_MAPPABLE_BO:
+    if size >= _ROCKCHIP_MAX_MAPPABLE_BO:
       va = FileIOInterface.anon_mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE,
                                      mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS, 0)
       return HCQBuffer(va_addr=va, size=size)

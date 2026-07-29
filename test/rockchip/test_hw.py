@@ -58,6 +58,25 @@ class TestDPU(unittest.TestCase):
     c = a.maximum(b).realize()
     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, b_np), rtol=1e-3, atol=1e-3)
 
+  def test_dpu_bool_reductions(self):
+    data = np.arange(1, 361, dtype=np.float16).reshape(3,4,5,6)
+    data[1,2,3,4] = 0
+    x = Tensor(data, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(x.any().realize().numpy(), np.any(data))
+    np.testing.assert_array_equal(x.all().realize().numpy(), np.all(data))
+    np.testing.assert_array_equal(x.any(axis=(1,2)).realize().numpy(), np.any(data, axis=(1,2)))
+    np.testing.assert_array_equal(x.all(axis=(1,2)).realize().numpy(), np.all(data, axis=(1,2)))
+    flags = np.array([True, False, True], dtype=np.bool_)
+    f = Tensor(flags, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(f.any().realize().numpy(), np.any(flags))
+    np.testing.assert_array_equal(f.all().realize().numpy(), np.all(flags))
+    # Exercises host byte tiling around the RK3588 2 MiB GEM mmap boundary;
+    # predicate masks and both reduction levels still execute on the NPU.
+    self.assertTrue(bool(Tensor.ones(2**20, dtype=dtypes.half, device="ROCKCHIP").bool().all().realize().item()))
+    empty = Tensor(np.empty((1,0,3,0,5), dtype=np.float16), device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(empty.any(axis=(1,3)).realize().numpy(), np.zeros((1,3,5), dtype=np.bool_))
+    np.testing.assert_array_equal(empty.all(axis=(1,3)).realize().numpy(), np.ones((1,3,5), dtype=np.bool_))
+
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)

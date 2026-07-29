@@ -1,13 +1,19 @@
 # test_ops.py Status — Rockchip NPU Backend
 
-**Last complete census:** 2026-07-29 (commit `a864e9519`)
-**Command:** `PYTHONPATH=. DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 .venv/bin/python -m pytest test/backend/test_ops.py -q --tb=line`
+**Last complete census:** 2026-07-29 (commit `76c31806e`)
+**Command:** `. .venv/bin/activate && CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 python -m pytest test/backend/test_ops.py -q --tb=no`
 
-The fresh serial census completed in **918.42 seconds: 182 passed, 333 failed,
-8 skipped, and 27 subtests passed**. Pytest still collects 424 test functions;
-its failed count also includes failing unittest subtests. This supersedes the
-older 140-passing census below. The dedicated Rockchip hardware regression is
-separately **70/70 passing in 207.22 seconds**.
+The fresh serial census completed in **1606.69 seconds: 257 passed, 165 failed,
+8 skipped, and 120 subtests passed**. Pytest still collects 424 test
+functions; its failed count also includes failing unittest subtests. This
+supersedes the older 182-passing census below.
+
+**Post-census boolean-reduction milestone:** all seven selected methods
+(`all`, `all_axis`, `all_large`, `all_zero_axis`, `any`, `any_axis`, and
+`any_zero_axis`) pass together in **39.55 seconds**. The five methods that
+failed in the census have not yet been folded into another full-suite count,
+so 257/165 remains the honest complete baseline. The expanded DPU hardware
+class is separately **58/58 passing in 287.78 seconds**.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -585,3 +591,29 @@ The rejected `_run_host_scatter` compatibility path remains disabled unless
 `ROCKCHIP_ALLOW_HOST_OPS=1`.
 
 Recovery patch: `rockchip-native-max-unpool-d72bcc3f0.patch`.
+
+### Native boolean-reduction milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `all`, `all_axis` | **passing** | **passing** |
+| `any`, `any_axis` | **passing** | **passing** |
+| `all_large` through `2**20` | **passing** | **passing with byte-only DMA tiling** |
+| `all_zero_axis`, `any_zero_axis` | **passing** | static identity byte fill |
+
+The seven methods pass together in **39.55 seconds**. ANY counts native DPU
+nonzero masks with CMAC and tests for a positive count. ALL counts zero masks
+and tests for a zero count, avoiding an inexact comparison with a large
+reduction extent.
+
+The 2 MiB RK3588 GEM mmap boundary is handled with 32,768-lane DMA tiles. Host
+callbacks copy fp16 bytes between the logical tensor and reusable tiles; DPU
+computes abs/nonzero/complement masks and CMAC performs the reduction. No host
+callback inspects runtime values or evaluates ALL/ANY.
+
+The permanent hardware regression includes ordinary, axis, bool-input,
+million-element, and empty-axis cases. The complete DPU class is **58/58
+passing in 287.78 seconds** and the hardware-free contract is **79/79 passing
+in 6.50 seconds**.
+
+Recovery patch: `rockchip-native-bool-reductions-76c31806e.patch`.

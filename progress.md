@@ -6018,3 +6018,103 @@ before unpool.
 
 The standalone recovery artifact is
 `rockchip-native-max-unpool-d72bcc3f0.patch`, based on `d72bcc3f0`.
+
+## 2026-07-29 — native boolean reductions and 2 MiB byte tiling
+
+The complete forward-only census at `76c31806e` finished without a driver
+abort:
+
+```text
+257 passed, 165 failed, 8 skipped, 120 subtests passed
+1606.69 seconds
+```
+
+This replaces the stale 182-passing inventory. The next low-hanging group was
+boolean reduction: `all`, `all_axis`, `all_large`, `any`, and `any_axis`.
+The two empty-axis identity cases already passed in isolation but exposed a
+suite-order DPU timeout after the new CMAC stages.
+
+### Native reduction algorithm
+
+The scheduled boolean graph is either `REDUCE(MAX, CMPNE(x, 0))` for ANY or
+`REDUCE(MUL, CMPNE(x, 0))` for ALL. It is lowered to:
+
+```text
+nonzero = compare(abs(x) > 0)       # DPU
+ANY     = compare(CMAC_sum(nonzero) > 0)
+
+zero    = 1 - nonzero               # DPU
+ALL     = 1 - compare(CMAC_sum(zero) > 0)
+```
+
+Counting zeros is important. Comparing a nonzero count with the reduction
+extent would become inexact for a million lanes and fp16 would overflow above
+65,504. A zero count remains exactly zero, while every positive count remains
+detectably positive even when the final fp16 boundary saturates.
+
+The fp16 source path uses DPU multiply by -1, MAX for absolute value, and the
+hardware-proven comparison stage. Bool source buffers use the existing typed
+buffer boundary to widen bytes, but predicate arithmetic, complement, count,
+comparison, and inversion all execute on the NPU. The final fp16 0/1 result is
+packed back to the byte-wide bool ABI at the buffer boundary.
+
+### Mixed CMAC/DPU typed boundaries
+
+The mixed execution path previously invoked every post-CMAC DPU stage through
+the single-task runner. That runner does not apply the multi-task
+`bool_inputs`/`bool_output` metadata, so a correct fp16 result was written into
+or read from a byte-wide bool buffer. The mixed runner now prepares those
+typed boundaries explicitly while retaining single-task submissions and NPU
+resets; attempting a one-element PC-chain submission after CMAC timed out.
+
+`ROCKCHIP_DEBUG_BOOL_REDUCE=2` prints the first eight values written by each
+mixed DPU/CMAC stage. Level 1 keeps only matcher diagnostics. This made it
+possible to distinguish mask errors from typed-output packing.
+
+### 2 MiB RK3588 GEM boundary
+
+The `2**20` case creates an exact 2 MiB fp16 tensor. RK3588 GEM creation
+succeeds, but mapping that size fails with `ENXIO`. Such buffers now use the
+existing anonymous host mapping at `>= 2 MiB`.
+
+Large boolean predicates are evaluated in reusable 32,768-lane DMA tiles:
+
+1. copy exact source bytes into a DMA tile;
+2. run DPU abs, compare, and optional zero-mask generation;
+3. copy exact mask bytes into a host-mapped full mask;
+4. let the materialized/tiled CMAC path gather that mask and perform the sum.
+
+Host callbacks only move existing bytes and apply static offsets. They do not
+inspect values or evaluate boolean arithmetic. Scratch allocation now uses
+each subtask's actual output size and offset instead of allocating every slot
+at the largest stage size.
+
+Empty reductions lower to static bool constants. Treating those identities as
+typed constant byte movement avoids the suite-order DPU timeout without
+performing runtime-dependent operator evaluation.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- official boolean group, including empty axes and `2**20`: **7/7 passing in
+  39.55 seconds**;
+- dedicated permanent boolean hardware regression: **1/1 passing in 31.80
+  seconds**;
+- complete DPU hardware class: **58/58 passing in 287.78 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.50 seconds**;
+- pycompile and `git diff --check`: passing.
+
+Mypy retains the same **13 pre-existing findings**. Ruff is not installed in
+the required `.venv` (`No module named ruff`). `pytest-xdist` is also absent,
+so the requested `-n12` option is unavailable; physical-NPU tests must remain
+serial in any case.
+
+The audit of other accelerator backends still finds no ordinary tensor
+operator implemented by host arithmetic. This milestone therefore uses host
+code only for typed ABI conversion, static empty identities, and exact byte
+tiling. `_run_host_scatter` remains opt-in diagnostics under
+`ROCKCHIP_ALLOW_HOST_OPS=1`.
+
+The standalone recovery artifact is
+`rockchip-native-bool-reductions-76c31806e.patch`, based on `76c31806e`.

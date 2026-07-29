@@ -6847,7 +6847,7 @@ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None: return None
   raw = store.src[1]
-  if raw.op not in (Ops.INDEX, Ops.WHERE): return None
+  if raw.op not in (Ops.INDEX, Ops.WHERE) and not (raw.op is Ops.CONST and raw.dtype is dtypes.bool): return None
   if store.src[0].dtype != raw.dtype: return None
 
   ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
@@ -7283,6 +7283,125 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   else:
     cmds, task, relocs = emit_rk(final_plan)
     tasks.append(RKSubTask(cmds, task, relocs))
+  return tuple(tasks)
+
+def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower bool ALL/ANY to native DPU masks followed by a CMAC count.
+
+  ANY counts nonzero lanes and tests count>0. ALL counts zero lanes and tests
+  count==0. The latter deliberately avoids comparing against the reduction
+  extent: a million-lane count may overflow fp16, while zero/nonzero remains
+  exact across the CMAC fp32 accumulator and its fp16 output boundary.
+  """
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.dtype is not dtypes.bool or store.src[0].dtype is not dtypes.bool or \
+     store.src[1] is not reduce or reduce.arg[0] not in (Ops.MAX, Ops.MUL): return None
+  if not reduce.src[1:] or any(r.src[0].op is not Ops.CONST for r in reduce.src[1:]): return None
+
+  body = reduce.src[0]
+  source:UOp|None = None
+  if body.op is Ops.INDEX and body.dtype is dtypes.bool:
+    source = body
+  elif body.op is Ops.CMPNE and len(body.src) == 2:
+    for candidate, zero in ((body.src[0], body.src[1]), (body.src[1], body.src[0])):
+      candidate = _unwrap(candidate)
+      if zero.op is Ops.CONST and float(zero.arg) == 0.0 and candidate.op is Ops.INDEX:
+        source = candidate
+        break
+  if source is None or source.src[0].op is not Ops.PARAM or source.dtype not in (dtypes.bool, dtypes.half): return None
+  if source.src[0].src[0].op is not Ops.CONST or store.src[0].src[0].src[0].op is not Ops.CONST: return None
+
+  info = ProgramInfo.from_sink(sink)
+  source_slot = source.src[0].buf_uop.arg.slot
+  input_total = int(source.src[0].src[0].arg)
+  output_total = int(store.src[0].src[0].src[0].arg)
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+
+  # Buffers at the RK3588 GEM mmap boundary cannot be submitted directly.
+  # Stage large predicates through reusable 32K-lane DMA tiles, then copy the
+  # exact fp16 mask bytes into one host-mapped tensor for tiled CMAC gathering.
+  if source.dtype is dtypes.half and input_total*2 >= 2*1024*1024:
+    counted = alloc()
+    input_tile, negative_tile, magnitude_tile, nonzero_tile = (alloc() for _ in range(4))
+    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    tile = 32768
+    for start in range(0, input_total, tile):
+      count = min(tile, input_total-start)
+      source_layout = (count, _HOST_MOVEMENT_LAYOUT, 2, 1, count,
+                       2, 1, 0,
+                       8, 1, 0, 0, start, 2, 0, 10, 0)
+      source_relocs = (RKReloc(0, input_tile, 0, 0, 0xFFFFFFFF),
+                       RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", source_layout, input_tile, is_copy=True), source_relocs))
+      tasks.extend((_emit_where_stage(count, negative_tile, (input_tile, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL),
+                    _emit_where_stage(count, magnitude_tile, (input_tile, 0), (negative_tile, 0), Ops.MAX),
+                    _emit_where_stage(count, nonzero_tile, (magnitude_tile, 0), (magnitude_tile, 0), Ops.MAX, compare=True)))
+      tile_result = nonzero_tile
+      if reduce.arg[0] is Ops.MUL:
+        tile_result = negative_tile
+        tasks.append(_emit_where_stage(count, tile_result, (_CONST_SLOT, 0x3f800000), (nonzero_tile, 0), Ops.SUB))
+      result_layout = (count, _HOST_MOVEMENT_LAYOUT, 2, 1, count,
+                       2, 1, 0,
+                       4, 1, 0, 10, 0)
+      result_relocs = (RKReloc(0, counted, 0, 0, 0xFFFFFFFF),
+                       RKReloc(0, tile_result, 0, 0, 0xFFFFFFFF))
+      result_task = RKTask(0, 0, 0, "dpu", result_layout, counted, is_copy=True, out_offset=start*2)
+      tasks.append(RKSubTask(host_cmds, result_task, result_relocs))
+  # Bool buffers are widened only at the existing typed buffer boundary; all
+  # predicate arithmetic and both reductions execute on the NPU.
+  elif source.dtype is dtypes.bool:
+    nonzero = alloc()
+    tasks.append(_emit_where_stage(input_total, nonzero, (source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                   bool_inputs=(source_slot,)))
+  else:
+    negative, magnitude, nonzero = (alloc() for _ in range(3))
+    # WIP reference: separate positive/negative comparisons also produce an
+    # exact nonzero mask, but retain five full-size scratch buffers. ABS then
+    # one comparison is equivalent and lets the 2**20 case fit GEM mmap limits.
+    # negative_diff, negative_mask, positive_diff, positive_mask, nonzero = (alloc() for _ in range(5))
+    tasks.extend((_emit_where_stage(input_total, negative, (source_slot, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL),
+                  _emit_where_stage(input_total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX),
+                  _emit_where_stage(input_total, nonzero, (magnitude, 0), (magnitude, 0), Ops.MAX, compare=True)))
+
+  if not (source.dtype is dtypes.half and input_total*2 >= 2*1024*1024):
+    counted = nonzero
+    if reduce.arg[0] is Ops.MUL:
+      counted = negative if source.dtype is dtypes.half else alloc()
+      tasks.append(_emit_where_stage(input_total, counted, (_CONST_SLOT, 0x3f800000), (nonzero, 0), Ops.SUB))
+
+  # Preserve the scheduled INDEX expressions and RANGE axes, replacing only
+  # the boolean source/output storage with fp16 scratch buffers.
+  counted_param = source.src[0].param_like(counted).replace(dtype=dtypes.half)
+  counted_index = source.replace(dtype=dtypes.half, src=(counted_param, *source.src[1:]))
+  float_value = UOp(Ops.CAST, dtypes.float, (counted_index,), arg=dtypes.float)
+  sum_reduce = UOp(Ops.REDUCE, dtypes.float, (float_value, *reduce.src[1:]), arg=(Ops.ADD, 0))
+  sum_value = UOp(Ops.CAST, dtypes.half, (sum_reduce,), arg=dtypes.half)
+  sum_slot = alloc()
+  sum_param = store.src[0].src[0].param_like(sum_slot).replace(dtype=dtypes.half)
+  sum_index = store.src[0].replace(dtype=dtypes.half, src=(sum_param, *store.src[0].src[1:]))
+  sum_store = store.replace(src=(sum_index, sum_value))
+  sum_sink = sink.substitute({store:sum_store})
+  sum_plan = plan_rk(sum_sink)
+  if isinstance(sum_plan, str) or sum_plan.kind != "cmac":
+    if getenv("ROCKCHIP_DEBUG_BOOL_REDUCE"): print("RK_BOOL_REDUCE_CMAC_REJECT", sum_plan, sum_sink)
+    return None
+  if (shared_tasks := _try_cmac_shared_subtasks(sum_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(sum_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(sum_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+  positive = info.outs[0] if reduce.arg[0] is Ops.MAX else alloc()
+  tasks.append(_emit_where_stage(output_total, positive, (sum_slot, 0), (sum_slot, 0), Ops.MAX, compare=True,
+                                 bool_output=reduce.arg[0] is Ops.MAX))
+  if reduce.arg[0] is Ops.MUL:
+    tasks.append(_emit_where_stage(output_total, info.outs[0], (_CONST_SLOT, 0x3f800000), (positive, 0), Ops.SUB,
+                                   bool_output=True))
   return tuple(tasks)
 
 def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -7730,6 +7849,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
+  if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, bool_reduce_tasks)
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variable_scale_tasks)

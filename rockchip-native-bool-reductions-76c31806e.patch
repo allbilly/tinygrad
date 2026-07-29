@@ -1,0 +1,461 @@
+diff --git a/progress.md b/progress.md
+index 6fa5bf904..7c4a8b846 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6018,3 +6018,103 @@ before unpool.
+ 
+ The standalone recovery artifact is
+ `rockchip-native-max-unpool-d72bcc3f0.patch`, based on `d72bcc3f0`.
++
++## 2026-07-29 — native boolean reductions and 2 MiB byte tiling
++
++The complete forward-only census at `76c31806e` finished without a driver
++abort:
++
++```text
++257 passed, 165 failed, 8 skipped, 120 subtests passed
++1606.69 seconds
++```
++
++This replaces the stale 182-passing inventory. The next low-hanging group was
++boolean reduction: `all`, `all_axis`, `all_large`, `any`, and `any_axis`.
++The two empty-axis identity cases already passed in isolation but exposed a
++suite-order DPU timeout after the new CMAC stages.
++
++### Native reduction algorithm
++
++The scheduled boolean graph is either `REDUCE(MAX, CMPNE(x, 0))` for ANY or
++`REDUCE(MUL, CMPNE(x, 0))` for ALL. It is lowered to:
++
++```text
++nonzero = compare(abs(x) > 0)       # DPU
++ANY     = compare(CMAC_sum(nonzero) > 0)
++
++zero    = 1 - nonzero               # DPU
++ALL     = 1 - compare(CMAC_sum(zero) > 0)
++```
++
++Counting zeros is important. Comparing a nonzero count with the reduction
++extent would become inexact for a million lanes and fp16 would overflow above
++65,504. A zero count remains exactly zero, while every positive count remains
++detectably positive even when the final fp16 boundary saturates.
++
++The fp16 source path uses DPU multiply by -1, MAX for absolute value, and the
++hardware-proven comparison stage. Bool source buffers use the existing typed
++buffer boundary to widen bytes, but predicate arithmetic, complement, count,
++comparison, and inversion all execute on the NPU. The final fp16 0/1 result is
++packed back to the byte-wide bool ABI at the buffer boundary.
++
++### Mixed CMAC/DPU typed boundaries
++
++The mixed execution path previously invoked every post-CMAC DPU stage through
++the single-task runner. That runner does not apply the multi-task
++`bool_inputs`/`bool_output` metadata, so a correct fp16 result was written into
++or read from a byte-wide bool buffer. The mixed runner now prepares those
++typed boundaries explicitly while retaining single-task submissions and NPU
++resets; attempting a one-element PC-chain submission after CMAC timed out.
++
++`ROCKCHIP_DEBUG_BOOL_REDUCE=2` prints the first eight values written by each
++mixed DPU/CMAC stage. Level 1 keeps only matcher diagnostics. This made it
++possible to distinguish mask errors from typed-output packing.
++
++### 2 MiB RK3588 GEM boundary
++
++The `2**20` case creates an exact 2 MiB fp16 tensor. RK3588 GEM creation
++succeeds, but mapping that size fails with `ENXIO`. Such buffers now use the
++existing anonymous host mapping at `>= 2 MiB`.
++
++Large boolean predicates are evaluated in reusable 32,768-lane DMA tiles:
++
++1. copy exact source bytes into a DMA tile;
++2. run DPU abs, compare, and optional zero-mask generation;
++3. copy exact mask bytes into a host-mapped full mask;
++4. let the materialized/tiled CMAC path gather that mask and perform the sum.
++
++Host callbacks only move existing bytes and apply static offsets. They do not
++inspect values or evaluate boolean arithmetic. Scratch allocation now uses
++each subtask's actual output size and offset instead of allocating every slot
++at the largest stage size.
++
++Empty reductions lower to static bool constants. Treating those identities as
++typed constant byte movement avoids the suite-order DPU timeout without
++performing runtime-dependent operator evaluation.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- official boolean group, including empty axes and `2**20`: **7/7 passing in
++  39.55 seconds**;
++- dedicated permanent boolean hardware regression: **1/1 passing in 31.80
++  seconds**;
++- complete DPU hardware class: **58/58 passing in 287.78 seconds**;
++- hardware-free PR1 contract: **79/79 passing in 6.50 seconds**;
++- pycompile and `git diff --check`: passing.
++
++Mypy retains the same **13 pre-existing findings**. Ruff is not installed in
++the required `.venv` (`No module named ruff`). `pytest-xdist` is also absent,
++so the requested `-n12` option is unavailable; physical-NPU tests must remain
++serial in any case.
++
++The audit of other accelerator backends still finds no ordinary tensor
++operator implemented by host arithmetic. This milestone therefore uses host
++code only for typed ABI conversion, static empty identities, and exact byte
++tiling. `_run_host_scatter` remains opt-in diagnostics under
++`ROCKCHIP_ALLOW_HOST_OPS=1`.
++
++The standalone recovery artifact is
++`rockchip-native-bool-reductions-76c31806e.patch`, based on `76c31806e`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index a00d80459..63df52ce1 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -58,6 +58,25 @@ class TestDPU(unittest.TestCase):
+     c = a.maximum(b).realize()
+     np.testing.assert_allclose(c.numpy(), np.maximum(a_np, b_np), rtol=1e-3, atol=1e-3)
+ 
++  def test_dpu_bool_reductions(self):
++    data = np.arange(1, 361, dtype=np.float16).reshape(3,4,5,6)
++    data[1,2,3,4] = 0
++    x = Tensor(data, device="ROCKCHIP").realize()
++    np.testing.assert_array_equal(x.any().realize().numpy(), np.any(data))
++    np.testing.assert_array_equal(x.all().realize().numpy(), np.all(data))
++    np.testing.assert_array_equal(x.any(axis=(1,2)).realize().numpy(), np.any(data, axis=(1,2)))
++    np.testing.assert_array_equal(x.all(axis=(1,2)).realize().numpy(), np.all(data, axis=(1,2)))
++    flags = np.array([True, False, True], dtype=np.bool_)
++    f = Tensor(flags, device="ROCKCHIP").realize()
++    np.testing.assert_array_equal(f.any().realize().numpy(), np.any(flags))
++    np.testing.assert_array_equal(f.all().realize().numpy(), np.all(flags))
++    # Exercises host byte tiling around the RK3588 2 MiB GEM mmap boundary;
++    # predicate masks and both reduction levels still execute on the NPU.
++    self.assertTrue(bool(Tensor.ones(2**20, dtype=dtypes.half, device="ROCKCHIP").bool().all().realize().item()))
++    empty = Tensor(np.empty((1,0,3,0,5), dtype=np.float16), device="ROCKCHIP").realize()
++    np.testing.assert_array_equal(empty.any(axis=(1,3)).realize().numpy(), np.zeros((1,3,5), dtype=np.bool_))
++    np.testing.assert_array_equal(empty.all(axis=(1,3)).realize().numpy(), np.ones((1,3,5), dtype=np.bool_))
++
+   def test_dpu_local_max_pool(self):
+     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
+     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 564e9cdcd..5f8749b06 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1,13 +1,19 @@
+ # test_ops.py Status — Rockchip NPU Backend
+ 
+-**Last complete census:** 2026-07-29 (commit `a864e9519`)
+-**Command:** `PYTHONPATH=. DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 .venv/bin/python -m pytest test/backend/test_ops.py -q --tb=line`
++**Last complete census:** 2026-07-29 (commit `76c31806e`)
++**Command:** `. .venv/bin/activate && CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 python -m pytest test/backend/test_ops.py -q --tb=no`
+ 
+-The fresh serial census completed in **918.42 seconds: 182 passed, 333 failed,
+-8 skipped, and 27 subtests passed**. Pytest still collects 424 test functions;
+-its failed count also includes failing unittest subtests. This supersedes the
+-older 140-passing census below. The dedicated Rockchip hardware regression is
+-separately **70/70 passing in 207.22 seconds**.
++The fresh serial census completed in **1606.69 seconds: 257 passed, 165 failed,
++8 skipped, and 120 subtests passed**. Pytest still collects 424 test
++functions; its failed count also includes failing unittest subtests. This
++supersedes the older 182-passing census below.
++
++**Post-census boolean-reduction milestone:** all seven selected methods
++(`all`, `all_axis`, `all_large`, `all_zero_axis`, `any`, `any_axis`, and
++`any_zero_axis`) pass together in **39.55 seconds**. The five methods that
++failed in the census have not yet been folded into another full-suite count,
++so 257/165 remains the honest complete baseline. The expanded DPU hardware
++class is separately **58/58 passing in 287.78 seconds**.
+ 
+ **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
+ including its float32 infinity/NaN subcase. The summary table below remains the
+@@ -585,3 +591,29 @@ The rejected `_run_host_scatter` compatibility path remains disabled unless
+ `ROCKCHIP_ALLOW_HOST_OPS=1`.
+ 
+ Recovery patch: `rockchip-native-max-unpool-d72bcc3f0.patch`.
++
++### Native boolean-reduction milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `all`, `all_axis` | **passing** | **passing** |
++| `any`, `any_axis` | **passing** | **passing** |
++| `all_large` through `2**20` | **passing** | **passing with byte-only DMA tiling** |
++| `all_zero_axis`, `any_zero_axis` | **passing** | static identity byte fill |
++
++The seven methods pass together in **39.55 seconds**. ANY counts native DPU
++nonzero masks with CMAC and tests for a positive count. ALL counts zero masks
++and tests for a zero count, avoiding an inexact comparison with a large
++reduction extent.
++
++The 2 MiB RK3588 GEM mmap boundary is handled with 32,768-lane DMA tiles. Host
++callbacks copy fp16 bytes between the logical tensor and reusable tiles; DPU
++computes abs/nonzero/complement masks and CMAC performs the reduction. No host
++callback inspects runtime values or evaluates ALL/ANY.
++
++The permanent hardware regression includes ordinary, axis, bool-input,
++million-element, and empty-axis cases. The complete DPU class is **58/58
++passing in 287.78 seconds** and the hardware-free contract is **79/79 passing
++in 6.50 seconds**.
++
++Recovery patch: `rockchip-native-bool-reductions-76c31806e.patch`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 1aecd826d..172b93892 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
+   _CMAC_MATERIALIZED_LAYOUT)
+ 
+-_ROCKCHIP_MAX_MAPPABLE_BO = 4 * 1024 * 1024
++_ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+ # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
+ def _pad_a(src, dst, M, K, align_in):
+@@ -588,6 +588,7 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+   value_code = meta[cursor+1:cursor+1+value_n]
+   inputs = [bufs[r.globals_slot] for r in relocs[1:]]
+   output = bufs[relocs[0].globals_slot]
++  output_base = task.out_offset // itemsize
+ 
+   def evaluate(code, coords):
+     stack:list = []
+@@ -619,12 +620,14 @@ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+     for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+     out_index = evaluate(out_code, coords)
+     input_id, in_index = evaluate(value_code, coords)
+-    if not 0 <= out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
++    if not 0 <= output_base+out_index < output.size // itemsize: raise RuntimeError(f"rk: host movement output index out of bounds {out_index}")
+     if input_id == -1:
+-      ctypes.memmove(output.va_addr + out_index*itemsize, int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
++      ctypes.memmove(output.va_addr + task.out_offset + out_index*itemsize,
++                     int(in_index).to_bytes(itemsize, 'little'), itemsize)  # type: ignore[arg-type]
+     else:
+       if not 0 <= in_index < inputs[input_id].size // itemsize: raise RuntimeError(f"rk: host movement input index out of bounds {in_index}")
+-      ctypes.memmove(output.va_addr + out_index*itemsize, inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
++      ctypes.memmove(output.va_addr + task.out_offset + out_index*itemsize,
++                     inputs[input_id].va_addr + in_index*itemsize, itemsize)  # type: ignore[arg-type]
+ 
+ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Materialize a compile-time fp16 tensor into a scratch buffer for a later NPU task."""
+@@ -1173,10 +1176,15 @@ class RockchipProgram(Program['RockchipDevice']):
+       ext, shared, original = list(bufs), [], self.subtasks
+       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                      default=len(ext)-1)
+-      total = max((st.task.layout[0]*st.task.layout[1] if st.task.kind == "cmac" else st.task.layout[0]) for st in subtasks)
++      scratch_sizes:dict[int, int] = {}
++      for st in subtasks:
++        if st.task.out_slot < len(ext): continue
++        elements = st.task.layout[0]*st.task.layout[1] if st.task.kind == "cmac" else st.task.layout[0]
++        itemsize = 4 if st.task.native_int32_output else 2
++        scratch_sizes[st.task.out_slot] = max(scratch_sizes.get(st.task.out_slot, 0), st.task.out_offset+elements*itemsize)
+       try:
+         while len(ext) <= max_slot:
+-          shared.append(b := dev._gpu_alloc(max(total*2, 4096), 0))
++          shared.append(b := dev._gpu_alloc(max(scratch_sizes.get(len(ext), 0), 4096), 0))
+           ext.append(b)
+         for st in subtasks:
+           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
+@@ -1188,9 +1196,45 @@ class RockchipProgram(Program['RockchipDevice']):
+           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+             _pack_static_gather(st.task, st.relocs, tuple(ext))
+             continue
+-          self.subtasks = None
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+-          self(*tuple(ext))
++          # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
++          # stages also stay single-task for reset stability, with the typed
++          # bool ABI boundary prepared explicitly around that submission.
++          if st.task.kind == "cmac":
++            self.subtasks = None
++            self(*tuple(ext))
++          else:
++            stage_ext, stage_temp = list(ext), []
++            try:
++              for slot in st.task.bool_inputs:
++                source_n = ext[slot].size
++                converted = dev._gpu_alloc(max(source_n*2, 4096), 0)
++                stage_temp.append(converted)
++                _convert_bool_to_fp16_buf(ext[slot].va_addr, converted.va_addr, source_n)
++                stage_ext[slot] = converted
++              bool_output = None
++              if st.task.bool_output:
++                original_out = ext[st.task.out_slot]
++                out_n = original_out.size
++                converted = dev._gpu_alloc(max(out_n*2, 4096), 0)
++                stage_temp.append(converted)
++                stage_ext[st.task.out_slot] = converted
++                bool_output = (original_out, converted, out_n)
++              self.subtasks = None
++              self(*tuple(stage_ext))
++              if bool_output is not None:
++                original_out, converted, out_n = bool_output
++                _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, out_n)
++            finally:
++              for b in stage_temp: dev._gpu_free(b)
++          if getenv("ROCKCHIP_DEBUG_BOOL_REDUCE") >= 2:
++            out = ext[st.task.out_slot]
++            if st.task.bool_output:
++              values = tuple(ctypes.string_at(out.va_addr, min(out.size, 8)))
++            else:
++              count = min(out.size//2, 8)
++              values = tuple(struct.unpack(f"<{count}e", ctypes.string_at(out.va_addr, count*2)))
++            print("RK_BOOL_REDUCE_STAGE", st.task.kind, st.task.out_slot, values)
+       finally:
+         self.subtasks = original
+         for b in shared: dev._gpu_free(b)
+@@ -1593,7 +1637,7 @@ class RockchipDevice(Compiled):
+     # The RK3588 GEM mmap path rejects multi-megabyte BOs. Generalized CMAC
+     # gathers logical tensors through their CPU mapping and submits compact
+     # DMA-backed tiles, so large logical buffers can safely remain host-backed.
+-    if size > _ROCKCHIP_MAX_MAPPABLE_BO:
++    if size >= _ROCKCHIP_MAX_MAPPABLE_BO:
+       va = FileIOInterface.anon_mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE,
+                                      mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS, 0)
+       return HCQBuffer(va_addr=va, size=size)
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index f8b5f4a9f..f59658ba8 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -6847,7 +6847,7 @@ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or _reduce_node(sink) is not None: return None
+   raw = store.src[1]
+-  if raw.op not in (Ops.INDEX, Ops.WHERE): return None
++  if raw.op not in (Ops.INDEX, Ops.WHERE) and not (raw.op is Ops.CONST and raw.dtype is dtypes.bool): return None
+   if store.src[0].dtype != raw.dtype: return None
+ 
+   ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+@@ -7285,6 +7285,125 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower bool ALL/ANY to native DPU masks followed by a CMAC count.
++
++  ANY counts nonzero lanes and tests count>0. ALL counts zero lanes and tests
++  count==0. The latter deliberately avoids comparing against the reduction
++  extent: a million-lane count may overflow fp16, while zero/nonzero remains
++  exact across the CMAC fp32 accumulator and its fp16 output boundary.
++  """
++  reduce, store = _reduce_node(sink), _store_node(sink)
++  if reduce is None or store is None or reduce.dtype is not dtypes.bool or store.src[0].dtype is not dtypes.bool or \
++     store.src[1] is not reduce or reduce.arg[0] not in (Ops.MAX, Ops.MUL): return None
++  if not reduce.src[1:] or any(r.src[0].op is not Ops.CONST for r in reduce.src[1:]): return None
++
++  body = reduce.src[0]
++  source:UOp|None = None
++  if body.op is Ops.INDEX and body.dtype is dtypes.bool:
++    source = body
++  elif body.op is Ops.CMPNE and len(body.src) == 2:
++    for candidate, zero in ((body.src[0], body.src[1]), (body.src[1], body.src[0])):
++      candidate = _unwrap(candidate)
++      if zero.op is Ops.CONST and float(zero.arg) == 0.0 and candidate.op is Ops.INDEX:
++        source = candidate
++        break
++  if source is None or source.src[0].op is not Ops.PARAM or source.dtype not in (dtypes.bool, dtypes.half): return None
++  if source.src[0].src[0].op is not Ops.CONST or store.src[0].src[0].src[0].op is not Ops.CONST: return None
++
++  info = ProgramInfo.from_sink(sink)
++  source_slot = source.src[0].buf_uop.arg.slot
++  input_total = int(source.src[0].src[0].arg)
++  output_total = int(store.src[0].src[0].src[0].arg)
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++
++  # Buffers at the RK3588 GEM mmap boundary cannot be submitted directly.
++  # Stage large predicates through reusable 32K-lane DMA tiles, then copy the
++  # exact fp16 mask bytes into one host-mapped tensor for tiled CMAC gathering.
++  if source.dtype is dtypes.half and input_total*2 >= 2*1024*1024:
++    counted = alloc()
++    input_tile, negative_tile, magnitude_tile, nonzero_tile = (alloc() for _ in range(4))
++    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    tile = 32768
++    for start in range(0, input_total, tile):
++      count = min(tile, input_total-start)
++      source_layout = (count, _HOST_MOVEMENT_LAYOUT, 2, 1, count,
++                       2, 1, 0,
++                       8, 1, 0, 0, start, 2, 0, 10, 0)
++      source_relocs = (RKReloc(0, input_tile, 0, 0, 0xFFFFFFFF),
++                       RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", source_layout, input_tile, is_copy=True), source_relocs))
++      tasks.extend((_emit_where_stage(count, negative_tile, (input_tile, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL),
++                    _emit_where_stage(count, magnitude_tile, (input_tile, 0), (negative_tile, 0), Ops.MAX),
++                    _emit_where_stage(count, nonzero_tile, (magnitude_tile, 0), (magnitude_tile, 0), Ops.MAX, compare=True)))
++      tile_result = nonzero_tile
++      if reduce.arg[0] is Ops.MUL:
++        tile_result = negative_tile
++        tasks.append(_emit_where_stage(count, tile_result, (_CONST_SLOT, 0x3f800000), (nonzero_tile, 0), Ops.SUB))
++      result_layout = (count, _HOST_MOVEMENT_LAYOUT, 2, 1, count,
++                       2, 1, 0,
++                       4, 1, 0, 10, 0)
++      result_relocs = (RKReloc(0, counted, 0, 0, 0xFFFFFFFF),
++                       RKReloc(0, tile_result, 0, 0, 0xFFFFFFFF))
++      result_task = RKTask(0, 0, 0, "dpu", result_layout, counted, is_copy=True, out_offset=start*2)
++      tasks.append(RKSubTask(host_cmds, result_task, result_relocs))
++  # Bool buffers are widened only at the existing typed buffer boundary; all
++  # predicate arithmetic and both reductions execute on the NPU.
++  elif source.dtype is dtypes.bool:
++    nonzero = alloc()
++    tasks.append(_emit_where_stage(input_total, nonzero, (source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                   bool_inputs=(source_slot,)))
++  else:
++    negative, magnitude, nonzero = (alloc() for _ in range(3))
++    # WIP reference: separate positive/negative comparisons also produce an
++    # exact nonzero mask, but retain five full-size scratch buffers. ABS then
++    # one comparison is equivalent and lets the 2**20 case fit GEM mmap limits.
++    # negative_diff, negative_mask, positive_diff, positive_mask, nonzero = (alloc() for _ in range(5))
++    tasks.extend((_emit_where_stage(input_total, negative, (source_slot, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL),
++                  _emit_where_stage(input_total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX),
++                  _emit_where_stage(input_total, nonzero, (magnitude, 0), (magnitude, 0), Ops.MAX, compare=True)))
++
++  if not (source.dtype is dtypes.half and input_total*2 >= 2*1024*1024):
++    counted = nonzero
++    if reduce.arg[0] is Ops.MUL:
++      counted = negative if source.dtype is dtypes.half else alloc()
++      tasks.append(_emit_where_stage(input_total, counted, (_CONST_SLOT, 0x3f800000), (nonzero, 0), Ops.SUB))
++
++  # Preserve the scheduled INDEX expressions and RANGE axes, replacing only
++  # the boolean source/output storage with fp16 scratch buffers.
++  counted_param = source.src[0].param_like(counted).replace(dtype=dtypes.half)
++  counted_index = source.replace(dtype=dtypes.half, src=(counted_param, *source.src[1:]))
++  float_value = UOp(Ops.CAST, dtypes.float, (counted_index,), arg=dtypes.float)
++  sum_reduce = UOp(Ops.REDUCE, dtypes.float, (float_value, *reduce.src[1:]), arg=(Ops.ADD, 0))
++  sum_value = UOp(Ops.CAST, dtypes.half, (sum_reduce,), arg=dtypes.half)
++  sum_slot = alloc()
++  sum_param = store.src[0].src[0].param_like(sum_slot).replace(dtype=dtypes.half)
++  sum_index = store.src[0].replace(dtype=dtypes.half, src=(sum_param, *store.src[0].src[1:]))
++  sum_store = store.replace(src=(sum_index, sum_value))
++  sum_sink = sink.substitute({store:sum_store})
++  sum_plan = plan_rk(sum_sink)
++  if isinstance(sum_plan, str) or sum_plan.kind != "cmac":
++    if getenv("ROCKCHIP_DEBUG_BOOL_REDUCE"): print("RK_BOOL_REDUCE_CMAC_REJECT", sum_plan, sum_sink)
++    return None
++  if (shared_tasks := _try_cmac_shared_subtasks(sum_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(sum_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(sum_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++
++  positive = info.outs[0] if reduce.arg[0] is Ops.MAX else alloc()
++  tasks.append(_emit_where_stage(output_total, positive, (sum_slot, 0), (sum_slot, 0), Ops.MAX, compare=True,
++                                 bool_output=reduce.arg[0] is Ops.MAX))
++  if reduce.arg[0] is Ops.MUL:
++    tasks.append(_emit_where_stage(output_total, info.outs[0], (_CONST_SLOT, 0x3f800000), (positive, 0), Ops.SUB,
++                                   bool_output=True))
++  return tuple(tasks)
++
+ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Gather static local-reduction windows, then compute their maximum on DPU."""
+   reduce, store = _reduce_node(sink), _store_node(sink)
+@@ -7730,6 +7849,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
+   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
+      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
++  if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, bool_reduce_tasks)
+   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
+   if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, variable_scale_tasks)
