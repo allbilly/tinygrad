@@ -5069,6 +5069,43 @@ patch is `rockchip-atanh-two-lut-d9d472885.patch`, against parent
 The complete hardware file remains **71/71 passing in 231.05 seconds** with
 the same 11 expected numerical warnings.
 
+## 2026-07-29 — shared asinh/acosh range LUT milestone
+
+The last inverse-function pair is green: unchanged `test_asinh` passes in
+**21.16 seconds** and unchanged `test_acosh` in **20.37 seconds**. This
+includes the ordinary `[-2,2]` tensors, finite `±300` asinh, invalid negative
+acosh, and finite positive-300 acosh. The expanded permanent inverse-trig
+hardware method passes in **35.93 seconds** over dense `[-20,20]` values plus
+`±303`, signed zero, and the exact acosh endpoint.
+
+The original expanded formulas square the input before SQRT, overflowing fp16
+at 300 and returning infinity. The new direct paths share the same two-task
+geometry:
+
+```text
+core task LE:   high-resolution origin (asinh) or x=1 endpoint (acosh)
+core task LO:   direct values through magnitude 2
+range task LE:  direct values for magnitudes 2 through 16
+range task LO:  direct values for x=19*z, covering finite inputs through 304
+```
+
+For asinh, the core LE coordinate is `-16*abs(x)` and stores
+`4*asinh(abs(z)/16)`; the near-zero identity still covers `abs(x)<=0.04`.
+For acosh, the coordinate is based on `distance=x-1`; LE directly resolves
+the square-root singularity, LO uses `2*distance`, and exact distance zero is
+masked back to zero to remove the hardware one-count LUT substitute.
+
+The range task uses a common address scale of 1024. Its negative coordinate
+is `-(x-2)` and Q15 value is function/4; its positive coordinate is `x/19`
+and value is function/8. This gives fine middle resolution and enough large
+range without a logarithm task or an overflowing square. Original-input
+domain masking restores NaN for acosh below one. `lut.md` records the complete
+layout. The standalone patch is
+`rockchip-asinh-acosh-range-1a9530393.patch`, against parent `1a9530393`.
+
+The complete hardware file remains **71/71 passing in 242.13 seconds** with
+the same 11 expected numerical warnings.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

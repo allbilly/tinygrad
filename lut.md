@@ -1670,6 +1670,52 @@ Do not create positive infinity before sign selection. An unselected
 contaminates the selected lane. Signing first also preserves both exact
 endpoint signs without a WHERE instruction.
 
+### Asinh/acosh: two tasks across core, middle, and large ranges
+
+The expanded definitions square the input:
+
+```text
+asinh(x) = log(x + sqrt(x*x + 1))
+acosh(x) = log(x + sqrt(x*x - 1))
+```
+
+At the official finite inputs around 300, `x*x` overflows fp16 and the whole
+chain returns infinity. A log-based repair would add multiple normalization
+and LUT tasks. Direct tables can cover the required finite interval with two
+tasks by assigning a different coordinate transform to each physical half.
+
+The core task has address scale `8192`, hence physical coordinate domain
+`[-2,2]`:
+
+| Function/table | Coordinate | Stored value | Decode/use |
+|---|---:|---:|---|
+| asinh LE | `z=-16*abs(x)` | `4*asinh(abs(z)/16)` | multiply by 0.25 through `abs(x)=0.125` |
+| asinh LO | `z=abs(x)` | `asinh(z)/2` | multiply by 2 through `abs(x)=2` |
+| acosh LE | `z=-16*(x-1)` | `acosh(1+abs(z)/16)` | direct through `x=1.125` |
+| acosh LO | `z=2*(x-1)` | `acosh(1+z/2)/2` | multiply by 2 through `x=2` |
+
+Asinh returns the identity through magnitude `0.04`. Acosh separately masks
+exact `x=1` to zero because the normal one-count substitute for a zero LUT
+entry exceeds the strict absolute tolerance.
+
+The range task has address scale `1024`, coordinate domain `[-16,16]`:
+
+| Table | Coordinate | Stored value | Decode/use |
+|---|---:|---:|---|
+| LE | `z=-(x-2)` | `function(2+abs(z))/4` | multiply by 4 for `2 < x <= 16` |
+| LO | `z=x/19` | `function(19*z)/8` | multiply by 8 for `16 < x <= 304` |
+
+The middle coordinate retains a `1/32` input step. In the large half, one
+table step represents `19/32`, but the curvature of asinh/acosh is already
+small above 16; exhaustive CPU simulation and dense hardware coverage remain
+within fp16 TestOps tolerance through 303.
+
+For asinh, take the absolute value before routing and restore sign only after
+the finite magnitude is assembled. For acosh, clamp only table addressing to
+one and derive `invalid=(x<1)` from the original input; multiply the assembled
+value by `valid/valid` to restore NaN. This avoids both cancellation on
+negative asinh inputs and overflow in the original square/SQRT graph.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

@@ -106,6 +106,14 @@ The dense inverse-trig method passes in **23.82 seconds**, including exact
 `±1` infinities and out-of-domain NaNs. `asinh` and `acosh` remain.
 The complete hardware file remains **71/71 passing in 231.05 seconds**.
 
+The inverse-hyperbolic group is now complete. Unchanged `test_asinh` passes in
+**21.16 seconds** and `test_acosh` in **20.37 seconds**, including their
+ordinary, finite ±300, and invalid-domain subcases. Their shared two-task
+layout uses separate physical table halves for origin/endpoint, `[0,2]`,
+`[2,16]`, and scaled large inputs through 304. The expanded dense
+inverse-function hardware method passes in **35.93 seconds**.
+The complete hardware file remains **71/71 passing in 242.13 seconds**.
+
 ## Summary
 
 | Status | Count |
@@ -225,6 +233,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - asin and acos, including endpoint precision and out-of-domain NaN
 - atan, including ordinary `[-2,2]` and finite `±300` ranges
 - atanh, including exact domain boundaries and invalid-domain NaN
+- asinh and acosh, including finite ±300 and acosh domain masking
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave

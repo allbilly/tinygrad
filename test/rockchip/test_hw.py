@@ -245,6 +245,8 @@ class TestDPU(unittest.TestCase):
                            np.array([-300, 300, -1, 1, -0.0, 0.0], dtype=np.float16)))
     atan_np = np.concatenate((np.linspace(-2, 2, 4097, dtype=np.float16),
                               np.array([-300, 300, -0.0, 0.0], dtype=np.float16)))
+    hyper_np = np.concatenate((np.linspace(-20, 20, 4097, dtype=np.float16),
+                               np.array([-303, -300, 300, 303, 1, -0.0, 0.0], dtype=np.float16)))
     with np.errstate(invalid="ignore", divide="ignore"):
       expected_asin = np.arcsin(a_np.astype(np.float32)).astype(np.float16)
       expected_acos = np.arccos(a_np.astype(np.float32)).astype(np.float16)
@@ -257,6 +259,12 @@ class TestDPU(unittest.TestCase):
                                np.arctan(atan_np.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
     np.testing.assert_allclose(Tensor(a_np, device="ROCKCHIP").atanh().realize().numpy(),
                                expected_atanh, rtol=1e-3, atol=1e-6)
+    np.testing.assert_allclose(Tensor(hyper_np, device="ROCKCHIP").asinh().realize().numpy(),
+                               np.arcsinh(hyper_np.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    with np.errstate(invalid="ignore"):
+      expected_acosh = np.arccosh(hyper_np.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(Tensor(hyper_np, device="ROCKCHIP").acosh().realize().numpy(),
+                               expected_acosh, rtol=1e-3, atol=1e-6)
 
   def test_dpu_sqrt_special_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -2, -0.0, 0, 0.25, 4], dtype=np.float16)
