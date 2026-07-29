@@ -420,7 +420,14 @@ def _try_softplus(val:UOp) -> tuple[UOp,float]|None:
   scaled_source_ok = maximum_value is source or (maximum_value is not None and maximum_value.op is Ops.MUL and
     any(_unwrap(x) is source for x in maximum_value.src) and
     any(x.op is Ops.CONST and math.isclose(float(x.arg), beta) for x in maximum_value.src))
-  return (source, beta) if logarithm is not None and scaled_source_ok and \
+  # BCE-with-logits exposes softplus(-x) after the outer negation distributes.
+  # Preserve that effective input so the subtask builder can materialize -x
+  # before applying the same NPU-native softplus LUT path.
+  negative_source = maximum_value if maximum_value is not None and maximum_value.op is Ops.MUL and \
+    any(_unwrap(x) is source for x in maximum_value.src) and \
+    any(x.op is Ops.CONST and math.isclose(float(x.arg), -beta) for x in maximum_value.src) else None
+  effective_source = source if scaled_source_ok else negative_source
+  return (effective_source, beta) if logarithm is not None and effective_source is not None and \
     any(_unwrap(x).op is Ops.LOG2 for x in logarithm.src) and all(u.op in allowed for u in nodes) and \
     sum(u.op is Ops.EXP2 for u in nodes) == 2 and sum(u.op is Ops.LOG2 for u in nodes) == 1 and \
     sum(u.op is Ops.MAX for u in nodes) == 1 else None
@@ -2969,8 +2976,16 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def scalar(value:float) -> tuple[int,int]:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
-  source_arg = (source.src[0].buf_uop.arg.slot, 0)
   tasks:list[RKSubTask] = []
+  if source.op is not Ops.INDEX:
+    materialized_source = alloc()
+    source_store = store.replace(src=(temp_index(materialized_source), source))
+    source_plan = plan_rk(sink.substitute({store:source_store}))
+    if isinstance(source_plan, str) or source_plan.kind != "dpu": return None
+    cmds, task, relocs = emit_rk(source_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+    source = temp_index(materialized_source)
+  source_arg = (source.src[0].buf_uop.arg.slot, 0)
   if beta < 1.0:
     correction, positive, raw_output = alloc(), alloc(), alloc()
     far_diff, far_mask, finite_mask, finite_output = (alloc() for _ in range(4))
@@ -2979,7 +2994,7 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     wide_plan = plan_rk(sink.substitute({store:wide_store}))
     if isinstance(wide_plan, str) or wide_plan.kind != "dpu_lut": return None
     cmds, task, relocs = emit_rk(wide_plan)
-    return (RKSubTask(cmds, task, relocs),
+    return (*tasks, RKSubTask(cmds, task, relocs),
             _emit_where_stage(total, positive, source_arg, (_ZERO_SLOT, 0), Ops.MAX),
             _emit_where_stage(total, raw_output, (positive, 0), (correction, 0), Ops.SUB),
             _emit_where_stage(total, far_diff, scalar(-100.0), source_arg, Ops.SUB),
@@ -6755,8 +6770,8 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def emit_stage(stage_val:UOp, out_slot:int) -> UOp|None:
     nonlocal next_slot
     stage_sink, out_idx = make_stage_sink(stage_val, out_slot)
-    for special in (_try_exp_correction_subtasks, _try_sigmoid_special_subtasks, _try_exp2_special_subtasks, _try_log2_special_subtasks,
-                    _try_rsqrt_special_subtasks, _try_sqrt_special_subtasks):
+    for special in (_try_logsigmoid_subtasks, _try_softplus_subtasks, _try_exp_correction_subtasks, _try_sigmoid_special_subtasks,
+                    _try_exp2_special_subtasks, _try_log2_special_subtasks, _try_rsqrt_special_subtasks, _try_sqrt_special_subtasks):
       if (special_tasks := special(stage_sink)) is None: continue
       tasks.extend(special_tasks)
       used_slots = [st.task.out_slot for st in special_tasks] + \
@@ -9681,6 +9696,61 @@ def _try_movement_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
+def _try_elementwise_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Materialize a fused fp16 elementwise reduction body, then sum it on CMAC."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.half or \
+     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  body = _reduce_body(reduce)
+  # Direct INDEX/MUL reductions belong to CMAC and multifactor lowering.  This
+  # path is only for a genuinely fused additive elementwise body such as BCE.
+  if body.op is not Ops.ADD: return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+
+  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
+    flat = axes[0]
+    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
+    return flat
+
+  info = ProgramInfo.from_sink(sink)
+  intermediate_slot = max(info.globals, default=-1) + 1
+  reduction_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in reductions]
+  stage_axes = [*loops, *reduction_loops]
+  stage_extents = [int(u.src[0].arg) for u in stage_axes]
+  stage_total = prod(stage_extents)
+  stage_body = body.substitute(dict(zip(reductions, reduction_loops)))
+  device = store.src[0].src[0].device
+  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=device)
+  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
+  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_body)), *stage_axes)))
+
+  # The reduction body is deliberately lowered as an ordinary elementwise graph:
+  # every arithmetic operation remains an NPU DPU/LUT task and only the static
+  # address calculation above is performed while constructing the command chain.
+  elementwise_tasks = _try_elementwise_subtasks(stage_sink)
+  if elementwise_tasks is None:
+    if getenv("ROCKCHIP_DEBUG_ELEMENTWISE_SUM"): print("RK_ELEMENTWISE_SUM_BODY_REJECT", stage_sink)
+    return None
+  tasks = list(elementwise_tasks)
+
+  final_axes = [*loops, *reductions]
+  final_extents = [int(u.src[0].arg) for u in final_axes]
+  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
+  final_acc = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (intermediate_index,), arg=dtypes.float), *reductions))
+  final_sink = sink.substitute({reduce:final_acc})
+  final_plan = plan_rk(final_sink)
+  if isinstance(final_plan, str) or final_plan.kind != "cmac":
+    if getenv("ROCKCHIP_DEBUG_ELEMENTWISE_SUM"): print("RK_ELEMENTWISE_SUM_CMAC_REJECT", final_plan, final_sink)
+    return None
+  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(final_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  return tuple(tasks)
+
 def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run a half-input CMAC sum, then widen its fp16 output through a DPU ABI stage."""
   store, reduce = _store_node(sink), _reduce_node(sink)
@@ -10613,6 +10683,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, variable_scale_tasks)
   if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, movement_sum_tasks)
+  if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, elementwise_sum_tasks)
   # WIP: this produces the explicitly requested float32 result correctly, but
   # the DEFAULT_FLOAT=HALF test harness compares it against a Torch fp16 sum.
   # if (fp32_sum_tasks := _wip_try_fp32_sum_output_subtasks(sink)) is not None:
@@ -10650,6 +10722,9 @@ def build_native_program(sink: UOp) -> UOp|None:
 def build_native_program_multi(sink: UOp, subtasks: tuple[RKSubTask, ...]) -> UOp|None:
   """Build a multi-task PROGRAM for PC chain. The first INS carries a tuple of RKSubTask,
   followed by all cmds and relocs from all subtasks (flattened)."""
+  if getenv("ROCKCHIP_DEBUG_SUBTASKS"):
+    print("RK_SUBTASKS", [(st.task.out_slot, st.task.kind, st.task.fp32_inputs, st.task.fp32_output,
+                           tuple(r.globals_slot for r in st.relocs)) for st in subtasks])
   ins_args: list = [subtasks]  # first INS carries the subtask list
   for st in subtasks:
     ins_args.extend(st.cmds)

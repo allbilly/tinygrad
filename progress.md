@@ -7271,3 +7271,58 @@ task chains can still abort during the driver reset ioctl.  Debug this
 separately from sorting by launching one axis/direction per process; a
 numerical or lowering fault will reproduce there, while reset-state
 accumulation will not.
+
+## 2026-07-30 — fused BCE reductions and nested softplus
+
+The default-reduction `TestOps.test_binary_crossentropy` now passes all four
+ordinary BCE/BCE-with-logits formulations.  The rejected kernel was a fused
+fp16 elementwise loss body inside an fp32 ADD reduction.  The backend now
+materializes that body with ordinary DPU/LUT tasks, preserves the fp16
+boundary, and feeds the intermediate to CMAC.  Static host work constructs
+only the flat intermediate addresses; it performs no loss arithmetic.
+
+BCE-with-logits exposed a second, independent dispatcher problem.  Compiler
+reassociation expresses the loss as weighted `softplus(x)` and
+`softplus(-x)`.  Nested elementwise lowering did not try the existing
+softplus/logsigmoid special builders, and the negative softplus matcher did
+not retain its effective `-x` input.  It consequently expanded into roughly
+200 primitive tasks with unsafe fp32 scratch conversions.  Nested special
+dispatch is now enabled, and `-x` is first materialized by one DPU task before
+reusing the proven two-LUT softplus path.  An eight-lane deterministic
+BCE-with-logits probe is bit-exact against its fp16 reference.
+
+Useful debug procedure:
+
+- set `ROCKCHIP_DEBUG_ELEMENTWISE_SUM=1` to distinguish body materialization
+  from final CMAC rejection;
+- set `RK_TRACE_MATCH=1` to confirm that inner softplus/logsigmoid graphs use
+  their special builders;
+- set `ROCKCHIP_DEBUG_SUBTASKS=1` to print output slots, task kinds,
+  fp32-conversion flags, and relocated input slots.  Unexpectedly long chains
+  or fp32 scratch flags identify a missed special match;
+- test `reduction="none"` separately from mean/sum.  Reduction averaging can
+  hide per-element LUT error even when the lowering is correct.
+
+Validation with `. .venv/bin/activate`, disabled caches,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged official `TestOps.test_binary_crossentropy`: **passing in
+  130.98 seconds** (all four formulations);
+- `test/rockchip/test_pr1.py`: **79/79 passing** after narrowing the new path
+  so direct MUL reductions remain with CMAC/multifactor lowering;
+- the reduction-mode method passed both mean cases and both sum cases, then
+  ordinary unreduced BCE missed 68/320 elements at 0.1% tolerance
+  (max relative error 0.434%, max absolute error 0.004883);
+- positive-weight logits remains a distinct broadcast-vector
+  `RKPLAN_REJECT:unsupported_op:Ops.ADD`.
+
+Python compilation and `git diff --check` pass.  Mypy remains at the same 13
+pre-existing errors in `rockchip.py`; this milestone introduced no new type
+errors.  Ruff is not installed in `.venv`.
+
+Next loss work is therefore split cleanly: tune or add a second NPU LUT task
+for unreduced BCE accuracy, then lower the `pos_weight` broadcast.  The
+accumulation drift reported in
+[RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+supports caution around long fp16 CMAC/reduction chains, but it does not
+explain the unreduced elementwise LUT error or the broadcast rejection.

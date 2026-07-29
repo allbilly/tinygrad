@@ -1209,3 +1209,26 @@ repeated-value case in a fresh process passed exactly, so Sort correctness is
 complete while long-process RK reset stability remains an infrastructure
 issue.  Do not count that ioctl abort as a failed Sort algorithm unless the
 same subcase fails in isolation.
+
+### Native BCE mean/sum milestone
+
+| Loss coverage | Result |
+|---|---:|
+| official BCE/BCE-with-logits default mean, four formulations | **4/4 passing** |
+| explicit mean and sum, ordinary and logits | **4/4 passing before next mode** |
+| ordinary BCE `reduction="none"` | **68/320 outside tolerance** |
+| logits with vector `pos_weight` | **broadcast ADD rejection** |
+
+Fused elementwise ADD-reduction bodies now materialize through DPU/LUT tasks
+and reduce through CMAC.  Nested lowering also recognizes inner
+softplus/logsigmoid, including `softplus(-x)` after one native negation stage;
+this replaces the incorrect roughly 200-task primitive expansion.  No
+operator arithmetic uses `run_host`.
+
+Validation used `. .venv/bin/activate`, caches disabled, half defaults, and
+forward-only.  The unchanged default BCE method passed in 130.98 seconds.
+The non-hardware PR1 suite remains **79/79 passing**, Python compilation and
+diff whitespace checks pass, and mypy remains at its pre-existing 13-error
+Rockchip baseline.  Ruff is unavailable in `.venv`.
+Unreduced ordinary BCE is the next LUT-accuracy task (max relative error
+0.434%); vector positive weights are a separate broadcast-lowering task.
