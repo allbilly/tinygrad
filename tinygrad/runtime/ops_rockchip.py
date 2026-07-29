@@ -17,7 +17,8 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.rockchip import (build_native_program,
   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT)
+  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
+  _HOST_ELEMENTWISE_LAYOUT)
 
 # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
 def _pad_a(src, dst, M, K, align_in):
@@ -200,6 +201,106 @@ def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     if not 0 <= magnitude_index < magnitude.size // itemsize: raise RuntimeError(f"rk: host copysign magnitude index out of bounds {magnitude_index}")
     if not 0 <= sign_index < sign.size // itemsize: raise RuntimeError(f"rk: host copysign sign index out of bounds {sign_index}")
     out_ptr[out_index] = (magnitude_ptr[magnitude_index] & ~sign_mask) | (sign_ptr[sign_index] & sign_mask)
+
+def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
+  import numpy as np
+  total, tag, out_dtype_code, n_ranges, *meta = task.layout
+  assert tag == _HOST_ELEMENTWISE_LAYOUT
+  extents, cursor = meta[:n_ranges], n_ranges
+  out_n = meta[cursor]
+  out_code = meta[cursor+1:cursor+1+out_n]
+  cursor += out_n+1
+  value_n = meta[cursor]
+  value_code = meta[cursor+1:cursor+1+value_n]
+  np_dtypes = (np.bool_, np.int32, np.uint32, np.int64, np.uint64, np.uint8,
+               np.float16, np.float32, np.int64, np.int16, np.uint16, np.int8, np.float64)
+  inputs:list[dict] = []
+  for reloc in relocs[1:]:
+    buf = bufs[reloc.globals_slot]
+    inputs.append({code:np.frombuffer(ctypes.string_at(buf.va_addr, buf.size), dtype=dtype)
+                   for code, dtype in enumerate(np_dtypes) if buf.size % np.dtype(dtype).itemsize == 0})
+  output = bufs[relocs[0].globals_slot]
+  out_dtype = np_dtypes[out_dtype_code]
+  result = np.zeros(output.size // np.dtype(out_dtype).itemsize, dtype=out_dtype)
+
+  def cast(value, dtype_code):
+    with np.errstate(all="ignore"):
+      return np.asarray(value, dtype=np_dtypes[dtype_code]).item()
+
+  def evaluate(code, coords):
+    stack:list = []
+    value:object
+    with np.errstate(all="ignore"):
+      for pos in range(0, len(code), 4):
+        op, dtype_code, arg0, arg1 = code[pos:pos+4]
+        if op == 0:
+          bits = (arg0 & 0xFFFFFFFF) | ((arg1 & 0xFFFFFFFF) << 32)
+          if dtype_code == 0: value = bool(bits)
+          elif dtype_code == 6: value = struct.unpack('<e', struct.pack('<H', bits & 0xFFFF))[0]
+          elif dtype_code == 7: value = struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
+          elif dtype_code == 12: value = struct.unpack('<d', struct.pack('<Q', bits))[0]
+          else:
+            width = np.dtype(np_dtypes[dtype_code]).itemsize * 8
+            if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
+            value = bits & ((1 << width)-1) if np.issubdtype(np_dtypes[dtype_code], np.unsignedinteger) else bits
+          stack.append(cast(value, dtype_code))
+          continue
+        if op == 1:
+          stack.append(cast(coords[arg0], dtype_code))
+          continue
+        if op == 2:
+          index = int(stack.pop())
+          source = inputs[arg0][dtype_code]
+          stack.append(source[index].item() if 0 <= index < source.size else cast(0, dtype_code))
+          continue
+        args = stack[-arg0:] if arg0 else []
+        if arg0: del stack[-arg0:]
+        if op == 3: value = args[0] + args[1]
+        elif op == 4: value = args[0] * args[1]
+        elif op == 5: value = np.divide(args[0], args[1])
+        elif op == 6: value = np.divide(1.0, args[0])
+        elif op == 7: value = np.maximum(args[0], args[1])
+        elif op == 8: value = args[0] < args[1]
+        elif op == 9: value = args[0] != args[1]
+        elif op == 10: value = args[1] if args[0] else args[2]
+        elif op == 11: value = args[0] & args[1]
+        elif op == 12: value = args[0] | args[1]
+        elif op == 13: value = args[0] ^ args[1]
+        elif op == 14: value = args[0]
+        elif op == 15: value = np.trunc(args[0])
+        elif op == 16: value = np.sqrt(args[0])
+        elif op == 17: value = np.exp2(args[0])
+        elif op == 18: value = np.log2(args[0])
+        elif op == 19: value = np.sin(args[0])
+        elif op == 20:
+          quotient = abs(int(args[0])) // abs(int(args[1]))
+          quotient = -quotient if (int(args[0]) < 0) != (int(args[1]) < 0) else quotient
+          value = int(args[0]) - quotient*int(args[1])
+        elif op == 21:
+          value = abs(int(args[0])) // abs(int(args[1]))
+          if (int(args[0]) < 0) != (int(args[1]) < 0): value = -value
+        elif op == 22: value = int(args[0]) // int(args[1])
+        elif op == 23: value = int(args[0]) % int(args[1])
+        elif op == 24: value = args[0] - args[1]
+        elif op == 25: value = np.power(args[0], args[1])
+        elif op == 26: value = -args[0]
+        elif op == 27: value = args[0] == args[1]
+        elif op == 28: value = int(args[0]) << int(args[1])
+        elif op == 29: value = int(args[0]) >> int(args[1])
+        elif op == 30: value = args[0]*args[1] + args[2]
+        else: raise RuntimeError(f"rk: invalid host elementwise opcode {op}")
+        stack.append(cast(value, dtype_code))
+    assert len(stack) == 1
+    return stack[0]
+
+  for linear in range(total):
+    rem, coords = linear, [0] * n_ranges
+    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+    out_index = int(evaluate(out_code, coords))
+    if not 0 <= out_index < result.size: raise RuntimeError(f"rk: host elementwise output index out of bounds {out_index}")
+    result[out_index] = evaluate(value_code, coords)
+  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute a compact postfix integer-index program and copy exact element bytes."""
@@ -510,6 +611,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
           _run_host_copysign(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+          _run_host_elementwise(task, st.relocs, bufs)
           continue
         if task.is_fill:
           total = task.layout[0]

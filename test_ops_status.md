@@ -129,6 +129,21 @@ without floating-point arithmetic. The official pair plus permanent special
 value/broadcast regression passes **3/3 in 4.93 seconds**. The complete
 hardware file is now **72/72 passing in 243.65 seconds**.
 
+Runtime-valued indexing is now fixed. `test_gather` and eight fancy-indexing
+methods pass **9/9 in 26.26 seconds**; with the permanent hardware regression
+the focused group is **10/10 in 18.69 seconds**. A typed postfix serializer
+handles nested index-tensor loads and their validity masks only after native
+classifiers reject the graph. The complete hardware file is now **73/73
+passing in 244.61 seconds**.
+
+A cache refresh also cleared historical failures for all/any, several
+sum/max/min/mean and dot/GEMM methods, one-hot, fixed-size masked select and
+nonzero, reflect/replicate pad, padding-add, nearest/bilinear interpolation,
+and integer constant powers. Do not interpret the remaining cache as a fresh
+census. Many methods now compute the correct values and fail only because
+`DEFAULT_FLOAT=HALF` gives tinygrad fp16 while their Torch/NumPy reference is
+hardcoded fp32; backend code cannot safely override that semantic policy.
+
 ## Summary
 
 | Status | Count |
@@ -253,6 +268,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave
+- runtime-valued gather and multidimensional fancy indexing
 - constant-valued movement for pad-reshape/slice, circular pad, tril, and triu
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values

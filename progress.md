@@ -5153,6 +5153,49 @@ change is needed. Mypy remains at 13 pre-existing findings and targeted Ruff
 at five pre-existing findings. The reusable patch is
 `rockchip-exact-copysign-61bd9388d.patch`, against parent `61bd9388d`.
 
+## 2026-07-29 — runtime-valued gather/fancy indexing milestone
+
+The unchanged `test_gather` plus eight multidimensional fancy-indexing
+methods now pass **9/9 in 26.26 seconds**. After narrowing the classifier and
+adding a permanent hardware gather regression, the combined group passes
+**10/10 in 18.69 seconds**. The complete Rockchip hardware file is now
+**73/73 passing in 244.61 seconds**, with the same 11 expected numerical
+warnings.
+
+The earlier indexed-movement task can evaluate loop-coordinate address
+programs, but gather addresses contain an `INDEX` that loads a runtime int32
+index tensor. A new `_HOST_ELEMENTWISE_LAYOUT` serializer records typed
+constants, ranges, nested loads, casts, validity WHEREs, and elementwise
+address arithmetic as fixed four-int postfix instructions. The runtime reads
+the original typed mapped buffers, evaluates the address expression for each
+output coordinate, treats speculative invalid loads as zero, and lets the
+serialized validity mask choose the result.
+
+The classifier is deliberately restricted to no-reduction graphs where a
+data INDEX address itself contains an INDEX load. It runs only after all
+specialized NPU/LUT/WHERE classifiers reject the graph, so ordinary
+arithmetic and interpolation remain on their existing native paths. This
+restriction is important: the general serializer correctly reproduces
+tinygrad's lowered formulas, but operation-specific PyTorch interpolation,
+pow, and fmod kernels can have different rounding semantics.
+
+No LUT change is involved. Mypy returned to the 13 pre-existing findings
+after annotating the interpreter, and targeted Ruff remains at the five
+pre-existing findings. The standalone patch is
+`rockchip-runtime-index-elementwise-bf46ebe1a.patch`, against parent
+`bf46ebe1a`.
+
+The failure-cache refresh also proved many historical entries stale without
+new code: constant/simple/tiny/full sum, basic max/min/mean, all/any, small
+GEMM/dot, one-hot, fixed-size masked-select/nonzero, reflect/replicate pad,
+padding-add, nearest/bilinear interpolation, lerp, and integer constant power
+methods all pass. Conversely, many correct-value methods remain red solely
+because `DEFAULT_FLOAT=HALF` makes tinygrad fp16 while the unchanged Torch
+side hardcodes fp32. This includes scalar add, ones/zeros/eye, arange,
+linspace, integer true division, several constant reductions, meshgrid,
+scalar stack, and fancy-index special values; changing the Rockchip backend
+cannot alter that framework-level dtype policy safely.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

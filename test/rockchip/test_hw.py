@@ -134,6 +134,12 @@ class TestDPU(unittest.TestCase):
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(np.signbit(actual), np.signbit(expected))
 
+  def test_host_runtime_gather(self):
+    data = np.arange(24, dtype=np.float16).reshape(2,3,4)
+    indices = np.array([[[2,1,0,2],[0,2,1,0]], [[1,0,2,1],[2,1,0,2]]], dtype=np.int32)
+    actual = Tensor(data, device="ROCKCHIP").gather(1, Tensor(indices, device="ROCKCHIP")).realize().numpy()
+    np.testing.assert_array_equal(actual, np.take_along_axis(data, indices, axis=1))
+
   def test_dpu_rounding(self):
     a_np = np.array([-8.75,-2,-0.5,-0.0,0,0.5,3.75,8], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()

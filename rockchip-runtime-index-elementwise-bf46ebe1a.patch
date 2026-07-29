@@ -1,0 +1,334 @@
+diff --git a/progress.md b/progress.md
+index f9235485a..1a78dcbc9 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5153,6 +5153,49 @@ change is needed. Mypy remains at 13 pre-existing findings and targeted Ruff
+ at five pre-existing findings. The reusable patch is
+ `rockchip-exact-copysign-61bd9388d.patch`, against parent `61bd9388d`.
+ 
++## 2026-07-29 — runtime-valued gather/fancy indexing milestone
++
++The unchanged `test_gather` plus eight multidimensional fancy-indexing
++methods now pass **9/9 in 26.26 seconds**. After narrowing the classifier and
++adding a permanent hardware gather regression, the combined group passes
++**10/10 in 18.69 seconds**. The complete Rockchip hardware file is now
++**73/73 passing in 244.61 seconds**, with the same 11 expected numerical
++warnings.
++
++The earlier indexed-movement task can evaluate loop-coordinate address
++programs, but gather addresses contain an `INDEX` that loads a runtime int32
++index tensor. A new `_HOST_ELEMENTWISE_LAYOUT` serializer records typed
++constants, ranges, nested loads, casts, validity WHEREs, and elementwise
++address arithmetic as fixed four-int postfix instructions. The runtime reads
++the original typed mapped buffers, evaluates the address expression for each
++output coordinate, treats speculative invalid loads as zero, and lets the
++serialized validity mask choose the result.
++
++The classifier is deliberately restricted to no-reduction graphs where a
++data INDEX address itself contains an INDEX load. It runs only after all
++specialized NPU/LUT/WHERE classifiers reject the graph, so ordinary
++arithmetic and interpolation remain on their existing native paths. This
++restriction is important: the general serializer correctly reproduces
++tinygrad's lowered formulas, but operation-specific PyTorch interpolation,
++pow, and fmod kernels can have different rounding semantics.
++
++No LUT change is involved. Mypy returned to the 13 pre-existing findings
++after annotating the interpreter, and targeted Ruff remains at the five
++pre-existing findings. The standalone patch is
++`rockchip-runtime-index-elementwise-bf46ebe1a.patch`, against parent
++`bf46ebe1a`.
++
++The failure-cache refresh also proved many historical entries stale without
++new code: constant/simple/tiny/full sum, basic max/min/mean, all/any, small
++GEMM/dot, one-hot, fixed-size masked-select/nonzero, reflect/replicate pad,
++padding-add, nearest/bilinear interpolation, lerp, and integer constant power
++methods all pass. Conversely, many correct-value methods remain red solely
++because `DEFAULT_FLOAT=HALF` makes tinygrad fp16 while the unchanged Torch
++side hardcodes fp32. This includes scalar add, ones/zeros/eye, arange,
++linspace, integer true division, several constant reductions, meshgrid,
++scalar stack, and fancy-index special values; changing the Rockchip backend
++cannot alter that framework-level dtype policy safely.
++
+ The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+ 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+ in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 7e1ab1fd2..7c7b67e98 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -134,6 +134,12 @@ class TestDPU(unittest.TestCase):
+     np.testing.assert_array_equal(actual, expected)
+     np.testing.assert_array_equal(np.signbit(actual), np.signbit(expected))
+ 
++  def test_host_runtime_gather(self):
++    data = np.arange(24, dtype=np.float16).reshape(2,3,4)
++    indices = np.array([[[2,1,0,2],[0,2,1,0]], [[1,0,2,1],[2,1,0,2]]], dtype=np.int32)
++    actual = Tensor(data, device="ROCKCHIP").gather(1, Tensor(indices, device="ROCKCHIP")).realize().numpy()
++    np.testing.assert_array_equal(actual, np.take_along_axis(data, indices, axis=1))
++
+   def test_dpu_rounding(self):
+     a_np = np.array([-8.75,-2,-0.5,-0.0,0,0.5,3.75,8], dtype=np.float16)
+     a = Tensor(a_np, device="ROCKCHIP").realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 04c7e1d7f..2287a6421 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -129,6 +129,21 @@ without floating-point arithmetic. The official pair plus permanent special
+ value/broadcast regression passes **3/3 in 4.93 seconds**. The complete
+ hardware file is now **72/72 passing in 243.65 seconds**.
+ 
++Runtime-valued indexing is now fixed. `test_gather` and eight fancy-indexing
++methods pass **9/9 in 26.26 seconds**; with the permanent hardware regression
++the focused group is **10/10 in 18.69 seconds**. A typed postfix serializer
++handles nested index-tensor loads and their validity masks only after native
++classifiers reject the graph. The complete hardware file is now **73/73
++passing in 244.61 seconds**.
++
++A cache refresh also cleared historical failures for all/any, several
++sum/max/min/mean and dot/GEMM methods, one-hot, fixed-size masked select and
++nonzero, reflect/replicate pad, padding-add, nearest/bilinear interpolation,
++and integer constant powers. Do not interpret the remaining cache as a fresh
++census. Many methods now compute the correct values and fail only because
++`DEFAULT_FLOAT=HALF` gives tinygrad fp16 while their Torch/NumPy reference is
++hardcoded fp32; backend code cannot safely override that semantic policy.
++
+ ## Summary
+ 
+ | Status | Count |
+@@ -253,6 +268,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are
+ - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
+ - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
+ - indexed movement for roll, cat/multicat, repeat, and repeat-interleave
++- runtime-valued gather and multidimensional fancy indexing
+ - constant-valued movement for pad-reshape/slice, circular pad, tril, and triu
+ - log2, including exact power-of-four normalization and near-one precision
+ - natural log and log10, including range reduction and IEEE special values
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 918afc65e..643f6e143 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -17,7 +17,8 @@ from tinygrad.runtime.support.hcq import HCQBuffer, FileIOInterface, HCQAllocato
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.runtime.support.rockchip import (build_native_program,
+   encode_rk, decode_rk, encode_rk_multi, decode_rk_multi, RKTask, RKReloc, RKSubTask,
+-  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT)
++  _CONST_SLOT, _ZERO_SLOT, _HOST_BITWISE_LAYOUT, _HOST_MOVEMENT_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT,
++  _HOST_ELEMENTWISE_LAYOUT)
+ 
+ # CMAC byte-level data transforms (no NumPy per plan §0.3 B2)
+ def _pad_a(src, dst, M, K, align_in):
+@@ -201,6 +202,106 @@ def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+     if not 0 <= sign_index < sign.size // itemsize: raise RuntimeError(f"rk: host copysign sign index out of bounds {sign_index}")
+     out_ptr[out_index] = (magnitude_ptr[magnitude_index] & ~sign_mask) | (sign_ptr[sign_index] & sign_mask)
+ 
++def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
++  import numpy as np
++  total, tag, out_dtype_code, n_ranges, *meta = task.layout
++  assert tag == _HOST_ELEMENTWISE_LAYOUT
++  extents, cursor = meta[:n_ranges], n_ranges
++  out_n = meta[cursor]
++  out_code = meta[cursor+1:cursor+1+out_n]
++  cursor += out_n+1
++  value_n = meta[cursor]
++  value_code = meta[cursor+1:cursor+1+value_n]
++  np_dtypes = (np.bool_, np.int32, np.uint32, np.int64, np.uint64, np.uint8,
++               np.float16, np.float32, np.int64, np.int16, np.uint16, np.int8, np.float64)
++  inputs:list[dict] = []
++  for reloc in relocs[1:]:
++    buf = bufs[reloc.globals_slot]
++    inputs.append({code:np.frombuffer(ctypes.string_at(buf.va_addr, buf.size), dtype=dtype)
++                   for code, dtype in enumerate(np_dtypes) if buf.size % np.dtype(dtype).itemsize == 0})
++  output = bufs[relocs[0].globals_slot]
++  out_dtype = np_dtypes[out_dtype_code]
++  result = np.zeros(output.size // np.dtype(out_dtype).itemsize, dtype=out_dtype)
++
++  def cast(value, dtype_code):
++    with np.errstate(all="ignore"):
++      return np.asarray(value, dtype=np_dtypes[dtype_code]).item()
++
++  def evaluate(code, coords):
++    stack:list = []
++    value:object
++    with np.errstate(all="ignore"):
++      for pos in range(0, len(code), 4):
++        op, dtype_code, arg0, arg1 = code[pos:pos+4]
++        if op == 0:
++          bits = (arg0 & 0xFFFFFFFF) | ((arg1 & 0xFFFFFFFF) << 32)
++          if dtype_code == 0: value = bool(bits)
++          elif dtype_code == 6: value = struct.unpack('<e', struct.pack('<H', bits & 0xFFFF))[0]
++          elif dtype_code == 7: value = struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
++          elif dtype_code == 12: value = struct.unpack('<d', struct.pack('<Q', bits))[0]
++          else:
++            width = np.dtype(np_dtypes[dtype_code]).itemsize * 8
++            if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
++            value = bits & ((1 << width)-1) if np.issubdtype(np_dtypes[dtype_code], np.unsignedinteger) else bits
++          stack.append(cast(value, dtype_code))
++          continue
++        if op == 1:
++          stack.append(cast(coords[arg0], dtype_code))
++          continue
++        if op == 2:
++          index = int(stack.pop())
++          source = inputs[arg0][dtype_code]
++          stack.append(source[index].item() if 0 <= index < source.size else cast(0, dtype_code))
++          continue
++        args = stack[-arg0:] if arg0 else []
++        if arg0: del stack[-arg0:]
++        if op == 3: value = args[0] + args[1]
++        elif op == 4: value = args[0] * args[1]
++        elif op == 5: value = np.divide(args[0], args[1])
++        elif op == 6: value = np.divide(1.0, args[0])
++        elif op == 7: value = np.maximum(args[0], args[1])
++        elif op == 8: value = args[0] < args[1]
++        elif op == 9: value = args[0] != args[1]
++        elif op == 10: value = args[1] if args[0] else args[2]
++        elif op == 11: value = args[0] & args[1]
++        elif op == 12: value = args[0] | args[1]
++        elif op == 13: value = args[0] ^ args[1]
++        elif op == 14: value = args[0]
++        elif op == 15: value = np.trunc(args[0])
++        elif op == 16: value = np.sqrt(args[0])
++        elif op == 17: value = np.exp2(args[0])
++        elif op == 18: value = np.log2(args[0])
++        elif op == 19: value = np.sin(args[0])
++        elif op == 20:
++          quotient = abs(int(args[0])) // abs(int(args[1]))
++          quotient = -quotient if (int(args[0]) < 0) != (int(args[1]) < 0) else quotient
++          value = int(args[0]) - quotient*int(args[1])
++        elif op == 21:
++          value = abs(int(args[0])) // abs(int(args[1]))
++          if (int(args[0]) < 0) != (int(args[1]) < 0): value = -value
++        elif op == 22: value = int(args[0]) // int(args[1])
++        elif op == 23: value = int(args[0]) % int(args[1])
++        elif op == 24: value = args[0] - args[1]
++        elif op == 25: value = np.power(args[0], args[1])
++        elif op == 26: value = -args[0]
++        elif op == 27: value = args[0] == args[1]
++        elif op == 28: value = int(args[0]) << int(args[1])
++        elif op == 29: value = int(args[0]) >> int(args[1])
++        elif op == 30: value = args[0]*args[1] + args[2]
++        else: raise RuntimeError(f"rk: invalid host elementwise opcode {op}")
++        stack.append(cast(value, dtype_code))
++    assert len(stack) == 1
++    return stack[0]
++
++  for linear in range(total):
++    rem, coords = linear, [0] * n_ranges
++    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
++    out_index = int(evaluate(out_code, coords))
++    if not 0 <= out_index < result.size: raise RuntimeError(f"rk: host elementwise output index out of bounds {out_index}")
++    result[out_index] = evaluate(value_code, coords)
++  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++
+ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute a compact postfix integer-index program and copy exact element bytes."""
+   total, tag, itemsize, n_ranges, *meta = task.layout
+@@ -511,6 +612,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
+           _run_host_copysign(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++          _run_host_elementwise(task, st.relocs, bufs)
++          continue
+         if task.is_fill:
+           total = task.layout[0]
+           out_slot = st.relocs[0].globals_slot
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b4264b28b..441358cf1 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -170,6 +170,16 @@ _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-b
+ _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
+ _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
+ _HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
++_HOST_ELEMENTWISE_LAYOUT = -1004  # is_copy task layout tag for serialized fused elementwise graphs
++
++def _host_dtype_code(dtype:DType) -> int|None:
++  """Stable dtype ids shared by serialized exact host tasks."""
++  table = {dtypes.bool:0, dtypes.int:1, dtypes.uint:2, dtypes.long:3, dtypes.ulong:4,
++           dtypes.uchar:5, dtypes.half:6, dtypes.float:7, dtypes.weakint:8,
++           dtypes.short:9, dtypes.ushort:10, dtypes.char:11, dtypes.double:12, dtypes.weakfloat:12}
++  return table.get(dtype)
++
++def _signed_i32(value:int) -> int: return value if value < 1 << 31 else value-(1 << 32)
+ 
+ def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
+   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
+@@ -6099,6 +6109,68 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
++def _try_elementwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  output, val = store.src
++  out_dtype = _host_dtype_code(output.dtype)
++  if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
++  # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
++  # gather/fancy-index kernels whose data INDEX address loads an index tensor.
++  if not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
++  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
++  range_ids = {u:i for i,u in enumerate(ranges)}
++  extents = tuple(int(u.src[0].arg) for u in ranges)
++  total = prod(extents)
++  if total != prod(_shape_of_store(sink)): return None
++  input_slots:list[int] = []
++  op_codes = {Ops.ADD:3, Ops.MUL:4, Ops.FDIV:5, Ops.RECIPROCAL:6, Ops.MAX:7,
++              Ops.CMPLT:8, Ops.CMPNE:9, Ops.WHERE:10, Ops.AND:11, Ops.OR:12,
++              Ops.XOR:13, Ops.CAST:14, Ops.TRUNC:15, Ops.SQRT:16, Ops.EXP2:17,
++              Ops.LOG2:18, Ops.SIN:19, Ops.CMOD:20, Ops.CDIV:21, Ops.FLOORDIV:22,
++              Ops.FLOORMOD:23, Ops.SUB:24, Ops.POW:25, Ops.NEG:26, Ops.CMPEQ:27,
++              Ops.SHL:28, Ops.SHR:29, Ops.MULACC:30}
++
++  def input_id(slot:int) -> int:
++    if slot not in input_slots: input_slots.append(slot)
++    return input_slots.index(slot)
++
++  def emit(u:UOp, code:list[int]) -> bool:
++    dtype_code = _host_dtype_code(u.dtype)
++    if dtype_code is None: return False
++    if u.op is Ops.CONST:
++      if u.arg is Invalid: bits = 0
++      elif dtype_code == 0: bits = int(bool(u.arg))
++      elif dtype_code == 6: bits = struct.unpack('<H', struct.pack('<e', float(u.arg)))[0]
++      elif dtype_code == 7: bits = struct.unpack('<I', struct.pack('<f', float(u.arg)))[0]
++      elif dtype_code == 12: bits = struct.unpack('<Q', struct.pack('<d', float(u.arg)))[0]
++      else: bits = int(u.arg) & 0xFFFFFFFFFFFFFFFF
++      code.extend((0, dtype_code, _signed_i32(bits & 0xFFFFFFFF), _signed_i32((bits >> 32) & 0xFFFFFFFF)))
++      return True
++    if u.op is Ops.RANGE and u in range_ids:
++      code.extend((1, dtype_code, range_ids[u], 0))
++      return True
++    if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM:
++      if not emit(u.src[1], code): return False
++      code.extend((2, dtype_code, input_id(u.src[0].buf_uop.arg.slot), 0))
++      return True
++    if u.op not in op_codes: return False
++    if not all(emit(x, code) for x in u.src): return False
++    code.extend((op_codes[u.op], dtype_code, len(u.src), 0))
++    return True
++
++  out_code:list[int] = []
++  value_code:list[int] = []
++  if not emit(output.src[1], out_code) or not emit(val, value_code): return None
++  out_slot = ProgramInfo.from_sink(sink).outs[0]
++  layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
++            len(out_code), *out_code, len(value_code), *value_code)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
++  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
++  return (RKSubTask(cmds, task, relocs),)
++
+ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
+   store = _store_node(sink)
+@@ -6530,6 +6602,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+     plan = plan_rk(sink)
+   if isinstance(plan, str):
+     if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
++    if (host_tasks := _try_elementwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, host_tasks)
+     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
+     raise RuntimeError(plan)  # reject — preserve reason, no fallback
+   cmds, task, relocs = emit_rk(plan)

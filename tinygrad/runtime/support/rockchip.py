@@ -170,6 +170,16 @@ _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-b
 _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
 _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
 _HOST_COPYSIGN_LAYOUT = -1003  # is_copy task layout tag for exact broadcast fp16/fp32 copysign
+_HOST_ELEMENTWISE_LAYOUT = -1004  # is_copy task layout tag for serialized fused elementwise graphs
+
+def _host_dtype_code(dtype:DType) -> int|None:
+  """Stable dtype ids shared by serialized exact host tasks."""
+  table = {dtypes.bool:0, dtypes.int:1, dtypes.uint:2, dtypes.long:3, dtypes.ulong:4,
+           dtypes.uchar:5, dtypes.half:6, dtypes.float:7, dtypes.weakint:8,
+           dtypes.short:9, dtypes.ushort:10, dtypes.char:11, dtypes.double:12, dtypes.weakfloat:12}
+  return table.get(dtype)
+
+def _signed_i32(value:int) -> int: return value if value < 1 << 31 else value-(1 << 32)
 
 def _try_scalar(val: UOp) -> tuple[int, float, bool]|None:
   """ADD/MUL/MAX/FDIV(INDEX, CONST(c)) → (index_slot, const_val, swap) for DPU scalar op, or None.
@@ -6099,6 +6109,68 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_elementwise_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  output, val = store.src
+  out_dtype = _host_dtype_code(output.dtype)
+  if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
+  # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
+  # gather/fancy-index kernels whose data INDEX address loads an index tensor.
+  if not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
+  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+  range_ids = {u:i for i,u in enumerate(ranges)}
+  extents = tuple(int(u.src[0].arg) for u in ranges)
+  total = prod(extents)
+  if total != prod(_shape_of_store(sink)): return None
+  input_slots:list[int] = []
+  op_codes = {Ops.ADD:3, Ops.MUL:4, Ops.FDIV:5, Ops.RECIPROCAL:6, Ops.MAX:7,
+              Ops.CMPLT:8, Ops.CMPNE:9, Ops.WHERE:10, Ops.AND:11, Ops.OR:12,
+              Ops.XOR:13, Ops.CAST:14, Ops.TRUNC:15, Ops.SQRT:16, Ops.EXP2:17,
+              Ops.LOG2:18, Ops.SIN:19, Ops.CMOD:20, Ops.CDIV:21, Ops.FLOORDIV:22,
+              Ops.FLOORMOD:23, Ops.SUB:24, Ops.POW:25, Ops.NEG:26, Ops.CMPEQ:27,
+              Ops.SHL:28, Ops.SHR:29, Ops.MULACC:30}
+
+  def input_id(slot:int) -> int:
+    if slot not in input_slots: input_slots.append(slot)
+    return input_slots.index(slot)
+
+  def emit(u:UOp, code:list[int]) -> bool:
+    dtype_code = _host_dtype_code(u.dtype)
+    if dtype_code is None: return False
+    if u.op is Ops.CONST:
+      if u.arg is Invalid: bits = 0
+      elif dtype_code == 0: bits = int(bool(u.arg))
+      elif dtype_code == 6: bits = struct.unpack('<H', struct.pack('<e', float(u.arg)))[0]
+      elif dtype_code == 7: bits = struct.unpack('<I', struct.pack('<f', float(u.arg)))[0]
+      elif dtype_code == 12: bits = struct.unpack('<Q', struct.pack('<d', float(u.arg)))[0]
+      else: bits = int(u.arg) & 0xFFFFFFFFFFFFFFFF
+      code.extend((0, dtype_code, _signed_i32(bits & 0xFFFFFFFF), _signed_i32((bits >> 32) & 0xFFFFFFFF)))
+      return True
+    if u.op is Ops.RANGE and u in range_ids:
+      code.extend((1, dtype_code, range_ids[u], 0))
+      return True
+    if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM:
+      if not emit(u.src[1], code): return False
+      code.extend((2, dtype_code, input_id(u.src[0].buf_uop.arg.slot), 0))
+      return True
+    if u.op not in op_codes: return False
+    if not all(emit(x, code) for x in u.src): return False
+    code.extend((op_codes[u.op], dtype_code, len(u.src), 0))
+    return True
+
+  out_code:list[int] = []
+  value_code:list[int] = []
+  if not emit(output.src[1], out_code) or not emit(val, value_code): return None
+  out_slot = ProgramInfo.from_sink(sink).outs[0]
+  layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
+            len(out_code), *out_code, len(value_code), *value_code)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
+  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
+
 def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower pure INDEX/WHERE movement to a compact host-side integer index program."""
   store = _store_node(sink)
@@ -6530,6 +6602,7 @@ def build_native_program(sink: UOp) -> UOp|None:
     plan = plan_rk(sink)
   if isinstance(plan, str):
     if (where_tasks := _try_where_subtasks(sink)) is not None: return build_native_program_multi(sink, where_tasks)
+    if (host_tasks := _try_elementwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, host_tasks)
     if (elementwise_tasks := _try_elementwise_subtasks(sink)) is not None: return build_native_program_multi(sink, elementwise_tasks)
     raise RuntimeError(plan)  # reject — preserve reason, no fallback
   cmds, task, relocs = emit_rk(plan)
