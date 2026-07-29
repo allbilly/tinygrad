@@ -1,0 +1,359 @@
+From a58c8670c8e07cd4fba9ea5e1bd8c3aeab534d5d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 07:04:36 +0800
+Subject: [PATCH] rockchip: lower scalar runtime tensor pow
+
+---
+ progress.md                          |  90 +++++++++++++--
+ test_ops_status.md                   |  28 ++++-
+ tinygrad/runtime/support/rockchip.py | 162 +++++++++++++++++++++++++++
+ 3 files changed, 265 insertions(+), 15 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index f6ef4dd25..37594e6d2 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7237,15 +7237,17 @@ Using `. .venv/bin/activate`, disabled caches,
+   **passing in 70.22 seconds**, with expected infinity-cast warnings
+   subsequently silenced at the ABI boundary.
+ 
+-### External RK3588 accumulation evidence
++### External RK3588 fp16 quantization evidence
+ 
+ [RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+-reports fp16 matmul accumulation drifting as K grows: `0.1*1` summed over 128
+-terms gives 12.80, over 256 gives 25.59 instead of 25.60, and over 4096 gives
+-409.50 instead of 409.60.  It supplies no register workaround, but it supports
+-our CumProd/large-reduction diagnosis: long fp16 accumulation needs bounded
+-chunks, compensation, or a higher-precision accumulator.  It does not explain
+-elementwise MUL, LUT interpolation, or the TopK layout issues above.
++initially describes matmul accumulation drift, but the reporter closed it
++after identifying ordinary fp32-to-fp16 input quantization.  FP16 stores
++`0.1` as `0.0999755859375`; multiplying that exact value by 256 and 4096
++gives `25.59375` and `409.5`, exactly the reported results.  The issue is
++therefore useful as a diagnostic warning to separate input quantization,
++accumulator precision, and final output conversion.  It is **not** evidence
++of an RK3588 accumulation defect and supplies no register or LUT workaround
++for CumProd, reductions, or TopK.
+ 
+ ## 2026-07-30 — complete Sort subcase verification
+ 
+@@ -7322,10 +7324,11 @@ errors.  Ruff is not installed in `.venv`.
+ 
+ Next loss work is therefore split cleanly: tune or add a second NPU LUT task
+ for unreduced BCE accuracy, then lower the `pos_weight` broadcast.  The
+-accumulation drift reported in
++numbers in
+ [RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+-supports caution around long fp16 CMAC/reduction chains, but it does not
+-explain the unreduced elementwise LUT error or the broadcast rejection.
++are fully explained by fp16 input quantization; they do not establish CMAC
++drift and do not explain the unreduced elementwise LUT error or broadcast
++rejection.
+ 
+ ## 2026-07-30 — BCE-with-logits vector positive weights
+ 
+@@ -7448,8 +7451,8 @@ No BCE arithmetic uses `run_host`.  A repository-wide search found no
+ general accelerator-backend convention for evaluating an unsupported
+ operator on CPU; Rockchip host helpers remain limited to static layout,
+ representation selection, and dtype/ABI conversion.  RKNN Toolkit2 issue
+-[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) remains useful
+-evidence for long fp16 accumulation drift, but it does not supply a LUT or
++[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) demonstrates
++fp16 input quantization, not accumulation drift, and does not supply a LUT or
+ elementwise workaround for this group.
+ 
+ ### Validation
+@@ -7466,3 +7469,66 @@ Using `. .venv/bin/activate`,
+ - Python compilation and `git diff --check`: **passing**;
+ - mypy: exact pre-existing **13-error** Rockchip baseline;
+ - ruff and pytest-xdist remain unavailable in `.venv`.
++
++## 2026-07-30 — scalar runtime tensor POW zero-base milestone
++
++The unchanged `TestOps.test_pow_zero_tensor` now passes all scalar fp32
++runtime-tensor cases: `0**0`, `0**0.3`, and `0**-0.3`.  The original graph
++was a nested WHERE around one LOG2/EXP2 magnitude path plus integer parity
++checks and rejected as `unsupported_op:Ops.WHERE`.
++
++The new strict matcher accepts only a one-element fp32 output with distinct
++runtime fp32 base and exponent buffers.  Host work is limited to the existing
++fp32↔fp16 ABI conversions.  DPU tasks compute absolute values, zero/sign
++masks, exponent multiplication, parity, signed selection, and invalid-domain
++NaN generation.  The proven LOG2, EXP2, and round-to-nearest-even LUT tasks
++remain NPU work.
++
++LOG2 receives `abs(base)+base_zero`, so it never evaluates the unusable zero
++entry.  The final NPU masks restore:
++
++```text
++0**positive = 0
++0**0        = 1
++0**negative = +inf
++```
++
++The visibility helper duplicates DPU writes because long mixed sequences
++need explicit scratch materialization.  Initially both copies of the final
++stage carried `fp32_output`; runtime conversion therefore selected the
++scratch slot and left the logical output half-written.  Typed output metadata
++now applies only to the logical second write.  This changed the first failure
++from a garbage fp32 value to correct `0**0`, after which the explicit
++zero-base masks fixed the remaining positive and negative exponent cases.
++
++The matcher was deliberately narrowed after a broad probe captured
++`test_pow_full`: its 2,925 fp16 lanes executed but 175 missed tolerance.
++General fp16 tensor POW remains a separate LUT-accuracy group.
++`TestOps.test_pow` also retains its pre-existing final fp16/fp32 dtype
++mismatch.  Neither failure is claimed by this milestone.
++
++Useful debug sequence:
++
++1. use `ROCKCHIP_DEBUG_SINK=1` to confirm one EXP2, one LOG2, one FLOORMOD,
++   and two distinct runtime INDEX buffers;
++2. use `ROCKCHIP_DEBUG_SUBTASKS=1` and verify only the final logical output
++   slot carries `fp32_output=True`;
++3. run `0**0`, `0**positive`, and `0**negative` separately before testing
++   arbitrary bases;
++4. if a large fp32 garbage value appears, inspect typed output-slot selection
++   before changing LUT knots;
++5. if only zero-base nonzero exponents fail, verify safe LOG2 input and the
++   final zero-base masks.
++
++Backups were written under `/tmp/rockchip-tensor-pow-20260730-*` before each
++substantive edit.  No LUT coefficients changed, so `lut.md` needs no new
++tuning table for this milestone.
++
++Validation with `. .venv/bin/activate`,
++`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
++
++- unchanged `TestOps.test_pow_zero_tensor`: **1 passed in 25.80 seconds**;
++- `test/rockchip/test_pr1.py`: **79/79 in 6.51 seconds**;
++- Python compilation and `git diff --check`: **passing**;
++- mypy: exact pre-existing **13-error** Rockchip baseline;
++- ruff and pytest-xdist remain unavailable in `.venv`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 74c4d4903..8a92d19e5 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1189,9 +1189,10 @@ forward-only:
+ - permanent five-lane half/integer padding regression in both directions:
+   **passing in 70.22 seconds**.
+ 
+-The linked RKNN Toolkit2 fp16 multiplication issue #471 is useful supporting
+-evidence for the separate cumulative/large-reduction precision group, not a
+-TopK or LUT workaround; exact observations and the URL are in `progress.md`.
++The linked RKNN Toolkit2 fp16 multiplication issue #471 is not evidence of
++accumulator drift: its values exactly follow fp16 quantization of `0.1`, and
++the reporter closed it for that reason.  It remains a useful warning to
++separate input quantization from accumulation and final conversion.
+ 
+ ### Complete Sort subcase verification
+ 
+@@ -1274,3 +1275,24 @@ Python compilation and whitespace checks pass.  Mypy remains at the exact
+ installed in `.venv`.  Detailed knot values, interpolation modeling, timeout
+ isolation, backups, and debug commands are recorded in `progress.md` and
+ `lut.md`.
++
++### Scalar runtime tensor POW zero-base milestone
++
++| Coverage | Result |
++|---|---:|
++| `0**0` with runtime fp32 tensors | **passing** |
++| `0**0.3` | **passing** |
++| `0**-0.3` | **passing** |
++| unchanged `test_pow_zero_tensor` | **1 passed in 25.80s** |
++| hardware-free PR1 contract | **79/79 in 6.51s** |
++
++A strict scalar-fp32 matcher now lowers the nested POW WHERE graph into DPU
++mask/arithmetic stages plus the established LOG2, EXP2, and roundoff LUTs.
++Host work is only fp32/fp16 ABI conversion.  LOG2 sees a safe nonzero value,
++and final NPU masks restore zero-base positive, zero, and negative-exponent
++semantics.  Typed output conversion is attached only to the logical output,
++not the duplicated visibility scratch.
++
++General fp16 `test_pow_full` remains a separate accuracy failure, and
++`TestOps.test_pow` retains its pre-existing final dtype mismatch.  Detailed
++failure counts, matcher boundaries, and debugging steps are in `progress.md`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index d00a1b7ca..61530060e 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -5649,6 +5649,166 @@ def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   dependent(out, (nan_numerator,0), (nan_denom,0), Ops.FDIV)
+   return tuple(tasks)
+ 
++def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate runtime tensor base/exponent POW with native magnitude and parity."""
++  store = _store_node(sink)
++  if store is None: return None
++  value = _unwrap(store.src[1])
++  nodes = value.toposort()
++  if value.op is not Ops.WHERE or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
++     sum(u.op is Ops.LOG2 for u in nodes) != 1 or sum(u.op is Ops.FLOORMOD for u in nodes) != 1: return None
++  exponential = next(u for u in nodes if u.op is Ops.EXP2)
++  scaled_log = _unwrap(exponential.src[0])
++  if scaled_log.op is not Ops.MUL or len(scaled_log.src) != 2: return None
++  logarithm = next((_unwrap(u) for u in scaled_log.src if _unwrap(u).op is Ops.LOG2), None)
++  exponent = next((_unwrap(u) for u in scaled_log.src if _unwrap(u).op is Ops.INDEX), None)
++  if logarithm is None or exponent is None: return None
++  absolute = _unwrap(logarithm.src[0])
++  if absolute.op is not Ops.WHERE: return None
++  base = next((_unwrap(u) for u in absolute.toposort() if _unwrap(u).op is Ops.INDEX and _unwrap(u) is not exponent), None)
++  if base is None or base.dtype is not dtypes.float or exponent.dtype is not dtypes.float: return None
++  if len({base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot}) != 2: return None
++
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  if total != 1 or store.src[0].src[0].dtype is not dtypes.float: return None
++  if any(int(u.src[0].src[0].arg) != total for u in (base, exponent)): return None
++  out, next_slot = info.outs[0], max(info.globals, default=-1)+1
++  base_slot, exponent_slot = base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot
++  tasks:list[RKSubTask] = []
++
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++
++  def scalar(number:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
++
++  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, **kwargs) -> None:
++    # The first write is an fp16 visibility scratch. Typed output conversion
++    # belongs only to the logical destination on the second write.
++    scratch_kwargs = {key:value for key, value in kwargs.items() if not key.endswith("_output")}
++    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op, **scratch_kwargs))
++    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op, **kwargs))
++
++  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
++    diff, mask = alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
++                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
++    return mask, 0
++
++  def temp_index(slot:int) -> UOp:
++    out_index = store.src[0]
++    return out_index.replace(dtype=dtypes.half,
++      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
++
++  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
++    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
++
++  def extend(stage_tasks:tuple[RKSubTask, ...]|None) -> bool:
++    nonlocal next_slot
++    if stage_tasks is None: return False
++    tasks.extend(stage_tasks)
++    used_slots = [task.task.out_slot for task in stage_tasks] + \
++      [reloc.globals_slot for task in stage_tasks for reloc in task.relocs
++       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++    next_slot = max(next_slot, max(used_slots, default=-1)+1)
++    return True
++
++  zero, one = (_ZERO_SLOT,0), scalar(1.0)
++  base_half = alloc() if base.dtype is dtypes.float else base_slot
++  exponent_half = alloc() if exponent.dtype is dtypes.float else exponent_slot
++  if base.dtype is dtypes.float:
++    tasks.append(_emit_where_stage(total, base_half, (base_slot,0), zero, Ops.ADD, fp32_inputs=(base_slot,)))
++  if exponent.dtype is dtypes.float:
++    tasks.append(_emit_where_stage(total, exponent_half, (exponent_slot,0), zero, Ops.ADD, fp32_inputs=(exponent_slot,)))
++
++  negative_base, absolute_base, negative_exponent, absolute_exponent = (alloc() for _ in range(4))
++  dependent(negative_base, zero, (base_half,0), Ops.SUB)
++  dependent(absolute_base, (base_half,0), (negative_base,0), Ops.MAX)
++  dependent(negative_exponent, zero, (exponent_half,0), Ops.SUB)
++  dependent(absolute_exponent, (exponent_half,0), (negative_exponent,0), Ops.MAX)
++  base_nonzero = positive_mask((absolute_base,0), zero)
++  exponent_nonzero = positive_mask((absolute_exponent,0), zero)
++  base_zero, exponent_zero, both_zero, safe_base = (alloc() for _ in range(4))
++  dependent(base_zero, one, base_nonzero, Ops.SUB)
++  dependent(exponent_zero, one, exponent_nonzero, Ops.SUB)
++  dependent(both_zero, (base_zero,0), (exponent_zero,0), Ops.MUL)
++  # LOG2 never sees zero. The final selection restores all zero-base rules:
++  # 0**positive=0, 0**0=1, and 0**negative=+inf.
++  dependent(safe_base, (absolute_base,0), (base_zero,0), Ops.ADD)
++
++  log_slot = alloc()
++  staged_log = UOp(Ops.LOG2, dtypes.half, (temp_index(safe_base),))
++  if not extend(_try_log2_special_subtasks(stage_sink(staged_log, log_slot))): return None
++  scaled_log_slot = alloc()
++  dependent(scaled_log_slot, (log_slot,0), (exponent_half,0), Ops.MUL)
++  magnitude = alloc()
++  staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(scaled_log_slot),))
++  if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude))): return None
++
++  def trunc_half(input_slot:int) -> int|None:
++    negative, absolute_value, rounded = alloc(), alloc(), alloc()
++    dependent(negative, zero, (input_slot,0), Ops.SUB)
++    dependent(absolute_value, (input_slot,0), (negative,0), Ops.MAX)
++    roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(absolute_value),), arg="rk_roundoff")
++    round_plan = plan_rk(stage_sink(roundoff, rounded))
++    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut": return None
++    cmds, task, relocs = emit_rk(round_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
++    dependent(overshoot_diff, (rounded,0), (absolute_value,0), Ops.SUB)
++    tasks.append(_emit_where_stage(total, overshoot, (overshoot_diff,0), (overshoot_diff,0), Ops.MAX, compare=True))
++    dependent(truncated_abs, (rounded,0), (overshoot,0), Ops.SUB)
++    positive = positive_mask((input_slot,0), zero)
++    negative_mask = positive_mask(zero, (input_slot,0))
++    sign, result = alloc(), alloc()
++    dependent(sign, positive, negative_mask, Ops.SUB)
++    dependent(result, (truncated_abs,0), (sign,0), Ops.MUL)
++    return result
++
++  truncated = trunc_half(exponent_half)
++  if truncated is None: return None
++  half = alloc()
++  dependent(half, (truncated,0), scalar(0.5), Ops.MUL)
++  half_truncated = trunc_half(half)
++  if half_truncated is None: return None
++  doubled, remainder, negative_remainder, odd = (alloc() for _ in range(4))
++  dependent(doubled, (half_truncated,0), scalar(2.0), Ops.MUL)
++  dependent(remainder, (truncated,0), (doubled,0), Ops.SUB)
++  dependent(negative_remainder, zero, (remainder,0), Ops.SUB)
++  dependent(odd, (remainder,0), (negative_remainder,0), Ops.MAX)
++  twice_odd, parity_sign = alloc(), alloc()
++  dependent(twice_odd, (odd,0), scalar(2.0), Ops.MUL)
++  dependent(parity_sign, one, (twice_odd,0), Ops.SUB)
++
++  exponent_above_trunc = positive_mask((exponent_half,0), (truncated,0))
++  trunc_above_exponent = positive_mask((truncated,0), (exponent_half,0))
++  noninteger, negative_mask, invalid = alloc(), positive_mask(zero, (base_half,0))[0], alloc()
++  dependent(noninteger, exponent_above_trunc, trunc_above_exponent, Ops.ADD)
++  dependent(invalid, (negative_mask,0), (noninteger,0), Ops.MUL)
++  sign_delta, selected_delta, effective_sign, signed = (alloc() for _ in range(4))
++  dependent(sign_delta, (parity_sign,0), one, Ops.SUB)
++  dependent(selected_delta, (negative_mask,0), (sign_delta,0), Ops.MUL)
++  dependent(effective_sign, one, (selected_delta,0), Ops.ADD)
++  dependent(signed, (magnitude,0), (effective_sign,0), Ops.MUL)
++  exponent_negative = positive_mask(zero, (exponent_half,0))
++  normal_result, zero_result, selected_result = (alloc() for _ in range(3))
++  dependent(normal_result, (signed,0), base_nonzero, Ops.MUL)
++  dependent(zero_result, (exponent_zero,0), (base_zero,0), Ops.MUL)
++  dependent(selected_result, (normal_result,0), (zero_result,0), Ops.ADD)
++  zero_negative, zero_numerator, zero_denom, zero_selected = (alloc() for _ in range(4))
++  dependent(zero_negative, (base_zero,0), exponent_negative, Ops.MUL)
++  dependent(zero_numerator, (selected_result,0), (zero_negative,0), Ops.ADD)
++  dependent(zero_denom, one, (zero_negative,0), Ops.SUB)
++  dependent(zero_selected, (zero_numerator,0), (zero_denom,0), Ops.FDIV)
++  valid_denom, valid_factor = alloc(), alloc()
++  dependent(valid_denom, one, (invalid,0), Ops.SUB)
++  dependent(valid_factor, (valid_denom,0), (valid_denom,0), Ops.FDIV)
++  dependent(out, (zero_selected,0), (valid_factor,0), Ops.MUL,
++            fp32_output=store.src[0].src[0].dtype is dtypes.float)
++  return tuple(tasks)
++
+ def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower fractional x**c through staged abs, LOG2, scale, and EXP2.
+ 
+@@ -11083,6 +11243,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, pow_neg_base55_tasks)
+   if (zero_base_pow_tasks := _try_zero_base_pow_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, zero_base_pow_tasks)
++  if (tensor_pow_tasks := _try_tensor_pow_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, tensor_pow_tasks)
+   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fractional_pow_tasks)
+   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
+-- 
+2.34.1
+
