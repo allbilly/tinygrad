@@ -5427,3 +5427,45 @@ Ruff module, so the installed `ruff` executable was used after activating it.
 `git diff --check` is clean. No LUT participates in this milestone, so
 `lut.md` does not change. The standalone patch is
 `rockchip-cmac-n-shared-51a962599.patch`, against parent `51a962599`.
+
+## 2026-07-29 — two-stage multifactor einsum milestone
+
+The complete unchanged forward-only `TestOps.test_einsum` method now passes
+on the real Rockchip backend in **21.84 seconds**. The refreshed
+einsum/dot/matmul selection is consequently **13/14 methods passing**; only
+the large-K ellipsis method remains.
+
+Tinygrad lowers `ik,jkl,il->ij` into one ADD reduction over
+`(a*b)*c`. A first attempt gathered `a` and `b`, multiplied them with DPU,
+then performed one CMAC reduction. It executed correctly but differed from
+Torch in 4/10 fp16 outputs because it placed the rounding boundary after an
+elementwise product instead of after a contraction.
+
+A scalar reference using the exact seeded test inputs proved Torch's order:
+
+```text
+tmp[i,j,l] = fp16(sum_k(fp32(a[i,k]) * fp32(b[j,k,l])))
+out[i,j]   = fp16(sum_l(fp32(tmp[i,j,l]) * fp32(c[i,l])))
+```
+
+The final lowering identifies the reduction axes common to the associated
+first factor pair, converts the uncontracted reduction axes into temporary
+output LOOP axes, and emits two materialized CMAC tasks. The first produces
+the fp16 intermediate; the second consumes it and writes the original output.
+All gathers remain movement only and all multiplication/accumulation stays on
+CNA/CORE.
+
+The permanent hardware test checks the full seeded result bit-for-bit. A
+hardware-free pipeline test also asserts that the UOp becomes exactly two
+CMAC stages. Validation:
+
+- new hardware regression plus unchanged official method: **2/2 in 22.12
+  seconds**;
+- CMAC hardware class: **20/20 in 7.52 seconds**;
+- PR1 contract/pipeline file: **75/75 in 6.16 seconds**;
+- mypy: the same 13 pre-existing findings;
+- targeted Ruff: the same five pre-existing findings;
+- `git diff --check`: clean.
+
+No LUT is used. The standalone patch is
+`rockchip-cmac-multifactor-f09be028b.patch`, against parent `f09be028b`.

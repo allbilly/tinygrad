@@ -367,3 +367,21 @@ weight CBUF; otherwise the lower-submit-count block-diagonal layout remains.
 That gating keeps the non-giant convolution selection clean at **42 passed,
 3 skipped, 37 passing subtests**. Current permanent checks are **19/19 CMAC
 hardware**, **78/78 complete hardware**, and **74/74 PR1 contract**.
+
+### Multifactor einsum refresh
+
+`test_einsum` is fixed and the refreshed group is now **13/14 methods
+passing**. Its three-factor `ik,jkl,il->ij` case is emitted as two CMAC
+contractions, matching Torch's fp16 intermediate boundary:
+
+1. contract `a*b` over `k` into `tmp[i,j,l]`;
+2. contract `tmp*c` over `l` into `out[i,j]`.
+
+This is not equivalent to a DPU elementwise `a*b` followed by one large CMAC;
+that attempted split differed in 4/10 seeded fp16 values. Permanent totals
+for this milestone are **20/20 CMAC hardware** and **75/75 PR1**.
+
+The sole remaining refreshed failure is `test_einsum_ellipsis`, whose final
+case has a per-output `K=13,824` dot and still rejects with
+`cmac_exceeds_cbuf`. It needs K segmentation without introducing fp16 partial
+sum rounding.

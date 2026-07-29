@@ -500,6 +500,18 @@ class TestCMAC(unittest.TestCase):
     expected = np.matmul(a_np.astype(np.float32), b_np.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(c.numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_cmac_multifactor_einsum(self):
+    # PyTorch contracts a*b over k, rounds the intermediate to fp16, then
+    # contracts with c over l. Two CMAC stages preserve that boundary.
+    np.random.seed(0)
+    a_np, b_np, c_np = (np.random.uniform(-2, 2, size=s).astype(np.float16)
+                         for s in ((2, 3), (5, 3, 7), (2, 7)))
+    a, b, c = (Tensor(v, device="ROCKCHIP").realize() for v in (a_np, b_np, c_np))
+    actual = Tensor.einsum("ik,jkl,il->ij", a, b, c).realize().numpy()
+    intermediate = np.einsum("ik,jkl->ijl", a_np.astype(np.float32), b_np.astype(np.float32)).astype(np.float16)
+    expected = np.einsum("ijl,il->ij", intermediate.astype(np.float32), c_np.astype(np.float32)).astype(np.float16)
+    np.testing.assert_array_equal(actual, expected)
+
   def test_cmac_gemv_vector_a(self):
     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
     a_np = np.array([1,2,3,4], dtype=np.float16)

@@ -7,7 +7,7 @@ import struct, math, numpy as np
 from dataclasses import dataclass, replace
 from tinygrad.dtype import dtypes, DType, Invalid
 from tinygrad.helpers import ceildiv, round_up, prod, getenv
-from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
+from tinygrad.uop.ops import Ops, UOp, AxisType, ProgramInfo, PatternMatcher, graph_rewrite
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.upat import UPat
 
@@ -6752,6 +6752,71 @@ def _try_cat_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(tuple(c.pack() for c in cmds), task, relocs))
   return tuple(tasks)
 
+def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Split a three-factor einsum into PyTorch-ordered fp16 CMAC contractions."""
+  reduce = _reduce_node(sink)
+  if reduce is None or reduce.arg[0] is not Ops.ADD: return None
+  body = _reduce_body(reduce)
+  if body.op is not Ops.MUL or len(body.src) != 2: return None
+  first, last = _unwrap(body.src[0]), _unwrap(body.src[1])
+  if first.op is not Ops.MUL or len(first.src) != 2 or _unwrap(last).op is not Ops.INDEX: return None
+  factors = tuple(_unwrap(x) for x in first.src)
+  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half for x in (*factors, last)): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  if not loops or not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  factor_nodes = tuple(set(x.toposort()) for x in factors)
+  contracted = [u for u in reductions if u in factor_nodes[0] and u in factor_nodes[1]]
+  remaining = [u for u in reductions if u not in contracted]
+  if not contracted or not remaining or any(u in set(last.toposort()) for u in contracted): return None
+  carry_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in remaining]
+  stage_axes = [*loops, *carry_loops]
+  stage_extents = [int(u.src[0].arg) for u in stage_axes]
+  stage_total = prod(stage_extents)
+
+  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
+    flat = axes[0]
+    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
+    return flat
+
+  info = ProgramInfo.from_sink(sink)
+  intermediate_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+
+  # PyTorch contracts the associated first pair over their common reduction
+  # axes, casts that intermediate to fp16, then performs the remaining dot.
+  carry_map = dict(zip(remaining, carry_loops))
+  stage_product = first.substitute(carry_map)
+  stage_acc = UOp(Ops.REDUCE, dtypes.float,
+                  (UOp(Ops.CAST, dtypes.float, (stage_product,), arg=dtypes.float), *contracted), arg=reduce.arg)
+  stage_value = UOp(Ops.CAST, dtypes.half, (stage_acc,), arg=dtypes.half)
+  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=factors[0].src[0].device)
+  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
+  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_value)), *stage_axes)))
+  stage_plan = plan_rk(stage_sink)
+  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(stage_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+  final_axes = [*loops, *remaining]
+  final_extents = [int(u.src[0].arg) for u in final_axes]
+  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
+  final_product = UOp(Ops.MUL, dtypes.half, (intermediate_index, last))
+  final_acc = UOp(Ops.REDUCE, dtypes.float,
+                  (UOp(Ops.CAST, dtypes.float, (final_product,), arg=dtypes.float), *remaining), arg=reduce.arg)
+  final_sink = sink.substitute({reduce:final_acc})
+  final_plan = plan_rk(final_sink)
+  if isinstance(final_plan, str) or final_plan.kind != "cmac": return None
+  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(final_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  return tuple(tasks)
+
 def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
   """Split flipped-kernel CMAC reductions at PyTorch fp16 col2im boundaries."""
   materialization = plan.cmac_materialization
@@ -6956,6 +7021,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+  if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, multifactor_tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
     # Nested elementwise lowering can materialize an indexed WHERE operand before

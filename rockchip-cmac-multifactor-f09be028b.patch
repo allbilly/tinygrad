@@ -1,0 +1,213 @@
+diff --git a/progress.md b/progress.md
+index e604f2ce5..1b382d846 100644
+--- a/progress.md
++++ b/progress.md
+@@ -5427,3 +5427,45 @@ Ruff module, so the installed `ruff` executable was used after activating it.
+ `git diff --check` is clean. No LUT participates in this milestone, so
+ `lut.md` does not change. The standalone patch is
+ `rockchip-cmac-n-shared-51a962599.patch`, against parent `51a962599`.
++
++## 2026-07-29 — two-stage multifactor einsum milestone
++
++The complete unchanged forward-only `TestOps.test_einsum` method now passes
++on the real Rockchip backend in **21.84 seconds**. The refreshed
++einsum/dot/matmul selection is consequently **13/14 methods passing**; only
++the large-K ellipsis method remains.
++
++Tinygrad lowers `ik,jkl,il->ij` into one ADD reduction over
++`(a*b)*c`. A first attempt gathered `a` and `b`, multiplied them with DPU,
++then performed one CMAC reduction. It executed correctly but differed from
++Torch in 4/10 fp16 outputs because it placed the rounding boundary after an
++elementwise product instead of after a contraction.
++
++A scalar reference using the exact seeded test inputs proved Torch's order:
++
++```text
++tmp[i,j,l] = fp16(sum_k(fp32(a[i,k]) * fp32(b[j,k,l])))
++out[i,j]   = fp16(sum_l(fp32(tmp[i,j,l]) * fp32(c[i,l])))
++```
++
++The final lowering identifies the reduction axes common to the associated
++first factor pair, converts the uncontracted reduction axes into temporary
++output LOOP axes, and emits two materialized CMAC tasks. The first produces
++the fp16 intermediate; the second consumes it and writes the original output.
++All gathers remain movement only and all multiplication/accumulation stays on
++CNA/CORE.
++
++The permanent hardware test checks the full seeded result bit-for-bit. A
++hardware-free pipeline test also asserts that the UOp becomes exactly two
++CMAC stages. Validation:
++
++- new hardware regression plus unchanged official method: **2/2 in 22.12
++  seconds**;
++- CMAC hardware class: **20/20 in 7.52 seconds**;
++- PR1 contract/pipeline file: **75/75 in 6.16 seconds**;
++- mypy: the same 13 pre-existing findings;
++- targeted Ruff: the same five pre-existing findings;
++- `git diff --check`: clean.
++
++No LUT is used. The standalone patch is
++`rockchip-cmac-multifactor-f09be028b.patch`, against parent `f09be028b`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 3521d9f39..bacf9c346 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -500,6 +500,18 @@ class TestCMAC(unittest.TestCase):
+     expected = np.matmul(a_np.astype(np.float32), b_np.astype(np.float32)).astype(np.float16)
+     np.testing.assert_allclose(c.numpy(), expected, rtol=1e-3, atol=1e-6)
+ 
++  def test_cmac_multifactor_einsum(self):
++    # PyTorch contracts a*b over k, rounds the intermediate to fp16, then
++    # contracts with c over l. Two CMAC stages preserve that boundary.
++    np.random.seed(0)
++    a_np, b_np, c_np = (np.random.uniform(-2, 2, size=s).astype(np.float16)
++                         for s in ((2, 3), (5, 3, 7), (2, 7)))
++    a, b, c = (Tensor(v, device="ROCKCHIP").realize() for v in (a_np, b_np, c_np))
++    actual = Tensor.einsum("ik,jkl,il->ij", a, b, c).realize().numpy()
++    intermediate = np.einsum("ik,jkl->ijl", a_np.astype(np.float32), b_np.astype(np.float32)).astype(np.float16)
++    expected = np.einsum("ijl,il->ij", intermediate.astype(np.float32), c_np.astype(np.float32)).astype(np.float16)
++    np.testing.assert_array_equal(actual, expected)
++
+   def test_cmac_gemv_vector_a(self):
+     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
+     a_np = np.array([1,2,3,4], dtype=np.float16)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index e49f0edbb..aa9123402 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -457,6 +457,15 @@ class TestPipeline(unittest.TestCase):
+     self.assertIsNotNone(binary)
+     self.assertGreater(len(binary), 24)
+ 
++  def test_multifactor_einsum_produces_two_cmac_stages(self):
++    a = Tensor.rand(2,3,dtype=dtypes.half).realize()
++    b = Tensor.rand(5,3,7,dtype=dtypes.half).realize()
++    c = Tensor.rand(2,7,dtype=dtypes.half).realize()
++    prg = build_native_program(_get_sink(Tensor.einsum("ik,jkl,il->ij", a, b, c)))
++    subtasks = prg.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 2)
++    self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
++
+   def test_max_produces_binary(self):
+     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
+     binary = self._compile(a.max(axis=0))
+diff --git a/test_ops_status.md b/test_ops_status.md
+index c22239bd2..fd813f810 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -367,3 +367,21 @@ weight CBUF; otherwise the lower-submit-count block-diagonal layout remains.
+ That gating keeps the non-giant convolution selection clean at **42 passed,
+ 3 skipped, 37 passing subtests**. Current permanent checks are **19/19 CMAC
+ hardware**, **78/78 complete hardware**, and **74/74 PR1 contract**.
++
++### Multifactor einsum refresh
++
++`test_einsum` is fixed and the refreshed group is now **13/14 methods
++passing**. Its three-factor `ik,jkl,il->ij` case is emitted as two CMAC
++contractions, matching Torch's fp16 intermediate boundary:
++
++1. contract `a*b` over `k` into `tmp[i,j,l]`;
++2. contract `tmp*c` over `l` into `out[i,j]`.
++
++This is not equivalent to a DPU elementwise `a*b` followed by one large CMAC;
++that attempted split differed in 4/10 seeded fp16 values. Permanent totals
++for this milestone are **20/20 CMAC hardware** and **75/75 PR1**.
++
++The sole remaining refreshed failure is `test_einsum_ellipsis`, whose final
++case has a per-output `K=13,824` dot and still rejects with
++`cmac_exceeds_cbuf`. It needs K segmentation without introducing fp16 partial
++sum rounding.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 555f26607..946fe438a 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -7,7 +7,7 @@ import struct, math, numpy as np
+ from dataclasses import dataclass, replace
+ from tinygrad.dtype import dtypes, DType, Invalid
+ from tinygrad.helpers import ceildiv, round_up, prod, getenv
+-from tinygrad.uop.ops import Ops, UOp, ProgramInfo, PatternMatcher, graph_rewrite
++from tinygrad.uop.ops import Ops, UOp, AxisType, ProgramInfo, PatternMatcher, graph_rewrite
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.uop.upat import UPat
+ 
+@@ -6752,6 +6752,71 @@ def _try_cat_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(tuple(c.pack() for c in cmds), task, relocs))
+   return tuple(tasks)
+ 
++def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Split a three-factor einsum into PyTorch-ordered fp16 CMAC contractions."""
++  reduce = _reduce_node(sink)
++  if reduce is None or reduce.arg[0] is not Ops.ADD: return None
++  body = _reduce_body(reduce)
++  if body.op is not Ops.MUL or len(body.src) != 2: return None
++  first, last = _unwrap(body.src[0]), _unwrap(body.src[1])
++  if first.op is not Ops.MUL or len(first.src) != 2 or _unwrap(last).op is not Ops.INDEX: return None
++  factors = tuple(_unwrap(x) for x in first.src)
++  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half for x in (*factors, last)): return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  reductions = list(reduce.src[1:])
++  if not loops or not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++  factor_nodes = tuple(set(x.toposort()) for x in factors)
++  contracted = [u for u in reductions if u in factor_nodes[0] and u in factor_nodes[1]]
++  remaining = [u for u in reductions if u not in contracted]
++  if not contracted or not remaining or any(u in set(last.toposort()) for u in contracted): return None
++  carry_loops = [u.replace(arg=(u.arg[0], AxisType.LOOP)) for u in remaining]
++  stage_axes = [*loops, *carry_loops]
++  stage_extents = [int(u.src[0].arg) for u in stage_axes]
++  stage_total = prod(stage_extents)
++
++  def flat_index(axes:list[UOp], extents:list[int]) -> UOp:
++    flat = axes[0]
++    for axis, extent in zip(axes[1:], extents[1:]): flat = flat*extent + axis
++    return flat
++
++  info = ProgramInfo.from_sink(sink)
++  intermediate_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++
++  # PyTorch contracts the associated first pair over their common reduction
++  # axes, casts that intermediate to fp16, then performs the remaining dot.
++  carry_map = dict(zip(remaining, carry_loops))
++  stage_product = first.substitute(carry_map)
++  stage_acc = UOp(Ops.REDUCE, dtypes.float,
++                  (UOp(Ops.CAST, dtypes.float, (stage_product,), arg=dtypes.float), *contracted), arg=reduce.arg)
++  stage_value = UOp(Ops.CAST, dtypes.half, (stage_acc,), arg=dtypes.half)
++  intermediate_param = UOp.param(intermediate_slot, dtypes.half, (stage_total,), device=factors[0].src[0].device)
++  stage_out = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(stage_axes, stage_extents)))
++  stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_value)), *stage_axes)))
++  stage_plan = plan_rk(stage_sink)
++  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
++  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(stage_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++
++  final_axes = [*loops, *remaining]
++  final_extents = [int(u.src[0].arg) for u in final_axes]
++  intermediate_index = UOp(Ops.INDEX, dtypes.half, (intermediate_param, flat_index(final_axes, final_extents)))
++  final_product = UOp(Ops.MUL, dtypes.half, (intermediate_index, last))
++  final_acc = UOp(Ops.REDUCE, dtypes.float,
++                  (UOp(Ops.CAST, dtypes.float, (final_product,), arg=dtypes.float), *remaining), arg=reduce.arg)
++  final_sink = sink.substitute({reduce:final_acc})
++  final_plan = plan_rk(final_sink)
++  if isinstance(final_plan, str) or final_plan.kind != "cmac": return None
++  if (shared_tasks := _try_cmac_shared_subtasks(final_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(final_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(final_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  return tuple(tasks)
++
+ def _try_cmac_rounding_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+   """Split flipped-kernel CMAC reductions at PyTorch fp16 col2im boundaries."""
+   materialization = plan.cmac_materialization
+@@ -6956,6 +7021,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
++  if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, multifactor_tasks)
+   plan = plan_rk(sink)
+   if isinstance(plan, str):
+     # Nested elementwise lowering can materialize an indexed WHERE operand before

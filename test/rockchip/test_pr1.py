@@ -457,6 +457,15 @@ class TestPipeline(unittest.TestCase):
     self.assertIsNotNone(binary)
     self.assertGreater(len(binary), 24)
 
+  def test_multifactor_einsum_produces_two_cmac_stages(self):
+    a = Tensor.rand(2,3,dtype=dtypes.half).realize()
+    b = Tensor.rand(5,3,7,dtype=dtypes.half).realize()
+    c = Tensor.rand(2,7,dtype=dtypes.half).realize()
+    prg = build_native_program(_get_sink(Tensor.einsum("ik,jkl,il->ij", a, b, c)))
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 2)
+    self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
+
   def test_max_produces_binary(self):
     a = Tensor.rand(4,8,dtype=dtypes.half).realize()
     binary = self._compile(a.max(axis=0))
