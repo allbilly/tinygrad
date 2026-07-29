@@ -6642,3 +6642,57 @@ native MUL high word is unsound.
 
 The standalone recovery artifact is
 `rockchip-fractional-pow-32cb1cd67.patch`, based on `32cb1cd67`.
+
+## 2026-07-30 — two-level POW8 LUT
+
+`x**8.0` is scheduled as three squarings. RK3588 executes each DPU task with
+an fp16 output boundary, so its result exactly matched three NumPy fp16
+squarings. Torch instead matched a float32 power followed by one final fp16
+round. The official subcase consequently missed tolerance in 617/2,925 lanes
+with maximum relative error `0.002876`.
+
+The new strict exponent-tree matcher keeps all work on DPU and uses exact
+power-of-two range reduction to map `0.25 < abs(x) < 4` into `1 < u < 2`.
+One low LUT stores `u**8` in Q11 through sqrt(2). A second high LUT stores
+`(u/2)**8` in Q15 above sqrt(2), then an exact DPU multiply by 256 restores
+the range. The normalized result is multiplied by the exact factor associated
+with the original magnitude interval.
+
+The former repeated-square chain remains as a fallback below 0.25 and at or
+above 4, retaining underflow, overflow, infinity, and NaN behavior. The LUT
+candidate is clamped to finite 65,504 before mask selection so an unselected
+infinity cannot contaminate the fallback through `0*inf`.
+
+### Rejected correction-LUT WIP
+
+A Q7 base plus a Q15 residual table on the same grid did not work. Hardware
+interpolates integer entries and then truncates during the output shift; a
+raw interpolation such as `400.75` becomes `400` before Q7 decode. A smooth
+same-grid residual cannot reconstruct that phase-dependent fraction. The
+unused residual builder is retained for reference.
+
+`ROCKCHIP_DEBUG_POW8_STAGE=1..7` can expose normalized input, both table
+outputs, the selected normalized power, range factor, and bounded final
+candidate. `lut.md` now documents this integer-shift behavior, the rejected
+approach, and the passing two-level design in detail.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- permanent 513-point `[-4.1,4.1]` plus `±inf/NaN` regression: **516/516
+  passing in 10.13 seconds**;
+- the official `test_pow_const` now passes its exponent-8 subcase and reaches
+  the separate exponent-5.5 accuracy failure;
+- all other DPU hardware cases: **63/63 passing in 310.52 seconds**;
+- separately rerun million-element bool stress case: **passing in 48.08
+  seconds**;
+- hardware-free PR1 contract: **79/79 passing in 4.78 seconds**;
+- pycompile and `git diff --check`: passing.
+
+The exponent-5.5 subcase currently misses 117/2,925 lanes with maximum
+relative error `0.001953`. It needs its own exponent-aware range factors and
+is not claimed by this milestone.
+
+The standalone recovery artifact is
+`rockchip-pow8-two-level-8376c0ffc.patch`, based on `8376c0ffc`.

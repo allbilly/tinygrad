@@ -1716,6 +1716,76 @@ one and derive `invalid=(x<1)` from the original input; multiply the assembled
 value by `valid/valid` to restore NaN. This avoids both cancellation on
 negative asinh inputs and overflow in the original square/SQRT graph.
 
+## Integer POW8: range reduction and a genuine two-level LUT
+
+Torch evaluates half-input `x**8` with a float32 internal power and one final
+half rounding. Three reset-separated DPU squarings instead perform three half
+roundings. A dense comparison proves the RK result exactly matches repeated
+NumPy fp16 squaring, while Torch exactly matches
+`float32(x)**8 -> fp16`.
+
+A single direct POW8 table cannot meet the tolerance. The result spans zero
+through 65,504, but every RK LUT entry is signed int16 with one shared output
+shift. Q7 is required to represent values near 256 and loses too much
+relative precision near one.
+
+The passing implementation first uses exact powers of two to normalize:
+
+| Magnitude range | Address multiplier | Normalized `u` | Final factor |
+|---:|---:|---:|---:|
+| `(0.25, 0.5]` | `4` | `(1,2]` | `2^-16` |
+| `(0.5, 1]` | `2` | `(1,2]` | `2^-8` |
+| `(1, 2]` | `1` | `(1,2]` | `1` |
+| `(2, 4)` | `0.5` | `(1,2)` | `256` |
+
+The masks build the multiplier and factor entirely on DPU. These constants
+are binary powers, so normalization does not introduce an additional
+rounding error for normal fp16 inputs.
+
+Two LUT tasks then divide the normalized range at the fp16 representation of
+sqrt(2):
+
+| Task | Active normalized range | Stored function | Fixed-point |
+|---|---:|---:|---:|
+| low | `[1,sqrt(2)]` | `u**8` | Q11, maximum 16 |
+| high | `[sqrt(2),2]` | `(u/2)**8` | Q15, maximum 1 |
+
+The high result is multiplied by exactly 256. Each table therefore spans
+only a 16:1 result range and retains better than the required 0.1% relative
+resolution at its lower endpoint. Both use address multiplier 8,192 and the
+normal 513-entry LE/LO physical tables.
+
+The old repeated-square result remains the fallback for `|x|<=0.25` and
+`|x|>=4`. The small result is already within the absolute tolerance, while
+the large result supplies correct overflow and infinity behavior. Before
+arithmetic selection, the LUT result is bounded to finite 65,504; otherwise
+an unselected `0*infinity` would turn the selected fallback into NaN. NaN
+itself remains on the repeated-square fallback.
+
+### Rejected same-grid correction experiment
+
+The first two-task design used:
+
+1. a Q7 `u**8` base table;
+2. a Q15 table containing `exact-base` residuals on the same address grid.
+
+It failed because the RK pipeline interpolates integer table values and then
+applies the integer output shift. For example, an interpolated Q7 raw value
+of `400.75` is shifted as `400`, so the observed output is `3.125`, not the
+fp16 rounding of `400.75/128`. A residual table on the same grid interpolates
+smoothly and cannot recover this fractional-phase sawtooth. The attempted
+builder remains as `_build_pow8_correction_lut`, and
+`ROCKCHIP_DEBUG_POW8_STAGE=1..7` exposes normalized, LUT, factor, and selected
+intermediates for future experiments.
+
+This is an important tuning rule: two LUT tasks only improve precision when
+the second task supplies genuinely finer addressing or a different
+fixed-point range. Merely storing endpoint residuals on the same grid cannot
+undo a later integer truncation.
+
+The permanent hardware regression covers 513 points across `[-4.1,4.1]`
+plus both infinities and NaN. All 516 values meet `rtol=1e-3, atol=1e-6`.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

@@ -884,3 +884,29 @@ maximum relative error `0.002876`. Tensor exponents still have a larger
 runtime WHERE graph and are not claimed here.
 
 Recovery patch: `rockchip-fractional-pow-32cb1cd67.patch`.
+
+### Two-level POW8 milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| scalar exponent `8.0` | **passing** | exact range reduction + two LUTs |
+| dense `[-4.1,4.1]`, `±inf`, NaN | **516/516 passing** | **passing** |
+| scalar exponent `5.5` | 117/2,925 tolerance misses | next POW subgroup |
+
+The power-of-two range reducer maps finite magnitudes into `[1,2]`. A Q11
+low table covers through sqrt(2), while a Q15 high table stores `(u/2)**8`
+and is decoded by an exact ×256. The old three-square DPU result supplies
+small-value, overflow, infinity, and NaN fallback behavior. No host
+arithmetic is used.
+
+The permanent regression passes in **10.13 seconds**. The other DPU cases
+pass **63/63 in 310.52 seconds**, the isolated large bool stress case passes
+in **48.08 seconds**, and PR1 remains **79/79 in 4.78 seconds**.
+
+The rejected same-grid Q7-base/Q15-residual builder remains as WIP. It
+demonstrated that RK LUT interpolation is followed by an integer output
+shift, so endpoint residual interpolation cannot recover discarded
+fractional raw bits. The detailed tuning procedure and
+`ROCKCHIP_DEBUG_POW8_STAGE` mapping are recorded in `lut.md`.
+
+Recovery patch: `rockchip-pow8-two-level-8376c0ffc.patch`.

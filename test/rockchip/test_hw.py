@@ -313,6 +313,13 @@ class TestDPU(unittest.TestCase):
       with np.errstate(all="ignore"): expected = np.power(a_np, np.float16(exponent))
       np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_dpu_pow8_two_level_lut(self):
+    a_np = np.concatenate((np.linspace(-4.1, 4.1, 513, dtype=np.float32).astype(np.float16),
+                           np.array([np.inf, -np.inf, np.nan], dtype=np.float16)))
+    actual = (Tensor(a_np, device="ROCKCHIP") ** 8.0).realize().numpy()
+    with np.errstate(all="ignore"): expected = np.power(a_np.astype(np.float32), 8).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_dpu_log2_two_lut_normalization(self):
     boundaries = np.array([0.0009766, 0.00215, 0.003906, 0.00391, 0.01562, 0.01564,
                            0.0625, 0.06256, 0.25, 0.2502, 0.8999, 0.9, 0.999,
