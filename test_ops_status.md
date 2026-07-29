@@ -12,8 +12,9 @@ supersedes the older 182-passing census below.
 (`all`, `all_axis`, `all_large`, `all_zero_axis`, `any`, `any_axis`, and
 `any_zero_axis`) pass together in **39.55 seconds**. The five methods that
 failed in the census have not yet been folded into another full-suite count,
-so 257/165 remains the honest complete baseline. The expanded DPU hardware
-class is separately **58/58 passing in 287.78 seconds**.
+so 257/165 remains the honest complete baseline. Product reduction and the
+product subcase of `const_reduce` now also pass incrementally. The expanded
+DPU hardware class is separately **59/59 passing in 288.81 seconds**.
 
 **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
 including its float32 infinity/NaN subcase. The summary table below remains the
@@ -617,3 +618,28 @@ passing in 287.78 seconds** and the hardware-free contract is **79/79 passing
 in 6.50 seconds**.
 
 Recovery patch: `rockchip-native-bool-reductions-76c31806e.patch`.
+
+### Native product-reduction milestone
+
+| Group | Numerical status | Strict NPU-native status |
+|---|---:|---:|
+| `prod`, all official forward cases | **passing** | **passing** |
+| `const_reduce` sum/product/max | **passing** | **passing** |
+| `cumprod` family | still precision-failing | separate milestone |
+
+Static reduction coordinates are substituted at compile time. Host movement
+copies exact source bytes into one compact buffer per reduction lane, and DPU
+multiplies those buffers in scheduled order. fp32 inputs use the established
+typed fp32↔fp16 boundary; runtime-dependent multiplication remains NPU work.
+
+The selected official product group passes **3/3 in 7.43 seconds**, the
+permanent hardware regression passes in **4.05 seconds**, the complete DPU
+class is **59/59 in 288.81 seconds**, and the hardware-free contract remains
+**79/79 in 6.52 seconds**.
+
+`cumprod` now reaches the same multiply lowering but misses strict tolerance
+because repeated fp16 rounding differs from Torch's prefix-product
+accumulation. It is deliberately tracked separately rather than claimed by
+this milestone.
+
+Recovery patch: `rockchip-native-product-reductions-03bad6205.patch`.

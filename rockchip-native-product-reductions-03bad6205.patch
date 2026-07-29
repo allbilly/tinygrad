@@ -1,0 +1,186 @@
+diff --git a/progress.md b/progress.md
+index 7c4a8b846..14b16b4ef 100644
+--- a/progress.md
++++ b/progress.md
+@@ -6118,3 +6118,48 @@ tiling. `_run_host_scatter` remains opt-in diagnostics under
+ 
+ The standalone recovery artifact is
+ `rockchip-native-bool-reductions-76c31806e.patch`, based on `76c31806e`.
++
++## 2026-07-29 — native small-window product reductions
++
++The next genuine isolated failure after boolean reductions was
++`REDUCE(MUL, INDEX)`. The official `prod` coverage uses small static windows:
++three lanes for the explicit float32 case and four or six lanes for fp16 axis
++reductions. `const_reduce` adds a nine-lane product.
++
++The new lowering substitutes every static reduction coordinate into the
++scheduled source expression and uses `_HOST_MOVEMENT_LAYOUT` only to copy the
++corresponding element bytes into a compact per-lane tensor. DPU MUL then
++combines those tensors in reduction order. No host callback reads or
++multiplies runtime values.
++
++Both fp16 and fp32 storage are accepted. fp32 storage uses the backend's
++existing typed boundary on each DPU stage, while the NPU continues to execute
++the actual multiply in fp16. This is sufficient for the official explicit
++`[1,2,3]` fp32 case and retains the expected output dtype.
++
++### Cumprod boundary
++
++The same matcher can expose cumulative-product kernels, but their repeated
++fp16 rounding differs from Torch's prefix-product accumulation. The isolated
++`test_cumprod` now computes structurally correct results but has 23/600 values
++just beyond `rtol=0.001` (maximum absolute error `0.001953125`). Cumprod is
++therefore not claimed by this milestone; it needs a separate higher-precision
++or rounding-boundary design.
++
++### Validation
++
++Using `. .venv/bin/activate`:
++
++- selected official `prod`, `prod_dtype_arg`, and `const_reduce`: **3/3
++  passing in 7.43 seconds**;
++- permanent fp32/fp16/constant product hardware regression: **1/1 passing in
++  4.05 seconds**;
++- complete DPU hardware class: **59/59 passing in 288.81 seconds**;
++- hardware-free PR1 contract: **79/79 passing in 6.52 seconds**;
++- pycompile and `git diff --check`: passing.
++
++Mypy retains the same **13 pre-existing findings**, and Ruff remains absent
++from `.venv`.
++
++The standalone recovery artifact is
++`rockchip-native-product-reductions-03bad6205.patch`, based on `03bad6205`.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 63df52ce1..339ecc13e 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -77,6 +77,15 @@ class TestDPU(unittest.TestCase):
+     np.testing.assert_array_equal(empty.any(axis=(1,3)).realize().numpy(), np.zeros((1,3,5), dtype=np.bool_))
+     np.testing.assert_array_equal(empty.all(axis=(1,3)).realize().numpy(), np.ones((1,3,5), dtype=np.bool_))
+ 
++  def test_dpu_product_reductions(self):
++    values = np.array([1, 2, 3], dtype=np.float32)
++    np.testing.assert_array_equal(Tensor(values, device="ROCKCHIP").realize().prod().realize().numpy(), np.prod(values))
++    data = np.array([[[1, 2, -1], [3, -2, 0.5]], [[-1, 4, 2], [0.25, 2, -3]]], dtype=np.float16)
++    x = Tensor(data, device="ROCKCHIP").realize()
++    np.testing.assert_array_equal(x.prod(axis=2).realize().numpy(), np.prod(data, axis=2))
++    full = x.full_like(2)
++    np.testing.assert_array_equal(full.prod().realize().numpy(), np.prod(np.full(data.shape, 2, dtype=np.float16)))
++
+   def test_dpu_local_max_pool(self):
+     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
+     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 5f8749b06..a34351ccb 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -12,8 +12,9 @@ supersedes the older 182-passing census below.
+ (`all`, `all_axis`, `all_large`, `all_zero_axis`, `any`, `any_axis`, and
+ `any_zero_axis`) pass together in **39.55 seconds**. The five methods that
+ failed in the census have not yet been folded into another full-suite count,
+-so 257/165 remains the honest complete baseline. The expanded DPU hardware
+-class is separately **58/58 passing in 287.78 seconds**.
++so 257/165 remains the honest complete baseline. Product reduction and the
++product subcase of `const_reduce` now also pass incrementally. The expanded
++DPU hardware class is separately **59/59 passing in 288.81 seconds**.
+ 
+ **Post-census milestone:** `TestOps.test_log2` now passes in isolated execution,
+ including its float32 infinity/NaN subcase. The summary table below remains the
+@@ -617,3 +618,28 @@ passing in 287.78 seconds** and the hardware-free contract is **79/79 passing
+ in 6.50 seconds**.
+ 
+ Recovery patch: `rockchip-native-bool-reductions-76c31806e.patch`.
++
++### Native product-reduction milestone
++
++| Group | Numerical status | Strict NPU-native status |
++|---|---:|---:|
++| `prod`, all official forward cases | **passing** | **passing** |
++| `const_reduce` sum/product/max | **passing** | **passing** |
++| `cumprod` family | still precision-failing | separate milestone |
++
++Static reduction coordinates are substituted at compile time. Host movement
++copies exact source bytes into one compact buffer per reduction lane, and DPU
++multiplies those buffers in scheduled order. fp32 inputs use the established
++typed fp32↔fp16 boundary; runtime-dependent multiplication remains NPU work.
++
++The selected official product group passes **3/3 in 7.43 seconds**, the
++permanent hardware regression passes in **4.05 seconds**, the complete DPU
++class is **59/59 in 288.81 seconds**, and the hardware-free contract remains
++**79/79 in 6.52 seconds**.
++
++`cumprod` now reaches the same multiply lowering but misses strict tolerance
++because repeated fp16 rounding differs from Torch's prefix-product
++accumulation. It is deliberately tracked separately rather than claimed by
++this milestone.
++
++Recovery patch: `rockchip-native-product-reductions-03bad6205.patch`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index f59658ba8..146987463 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -7285,6 +7285,54 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, task, relocs))
+   return tuple(tasks)
+ 
++def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Gather a small static float reduction window, then multiply it on DPU."""
++  reduce, store = _reduce_node(sink), _store_node(sink)
++  if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype not in (dtypes.half, dtypes.float) or \
++     store.src[0].dtype is not reduce.dtype or store.src[1] is not reduce: return None
++  value_dtype = reduce.dtype
++  reductions = list(reduce.src[1:])
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++  loop_extents = [int(u.src[0].arg) for u in loops]
++  reduce_extents = [int(u.src[0].arg) for u in reductions]
++  total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
++  if prod(loop_extents) != total or not 2 <= window <= 256: return None
++
++  info = ProgramInfo.from_sink(sink)
++  next_slot = max(info.globals, default=-1) + 1
++  tasks:list[RKSubTask] = []
++  gathered_slots:list[int] = []
++  for linear in range(window):
++    rem, fixed = linear, {}
++    for reduce_axis in range(len(reductions)-1, -1, -1):
++      rem, coord = divmod(rem, reduce_extents[reduce_axis])
++      fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
++    gathered = reduce.src[0].substitute(fixed)
++    if gathered.dtype is not value_dtype: return None
++    scratch_slot, next_slot = next_slot, next_slot+1
++    scratch = UOp.param(scratch_slot, value_dtype, (total,), device=store.src[0].src[0].device)
++    scratch_index = store.src[0].replace(dtype=value_dtype, src=(scratch, *store.src[0].src[1:]))
++    movement_store = UOp(Ops.STORE, src=(scratch_index, gathered))
++    movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
++    movement_tasks = _try_movement_host_subtasks(movement_sink)
++    if movement_tasks is None or len(movement_tasks) != 1: return None
++    tasks.extend(movement_tasks)
++    gathered_slots.append(scratch_slot)
++
++  accumulator = gathered_slots[0]
++  for index, operand in enumerate(gathered_slots[1:], 1):
++    final = index == len(gathered_slots)-1
++    out_slot = info.outs[0] if final else next_slot
++    if not final: next_slot += 1
++    if value_dtype is dtypes.float:
++      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL,
++                                     fp32_inputs=(accumulator, operand), fp32_output=True))
++    else:
++      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL))
++    accumulator = out_slot
++  return tuple(tasks)
++
+ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower bool ALL/ANY to native DPU masks followed by a CMAC count.
+ 
+@@ -7849,6 +7897,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
+   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
+      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
++  if (product_tasks := _try_local_product_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, product_tasks)
+   if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, bool_reduce_tasks)
+   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)

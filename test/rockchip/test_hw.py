@@ -77,6 +77,15 @@ class TestDPU(unittest.TestCase):
     np.testing.assert_array_equal(empty.any(axis=(1,3)).realize().numpy(), np.zeros((1,3,5), dtype=np.bool_))
     np.testing.assert_array_equal(empty.all(axis=(1,3)).realize().numpy(), np.ones((1,3,5), dtype=np.bool_))
 
+  def test_dpu_product_reductions(self):
+    values = np.array([1, 2, 3], dtype=np.float32)
+    np.testing.assert_array_equal(Tensor(values, device="ROCKCHIP").realize().prod().realize().numpy(), np.prod(values))
+    data = np.array([[[1, 2, -1], [3, -2, 0.5]], [[-1, 4, 2], [0.25, 2, -3]]], dtype=np.float16)
+    x = Tensor(data, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(x.prod(axis=2).realize().numpy(), np.prod(data, axis=2))
+    full = x.full_like(2)
+    np.testing.assert_array_equal(full.prod().realize().numpy(), np.prod(np.full(data.shape, 2, dtype=np.float16)))
+
   def test_dpu_local_max_pool(self):
     x_np = np.array([[[[-4, 2, 1, 7, -3], [5, -6, 8, 0, 4], [3, 9, -2, 6, 1], [-5, 2, 4, -1, 8]]]], dtype=np.float16)
     padded = np.pad(x_np, ((0,0), (0,0), (1,1), (1,1)), constant_values=-np.inf)

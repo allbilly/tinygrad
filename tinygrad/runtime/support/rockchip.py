@@ -7285,6 +7285,54 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
   return tuple(tasks)
 
+def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Gather a small static float reduction window, then multiply it on DPU."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype not in (dtypes.half, dtypes.float) or \
+     store.src[0].dtype is not reduce.dtype or store.src[1] is not reduce: return None
+  value_dtype = reduce.dtype
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  loop_extents = [int(u.src[0].arg) for u in loops]
+  reduce_extents = [int(u.src[0].arg) for u in reductions]
+  total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
+  if prod(loop_extents) != total or not 2 <= window <= 256: return None
+
+  info = ProgramInfo.from_sink(sink)
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  gathered_slots:list[int] = []
+  for linear in range(window):
+    rem, fixed = linear, {}
+    for reduce_axis in range(len(reductions)-1, -1, -1):
+      rem, coord = divmod(rem, reduce_extents[reduce_axis])
+      fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
+    gathered = reduce.src[0].substitute(fixed)
+    if gathered.dtype is not value_dtype: return None
+    scratch_slot, next_slot = next_slot, next_slot+1
+    scratch = UOp.param(scratch_slot, value_dtype, (total,), device=store.src[0].src[0].device)
+    scratch_index = store.src[0].replace(dtype=value_dtype, src=(scratch, *store.src[0].src[1:]))
+    movement_store = UOp(Ops.STORE, src=(scratch_index, gathered))
+    movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
+    movement_tasks = _try_movement_host_subtasks(movement_sink)
+    if movement_tasks is None or len(movement_tasks) != 1: return None
+    tasks.extend(movement_tasks)
+    gathered_slots.append(scratch_slot)
+
+  accumulator = gathered_slots[0]
+  for index, operand in enumerate(gathered_slots[1:], 1):
+    final = index == len(gathered_slots)-1
+    out_slot = info.outs[0] if final else next_slot
+    if not final: next_slot += 1
+    if value_dtype is dtypes.float:
+      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL,
+                                     fp32_inputs=(accumulator, operand), fp32_output=True))
+    else:
+      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL))
+    accumulator = out_slot
+  return tuple(tasks)
+
 def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower bool ALL/ANY to native DPU masks followed by a CMAC count.
 
@@ -7849,6 +7897,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
+  if (product_tasks := _try_local_product_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, product_tasks)
   if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
     return build_native_program_multi(sink, bool_reduce_tasks)
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)

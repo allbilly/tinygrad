@@ -6118,3 +6118,48 @@ tiling. `_run_host_scatter` remains opt-in diagnostics under
 
 The standalone recovery artifact is
 `rockchip-native-bool-reductions-76c31806e.patch`, based on `76c31806e`.
+
+## 2026-07-29 — native small-window product reductions
+
+The next genuine isolated failure after boolean reductions was
+`REDUCE(MUL, INDEX)`. The official `prod` coverage uses small static windows:
+three lanes for the explicit float32 case and four or six lanes for fp16 axis
+reductions. `const_reduce` adds a nine-lane product.
+
+The new lowering substitutes every static reduction coordinate into the
+scheduled source expression and uses `_HOST_MOVEMENT_LAYOUT` only to copy the
+corresponding element bytes into a compact per-lane tensor. DPU MUL then
+combines those tensors in reduction order. No host callback reads or
+multiplies runtime values.
+
+Both fp16 and fp32 storage are accepted. fp32 storage uses the backend's
+existing typed boundary on each DPU stage, while the NPU continues to execute
+the actual multiply in fp16. This is sufficient for the official explicit
+`[1,2,3]` fp32 case and retains the expected output dtype.
+
+### Cumprod boundary
+
+The same matcher can expose cumulative-product kernels, but their repeated
+fp16 rounding differs from Torch's prefix-product accumulation. The isolated
+`test_cumprod` now computes structurally correct results but has 23/600 values
+just beyond `rtol=0.001` (maximum absolute error `0.001953125`). Cumprod is
+therefore not claimed by this milestone; it needs a separate higher-precision
+or rounding-boundary design.
+
+### Validation
+
+Using `. .venv/bin/activate`:
+
+- selected official `prod`, `prod_dtype_arg`, and `const_reduce`: **3/3
+  passing in 7.43 seconds**;
+- permanent fp32/fp16/constant product hardware regression: **1/1 passing in
+  4.05 seconds**;
+- complete DPU hardware class: **59/59 passing in 288.81 seconds**;
+- hardware-free PR1 contract: **79/79 passing in 6.52 seconds**;
+- pycompile and `git diff --check`: passing.
+
+Mypy retains the same **13 pre-existing findings**, and Ruff remains absent
+from `.venv`.
+
+The standalone recovery artifact is
+`rockchip-native-product-reductions-03bad6205.patch`, based on `03bad6205`.
