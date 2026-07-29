@@ -1245,3 +1245,32 @@ The LUT classifier now accepts compatible uniform 2D affine layouts, matching
 the existing DPU rule.  The vector broadcast, softplus, multiplication, and
 final CMAC mean all remain NPU-native; `run_host` performs no operator
 arithmetic.  Unreduced ordinary BCE LUT accuracy remains the next loss issue.
+
+### Complete BCE reduction milestone
+
+| Coverage | Result |
+|---|---:|
+| ordinary BCE mean/sum/none | **passing** |
+| BCE-with-logits mean/sum/none | **passing** |
+| unchanged reductions method | **1 passed in 31.74s** |
+| unchanged default BCE + logits `pos_weight` | **2 passed in 40.38s** |
+| hardware-free PR1 contract | **79/79 in 6.67s** |
+
+Ordinary unreduced BCE now uses two fitted endpoint-loss LUT tasks:
+`(1-y)*loss0 + y*loss1`.  Logits uses one fitted `softplus(-x)` task and the
+fp16 formula `(1-y)*x + softplus(-x)`.  Large-loss table halves are stored
+divided by four in Q15 and restored by DPU sign masks.  The fit covers every
+finite fp16 input in `[-2,2]`, weighted by representable-value interval width;
+small measured knot corrections handle RK interpolation phase.
+
+Mean and sum materialize the same endpoint formulas before CMAC, reducing
+ordinary mean from roughly 76 seconds to roughly 11 seconds.  Runtime
+submission keeps LUT/comparison/CMAC boundaries reset-separated and batches
+only consecutive ordinary DPU tasks, avoiding the reproducible post-fourth-
+CMAC timeout.  No loss arithmetic is host-executed.
+
+Python compilation and whitespace checks pass.  Mypy remains at the exact
+13-error pre-existing Rockchip baseline; ruff and pytest-xdist are not
+installed in `.venv`.  Detailed knot values, interpolation modeling, timeout
+isolation, backups, and debug commands are recorded in `progress.md` and
+`lut.md`.

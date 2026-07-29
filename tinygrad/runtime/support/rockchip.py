@@ -746,6 +746,12 @@ _LUT_POW_BASE8_FAR_HIGH = Ops.LOAD
 _LUT_POW_BASE07 = Ops.STORE
 _LUT_POW_BASE2_LOW = Ops.TRUNC
 _LUT_POW_BASE2_HIGH = Ops.BITCAST
+_LUT_LOG_HALF_LOW = Ops.PERMUTE
+_LUT_LOG_HALF_HIGH = Ops.ALLREDUCE
+_LUT_SIGMOID_LOCAL = Ops.REDUCE
+_LUT_BCE_ZERO = Ops.PARAM
+_LUT_BCE_ONE = Ops.CONST
+_LUT_BCE_LOGITS = Ops.WHERE
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -1147,6 +1153,25 @@ def _build_log2_local_lut(function_scale:float=1.0) -> tuple[list[int], int, flo
       lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
+def _build_log_half_lut(high:bool) -> tuple[list[int], int, float, float, int]:
+  """Direct natural-log refinement for fp16 probabilities.
+
+  The low table covers a normalized mantissa m∈[0.25,0.5] as
+  z=(m-0.375)*16 in Q14.  The high table covers m∈[0.5,1] as
+  z=(m-0.75)*8 in Q15.  The caller restores the power-of-four exponent.
+  """
+  center, transform, output_scale, minus_exp = (0.75, 8.0, 32768.0, 15) if high else (0.375, 16.0, 16384.0, 14)
+  bias = getenv("ROCKCHIP_LOG_HALF_BIAS", 0)
+  index_scale, step, lut = 8192.0, 32.0/8192.0, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      z = (-(512-i) if table == 0 else i)*step
+      x = center + z/transform
+      raw = int(round(math.log(max(x, 2**-24))*output_scale))
+      if raw < 0: raw += bias
+      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else -1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
 def _build_logsigmoid_correction_lut(input_beta:float=1.0) -> tuple[list[int], int, float, float, int]:
   """Q15 scaled -log1p(exp(-abs(x))) over [-8,8]."""
   index_scale, output_scale = 2048.0*input_beta, 32768.0
@@ -1520,6 +1545,102 @@ def _build_sigmoid_lut() -> tuple[list[int], int, float, float, int]:
     lut[_LUT_SIZE+i] = max(1, min(32767, int(round(output_scale / (1.0 + math.exp(-x))))))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
 
+def _build_sigmoid_local_lut() -> tuple[list[int], int, float, float, int]:
+  """Dense Q15 sigmoid over [-2,2], selected inside the broad [-8,8] path."""
+  index_scale, output_scale, minus_exp = 8192.0, 32768.0, 15
+  sample_shift = getenv("ROCKCHIP_SIGMOID_LOCAL_SHIFT", 0.0)
+  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    for i in range(_LUT_SIZE):
+      x = ((-(512-i) if table == 0 else i)+sample_shift)*step
+      raw = int(round(output_scale/(1.0+math.exp(-x))))
+      lut[offset+i] = max(1, min(32767, raw))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
+def _build_bce_endpoint_lut(target_one:bool) -> tuple[list[int], int, float, float, int]:
+  """Q15 BCE(sigmoid_fp16(x), target) over [-2,2].
+
+  The large-loss half is stored divided by four and restored by the staged
+  sign mask, giving both physical halves Q15 effective precision.  Fit the
+  table nodes over every representable fp16 input, weighted by its real-number
+  Voronoi interval: direct grid samples linearly interpolate across sigmoid's
+  fp16 rounding steps and introduce avoidable one-ULP endpoint errors.
+  """
+  index_scale, output_scale, minus_exp = 8192.0, 32768.0, 15
+  bit_patterns = np.arange(0x10000, dtype=np.uint16)
+  xs = bit_patterns.view(np.float16)
+  xs = np.sort(xs[np.isfinite(xs) & (xs >= -2) & (xs <= 2)].astype(np.float64))
+  midpoints = (xs[:-1]+xs[1:])/2
+  boundaries = np.concatenate((np.array([-2.0]), midpoints, np.array([2.0])))
+  weights = np.maximum(0.0, boundaries[1:]-boundaries[:-1])
+  probabilities = np.float16(1.0/(1.0+np.exp(-xs))).astype(np.float64)
+  losses = np.float16(-np.log(probabilities) if target_one else -np.log1p(-probabilities)).astype(np.float64)
+  large = xs < 0 if target_one else xs >= 0
+  desired_raw = losses / np.where(large, 4.0, 1.0) * output_scale
+  negative = xs < 0
+  position = np.where(negative, (xs+2.0)*256.0, xs*256.0)
+  index = np.minimum(np.floor(position).astype(np.int32), 511)
+  fraction = position-index
+  lut = [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    selected = negative if table == 0 else ~negative
+    i, f, w, y = index[selected], fraction[selected], weights[selected], desired_raw[selected]
+    normal = np.zeros((_LUT_SIZE, _LUT_SIZE), dtype=np.float64)
+    rhs = np.zeros(_LUT_SIZE, dtype=np.float64)
+    np.add.at(normal, (i, i), w*(1.0-f)**2)
+    np.add.at(normal, (i+1, i+1), w*f**2)
+    np.add.at(normal, (i, i+1), w*f*(1.0-f))
+    np.add.at(normal, (i+1, i), w*f*(1.0-f))
+    np.add.at(rhs, i, w*(1.0-f)*y)
+    np.add.at(rhs, i+1, w*f*y)
+    fitted = np.rint(np.linalg.solve(normal + np.eye(_LUT_SIZE)*1e-10, rhs)).astype(np.int32)
+    lut[offset:offset+_LUT_SIZE] = np.clip(fitted, 1, 32767).tolist()
+  if target_one:
+    # Sparse interpolation-boundary calibration after the global fp16-domain
+    # fit. Each pair moves a knot by one output ULP or less; it is not a
+    # per-input result table.
+    for table, knot_index, correction in ((0, 372, 8), (0, 373, 8), (1, 155, 8), (1, 156, 8),
+                                          (1, 383, 8), (1, 384, 8), (1, 401, -8), (1, 402, -8),
+                                          (1, 460, -8), (1, 467, 8)):
+      lut[table*_LUT_SIZE+knot_index] += correction
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
+def _build_bce_logits_lut() -> tuple[list[int], int, float, float, int]:
+  """Fitted Q15 softplus(-x) for BCE-with-logits over fp16 x∈[-2,2].
+
+  Negative x is stored divided by four and restored by the staged sign mask.
+  """
+  index_scale, output_scale, minus_exp = 8192.0, 32768.0, 15
+  bit_patterns = np.arange(0x10000, dtype=np.uint16)
+  xs = bit_patterns.view(np.float16)
+  xs = np.sort(xs[np.isfinite(xs) & (xs >= -2) & (xs <= 2)].astype(np.float64))
+  midpoints = (xs[:-1]+xs[1:])/2
+  boundaries = np.concatenate((np.array([-2.0]), midpoints, np.array([2.0])))
+  weights = np.maximum(0.0, boundaries[1:]-boundaries[:-1])
+  negative = xs < 0
+  desired_raw = np.float16(np.log1p(np.exp(-xs))).astype(np.float64) / np.where(negative, 4.0, 1.0) * output_scale
+  position = np.where(negative, (xs+2.0)*256.0, xs*256.0)
+  index = np.minimum(np.floor(position).astype(np.int32), 511)
+  fraction = position-index
+  lut = [0] * (_LUT_SIZE*2)
+  for table, offset in ((0, 0), (1, _LUT_SIZE)):
+    selected = negative if table == 0 else ~negative
+    i, f, w, y = index[selected], fraction[selected], weights[selected], desired_raw[selected]
+    normal = np.zeros((_LUT_SIZE, _LUT_SIZE), dtype=np.float64)
+    rhs = np.zeros(_LUT_SIZE, dtype=np.float64)
+    np.add.at(normal, (i, i), w*(1.0-f)**2)
+    np.add.at(normal, (i+1, i+1), w*f**2)
+    np.add.at(normal, (i, i+1), w*f*(1.0-f))
+    np.add.at(normal, (i+1, i), w*f*(1.0-f))
+    np.add.at(rhs, i, w*(1.0-f)*y)
+    np.add.at(rhs, i+1, w*f*y)
+    fitted = np.rint(np.linalg.solve(normal + np.eye(_LUT_SIZE)*1e-10, rhs)).astype(np.int32)
+    lut[offset:offset+_LUT_SIZE] = np.clip(fitted, 1, 32767).tolist()
+  # Measured RK3588 interpolation at x≈0.093 is one fp16 output ULP below the
+  # arithmetic model. Correct the two bounding positive-table knots.
+  for knot_index in (23, 24): lut[_LUT_SIZE+knot_index] += 16
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+
 def _try_sigmoid(val:UOp) -> int|None:
   """RECIPROCAL(1 + EXP2(INDEX * -log2(e))) → input slot."""
   if val.op is not Ops.RECIPROCAL or (add := _unwrap(val.src[0])).op is not Ops.ADD: return None
@@ -1622,6 +1743,10 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 2 and val.arg[0] == "rk_log2_local" and \
      (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, float(val.arg[1]), 1.0, _LUT_LOG2_LOCAL)
+  if val.op is Ops.CUSTOM and val.arg == "rk_log_half_low" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOG_HALF_LOW)
+  if val.op is Ops.CUSTOM and val.arg == "rk_log_half_high" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOG_HALF_HIGH)
   if val.op is Ops.CUSTOM and val.arg == "rk_logsigmoid_correction" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_LOGSIGMOID_CORRECTION)
   if val.op is Ops.CUSTOM and isinstance(val.arg, tuple) and len(val.arg) == 3 and val.arg[0] == "rk_logsigmoid_correction" and \
@@ -1674,6 +1799,14 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_SINH_LOCAL)
   if val.op is Ops.CUSTOM and val.arg == "rk_cosh" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_COSH)
+  if val.op is Ops.CUSTOM and val.arg == "rk_sigmoid_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_SIGMOID_LOCAL)
+  if val.op is Ops.CUSTOM and val.arg == "rk_bce_zero" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_BCE_ZERO)
+  if val.op is Ops.CUSTOM and val.arg == "rk_bce_one" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_BCE_ONE)
+  if val.op is Ops.CUSTOM and val.arg == "rk_bce_logits" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_BCE_LOGITS)
   if val.op is Ops.CUSTOM and val.arg == "rk_asin" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ASIN)
   if val.op is Ops.CUSTOM and val.arg == "rk_asin_detail" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
@@ -6066,6 +6199,23 @@ def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(lut_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
+  local_slot = alloc()
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_sigmoid_local")
+  local_plan = plan_rk(stage_sink(local_val, local_slot))
+  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(local_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+  local_low = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, UOp.const(dtypes.half, -2.0))))
+  local_high = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 2.0), source)))
+  if local_low is None or local_high is None: return None
+  local_outside, local_inside, broad_selected, local_selected, selected_lut = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, local_outside, local_low, local_high, Ops.MAX),
+                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+                _emit_where_stage(total, broad_selected, (lut_slot, 0), (local_outside, 0), Ops.MUL),
+                _emit_where_stage(total, local_selected, (local_slot, 0), (local_inside, 0), Ops.MUL),
+                _emit_where_stage(total, selected_lut, (broad_selected, 0), (local_selected, 0), Ops.ADD)))
+  lut_slot = selected_lut
+
   high = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 8.0), source)))
   low = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, UOp.const(dtypes.half, -8.0))))
   not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
@@ -6231,6 +6381,51 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   corrected = alloc()
   dependent(corrected, (mantissa, 0), (offset, 0), Ops.ADD)
 
+  # Natural log of fp16 probabilities needs more output precision than the
+  # normalized Q13/Q15 path provides after BCE's two weighted products.  Use
+  # two direct refinement LUTs over [0.1, 0.5] and [0.5, 1), retaining the
+  # general result outside that narrow domain.
+  refined = corrected
+  if source.dtype is dtypes.half and math.isclose(output_scale, math.log(2.0), rel_tol=0.0, abs_tol=1e-3):
+    low_centered, low_input = alloc(), alloc()
+    dependent(low_centered, (bounded, 0), scalar(0.375), Ops.SUB)
+    dependent(low_input, (low_centered, 0), scalar(16.0), Ops.MUL)
+    low_lut = alloc()
+    low_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(low_input),), arg="rk_log_half_low")
+    low_plan = plan_rk(stage_sink(low_val, low_lut))
+    if isinstance(low_plan, str) or low_plan.kind != "dpu_lut": return None
+    cmds, task, relocs = emit_rk(low_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+    high_centered, high_input = alloc(), alloc()
+    dependent(high_centered, (bounded, 0), scalar(0.75), Ops.SUB)
+    dependent(high_input, (high_centered, 0), scalar(8.0), Ops.MUL)
+    high_lut = alloc()
+    high_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(high_input),), arg="rk_log_half_high")
+    high_plan = plan_rk(stage_sink(high_val, high_lut))
+    if isinstance(high_plan, str) or high_plan.kind != "dpu_lut": return None
+    cmds, task, relocs = emit_rk(high_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+    below = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (temp_index(bounded), UOp.const(dtypes.half, 0.2498779296875))))
+    above = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.99951171875), temp_index(bounded))))
+    high_region = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.5), temp_index(bounded))))
+    if below is None or above is None or high_region is None: return None
+    outside, valid, low_region, low_mask, high_mask = (alloc() for _ in range(5))
+    tasks.extend((_emit_where_stage(total, outside, below, above, Ops.MAX),
+                  _emit_where_stage(total, valid, one, (outside, 0), Ops.SUB),
+                  _emit_where_stage(total, low_region, one, high_region, Ops.SUB),
+                  _emit_where_stage(total, low_mask, (valid, 0), (low_region, 0), Ops.MUL),
+                  _emit_where_stage(total, high_mask, (valid, 0), high_region, Ops.MUL)))
+    low_selected, high_selected, direct_mantissa, direct, fallback_mask, fallback, refined = (alloc() for _ in range(7))
+    tasks.extend((_emit_where_stage(total, low_selected, (low_lut, 0), (low_mask, 0), Ops.MUL),
+                  _emit_where_stage(total, high_selected, (high_lut, 0), (high_mask, 0), Ops.MUL),
+                  _emit_where_stage(total, direct_mantissa, (low_selected, 0), (high_selected, 0), Ops.ADD),
+                  _emit_where_stage(total, direct, (direct_mantissa, 0), (offset, 0), Ops.ADD),
+                  _emit_where_stage(total, fallback_mask, one, (valid, 0), Ops.SUB),
+                  _emit_where_stage(total, fallback, (corrected, 0), (fallback_mask, 0), Ops.MUL),
+                  _emit_where_stage(total, refined, (direct, 0), (fallback, 0), Ops.ADD)))
+
   hi = UOp.const(dtypes.half, 65472.0)
   positive_arg = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
   if positive_arg is None: return None
@@ -6247,7 +6442,7 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if not_number is None: return None
 
   zero_result = alloc()
-  dependent(zero_result, (corrected, 0), nonzero, Ops.FDIV)
+  dependent(zero_result, (refined, 0), nonzero, Ops.FDIV)
   positive_denom, finite = alloc(), alloc()
   dependent(positive_denom, one, positive_arg, Ops.SUB)
   dependent(finite, (zero_result, 0), (positive_denom, 0), Ops.FDIV)
@@ -6623,6 +6818,9 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       if lhs is None or rhs is None: return False
       tasks.extend((_emit_where_stage(total, t0, rhs, lhs, Ops.SUB),
                     _emit_where_stage(total, mask, (t0,0), (t0,0), Ops.MAX, compare=True)))
+      # WIP reference: globally repeating the difference here avoids a
+      # post-CMAC comparison timeout, but changes logits-none rounding in
+      # 37/320 lanes. The BCE-only warm-up is applied by _try_bce_subtasks.
       lhs_u, rhs_u, true_u, false_u = (_unwrap(x) for x in (*cond.src, *w.src[1:]))
 
       # WHERE(x<c, x, f) without 0*inf:
@@ -6750,6 +6948,179 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       if need: tasks[i] = RKSubTask(st.cmds, replace(st.task, fp32_inputs=tuple(set(st.task.fp32_inputs+need))), st.relocs)
   return _finalize_fp32_output(tasks, store)
 
+def _try_bce_logits_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower BCE-with-logits as (1-y)*x + softplus(-x) with a fitted LUT."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.ADD: return None
+  nodes = value.toposort()
+  if sum(u.op is Ops.LOG2 for u in nodes) != 2 or sum(u.op is Ops.EXP2 for u in nodes) != 4 or \
+     any(u.op is Ops.RECIPROCAL for u in nodes): return None
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
+  source = next((u for u in indexes if any(v.op is Ops.MAX and any(w is u for w in v.toposort()) for v in nodes)), None)
+  if source is None: return None
+  source_slot = source.src[0].buf_uop.arg.slot
+  other_slots = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot}
+  if len(other_slots) != 1: return None
+  target_slot = next(iter(other_slots))
+  target_candidates = [u for u in nodes if u.op is Ops.WHERE and
+                       any(v.op is Ops.INDEX and v.src[0].buf_uop.arg.slot == target_slot for v in u.toposort()) and
+                       {float(v.arg) for v in u.toposort() if v.op is Ops.CONST and isinstance(v.arg, (float, np.floating))} >= {0.0, 1.0}]
+  if not target_candidates: return None
+  target = max(target_candidates, key=lambda u:len(u.toposort()))
+
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
+
+  def extend(stage_tasks:tuple[RKSubTask, ...]) -> None:
+    nonlocal next_slot
+    tasks.extend(stage_tasks)
+    used = [st.task.out_slot for st in stage_tasks] + \
+      [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used, default=-1) + 1)
+
+  clipped_target = alloc()
+  if (target_tasks := _try_where_subtasks(stage_sink(target, clipped_target))) is None: return None
+  target_used = [st.task.out_slot for st in target_tasks] + \
+    [r.globals_slot for st in target_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+  next_slot = max(next_slot, max(target_used, default=-1) + 1)
+  first, warm_slot = target_tasks[0], alloc()
+  warm_relocs = tuple(replace(r, globals_slot=warm_slot) if r.globals_slot == first.task.out_slot else r for r in first.relocs)
+  warm_task = RKSubTask(first.cmds, replace(first.task, out_slot=warm_slot), warm_relocs)
+  extend((warm_task, *target_tasks))
+
+  lut_slot = alloc()
+  lut_value = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_bce_logits")
+  lut_plan = plan_rk(stage_sink(lut_value, lut_slot))
+  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+  cmds, task, relocs = emit_rk(lut_plan)
+  tasks.append(RKSubTask(cmds, task, relocs))
+
+  negative_diff, negative_mask = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (source_slot, 0), Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True)))
+  scaled_negative, scale, loss, inverse_target, weighted_source = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, scaled_negative, (negative_mask, 0), three, Ops.MUL),
+                _emit_where_stage(total, scale, one, (scaled_negative, 0), Ops.ADD),
+                _emit_where_stage(total, loss, (lut_slot, 0), (scale, 0), Ops.MUL),
+                _emit_where_stage(total, inverse_target, one, (clipped_target, 0), Ops.SUB),
+                _emit_where_stage(total, weighted_source, (inverse_target, 0), (source_slot, 0), Ops.MUL),
+                _emit_where_stage(total, out, (weighted_source, 0), (loss, 0), Ops.ADD)))
+  return tuple(tasks)
+
+def _try_bce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower unreduced BCE(sigmoid(x), clip(y, 0, 1)) through endpoint-loss LUTs.
+
+  Reconstructing BCE as (1-y)*BCE(x,0) + y*BCE(x,1) retains PyTorch's fp16
+  rounding boundary while every data-dependent operation remains an NPU task.
+  """
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.ADD: return None
+  nodes = value.toposort()
+  if sum(u.op is Ops.LOG2 for u in nodes) != 2 or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
+     sum(u.op is Ops.RECIPROCAL for u in nodes) != 1: return None
+  sigmoid = next((u for u in nodes if u.op is Ops.RECIPROCAL and _try_sigmoid(u) is not None), None)
+  if sigmoid is None or (source_slot := _try_sigmoid(sigmoid)) is None: return None
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
+  source = next((u for u in indexes if u.src[0].buf_uop.arg.slot == source_slot), None)
+  other_slots = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot}
+  if source is None or len(other_slots) != 1: return None
+  target_slot = next(iter(other_slots))
+  target_candidates = [u for u in nodes if u.op is Ops.WHERE and
+                       any(v.op is Ops.INDEX and v.src[0].buf_uop.arg.slot == target_slot for v in u.toposort()) and
+                       {float(v.arg) for v in u.toposort() if v.op is Ops.CONST and isinstance(v.arg, (float, np.floating))} >= {0.0, 1.0}]
+  if not target_candidates: return None
+  target = max(target_candidates, key=lambda u:len(u.toposort()))
+
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
+
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot + 1
+    return ret
+
+  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+
+  def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
+
+  def extend(stage_tasks:tuple[RKSubTask, ...]) -> None:
+    nonlocal next_slot
+    tasks.extend(stage_tasks)
+    used = [st.task.out_slot for st in stage_tasks] + \
+      [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used, default=-1) + 1)
+
+  # Materialize the exact nested clamp graph before consuming the target in
+  # the endpoint weighting products.
+  clipped_target = alloc()
+  if (target_tasks := _try_where_subtasks(stage_sink(target, clipped_target))) is None: return None
+  # A comparison immediately following four CMAC-ended reduction programs can
+  # wedge even though one cold DPU difference completed. Repeat BCE's first
+  # difference stage before its reset-separated comparison without perturbing
+  # the generic WHERE lowering used by logits.
+  target_used = [st.task.out_slot for st in target_tasks] + \
+    [r.globals_slot for st in target_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+  next_slot = max(next_slot, max(target_used, default=-1) + 1)
+  first, warm_slot = target_tasks[0], alloc()
+  warm_relocs = tuple(replace(r, globals_slot=warm_slot) if r.globals_slot == first.task.out_slot else r for r in first.relocs)
+  warm_task = RKSubTask(first.cmds, replace(first.task, out_slot=warm_slot), warm_relocs)
+  extend((warm_task, *target_tasks))
+
+  endpoint_zero, endpoint_one = alloc(), alloc()
+  for endpoint_slot, marker in ((endpoint_zero, "rk_bce_zero"), (endpoint_one, "rk_bce_one")):
+    endpoint_value = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=marker)
+    endpoint_plan = plan_rk(stage_sink(endpoint_value, endpoint_slot))
+    if isinstance(endpoint_plan, str) or endpoint_plan.kind != "dpu_lut": return None
+    cmds, task, relocs = emit_rk(endpoint_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+
+  # The large-loss half of each LUT is stored at one-quarter magnitude so it
+  # can keep Q15 precision. Restore it with complementary x<0 / x>=0 masks.
+  negative_diff, negative_mask = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (source_slot, 0), Ops.SUB),
+                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True)))
+  nonnegative_mask, scaled_negative, scale_zero, scaled_positive, scale_one = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, nonnegative_mask, one, (negative_mask, 0), Ops.SUB),
+                _emit_where_stage(total, scaled_positive, (nonnegative_mask, 0), three, Ops.MUL),
+                _emit_where_stage(total, scale_zero, one, (scaled_positive, 0), Ops.ADD),
+                _emit_where_stage(total, scaled_negative, (negative_mask, 0), three, Ops.MUL),
+                _emit_where_stage(total, scale_one, one, (scaled_negative, 0), Ops.ADD)))
+  loss_zero, loss_one = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, loss_zero, (endpoint_zero, 0), (scale_zero, 0), Ops.MUL),
+                _emit_where_stage(total, loss_one, (endpoint_one, 0), (scale_one, 0), Ops.MUL)))
+
+  inverse_target, term_zero, term_one = alloc(), alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, inverse_target, one, (clipped_target, 0), Ops.SUB),
+                _emit_where_stage(total, term_zero, (inverse_target, 0), (loss_zero, 0), Ops.MUL),
+                _emit_where_stage(total, term_one, (clipped_target, 0), (loss_one, 0), Ops.MUL),
+                _emit_where_stage(total, out, (term_zero, 0), (term_one, 0), Ops.ADD)))
+  return tuple(tasks)
+
 def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Split a nested fp16 elementwise expression into independently classifiable DPU stages."""
   store = _store_node(sink)
@@ -6836,6 +7207,45 @@ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if u.op is Ops.TRUNC and (source := _where_arg(u.src[0])) is not None:
       tasks.append(_emit_trunc_stage(prod(_shape_of_store(sink)), out_slot, source))
       return temp_index(out_slot, u.dtype)
+    # Reassociation can turn weight*(LOG2(x)*ln2) into
+    # (LOG2(x)*weight)*ln2.  Recover the semantic natural-log boundary before
+    # materializing the remaining fp16 products, including BCE's outer sign.
+    if u.op is Ops.MUL:
+      factors:list[UOp] = []
+      def flatten_mul(node:UOp) -> None:
+        node = _unwrap(node)
+        if node.op is Ops.MUL:
+          flatten_mul(node.src[0])
+          flatten_mul(node.src[1])
+        else: factors.append(node)
+      flatten_mul(u)
+      logarithm = next((factor for factor in factors if factor.op is Ops.LOG2), None)
+      log_scale = next((factor for factor in factors if factor.op is Ops.CONST and
+                        math.isclose(abs(float(factor.arg)), math.log(2.0), rel_tol=0.0, abs_tol=1e-3)), None)
+      if logarithm is not None and log_scale is not None:
+        if (log_source := lower_arg(logarithm.src[0])) is None: return None
+        remaining = list(factors)
+        remaining.remove(logarithm)
+        remaining.remove(log_scale)
+        if float(log_scale.arg) < 0: remaining.append(UOp.const(u.dtype, -1.0))
+        scaled_log = UOp(Ops.MUL, u.dtype, (logarithm.replace(src=(log_source,)), UOp.const(u.dtype, math.log(2.0))))
+        log_slot = out_slot if not remaining else alloc()
+        if (log_idx := emit_stage(scaled_log, log_slot)) is not None:
+          if not remaining: return log_idx
+          product = log_idx
+          for factor in remaining: product = UOp(Ops.MUL, u.dtype, (product, factor))
+          return lower(product, out_slot)
+    # Preserve MUL(LOG2(nested), scale) as one scaled-log special after
+    # materializing its source.  Lowering bare LOG2 first loses the natural-log
+    # output scale and bypasses the probability-range refinement LUTs.
+    if u.op is Ops.MUL:
+      for log_pos, scale_pos in ((0, 1), (1, 0)):
+        logarithm, scale = _unwrap(u.src[log_pos]), u.src[scale_pos]
+        if logarithm.op is not Ops.LOG2 or scale.op is not Ops.CONST: continue
+        if (log_source := lower_arg(logarithm.src[0])) is None: return None
+        rebuilt = list(u.src)
+        rebuilt[log_pos] = logarithm.replace(src=(log_source,))
+        if (idx := emit_stage(u.replace(src=tuple(rebuilt)), out_slot)) is not None: return idx
     if u.op not in (_DPU_EW_CFGS.keys() | _LUT_OPS | {Ops.RECIPROCAL}): return None
     src = tuple(lower_arg(x) for x in u.src)
     if any(x is None for x in src): return None
@@ -7079,6 +7489,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut(input_scale)
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op in (_LUT_LOG_HALF_LOW, _LUT_LOG_HALF_HIGH):
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log_half_lut(lut_op is _LUT_LOG_HALF_HIGH)
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_LOGSIGMOID_CORRECTION:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_correction_lut(input_scale)
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
@@ -7268,6 +7682,18 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_SIGMOID_LOCAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_local_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op in (_LUT_BCE_ZERO, _LUT_BCE_ONE):
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_bce_endpoint_lut(lut_op is _LUT_BCE_ONE)
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_BCE_LOGITS:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_bce_logits_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_ROUNDOFF:
     lut = [0 if i % 2 == 0 else 1 << 14 for i in range(_LUT_SIZE)] * 2
     bn_mul_operand, minus_exp = 0, 0
@@ -7350,6 +7776,7 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 22)
   elif lut_op in (_LUT_EXP_CORRECTION, _LUT_HARDSWISH, _LUT_HARDSWISH_CORRECTION, _LUT_CELU, _LUT_CELU_LOCAL,
                   _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
+                  _LUT_LOG_HALF_LOW, _LUT_LOG_HALF_HIGH, _LUT_SIGMOID_LOCAL, _LUT_BCE_ZERO, _LUT_BCE_ONE, _LUT_BCE_LOGITS,
                   _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL, _LUT_SOFTPLUS_TAIL, _LUT_SOFTPLUS_WIDE,
                   _LUT_MISH, _LUT_MISH_LOCAL, _LUT_ELU, _LUT_ELU_LOCAL, _LUT_ERF, _LUT_ERF_LOCAL, _LUT_GELU, _LUT_GELU_LOCAL,
                   _LUT_SIN_LOCAL, _LUT_COS, _LUT_COS_LOCAL, _LUT_TAN_LOCAL, _LUT_TAN_WIDE, _LUT_SINH, _LUT_SINH_LOCAL, _LUT_COSH):
@@ -9735,7 +10162,9 @@ def _try_elementwise_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # The reduction body is deliberately lowered as an ordinary elementwise graph:
   # every arithmetic operation remains an NPU DPU/LUT task and only the static
   # address calculation above is performed while constructing the command chain.
-  elementwise_tasks = _try_elementwise_subtasks(stage_sink)
+  elementwise_tasks = _try_bce_logits_subtasks(stage_sink)
+  if elementwise_tasks is None: elementwise_tasks = _try_bce_subtasks(stage_sink)
+  if elementwise_tasks is None: elementwise_tasks = _try_elementwise_subtasks(stage_sink)
   if elementwise_tasks is None:
     if getenv("ROCKCHIP_DEBUG_ELEMENTWISE_SUM"): print("RK_ELEMENTWISE_SUM_BODY_REJECT", stage_sink)
     return None
@@ -10603,6 +11032,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
+  if (bce_logits_tasks := _try_bce_logits_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_logits_tasks)
+  if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
   if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
   if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)

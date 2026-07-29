@@ -1989,6 +1989,148 @@ select the decoded high task for `x>0`.  The result feeds the same roundoff
 LUT validity/parity pipeline documented above; a dense half sweep therefore
 also verifies that all noninteger exponents remain NaN.
 
+## BCE endpoint LUTs: fit the fp16 domain, not only the knots
+
+Unreduced BCE is unusually sensitive to LUT construction because its
+reference includes multiple fp16 rounding boundaries.  A mathematically
+smooth approximation to `softplus` is not necessarily the same result as
+`-log(fp16(sigmoid(x)))`, and sampling that rounded function only at the RK
+grid knots is also insufficient: hardware interpolates linearly between
+steps of a staircase.
+
+### Ordinary BCE: two physical NPU LUT tasks
+
+Preserve the fp16 endpoint formulation:
+
+```text
+loss0 = BCE(fp16(sigmoid(x)), 0)
+loss1 = BCE(fp16(sigmoid(x)), 1)
+result = fp16(fp16((1-y)*loss0) + fp16(y*loss1))
+```
+
+Use one LUT task for each endpoint.  Both use:
+
+| Parameter | Value |
+|---|---:|
+| domain | `[-2,2]` |
+| entries | `513 negative + 513 positive` |
+| input scale | `8192` |
+| grid spacing | `1/256` |
+| stored precision | Q15 |
+
+`loss0` exceeds one on nonnegative `x`, while `loss1` exceeds one on negative
+`x`.  Store the corresponding large half divided by four and restore it with
+the DPU mask:
+
+```text
+negative    = x < 0
+scale0      = 1 + 3*(1-negative)
+scale1      = 1 + 3*negative
+decoded0    = table0(x) * scale0
+decoded1    = table1(x) * scale1
+```
+
+This is a genuine two-level/two-task LUT design: both NPU tasks evaluate the
+same input with different endpoint functions, and subsequent NPU products
+combine them.  It is not a host lookup and it is not two tables selected
+inside one task.
+
+### Weighted least-squares node fit
+
+Generate all 65,536 fp16 bit patterns, retain finite values in `[-2,2]`, sort
+them, and assign each value a weight equal to its real-number Voronoi width:
+
+```text
+boundary[j] = (x[j-1] + x[j]) / 2
+weight[j]   = boundary[j+1] - boundary[j]
+```
+
+For an input in interval `i` with fractional position `f`, RK interpolation
+uses:
+
+```text
+predicted_raw = (1-f)*node[i] + f*node[i+1]
+```
+
+Accumulate the weighted normal equations for the two adjacent nodes:
+
+```text
+A[i,i]       += w*(1-f)^2
+A[i+1,i+1]   += w*f^2
+A[i,i+1]     += w*f*(1-f)
+A[i+1,i]     += w*f*(1-f)
+b[i]         += w*(1-f)*desired_raw
+b[i+1]       += w*f*desired_raw
+```
+
+Solve negative and positive tables independently, round the fitted nodes to
+integers, and clamp to the signed Q15 range.  The interval weighting matters:
+uniformly weighting half bit patterns vastly overrepresents the subnormal
+region compared with uniformly distributed real inputs.
+
+For target one, measured RK interpolation needs these sparse corrections:
+
+```text
+(table,index,delta):
+(0,372,+8) (0,373,+8)
+(1,155,+8) (1,156,+8)
+(1,383,+8) (1,384,+8)
+(1,401,-8) (1,402,-8)
+(1,460,-8) (1,467,+8)
+```
+
+Always adjust both bounding knots when correcting a broad interval.  A lone
+knot correction can fix one phase while breaking an adjacent half input.
+Here knots 460 and 467 are exact-node corrections and therefore stand alone.
+
+### BCE with logits: one fitted LUT task
+
+For the tested fp16 graph, PyTorch semantics are:
+
+```text
+tail   = fp16(softplus(-x))
+result = fp16(fp16((1-y)*x) + tail)
+```
+
+Fit only `tail`.  Store the negative-input half divided by four because
+`softplus(-x)>1` there, then decode with `1+3*(x<0)`.  The global fit predicts
+zero tolerance failures on the deterministic official tensor.  RK3588 is one
+output ULP low near `x≈0.093`, so positive-table knots 23 and 24 receive
+`+16` raw units.
+
+Do not replace the fp16 formula with endpoint blending
+`(1-y)*loss0+y*loss1`: it has two official tolerance misses even when both
+endpoint values are exact.  The multiplication/addition association is part
+of the reference.
+
+### Hardware tuning loop
+
+1. Record `x`, clipped `y`, expected output, NPU output, endpoint outputs,
+   table id, index, and interpolation fraction for every miss.
+2. Verify the software interpolation model includes fp16 rounding immediately
+   after the LUT and again after the `*4` decode.
+3. Sweep a proposed raw correction in software over the complete deterministic
+   tensor, not only the failing lane.
+4. Run the isolated unchanged none-reduction test on hardware.
+5. Rerun mean/sum because a harmless lane ULP can cross a CMAC final-rounding
+   boundary.
+6. Rerun a multi-program sequence.  A driver timeout after several CMAC
+   programs is submission/reset state and must not be tuned as LUT error.
+
+Useful controls:
+
+| Control | Purpose |
+|---|---|
+| `ROCKCHIP_DEBUG_SUBTASKS=1` | verify two ordinary endpoint LUTs or one logits LUT |
+| `ROCKCHIP_LOG_HALF_BIAS` | reproduce rejected direct-log bias sweeps |
+| `ROCKCHIP_SIGMOID_LOCAL_SHIFT` | reproduce rejected dense-sigmoid phase sweeps |
+| `DEBUG=1` | identify the exact successful submission before a timeout |
+
+Measured ordinary-none progression was 68 misses for the original graph, 53
+after log/sigmoid refinement, 16 with direct endpoint knots, 6 after the
+global fp16 fit, and 0 after sparse calibration.  The logits path improved
+from 37 misses to one with the fit and to zero with the two-knot correction.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

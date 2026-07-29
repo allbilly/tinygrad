@@ -1476,7 +1476,7 @@ class RockchipProgram(Program['RockchipDevice']):
         for b in shared: dev._gpu_free(b)
       return
     # Custom comparison and LUT stages leave DPU state that makes a mixed chain unstable.
-    # Submit those programs stage-by-stage with resets, retaining shared scratch allocations.
+    # Keep those stages isolated and chain only consecutive ordinary DPU tasks.
     def is_cmp(st): return any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
                                ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds)
     if len(subtasks) > 1 and any(is_cmp(st) or st.task.kind == "dpu_lut" for st in subtasks):
@@ -1489,10 +1489,30 @@ class RockchipProgram(Program['RockchipDevice']):
         while len(ext) <= max_slot:
           shared.append(b := dev._gpu_alloc(max(total * 2, 4096), 0))
           ext.append(b)
-        for st in subtasks:
+        # Batch only consecutive ordinary DPU stages. LUT, comparison, and
+        # compute-family boundaries remain reset-separated.
+        dpu_pending:list[RKSubTask] = []
+        def flush_pending() -> None:
+          if not dpu_pending: return
           dev.reset_npu()
-          self.subtasks = [st]
+          self.subtasks = list(dpu_pending)
           self._submit_multi(tuple(ext))
+          dpu_pending.clear()
+        for st in subtasks:
+          if is_cmp(st) or st.task.kind != "dpu":
+            flush_pending()
+            dev.reset_npu()
+            self.subtasks = [st]
+            self._submit_multi(tuple(ext))
+          else:
+            dpu_pending.append(st)
+        flush_pending()
+        # WIP reference: the older stability path submitted every stage
+        # separately. Long reduction sequences eventually wedged the driver:
+        #   for st in subtasks:
+        #     dev.reset_npu()
+        #     self.subtasks = [st]
+        #     self._submit_multi(tuple(ext))
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)

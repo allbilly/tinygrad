@@ -7356,3 +7356,113 @@ Use `RK_TRACE_MATCH=1` when this path regresses.  A successful softplus match
 followed by `unsupported_layout:Ops.ADD` means the special function saw a
 multi-axis affine index; `ROCKCHIP_DEBUG_SUBTASKS=1` verifies the flattening
 copy and confirms scratch buffers are not incorrectly marked fp32.
+
+## 2026-07-30 — complete forward BCE reductions with fitted endpoint LUTs
+
+All unchanged BCE forward tests now pass, including ordinary and logits
+`reduction="none"`.  The unreduced ordinary failure was not a single bad log
+constant.  The same expression on Tinygrad CPU with
+`DEFAULT_FLOAT=HALF` missed 73/320 lanes, and Rockchip initially missed
+68/320 (maximum absolute error `0.0048828125`).  Direct natural-log
+refinement reduced the error, but the remaining sigmoid and multiplication
+rounding boundaries required preserving BCE's fp16 endpoint formulation:
+
+```text
+ordinary: (1-y)*BCE(sigmoid(x), 0) + y*BCE(sigmoid(x), 1)
+logits:   (1-y)*x + softplus(-x)
+```
+
+### Ordinary two-task endpoint design
+
+Two NPU LUT tasks evaluate target-zero and target-one loss.  Each LUT covers
+`x∈[-2,2]` on the dense `index_scale=8192` grid.  Its large-loss half is
+stored divided by four in Q15 and restored by a DPU sign mask, so both halves
+retain Q15 effective precision.  The clipped target, sign masks, scale
+restoration, two products, and final add are all DPU work.
+
+Sampling only the 513 grid knots is wrong because `sigmoid_fp16(x)` is a
+staircase and RK linear interpolation crosses its rounding steps.  The final
+builder fits 513 nodes against every finite fp16 input in the domain.  Each
+input is weighted by the width of its real-number Voronoi interval, and the
+two-node linear least-squares normal equations are solved independently for
+the negative and positive tables.  Measured progression on the deterministic
+320-lane official input was:
+
+| Ordinary-none implementation | Outside tolerance |
+|---|---:|
+| original general sigmoid/log graph | 68 |
+| refined log plus dense sigmoid | 53 |
+| direct endpoint grid samples | 16 |
+| fp16-domain fitted endpoint nodes | 6 |
+| fitted nodes plus sparse interpolation calibration | **0** |
+
+Target-one calibration moves only knots
+`(table,index,raw_delta)=(0,372,+8),(0,373,+8),
+(1,155,+8),(1,156,+8),(1,383,+8),(1,384,+8),
+(1,401,-8),(1,402,-8),(1,460,-8),(1,467,+8)`.
+These are interpolation-boundary corrections, not per-input outputs.
+
+### Logits one-task endpoint design
+
+PyTorch fp16 BCE-with-logits is exactly
+`fp16(fp16((1-y)*x) + fp16(softplus(-x)))` for the official domain.
+A dedicated fitted `softplus(-x)` LUT uses the same Q15/divide-by-four split
+on negative `x`.  Its arithmetic model predicted zero tolerance misses and
+three harmless bit differences.  RK hardware was one output ULP low near
+`x≈0.093`; adding `+16` to positive-table knots 23 and 24 makes the unchanged
+320-lane logits-none case pass.
+
+### Reduction and reset-state handling
+
+Mean and sum now materialize either endpoint formula before the existing
+CMAC reduction.  Ordinary mean fell from about 76 seconds and hundreds of
+generic tasks to about 11 seconds and 31 DPU/LUT stages plus CMAC.
+
+The unchanged six-case reductions method originally timed out reproducibly
+after four CMAC-ended programs.  The runtime was reset-submitting every
+single arithmetic stage whenever any LUT or comparison existed, accumulating
+well over 100 resets.  It now keeps LUT, comparison, and CMAC boundaries
+reset-separated but PC-chains consecutive ordinary DPU stages.  The older
+stage-by-stage loop remains commented beside the active batching logic.
+A distinct BCE-only warm difference buffer is emitted before the first
+clamp comparison; applying that warm-up globally changed logits rounding and
+was rejected.
+
+Debug sequence for future regressions:
+
+1. run ordinary and logits `reduction="none"` separately to distinguish LUT
+   accuracy from CMAC accumulation;
+2. print failing `x`, clipped `y`, endpoint losses, table/index/fraction, and
+   raw neighboring knots;
+3. emulate RK interpolation as `raw[i]*(1-f)+raw[i+1]*f`, then round to
+   fp16 before the DPU `*4` restoration;
+4. use `ROCKCHIP_DEBUG_SUBTASKS=1` to verify ordinary none has two endpoint
+   LUTs and logits none has one;
+5. use `DEBUG=1` around a multi-case sequence.  A successful first DPU
+   followed by a comparison timeout indicates reset-state accumulation, not
+   a numerical LUT miss;
+6. test sparse knot changes against all deterministic lanes before hardware,
+   then confirm on RK3588 because interpolation phase can differ by one ULP.
+
+No BCE arithmetic uses `run_host`.  A repository-wide search found no
+general accelerator-backend convention for evaluating an unsupported
+operator on CPU; Rockchip host helpers remain limited to static layout,
+representation selection, and dtype/ABI conversion.  RKNN Toolkit2 issue
+[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) remains useful
+evidence for long fp16 accumulation drift, but it does not supply a LUT or
+elementwise workaround for this group.
+
+### Validation
+
+Using `. .venv/bin/activate`,
+`DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1`:
+
+- unchanged `TestOps.test_binary_crossentropy_reductions`: **1 passed in
+  31.74 seconds**;
+- unchanged default BCE plus vector-positive-weight logits:
+  **2 passed in 40.38 seconds**;
+- isolated ordinary none and logits none: **320/320 passing each**;
+- `test/rockchip/test_pr1.py`: **79/79 in 6.67 seconds**;
+- Python compilation and `git diff --check`: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline;
+- ruff and pytest-xdist remain unavailable in `.venv`.
