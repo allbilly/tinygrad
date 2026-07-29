@@ -7326,3 +7326,33 @@ accumulation drift reported in
 [RKNN Toolkit2 issue #471](https://github.com/airockchip/rknn-toolkit2/issues/471)
 supports caution around long fp16 CMAC/reduction chains, but it does not
 explain the unreduced elementwise LUT error or the broadcast rejection.
+
+## 2026-07-30 — BCE-with-logits vector positive weights
+
+The unchanged `TestOps.test_binary_crossentropy_logits_pos_weights` now
+passes.  Its two reduction axes turn the logically flat 320-element
+softplus input into the affine index `row*10+column`.  The special softplus
+matcher succeeded, but the LUT classifier rejected that uniform two-axis
+layout while ordinary DPU scalar tasks already accepted it.
+
+DPU LUT classification now permits the same uniform two-axis affine layout:
+every indexed tensor in the stage must use the compatible layout.  A
+non-flat inner softplus input is materialized by a native DPU copy before its
+two LUT tasks, after which the existing broadcast expansion multiplies the
+10-element positive-weight vector over 32 rows.  No value-dependent host
+callback and no `run_host` arithmetic are used.
+
+Validation with `. .venv/bin/activate`, disabled caches, half defaults, and
+forward-only:
+
+- unchanged official positive-weight BCE-with-logits: **passing in 12.10
+  seconds**;
+- `test/rockchip/test_pr1.py`: **79/79 passing**;
+- Python compilation and `git diff --check`: **passing**;
+- mypy: unchanged **13-error** Rockchip baseline; ruff remains unavailable in
+  `.venv`.
+
+Use `RK_TRACE_MATCH=1` when this path regresses.  A successful softplus match
+followed by `unsupported_layout:Ops.ADD` means the special function saw a
+multi-axis affine index; `ROCKCHIP_DEBUG_SUBTASKS=1` verifies the flattening
+copy and confirms scratch buffers are not incorrectly marked fp32.

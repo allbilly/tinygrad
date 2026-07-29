@@ -2056,7 +2056,7 @@ def plan_rk(sink: UOp) -> RKPlan|str:
     abs_slot = _try_abs(val) if not (lut_result is not None or sub_slots is not None or scalar is not None or reciprocal is not None) else None
     # PR1 DPU contract: binary EW with two INDEX operands, scalar operand, DMA copy, or constant fill.
     # Broadcast and mean are rejected — no host-side tensor arithmetic.
-    if lut_result is not None: kind, a2d, ru = "dpu_lut", False, False
+    if lut_result is not None: kind, a2d, ru = "dpu_lut", True, True
     elif sub_slots is not None: kind, a2d, ru = "dpu", False, False
     elif reciprocal is not None: kind, a2d, ru = "dpu", True, True
     elif scalar is not None or (val.op in _DPU_EW_CFGS and all(_unwrap(s).op is Ops.INDEX for s in val.src)): kind, a2d, ru = "dpu", True, True
@@ -2977,11 +2977,13 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
   tasks:list[RKSubTask] = []
-  if source.op is not Ops.INDEX:
+  if source.op is not Ops.INDEX or not _is_flat_contiguous(source.src[1]):
     materialized_source = alloc()
     source_store = store.replace(src=(temp_index(materialized_source), source))
     source_plan = plan_rk(sink.substitute({store:source_store}))
-    if isinstance(source_plan, str) or source_plan.kind != "dpu": return None
+    if isinstance(source_plan, str) or source_plan.kind != "dpu":
+      if getenv("RK_TRACE_MATCH"): print("rk softplus source reject", source_plan)
+      return None
     cmds, task, relocs = emit_rk(source_plan)
     tasks.append(RKSubTask(cmds, task, relocs))
     source = temp_index(materialized_source)
@@ -3007,7 +3009,9 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   broad_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_logsigmoid_correction", beta, 1/beta))
   broad_store = store.replace(src=(temp_index(correction), broad_val))
   broad_plan = plan_rk(sink.substitute({store:broad_store}))
-  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut":
+    if getenv("RK_TRACE_MATCH"): print("rk softplus broad reject", broad_plan)
+    return None
   cmds, task, relocs = emit_rk(broad_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
@@ -3015,7 +3019,9 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tail_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_softplus_tail", beta, 1/beta))
   tail_store = store.replace(src=(temp_index(tail), tail_val))
   tail_plan = plan_rk(sink.substitute({store:tail_store}))
-  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut": return None
+  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut":
+    if getenv("RK_TRACE_MATCH"): print("rk softplus tail reject", tail_plan)
+    return None
   cmds, task, relocs = emit_rk(tail_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 

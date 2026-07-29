@@ -1232,3 +1232,16 @@ diff whitespace checks pass, and mypy remains at its pre-existing 13-error
 Rockchip baseline.  Ruff is unavailable in `.venv`.
 Unreduced ordinary BCE is the next LUT-accuracy task (max relative error
 0.434%); vector positive weights are a separate broadcast-lowering task.
+
+### BCE-with-logits positive-weight milestone
+
+| Coverage | Result |
+|---|---:|
+| official `(32,10)` logits with 10-lane `pos_weight` | **passing in 12.10s** |
+| uniform two-axis softplus LUT input | **native DPU copy + LUT** |
+| PR1 regression suite | **79/79 passing** |
+
+The LUT classifier now accepts compatible uniform 2D affine layouts, matching
+the existing DPU rule.  The vector broadcast, softplus, multiplication, and
+final CMAC mean all remain NPU-native; `run_host` performs no operator
+arithmetic.  Unreduced ordinary BCE LUT accuracy remains the next loss issue.
