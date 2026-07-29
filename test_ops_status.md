@@ -80,6 +80,17 @@ pad-slice, tril, and triu; circular pad passes through modulo indexing. The
 combined movement neighborhood is **11/11 in 23.13 seconds**, and the hardware
 regression remains **70/70 in 207.21 seconds**.
 
+The inverse-trig pass now recognizes the exact tinygrad asin/acos lowering and
+evaluates each method with two NPU LUT tasks. Unchanged `test_asin` and
+`test_acos` pass **2/2 in 35.43 seconds**, including out-of-domain NaN
+subcases. Asin combines broad interpolation with a dual-purpose near-zero /
+endpoint-distance detail table; acos uses asymmetric signed broad encoding and
+a high-resolution endpoint table. `atan`, `asinh`, `acosh`, and `atanh`
+remain in the next inverse-function group. A new 4,103-value dense regression
+covers signed zero, endpoints, and invalid inputs; the complete hardware file
+is now **71/71 passing in 218.55 seconds**. The official pair passes **2/2 in
+35.08 seconds** after the signed-zero fix.
+
 ## Summary
 
 | Status | Count |
@@ -196,6 +207,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
   periodic angles through `±1,000,000`
 - exp and exp2, including integer scalar typing and IEEE specials
 - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
+- asin and acos, including endpoint precision and out-of-domain NaN
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave

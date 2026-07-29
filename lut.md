@@ -1520,6 +1520,83 @@ infinity for cosh. Direct fp16 NaN/infinity input still exposes root-LUT
 nonfinite behavior and should get an explicit sentinel/validity path if those
 values are added to the official method.
 
+### Asin/acos: two tasks, three precision regions
+
+The `rknnops.h` algorithms 32 and 33 establish useful register geometry, but
+their unsigned Q0.15 output is biased by one and normalized for a host-side
+decode. Tinygrad instead needs signed, fully decoded tensor values. The native
+paths use two DPU LUT tasks per operation and ordinary elementwise tasks for
+selection.
+
+The first attempted asin design was a uniform `asin(x)/2` Q15 table over
+`[-1,1]`, decoded by a multiply by two. Enumerating all 15,414 finite fp16
+values in that interval found six failures:
+
+```text
+±0.99853515625, ±0.9990234375, ±0.99951171875
+```
+
+The official NumPy seed contains four of those values, so an endpoint fix is
+required rather than optional dense-test hardening. The derivative of asin is
+singular at `|x|=1`; increasing a uniform address scale cannot cover the full
+domain and improve those endpoints simultaneously.
+
+The passing asin geometry is:
+
+| Task/table | LUT input | Stored value | Decode/use |
+|---|---:|---:|---|
+| broad LO | `abs(x)` | `asin(abs(x))/2` | multiply by 2 for `0.125 < abs(x) <= 0.875` |
+| detail LE | `-abs(x)` | `4*asin(abs(x))` | multiply by 0.25 for `0.04 < abs(x) <= 0.125` |
+| detail LO | `1-abs(x)` | `asin(1-d)/2` | multiply by 2 for `abs(x) > 0.875` |
+| no LUT | `abs(x)` | identity | `abs(x) <= 0.04` |
+
+The broad address multiplier is `16384`; the detail multiplier is `65504`.
+The detail task is still one NPU task: its LE and LO physical tables implement
+different functions, and a staged composite coordinate routes each lane to
+the intended half. This is the useful general pattern for a two-level LUT
+whose function has two unrelated difficult regions.
+
+For acos, `pi/2 - fp16_asin(x)` is not accurate enough. Even using an exactly
+rounded fp16 asin intermediate creates 70 failures on the official seeded
+tensor because the extra store and subtraction cross acos rounding
+boundaries. Acos therefore uses direct tables:
+
+| Task/table | Domain | Stored value | Decode |
+|---|---:|---:|---:|
+| broad LE | `[-0.875,0]` | `acos(x)/4` | multiply by 4 |
+| broad LO | `[0,0.875]` | `acos(x)/2` | multiply by 2 |
+| endpoint LO | distance `d=1-abs(x)` | `acos(1-d)` | direct |
+
+The asymmetric broad gains use the available Q15 range efficiently while
+avoiding a staged `pi-acos(abs(x))` reconstruction for ordinary negative
+inputs. Negative endpoint lanes can use that identity safely because their
+result is near pi and has a much larger relative tolerance.
+
+Build the sign masks as `negative = (x < 0)` and
+`nonnegative = 1-negative`. Testing only `x > 0` incorrectly sends both signed
+zeros through the negative LE gain, decoding `acos(0)/2` by four and returning
+approximately pi. The dense hardware test includes `-0.0` and `+0.0` to keep
+this boundary covered.
+
+Literal zero LUT entries are unsafe in the normal DPU configuration. Builders
+replace them with one count, but `acos(1)` must be exact enough for an absolute
+tolerance of `1e-6`. The endpoint path therefore detects the only fp16 value
+above `0.99975` and masks the one-count substitute back to zero.
+
+Both methods clamp the table address input to `[-1,1]`, separately compare the
+unclamped `abs(x)` with one, and multiply the selected finite result by
+`valid/valid`. That expression is one on valid lanes and `0/0` on
+out-of-domain lanes, restoring NaN for the `±300` TestOps subcases. As with
+other PC-chain comparisons, the first comparison consumer is emitted as a
+scratch task before the value used by the result path.
+
+When tuning this family, simulate the exact quantized address multiplier,
+integer table entries, interpolation, and an fp16 cast after every staged
+operation. Then test the unchanged official method on hardware. The CPU model
+is excellent for choosing regions, but it did not predict the final isolated
+acos rounding miss caused by `pi-acos(abs(x))`; only the complete NPU chain
+made that visible.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

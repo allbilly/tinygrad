@@ -4959,6 +4959,55 @@ targeted Ruff, and classifier results remain at their 13/5/four-stale-failure
 baselines. `rockchip-constant-movement-565b4091b.patch` is the standalone patch
 against parent `565b4091b`.
 
+## 2026-07-29 — two-task asin/acos LUT milestone
+
+The unchanged forward-only `test_asin` and `test_acos` methods now pass
+**2/2 in 35.43 seconds**, including their ordinary `[-1,1]` inputs and both
+out-of-domain `±300` subcases. The implementation recognizes only tinygrad's
+specific eight-coefficient asin polynomial (and the `pi/2-asin` acos wrapper),
+then replaces the inaccurate expanded graph with two DPU LUT tasks plus
+elementwise selection and IEEE-domain stages.
+
+A uniform asin table was not sufficient. CPU enumeration of every fp16 value
+in `[-1,1]` found six endpoint failures, and the official seeded tensor
+actually contains four of them. The final asin detail task uses both physical
+tables for different precision regions:
+
+```text
+LE input: -abs(x)       -> 4*asin(abs(x)), decoded by 0.25 near zero
+LO input: 1-abs(x)      -> asin(1-distance)/2, decoded by 2 near |x|=1
+```
+
+The broad task stores `asin(abs(x))/2`. The selected regions are the identity
+for `abs(x)<=0.04`, amplified detail through `0.125`, broad interpolation
+through `0.875`, and endpoint-distance detail above `0.875`. This is exactly
+two NPU LUT tasks despite covering both difficult regions.
+
+For acos, storing an fp16 asin result and then subtracting it from `pi/2`
+failed even when that intermediate asin was correctly rounded. Acos therefore
+has its own two-task path. Its broad physical tables are asymmetric:
+negative inputs store `acos(x)/4`, while positive inputs store `acos(x)/2`.
+The endpoint table directly stores `acos(1-distance)` at high address
+resolution. This avoids the extra `pi-acos(abs(x))` rounding for ordinary
+negative values. A mask for exact `x=1` removes the required one-count
+substitute for the hardware's unsafe literal-zero LUT entry.
+
+Both paths clamp LUT addresses to the valid domain and use duplicated compare
+consumers plus `valid/valid` to produce NaN for `abs(x)>1`. `lut.md` records
+the full geometry, exhaustive fp16 simulation method, and the failed uniform
+and shared-intermediate designs. The standalone patch is
+`rockchip-asin-acos-two-lut-e0f6b5c4a.patch`, against parent `e0f6b5c4a`.
+
+The new dense hardware regression spans 4,103 values, including both signed
+zeros, exact endpoints, and invalid-domain values. It exposed and fixed a
+signed-zero routing bug in acos: zero must be classified as not-negative,
+rather than being sent through the negative broad-table gain. The complete
+Rockchip hardware file is now **71/71 passing in 218.55 seconds** with the same
+11 expected numerical warnings. The official pair remains **2/2 passing in
+35.08 seconds** after that fix. Mypy remains at 13 pre-existing findings,
+targeted Ruff at five, and the classifier at 68 passes plus its four stale
+rejection expectations.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
