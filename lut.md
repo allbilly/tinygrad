@@ -1597,6 +1597,46 @@ is excellent for choosing regions, but it did not predict the final isolated
 acos rounding miss caused by `pi-acos(abs(x))`; only the complete NPU chain
 made that visible.
 
+### Atan: reciprocal folding with a direct large-value table
+
+Tinygrad lowers atan to `asin(x/sqrt(1+x*x))`. The Rockchip hook sees the
+post-rewrite form `x/sqrt(1+x*x)`, so its recognizer must accept FDIV as well
+as the original MUL/RECIPROCAL graph.
+
+Use the magnitude identity:
+
+```text
+t = abs(x)                    when abs(x) <= 1
+t = 1/abs(x)                  when abs(x) > 1
+```
+
+This maps both the ordinary `[-2,2]` and finite `±300` TestOps ranges into
+`[0,1]`. For the small branch, form the otherwise-unused reciprocal
+denominator as `abs(x)+1`; this prevents `1/0` and avoids an unselected
+infinity contaminating later multiplication.
+
+The first hardware attempt evaluated `atan(t)` and used
+`pi/2-atan(t)` for the reciprocal branch. It missed 30 of 2,925 ordinary
+official values by one fp16 ULP. As with acos, a mathematically exact identity
+is not necessarily accurate across a LUT store followed by an fp16
+subtraction.
+
+The passing two-task layout is:
+
+| Task/table | Coordinate | Stored value | Decode/use |
+|---|---:|---:|---|
+| broad LO | `t` | `atan(t)` | direct for `0.125 < abs(x) <= 1` |
+| detail LE | `-4*t` | `4*atan(abs(z)/4)` | multiply by 0.25 for `0.04 < abs(x) <= 0.125` |
+| detail LO | `t=1/abs(x)` | `atan(1/t)/2` | multiply by 2 for `abs(x)>1` |
+| no LUT | `abs(x)` | identity | `abs(x)<=0.04` |
+
+Both table tasks use address scale `16384`. Multiplying the local coordinate
+by four gives the LE half the same effective input resolution as a dedicated
+`65504` local table. Large lanes use the LO half and receive direct atan
+values, avoiding the rejected pi/2 subtraction. The sign is restored only
+after all magnitude regions are combined, with signed zero classified as
+nonnegative.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.

@@ -482,6 +482,35 @@ def _try_asin_acos(val:UOp) -> tuple[UOp,bool]|None:
     sum(u.op is Ops.SQRT for u in nodes) == 1 and sum(u.op is Ops.WHERE for u in nodes) == 2 and \
     all(any(u.op is Ops.CONST and math.isclose(float(u.arg), coefficient) for u in nodes) for coefficient in coefficients) else None
 
+def _try_atan(val:UOp) -> UOp|None:
+  """Recognize atan(x) lowered as asin(x/sqrt(1+x*x))."""
+  val = _unwrap(val)
+  indexes = list(dict.fromkeys(u for u in val.toposort() if u.op is Ops.INDEX))
+  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half or val.op is not Ops.MUL: return None
+  sign = next((_unwrap(x) for x in val.src if _unwrap(x).op is Ops.WHERE), None)
+  if sign is None or _unwrap(sign.src[0]).op is not Ops.CMPNE: return None
+  candidate = next((_unwrap(x) for x in sign.src[0].src if _unwrap(x).op is not Ops.CONST), None)
+  if candidate is None: return None
+  if candidate.op is Ops.FDIV:
+    if _unwrap(candidate.src[0]) is not source or (root := _unwrap(candidate.src[1])).op is not Ops.SQRT: return None
+  elif candidate.op is Ops.MUL:
+    if not any(_unwrap(x) is source for x in candidate.src): return None
+    reciprocal = next((_unwrap(x) for x in candidate.src if _unwrap(x).op is Ops.RECIPROCAL), None)
+    if reciprocal is None or (root := _unwrap(reciprocal.src[0])).op is not Ops.SQRT: return None
+  else: return None
+  denominator = _unwrap(root.src[0])
+  if denominator.op is not Ops.ADD or not any(x.op is Ops.CONST and float(x.arg) == 1.0 for x in denominator.src): return None
+  square = next((_unwrap(x) for x in denominator.src if _unwrap(x).op is Ops.MUL), None)
+  if square is None or not all(_unwrap(x) is source for x in square.src): return None
+  nodes = val.toposort()
+  coefficients = (-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810,
+                  -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050)
+  allowed = {Ops.ADD, Ops.MUL, Ops.FDIV, Ops.SQRT, Ops.RECIPROCAL, Ops.WHERE, Ops.CMPLT, Ops.CMPNE,
+             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  return source if all(u.op in allowed for u in nodes) and sum(u.op is Ops.SQRT for u in nodes) == 2 and \
+    sum(u.op in (Ops.RECIPROCAL, Ops.FDIV) for u in nodes) == 1 and sum(u.op is Ops.WHERE for u in nodes) == 2 and \
+    all(any(u.op is Ops.CONST and math.isclose(float(u.arg), coefficient) for u in nodes) for coefficient in coefficients) else None
+
 def _try_sin_cos(val:UOp) -> tuple[UOp,bool]|None:
   """Recognize root sin(x) and tinygrad's cos(x) = sin(pi/2-cast_float(x))."""
   val = _unwrap(val)
@@ -613,6 +642,8 @@ _LUT_ASIN = Ops.WAIT
 _LUT_ASIN_DETAIL = Ops.INS
 _LUT_ACOS = Ops.CONTIGUOUS
 _LUT_ACOS_ENDPOINT = Ops.DETACH
+_LUT_ATAN = Ops.STAGE
+_LUT_ATAN_LOCAL = Ops.SLICE
 _LUT_SIZE = 513
 
 def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
@@ -1069,6 +1100,27 @@ def _build_acos_endpoint_lut() -> tuple[list[int], int, float, float, int]:
     lut[_LUT_SIZE+i] = max(-32768, min(32767, raw if raw != 0 else 1))
   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
 
+def _build_atan_lut() -> tuple[list[int], int, float, float, int]:
+  """Direct Q15 atan(x) for transformed x∈[0,1]."""
+  index_scale, output_scale = 16384.0, 32768.0
+  step, lut = 32.0/float(np.float16(index_scale)), [1] * (_LUT_SIZE*2)
+  for i in range(_LUT_SIZE):
+    raw = int(round(math.atan(i*step)*output_scale))
+    lut[_LUT_SIZE+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
+def _build_atan_local_lut() -> tuple[list[int], int, float, float, int]:
+  """Detail LUT: LE stores 4*atan(|z|/4), LO stores atan(1/z)/2."""
+  index_scale, output_scale = 16384.0, 32768.0
+  step, lut = 32.0/float(np.float16(index_scale)), [1] * (_LUT_SIZE*2)
+  for i in range(_LUT_SIZE):
+    negative_z, positive_z = -(512-i)*step, i*step
+    local_raw = int(round(4.0*math.atan(abs(negative_z)/4.0)*output_scale))
+    wide_raw = int(round(0.5*(math.pi/2 if positive_z == 0 else math.atan(1.0/positive_z))*output_scale))
+    lut[i] = max(-32768, min(32767, local_raw if local_raw != 0 else 1))
+    lut[_LUT_SIZE+i] = max(-32768, min(32767, wide_raw if wide_raw != 0 else 1))
+  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+
 def _build_tan_local_lut() -> tuple[list[int], int, float, float, int]:
   """Direct Q15 tangent over [-0.45,0.45]."""
   index_scale, output_scale = 32768.0, 32768.0
@@ -1315,6 +1367,10 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ACOS)
   if val.op is Ops.CUSTOM and val.arg == "rk_acos_endpoint" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ACOS_ENDPOINT)
+  if val.op is Ops.CUSTOM and val.arg == "rk_atan" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ATAN)
+  if val.op is Ops.CUSTOM and val.arg == "rk_atan_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ATAN_LOCAL)
   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
   if val.op is Ops.MUL:
@@ -3221,6 +3277,96 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, info.outs[0], (selected, 0), (factor, 0), Ops.MUL)))
   return tuple(tasks)
 
+def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Two-LUT atan after reciprocal folding maps every finite magnitude into [0,1]."""
+  store = _store_node(sink)
+  if store is None or (source := _try_atan(store.src[1])) is None: return None
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
+  def temp_index(slot:int) -> UOp:
+    idx = store.src[0]
+    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
+  def add_lut(arg:str, source_slot:int, out_slot:int) -> bool:
+    value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(source_slot),), arg=arg)
+    plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(out_slot), value))}))
+    if isinstance(plan, str) or plan.kind != "dpu_lut": return False
+    cmds, task, relocs = emit_rk(plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+    return True
+
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  neg_source, abs_source = alloc(), alloc()
+  negative_diff, negative_scratch, negative, nonnegative = (alloc() for _ in range(4))
+  large_diff, large_scratch, large, small = (alloc() for _ in range(4))
+  safe_denominator, inverse, small_input, large_input, transformed = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+                _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
+                _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
+                _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, nonnegative, one, (negative, 0), Ops.SUB),
+                _emit_where_stage(total, large_diff, (abs_source, 0), one, Ops.SUB),
+                _emit_where_stage(total, large_scratch, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, large, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, small, one, (large, 0), Ops.SUB),
+                # Adding one only to the unused |x|<=1 denominator avoids 1/0
+                # and therefore avoids contaminating the selected identity lane.
+                _emit_where_stage(total, safe_denominator, (abs_source, 0), (small, 0), Ops.ADD),
+                _emit_where_stage(total, inverse, one, (safe_denominator, 0), Ops.FDIV),
+                _emit_where_stage(total, small_input, (abs_source, 0), (small, 0), Ops.MUL),
+                _emit_where_stage(total, large_input, (inverse, 0), (large, 0), Ops.MUL),
+                _emit_where_stage(total, transformed, (small_input, 0), (large_input, 0), Ops.ADD)))
+
+  near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
+  local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
+  tasks.extend((_emit_where_stage(total, near_diff, (transformed, 0), scalar(.04), Ops.SUB),
+                _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+                _emit_where_stage(total, local_diff, (transformed, 0), scalar(.125), Ops.SUB),
+                _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB)))
+
+  negative_transformed, amplified_negative, local_small, local_coordinate = (alloc() for _ in range(4))
+  large_coordinate, detail_input = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, negative_transformed, zero, (transformed, 0), Ops.SUB),
+                _emit_where_stage(total, amplified_negative, (negative_transformed, 0), scalar(4), Ops.MUL),
+                _emit_where_stage(total, local_small, (local_inside, 0), (small, 0), Ops.MUL),
+                _emit_where_stage(total, local_coordinate, (amplified_negative, 0), (local_small, 0), Ops.MUL),
+                _emit_where_stage(total, large_coordinate, (transformed, 0), (large, 0), Ops.MUL),
+                _emit_where_stage(total, detail_input, (local_coordinate, 0), (large_coordinate, 0), Ops.ADD)))
+  broad_slot, local_slot = alloc(), alloc()
+  if not add_lut("rk_atan", transformed, broad_slot) or not add_lut("rk_atan_local", detail_input, local_slot): return None
+  broad_region, local_region, near_region = alloc(), alloc(), alloc()
+  broad_selected, local_scaled, local_selected, near_selected = (alloc() for _ in range(4))
+  large_scaled, large_selected, partial, base_partial, magnitude = (alloc() for _ in range(5))
+  negative_magnitude, positive_selected, negative_selected = (alloc() for _ in range(3))
+  tasks.extend((_emit_where_stage(total, broad_region, (local_outside, 0), (small, 0), Ops.MUL),
+                _emit_where_stage(total, local_region, (local_mask, 0), (small, 0), Ops.MUL),
+                _emit_where_stage(total, near_region, (near_inside, 0), (small, 0), Ops.MUL),
+                _emit_where_stage(total, broad_selected, (broad_slot, 0), (broad_region, 0), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(.25), Ops.MUL),
+                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_region, 0), Ops.MUL),
+                _emit_where_stage(total, near_selected, (transformed, 0), (near_region, 0), Ops.MUL),
+                _emit_where_stage(total, large_scaled, (local_slot, 0), scalar(2), Ops.MUL),
+                _emit_where_stage(total, large_selected, (large_scaled, 0), (large, 0), Ops.MUL),
+                _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+                _emit_where_stage(total, base_partial, (partial, 0), (near_selected, 0), Ops.ADD),
+                _emit_where_stage(total, magnitude, (base_partial, 0), (large_selected, 0), Ops.ADD),
+                _emit_where_stage(total, negative_magnitude, zero, (magnitude, 0), Ops.SUB),
+                _emit_where_stage(total, positive_selected, (magnitude, 0), (nonnegative, 0), Ops.MUL),
+                _emit_where_stage(total, negative_selected, (negative_magnitude, 0), (negative, 0), Ops.MUL),
+                _emit_where_stage(total, info.outs[0], (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+  return tuple(tasks)
+
 def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate sinh/cosh directly on [-2,2] and restore fp16 overflow outside the finite range."""
   store = _store_node(sink)
@@ -4918,6 +5064,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_endpoint_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_ATAN:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+  elif lut_op is _LUT_ATAN_LOCAL:
+    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_local_lut()
+    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
   elif lut_op is _LUT_TAN_LOCAL:
     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_local_lut()
     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
@@ -5868,6 +6022,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
   if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
   if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
+  if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
   if (sinh_cosh_tasks := _try_sinh_cosh_subtasks(sink)) is not None: return build_native_program_multi(sink, sinh_cosh_tasks)
   if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
   if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)

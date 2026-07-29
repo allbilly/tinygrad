@@ -240,9 +240,11 @@ class TestDPU(unittest.TestCase):
       actual = Tensor(a_np, device="ROCKCHIP").gelu(approximate=approximate).realize().numpy()
       np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
-  def test_dpu_asin_acos_two_lut(self):
+  def test_dpu_inverse_trig_two_lut(self):
     a_np = np.concatenate((np.linspace(-1, 1, 4097, dtype=np.float16),
                            np.array([-300, 300, -1, 1, -0.0, 0.0], dtype=np.float16)))
+    atan_np = np.concatenate((np.linspace(-2, 2, 4097, dtype=np.float16),
+                              np.array([-300, 300, -0.0, 0.0], dtype=np.float16)))
     with np.errstate(invalid="ignore"):
       expected_asin = np.arcsin(a_np.astype(np.float32)).astype(np.float16)
       expected_acos = np.arccos(a_np.astype(np.float32)).astype(np.float16)
@@ -250,6 +252,8 @@ class TestDPU(unittest.TestCase):
                                expected_asin, rtol=1e-3, atol=1e-6)
     np.testing.assert_allclose(Tensor(a_np, device="ROCKCHIP").acos().realize().numpy(),
                                expected_acos, rtol=1e-3, atol=1e-6)
+    np.testing.assert_allclose(Tensor(atan_np, device="ROCKCHIP").atan().realize().numpy(),
+                               np.arctan(atan_np.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
 
   def test_dpu_sqrt_special_values(self):
     a_np = np.array([np.inf, -np.inf, np.nan, -2, -0.0, 0, 0.25, 4], dtype=np.float16)

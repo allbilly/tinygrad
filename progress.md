@@ -5008,6 +5008,40 @@ Rockchip hardware file is now **71/71 passing in 218.55 seconds** with the same
 targeted Ruff at five, and the classifier at 68 passes plus its four stale
 rejection expectations.
 
+## 2026-07-29 — reciprocal-folded atan milestone
+
+Unchanged `test_atan` now passes all three official ranges in **18.86
+seconds**. The dense inverse-trig hardware method, expanded to cover 4,101
+atan values across `[-2,2]`, `±300`, and signed zero, passes in **17.11
+seconds**.
+
+The recognizer matches both the original
+`asin(x/sqrt(1+x*x))` graph and its post-rewrite FDIV form. The native path
+uses `t=min(abs(x),1/abs(x))`, keeping every LUT address in `[0,1]`; adding the
+small-magnitude mask to the otherwise-unused denominator avoids forming
+`1/0`.
+
+The first implementation used the broad/local atan tables to calculate
+`atan(t)` and then formed `pi/2-atan(t)` for `abs(x)>1`. It missed 30 official
+values by one fp16 ULP because the staged subtraction crossed output rounding
+boundaries. The passing detail task again assigns different work to its two
+physical tables:
+
+```text
+LE coordinate -4*t: 4*atan(t), decoded by 0.25 for small direct inputs
+LO coordinate t:    atan(1/t)/2, decoded by 2 for abs(x)>1
+```
+
+Thus large magnitudes receive direct atan output without a staged pi/2
+subtraction, while `abs(x)<=0.04` uses the identity and the broad table handles
+the remaining direct interval. The implementation remains exactly two NPU LUT
+tasks. `lut.md` includes the accepted geometry and the failed subtractive
+design. The standalone patch is `rockchip-atan-folded-e8858b004.patch`,
+against parent `e8858b004`.
+
+The complete hardware file remains **71/71 passing in 223.19 seconds** with
+the same 11 expected numerical warnings.
+
 The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
 64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
 in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

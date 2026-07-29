@@ -91,6 +91,14 @@ covers signed zero, endpoints, and invalid inputs; the complete hardware file
 is now **71/71 passing in 218.55 seconds**. The official pair passes **2/2 in
 35.08 seconds** after the signed-zero fix.
 
+`test_atan` now also passes all three official ranges in **18.86 seconds**.
+The backend folds magnitudes above one through a reciprocal and uses the
+detail LUT's LO table to emit direct `atan(1/t)` values; its LE table retains
+the amplified near-zero path. The expanded dense inverse-trig method passes
+in **17.11 seconds**. `asinh`, `acosh`, and `atanh` are the remaining
+inverse-hyperbolic group. The complete hardware file remains **71/71 passing
+in 223.19 seconds**.
+
 ## Summary
 
 | Status | Count |
@@ -208,6 +216,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - exp and exp2, including integer scalar typing and IEEE specials
 - sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
 - asin and acos, including endpoint precision and out-of-domain NaN
+- atan, including ordinary `[-2,2]` and finite `±300` ranges
 - exact int32/uint32/bool XOR, AND, OR, bitwise NOT, and signed/unsigned shifts
 - fp16/fp32/int32/bool/uint8 constant fills, including zero and arbitrary full values
 - indexed movement for roll, cat/multicat, repeat, and repeat-interleave
