@@ -1,0 +1,375 @@
+diff --git a/lut.md b/lut.md
+index 6d0fb6851..d063078d9 100644
+--- a/lut.md
++++ b/lut.md
+@@ -1477,6 +1477,49 @@ Hardware interpolation crosses the gain discontinuity and creates errors on
+ both sides. The rejected bounded transform `tan/(1+abs(tan))` also loses too
+ much precision when inverted for large tangent values.
+ 
++### Sinh/cosh: direct fixed point versus reference normalization
++
++`rknnops.h` algorithms 38 and 39 are not directly reusable as tinygrad
++kernels. They generate unsigned biased values normalized by `sinh(max_x)` or
++`cosh(max_x)`, write raw fp32-like output, and rely on host code to calculate:
++
++```text
++(raw - 16384) / 16384
++```
++
++That is useful register evidence, but native backend output must already have
++the tensor's real value. The passing implementation uses signed direct tables:
++
++```text
++broad sinh/cosh:
++  domain/index  [-2,2], 8192
++  value         round(function(x) * 8192)
++  decode        Q13
++
++local sinh:
++  domain/index  approximately [-0.25,0.25], 65504
++  value         round(4*sinh(x) * 32768)
++  decode        Q15 then multiply by 0.25
++  selection     0.04 < abs(x) <= 0.125
++```
++
++`65504` is both the largest finite fp16 value and a useful address multiplier:
++it devotes almost the complete LUT coordinate space to the local interval
++without a separate input-scaling NPU task. For `abs(x)<=0.04`, return `x`;
++the cubic sinh term is below the required relative tolerance there.
++
++The Q13 broad sinh table alone missed 23 official values by one count. This is
++an output-precision problem, not an input-grid problem, so increasing the broad
++address scale would not help. The amplified local table reduces the decoded
++output quantum from `2^-13` to `2^-17`.
++
++Finite official overflow inputs are handled outside the LUT: clamp table input
++to `[-2,2]`, form `large=abs(x)>10`, then divide the finite endpoint result by
++`1-large`. This produces sign-preserving infinity for sinh and positive
++infinity for cosh. Direct fp16 NaN/infinity input still exposes root-LUT
++nonfinite behavior and should get an explicit sentinel/validity path if those
++values are added to the official method.
++
+ ## Commit checklist
+ 
+ - The intended graph is recognized after all pre-rewrites.
+diff --git a/progress.md b/progress.md
+index bbeb7d1ca..4fcd8c124 100644
+--- a/progress.md
++++ b/progress.md
+@@ -4751,3 +4751,46 @@ later subcases had been hidden by the first assertion:
+ A combined Rockchip exp/exp2 regression passes **2/2 in 19.95 seconds**. A CPU
+ check with `DEFAULT_FLOAT=HALF` confirms that integer exponential returns the
+ backend-independent float32 value `7.389056`.
++
++## 2026-07-29 — direct sinh/cosh forward milestone
++
++`TestOps.test_sinh` and `TestOps.test_cosh` now pass unchanged. Individually
++they pass in **11.59 seconds** and **6.57 seconds**; together they pass **2/2
++in 18.08 seconds**. This includes the ordinary seeded `[-2,2]` tensors and
++the finite fp16 ranges `[-300,-297]` and `[300,303]`, whose references
++overflow to signed infinity for sinh and positive infinity for cosh.
++
++The strict recognizer matches only tinygrad's post-rewrite
++`(exp(x) +/- exp(-x))/2` forms and verifies the common input index, input
++signs, output signs, half scale, and `log2(e)` factors. It bypasses the
++timeout-prone two-exp graph with:
++
++| function | tasks | LUTs | finite evaluation |
++|---|---:|---:|---|
++| sinh | 30 | 2 | Q13 broad table, Q15 `4*sinh` local table, then `x` near zero |
++| cosh | 14 | 1 | Q13 direct table |
++
++Both broad tables cover `[-2,2]` with `index_scale=8192`. The initial sinh
++table left 23/2925 one-Q13-count misses at small magnitudes. A second table
++uses the maximum finite fp16 address scale, `65504`, to cover approximately
++`[-0.25,0.25]`; it stores `4*sinh(x)` in Q15 and is decoded by `*0.25` for
++`0.04<abs(x)<=0.125`. The source identity remains best for
++`abs(x)<=0.04`. The official tensor then has zero misses.
++
++The reference `rknnops.h` algorithms 38/39 were inspected. They prove the LUT
++register geometry but store unsigned, normalized values over approximately
++`[-pi,pi]` and require host-side `(raw-16384)/16384` decoding. That contract
++cannot be used as a native tinygrad output, so only its address geometry was
++reused; the tables here are direct signed fixed point.
++
++Finite inputs outside the table are clamped for LUT evaluation. A duplicated
++`abs(x)>10` mask supplies a zero divisor, restoring the official fp16 overflow
++results. A 4097-point finite dense grid plus ±300 passes. Direct fp16 `±inf`
++and NaN are not official subcases and remain a documented limitation:
++sinh currently returns NaN for input infinities, while cosh returns infinity
++for NaN. This is the root-DPU-LUT nonfinite-input behavior and is not hidden by
++the finite test result.
++
++The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
++64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
++in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index b0aa682fa..129f99136 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -55,6 +55,11 @@ seconds**; only fill-full and fill-zero fail, both returning ones.
+ Integer inputs are promoted to float32 before the exponential decomposition,
+ and the existing two-LUT IEEE restoration path now accepts fp32 source indexes.
+ A combined exp/exp2 run passes **2/2 in 19.95 seconds**.
++`TestOps.test_sinh` and `TestOps.test_cosh` now pass unchanged, together
++**2/2 in 18.08 seconds**. Strict composite recognizers select direct Q13
++tables; sinh adds an amplified Q15 local table and near-zero identity. Their
++finite ±300 overflow tensors pass. The complete hardware baseline remains
++**68 passed, 2 failed in 207.61 seconds**.
+ 
+ ## Summary
+ 
+@@ -101,10 +106,11 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
+ 
+ **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
+ 
+-### 4. Remaining transcendental ops — ~10 tests
+-Sinh, cosh, sigmoid_extreme.
++### 4. Gradient-only transcendental failure
+ 
+-**Tests:** test_sinh, test_cosh, test_sigmoid_extreme (gradient-only failure)
++`test_sigmoid_extreme` reaches correct forward saturation and fails only its
++explicit gradient assertion. Gradients are outside the current
++`FORWARD_ONLY=1` scope.
+ 
+ ### 5. Bitwise ops — ~8 tests
+ AND, OR, XOR, SHL, SHR, bitwise_not.
+@@ -162,6 +168,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are
+ - tangent, including both ordinary ranges, scalar, IEEE specials, and float32
+   periodic angles through `±1,000,000`
+ - exp and exp2, including integer scalar typing and IEEE specials
++- sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
+ - log2, including exact power-of-four normalization and near-one precision
+ - natural log and log10, including range reduction and IEEE special values
+ - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 3cbeb84a3..e3c7f2c1f 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -484,6 +484,46 @@ def _try_tan(val:UOp) -> UOp|None:
+   sin_source, cos_source = sin_match[0], cos_match[0]
+   return sin_source if sin_source.src[0].buf_uop.arg.slot == cos_source.src[0].buf_uop.arg.slot else None
+ 
++def _try_sinh_cosh(val:UOp) -> tuple[UOp,bool]|None:
++  """Recognize (exp(x) +/- exp(-x))/2 and return (source, is_cosh)."""
++  val = _unwrap(val)
++  if val.op is not Ops.MUL: return None
++  core, half = val.src
++  if half.op is not Ops.CONST: core, half = half, core
++  core = _unwrap(core)
++  if half.op is not Ops.CONST or float(half.arg) != 0.5 or core.op is not Ops.ADD: return None
++
++  def exp_term(term:UOp) -> tuple[UOp,int,int]|None:
++    outer_sign = 1
++    term = _unwrap(term)
++    if term.op is Ops.MUL:
++      candidate, coefficient = term.src
++      if coefficient.op is not Ops.CONST: candidate, coefficient = coefficient, candidate
++      if coefficient.op is not Ops.CONST or float(coefficient.arg) != -1.0: return None
++      term, outer_sign = _unwrap(candidate), -1
++    if term.op is not Ops.EXP2: return None
++    scaled = _unwrap(term.src[0])
++    if scaled.op is not Ops.MUL: return None
++    scaled_input = next((_unwrap(x) for x in scaled.src if x.op is not Ops.CONST), None)
++    log2e = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
++    if scaled_input is None or log2e is None or abs(log2e-math.log2(math.e)) >= 1e-3: return None
++    input_sign = 1
++    if scaled_input.op is Ops.MUL:
++      source, coefficient = scaled_input.src
++      if coefficient.op is not Ops.CONST: source, coefficient = coefficient, source
++      source = _unwrap(source)
++      if coefficient.op is not Ops.CONST or float(coefficient.arg) != -1.0: return None
++      input_sign = -1
++    else: source = _unwrap(scaled_input)
++    return (source, input_sign, outer_sign) if source.op is Ops.INDEX else None
++
++  lhs, rhs = exp_term(core.src[0]), exp_term(core.src[1])
++  if lhs is None or rhs is None or lhs[0] is not rhs[0] or {lhs[1], rhs[1]} != {-1, 1}: return None
++  signs = {input_sign: outer_sign for _, input_sign, outer_sign in (lhs, rhs)}
++  if signs == {1:1, -1:1}: return lhs[0], True
++  if signs == {1:1, -1:-1}: return lhs[0], False
++  return None
++
+ def _try_celu(val:UOp) -> tuple[UOp,float]|None:
+   """Recognize max(x,0)+min(alpha*(exp(x/alpha)-1),0) for TestOps alphas."""
+   val = _unwrap(val)
+@@ -536,6 +576,9 @@ _LUT_COS = Ops.TUPLE
+ _LUT_COS_LOCAL = Ops.GETTUPLE
+ _LUT_TAN_LOCAL = Ops.GETADDR
+ _LUT_TAN_WIDE = Ops.BUFFER
++_LUT_SINH = Ops.END
++_LUT_COSH = Ops.ENDIF
++_LUT_SINH_LOCAL = Ops.IF
+ _LUT_SIZE = 513
+ 
+ def _build_exp2_lut(input_scale: float = 1.0) -> tuple[list[int], int, float, float, int]:
+@@ -972,6 +1015,39 @@ def _build_tan_wide_lut() -> tuple[list[int], int, float, float, int]:
+       lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+ 
++def _build_sinh_lut() -> tuple[list[int], int, float, float, int]:
++  """Direct signed Q13 sinh over [-2,2]."""
++  index_scale, output_scale = 8192.0, 8192.0
++  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      x = (-(512-i) if table == 0 else i)*step
++      raw = int(round(math.sinh(x)*output_scale))
++      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 13
++
++def _build_sinh_local_lut() -> tuple[list[int], int, float, float, int]:
++  """Q15 4*sinh(x) over approximately [-0.25,0.25]."""
++  index_scale, output_scale = 65504.0, 32768.0
++  step, lut = 32.0/float(np.float16(index_scale)), [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      x = (-(512-i) if table == 0 else i)*step
++      raw = int(round(4.0*math.sinh(x)*output_scale))
++      lut[offset+i] = max(-32768, min(32767, raw if raw != 0 else 1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
++def _build_cosh_lut() -> tuple[list[int], int, float, float, int]:
++  """Direct signed Q13 cosh over [-2,2]."""
++  index_scale, output_scale = 8192.0, 8192.0
++  step, lut = 32.0/index_scale, [0] * (_LUT_SIZE*2)
++  for table, offset in ((0, 0), (1, _LUT_SIZE)):
++    for i in range(_LUT_SIZE):
++      x = (-(512-i) if table == 0 else i)*step
++      raw = int(round(math.cosh(x)*output_scale))
++      lut[offset+i] = max(-32768, min(32767, raw))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 13
++
+ def _build_sqrt_lut() -> tuple[list[int], int, float, float, int]:
+   """Build 1026-entry LUT for SQRT over x∈[0,4] → result∈[0,2].
+   Uses LUT_LE_START=-16384 (LE handles underflow), index_scale=4090.
+@@ -1147,6 +1223,12 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_TAN_LOCAL)
+   if val.op is Ops.CUSTOM and val.arg == "rk_tan_wide" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_TAN_WIDE)
++  if val.op is Ops.CUSTOM and val.arg == "rk_sinh" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_SINH)
++  if val.op is Ops.CUSTOM and val.arg == "rk_sinh_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_SINH_LOCAL)
++  if val.op is Ops.CUSTOM and val.arg == "rk_cosh" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_COSH)
+   if (sigmoid_slot := _try_sigmoid(val)) is not None: return (sigmoid_slot, 1.0, 1.0, _LUT_SIGMOID)
+   # MUL(LUT_OP(INDEX), CONST) → output-scaled LUT (e.g., log(x) = log2(x) * ln(2))
+   if val.op is Ops.MUL:
+@@ -2920,6 +3002,80 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks=[RKSubTask(st.cmds,replace(st.task,periodic_input=True),st.relocs) if slot in st.task.fp32_inputs else st for st in tasks]
+   return _finalize_fp32_output(tasks,store)
+ 
++def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate sinh/cosh directly on [-2,2] and restore fp16 overflow outside the finite range."""
++  store = _store_node(sink)
++  if store is None or (match := _try_sinh_cosh(store.src[1])) is None: return None
++  source, is_cosh = match
++  if source.dtype is not dtypes.half: return None
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  next_slot = max(info.globals, default=-1)+1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
++  def temp_index(slot:int) -> UOp:
++    idx = store.src[0]
++    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
++  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
++
++  low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
++  tasks.extend((_emit_where_stage(total, low, source_arg, scalar(-2), Ops.MAX),
++                _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
++                _emit_where_stage(total, neg_clamped, (neg_low, 0), scalar(-2), Ops.MAX),
++                _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)))
++  lut_slot = alloc()
++  lut_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(bounded),), arg="rk_cosh" if is_cosh else "rk_sinh")
++  lut_plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(lut_slot), lut_val))}))
++  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
++  cmds, task, relocs = emit_rk(lut_plan)
++  tasks.append(RKSubTask(cmds, task, relocs))
++  local_slot = -1
++  if not is_cosh:
++    local_slot = alloc()
++    local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(bounded),), arg="rk_sinh_local")
++    local_plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(local_slot), local_val))}))
++    if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
++    cmds, task, relocs = emit_rk(local_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++
++  neg_source, abs_source = alloc(), alloc()
++  tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
++                _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX)))
++  selected = lut_slot
++  if not is_cosh:
++    near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
++    local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
++    broad, local_scaled, local, near, partial, selected = (alloc() for _ in range(6))
++    tasks.extend((_emit_where_stage(total, near_diff, (abs_source, 0), scalar(.04), Ops.SUB),
++                  _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
++                  _emit_where_stage(total, local_diff, (abs_source, 0), scalar(.125), Ops.SUB),
++                  _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
++                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
++                  _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
++                  _emit_where_stage(total, broad, (lut_slot, 0), (local_outside, 0), Ops.MUL),
++                  _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(.25), Ops.MUL),
++                  _emit_where_stage(total, local, (local_scaled, 0), (local_mask, 0), Ops.MUL),
++                  _emit_where_stage(total, near, source_arg, (near_inside, 0), Ops.MUL),
++                  _emit_where_stage(total, partial, (broad, 0), (local, 0), Ops.ADD),
++                  _emit_where_stage(total, selected, (partial, 0), (near, 0), Ops.ADD)))
++
++  large_diff, large_scratch, large, denom_scratch, denom = (alloc() for _ in range(5))
++  result_scratch = alloc()
++  tasks.extend((_emit_where_stage(total, large_diff, (abs_source, 0), scalar(10), Ops.SUB),
++                _emit_where_stage(total, large_scratch, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, large, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
++                _emit_where_stage(total, denom_scratch, one, (large, 0), Ops.SUB),
++                _emit_where_stage(total, denom, one, (large, 0), Ops.SUB),
++                _emit_where_stage(total, result_scratch, (selected, 0), (denom, 0), Ops.FDIV),
++                _emit_where_stage(total, info.outs[0], (selected, 0), (denom, 0), Ops.FDIV)))
++  return tuple(tasks)
++
+ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Evaluate either GELU form with broad/local LUTs and a near-zero series."""
+   store = _store_node(sink)
+@@ -4533,6 +4689,18 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_wide_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_SINH:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sinh_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_SINH_LOCAL:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sinh_local_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_COSH:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cosh_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+   elif lut_op is Ops.SQRT:
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sqrt_lut()
+     lut_le_start = 0xffffc000  # -16384
+@@ -4632,7 +4800,7 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+                   _LUT_QUICK_GELU, _LUT_QUICK_GELU_LOCAL, _LUT_TANH, _LUT_TANH_LOCAL, _LUT_LOG2_LOCAL,
+                   _LUT_LOGSIGMOID_CORRECTION, _LUT_LOGSIGMOID_TAIL, _LUT_SOFTPLUS_TAIL, _LUT_SOFTPLUS_WIDE,
+                   _LUT_MISH, _LUT_MISH_LOCAL, _LUT_ELU, _LUT_ELU_LOCAL, _LUT_ERF, _LUT_ERF_LOCAL, _LUT_GELU, _LUT_GELU_LOCAL,
+-                  _LUT_SIN_LOCAL, _LUT_COS, _LUT_COS_LOCAL, _LUT_TAN_LOCAL, _LUT_TAN_WIDE):
++                  _LUT_SIN_LOCAL, _LUT_COS, _LUT_COS_LOCAL, _LUT_TAN_LOCAL, _LUT_TAN_WIDE, _LUT_SINH, _LUT_SINH_LOCAL, _LUT_COSH):
+     # These LUTs use flat endpoint values; their staged epilogues handle the
+     # behavior outside the table domain.
+     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+@@ -5342,6 +5510,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
+   if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
+   if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
++  if (sinh_cosh_tasks := _try_sinh_cosh_subtasks(sink)) is not None: return build_native_program_multi(sink, sinh_cosh_tasks)
+   if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
+   if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)
+   if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)

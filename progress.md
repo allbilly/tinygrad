@@ -4751,3 +4751,46 @@ later subcases had been hidden by the first assertion:
 A combined Rockchip exp/exp2 regression passes **2/2 in 19.95 seconds**. A CPU
 check with `DEFAULT_FLOAT=HALF` confirms that integer exponential returns the
 backend-independent float32 value `7.389056`.
+
+## 2026-07-29 — direct sinh/cosh forward milestone
+
+`TestOps.test_sinh` and `TestOps.test_cosh` now pass unchanged. Individually
+they pass in **11.59 seconds** and **6.57 seconds**; together they pass **2/2
+in 18.08 seconds**. This includes the ordinary seeded `[-2,2]` tensors and
+the finite fp16 ranges `[-300,-297]` and `[300,303]`, whose references
+overflow to signed infinity for sinh and positive infinity for cosh.
+
+The strict recognizer matches only tinygrad's post-rewrite
+`(exp(x) +/- exp(-x))/2` forms and verifies the common input index, input
+signs, output signs, half scale, and `log2(e)` factors. It bypasses the
+timeout-prone two-exp graph with:
+
+| function | tasks | LUTs | finite evaluation |
+|---|---:|---:|---|
+| sinh | 30 | 2 | Q13 broad table, Q15 `4*sinh` local table, then `x` near zero |
+| cosh | 14 | 1 | Q13 direct table |
+
+Both broad tables cover `[-2,2]` with `index_scale=8192`. The initial sinh
+table left 23/2925 one-Q13-count misses at small magnitudes. A second table
+uses the maximum finite fp16 address scale, `65504`, to cover approximately
+`[-0.25,0.25]`; it stores `4*sinh(x)` in Q15 and is decoded by `*0.25` for
+`0.04<abs(x)<=0.125`. The source identity remains best for
+`abs(x)<=0.04`. The official tensor then has zero misses.
+
+The reference `rknnops.h` algorithms 38/39 were inspected. They prove the LUT
+register geometry but store unsigned, normalized values over approximately
+`[-pi,pi]` and require host-side `(raw-16384)/16384` decoding. That contract
+cannot be used as a native tinygrad output, so only its address geometry was
+reused; the tables here are direct signed fixed point.
+
+Finite inputs outside the table are clamped for LUT evaluation. A duplicated
+`abs(x)>10` mask supplies a zero divisor, restoring the official fp16 overflow
+results. A 4097-point finite dense grid plus ±300 passes. Direct fp16 `±inf`
+and NaN are not official subcases and remain a documented limitation:
+sinh currently returns NaN for input infinities, while cosh returns infinity
+for NaN. This is the root-DPU-LUT nonfinite-input behavior and is not hidden by
+the finite test result.
+
+The neighboring exp, sigmoid, sinh/cosh, and tanh regression passes **7/7 in
+64.74 seconds**. The complete hardware file remains at **68 passed, 2 failed
+in 207.61 seconds**, with only the unchanged fill-full/fill-zero failures.

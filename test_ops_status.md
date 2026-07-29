@@ -55,6 +55,11 @@ seconds**; only fill-full and fill-zero fail, both returning ones.
 Integer inputs are promoted to float32 before the exponential decomposition,
 and the existing two-LUT IEEE restoration path now accepts fp32 source indexes.
 A combined exp/exp2 run passes **2/2 in 19.95 seconds**.
+`TestOps.test_sinh` and `TestOps.test_cosh` now pass unchanged, together
+**2/2 in 18.08 seconds**. Strict composite recognizers select direct Q13
+tables; sinh adds an amplified Q15 local table and near-zero identity. Their
+finite ±300 overflow tensors pass. The complete hardware baseline remains
+**68 passed, 2 failed in 207.61 seconds**.
 
 ## Summary
 
@@ -101,10 +106,11 @@ Sum, max, min, mean, std, var, prod, cumsum, cummax, cummin, cumprod all fail.
 
 **Tests:** test_sum*, test_max, test_min, test_mean*, test_std*, test_var*, test_prod, test_cum*, test_argmax, test_argmin, etc.
 
-### 4. Remaining transcendental ops — ~10 tests
-Sinh, cosh, sigmoid_extreme.
+### 4. Gradient-only transcendental failure
 
-**Tests:** test_sinh, test_cosh, test_sigmoid_extreme (gradient-only failure)
+`test_sigmoid_extreme` reaches correct forward saturation and fails only its
+explicit gradient assertion. Gradients are outside the current
+`FORWARD_ONLY=1` scope.
 
 ### 5. Bitwise ops — ~8 tests
 AND, OR, XOR, SHL, SHR, bitwise_not.
@@ -162,6 +168,7 @@ The first 3 are quick wins (~70 errors). Then dtype (58 more). WHERE+layout are 
 - tangent, including both ordinary ranges, scalar, IEEE specials, and float32
   periodic angles through `±1,000,000`
 - exp and exp2, including integer scalar typing and IEEE specials
+- sinh and cosh, including ordinary finite inputs and ±300 fp16 overflow
 - log2, including exact power-of-four normalization and near-one precision
 - natural log and log10, including range reduction and IEEE special values
 - LogSigmoid, including dense `[-8,8]` coverage and IEEE special values

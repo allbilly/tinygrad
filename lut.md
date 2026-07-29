@@ -1477,6 +1477,49 @@ Hardware interpolation crosses the gain discontinuity and creates errors on
 both sides. The rejected bounded transform `tan/(1+abs(tan))` also loses too
 much precision when inverted for large tangent values.
 
+### Sinh/cosh: direct fixed point versus reference normalization
+
+`rknnops.h` algorithms 38 and 39 are not directly reusable as tinygrad
+kernels. They generate unsigned biased values normalized by `sinh(max_x)` or
+`cosh(max_x)`, write raw fp32-like output, and rely on host code to calculate:
+
+```text
+(raw - 16384) / 16384
+```
+
+That is useful register evidence, but native backend output must already have
+the tensor's real value. The passing implementation uses signed direct tables:
+
+```text
+broad sinh/cosh:
+  domain/index  [-2,2], 8192
+  value         round(function(x) * 8192)
+  decode        Q13
+
+local sinh:
+  domain/index  approximately [-0.25,0.25], 65504
+  value         round(4*sinh(x) * 32768)
+  decode        Q15 then multiply by 0.25
+  selection     0.04 < abs(x) <= 0.125
+```
+
+`65504` is both the largest finite fp16 value and a useful address multiplier:
+it devotes almost the complete LUT coordinate space to the local interval
+without a separate input-scaling NPU task. For `abs(x)<=0.04`, return `x`;
+the cubic sinh term is below the required relative tolerance there.
+
+The Q13 broad sinh table alone missed 23 official values by one count. This is
+an output-precision problem, not an input-grid problem, so increasing the broad
+address scale would not help. The amplified local table reduces the decoded
+output quantum from `2^-13` to `2^-17`.
+
+Finite official overflow inputs are handled outside the LUT: clamp table input
+to `[-2,2]`, form `large=abs(x)>10`, then divide the finite endpoint result by
+`1-large`. This produces sign-preserving infinity for sinh and positive
+infinity for cosh. Direct fp16 NaN/infinity input still exposes root-LUT
+nonfinite behavior and should get an explicit sentinel/validity path if those
+values are added to the official method.
+
 ## Commit checklist
 
 - The intended graph is recognized after all pre-rewrites.
