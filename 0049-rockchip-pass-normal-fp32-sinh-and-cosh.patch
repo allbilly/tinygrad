@@ -1,0 +1,129 @@
+From c84bdab1a79b1154d9236518f3b4fd51877dbba5 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:08:29 +0800
+Subject: [PATCH] rockchip: pass normal fp32 sinh and cosh
+
+---
+ progress.md                          | 20 ++++++++++++++++++++
+ test/rockchip/test_pr1.py            |  9 +++++++++
+ test_ops_status.md                   | 12 ++++++++++++
+ tinygrad/runtime/support/rockchip.py | 16 +++++++++++++---
+ 4 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index e5094e030..6d0455288 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9470,3 +9470,23 @@ stabilization across a large exponential gap. No additional code, LUT, or
+ runtime ABI change was needed.
+ 
+ Next forward group: `TestOps.test_sinh`.
++
++## 2026-07-30 — normal-fp32 sinh/cosh milestone
++
++The unchanged `TestOps.test_sinh` and `TestOps.test_cosh` groups pass together
++in **4.29s**, including ordinary inputs and the ±300 extreme ranges. The
++hardware-free Rockchip contract is **121/121 in 7.00s**.
++
++Before the fix, normal-fp32 sinh classified through the generic splitter as
++44 tasks (41 non-copy DPU tasks) and timed out during submission. Cosh used
++43/40 tasks. `_try_fp32_sinh_cosh_host_subtasks` now accepts only the exact
++`(exp(x) +/- exp(-x))/2` graph and runs it as one serialized fp32 task.
++The existing fp16 two-LUT sinh/cosh implementation remains unchanged.
++
++The optimizer folds `exp(-x)` to `EXP2(x * -log2(e))`; the shared recognizer
++now accepts that coefficient-sign form while retaining the previous nested
++`(-x) * log2(e)` form. Extreme overflow therefore follows NumPy/tinygrad
++fp32 semantics without exhausting the NPU reset budget. No LUT changed;
++mypy remains at the exact 12-error baseline.
++
++Next forward group: `TestOps.test_tanh`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 69de03ff3..20d17d62e 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -435,6 +435,15 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_sinh_cosh_avoid_generic_dpu_splitter(self):
++    for expression in (Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").sinh(),
++                       Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").cosh()):
++      program = build_native_program(_get_sink(expression))
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index d885f19a6..c1e70bfd4 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2095,3 +2095,15 @@ Next forward group: `TestOps.test_logcumsumexp_numerical`.
+ 
+ The unchanged `[0.0, 100.0]` case passes in **2.92s** with no additional
+ change. Next forward group: `TestOps.test_sinh`.
++
++### Normal-fp32 sinh/cosh
++
++| Group | Status |
++|---|---:|
++| `test_sinh` + `test_cosh` | **2 passed in 4.29s** |
++| hardware-free Rockchip contract | **121/121** |
++
++Exact fp32 `(exp(x) +/- exp(-x))/2` graphs use one serialized task instead of
++the timeout-prone 43–44-task generic DPU split. Folded `-log2(e)` and the old
++nested-negation recognition are both retained; fp16 LUT paths are unchanged.
++Next forward group: `TestOps.test_tanh`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 5b224280d..89629ce37 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -653,14 +653,14 @@ def _try_sinh_cosh(val:UOp) -> tuple[UOp,bool]|None:
+     if scaled.op is not Ops.MUL: return None
+     scaled_input = next((_unwrap(x) for x in scaled.src if x.op is not Ops.CONST), None)
+     log2e = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
+-    if scaled_input is None or log2e is None or abs(log2e-math.log2(math.e)) >= 1e-3: return None
+-    input_sign = 1
++    if scaled_input is None or log2e is None or abs(abs(log2e)-math.log2(math.e)) >= 1e-3: return None
++    input_sign = -1 if log2e < 0 else 1
+     if scaled_input.op is Ops.MUL:
+       source, coefficient = scaled_input.src
+       if coefficient.op is not Ops.CONST: source, coefficient = coefficient, source
+       source = _unwrap(source)
+       if coefficient.op is not Ops.CONST or float(coefficient.arg) != -1.0: return None
+-      input_sign = -1
++      input_sign *= -1
+     else: source = _unwrap(scaled_input)
+     return (source, input_sign, outer_sign) if source.op is Ops.INDEX else None
+ 
+@@ -4527,6 +4527,14 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+   return _finalize_fp32_output(tasks, store)
+ 
++def _try_fp32_sinh_cosh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Keep exact normal-fp32 sinh/cosh off the reset-heavy generic DPU splitter."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float or (match := _try_sinh_cosh(store.src[1])) is None: return None
++  source, _ = match
++  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Evaluate sinh/cosh directly on [-2,2] and restore fp16 overflow outside the finite range."""
+   store = _store_node(sink)
+@@ -13528,6 +13536,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
+   if (atanh_tasks := _try_atanh_subtasks(sink)) is not None: return build_native_program_multi(sink, atanh_tasks)
+   if (asinh_acosh_tasks := _try_asinh_acosh_subtasks(sink)) is not None: return build_native_program_multi(sink, asinh_acosh_tasks)
++  if (fp32_sinh_cosh_tasks := _try_fp32_sinh_cosh_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_sinh_cosh_tasks)
+   if (sinh_cosh_tasks := _try_sinh_cosh_subtasks(sink)) is not None: return build_native_program_multi(sink, sinh_cosh_tasks)
+   if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
+   if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)
+-- 
+2.34.1
+
