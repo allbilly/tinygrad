@@ -9,7 +9,7 @@ from tinygrad.codegen import pm_to_program
 from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-                                               _HOST_ELEMENTWISE_LAYOUT)
+                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -335,6 +335,17 @@ class TestClassifier(unittest.TestCase):
     self.assertIn((1, _HOST_FP32_HALF_LAYOUT, 0, 0), scalar_views)
     self.assertIn((1, _HOST_FP32_RESIDUAL_LAYOUT, 0, 0), scalar_views)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
+  def test_fp32_variance_uses_one_strict_serialized_task(self):
+    expression = Tensor.empty(15,25,35, dtype=dtypes.float, device="ROCKCHIP").var((1,2))
+    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+    program = build_native_program(sinks[-1])
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertTrue(subtasks[0].task.is_copy)
+    self.assertTrue(subtasks[0].task.fp32_output)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
 
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")

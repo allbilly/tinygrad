@@ -1954,3 +1954,28 @@ non-scalar affine checks remain active.
 No LUT or host operator arithmetic changed. `test_mean_zero_axis` retains a
 non-failing NumPy invalid-cast warning. Next forward group:
 `TestOps.test_var`.
+
+### Normal-fp32 variance
+
+| Group | Status |
+|---|---:|
+| `test_var` | pass |
+| `test_var_axis` | pass |
+| `test_var_zero_in_axis` | pass |
+| `test_var_one_in_axis` | pass |
+| `test_var_keepdim` | pass |
+| combined official run | **5 passed in 101.43s** |
+| hardware-free Rockchip contract | **112/112** |
+
+Variance's exact second-pass topology is serialized as one strict
+`_HOST_VARIANCE_LAYOUT` task under the user's approved host-operator policy.
+The matcher requires `SUM((x-mean)^2)*scale`, static affine ranges, direct
+fp32 inputs, and bounded mappings; it is not a general reduction fallback.
+It recomputes each row mean from original fp32 data because the `(15,K=875)`
+axis case crosses the `conv_grok` multi-row K boundary and its scheduled
+native mean corrupts 7/15 rows.
+
+A rejected native prototype used 114 tasks and returned NaN. It also exposed
+and fixed two-byte scratch underallocation for four-byte
+`_HOST_FP32_COMBINE_LAYOUT` writes. No LUT changed. Next forward group:
+`TestOps.test_std`.

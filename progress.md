@@ -9183,3 +9183,77 @@ pass, the final hardware-free suite is **111/111**, and the current mypy
 baseline is the pre-existing **12 errors**. See the detailed
 **normal-fp32 mean and scalar factorized epilogue** section for the
 `conv_grok` comparison and debug method. Continue with `TestOps.test_var`.
+
+## 2026-07-30 — normal-fp32 variance milestone
+
+All unchanged forward variance groups pass:
+
+| Coverage | Result |
+|---|---:|
+| `TestOps.test_var` | **1 passed in 27.72s** |
+| `TestOps.test_var_axis` | **1 passed in 41.92s** |
+| zero-axis + one-axis + keepdim | pass |
+| combined five official groups | **5 passed in 101.43s** |
+| mean/isclose/basic-DPU regression | **5 passed in 19.93s** |
+| hardware-free Rockchip contract | **112/112 in 8.13s** |
+
+Tinygrad schedules variance in two passes: first mean, then
+`SUM((x-mean)^2) * (1/(K-correction))`. A native prototype reused compensated
+fp32 ADD, MUL, long SUM, and scalar MUL. It classified to **114 tasks / 12
+CMAC tasks** for the full `(15,25,35)` case. Its first in-place probe exposed
+a real runtime bug: `_HOST_FP32_COMBINE_LAYOUT` always writes four-byte fp32
+values, but mixed scratch sizing allocated two bytes unless `fp32_output` was
+set. The allocator now recognizes the combine layout explicitly; its former
+size rule remains commented in source. After that fix the native prototype
+was memory-safe but returned NaN, so the 114-task design remains rejected WIP
+and was not installed.
+
+Under the user's explicit permission to use a host operator boundary where
+other non-CPU backends allow `run_host`, the active implementation is one
+strict `_HOST_VARIANCE_LAYOUT` task. It is not a generic reduction fallback.
+The matcher requires all of the following:
+
+- fp32 output and ADD reduction;
+- an exact `MUL(delta, delta)` square using the same UOp twice;
+- `delta = direct_fp32_INDEX + direct_fp32_INDEX * -1`;
+- a direct constant correction scale that is positive or `+inf`;
+- static LOOP/REDUCE ranges, affine nonnegative data/mean/output indexes,
+  a mean independent of every reduction axis, and bounded buffers.
+
+The serialized task carries range extents, affine mappings, and the scale.
+Runtime gathers original fp32 rows and executes NumPy fp32 variance with the
+correction inferred from `K - round(1/scale)`. Positive infinity therefore
+correctly represents `correction == K`; NaN and nonpositive scales remain
+rejected. Empty/invalid-degree cases that simplify to constant NaN continue
+through the existing typed-fill path.
+
+### Why the scheduled mean is not consumed
+
+Axis 0 and axis 2 passed when the strict task initially consumed the first
+kernel's mean. Axis `(1,2)` failed 7/15 rows, with maximum variance error
+`0.01523459`. That case is 15 independent rows at K=875. This matches the
+current `allbilly/rk3588/conv_grok` finding that multi-row GEMM is proven only
+through the small aligned-K region (roughly K<=416) and larger K must be row
+serialized. The variance boundary therefore recomputes each row mean from
+the original fp32 data it already owns, rather than consuming a known-bad
+multi-row K=875 native mean. The former mean-buffer delta calculation remains
+commented as WIP reference.
+
+### Debug method
+
+1. Print all scheduled sinks, not only the first: variance has a mean sink
+   followed by the centered-square sink.
+2. For the second sink, confirm one LOOP range for flattened output rows and
+   one REDUCE range for flattened K (full variance has zero LOOP ranges).
+3. Inspect the task layout prefix:
+   `(output_total, _HOST_VARIANCE_LAYOUT, nloops, nreductions, ...)`.
+4. If only a large-axis case drifts, compare `(rows,K)` against the proven
+   multi-row K boundary before changing correction arithmetic.
+5. For correction edges, distinguish a constant-NaN sink from the
+   centered-square graph with `scale=+inf`.
+6. If a future native scratch chain uses fp32 combine output, verify scratch
+   allocation is `4*elements`; a two-byte allocation can corrupt memory
+   before any numerical diagnosis is meaningful.
+
+No LUT coefficient or two-task LUT schedule changed. The next forward group
+is `TestOps.test_std`.

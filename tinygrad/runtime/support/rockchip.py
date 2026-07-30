@@ -202,6 +202,7 @@ _HOST_FP32_HALF_LAYOUT = -1024  # nearest-fp16 representation view of an fp32 AB
 _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of an fp32 ABI buffer
 _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
 _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
+_HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -11566,6 +11567,70 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                      info.outs[0], is_copy=True), relocs))
   return tuple(tasks)
 
+def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize only tinygrad's two-pass fp32 variance kernel after its mean kernel."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
+     reduce.arg[0] is not Ops.ADD: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.MUL or len(val.src) != 2: return None
+  scale, reduced = None, None
+  for lhs, rhs in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
+    if _unwrap(lhs) is reduce and _unwrap(rhs).op is Ops.CONST:
+      reduced, scale = _unwrap(lhs), _unwrap(rhs)
+      break
+  if reduced is None or scale is None or scale.dtype is not dtypes.float or \
+     math.isnan(float(scale.arg)) or float(scale.arg) <= 0.0: return None
+  square = _unwrap(reduce.src[0])
+  if square.op is not Ops.MUL or len(square.src) != 2 or _unwrap(square.src[0]) is not _unwrap(square.src[1]): return None
+  delta = _unwrap(square.src[0])
+  if delta.op is not Ops.ADD or len(delta.src) != 2: return None
+
+  data, mean = None, None
+  for candidate, negative in ((delta.src[0], delta.src[1]), (delta.src[1], delta.src[0])):
+    candidate, negative = _unwrap(candidate), _unwrap(negative)
+    if candidate.op is not Ops.INDEX or candidate.src[0].op is not Ops.PARAM or negative.op is not Ops.MUL: continue
+    mean_candidate = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
+    coefficient = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
+    if mean_candidate is not None and mean_candidate.src[0].op is Ops.PARAM and coefficient is not None and \
+       float(coefficient.arg) == -1.0:
+      data, mean = candidate, mean_candidate
+      break
+  if data is None or mean is None or data.dtype is not dtypes.float or mean.dtype is not dtypes.float: return None
+
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  axes = [*loops, *reductions]
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in axes): return None
+  extents = tuple(int(u.src[0].arg) for u in axes)
+  axis_ids = tuple(u.arg[0] for u in axes)
+  loop_ids, reduction_ids = set(axis_ids[:len(loops)]), set(axis_ids[len(loops):])
+  data_aff, mean_aff, out_aff = _affine_index(data.src[1]), _affine_index(mean.src[1]), _affine_index(store.src[0].src[1])
+  if data_aff is None or mean_aff is None or out_aff is None or \
+     any(axis not in axis_ids or stride < 0 for aff in (data_aff, mean_aff) for axis, stride in aff[0].items()) or \
+     any(axis not in loop_ids or stride < 0 for axis, stride in out_aff[0].items()) or \
+     any(mean_aff[0].get(axis, 0) != 0 for axis in reduction_ids) or \
+     not any(data_aff[0].get(axis, 0) != 0 for axis in reduction_ids): return None
+
+  def bounded(aff:tuple[dict[int,int],int], total:int, used_extents:tuple[int,...]) -> bool:
+    maximum = aff[1] + sum((extent-1)*aff[0].get(axis, 0) for axis, extent in zip(axis_ids, used_extents))
+    return aff[1] >= 0 and maximum < total
+  data_total, mean_total = int(data.src[0].src[0].arg), int(mean.src[0].src[0].arg)
+  output_total = prod(_shape_of_store(sink))
+  if not bounded(data_aff, data_total, extents) or not bounded(mean_aff, mean_total, extents) or \
+     not bounded(out_aff, output_total, (*extents[:len(loops)], *([1]*len(reductions)))): return None
+
+  def mapping(aff:tuple[dict[int,int],int], ids:tuple[int,...]) -> tuple[int,...]:
+    return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
+  scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
+  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), *extents, scale_bits,
+            *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
+  info = ProgramInfo.from_sink(sink)
+  slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
+  task = RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True, fp32_output=True)
+  return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
+
 def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower optimizer-factorized SUM(x)*output_factor*constant in its original fp32 order."""
   store, reduce = _store_node(sink), _reduce_node(sink)
@@ -13153,6 +13218,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fp32_add_tasks)
   if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_mul_tasks)
+  if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, variance_tasks)
   if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_factorized_sum_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)

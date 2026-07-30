@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-  _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_VARIANCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -648,6 +648,60 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
     if not 0 <= out_index < result.size: raise RuntimeError(f"rk: host elementwise output index out of bounds {out_index}")
     result[out_index] = evaluate(value_code, coords)
   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+
+def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
+  import numpy as np
+  output_total, tag, nloops, nreductions, *meta = task.layout
+  assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
+  naxes, cursor = nloops+nreductions, 0
+  extents = tuple(meta[cursor:cursor+naxes])
+  cursor += naxes
+  scale = struct.unpack('<f', struct.pack('<I', meta[cursor] & 0xFFFFFFFF))[0]
+  cursor += 1
+  data_mapping = tuple(meta[cursor:cursor+naxes+1])
+  cursor += naxes+1
+  mean_mapping = tuple(meta[cursor:cursor+naxes+1])
+  cursor += naxes+1
+  output_mapping = tuple(meta[cursor:cursor+nloops+1])
+  assert cursor+nloops+1 == len(meta)
+
+  output_buf, data_buf, mean_buf = (bufs[r.globals_slot] for r in relocs)
+  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float32)
+  mean = np.frombuffer(ctypes.string_at(mean_buf.va_addr, mean_buf.size), dtype=np.float32)
+  result = np.empty(output_buf.size//4, dtype=np.float32)
+  loop_extents, reduction_extents = extents[:nloops], extents[nloops:]
+  reduction_total = int(np.prod(reduction_extents, dtype=np.int64))
+  correction = reduction_total-round(1.0/float(scale))
+  if correction < 0 or correction > reduction_total:
+    raise RuntimeError(f"rk: variance invalid correction {correction} for K={reduction_total}")
+
+  def coordinates(linear:int, shape:tuple[int,...]) -> list[int]:
+    ret = [0]*len(shape)
+    for axis in range(len(shape)-1, -1, -1): linear, ret[axis] = divmod(linear, shape[axis])
+    return ret
+  def affine(mapping:tuple[int,...], coords:list[int]) -> int:
+    return mapping[0] + sum(coord*stride for coord, stride in zip(coords, mapping[1:]))
+
+  with np.errstate(all="ignore"):
+    for output_linear in range(output_total):
+      loop_coords = coordinates(output_linear, loop_extents)
+      output_index = affine(output_mapping, loop_coords)
+      if not 0 <= output_index < result.size: raise RuntimeError(f"rk: variance output index out of bounds {output_index}")
+      values = np.empty(reduction_total, dtype=np.float32)
+      for reduction_linear in range(reduction_total):
+        coords = [*loop_coords, *coordinates(reduction_linear, reduction_extents)]
+        data_index, mean_index = affine(data_mapping, coords), affine(mean_mapping, coords)
+        if not 0 <= data_index < data.size or not 0 <= mean_index < mean.size:
+          raise RuntimeError(f"rk: variance input index out of bounds data={data_index} mean={mean_index}")
+        values[reduction_linear] = data[data_index]
+      # WIP reference: consuming `mean[mean_index]` here exposed the native
+      # multi-row K=875 mean corruption. The strict variance boundary owns the
+      # full operator, so recompute its row mean from the original fp32 values.
+      # delta = np.float32(data[data_index]-mean[mean_index])
+      # accumulator = np.float32(accumulator + np.float32(delta*delta))
+      result[output_index] = np.var(values, dtype=np.float32, ddof=correction)
+  ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute a compact postfix integer-index program and copy exact element bytes."""
@@ -1286,6 +1340,9 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
           _run_host_elementwise(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
+          _run_host_variance(task, st.relocs, bufs)
+          continue
         if task.is_fill:
           total = task.layout[0]
           out_slot = st.relocs[0].globals_slot
@@ -1358,7 +1415,10 @@ class RockchipProgram(Program['RockchipDevice']):
           logical_extents = _decode_materialized_cmac_layout(st.task.layout)[8]
           elements = 1
           for extent in logical_extents: elements *= extent
-        itemsize = 4 if st.task.native_int32_output or st.task.fp32_output else 2
+        # WIP reference: `4 if native_int32_output or fp32_output else 2`
+        # underallocated scratch written by the fp32-combine host ABI task.
+        fp32_combine = st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT
+        itemsize = 4 if st.task.native_int32_output or st.task.fp32_output or fp32_combine else 2
         scratch_sizes[st.task.out_slot] = max(scratch_sizes.get(st.task.out_slot, 0), st.task.out_offset+elements*itemsize)
       try:
         while len(ext) <= max_slot:
