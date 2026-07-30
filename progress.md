@@ -9423,3 +9423,20 @@ fp32 division without enabling general host division.
 
 No LUT or new runtime ABI changed. Mypy remains at the exact 12-error
 baseline. Next forward group: `TestOps.test_logsumexp`.
+
+## 2026-07-30 — normal-fp32 logsumexp milestone
+
+The unchanged ten-case `TestOps.test_logsumexp` group passes in **32.57s**,
+covering axes 0/1/2/3, keepdim, ranks 0 through 4, and vector/scalar cases.
+The hardware-free Rockchip contract is **119/119 in 6.96s**.
+
+The strict softmax-family evaluator now recognizes
+`max + LOG2(SUM(EXP2((x-max)*log2(e))))*ln(2)`. Rowwise schedules retain the
+existing NPU maximum producer and serialize one ADD reduction. A full vector
+fuses both MAX and ADD reductions; both are statically expanded inside the
+same exact fp32 evaluator. The matcher verifies the logarithm wraps the ADD
+reduction, the maximum term is either the matching MAX reduction or its
+scheduled fp32 buffer, and all prior exp/max constants and opcode gates.
+
+No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_logcumsumexp`.

@@ -2067,3 +2067,15 @@ Exact p-norm denominator fingerprints for p=`2,1,3,0,-1` use the serialized
 fp32 evaluator. The final full-input/smaller-broadcast-norm division also
 stays fp32; leaving it on DPU caused 15 tolerance misses. No LUT or new
 runtime ABI changed. Next forward group: `TestOps.test_logsumexp`.
+
+### Normal-fp32 logsumexp
+
+| Group | Status |
+|---|---:|
+| `test_logsumexp` (ten cases) | **pass in 32.57s** |
+| hardware-free Rockchip contract | **119/119** |
+
+Exact rowwise and full-vector `max + log(sum(exp(x-max)))` signatures reuse
+the strict serialized fp32 evaluator; the full-vector form safely expands
+both fused reductions. No LUT or runtime ABI changed. Next forward group:
+`TestOps.test_logcumsumexp`.

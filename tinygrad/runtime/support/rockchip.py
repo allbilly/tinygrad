@@ -9130,7 +9130,8 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if signature not in ((1, 0, 1, 0, Ops.REDUCE), (0, 1, 1, 0, Ops.EXP2),
                        (0, 0, 1, 0, Ops.FDIV), (1, 0, 0, 0, Ops.FDIV),
                        (1, 0, 1, 1, Ops.MUL), (0, 1, 0, 0, Ops.ADD),
-                       (0, 0, 0, 0, Ops.ADD)): return None
+                       (0, 0, 0, 0, Ops.ADD), (1, 0, 1, 1, Ops.ADD),
+                       (1, 1, 1, 1, Ops.ADD)): return None
   if value.op is Ops.REDUCE and (value is not add_reductions[0] or _unwrap(value.src[0]) is not exponentials[0]): return None
   if value.op is Ops.EXP2 and value is not exponentials[0]: return None
   if value.op is Ops.FDIV:
@@ -9141,10 +9142,15 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if not add_reductions and denominator.op is not Ops.INDEX: return None
   if logarithms:
     logarithm = logarithms[0]
-    ln2 = next((_unwrap(x) for x in value.src if _unwrap(x).op is Ops.CONST), None)
-    if logarithm not in value.src or _unwrap(logarithm.src[0]) is not add_reductions[0] or \
+    log_product = next((u for u in value.toposort() if u.op is Ops.MUL and logarithm in u.src), None)
+    ln2 = next((_unwrap(x) for x in log_product.src if _unwrap(x).op is Ops.CONST), None) if log_product is not None else None
+    if log_product is None or _unwrap(logarithm.src[0]) is not add_reductions[0] or \
        ln2 is None or ln2.dtype is not dtypes.float or not math.isclose(float(ln2.arg), math.log(2.0), rel_tol=1e-12): return None
-  if value.op is Ops.ADD and max_reductions:
+    if value.op is Ops.ADD:
+      maximum_output = next((_unwrap(x) for x in value.src if _unwrap(x) is not log_product), None)
+      if maximum_output is None or maximum_output.op not in (Ops.INDEX, Ops.REDUCE) or \
+         (maximum_output.op is Ops.REDUCE and maximum_output not in max_reductions): return None
+  if value.op is Ops.ADD and max_reductions and not logarithms:
     indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float]
     minus_ones = [u for u in value.toposort() if u.op is Ops.CONST and u.dtype is dtypes.float and float(u.arg) == -1.0]
     if len(indexes) != 2 or len(minus_ones) != 1 or max_reductions[0] not in value.toposort(): return None
