@@ -332,6 +332,18 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 3)
     self.assertTrue(subtasks[-1].task.fp32_output)
 
+  def test_batched_fp32_gemm_serializes_shared_axis(self):
+    a = Tensor.empty(8,45,65, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(8,65,100, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a@b))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    cmac_tasks = [task.task for task in subtasks if task.task.kind == "cmac"]
+    self.assertEqual(len(cmac_tasks), 3*8)
+    self.assertTrue(all(task.layout[:3] == (45,100,65) for task in cmac_tasks))
+    self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 8)
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_large_fp32_contraction_uses_tiled_raw_cmac_boundary(self):
     a = Tensor.empty(3,5,8,10, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(11,7,5,13,8, dtype=dtypes.float, device="ROCKCHIP")

@@ -1791,3 +1791,25 @@ hardware-free planner/runtime contract is **102/102**.
 | trace, shape-check, arity-check1, arity-check2 | **4 passed in 5.07s** |
 
 All einsum-specific normal-fp32 groups are green. Resume at `test_dot_1d`.
+
+### Normal-fp32 dot validation and batched fix
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_dot_1d` | pass |
+| unchanged `TestOps.test_dot` | pass |
+| permanent `(8,45,65)@(8,65,100)` fp32 hardware case | **1 passed in 21.67s** |
+| hardware-free planner/runtime contract | **103/103 in 6.44s** |
+
+The fp32 wrapper now serializes shared batch axes before all three
+compensated CMAC contractions. The official batched form emits 24 native
+CMAC tasks, each `M=45, N=100, K=65`, instead of one unsafe block-diagonal
+`K=520` materialization. Runtime scratch sizing follows the full logical
+materialized output domain, not only each active tile.
+
+`allbilly/rk3588/conv_grok` corroborates the limit: its legacy GEMM helper
+only permits multi-row tiling through aligned K=384 and saturates DMA groups
+at 13. No LUT change or host operator arithmetic was introduced.
+
+Continue with `TestOps.test_mulacc_with_zero_strides`; its first case passes
+and its second currently rejects as `unsupported_op:fused_epilogue`.

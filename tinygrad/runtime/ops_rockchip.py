@@ -1314,6 +1314,13 @@ class RockchipProgram(Program['RockchipDevice']):
       for st in subtasks:
         if st.task.out_slot < len(ext): continue
         elements = st.task.layout[0]*st.task.layout[1] if st.task.kind == "cmac" else st.task.layout[0]
+        if st.task.kind == "cmac" and len(st.task.layout) > 5 and st.task.layout[5] == _CMAC_MATERIALIZED_LAYOUT:
+          # A serialized shared-axis task computes only its active MxN tile but
+          # unpacks through the original output index program. Scratch must
+          # therefore cover the full logical loop domain, not just that tile.
+          logical_extents = _decode_materialized_cmac_layout(st.task.layout)[8]
+          elements = 1
+          for extent in logical_extents: elements *= extent
         itemsize = 4 if st.task.native_int32_output or st.task.fp32_output else 2
         scratch_sizes[st.task.out_slot] = max(scratch_sizes.get(st.task.out_slot, 0), st.task.out_offset+elements*itemsize)
       try:

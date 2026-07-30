@@ -7470,6 +7470,68 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — normal-fp32 batched dot milestone
+
+The unchanged forward-only `TestOps.test_dot` now passes both
+`(45,65)@(65,100)` and `(8,45,65)@(8,65,100)`. The unbatched case already
+passed; the batched result previously produced the first row correctly and
+mostly zeros afterward.
+
+### `allbilly/rk3588/conv_grok` insight and root cause
+
+`ref/rk3588/conv_grok` proves 217/217 native CONV cases with formula-derived
+independent local tiles. Its successful hot path does not call
+`gemm_npu.py`; that file is a legacy reference. The useful constraints are:
+
+- `GEMM_MAX_ALIGN_IN = 12*32 = 384`;
+- multi-row `m_tile` is computed only while `align_in <= 384`, otherwise the
+  helper falls back to one row;
+- `CNA_DMA_CON1` and output-notch groups saturate at 13 32-channel groups;
+- BY_YK schedules the full Cartesian product and gives every tile explicit
+  source/output windows.
+
+This independently agrees with our hardware probes: multi-row K=384 and
+K=416 work, while K=512 corrupts rows after the first. It also means our
+4096 materialization split is not a hardware-resident multi-row K guarantee.
+
+The compensated fp32 CMAC wrapper bypassed the existing shared-axis
+serializer. Batched matmul was therefore materialized as one block-diagonal
+`M=360, N=800, K=520` operation. That crossed the proven multi-row K
+boundary. All three limb contractions now use
+`_try_cmac_shared_subtasks`, producing eight independent native
+`M=45, N=100, K=65` CMAC tasks apiece.
+
+The first fixed hardware run segfaulted because each serialized CMAC
+advertised its active 4,500-element tile while its output index program
+unpacked into the full 36,000-element batch domain. Intermediate scratch
+allocation used the active tile size. Materialized-CMAC scratch sizing now
+uses the complete logical loop extents, preventing the out-of-bounds write
+for shared batch/group axes.
+
+Useful debug sequence:
+
+1. establish whether unbatched and batched forms diverge;
+2. inspect the materialization tuple `(M,N,K)` and shared loop axes;
+3. compare expanded K against the measured 416 multi-row ceiling;
+4. count CMAC subtasks—this official case must have `3*8`, each
+   `(45,100,65)`;
+5. if serialization segfaults before an assertion, compare active tile
+   elements with the maximum global output index used by unpacking.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_dot`: **1 passed** in the combined 25.93-second
+  command;
+- permanent official-shape fp32 batched matmul: **1 passed in 21.67s**;
+- hardware-free planner/runtime contract: **103/103 in 6.44s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT coefficients or schedules changed. The next group,
+`TestOps.test_mulacc_with_zero_strides`, reaches its second case and rejects
+with `RKPLAN_REJECT:unsupported_op:fused_epilogue`.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`

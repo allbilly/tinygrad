@@ -11431,8 +11431,15 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     # Runtime K-tile accumulation is retained as WIP reference, but uses host
     # addition between NPU partials. Keep this forward path NPU-arithmetic-only.
     if stage_plan.cmac_materialization and stage_plan.cmac_materialization[2] > 4096: return None
-    cmds, task, relocs = emit_rk(stage_plan)
-    tasks.append(RKSubTask(cmds, replace(task, fp32_output=fp32_output), relocs))
+    # Shared batch/group axes expand direct materialization into a block-diagonal
+    # K. Serialize them like conv_grok's cartesian local tiles: besides avoiding
+    # unused cross-batch cells, this keeps multi-row CMAC below the proven
+    # CNA_DMA_CON1 K-group ceiling (8x65 previously became unsafe K=520).
+    if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None:
+      tasks.extend(RKSubTask(st.cmds, replace(st.task, fp32_output=fp32_output), st.relocs) for st in shared_tasks)
+    else:
+      cmds, task, relocs = emit_rk(stage_plan)
+      tasks.append(RKSubTask(cmds, replace(task, fp32_output=fp32_output), relocs))
     return out_slot
 
   high = cmac(views[0][0], views[1][0], fp32_output=True)
