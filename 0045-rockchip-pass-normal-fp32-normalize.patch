@@ -1,0 +1,164 @@
+From 6892e5423c78920359fef4efda19db1d7fb8119a Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:56:20 +0800
+Subject: [PATCH] rockchip: pass normal fp32 normalize
+
+---
+ progress.md                          | 24 ++++++++++++
+ test/rockchip/test_pr1.py            | 11 ++++++
+ test_ops_status.md                   | 12 ++++++
+ tinygrad/runtime/support/rockchip.py | 57 ++++++++++++++++++++++++++++
+ 4 files changed, 104 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index a317e9c12..126a50834 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9399,3 +9399,27 @@ and scalar log-softmax remains typed constant zero.
+ 
+ No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_normalize`.
++
++## 2026-07-30 — normal-fp32 normalize milestone
++
++The unchanged seven-case `TestOps.test_normalize` group passes in **11.27s**,
++covering p norms `2, 1, 3, 0, -1`, axes 0/1/2, and rank 2/3. The
++hardware-free Rockchip contract is **118/118 in 6.78s**.
++
++`_try_normalize_norm_host_subtasks` strictly recognizes the normalize
++denominator's fp32 `MAX(p_norm, 1e-12)` topology. Its measured signatures
++cover squared-sum/sqrt, absolute sum, cubic LOG2/EXP2 power, nonzero count,
++and reciprocal absolute sum. Each requires one static ADD reduction, one
++direct fp32 source, exactly one CMPNE, the epsilon constant, and only the
++bounded p-norm opcode family. Static reduction expansion reuses the serialized
++typed evaluator.
++
++The first denominator-only run still missed 15/2,925 p=2 outputs, with maximum
++relative error `0.00120325`; the remaining final division had rounded through
++fp16 NPU arithmetic. The strict output stage now requires
++`full_size_fp32_input / smaller_broadcast_norm`, equal output/input size, a
++positive proper-divisor norm buffer, and no other arithmetic. It preserves
++fp32 division without enabling general host division.
++
++No LUT or new runtime ABI changed. Mypy remains at the exact 12-error
++baseline. Next forward group: `TestOps.test_logsumexp`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a633d251a..74f6fc5af 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -403,6 +403,17 @@ class TestClassifier(unittest.TestCase):
+           self.assertEqual(len(subtasks), 1)
+           self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_normalize_denominators_use_strict_serialized_tasks(self):
++    for p in (2, 1, 3, 0, -1):
++      expression = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").normalize(p=p)
++      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src
++                  if call.src[0].op is Ops.SINK and any(u.op is Ops.REDUCE for u in call.src[0].toposort()))
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 69624e63c..91e1b9405 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2055,3 +2055,15 @@ the strict serialized fp32 softmax evaluator. Reduced-buffer size checks keep
+ ordinary compensated fp32 subtraction out of this path. Scalar results stay
+ on typed constant zero. No LUT or runtime ABI changed. Next forward group:
+ `TestOps.test_normalize`.
++
++### Normal-fp32 normalize
++
++| Group | Status |
++|---|---:|
++| `test_normalize` (seven p/axis cases) | **pass in 11.27s** |
++| hardware-free Rockchip contract | **118/118** |
++
++Exact p-norm denominator fingerprints for p=`2,1,3,0,-1` use the serialized
++fp32 evaluator. The final full-input/smaller-broadcast-norm division also
++stays fp32; leaving it on DPU caused 15 tolerance misses. No LUT or new
++runtime ABI changed. Next forward group: `TestOps.test_logsumexp`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 13c895e62..3f4317157 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9309,6 +9309,62 @@ def _try_softmax_argmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
+ 
++def _try_normalize_norm_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize only the static fp32 p-norm denominator stages used by Tensor.normalize."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float: return None
++  value = _unwrap(store.src[1])
++  if value.op is Ops.FDIV and len(value.src) == 2:
++    numerator, denominator = (_unwrap(x) for x in value.src)
++    if numerator.op is not Ops.INDEX or denominator.op is not Ops.INDEX or \
++       numerator.src[0].op is not Ops.PARAM or denominator.src[0].op is not Ops.PARAM: return None
++    output_total = prod(_shape_of_store(sink))
++    numerator_total, denominator_total = int(numerator.src[0].src[0].arg), int(denominator.src[0].src[0].arg)
++    if numerator_total != output_total or denominator_total <= 0 or denominator_total >= output_total or \
++       output_total % denominator_total: return None
++    return _try_elementwise_host_subtasks(sink, allow_plain=True)
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  if value.op is not Ops.MAX or len(reductions) != 1 or reductions[0].dtype not in (dtypes.float, dtypes.int) or \
++     reductions[0].arg[0] is not Ops.ADD or not reductions[0].src[1:] or \
++     any(axis.src[0].op is not Ops.CONST for axis in reductions[0].src[1:]): return None
++  epsilon = next((_unwrap(x) for x in value.src if _unwrap(x).op is Ops.CONST), None)
++  if epsilon is None or epsilon.dtype is not dtypes.float or float(epsilon.arg) != 1e-12: return None
++  indexes = list(dict.fromkeys(u for u in reductions[0].toposort()
++                              if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM))
++  if len(indexes) != 1: return None
++  nodes = value.toposort()
++  signature = (sum(u.op is Ops.SQRT for u in nodes), sum(u.op is Ops.EXP2 for u in nodes),
++               sum(u.op is Ops.LOG2 for u in nodes), sum(u.op is Ops.WHERE for u in nodes))
++  if signature not in ((1,0,0,2), (0,0,0,2), (0,1,1,4), (0,0,0,0)): return None
++  if sum(u.op is Ops.CMPNE for u in nodes) != 1: return None
++  allowed = {Ops.MAX, Ops.REDUCE, Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.WHERE, Ops.CMPNE, Ops.CMPLT,
++             Ops.CAST, Ops.RECIPROCAL, Ops.FDIV, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM,
++             Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes): return None
++
++  def expand(u:UOp) -> UOp:
++    if u.op is Ops.REDUCE:
++      ranges = u.src[1:]
++      extents = [int(r.src[0].arg) for r in ranges]
++      terms:list[UOp] = []
++      for linear in range(prod(extents)):
++        rem, fixed = linear, {}
++        for axis in range(len(ranges)-1, -1, -1):
++          rem, coordinate = divmod(rem, extents[axis])
++          fixed[ranges[axis]] = UOp.const(ranges[axis].dtype, coordinate)
++        terms.append(expand(u.src[0].substitute(fixed)))
++      if not terms: raise ValueError("empty normalize reduction")
++      result = terms[0]
++      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
++      return result
++    new_src = tuple(expand(x) for x in u.src)
++    return u if new_src == u.src else u.replace(src=new_src)
++
++  try: expanded_value = expand(store.src[1])
++  except (TypeError, ValueError, OverflowError): return None
++  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
++  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
++
+ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Unroll the static integer reductions used to choose max-pool indices."""
+   store = _store_node(sink)
+@@ -13426,6 +13482,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
+   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
+   if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
++  if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, exp_correction_tasks)
+-- 
+2.34.1
+
