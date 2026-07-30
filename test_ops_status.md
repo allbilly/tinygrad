@@ -1555,3 +1555,26 @@ The ADD-tree parser recognizes multiplication by `-1` as a signed operand.
 Runtime fp32 sources are negated as high and x256-low limbs in two NPU
 SUB-from-zero stages.  Signed constants are split at compile time.  The
 remaining TwoSum and final ABI decode are shared with compensated ADD.
+
+### Compensated fp32 MUL milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_mul` + scalar MUL + MUL NaN/Inf | **3 passed in 4.80s** |
+| unchanged `test_tiny_mul` plus ADD/SUB neighborhood | **9 passed in 5.28s** |
+| old direct tensor MUL path | **8/4096 misses, max abs 0.0014329** |
+| fp16-stage compensated model | **0 misses, max abs about 1.2e-6** |
+| full hardware-free planner/codec contract | **93/93 in 24.52s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Direct, scalar, and affine-view fp32 products now use high and x256-residual
+input limbs. A 25-stage NPU Dekker/TwoProduct sequence reconstructs the fp16
+high-product rounding error and both input-residual cross terms. The host
+only gathers/encodes affine views and decodes the NPU-produced split result.
+
+The initial version overflowed on `255*x` because it scaled the rounded
+product by 256. The final version computes the small unscaled product error
+before scaling it, so all six scalar subcases pass. `NEG` and logical-not
+were already passing in the probe that identified MUL as the next failed
+group. This is an incremental normal-default milestone; the last complete
+suite census at the top of this file is not replaced by these focused runs.

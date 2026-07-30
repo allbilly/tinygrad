@@ -7470,6 +7470,37 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — compensated fp32 MUL milestone
+
+Normal-default forward-only `TestOps.test_mul`, `test_scalar_mul`,
+`test_tiny_mul`, and `test_mul_naninf` now pass on the RK3588. The old direct
+fp16 product missed tolerance in 8/4096 lanes. The active path represents
+each fp32 operand as an fp16 high limb plus an x256 residual limb, then uses a
+25-stage DPU Dekker/TwoProduct sequence. Host work is limited to static
+affine gather/broadcast and final split-fp32 ABI decoding; it never evaluates
+the multiplication.
+
+The first hardware version formed `rounded_product*256` while reconstructing
+the product error. This overflowed fp16 for finite `255*x` results. The fixed
+sequence forms the small unscaled Dekker error first, scales only that error
+by 256, and then adds `high*low`, `low*high`, and `low*low/256` corrections.
+The measured fp16-stage model has zero official tensor misses and maximum
+absolute error about `1.2e-6`.
+
+Validation used `. .venv/bin/activate` with
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged direct, scalar, and NaN/Inf MUL methods: **3 passed in 4.80s**;
+- unchanged tiny MUL: passed with the nine-method ADD/SUB neighborhood,
+  **9 passed in 5.28s**;
+- hardware-free Rockchip planner/codec contract: **93/93 in 24.52s**;
+- mypy: exact pre-existing **13-error** Rockchip baseline;
+- `git diff --check`: passing.
+
+No LUT coefficients or task topology changed, so this milestone does not
+require a new `lut.md` tuning entry. RKNN Toolkit2 issue #471 remains only
+evidence of fp16 input rounding; it contains no product-error workaround.
+
 ## 2026-07-30 — normal-fp32 ASINH/ACOSH two-LUT milestone
 
 The normal-default forward census no longer times out in
