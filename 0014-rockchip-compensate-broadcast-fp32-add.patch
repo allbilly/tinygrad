@@ -1,0 +1,288 @@
+From 51c619f3bfee37a8774817fb61903e9baa3ab57b Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 10:22:45 +0800
+Subject: [PATCH] rockchip: compensate broadcast fp32 add
+
+---
+ progress.md                          | 42 ++++++++++++++++++
+ test/rockchip/test_pr1.py            | 19 ++++++++
+ test_ops_status.md                   | 20 +++++++++
+ tinygrad/runtime/ops_rockchip.py     | 30 +++++++++++--
+ tinygrad/runtime/support/rockchip.py | 66 ++++++++++++++++++++--------
+ 5 files changed, 155 insertions(+), 22 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 8853717d7..ce9af0df2 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7610,6 +7610,48 @@ The three-input program uses six input representation views, eighteen NPU
+ arithmetic stages, and one final high/residual fp32 ABI decode.  Broadcast
+ ADD and SUB remain separate groups.
+ 
++## 2026-07-30 — affine broadcast fp32 ADD milestone
++
++The next broadcast case reproduced the previously documented failure:
++`test_broadcasted_add` had **300/2925** misses and maximum absolute error
++**0.00092542**.  The one-stage broadcast path expanded fp32 operands but
++still rounded them to one fp16 limb before addition.
++
++The compensated ADD matcher now accepts affine direct INDEX operands whose
++static strides map into the logical output shape.  Each input view records:
++
++```text
++(ndim, output_shape..., source_strides..., source_offset)
++```
++
++The host uses only those compile-time strides to gather/broadcast fp32 ABI
++values while encoding high and x256-residual halves.  It does not combine
++operands.  Row broadcast `(45,1)`, scalar broadcast, and trailing vector
++`(65,)` therefore feed the same nine NPU TwoSum/correction stages used by
++direct ADD.
++
++Early simplification turns a scalar tensor operand into a fp32 CONST.
++Constants are now split into high/residual scalar register operands and stay
++inside the NPU sequence; no repeated host tensor is materialized.
++
++One debug trap mattered: an emitter-sensitive run initially reused the old
++one-stage image, so `ROCKCHIP_DEBUG_FP32_ADD` never reached the new final ABI
++decode.  Final measurements used both `CACHELEVEL=0` and `CCACHE=0`, as
++required for emitter changes.
++
++Validation with `. .venv/bin/activate` and
++`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
++
++- unchanged `test_broadcasted_add` + `test_broadcasted_add_2`:
++  **2 passed in 3.11 seconds**;
++- complete direct/nested/broadcast ADD family: **5 passed in 4.35 seconds**;
++- full hardware-free planner/codec contract: **89/89 in 6.99 seconds**;
++- Python compilation and `git diff --check`: passing;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++`ROCKCHIP_DEBUG_FP32_ADD=1` prints the final high limb, x256-low limb, and
++decoded fp32 values.  SUB is the next separate arithmetic group.
++
+ ## 2026-07-30 — logarithmic long cumulative products
+ 
+ The unchanged forward-only `TestOps.test_simple_cumprod` now passes both
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index e65a9d637..23749aab1 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -320,6 +320,25 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.task.is_copy for task in subtasks), 7)
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_fp32_broadcast_add_uses_affine_limb_views(self):
++    a = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
++    b = Tensor.empty(45,1, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a+b))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 9)
++    self.assertTrue(all(len(task.task.layout) > 2 for task in subtasks[:4]))
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
++
++  def test_fp32_scalar_add_uses_compensated_constant_limbs(self):
++    a = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a+0.1251))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 9)
++    self.assertEqual(sum(task.task.is_copy for task in subtasks), 3)
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
++
+   def test_fp32_acos_uses_specialized_lut_boundary(self):
+     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
+     self.assertIsNotNone(program)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 9abcf11d5..bcfd3589f 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1520,3 +1520,23 @@ caller-visible fp32 buffer and raised `IndexError`.
+ 
+ Three-input ADD uses eighteen NPU arithmetic stages.  Broadcast ADD and SUB
+ remain open and are not covered by this milestone.
++
++### Affine broadcast fp32 ADD milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged `test_broadcasted_add` + `test_broadcasted_add_2` | **2 passed in 3.11s** |
++| complete ADD family: direct, nested, scalar, row/vector broadcast | **5 passed in 4.35s** |
++| old row-broadcast path | **300/2925 misses, max abs 0.00092542** |
++| full hardware-free planner/codec contract | **89/89 in 6.99s** |
++| mypy | **pre-existing 13-error baseline** |
++
++Static affine fp32 views now combine layout expansion with high/residual ABI
++encoding.  Source strides of zero perform scalar or dimension broadcast;
++all operand addition remains in the compensated NPU TwoSum stages.
++Early-simplified fp32 CONST operands are encoded as high/residual scalar
++operands rather than host-expanded tensors.
++
++Final emitter-sensitive validation disabled both `CACHELEVEL` and `CCACHE`.
++`ROCKCHIP_DEBUG_FP32_ADD=1` exposes the final NPU-produced limbs and decoded
++fp32 ABI result.  SUB remains the next distinct group.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 49a844778..d7680ef3e 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -103,6 +103,9 @@ def _run_host_fp32_combine(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...]
+   low = np.frombuffer(ctypes.string_at(low_buf.va_addr, total*2), dtype=np.float16).astype(np.float32)
+   with np.errstate(invalid="ignore"):
+     result = np.where(np.isfinite(high), high+low/256.0, high).astype(np.float32)
++  if getenv("ROCKCHIP_DEBUG_FP32_ADD"):
++    count = min(total, 32)
++    print("RK_FP32_COMBINE", "high", high[:count], "low256", low[:count], "result", result[:count])
+   ctypes.memmove(output.va_addr, result.ctypes.data, total*4)  # type: ignore[arg-type]
+ 
+ def _convert_bool_to_fp16_buf(src, dst, n):
+@@ -692,9 +695,30 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+   for i, value in enumerate(values): output[i] = value
+ 
+ def _run_host_fp32_view(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple, residual:bool) -> None:
+-  total, source_slot = task.layout[0], relocs[1].globals_slot
+-  if residual: _convert_fp32_residual_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
+-  else: _convert_fp32_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
++  total, tag, *meta = task.layout
++  source_slot = relocs[1].globals_slot
++  if not meta:
++    if residual: _convert_fp32_residual_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
++    else: _convert_fp32_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
++    return
++  import numpy as np
++  ndim, *mapping = meta
++  shape, strides, offset = mapping[:ndim], mapping[ndim:2*ndim], mapping[-1]
++  assert tag in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT) and len(mapping) == 2*ndim+1 and np.prod(shape) == total
++  source_n = bufs[source_slot].size//4
++  source = np.frombuffer(ctypes.string_at(bufs[source_slot].va_addr, source_n*4), dtype=np.float32)
++  indexes = np.empty(total, dtype=np.int64)
++  for linear in range(total):
++    rem, source_index = linear, offset
++    for axis in range(ndim-1, -1, -1):
++      rem, coord = divmod(rem, shape[axis])
++      source_index += coord*strides[axis]
++    if not 0 <= source_index < source_n: raise RuntimeError(f"rk: fp32 view index out of bounds {source_index}")
++    indexes[linear] = source_index
++  gathered = source[indexes]
++  high = gathered.astype(np.float16)
++  result = ((gathered-high.astype(np.float32))*256.0).astype(np.float16) if residual else high
++  ctypes.memmove(bufs[task.out_slot].va_addr, result.ctypes.data, total*2)  # type: ignore[arg-type]
+ 
+ def _run_host_static_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Materialize compile-time int32 constants for a later NPU task."""
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index d773c2109..5017c53bd 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10776,10 +10776,30 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   flatten_add(val)
+   sources = tuple(sources_list)
+   if len(sources) not in (2, 3): return None
+-  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM or
+-         not _is_flat_contiguous(x.src[1]) for x in sources) or not _is_flat_contiguous(store.src[0].src[1]): return None
+-  total = prod(_shape_of_store(sink))
+-  if any(int(x.src[0].src[0].arg) != total for x in sources): return None
++  if any(x.dtype is not dtypes.float or x.op not in (Ops.INDEX, Ops.CONST) or
++         (x.op is Ops.INDEX and x.src[0].op is not Ops.PARAM) for x in sources): return None
++  store_aff = _affine_index(store.src[0].src[1])
++  if store_aff is None: return None
++  extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
++             if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
++  axes = sorted(store_aff[0], key=lambda x:store_aff[0][x], reverse=True)
++  if not axes or not all(axis in extents for axis in axes): return None
++  out_shape = tuple(extents[axis] for axis in axes)
++  total = prod(out_shape)
++  if total != prod(_shape_of_store(sink)): return None
++  source_layouts:list[tuple[int,...]|None] = []
++  for source in sources:
++    if source.op is Ops.CONST:
++      source_layouts.append(None)
++      continue
++    aff = _affine_index(source.src[1])
++    if aff is None: return None
++    if any(axis not in axes or stride < 0 for axis, stride in aff[0].items()): return None
++    strides = tuple(aff[0].get(axis, 0) for axis in axes)
++    source_total = int(source.src[0].src[0].arg)
++    max_index = aff[1] + sum((extent-1)*stride for extent, stride in zip(out_shape, strides))
++    if aff[1] < 0 or max_index >= source_total: return None
++    source_layouts.append((len(out_shape), *out_shape, *strides, aff[1]))
+ 
+   info = ProgramInfo.from_sink(sink)
+   next_slot = max(info.globals, default=-1)+1
+@@ -10788,19 +10808,29 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     nonlocal next_slot
+     ret, next_slot = next_slot, next_slot+1
+     return ret
+-  def view(source_slot:int, tag:int) -> int:
++  def view(source_slot:int, tag:int, layout:tuple[int,...]) -> int:
+     out = alloc()
+     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+-    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag), out, is_copy=True), relocs))
++    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag, *layout), out, is_copy=True), relocs))
+     return out
+-  def stage(a:int, b:int, op:Ops) -> int:
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++  def stage(a:tuple[int,int], b:tuple[int,int], op:Ops) -> tuple[int,int]:
+     out = alloc()
+-    tasks.append(_emit_where_stage(total, out, (a, 0), (b, 0), op))
+-    return out
+-
+-  limbs = tuple((view(x.src[0].arg.slot, _HOST_FP32_HALF_LAYOUT),
+-                 view(x.src[0].arg.slot, _HOST_FP32_RESIDUAL_LAYOUT)) for x in sources)
++    tasks.append(_emit_where_stage(total, out, a, b, op))
++    return out, 0
++  def limb(source:UOp, tag:int, layout:tuple[int,...]|None) -> tuple[int,int]:
++    if source.op is Ops.CONST:
++      original = np.float32(source.arg)
++      high = np.float16(original)
++      value = high if tag == _HOST_FP32_HALF_LAYOUT else np.float16((original-np.float32(high))*256.0)
++      return scalar(float(value))
++    assert layout is not None
++    return view(source.src[0].arg.slot, tag, layout), 0
++
++  limbs = tuple((limb(x, _HOST_FP32_HALF_LAYOUT, layout), limb(x, _HOST_FP32_RESIDUAL_LAYOUT, layout))
++                for x, layout in zip(sources, source_layouts))
+   high, low = limbs[0]
+   for next_high, next_low in limbs[1:]:
+     old_high = high
+@@ -10811,14 +10841,12 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     error_b = stage(next_high, rounded_b, Ops.SUB)
+     high_error = stage(error_a, error_b, Ops.ADD)
+     input_low = stage(low, next_low, Ops.ADD)
+-    scaled_high_error = alloc()
+-    tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
+-                                   (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
++    scaled_high_error = stage(high_error, scalar(256.0), Ops.MUL)
+     low = stage(input_low, scaled_high_error, Ops.ADD)
+ 
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high, 0, 0, 0xFFFFFFFF),
+-            RKReloc(0, low, 0, 0, 0xFFFFFFFF))
++  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high[0], 0, 0, 0xFFFFFFFF),
++            RKReloc(0, low[0], 0, 0, 0xFFFFFFFF))
+   tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_COMBINE_LAYOUT),
+                                      info.outs[0], is_copy=True), relocs))
+   return tuple(tasks)
+@@ -12094,6 +12122,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   # scan; multidimensional cumprod uses the same physical helper shape.
+   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
+   #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
++  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_add_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
+   if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
+@@ -12130,8 +12160,6 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, movement_sum_tasks)
+   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, elementwise_sum_tasks)
+-  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
+-    return build_native_program_multi(sink, fp32_add_tasks)
+   if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_cmac_tasks)
+   # Retain the half-input WIP above for reference. The active path is narrower:
+-- 
+2.34.1
+
