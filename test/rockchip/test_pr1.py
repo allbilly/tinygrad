@@ -9,7 +9,7 @@ from tinygrad.codegen import pm_to_program
 from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT)
+                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -379,6 +379,17 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(host_stages)
       self.assertTrue(all(len(subtasks) == 1 and subtasks[0].task.layout[1] == _HOST_ELEMENTWISE_LAYOUT
                           for subtasks in host_stages))
+
+  def test_fp32_softmax_argmax_uses_linear_strict_task(self):
+    for axis, compact_mapping in ((0, 1), (1, 0)):
+      expression = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").softmax(axis).argmax()
+      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+      program = build_native_program(sinks[-1])
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_SOFTMAX_ARGMAX_LAYOUT)
+      self.assertEqual(subtasks[0].task.layout[3], compact_mapping)
 
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")

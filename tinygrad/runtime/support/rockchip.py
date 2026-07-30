@@ -203,6 +203,7 @@ _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of
 _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
 _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
 _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
+_HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -9181,6 +9182,106 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
 
+def _try_softmax_argmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize tinygrad's exact global argmax-of-softmax graph without quadratic expansion."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.int or prod(_shape_of_store(sink)) != 1: return None
+  value = _unwrap(store.src[1])
+  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+  float_maxima = [u for u in reductions if u.dtype is dtypes.float and u.arg[0] is Ops.MAX]
+  int_maxima = [u for u in reductions if u.dtype is dtypes.int and u.arg[0] is Ops.MAX]
+  if len(reductions) != 2 or len(float_maxima) != 1 or len(int_maxima) != 1: return None
+  normalized_nodes = [u for u in value.toposort() if u.op is Ops.FDIV and u.dtype is dtypes.float]
+  exponentials = [u for u in value.toposort() if u.op is Ops.EXP2 and u.dtype is dtypes.float]
+  comparisons = [u for u in value.toposort() if u.op is Ops.CMPNE]
+  casts = [u for u in value.toposort() if u.op is Ops.CAST]
+  if len(normalized_nodes) != 2 or len(exponentials) != 2 or len(comparisons) != 2 or len(casts) != 2: return None
+  normalized = _unwrap(float_maxima[0].src[0])
+  if normalized.op is not Ops.FDIV: return None
+  exponential, denominator = (_unwrap(x) for x in normalized.src)
+  if exponential.op is not Ops.EXP2 or denominator.op is not Ops.INDEX or denominator.src[0].op is not Ops.PARAM: return None
+  scaled = _unwrap(exponential.src[0])
+  if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
+  log2e = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST), None)
+  delta = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.ADD), None)
+  if log2e is None or log2e.dtype is not dtypes.float or \
+     not math.isclose(float(log2e.arg), math.log2(math.e), rel_tol=1e-12) or delta is None: return None
+  data = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.INDEX), None)
+  negative = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.MUL), None)
+  if data is None or data.src[0].op is not Ops.PARAM or negative is None: return None
+  minus_one = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
+  maximum = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
+  if minus_one is None or minus_one.dtype is not dtypes.float or float(minus_one.arg) != -1.0 or \
+     maximum is None or maximum.src[0].op is not Ops.PARAM: return None
+
+  allowed = {Ops.SINK, Ops.STORE, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.RANGE, Ops.REDUCE,
+             Ops.EXP2, Ops.MUL, Ops.ADD, Ops.FDIV, Ops.CMPNE, Ops.CAST, Ops.FLOORDIV}
+  if any(u.op not in allowed for u in sink.toposort()): return None
+  axes = list(float_maxima[0].src[1:])
+  if not axes or any(axis.src[0].op is not Ops.CONST for axis in axes): return None
+  extents = tuple(int(axis.src[0].arg) for axis in axes)
+
+  # Grouped reductions use RANGE args such as (group, dimension, AxisType), so
+  # arg[0] alone is not unique. Keep UOp identity in this local affine parser.
+  def affine_uop(idx:UOp) -> tuple[dict[UOp,int],int]|None:
+    if idx.op is Ops.RANGE: return ({idx:1}, 0)
+    if idx.op is Ops.CONST: return ({}, int(idx.arg))
+    if idx.op is Ops.ADD:
+      lhs, rhs = affine_uop(idx.src[0]), affine_uop(idx.src[1])
+      if lhs is None or rhs is None: return None
+      return ({key:lhs[0].get(key, 0)+rhs[0].get(key, 0) for key in lhs[0].keys()|rhs[0].keys()}, lhs[1]+rhs[1])
+    if idx.op is Ops.MUL:
+      constant, source = (idx.src[0], idx.src[1]) if idx.src[0].op is Ops.CONST else (idx.src[1], idx.src[0])
+      if constant.op is not Ops.CONST or (aff := affine_uop(source)) is None: return None
+      return ({key:value*int(constant.arg) for key, value in aff[0].items()}, aff[1]*int(constant.arg))
+    return None
+
+  affines = (affine_uop(data.src[1]), affine_uop(maximum.src[1]), affine_uop(denominator.src[1]))
+  compact = all(aff is not None and
+                all(axis in axes and stride >= 0 for axis, stride in aff[0].items()) for aff in affines)
+
+  def bounded(aff:tuple[dict[UOp,int],int], total:int) -> bool:
+    maximum_index = aff[1] + sum((extent-1)*aff[0].get(axis, 0) for axis, extent in zip(axes, extents))
+    return aff[1] >= 0 and maximum_index < total
+  totals = (int(data.src[0].src[0].arg), int(maximum.src[0].src[0].arg), int(denominator.src[0].src[0].arg))
+  if prod(extents) != totals[0]: return None
+
+  def mapping(aff:tuple[dict[UOp,int],int]) -> tuple[int,...]:
+    return (aff[1], *(aff[0].get(axis, 0) for axis in axes))
+  if compact:
+    compact_affines = tuple(aff for aff in affines if aff is not None)
+    assert len(compact_affines) == 3
+    if not all(bounded(aff, total) for aff, total in zip(compact_affines, totals)): return None
+    serialized_mappings = tuple(value for aff in compact_affines for value in mapping(aff))
+  else:
+    def evaluate_index(idx:UOp, coordinates:dict[UOp,int]) -> int:
+      if idx.op is Ops.RANGE: return coordinates[idx]
+      if idx.op is Ops.CONST: return int(idx.arg)
+      lhs, rhs = evaluate_index(idx.src[0], coordinates), evaluate_index(idx.src[1], coordinates)
+      if idx.op is Ops.ADD: return lhs+rhs
+      if idx.op is Ops.MUL: return lhs*rhs
+      if idx.op is Ops.FLOORDIV: return lhs//rhs
+      raise ValueError(f"unsupported softmax argmax index op {idx.op}")
+    explicit:list[int] = []
+    for index, total in zip((data.src[1], maximum.src[1], denominator.src[1]), totals):
+      addresses:list[int] = []
+      for linear in range(prod(extents)):
+        rem, coordinates = linear, {}
+        for axis in range(len(axes)-1, -1, -1):
+          rem, coordinate = divmod(rem, extents[axis])
+          coordinates[axes[axis]] = coordinate
+        address = evaluate_index(index, coordinates)
+        if not 0 <= address < total: return None
+        addresses.append(address)
+      explicit.extend(addresses)
+    serialized_mappings = tuple(explicit)
+  out_slot = ProgramInfo.from_sink(sink).outs[0]
+  layout = (1, _HOST_SOFTMAX_ARGMAX_LAYOUT, len(extents), int(compact), *extents, *serialized_mappings)
+  slots = (out_slot, data.src[0].buf_uop.arg.slot, maximum.src[0].buf_uop.arg.slot, denominator.src[0].buf_uop.arg.slot)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
+  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+  return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
+
 def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Unroll the static integer reductions used to choose max-pool indices."""
   store = _store_node(sink)
@@ -13351,6 +13452,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, argsort_selected_tasks)
   if (argsort_tasks := _try_argsort_index_subtasks(sink)) is not None:
     return build_native_program_multi(sink, argsort_tasks)
+  if (softmax_argmax_tasks := _try_softmax_argmax_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, softmax_argmax_tasks)
   if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
     return build_native_program_multi(sink, arg_extrema_tasks)
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)

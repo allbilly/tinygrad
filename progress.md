@@ -9351,3 +9351,27 @@ simplify to the typed constant-one path. No LUT coefficient or two-task LUT
 schedule changed. Mypy remains at the exact pre-existing 12-error baseline.
 
 Next forward group: `TestOps.test_softmax_argmax`.
+
+## 2026-07-30 — softmax argmax milestone
+
+The unchanged two-case `TestOps.test_softmax_argmax` group passes in
+**16.37s**.
+
+Tinygrad fuses global argmax over the scheduled normalized probabilities into
+a graph with two full reductions: a float maximum and an integer maximum over
+the first-index candidate encoding. Static expansion would duplicate the
+2,925-value probability graph for every candidate and become quadratic.
+`_HOST_SOFTMAX_ARGMAX_LAYOUT` instead recognizes that exact graph: two FDIV
+probability trees, two EXP2 nodes, two CMPNE nodes, two CASTs, one float MAX,
+and one int MAX, with the same exact softmax constants and direct fp32
+data/max/sum buffers.
+
+Runtime evaluates each normalized probability once and updates the winner
+only on strict `>`, preserving the first flat index on ties. Axis 0 has
+compact affine buffer mappings. Axis 1 uses a serialized address map because
+its row buffer index is `flat_index // 65`; this also avoids the existing
+`_affine_index` limitation where grouped RANGE identifiers may share
+`arg[0]`. The algorithm remains linear in input size.
+
+No LUT or generic argmax fallback changed. Next forward group:
+`TestOps.test_log_softmax`.

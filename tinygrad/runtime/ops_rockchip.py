@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-  _HOST_VARIANCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -709,6 +709,39 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
         result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
+def _run_host_softmax_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Execute the exact global argmax over scheduled fp32 softmax intermediates."""
+  import numpy as np
+  _, tag, naxes, compact, *meta = task.layout
+  assert tag == _HOST_SOFTMAX_ARGMAX_LAYOUT and len(relocs) == 4
+  cursor = 0
+  extents = tuple(meta[cursor:cursor+naxes])
+  cursor += naxes
+  mappings = []
+  mapping_size = naxes+1 if compact else int(np.prod(extents, dtype=np.int64))
+  for _ in range(3):
+    mappings.append(tuple(meta[cursor:cursor+mapping_size]))
+    cursor += mapping_size
+  assert cursor == len(meta)
+  output_buf, data_buf, max_buf, sum_buf = (bufs[r.globals_slot] for r in relocs)
+  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float32)
+  maxima = np.frombuffer(ctypes.string_at(max_buf.va_addr, max_buf.size), dtype=np.float32)
+  sums = np.frombuffer(ctypes.string_at(sum_buf.va_addr, sum_buf.size), dtype=np.float32)
+
+  def affine(mapping:tuple[int,...], coords:list[int]) -> int:
+    return mapping[0] + sum(coord*stride for coord, stride in zip(coords, mapping[1:]))
+  best_index, best_value = 0, np.float32(-np.inf)
+  for linear in range(int(np.prod(extents, dtype=np.int64))):
+    rem, coords = linear, [0]*naxes
+    for axis in range(naxes-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+    data_index, max_index, sum_index = ((affine(mapping, coords) if compact else mapping[linear]) for mapping in mappings)
+    if not 0 <= data_index < data.size or not 0 <= max_index < maxima.size or not 0 <= sum_index < sums.size:
+      raise RuntimeError(f"rk: softmax argmax input index out of bounds data={data_index} max={max_index} sum={sum_index}")
+    probability = np.float32(np.exp2(np.float32((data[data_index]-maxima[max_index])*np.float32(np.log2(np.e)))) / sums[sum_index])
+    if probability > best_value:
+      best_index, best_value = linear, probability
+  ctypes.c_int32.from_address(output_buf.va_addr).value = best_index
+
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute a compact postfix integer-index program and copy exact element bytes."""
   total, tag, itemsize, n_ranges, *meta = task.layout
@@ -1348,6 +1381,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
           _run_host_variance(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_SOFTMAX_ARGMAX_LAYOUT:
+          _run_host_softmax_argmax(task, st.relocs, bufs)
           continue
         if task.is_fill:
           total = task.layout[0]

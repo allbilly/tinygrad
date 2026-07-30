@@ -2032,3 +2032,12 @@ stage shapes use the existing serialized fp32 host evaluator after strict
 softmax fingerprinting and static reduction expansion. Scalar softmax remains
 the typed constant-one path. No generic host fallback or LUT change was
 introduced. Next forward group: `TestOps.test_softmax_argmax`.
+
+### Softmax argmax
+
+`TestOps.test_softmax_argmax`: **pass in 16.37s** for axes 0 and 1. A strict
+linear-time host task evaluates the already-scheduled fp32 softmax
+probabilities and preserves first-index tie semantics. Compact affine
+mappings cover axis 0; an explicit bounded address map covers axis 1's
+`flat_index // 65` row selection. No LUT or generic argmax fallback changed.
+Next forward group: `TestOps.test_log_softmax`.
