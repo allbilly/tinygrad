@@ -473,6 +473,24 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
       self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_scatter_reduce_tensor_uses_bounded_typed_boundary(self):
+    x = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
+    indices = Tensor.empty(3,4,5, dtype=dtypes.int, device="ROCKCHIP")
+    src = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
+    for mode in ("sum", "prod", "mean", "amin", "amax"):
+      for include_self in (True, False):
+        program = build_native_program(_get_sink(x.scatter_reduce(-1, indices, src, mode, include_self=include_self)))
+        self.assertIsNotNone(program)
+        subtasks = program.src[1].src[0].arg
+        self.assertEqual(len(subtasks), 1)
+        self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    padded = Tensor.zeros(4,5,6, dtype=dtypes.float, device="ROCKCHIP").scatter_reduce(
+      1, indices, Tensor.empty(4,5,6, dtype=dtypes.float, device="ROCKCHIP"), "prod")
+    padded_sinks = [early_simplify(call.src[0]) for call in padded.schedule_linear().src if call.src[0].op is Ops.SINK]
+    padded_program = build_native_program(padded_sinks[-1])
+    self.assertIsNotNone(padded_program)
+    self.assertEqual(padded_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")

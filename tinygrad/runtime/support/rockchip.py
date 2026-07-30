@@ -9240,6 +9240,50 @@ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if not {Ops.WHERE, Ops.OR, Ops.CMPNE}.issubset({u.op for u in value.toposort()}): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_scatter_reduce_tensor_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Expand only tinygrad's bounded fp32 tensor scatter_reduce lowering."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float: return None
+  value = _unwrap(store.src[1])
+  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+  if not 1 <= len(reductions) <= 3 or value.op not in (Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV): return None
+  if any(u.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or u.dtype not in (dtypes.bool, dtypes.int, dtypes.float) or
+         not u.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in u.src[1:]) for u in reductions): return None
+  reduction_sizes = [prod(int(axis.src[0].arg) for axis in u.src[1:]) for u in reductions]
+  if any(size > 8 for size in reduction_sizes) or sum(reduction_sizes) > 24: return None
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  int_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}
+  float_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}
+  if len(int_slots) != 1 or len(float_slots) != 2: return None
+  nodes = value.toposort()
+  if not {Ops.WHERE, Ops.CMPNE}.issubset({u.op for u in nodes}): return None
+  allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.CAST,
+             Ops.ADD, Ops.MUL, Ops.MAX, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+
+  def expand(u:UOp) -> UOp:
+    if u.op is Ops.REDUCE:
+      ranges = u.src[1:]
+      extents = [int(r.src[0].arg) for r in ranges]
+      terms:list[UOp] = []
+      for linear in range(prod(extents)):
+        rem, fixed = linear, {}
+        for reduce_axis in range(len(ranges)-1, -1, -1):
+          rem, coord = divmod(rem, extents[reduce_axis])
+          fixed[ranges[reduce_axis]] = UOp.const(ranges[reduce_axis].dtype, coord)
+        terms.append(expand(u.src[0].substitute(fixed)))
+      if not terms: raise ValueError("empty scatter_reduce reduction")
+      result = terms[0]
+      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
+      return result
+    new_src = tuple(expand(x) for x in u.src)
+    return u if new_src == u.src else u.replace(src=new_src)
+
+  try: expanded_value = expand(store.src[1])
+  except (TypeError, ValueError, OverflowError): return None
+  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
+  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+
 def _try_scatter_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Stage only legacy scalar scatter ADD/MUL reductions and their base epilogue."""
   store = _store_node(sink)
@@ -13903,6 +13947,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fancy_index_reduce_tasks)
   if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, scatter_tasks)
+  if (scatter_reduce_tensor_tasks := _try_scatter_reduce_tensor_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, scatter_reduce_tensor_tasks)
   if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, scatter_reduce_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)

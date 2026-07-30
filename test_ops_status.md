@@ -2335,3 +2335,16 @@ reduction layout now encodes ADD versus MUL and feeds a second typed
 base-epilogue task, reusing the output buffer as safe all-host scratch. No
 new tag or LUT changed. Contract: **138/138**. Next forward group:
 `TestOps.test_scatter_reduce`.
+
+### Tensor scatter-reduce
+
+The three scatter-reduce methods pass together in **9.13s**. The main method
+passes all 30 `reduction × dimension × include_self` forms in **7.71s**;
+the zero-base product regression and invalid-mode/dtype errors also pass. A
+strict one-index/two-fp32-input matcher expands only one-to-three tiny static
+ADD/MUL/MAX reductions, capped at eight candidates apiece and a combined
+budget of 24, into the existing typed fp32 evaluator. The padded unequal-shape
+form additionally admits its exact `CMPLT/AND` guards, and mean is matched
+after reciprocal-to-FDIV rewriting. No runtime ABI or LUT changed. Contract:
+**139/139**. Next forward group:
+`TestOps.test_scaled_dot_product_attention`.

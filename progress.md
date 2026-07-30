@@ -9922,3 +9922,30 @@ overwriting.
 This extends the existing reduction-layout ABI but adds no new tag or LUT.
 Mypy remains at the exact 12-error baseline. Next forward group:
 `TestOps.test_scatter_reduce`.
+
+## 2026-07-30 — tensor scatter-reduce milestone
+
+The unchanged `test_scatter_reduce`, `test_scatter_reduce_prod_zeros`, and
+`test_scatter_reduce_errors` methods pass together in **9.13s**. The main
+method passes alone in **7.71s** and covers all 30 combinations of five
+reductions (`sum`, `prod`, `mean`, `amin`, and `amax`), three signed
+dimensions, and both `include_self` modes. The adjacent methods cover the
+larger zero-base product geometry and both expected API errors. The
+hardware-free Rockchip contract is **139/139 in 9.90s**.
+
+Tinygrad lowers this family to one through three small static reductions:
+fp32 ADD/MUL/MAX for values, bool MAX for the no-self occupancy mask, and
+int32 ADD for the mean divisor. A strict matcher requires exactly one int32
+index input and two fp32 data inputs, accepts no more than three reductions,
+caps each static reduction at eight candidates and their combined expansion
+budget at 24, and then expands them into the existing typed fp32 elementwise
+boundary. `mean` is recognized after the normal reciprocal-to-FDIV compiler
+rewrite.
+
+The unequal `(4,5,6)` destination with a `(3,4,5)` index adds `CMPLT` and
+`AND` padding guards around the same bounded product signature; those guards
+are serialized by the same typed evaluator. This path remains separate from
+the compact staged implementation for legacy scalar scatter ADD/MUL.
+
+No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_scaled_dot_product_attention`.
