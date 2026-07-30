@@ -1,0 +1,54 @@
+From 0d1b60f9f96df610bb936d3e7060676f680e1220 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 14:06:05 +0800
+Subject: [PATCH] docs: record normal fp32 topk validation
+
+---
+ progress.md        | 12 ++++++++++++
+ test_ops_status.md | 10 ++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 69e4f213f..2e8f1cc3d 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7628,6 +7628,18 @@ No LUT coefficients or task count changed; a two-level LUT is unrelated to
+ lexicographic high/residual ordering. Continue the normal-fp32 census after
+ `test_sort`, with `test_topk` as the next adjacent group.
+ 
++## 2026-07-30 — normal-fp32 topk validation
++
++Unchanged forward-only `TestOps.test_topk` passes in **19.22 seconds**. This
++covers value and int32-index outputs, largest and smallest selection, axes 0
++and 1, sorted output, non-power-of-two padding, repeated-value stability, and
++the out-of-range exception case.
++
++No additional backend change was required. Topk reuses the exact two-limb
++sort and stable index reconstruction committed in the preceding milestone.
++No LUT or host operator arithmetic was introduced. Continue the collected
++normal-fp32 census after `test_topk`.
++
+ ## 2026-07-30 — compensated fp32 MUL milestone
+ 
+ Normal-default forward-only `TestOps.test_mul`, `test_scalar_mul`,
+diff --git a/test_ops_status.md b/test_ops_status.md
+index edd2db1cc..ebba6942f 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1703,3 +1703,13 @@ four-lane WIP remains selectable with `ROCKCHIP_NATIVE_ARGSORT_PACK=1`.
+ 
+ No LUT change was involved. `test_sort` is resolved; continue with
+ `TestOps.test_topk`.
++
++### Normal-fp32 topk validation
++
++| Coverage | Result |
++|---|---:|
++| unchanged `TestOps.test_topk` | **1 passed in 19.22s** |
++
++Topk values/indices, largest/smallest, axis selection, padding, duplicate
++stability, and exception behavior all pass through the exact sort path. No
++new code or LUT change was needed. Continue the census after `test_topk`.
+-- 
+2.34.1
+
