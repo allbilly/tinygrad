@@ -1703,3 +1703,13 @@ four-lane WIP remains selectable with `ROCKCHIP_NATIVE_ARGSORT_PACK=1`.
 
 No LUT change was involved. `test_sort` is resolved; continue with
 `TestOps.test_topk`.
+
+### Normal-fp32 topk validation
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_topk` | **1 passed in 19.22s** |
+
+Topk values/indices, largest/smallest, axis selection, padding, duplicate
+stability, and exception behavior all pass through the exact sort path. No
+new code or LUT change was needed. Continue the census after `test_topk`.

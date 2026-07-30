@@ -7628,6 +7628,18 @@ No LUT coefficients or task count changed; a two-level LUT is unrelated to
 lexicographic high/residual ordering. Continue the normal-fp32 census after
 `test_sort`, with `test_topk` as the next adjacent group.
 
+## 2026-07-30 — normal-fp32 topk validation
+
+Unchanged forward-only `TestOps.test_topk` passes in **19.22 seconds**. This
+covers value and int32-index outputs, largest and smallest selection, axes 0
+and 1, sorted output, non-power-of-two padding, repeated-value stability, and
+the out-of-range exception case.
+
+No additional backend change was required. Topk reuses the exact two-limb
+sort and stable index reconstruction committed in the preceding milestone.
+No LUT or host operator arithmetic was introduced. Continue the collected
+normal-fp32 census after `test_topk`.
+
 ## 2026-07-30 — compensated fp32 MUL milestone
 
 Normal-default forward-only `TestOps.test_mul`, `test_scalar_mul`,
