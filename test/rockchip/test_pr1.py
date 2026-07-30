@@ -1,11 +1,13 @@
 # PR 1 hardware-free tests: classifier, emitter, codec, determinism.
 # These tests do not require an NPU and run under DEV=NULL.
 import unittest, struct
+from dataclasses import replace
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
 from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
 from tinygrad.codegen import pm_to_program
-from tinygrad.runtime.support.rockchip import plan_rk, emit_rk, encode_rk, decode_rk, build_native_program, RKPlan
+from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
+                                               build_native_program, RKPlan, RKSubTask)
 from tinygrad.runtime.ops_rockchip import RockchipRenderer
 from tinygrad.helpers import Target
 
@@ -355,6 +357,13 @@ class TestCodec(unittest.TestCase):
     dec_cmds, dec_task, dec_relocs = decode_rk(packed)
     self.assertTrue(dec_task.is_fill)
     self.assertEqual(len(dec_cmds), len(cmds))
+
+  def test_roundtrip_multi_fp32_residual_input(self):
+    cmds, task, relocs = _emit(_get_sink(Tensor.rand(4,4,dtype=dtypes.half).realize()+1))
+    encoded = encode_rk_multi((RKSubTask(cmds, replace(task, fp32_residual_input=True), relocs),))
+    decoded = decode_rk_multi(encoded)
+    self.assertEqual(len(decoded), 1)
+    self.assertTrue(decoded[0].task.fp32_residual_input)
 
   def test_roundtrip_cmac_scaled_sum(self):
     # Scaled sum roundtrip: verify const_val survives codec

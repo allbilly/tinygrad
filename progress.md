@@ -7547,6 +7547,87 @@ The interpretation of RKNN Toolkit2 issue #471 remains unchanged: its values
 are exactly fp16 quantization of `0.1`, not evidence for accumulator drift or
 a solution to this EXP2 range problem.
 
+## 2026-07-30 — compensated float product and cumulative product
+
+The unchanged forward-only `TestOps.test_cumprod` now passes scalar, length
+20, both `(20,30)` axes, and both equivalent last-axis forms for
+`(20,30,40)`. The original product matcher gathered the correct static
+windows but chained one fp16 multiply per factor. That differs from Torch's
+float32 prefix accumulator and previously left 23/600 values outside
+`rtol=0.001` in the first 2-D axis case.
+
+### Failure isolation
+
+Pure fp16 emulation separated three numerical boundaries:
+
+1. a two-half accumulator with already-quantized fp16 operands reduced a
+   representative 2-D case to zero tolerance failures;
+2. using only `fp16(x)` for the official float32 operands lost input bits and
+   produced 71/600 misses;
+3. representing each float32 operand as `hi=fp16(x)` plus
+   `lo=fp16(256*(x-float32(hi)))` reduced the official 2-D models to zero.
+
+The x256 low limb is required because an unscaled residual underflows after
+roughly 20 small factors. Product-error terms and accumulator residuals stay
+in that scaled domain; only renormalization and the visible output divide by
+256.
+
+Dekker's binary16 splitter is 65. The initial compensated implementation
+therefore overflowed `65*hi` for 35 growing lanes in the 3-D case and
+generated exactly 35 NaNs. DPU masks now normalize lanes with `abs(hi)>64`
+by `1/256` only while recovering the product error, then restore the
+power-of-two scale. The unchanged 24,000-element 3-D case has no NaNs and no
+tolerance failures.
+
+### Runtime and ABI details
+
+Version-4 images encode fp32 inputs only for low global slots. Reusing one
+low-numbered gather slot avoids silently interpreting later float scratch
+buffers as pairs of halfwords. Each static host movement copies exact fp32
+bytes into that slot; the established ABI converter emits the high half and
+a new x256 residual half. All multiplication, product-error recovery,
+masking, scaling, addition, and final rounding remain DPU work. The residual
+converter changes representation only; it does not evaluate a product or
+prefix operator on the host.
+
+Because the gather slot is reused, movement and DPU conversions must remain
+ordered. The mixed runner now detects a copy after compute, flushes dependent
+work before overwriting a live slot, isolates the two different fp32
+conversion views, and reset-separates comparison tasks. The latter avoids a
+reproducible ioctl timeout after an ordinary DPU batch.
+
+Short float `prod` windows use the same two-limb path. This fixed the
+low-slot serialization problem and keeps both unchanged `test_prod` and
+`test_prod_dtype_arg` passing. Native-half windows below ten lanes retain the
+older fast sequential chain.
+
+### Validation and remaining boundary
+
+Using `. .venv/bin/activate` and `DEV=ROCKCHIP FORWARD_ONLY=1`:
+
+- unchanged `TestOps.test_cumprod`: **1 passed in 60.01 seconds**;
+- unchanged `TestOps.test_small_cumprod`: **1 passed in 5.30 seconds** after
+  the final large-lane normalization;
+- unchanged `TestOps.test_cumprod_zero_axis`: **1 passed in 2.71 seconds**;
+- unchanged `test_prod` and `test_prod_dtype_arg`: both passed before the
+  combined command reached an unrelated constant-sum rejection;
+- hardware-free codec/classifier contract: **80/80 in 6.56 seconds**,
+  including permanent round-trip coverage for the residual-input flag;
+- Python compilation and `git diff --check`: passing;
+- mypy: the exact pre-existing **13-error** Rockchip baseline.
+
+`test_const_reduce` currently stops in its first constant `sum` subcase with
+`RKPLAN_REJECT:unsupported_dtype:fp32_cmac`; that graph does not enter product
+lowering and is tracked separately. `test_simple_cumprod` uses windows 512
+and 1022, beyond the matcher's current static-window guard of 256, so it is
+the next cumulative-product milestone.
+
+RKNN Toolkit2 issue
+[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) remains useful
+only as an input-quantization diagnostic: its `25.59375` and `409.5` results
+follow exactly from fp16 `0.1 = 0.0999755859375`. It neither demonstrates
+accumulator drift nor supplies a cumprod precision fix.
+
 ## 2026-07-30 — scalar runtime tensor POW zero-base milestone
 
 The unchanged `TestOps.test_pow_zero_tensor` now passes all scalar fp32

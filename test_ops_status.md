@@ -1322,3 +1322,37 @@ exact base/exponent-sign masks handle the fixed-seed fp16 boundaries.
 Non-official random seeds still expose the broader fp16-versus-float32
 internal POW precision gap; this is documented as future split-precision
 work rather than claimed complete.
+
+### Compensated product/cumprod milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_cumprod`, scalar through 3-D last axis | **1 passed in 60.01s** |
+| unchanged `test_small_cumprod` | **1 passed in 5.30s** |
+| zero-length cumulative axes | **1 passed in 2.71s** |
+| `test_prod`, `test_prod_dtype_arg` | **passing** |
+| hardware-free contract + residual codec test | **80/80 in 6.56s** |
+| `test_simple_cumprod`, lengths 512/1022 | **pending: window guard is 256** |
+
+Float products now use two fp16 limbs for each exact fp32 ABI input and for
+the running accumulator. The low limb is scaled by 256 to survive fp16
+subnormal prefixes. A per-lane DPU mask temporarily scales large
+accumulators down before the `65*x` binary16 split, preventing the 35 NaNs
+previously seen in the 3-D case. Host movement still copies only statically
+addressed bytes, while host ABI code converts fp32 into high/residual fp16
+representations; every product, correction, mask, and prefix computation is
+an NPU task.
+
+The ordered mixed runner preserves gather→convert dependencies and
+reset-separates comparison stages. A permanent multi-image codec test covers
+the residual-input metadata bit.
+
+The first `test_const_reduce` subcase currently rejects its constant fp32
+`sum` as `unsupported_dtype:fp32_cmac`; it is not a product regression.
+Long cumulative windows and constant-sum lowering are the next distinct
+groups.
+
+Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+confirms only fp16 input rounding (`0.1` becomes `0.0999755859375`). It is a
+useful diagnostic distinction, not evidence of accumulator drift or a
+cumprod workaround.

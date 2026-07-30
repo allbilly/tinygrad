@@ -96,6 +96,7 @@ class RKTask:
   bool_output: bool = False           # multi-task output converted from fp16 mask to bool
   trunc_output: bool = False          # multi-task fp16 output truncated through an integer cast round-trip
   periodic_input: bool = False        # reduce fp32 inputs modulo 2*pi before fp16 conversion
+  fp32_residual_input: bool = False   # convert fp32 input to a 256-scaled residual after its nearest fp16 value
   native_int32_output: bool = False   # DPU WDMA writes already-integral values directly as int32
   native_int32_input: bool = False    # MRDMA consumes one aligned compact int32 atom directly
   out_offset: int = 0                 # byte offset into the output buffer (for cat-like copies)
@@ -2364,7 +2365,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
                       bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
                       uint8_output=False, bool_output=False, trunc_output=False, comparison_inputs:tuple[int,...]=(),
                       fp32_inputs:tuple[int,...]=(), fp32_output=False, native_int32_output=False, native_int32_input=False,
-                      native_int32_offset=0) -> RKSubTask:
+                      native_int32_offset=0, fp32_residual_input=False) -> RKSubTask:
   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
   cmds:list[RKCmd] = []
   relocs:list[RKReloc] = []
@@ -2446,7 +2447,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
                 bool_output=bool_output, trunc_output=trunc_output, comparison_inputs=comparison_inputs,
                 fp32_inputs=fp32_inputs, fp32_output=fp32_output, native_int32_output=native_int32_output,
-                native_int32_input=native_int32_input)
+                native_int32_input=native_int32_input, fp32_residual_input=fp32_residual_input)
   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
 
 def _emit_trunc_stage(total:int, out_slot:int, source:tuple[int,int]) -> RKSubTask:
@@ -8492,6 +8493,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
   dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | (int(task.trunc_output) << 3) | \
     (int(task.periodic_input) << 4) | (int(task.native_int32_output) << 5) | (int(task.native_int32_input) << 6) | \
+    (int(task.fp32_residual_input) << 7) | \
     sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
   input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16) | \
     sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
@@ -8535,6 +8537,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
                       comparison_inputs=comparison_inputs,
                       int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
                       bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8), periodic_input=bool(dtype_flags & 16),
+                      fp32_residual_input=bool(dtype_flags & 128),
                       native_int32_output=bool(dtype_flags & 32), native_int32_input=bool(dtype_flags & 64),
                       out_offset=out_offset), relocs, off
 
@@ -10586,7 +10589,14 @@ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Gather a small static float reduction window, then multiply it on DPU."""
+  """Gather a static float reduction window, then multiply it on DPU.
+
+  Prefix products need more than a plain fp16 chain: Torch keeps its running
+  product in fp32 and only rounds each visible prefix.  For longer half
+  windows retain a two-half (hi, lo) product using Dekker's fp16 splitter.
+  Every arithmetic operation below is a DPU task; host movement only gathers
+  statically addressed input bytes.
+  """
   reduce, store = _reduce_node(sink), _store_node(sink)
   if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype not in (dtypes.half, dtypes.float) or \
      store.src[0].dtype is not reduce.dtype or store.src[1] is not reduce: return None
@@ -10603,6 +10613,14 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   next_slot = max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
   gathered_slots:list[int] = []
+  gathered_low_slots:list[int] = []
+  # Version-4 task images retain only low global slots in their fp32 input
+  # mask. Reuse one such slot for gather→half conversion instead of assigning
+  # an unencodable fp32 flag to every cumulative candidate.
+  float_gather_slot = next_slot if value_dtype is dtypes.float else None
+  if float_gather_slot is not None:
+    if float_gather_slot >= 7: return None
+    next_slot += 1
   for linear in range(window):
     rem, fixed = linear, {}
     for reduce_axis in range(len(reductions)-1, -1, -1):
@@ -10610,7 +10628,8 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
     gathered = reduce.src[0].substitute(fixed)
     if gathered.dtype is not value_dtype: return None
-    scratch_slot, next_slot = next_slot, next_slot+1
+    scratch_slot = float_gather_slot if float_gather_slot is not None else next_slot
+    if float_gather_slot is None: next_slot += 1
     scratch = UOp.param(scratch_slot, value_dtype, (total,), device=store.src[0].src[0].device)
     scratch_index = store.src[0].replace(dtype=value_dtype, src=(scratch, *store.src[0].src[1:]))
     movement_store = UOp(Ops.STORE, src=(scratch_index, gathered))
@@ -10618,19 +10637,113 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     movement_tasks = _try_movement_host_subtasks(movement_sink)
     if movement_tasks is None or len(movement_tasks) != 1: return None
     tasks.extend(movement_tasks)
-    gathered_slots.append(scratch_slot)
-
-  accumulator = gathered_slots[0]
-  for index, operand in enumerate(gathered_slots[1:], 1):
-    final = index == len(gathered_slots)-1
-    out_slot = info.outs[0] if final else next_slot
-    if not final: next_slot += 1
-    if value_dtype is dtypes.float:
-      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL,
-                                     fp32_inputs=(accumulator, operand), fp32_output=True))
+    if float_gather_slot is not None:
+      half_slot, next_slot = next_slot, next_slot+1
+      tasks.append(_emit_where_stage(total, half_slot, (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                     fp32_inputs=(scratch_slot,)))
+      gathered_slots.append(half_slot)
+      residual_slot, next_slot = next_slot, next_slot+1
+      tasks.append(_emit_where_stage(total, residual_slot, (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                     fp32_inputs=(scratch_slot,), fp32_residual_input=True))
+      gathered_low_slots.append(residual_slot)
     else:
+      gathered_slots.append(scratch_slot)
+      gathered_low_slots.append(_ZERO_SLOT)
+
+  # Keep the original short product chain for native-half 3/4/6/9-lane
+  # reductions. Float32 ABI products need both input limbs even at six lanes.
+  if value_dtype is dtypes.half and window < 10:
+    accumulator = gathered_slots[0]
+    for index, operand in enumerate(gathered_slots[1:], 1):
+      final = index == len(gathered_slots)-1
+      out_slot = info.outs[0] if final else next_slot
+      if not final: next_slot += 1
       tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL))
-    accumulator = out_slot
+      accumulator = out_slot
+    return tuple(tasks)
+
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+  def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, **kwargs) -> int:
+    nonlocal next_slot
+    out_slot, next_slot = next_slot, next_slot+1
+    tasks.append(_emit_where_stage(total, out_slot, a, b, op, **kwargs))
+    return out_slot
+
+  hi, lo = gathered_slots[0], gathered_low_slots[0]
+  splitter = scalar(65.0)  # 2**ceil(11/2)+1 for binary16's 11-bit significand.
+  limb_scale, inverse_limb_scale = scalar(256.0), scalar(1/256)
+  for operand, operand_low in zip(gathered_slots[1:], gathered_low_slots[1:]):
+    p = stage((hi, 0), (operand, 0), Ops.MUL)
+    # Dekker's 65*x split overflows once |x| approaches 1008. Normalize lanes
+    # above 64 by 1/256 while recovering the product error, then restore that
+    # error below. The actual visible product `p` remains unscaled.
+    negative_hi = stage((_ZERO_SLOT, 0), (hi, 0), Ops.SUB)
+    magnitude_hi = stage((hi, 0), (negative_hi, 0), Ops.MAX)
+    large_diff = stage((magnitude_hi, 0), scalar(64.0), Ops.SUB)
+    large = stage((large_diff, 0), (large_diff, 0), Ops.MAX, compare=True)
+    weighted_large = stage((large, 0), scalar(255/256), Ops.MUL)
+    normalization = stage(scalar(1.0), (weighted_large, 0), Ops.SUB)
+    normalized_hi = stage((hi, 0), (normalization, 0), Ops.MUL)
+
+    # TwoProduct(hi, operand): p is the visible fp16 product and err recovers
+    # the discarded low part using split high/low factors.
+    c_hi = stage(splitter, (normalized_hi, 0), Ops.MUL)
+    big_hi = stage((c_hi, 0), (normalized_hi, 0), Ops.SUB)
+    hi_head = stage((c_hi, 0), (big_hi, 0), Ops.SUB)
+    hi_tail = stage((normalized_hi, 0), (hi_head, 0), Ops.SUB)
+    c_operand = stage(splitter, (operand, 0), Ops.MUL)
+    big_operand = stage((c_operand, 0), (operand, 0), Ops.SUB)
+    operand_head = stage((c_operand, 0), (big_operand, 0), Ops.SUB)
+    operand_tail = stage((operand, 0), (operand_head, 0), Ops.SUB)
+    # Keep the product error in the same x256 domain as the low limb. This
+    # prevents the residual from underflowing when a long prefix becomes
+    # smaller than the normal fp16 range.
+    operand_head_scaled = stage((operand_head, 0), limb_scale, Ops.MUL)
+    operand_tail_scaled = stage((operand_tail, 0), limb_scale, Ops.MUL)
+    normalized_product = stage((normalized_hi, 0), (operand, 0), Ops.MUL)
+    head_product = stage((hi_head, 0), (operand_head_scaled, 0), Ops.MUL)
+    p_scaled = stage((normalized_product, 0), limb_scale, Ops.MUL)
+    err = stage((head_product, 0), (p_scaled, 0), Ops.SUB)
+    cross = stage((hi_head, 0), (operand_tail_scaled, 0), Ops.MUL)
+    err = stage((err, 0), (cross, 0), Ops.ADD)
+    cross = stage((hi_tail, 0), (operand_head_scaled, 0), Ops.MUL)
+    err = stage((err, 0), (cross, 0), Ops.ADD)
+    tail_product = stage((hi_tail, 0), (operand_tail_scaled, 0), Ops.MUL)
+    err = stage((err, 0), (tail_product, 0), Ops.ADD)
+    # For normalized lanes, err currently represents
+    # 256*(normalized_hi*operand-normalized_product). Restore the original
+    # scale and include any power-of-two round-trip discrepancy.
+    large_err = stage((err, 0), (large, 0), Ops.MUL)
+    large_err = stage((large_err, 0), limb_scale, Ops.MUL)
+    large_normalized_product = stage((normalized_product, 0), (large, 0), Ops.MUL)
+    restored_product = stage((large_normalized_product, 0), limb_scale, Ops.MUL)
+    large_product = stage((p, 0), (large, 0), Ops.MUL)
+    restoration_error = stage((restored_product, 0), (large_product, 0), Ops.SUB)
+    restoration_error = stage((restoration_error, 0), limb_scale, Ops.MUL)
+    large_err = stage((large_err, 0), (restoration_error, 0), Ops.ADD)
+    small = stage(scalar(1.0), (large, 0), Ops.SUB)
+    small_err = stage((err, 0), (small, 0), Ops.MUL)
+    err = stage((small_err, 0), (large_err, 0), Ops.ADD)
+
+    # Carry the x256 low limb through the new multiplication, renormalize
+    # p+low_sum/256, and preserve the scaled remainder for the next prefix.
+    low_product = stage((lo, 0), (operand, 0), Ops.MUL)
+    low_sum = stage((err, 0), (low_product, 0), Ops.ADD)
+    if value_dtype is dtypes.float:
+      input_low_product = stage((hi, 0), (operand_low, 0), Ops.MUL)
+      low_sum = stage((low_sum, 0), (input_low_product, 0), Ops.ADD)
+      previous_low_product = stage((lo, 0), (operand_low, 0), Ops.MUL)
+      previous_low_product = stage((previous_low_product, 0), inverse_limb_scale, Ops.MUL)
+      low_sum = stage((low_sum, 0), (previous_low_product, 0), Ops.ADD)
+    correction = stage((low_sum, 0), inverse_limb_scale, Ops.MUL)
+    new_hi = stage((p, 0), (correction, 0), Ops.ADD)
+    delta = stage((new_hi, 0), (p, 0), Ops.SUB)
+    delta_scaled = stage((delta, 0), limb_scale, Ops.MUL)
+    new_lo = stage((low_sum, 0), (delta_scaled, 0), Ops.SUB)
+    hi, lo = new_hi, new_lo
+  visible_low = stage((lo, 0), inverse_limb_scale, Ops.MUL)
+  tasks.append(_emit_where_stage(total, info.outs[0], (hi, 0), (visible_low, 0), Ops.ADD, fp32_output=value_dtype is dtypes.float))
   return tuple(tasks)
 
 def _wip_try_native_small_int_power_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:

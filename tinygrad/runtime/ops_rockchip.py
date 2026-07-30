@@ -68,6 +68,14 @@ def _convert_fp32_to_fp16_buf(src, dst, n):
   arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32).astype(np.float16)
   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
 
+def _convert_fp32_residual_to_fp16_buf(src, dst, n):
+  """Encode 256 times the fp32 remainder after its nearest fp16 value."""
+  import numpy as np
+  arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32)
+  high = arr.astype(np.float16).astype(np.float32)
+  residual = ((arr-high)*256.0).astype(np.float16)
+  ctypes.memmove(dst, residual.ctypes.data, n * 2)  # type: ignore[arg-type]
+
 def _convert_periodic_fp32_to_fp16_buf(src, dst, n):
   """Reduce finite fp32 angles to [-pi,pi]; encode nonfinite values as a detectable sentinel."""
   import numpy as np
@@ -1306,7 +1314,9 @@ class RockchipProgram(Program['RockchipDevice']):
                                  _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
                                  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
                                  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT,
-                                 _HOST_HALF_INT_LAYOUT) for st in subtasks):
+                                 _HOST_HALF_INT_LAYOUT) for st in subtasks) or \
+       any(st.task.is_copy and any(not prior.task.is_copy for prior in subtasks[:index])
+           for index, st in enumerate(subtasks)):
       ext, shared, original = list(bufs), [], self.subtasks
       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                      default=len(ext)-1)
@@ -1352,6 +1362,21 @@ class RockchipProgram(Program['RockchipDevice']):
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits(task, st.relocs, tuple(ext))
             else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
+            continue
+          if task.fp32_residual_input:
+            # The preceding high-half conversion and this residual conversion
+            # read the same fp32 slot through different ABI views.
+            flush_pending()
+            pending.append(st)
+            flush_pending()
+            continue
+          if any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
+                 ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds):
+            flush_pending()
+            dev.reset_npu()
+            pending.append(st)
+            flush_pending()
+            dev.reset_npu()
             continue
           pending.append(st)
           if len(pending) == 64: flush_pending()
@@ -1528,11 +1553,13 @@ class RockchipProgram(Program['RockchipDevice']):
       prepared.append(scratch)
     source_counts:dict[int, int] = {}
     periodic_slots = {s for st in subtasks if st.task.periodic_input for s in st.task.fp32_inputs}
+    residual_slots = {s for st in subtasks if st.task.fp32_residual_input for s in st.task.fp32_inputs}
     for slot in {s for st in subtasks for s in st.task.fp32_inputs}:
       source_counts[slot] = source_n = prepared[slot].size // 4
       converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
       temp.append(converted)
-      if slot in periodic_slots: _convert_periodic_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+      if slot in residual_slots: _convert_fp32_residual_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+      elif slot in periodic_slots: _convert_periodic_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
       else: _convert_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
       prepared[slot] = converted
     for slot in {s for st in subtasks for s in st.task.int32_inputs}:
