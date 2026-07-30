@@ -273,6 +273,14 @@ class TestClassifier(unittest.TestCase):
       build_native_program(sink)
     self.assertIn("RKPLAN_REJECT", str(cm.exception))
 
+  def test_long_cumprod_uses_logarithmic_scan(self):
+    sink = _get_sink(Tensor.empty(512, device="ROCKCHIP").cumprod(0))
+    program = build_native_program(sink)
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertTrue(all(isinstance(task, RKSubTask) for task in subtasks))
+    self.assertLess(len(subtasks), 600)
+
   def test_reject_cmac_exceeds_cbuf(self):
     # M=6000 with K=4: align_in=32, input_row_bytes=64, data_banks=ceil(6000*64/32768)=12 > 11
     a = Tensor.rand(6000,4,dtype=dtypes.half).realize()

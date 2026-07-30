@@ -1356,3 +1356,29 @@ Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2
 confirms only fp16 input rounding (`0.1` becomes `0.0999755859375`). It is a
 useful diagnostic distinction, not evidence of accumulator drift or a
 cumprod workaround.
+
+### Long cumulative-product milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_simple_cumprod`, lengths 512 and 1022 | **1 passed in 8.78s** |
+| small + complete ordinary cumprod regression pair | **2 passed in 62.21s** |
+| `test_prod` + `test_prod_dtype_arg` regression pair | **2 passed in 7.28s** |
+| hardware-free PR1 contract | **81/81 in 6.63s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Length 512 now uses a logarithmic compensated Hillis-Steele scan.  Length
+1022 uses a physical 1024-lane, four-by-256 blocked scan with two leading
+identities, a four-element compensated block-prefix product, typed broadcast
+combines, and a static final shift.  Operator arithmetic remains on the NPU;
+host work is restricted to static movement/layout and fp32 ABI conversion.
+
+The generic neutral-block shortcut was rejected because it also matched
+ordinary multidimensional cumprod helper kernels.  The experiment is kept as
+commented WIP.  The separately observed `test_broadcasted_add` precision
+group remains open at 300/2925 mismatches (maximum absolute error 0.000925);
+constant fp32 SUM remains another independent rejection group.
+
+Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+helps distinguish initial fp16 input rounding from accumulator error, but it
+does not provide a scan, accumulation, or precision workaround.

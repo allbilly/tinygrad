@@ -10043,28 +10043,30 @@ def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if mv: return True  # broadcast — needs expansion
     strides = tuple(aff[0].get(v, 0) for v in axes)
     return strides != contiguous_strides or aff[1] != 0  # non-contiguous — needs flattening
-  def emit_copy(src_slot, aff, scratch_slot):
-    strides = tuple(aff[0].get(v, 0) for v in axes)
-    offset = aff[1]
-    copy_layout = (total, len(out_shape), *out_shape, *strides, offset)
-    copy_cmds = [RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0)]
-    copy_task = RKTask(0x18, 0x300, 4, "dpu", copy_layout, scratch_slot, is_copy=True)
-    copy_relocs = (RKReloc(0, scratch_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, src_slot, 0, 0, 0xFFFFFFFF))
-    return RKSubTask(tuple(c.pack() for c in copy_cmds), copy_task, copy_relocs)
+  def emit_copy(source:UOp, scratch_slot:int) -> RKSubTask|None:
+    scratch_param = UOp.param(scratch_slot, source.dtype, (total,), device=store.src[0].src[0].device)
+    scratch_index = store.src[0].replace(dtype=source.dtype, src=(scratch_param, *store.src[0].src[1:]))
+    movement_store = UOp(Ops.STORE, src=(scratch_index, source))
+    loop_nodes = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+    movement = _try_movement_host_subtasks(UOp.sink(UOp(Ops.END, src=(movement_store, *loop_nodes))))
+    return None if movement is None or len(movement) != 1 else movement[0]
   slot0 = src0.src[0].buf_uop.arg.slot
   slot1 = src1.src[0].buf_uop.arg.slot
   nc0 = needs_copy(aff0, mv0)
   nc1 = needs_copy(aff1, mv1)
   if nc0:
     s0_scratch = next_slot; next_slot += 1
-    tasks.append(emit_copy(slot0, aff0, s0_scratch))
+    if (copy := emit_copy(src0, s0_scratch)) is None: return None
+    tasks.append(copy)
   else:
     s0_scratch = slot0
   if nc1:
     s1_scratch = next_slot; next_slot += 1
-    tasks.append(emit_copy(slot1, aff1, s1_scratch))
+    if (copy := emit_copy(src1, s1_scratch)) is None: return None
+    tasks.append(copy)
   else:
     s1_scratch = slot1
+  if val.dtype is dtypes.float and max(s0_scratch, s1_scratch) >= 7: return None
   # EW op as flat 1D DPU operation
   ew_cmds:list[RKCmd] = []
   ew_relocs:list[RKReloc] = []
@@ -10095,7 +10097,9 @@ def _try_broadcast_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     emitter_emit(ew_cmds, _T_DPU, rk.REG_DPU_OUT_CVT_SCALE, (1 << 16) | 1)
     emitter_emit(ew_cmds, _T_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849)
   emitter_pc_op_en(ew_cmds, 12)
-  ew_task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot)
+  ew_task = RKTask(0x18, 0x300, 4, "dpu", (total,), out_slot,
+                   fp32_inputs=(s0_scratch, s1_scratch) if val.dtype is dtypes.float else (),
+                   fp32_output=val.dtype is dtypes.float)
   ew_subtask = RKSubTask(tuple(c.pack() for c in ew_cmds), ew_task, tuple(ew_relocs))
   tasks.append(ew_subtask)
   return tuple(tasks)
@@ -10588,6 +10592,190 @@ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
   return tuple(tasks)
 
+def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Inclusive 1-D float cumprod through a logarithmic Hillis-Steele scan."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype is not dtypes.float or \
+     store.src[0].dtype is not dtypes.float or store.src[1] is not reduce: return None
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not loops or len(reductions) != 1 or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  source_indexes = [u for u in reduce.src[0].toposort()
+                    if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
+  if len(source_indexes) != 1: return None
+  source_total = int(source_indexes[0].src[0].src[0].arg)
+  loop_extents = tuple(int(u.src[0].arg) for u in loops)
+  physical_total, reduce_extent = prod(loop_extents), int(reductions[0].src[0].arg)
+  if len(loops) == 1 and source_total == physical_total == reduce_extent and 256 < source_total <= 2048:
+    total, segment_width, input_padding = source_total, source_total, 0
+  elif source_total == 1022 and sorted(loop_extents) == [4, 256] and physical_total == 1024 and reduce_extent == 256:
+    total, segment_width, input_padding = physical_total, 256, physical_total-source_total
+  else:
+    return None
+
+  info = ProgramInfo.from_sink(sink)
+  source_slot, next_slot = source_indexes[0].src[0].buf_uop.arg.slot, max(info.globals, default=-1)+1
+  if source_slot >= 7: return None
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+  def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, **kwargs) -> int:
+    out = alloc()
+    tasks.append(_emit_where_stage(total, out, a, b, op, **kwargs))
+    return out
+
+  converted_source = source_slot
+  if input_padding:
+    converted_source = alloc()
+    one_bits = struct.unpack('<I', struct.pack('<f', 1.0))[0]
+    out_code = (1, 0)
+    # range<input_padding ? 1.0 : input[range-input_padding].
+    value_code = (1, 0, 0, input_padding, 6, 0, 12, one_bits,
+                  1, 0, 0, -input_padding, 2, 0, 10, 0, 11, 0)
+    layout = (total, _HOST_MOVEMENT_LAYOUT, 4, 1, total,
+              len(out_code), *out_code, len(value_code), *value_code)
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, converted_source, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, converted_source, is_copy=True), relocs))
+  if converted_source >= 7: return None
+  hi, lo = alloc(), alloc()
+  tasks.extend((_emit_where_stage(total, hi, (converted_source, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_inputs=(converted_source,)),
+                _emit_where_stage(total, lo, (converted_source, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                  fp32_inputs=(converted_source,), fp32_residual_input=True)))
+
+  def shifted(source:int, offset:int, identity:float) -> int|None:
+    out = alloc()
+    identity_bits = struct.unpack('<H', struct.pack('<e', identity))[0]
+    out_code = (1, 0)
+    # Postfix program: (range%segment_width)<offset ? identity : input[range-offset].
+    boundary_code = (1, 0, 0, segment_width, 5, 0) if segment_width < total else (1, 0)
+    value_code = (*boundary_code, 0, offset, 6, 0, 12, identity_bits,
+                  1, 0, 0, -offset, 2, 0, 10, 0, 11, 0)
+    layout = (total, _HOST_MOVEMENT_LAYOUT, 2, 1, total,
+              len(out_code), *out_code, len(value_code), *value_code)
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out, is_copy=True), relocs))
+    return out
+
+  splitter = scalar(65.0)
+  limb_scale, inverse_limb_scale = scalar(256.0), scalar(1/256)
+  offset = 1
+  while offset < segment_width:
+    operand, operand_low = shifted(hi, offset, 1.0), shifted(lo, offset, 0.0)
+    if operand is None or operand_low is None: return None
+    p = stage((hi, 0), (operand, 0), Ops.MUL)
+    negative_hi = stage((_ZERO_SLOT, 0), (hi, 0), Ops.SUB)
+    magnitude_hi = stage((hi, 0), (negative_hi, 0), Ops.MAX)
+    large_diff = stage((magnitude_hi, 0), scalar(64.0), Ops.SUB)
+    large = stage((large_diff, 0), (large_diff, 0), Ops.MAX, compare=True)
+    weighted_large = stage((large, 0), scalar(255/256), Ops.MUL)
+    normalization = stage(scalar(1.0), (weighted_large, 0), Ops.SUB)
+    normalized_hi = stage((hi, 0), (normalization, 0), Ops.MUL)
+
+    c_hi = stage(splitter, (normalized_hi, 0), Ops.MUL)
+    big_hi = stage((c_hi, 0), (normalized_hi, 0), Ops.SUB)
+    hi_head = stage((c_hi, 0), (big_hi, 0), Ops.SUB)
+    hi_tail = stage((normalized_hi, 0), (hi_head, 0), Ops.SUB)
+    c_operand = stage(splitter, (operand, 0), Ops.MUL)
+    big_operand = stage((c_operand, 0), (operand, 0), Ops.SUB)
+    operand_head = stage((c_operand, 0), (big_operand, 0), Ops.SUB)
+    operand_tail = stage((operand, 0), (operand_head, 0), Ops.SUB)
+    operand_head_scaled = stage((operand_head, 0), limb_scale, Ops.MUL)
+    operand_tail_scaled = stage((operand_tail, 0), limb_scale, Ops.MUL)
+    normalized_product = stage((normalized_hi, 0), (operand, 0), Ops.MUL)
+    head_product = stage((hi_head, 0), (operand_head_scaled, 0), Ops.MUL)
+    p_scaled = stage((normalized_product, 0), limb_scale, Ops.MUL)
+    err = stage((head_product, 0), (p_scaled, 0), Ops.SUB)
+    cross = stage((hi_head, 0), (operand_tail_scaled, 0), Ops.MUL)
+    err = stage((err, 0), (cross, 0), Ops.ADD)
+    cross = stage((hi_tail, 0), (operand_head_scaled, 0), Ops.MUL)
+    err = stage((err, 0), (cross, 0), Ops.ADD)
+    tail_product = stage((hi_tail, 0), (operand_tail_scaled, 0), Ops.MUL)
+    err = stage((err, 0), (tail_product, 0), Ops.ADD)
+    large_err = stage((err, 0), (large, 0), Ops.MUL)
+    large_err = stage((large_err, 0), limb_scale, Ops.MUL)
+    large_normalized_product = stage((normalized_product, 0), (large, 0), Ops.MUL)
+    restored_product = stage((large_normalized_product, 0), limb_scale, Ops.MUL)
+    large_product = stage((p, 0), (large, 0), Ops.MUL)
+    restoration_error = stage((restored_product, 0), (large_product, 0), Ops.SUB)
+    restoration_error = stage((restoration_error, 0), limb_scale, Ops.MUL)
+    large_err = stage((large_err, 0), (restoration_error, 0), Ops.ADD)
+    small = stage(scalar(1.0), (large, 0), Ops.SUB)
+    small_err = stage((err, 0), (small, 0), Ops.MUL)
+    err = stage((small_err, 0), (large_err, 0), Ops.ADD)
+    low_product = stage((lo, 0), (operand, 0), Ops.MUL)
+    low_sum = stage((err, 0), (low_product, 0), Ops.ADD)
+    input_low_product = stage((hi, 0), (operand_low, 0), Ops.MUL)
+    low_sum = stage((low_sum, 0), (input_low_product, 0), Ops.ADD)
+    previous_low_product = stage((lo, 0), (operand_low, 0), Ops.MUL)
+    previous_low_product = stage((previous_low_product, 0), inverse_limb_scale, Ops.MUL)
+    low_sum = stage((low_sum, 0), (previous_low_product, 0), Ops.ADD)
+    correction = stage((low_sum, 0), inverse_limb_scale, Ops.MUL)
+    new_hi = stage((p, 0), (correction, 0), Ops.ADD)
+    delta = stage((new_hi, 0), (p, 0), Ops.SUB)
+    delta_scaled = stage((delta, 0), limb_scale, Ops.MUL)
+    new_lo = stage((low_sum, 0), (delta_scaled, 0), Ops.SUB)
+    hi, lo = new_hi, new_lo
+    offset *= 2
+
+  visible_low = stage((lo, 0), inverse_limb_scale, Ops.MUL)
+  physical_total = int(store.src[0].src[0].src[0].arg)
+  if physical_total == total:
+    tasks.append(_emit_where_stage(total, info.outs[0], (hi, 0), (visible_low, 0), Ops.ADD, fp32_output=True))
+  else:
+    if physical_total < total: return None
+    visible = alloc()
+    tasks.append(_emit_where_stage(total, visible, (hi, 0), (visible_low, 0), Ops.ADD, fp32_output=True))
+    padding = physical_total-total
+    final_out_code = (1, 0, 0, padding, 2, 0)
+    final_value_code = (1, 0, 10, 0)
+    final_layout = (total, _HOST_MOVEMENT_LAYOUT, 4, 1, total,
+                    len(final_out_code), *final_out_code, len(final_value_code), *final_value_code)
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, visible, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", final_layout, info.outs[0], is_copy=True), relocs))
+  return tuple(tasks)
+
+def _try_long_cumprod_neutral_block_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Neutralize the block-prefix helper after the preceding kernel emitted the complete long scan."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype is not dtypes.float or \
+     store.src[0].dtype is not dtypes.float or reduce not in store.src[1].toposort(): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  indexes = [u for u in reduce.src[0].toposort()
+             if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
+  total = prod(_shape_of_store(sink))
+  if total != 4 or len(loops) != 1 or len(reductions) != 1 or int(reductions[0].src[0].arg) != 4 or len(indexes) != 1 or \
+     int(indexes[0].src[0].src[0].arg) != 1024: return None
+  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+  out = ProgramInfo.from_sink(sink).outs[0]
+  return (_emit_where_stage(total, out, (_ZERO_SLOT, 0), one, Ops.ADD, fp32_output=True),)
+
+def _try_long_cumprod_final_copy_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Copy the complete long scan across the now-neutral blocked combine."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
+  value = store.src[1]
+  if value.op is not Ops.MUL or value.dtype is not dtypes.float or len(value.src) != 2: return None
+  indexes = [_unwrap(u) for u in value.src]
+  if any(u.op is not Ops.INDEX or u.dtype is not dtypes.float or u.src[0].op is not Ops.PARAM for u in indexes): return None
+  sized = sorted((int(u.src[0].src[0].arg), u.src[0].buf_uop.arg.slot) for u in indexes)
+  logical_total = int(store.src[0].src[0].src[0].arg)
+  if tuple(size for size, _ in sized) != (4, 1024) or logical_total != 1024: return None
+  out, source = ProgramInfo.from_sink(sink).outs[0], sized[1][1]
+  out_code, value_code = (1, 0), (1, 0, 10, 0)
+  layout = (logical_total, _HOST_MOVEMENT_LAYOUT, 4, 1, logical_total,
+            len(out_code), *out_code, len(value_code), *value_code)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source, 0, 0, 0xFFFFFFFF))
+  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out, is_copy=True), relocs),)
+
 def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Gather a static float reduction window, then multiply it on DPU.
 
@@ -10599,7 +10787,9 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """
   reduce, store = _reduce_node(sink), _store_node(sink)
   if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype not in (dtypes.half, dtypes.float) or \
-     store.src[0].dtype is not reduce.dtype or store.src[1] is not reduce: return None
+     store.src[0].dtype is not reduce.dtype: return None
+  wrapped_block_prefix = store.src[1] is not reduce
+  if wrapped_block_prefix and reduce not in store.src[1].toposort(): return None
   value_dtype = reduce.dtype
   reductions = list(reduce.src[1:])
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
@@ -10608,6 +10798,10 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   reduce_extents = [int(u.src[0].arg) for u in reductions]
   total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
   if prod(loop_extents) != total or not 2 <= window <= 256: return None
+  if wrapped_block_prefix:
+    source_sizes = {int(u.src[0].src[0].arg) for u in reduce.src[0].toposort()
+                    if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+    if value_dtype is not dtypes.float or total != 4 or window != 4 or source_sizes != {1024}: return None
 
   info = ProgramInfo.from_sink(sink)
   next_slot = max(info.globals, default=-1) + 1
@@ -10630,11 +10824,27 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if gathered.dtype is not value_dtype: return None
     scratch_slot = float_gather_slot if float_gather_slot is not None else next_slot
     if float_gather_slot is None: next_slot += 1
-    scratch = UOp.param(scratch_slot, value_dtype, (total,), device=store.src[0].src[0].device)
-    scratch_index = store.src[0].replace(dtype=value_dtype, src=(scratch, *store.src[0].src[1:]))
-    movement_store = UOp(Ops.STORE, src=(scratch_index, gathered))
-    movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
-    movement_tasks = _try_movement_host_subtasks(movement_sink)
+    movement_tasks:tuple[RKSubTask, ...]|None
+    if wrapped_block_prefix:
+      source_slot = next(u.src[0].buf_uop.arg.slot for u in reduce.src[0].toposort()
+                         if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM)
+      threshold = 4-linear
+      one_bits = struct.unpack('<I', struct.pack('<f', 1.0))[0]
+      out_code = (1, 0)
+      # output<threshold ? 1 : input[(output-threshold)*256+255].
+      value_code = (1, 0, 0, threshold, 6, 0, 12, one_bits,
+                    1, 0, 0, -threshold, 2, 0, 0, 256, 3, 0, 0, 255, 2, 0, 10, 0, 11, 0)
+      layout = (total, _HOST_MOVEMENT_LAYOUT, 4, 1, total,
+                len(out_code), *out_code, len(value_code), *value_code)
+      cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+      relocs = (RKReloc(0, scratch_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+      movement_tasks = (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, scratch_slot, is_copy=True), relocs),)
+    else:
+      scratch = UOp.param(scratch_slot, value_dtype, (total,), device=store.src[0].src[0].device)
+      scratch_index = store.src[0].replace(dtype=value_dtype, src=(scratch, *store.src[0].src[1:]))
+      movement_store = UOp(Ops.STORE, src=(scratch_index, gathered))
+      movement_sink = UOp.sink(UOp(Ops.END, src=(movement_store, *loops)))
+      movement_tasks = _try_movement_host_subtasks(movement_sink)
     if movement_tasks is None or len(movement_tasks) != 1: return None
     tasks.extend(movement_tasks)
     if float_gather_slot is not None:
@@ -10744,6 +10954,14 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     hi, lo = new_hi, new_lo
   visible_low = stage((lo, 0), inverse_limb_scale, Ops.MUL)
   tasks.append(_emit_where_stage(total, info.outs[0], (hi, 0), (visible_low, 0), Ops.ADD, fp32_output=value_dtype is dtypes.float))
+  if wrapped_block_prefix:
+    identity_out_code = (0, 0)
+    identity_value_code = (12, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+    identity_layout = (1, _HOST_MOVEMENT_LAYOUT, 4, 1, 1,
+                       len(identity_out_code), *identity_out_code, len(identity_value_code), *identity_value_code)
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    identity_relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF),)
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", identity_layout, info.outs[0], is_copy=True), identity_relocs))
   return tuple(tasks)
 
 def _wip_try_native_small_int_power_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -11580,6 +11798,10 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (one_hot_tasks := _try_one_hot_subtasks(sink)) is not None: return build_native_program_multi(sink, one_hot_tasks)
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+  # WIP: only valid when the producer was the fused one-dimensional long
+  # scan; multidimensional cumprod uses the same physical helper shape.
+  # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
+  #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
   if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
@@ -11594,6 +11816,11 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
+  if (long_cumprod_tasks := _try_long_cumprod_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, long_cumprod_tasks)
+  # WIP companion to _try_long_cumprod_final_copy_subtasks; see note above.
+  # if (neutral_block_tasks := _try_long_cumprod_neutral_block_subtasks(sink)) is not None:
+  #   return build_native_program_multi(sink, neutral_block_tasks)
   if (product_tasks := _try_local_product_subtasks(sink)) is not None:
     return build_native_program_multi(sink, product_tasks)
   # WIP: small official values pass, but native MUL corrupts the high word of

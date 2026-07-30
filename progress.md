@@ -7470,6 +7470,70 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — logarithmic long cumulative products
+
+The unchanged forward-only `TestOps.test_simple_cumprod` now passes both
+long cases, lengths 512 and 1022, on RK3588.  The 512-lane case uses an
+inclusive Hillis-Steele scan with power-of-two offsets.  This replaces the
+rejected linear 511-stage product chain with logarithmic scan depth.
+
+The 1022-lane graph is physically padded to 1024 values.  The lowering emits
+two leading multiplicative identities and then executes:
+
+1. four independent compensated 256-lane scans;
+2. a compensated four-element product over the block endpoints;
+3. typed broadcast/combine stages for the preceding block prefixes;
+4. a static final movement copy which removes the two leading identities.
+
+Every multiply, correction, prefix, and combine remains DPU work.  Host
+movement evaluates only static address/layout expressions, and the runtime
+performs the already documented fp32/high-residual ABI conversions.  The
+generic idea of replacing the later block-prefix kernels with identities was
+rejected because the same helper shapes occur in ordinary multidimensional
+cumprod.  Its strict experimental matchers and disabled hooks remain in the
+source as labelled WIP, per the Rockchip preservation rule.
+
+The broadcast helper now reuses typed movement lowering instead of a
+hard-coded two-byte copy.  That is required when a long fp32 prefix crosses
+the block-combine boundary.  The resulting DPU add still has ordinary fp16
+arithmetic precision; the separate `test_broadcasted_add` group currently
+has 300/2925 values outside its strict tolerance (maximum absolute error
+0.000925) and is not claimed by this milestone.
+
+Useful debug sequence:
+
+1. compare model-0 rejection with physical compilation for lengths 512 and
+   1022;
+2. inspect subtask count and verify offsets are powers of two rather than a
+   linear prefix chain;
+3. for 1022, confirm the physical shape is `4*256`, the first two inputs are
+   one, and the final copy shifts output indices back by two;
+4. run the unchanged multidimensional `test_cumprod` after any matcher
+   broadening, because its internal helper shapes can resemble the blocked
+   long graph;
+5. debug the four-element block-prefix candidates independently before
+   changing compensated product constants.
+
+Validation using `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1`:
+
+- unchanged `TestOps.test_simple_cumprod`: **1 passed in 8.78 seconds**;
+- unchanged small plus complete ordinary cumprod regression pair:
+  **2 passed in 62.21 seconds**;
+- unchanged `test_prod` plus `test_prod_dtype_arg`: **2 passed in 7.28
+  seconds**;
+- hardware-free classifier contract: **81/81 in 6.63 seconds**;
+- Python compilation and whitespace checks: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline;
+- pytest-xdist and ruff remain unavailable in `.venv`.
+
+RKNN Toolkit2 issue
+[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) is relevant
+only to the first diagnostic layer: it confirms that a nominal fp32 input
+such as `0.1` can enter an fp16 graph as `0.0999755859375`.  It does not
+describe long-scan scheduling, product accumulation error, or a correction
+algorithm.
+
 ## 2026-07-30 — general fp16 runtime tensor POW with two-level EXP2
 
 The unchanged `TestOps.test_pow_full` now passes both `x**y` and `x.pow(y)`.
