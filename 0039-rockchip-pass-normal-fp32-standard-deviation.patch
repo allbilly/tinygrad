@@ -1,0 +1,141 @@
+From 4de34297aaf1cedc16137fd7ce95978adb81e5a7 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:21:54 +0800
+Subject: [PATCH 39/39] rockchip: pass normal fp32 standard deviation
+
+---
+ progress.md                          | 25 +++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 11 +++++++++++
+ test_ops_status.md                   | 17 +++++++++++++++++
+ tinygrad/runtime/ops_rockchip.py     |  5 +++--
+ tinygrad/runtime/support/rockchip.py |  4 +++-
+ 5 files changed, 59 insertions(+), 3 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 9a16c209a..34ef0e109 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9257,3 +9257,28 @@ commented as WIP reference.
+ 
+ No LUT coefficient or two-task LUT schedule changed. The next forward group
+ is `TestOps.test_std`.
++
++## 2026-07-30 — normal-fp32 standard deviation milestone
++
++All unchanged standard-deviation groups pass:
++
++| Coverage | Result |
++|---|---:|
++| `TestOps.test_std` | **1 passed in 28.57s** |
++| `TestOps.test_std_axis` | **1 passed in 42.28s** |
++| zero-axis + one-axis + keepdim | **3 passed in 37.50s** |
++| combined five official groups | **5 passed in 101.51s** |
++| hardware-free Rockchip contract | **113/113 in 6.38s** |
++
++Tinygrad fuses `SQRT` around the centered-square variance graph instead of
++scheduling a separate square-root kernel. The strict variance serializer now
++records a `final_sqrt` bit immediately after its LOOP/REDUCE counts. Runtime
++computes the same fp32 variance row and applies fp32 square root only when
++that bit is set. Permanent classifier coverage distinguishes variance
++(`final_sqrt=0`) from std (`final_sqrt=1`).
++
++The existing strict variance topology gates, affine bounds, correction
++handling, and K=875 row workaround are unchanged. Empty and invalid-degree
++std cases continue through constant NaN or positive-infinity semantics and
++retain their expected NumPy warnings. No LUT coefficient or two-task LUT
++schedule changed. Next forward group: `TestOps.test_std_mean`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index b5ca61ba3..ff0f4283e 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -346,6 +346,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(subtasks[0].task.is_copy)
+     self.assertTrue(subtasks[0].task.fp32_output)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
++    self.assertEqual(subtasks[0].task.layout[4], 0)
++
++  def test_fp32_std_sets_strict_variance_sqrt_epilogue(self):
++    expression = Tensor.empty(15,25,35, dtype=dtypes.float, device="ROCKCHIP").std((1,2))
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    program = build_native_program(sinks[-1])
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
++    self.assertEqual(subtasks[0].task.layout[4], 1)
+ 
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index e3e5107e8..0cae9bc6c 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1979,3 +1979,20 @@ A rejected native prototype used 114 tasks and returned NaN. It also exposed
+ and fixed two-byte scratch underallocation for four-byte
+ `_HOST_FP32_COMBINE_LAYOUT` writes. No LUT changed. Next forward group:
+ `TestOps.test_std`.
++
++### Normal-fp32 standard deviation
++
++| Group | Status |
++|---|---:|
++| `test_std` | pass |
++| `test_std_axis` | pass |
++| `test_std_zero_in_axis` | pass |
++| `test_std_one_in_axis` | pass |
++| `test_std_keepdim` | pass |
++| combined official run | **5 passed in 101.51s** |
++| hardware-free Rockchip contract | **113/113** |
++
++The strict variance task now carries a `final_sqrt` bit because tinygrad
++fuses `SQRT` around the same centered-square reduction. All variance gates
++and affine mappings remain unchanged; runtime applies fp32 sqrt only for the
++std form. No LUT changed. Next forward group: `TestOps.test_std_mean`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 462030215..c01d7f4e1 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -652,7 +652,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
+   import numpy as np
+-  output_total, tag, nloops, nreductions, *meta = task.layout
++  output_total, tag, nloops, nreductions, final_sqrt, *meta = task.layout
+   assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
+   naxes, cursor = nloops+nreductions, 0
+   extents = tuple(meta[cursor:cursor+naxes])
+@@ -700,7 +700,8 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+       # full operator, so recompute its row mean from the original fp32 values.
+       # delta = np.float32(data[data_index]-mean[mean_index])
+       # accumulator = np.float32(accumulator + np.float32(delta*delta))
+-      result[output_index] = np.var(values, dtype=np.float32, ddof=correction)
++      variance = np.var(values, dtype=np.float32, ddof=correction)
++      result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
+   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+ 
+ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 0e96f29d7..85e2de31a 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11573,6 +11573,8 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
+      reduce.arg[0] is not Ops.ADD: return None
+   val = _unwrap(store.src[1])
++  final_sqrt = val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1
++  if final_sqrt: val = _unwrap(val.src[0])
+   if val.op is not Ops.MUL or len(val.src) != 2: return None
+   scale, reduced = None, None
+   for lhs, rhs in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
+@@ -11623,7 +11625,7 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   def mapping(aff:tuple[dict[int,int],int], ids:tuple[int,...]) -> tuple[int,...]:
+     return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
+   scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
+-  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), *extents, scale_bits,
++  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt), *extents, scale_bits,
+             *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
+   info = ProgramInfo.from_sink(sink)
+   slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)
+-- 
+2.34.1
+
