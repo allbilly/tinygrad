@@ -10592,6 +10592,45 @@ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
   return tuple(tasks)
 
+def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Give CMAC a typed half view of a small direct fp32 input, then widen its result."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
+     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  source = _unwrap(reduce.src[0])
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+
+  info = ProgramInfo.from_sink(sink)
+  source_slot = source.src[0].buf_uop.arg.slot
+  scratch_slot = max(info.globals, default=-1) + 1
+  if source_slot >= 7: return None
+  source_total, output_total = int(source.src[0].src[0].arg), prod(_shape_of_store(sink))
+  if source_total > 16: return None
+  tasks:list[RKSubTask] = []
+
+  device = store.src[0].src[0].device
+  converted_param = UOp.param(source_slot, dtypes.half, (source_total,), device=device)
+  converted_index = source.replace(dtype=dtypes.half, src=(converted_param, *source.src[1:]))
+  converted_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (converted_index,), arg=dtypes.float), *reductions))
+  scratch_param = UOp.param(scratch_slot, dtypes.half, (output_total,), device=device)
+  scratch_index = store.src[0].replace(dtype=dtypes.half, src=(scratch_param, *store.src[0].src[1:]))
+  stage_store = store.replace(src=(scratch_index, UOp(Ops.CAST, dtypes.half, (converted_reduce,), arg=dtypes.half)))
+  stage_sink = sink.substitute({store:stage_store})
+  stage_plan = plan_rk(stage_sink)
+  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
+  else:
+    cmds, task, relocs = emit_rk(stage_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+  tasks = [RKSubTask(st.cmds, replace(st.task, fp32_inputs=tuple(set(st.task.fp32_inputs+(source_slot,)))), st.relocs)
+           if st.task.kind == "cmac" and any(r.globals_slot == source_slot for r in st.relocs) else st for st in tasks]
+  tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
+  return tuple(tasks)
+
 def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Inclusive 1-D float cumprod through a logarithmic Hillis-Steele scan."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -11838,10 +11877,10 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, movement_sum_tasks)
   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, elementwise_sum_tasks)
-  # WIP: this produces the explicitly requested float32 result correctly, but
-  # the DEFAULT_FLOAT=HALF test harness compares it against a Torch fp16 sum.
-  # if (fp32_sum_tasks := _wip_try_fp32_sum_output_subtasks(sink)) is not None:
-  #   return build_native_program_multi(sink, fp32_sum_tasks)
+  # Retain the half-input WIP above for reference. The active path is narrower:
+  # it requires a direct fp32 INDEX and preserves the explicitly fp32 output.
+  if (fp32_sum_tasks := _try_fp32_sum_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_sum_tasks)
   if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, relu_sum_tasks)
   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:

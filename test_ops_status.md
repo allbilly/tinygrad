@@ -1382,3 +1382,27 @@ constant fp32 SUM remains another independent rejection group.
 Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2/issues/471)
 helps distinguish initial fp16 input rounding from accumulator error, but it
 does not provide a scan, accumulation, or precision workaround.
+
+### Small direct fp32 SUM milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged normal-default `test_const_reduce` | **1 passed in 7.79s** |
+| small SUM + const reduce + product regression set | **4/4 in 12.67s** |
+| hardware-free PR1 contract | **82/82 in 7.00s** |
+| mypy | **pre-existing 13-error baseline** |
+
+A strict direct-INDEX matcher now handles fp32 SUM inputs of at most 16
+lanes.  CMAC input packing supplies a temporary fp16 ABI view, CMAC performs
+the addition, and a final DPU task widens the result to fp32.  No SUM
+arithmetic runs on the host.
+
+The first pre-CMAC DPU conversion design timed out and was replaced by the
+typed CMAC packing boundary.  The matcher deliberately excludes
+`test_sum_full`: applying the untiled path to 16,384 lanes overflowed to
+infinity, so large fp32 SUM remains a separate tiled/scale-safe group.
+
+The active forward census uses the normal dtype default with
+`FORWARD_ONLY=1`.  Adding `DEFAULT_FLOAT=HALF` hides this fp32 rejection but
+introduces official Torch/tinygrad dtype mismatches, beginning with scalar
+`test_add`.

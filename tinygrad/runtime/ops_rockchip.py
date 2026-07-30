@@ -862,6 +862,14 @@ class RockchipProgram(Program['RockchipDevice']):
       buf_map:dict[int, HCQBuffer] = {}
       cmac_bufs: list[HCQBuffer] = []
       if task.kind == "cmac":
+        cmac_sources = list(bufs)
+        for slot in task.fp32_inputs:
+          if slot in (_CONST_SLOT, _ZERO_SLOT): continue
+          source_n = cmac_sources[slot].size // 4
+          converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+          temp.append(converted)
+          _convert_fp32_to_fp16_buf(cmac_sources[slot].va_addr, converted.va_addr, source_n)
+          cmac_sources[slot] = converted
         layout = task.layout
         M, N, K, align_in, align_out = layout[0], layout[1], layout[2], layout[3], layout[4]
         a_s, b_s = self.relocs[0].globals_slot, self.relocs[1].globals_slot
@@ -874,18 +882,18 @@ class RockchipProgram(Program['RockchipDevice']):
         elif a_s == _CONST_SLOT:
           ctypes.memmove(a_buf.va_addr, struct.pack('<e', task.const_val) * align_in, align_in * 2)  # type: ignore[arg-type]
         else:
-          _pad_a(bufs[a_s].va_addr, a_buf.va_addr, M, K, align_in)
+          _pad_a(cmac_sources[a_s].va_addr, a_buf.va_addr, M, K, align_in)
         b_buf = dev._gpu_alloc(max(align_out*align_in*2, 4096), 0)
         temp.append(b_buf)
         if materialized:
           assert decoded_materialized is not None
-          b_src = None if b_s == _CONST_SLOT else bufs[b_s].va_addr
-          _materialize_cmac_inputs(bufs[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
+          b_src = None if b_s == _CONST_SLOT else cmac_sources[b_s].va_addr
+          _materialize_cmac_inputs(cmac_sources[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
                                    M, N, K, align_in, align_out, decoded_materialized)
         elif b_s == _CONST_SLOT:
           ctypes.memmove(b_buf.va_addr, struct.pack('<e', task.const_val) * (align_out * align_in), align_out * align_in * 2)  # type: ignore[arg-type]
         else:
-          _swizzle_b(bufs[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
+          _swizzle_b(cmac_sources[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
         o_buf = dev._gpu_alloc(max(M*align_out*4, 4096), 0)
         temp.append(o_buf)
         cmac_bufs = [a_buf, b_buf, o_buf]  # ordered by reloc emission: A, B, output

@@ -7534,6 +7534,49 @@ such as `0.1` can enter an fp16 graph as `0.0999755859375`.  It does not
 describe long-scan scheduling, product accumulation error, or a correction
 algorithm.
 
+## 2026-07-30 — small direct fp32 SUM boundary
+
+The unchanged normal-default forward `TestOps.test_const_reduce` now passes
+its constant SUM, product, and maximum subcases.  The SUM kernel is not
+constant by the time it reaches the backend: the preceding typed-fill kernel
+materializes nine fp32 values, and the next kernel sees only a direct fp32
+INDEX under `REDUCE(ADD)`.
+
+The active matcher is therefore based on the actual ABI graph, not on
+cross-kernel constant knowledge.  It accepts a direct fp32 input and fp32
+output with at most 16 source lanes.  Runtime creates a temporary fp16 view
+while packing the CMAC input, CMAC performs the reduction, and a final DPU
+stage widens the half result into the logical fp32 output.  The host
+conversion is only the existing fp32/fp16 representation boundary; SUM
+arithmetic remains on CMAC.
+
+An initial three-task design used a DPU add to create the half input before
+CMAC.  On hardware that first DPU submission reproducibly timed out inside
+the mixed CMAC runner.  The retained two-task design converts the source
+while CMAC inputs are packed and avoids that unstable compute-family
+transition.
+
+The source limit is important.  Broadening the same path to the unchanged
+16,384-element `test_sum_full` produced `+inf` instead of approximately
+`-369.8`; large fp32 SUM needs separate tiled and scale-safe accumulation.
+The strict `<=16` guard turns that case back into its prior planning
+rejection rather than returning a plausible-looking wrong result.
+
+Validation with `. .venv/bin/activate`, `DEV=ROCKCHIP FORWARD_ONLY=1`:
+
+- unchanged `test_const_reduce`: **1 passed in 7.79 seconds**;
+- `test_sum_simple`, `test_const_reduce`, `test_prod`, and
+  `test_prod_dtype_arg`: **4/4 in 12.67 seconds**;
+- hardware-free PR1 contract: **82/82 in 7.00 seconds**;
+- Python compilation and whitespace checks: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+`DEFAULT_FLOAT=HALF` is not part of the requested forward command.  It makes
+`test_const_reduce` pass through the older half path, but also causes
+official dtype mismatches such as the scalar subcase in `test_add`.
+Milestone census and fixes therefore continue with the normal dtype default
+plus `FORWARD_ONLY=1`.
+
 ## 2026-07-30 — general fp16 runtime tensor POW with two-level EXP2
 
 The unchanged `TestOps.test_pow_full` now passes both `x**y` and `x.pow(y)`.
