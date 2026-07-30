@@ -1,0 +1,462 @@
+From 54bae71dec331d3e2ee29e5df0396cbdf7bd700e Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 08:16:10 +0800
+Subject: [PATCH] rockchip: compensate float product reductions
+
+---
+ progress.md                          |  81 +++++++++++++++
+ test/rockchip/test_pr1.py            |  11 ++-
+ test_ops_status.md                   |  34 +++++++
+ tinygrad/runtime/ops_rockchip.py     |  31 +++++-
+ tinygrad/runtime/support/rockchip.py | 143 ++++++++++++++++++++++++---
+ 5 files changed, 282 insertions(+), 18 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 0d66c55e9..b4291d98a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7547,6 +7547,87 @@ The interpretation of RKNN Toolkit2 issue #471 remains unchanged: its values
+ are exactly fp16 quantization of `0.1`, not evidence for accumulator drift or
+ a solution to this EXP2 range problem.
+ 
++## 2026-07-30 — compensated float product and cumulative product
++
++The unchanged forward-only `TestOps.test_cumprod` now passes scalar, length
++20, both `(20,30)` axes, and both equivalent last-axis forms for
++`(20,30,40)`. The original product matcher gathered the correct static
++windows but chained one fp16 multiply per factor. That differs from Torch's
++float32 prefix accumulator and previously left 23/600 values outside
++`rtol=0.001` in the first 2-D axis case.
++
++### Failure isolation
++
++Pure fp16 emulation separated three numerical boundaries:
++
++1. a two-half accumulator with already-quantized fp16 operands reduced a
++   representative 2-D case to zero tolerance failures;
++2. using only `fp16(x)` for the official float32 operands lost input bits and
++   produced 71/600 misses;
++3. representing each float32 operand as `hi=fp16(x)` plus
++   `lo=fp16(256*(x-float32(hi)))` reduced the official 2-D models to zero.
++
++The x256 low limb is required because an unscaled residual underflows after
++roughly 20 small factors. Product-error terms and accumulator residuals stay
++in that scaled domain; only renormalization and the visible output divide by
++256.
++
++Dekker's binary16 splitter is 65. The initial compensated implementation
++therefore overflowed `65*hi` for 35 growing lanes in the 3-D case and
++generated exactly 35 NaNs. DPU masks now normalize lanes with `abs(hi)>64`
++by `1/256` only while recovering the product error, then restore the
++power-of-two scale. The unchanged 24,000-element 3-D case has no NaNs and no
++tolerance failures.
++
++### Runtime and ABI details
++
++Version-4 images encode fp32 inputs only for low global slots. Reusing one
++low-numbered gather slot avoids silently interpreting later float scratch
++buffers as pairs of halfwords. Each static host movement copies exact fp32
++bytes into that slot; the established ABI converter emits the high half and
++a new x256 residual half. All multiplication, product-error recovery,
++masking, scaling, addition, and final rounding remain DPU work. The residual
++converter changes representation only; it does not evaluate a product or
++prefix operator on the host.
++
++Because the gather slot is reused, movement and DPU conversions must remain
++ordered. The mixed runner now detects a copy after compute, flushes dependent
++work before overwriting a live slot, isolates the two different fp32
++conversion views, and reset-separates comparison tasks. The latter avoids a
++reproducible ioctl timeout after an ordinary DPU batch.
++
++Short float `prod` windows use the same two-limb path. This fixed the
++low-slot serialization problem and keeps both unchanged `test_prod` and
++`test_prod_dtype_arg` passing. Native-half windows below ten lanes retain the
++older fast sequential chain.
++
++### Validation and remaining boundary
++
++Using `. .venv/bin/activate` and `DEV=ROCKCHIP FORWARD_ONLY=1`:
++
++- unchanged `TestOps.test_cumprod`: **1 passed in 60.01 seconds**;
++- unchanged `TestOps.test_small_cumprod`: **1 passed in 5.30 seconds** after
++  the final large-lane normalization;
++- unchanged `TestOps.test_cumprod_zero_axis`: **1 passed in 2.71 seconds**;
++- unchanged `test_prod` and `test_prod_dtype_arg`: both passed before the
++  combined command reached an unrelated constant-sum rejection;
++- hardware-free codec/classifier contract: **80/80 in 6.56 seconds**,
++  including permanent round-trip coverage for the residual-input flag;
++- Python compilation and `git diff --check`: passing;
++- mypy: the exact pre-existing **13-error** Rockchip baseline.
++
++`test_const_reduce` currently stops in its first constant `sum` subcase with
++`RKPLAN_REJECT:unsupported_dtype:fp32_cmac`; that graph does not enter product
++lowering and is tracked separately. `test_simple_cumprod` uses windows 512
++and 1022, beyond the matcher's current static-window guard of 256, so it is
++the next cumulative-product milestone.
++
++RKNN Toolkit2 issue
++[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) remains useful
++only as an input-quantization diagnostic: its `25.59375` and `409.5` results
++follow exactly from fp16 `0.1 = 0.0999755859375`. It neither demonstrates
++accumulator drift nor supplies a cumprod precision fix.
++
+ ## 2026-07-30 — scalar runtime tensor POW zero-base milestone
+ 
+ The unchanged `TestOps.test_pow_zero_tensor` now passes all scalar fp32
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 4d69d894e..fdccc87e8 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -1,11 +1,13 @@
+ # PR 1 hardware-free tests: classifier, emitter, codec, determinism.
+ # These tests do not require an NPU and run under DEV=NULL.
+ import unittest, struct
++from dataclasses import replace
+ from tinygrad import Tensor, dtypes
+ from tinygrad.codegen import early_simplify
+ from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
+ from tinygrad.codegen import pm_to_program
+-from tinygrad.runtime.support.rockchip import plan_rk, emit_rk, encode_rk, decode_rk, build_native_program, RKPlan
++from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
++                                               build_native_program, RKPlan, RKSubTask)
+ from tinygrad.runtime.ops_rockchip import RockchipRenderer
+ from tinygrad.helpers import Target
+ 
+@@ -356,6 +358,13 @@ class TestCodec(unittest.TestCase):
+     self.assertTrue(dec_task.is_fill)
+     self.assertEqual(len(dec_cmds), len(cmds))
+ 
++  def test_roundtrip_multi_fp32_residual_input(self):
++    cmds, task, relocs = _emit(_get_sink(Tensor.rand(4,4,dtype=dtypes.half).realize()+1))
++    encoded = encode_rk_multi((RKSubTask(cmds, replace(task, fp32_residual_input=True), relocs),))
++    decoded = decode_rk_multi(encoded)
++    self.assertEqual(len(decoded), 1)
++    self.assertTrue(decoded[0].task.fp32_residual_input)
++
+   def test_roundtrip_cmac_scaled_sum(self):
+     # Scaled sum roundtrip: verify const_val survives codec
+     cmds, task, relocs = _emit(_get_sink((Tensor.rand(4,4,dtype=dtypes.half).realize()*2).sum()))
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 39309a408..c1409d3cc 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1322,3 +1322,37 @@ exact base/exponent-sign masks handle the fixed-seed fp16 boundaries.
+ Non-official random seeds still expose the broader fp16-versus-float32
+ internal POW precision gap; this is documented as future split-precision
+ work rather than claimed complete.
++
++### Compensated product/cumprod milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged `test_cumprod`, scalar through 3-D last axis | **1 passed in 60.01s** |
++| unchanged `test_small_cumprod` | **1 passed in 5.30s** |
++| zero-length cumulative axes | **1 passed in 2.71s** |
++| `test_prod`, `test_prod_dtype_arg` | **passing** |
++| hardware-free contract + residual codec test | **80/80 in 6.56s** |
++| `test_simple_cumprod`, lengths 512/1022 | **pending: window guard is 256** |
++
++Float products now use two fp16 limbs for each exact fp32 ABI input and for
++the running accumulator. The low limb is scaled by 256 to survive fp16
++subnormal prefixes. A per-lane DPU mask temporarily scales large
++accumulators down before the `65*x` binary16 split, preventing the 35 NaNs
++previously seen in the 3-D case. Host movement still copies only statically
++addressed bytes, while host ABI code converts fp32 into high/residual fp16
++representations; every product, correction, mask, and prefix computation is
++an NPU task.
++
++The ordered mixed runner preserves gather→convert dependencies and
++reset-separates comparison stages. A permanent multi-image codec test covers
++the residual-input metadata bit.
++
++The first `test_const_reduce` subcase currently rejects its constant fp32
++`sum` as `unsupported_dtype:fp32_cmac`; it is not a product regression.
++Long cumulative windows and constant-sum lowering are the next distinct
++groups.
++
++Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2/issues/471)
++confirms only fp16 input rounding (`0.1` becomes `0.0999755859375`). It is a
++useful diagnostic distinction, not evidence of accumulator drift or a
++cumprod workaround.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 21f27a25f..29f744672 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -68,6 +68,14 @@ def _convert_fp32_to_fp16_buf(src, dst, n):
+   arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32).astype(np.float16)
+   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
+ 
++def _convert_fp32_residual_to_fp16_buf(src, dst, n):
++  """Encode 256 times the fp32 remainder after its nearest fp16 value."""
++  import numpy as np
++  arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32)
++  high = arr.astype(np.float16).astype(np.float32)
++  residual = ((arr-high)*256.0).astype(np.float16)
++  ctypes.memmove(dst, residual.ctypes.data, n * 2)  # type: ignore[arg-type]
++
+ def _convert_periodic_fp32_to_fp16_buf(src, dst, n):
+   """Reduce finite fp32 angles to [-pi,pi]; encode nonfinite values as a detectable sentinel."""
+   import numpy as np
+@@ -1306,7 +1314,9 @@ class RockchipProgram(Program['RockchipDevice']):
+                                  _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+                                  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT,
+                                  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT,
+-                                 _HOST_HALF_INT_LAYOUT) for st in subtasks):
++                                 _HOST_HALF_INT_LAYOUT) for st in subtasks) or \
++       any(st.task.is_copy and any(not prior.task.is_copy for prior in subtasks[:index])
++           for index, st in enumerate(subtasks)):
+       ext, shared, original = list(bufs), [], self.subtasks
+       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
+                      default=len(ext)-1)
+@@ -1353,6 +1363,21 @@ class RockchipProgram(Program['RockchipDevice']):
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits(task, st.relocs, tuple(ext))
+             else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
+             continue
++          if task.fp32_residual_input:
++            # The preceding high-half conversion and this residual conversion
++            # read the same fp32 slot through different ABI views.
++            flush_pending()
++            pending.append(st)
++            flush_pending()
++            continue
++          if any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
++                 ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds):
++            flush_pending()
++            dev.reset_npu()
++            pending.append(st)
++            flush_pending()
++            dev.reset_npu()
++            continue
+           pending.append(st)
+           if len(pending) == 64: flush_pending()
+         flush_pending()
+@@ -1528,11 +1553,13 @@ class RockchipProgram(Program['RockchipDevice']):
+       prepared.append(scratch)
+     source_counts:dict[int, int] = {}
+     periodic_slots = {s for st in subtasks if st.task.periodic_input for s in st.task.fp32_inputs}
++    residual_slots = {s for st in subtasks if st.task.fp32_residual_input for s in st.task.fp32_inputs}
+     for slot in {s for st in subtasks for s in st.task.fp32_inputs}:
+       source_counts[slot] = source_n = prepared[slot].size // 4
+       converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+       temp.append(converted)
+-      if slot in periodic_slots: _convert_periodic_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
++      if slot in residual_slots: _convert_fp32_residual_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
++      elif slot in periodic_slots: _convert_periodic_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+       else: _convert_fp32_to_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_n)
+       prepared[slot] = converted
+     for slot in {s for st in subtasks for s in st.task.int32_inputs}:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index af7a4a14e..fddfe9fa4 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -96,6 +96,7 @@ class RKTask:
+   bool_output: bool = False           # multi-task output converted from fp16 mask to bool
+   trunc_output: bool = False          # multi-task fp16 output truncated through an integer cast round-trip
+   periodic_input: bool = False        # reduce fp32 inputs modulo 2*pi before fp16 conversion
++  fp32_residual_input: bool = False   # convert fp32 input to a 256-scaled residual after its nearest fp16 value
+   native_int32_output: bool = False   # DPU WDMA writes already-integral values directly as int32
+   native_int32_input: bool = False    # MRDMA consumes one aligned compact int32 atom directly
+   out_offset: int = 0                 # byte offset into the output buffer (for cat-like copies)
+@@ -2364,7 +2365,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+                       bool_inputs:tuple[int,...]=(), int32_inputs:tuple[int,...]=(), broadcast_inputs:tuple[int,...]=(), int32_output=False,
+                       uint8_output=False, bool_output=False, trunc_output=False, comparison_inputs:tuple[int,...]=(),
+                       fp32_inputs:tuple[int,...]=(), fp32_output=False, native_int32_output=False, native_int32_input=False,
+-                      native_int32_offset=0) -> RKSubTask:
++                      native_int32_offset=0, fp32_residual_input=False) -> RKSubTask:
+   """Fully-specified DPU stage used by the hardware-proven eight-pass WHERE lowering."""
+   cmds:list[RKCmd] = []
+   relocs:list[RKReloc] = []
+@@ -2446,7 +2447,7 @@ def _emit_where_stage(total:int, out_slot:int, a:tuple[int,int], b:tuple[int,int
+                 broadcast_inputs=broadcast_inputs, int32_output=int32_output, uint8_output=uint8_output,
+                 bool_output=bool_output, trunc_output=trunc_output, comparison_inputs=comparison_inputs,
+                 fp32_inputs=fp32_inputs, fp32_output=fp32_output, native_int32_output=native_int32_output,
+-                native_int32_input=native_int32_input)
++                native_int32_input=native_int32_input, fp32_residual_input=fp32_residual_input)
+   return RKSubTask(tuple(c.pack() for c in cmds), task, tuple(relocs))
+ 
+ def _emit_trunc_stage(total:int, out_slot:int, source:tuple[int,int]) -> RKSubTask:
+@@ -8492,6 +8493,7 @@ def _encode_one_task(task: RKTask, cmds: tuple[int,...], relocs: tuple[RKReloc,.
+   kind_layout = (_RK_KINDS.index(task.kind) << 24) | ((1 if task.is_copy else 0) << 23) | ((1 if task.is_fill else 0) << 22) | n_layout
+   dtype_flags = int(task.int32_output) | (int(task.uint8_output) << 1) | (int(task.bool_output) << 2) | (int(task.trunc_output) << 3) | \
+     (int(task.periodic_input) << 4) | (int(task.native_int32_output) << 5) | (int(task.native_int32_input) << 6) | \
++    (int(task.fp32_residual_input) << 7) | \
+     sum(1 << (8+s) for s in task.bool_inputs if s < 16) | sum(1 << (24+s) for s in task.int32_inputs if s < 7)
+   input_flags = sum(1 << s for s in task.broadcast_inputs if s < 16) | \
+     sum(1 << (16+s) for s in task.comparison_inputs if s < 16)
+@@ -8535,6 +8537,7 @@ def _decode_one_task(data: bytes, off: int) -> tuple[list[int], RKTask, list[RKR
+                       comparison_inputs=comparison_inputs,
+                       int32_output=bool(dtype_flags & 1), uint8_output=bool(dtype_flags & 2),
+                       bool_output=bool(dtype_flags & 4), trunc_output=bool(dtype_flags & 8), periodic_input=bool(dtype_flags & 16),
++                      fp32_residual_input=bool(dtype_flags & 128),
+                       native_int32_output=bool(dtype_flags & 32), native_int32_input=bool(dtype_flags & 64),
+                       out_offset=out_offset), relocs, off
+ 
+@@ -10586,7 +10589,14 @@ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   return tuple(tasks)
+ 
+ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Gather a small static float reduction window, then multiply it on DPU."""
++  """Gather a static float reduction window, then multiply it on DPU.
++
++  Prefix products need more than a plain fp16 chain: Torch keeps its running
++  product in fp32 and only rounds each visible prefix.  For longer half
++  windows retain a two-half (hi, lo) product using Dekker's fp16 splitter.
++  Every arithmetic operation below is a DPU task; host movement only gathers
++  statically addressed input bytes.
++  """
+   reduce, store = _reduce_node(sink), _store_node(sink)
+   if reduce is None or store is None or reduce.arg[0] is not Ops.MUL or reduce.dtype not in (dtypes.half, dtypes.float) or \
+      store.src[0].dtype is not reduce.dtype or store.src[1] is not reduce: return None
+@@ -10603,6 +10613,14 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   next_slot = max(info.globals, default=-1) + 1
+   tasks:list[RKSubTask] = []
+   gathered_slots:list[int] = []
++  gathered_low_slots:list[int] = []
++  # Version-4 task images retain only low global slots in their fp32 input
++  # mask. Reuse one such slot for gather→half conversion instead of assigning
++  # an unencodable fp32 flag to every cumulative candidate.
++  float_gather_slot = next_slot if value_dtype is dtypes.float else None
++  if float_gather_slot is not None:
++    if float_gather_slot >= 7: return None
++    next_slot += 1
+   for linear in range(window):
+     rem, fixed = linear, {}
+     for reduce_axis in range(len(reductions)-1, -1, -1):
+@@ -10610,7 +10628,8 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       fixed[reductions[reduce_axis]] = UOp.const(reductions[reduce_axis].dtype, coord)
+     gathered = reduce.src[0].substitute(fixed)
+     if gathered.dtype is not value_dtype: return None
+-    scratch_slot, next_slot = next_slot, next_slot+1
++    scratch_slot = float_gather_slot if float_gather_slot is not None else next_slot
++    if float_gather_slot is None: next_slot += 1
+     scratch = UOp.param(scratch_slot, value_dtype, (total,), device=store.src[0].src[0].device)
+     scratch_index = store.src[0].replace(dtype=value_dtype, src=(scratch, *store.src[0].src[1:]))
+     movement_store = UOp(Ops.STORE, src=(scratch_index, gathered))
+@@ -10618,19 +10637,113 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     movement_tasks = _try_movement_host_subtasks(movement_sink)
+     if movement_tasks is None or len(movement_tasks) != 1: return None
+     tasks.extend(movement_tasks)
+-    gathered_slots.append(scratch_slot)
+-
+-  accumulator = gathered_slots[0]
+-  for index, operand in enumerate(gathered_slots[1:], 1):
+-    final = index == len(gathered_slots)-1
+-    out_slot = info.outs[0] if final else next_slot
+-    if not final: next_slot += 1
+-    if value_dtype is dtypes.float:
+-      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL,
+-                                     fp32_inputs=(accumulator, operand), fp32_output=True))
++    if float_gather_slot is not None:
++      half_slot, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(total, half_slot, (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                     fp32_inputs=(scratch_slot,)))
++      gathered_slots.append(half_slot)
++      residual_slot, next_slot = next_slot, next_slot+1
++      tasks.append(_emit_where_stage(total, residual_slot, (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                     fp32_inputs=(scratch_slot,), fp32_residual_input=True))
++      gathered_low_slots.append(residual_slot)
+     else:
++      gathered_slots.append(scratch_slot)
++      gathered_low_slots.append(_ZERO_SLOT)
++
++  # Keep the original short product chain for native-half 3/4/6/9-lane
++  # reductions. Float32 ABI products need both input limbs even at six lanes.
++  if value_dtype is dtypes.half and window < 10:
++    accumulator = gathered_slots[0]
++    for index, operand in enumerate(gathered_slots[1:], 1):
++      final = index == len(gathered_slots)-1
++      out_slot = info.outs[0] if final else next_slot
++      if not final: next_slot += 1
+       tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MUL))
+-    accumulator = out_slot
++      accumulator = out_slot
++    return tuple(tasks)
++
++  def scalar(value:float) -> tuple[int,int]:
++    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++  def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, **kwargs) -> int:
++    nonlocal next_slot
++    out_slot, next_slot = next_slot, next_slot+1
++    tasks.append(_emit_where_stage(total, out_slot, a, b, op, **kwargs))
++    return out_slot
++
++  hi, lo = gathered_slots[0], gathered_low_slots[0]
++  splitter = scalar(65.0)  # 2**ceil(11/2)+1 for binary16's 11-bit significand.
++  limb_scale, inverse_limb_scale = scalar(256.0), scalar(1/256)
++  for operand, operand_low in zip(gathered_slots[1:], gathered_low_slots[1:]):
++    p = stage((hi, 0), (operand, 0), Ops.MUL)
++    # Dekker's 65*x split overflows once |x| approaches 1008. Normalize lanes
++    # above 64 by 1/256 while recovering the product error, then restore that
++    # error below. The actual visible product `p` remains unscaled.
++    negative_hi = stage((_ZERO_SLOT, 0), (hi, 0), Ops.SUB)
++    magnitude_hi = stage((hi, 0), (negative_hi, 0), Ops.MAX)
++    large_diff = stage((magnitude_hi, 0), scalar(64.0), Ops.SUB)
++    large = stage((large_diff, 0), (large_diff, 0), Ops.MAX, compare=True)
++    weighted_large = stage((large, 0), scalar(255/256), Ops.MUL)
++    normalization = stage(scalar(1.0), (weighted_large, 0), Ops.SUB)
++    normalized_hi = stage((hi, 0), (normalization, 0), Ops.MUL)
++
++    # TwoProduct(hi, operand): p is the visible fp16 product and err recovers
++    # the discarded low part using split high/low factors.
++    c_hi = stage(splitter, (normalized_hi, 0), Ops.MUL)
++    big_hi = stage((c_hi, 0), (normalized_hi, 0), Ops.SUB)
++    hi_head = stage((c_hi, 0), (big_hi, 0), Ops.SUB)
++    hi_tail = stage((normalized_hi, 0), (hi_head, 0), Ops.SUB)
++    c_operand = stage(splitter, (operand, 0), Ops.MUL)
++    big_operand = stage((c_operand, 0), (operand, 0), Ops.SUB)
++    operand_head = stage((c_operand, 0), (big_operand, 0), Ops.SUB)
++    operand_tail = stage((operand, 0), (operand_head, 0), Ops.SUB)
++    # Keep the product error in the same x256 domain as the low limb. This
++    # prevents the residual from underflowing when a long prefix becomes
++    # smaller than the normal fp16 range.
++    operand_head_scaled = stage((operand_head, 0), limb_scale, Ops.MUL)
++    operand_tail_scaled = stage((operand_tail, 0), limb_scale, Ops.MUL)
++    normalized_product = stage((normalized_hi, 0), (operand, 0), Ops.MUL)
++    head_product = stage((hi_head, 0), (operand_head_scaled, 0), Ops.MUL)
++    p_scaled = stage((normalized_product, 0), limb_scale, Ops.MUL)
++    err = stage((head_product, 0), (p_scaled, 0), Ops.SUB)
++    cross = stage((hi_head, 0), (operand_tail_scaled, 0), Ops.MUL)
++    err = stage((err, 0), (cross, 0), Ops.ADD)
++    cross = stage((hi_tail, 0), (operand_head_scaled, 0), Ops.MUL)
++    err = stage((err, 0), (cross, 0), Ops.ADD)
++    tail_product = stage((hi_tail, 0), (operand_tail_scaled, 0), Ops.MUL)
++    err = stage((err, 0), (tail_product, 0), Ops.ADD)
++    # For normalized lanes, err currently represents
++    # 256*(normalized_hi*operand-normalized_product). Restore the original
++    # scale and include any power-of-two round-trip discrepancy.
++    large_err = stage((err, 0), (large, 0), Ops.MUL)
++    large_err = stage((large_err, 0), limb_scale, Ops.MUL)
++    large_normalized_product = stage((normalized_product, 0), (large, 0), Ops.MUL)
++    restored_product = stage((large_normalized_product, 0), limb_scale, Ops.MUL)
++    large_product = stage((p, 0), (large, 0), Ops.MUL)
++    restoration_error = stage((restored_product, 0), (large_product, 0), Ops.SUB)
++    restoration_error = stage((restoration_error, 0), limb_scale, Ops.MUL)
++    large_err = stage((large_err, 0), (restoration_error, 0), Ops.ADD)
++    small = stage(scalar(1.0), (large, 0), Ops.SUB)
++    small_err = stage((err, 0), (small, 0), Ops.MUL)
++    err = stage((small_err, 0), (large_err, 0), Ops.ADD)
++
++    # Carry the x256 low limb through the new multiplication, renormalize
++    # p+low_sum/256, and preserve the scaled remainder for the next prefix.
++    low_product = stage((lo, 0), (operand, 0), Ops.MUL)
++    low_sum = stage((err, 0), (low_product, 0), Ops.ADD)
++    if value_dtype is dtypes.float:
++      input_low_product = stage((hi, 0), (operand_low, 0), Ops.MUL)
++      low_sum = stage((low_sum, 0), (input_low_product, 0), Ops.ADD)
++      previous_low_product = stage((lo, 0), (operand_low, 0), Ops.MUL)
++      previous_low_product = stage((previous_low_product, 0), inverse_limb_scale, Ops.MUL)
++      low_sum = stage((low_sum, 0), (previous_low_product, 0), Ops.ADD)
++    correction = stage((low_sum, 0), inverse_limb_scale, Ops.MUL)
++    new_hi = stage((p, 0), (correction, 0), Ops.ADD)
++    delta = stage((new_hi, 0), (p, 0), Ops.SUB)
++    delta_scaled = stage((delta, 0), limb_scale, Ops.MUL)
++    new_lo = stage((low_sum, 0), (delta_scaled, 0), Ops.SUB)
++    hi, lo = new_hi, new_lo
++  visible_low = stage((lo, 0), inverse_limb_scale, Ops.MUL)
++  tasks.append(_emit_where_stage(total, info.outs[0], (hi, 0), (visible_low, 0), Ops.ADD, fp32_output=value_dtype is dtypes.float))
+   return tuple(tasks)
+ 
+ def _wip_try_native_small_int_power_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-- 
+2.34.1
+
