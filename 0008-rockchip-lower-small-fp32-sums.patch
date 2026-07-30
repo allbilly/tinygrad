@@ -1,0 +1,229 @@
+From 7f68cebc6b9a88b2229e953244b0b3e3ae4db1bf Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 08:55:21 +0800
+Subject: [PATCH] rockchip: lower small fp32 sums
+
+---
+ progress.md                          | 43 +++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            |  9 ++++++
+ test_ops_status.md                   | 24 ++++++++++++++
+ tinygrad/runtime/ops_rockchip.py     | 16 +++++++---
+ tinygrad/runtime/support/rockchip.py | 47 +++++++++++++++++++++++++---
+ 5 files changed, 131 insertions(+), 8 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index f82f105a6..c814d6f8f 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7534,6 +7534,49 @@ such as `0.1` can enter an fp16 graph as `0.0999755859375`.  It does not
+ describe long-scan scheduling, product accumulation error, or a correction
+ algorithm.
+ 
++## 2026-07-30 — small direct fp32 SUM boundary
++
++The unchanged normal-default forward `TestOps.test_const_reduce` now passes
++its constant SUM, product, and maximum subcases.  The SUM kernel is not
++constant by the time it reaches the backend: the preceding typed-fill kernel
++materializes nine fp32 values, and the next kernel sees only a direct fp32
++INDEX under `REDUCE(ADD)`.
++
++The active matcher is therefore based on the actual ABI graph, not on
++cross-kernel constant knowledge.  It accepts a direct fp32 input and fp32
++output with at most 16 source lanes.  Runtime creates a temporary fp16 view
++while packing the CMAC input, CMAC performs the reduction, and a final DPU
++stage widens the half result into the logical fp32 output.  The host
++conversion is only the existing fp32/fp16 representation boundary; SUM
++arithmetic remains on CMAC.
++
++An initial three-task design used a DPU add to create the half input before
++CMAC.  On hardware that first DPU submission reproducibly timed out inside
++the mixed CMAC runner.  The retained two-task design converts the source
++while CMAC inputs are packed and avoids that unstable compute-family
++transition.
++
++The source limit is important.  Broadening the same path to the unchanged
++16,384-element `test_sum_full` produced `+inf` instead of approximately
++`-369.8`; large fp32 SUM needs separate tiled and scale-safe accumulation.
++The strict `<=16` guard turns that case back into its prior planning
++rejection rather than returning a plausible-looking wrong result.
++
++Validation with `. .venv/bin/activate`, `DEV=ROCKCHIP FORWARD_ONLY=1`:
++
++- unchanged `test_const_reduce`: **1 passed in 7.79 seconds**;
++- `test_sum_simple`, `test_const_reduce`, `test_prod`, and
++  `test_prod_dtype_arg`: **4/4 in 12.67 seconds**;
++- hardware-free PR1 contract: **82/82 in 7.00 seconds**;
++- Python compilation and whitespace checks: **passing**;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++`DEFAULT_FLOAT=HALF` is not part of the requested forward command.  It makes
++`test_const_reduce` pass through the older half path, but also causes
++official dtype mismatches such as the scalar subcase in `test_add`.
++Milestone census and fixes therefore continue with the normal dtype default
++plus `FORWARD_ONLY=1`.
++
+ ## 2026-07-30 — general fp16 runtime tensor POW with two-level EXP2
+ 
+ The unchanged `TestOps.test_pow_full` now passes both `x**y` and `x.pow(y)`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 59aa62654..b1979b39b 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -281,6 +281,15 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(all(isinstance(task, RKSubTask) for task in subtasks))
+     self.assertLess(len(subtasks), 600)
+ 
++  def test_fp32_sum_uses_typed_cmac_boundary(self):
++    sink = _get_sink(Tensor.empty(3,3, dtype=dtypes.float, device="ROCKCHIP").sum())
++    program = build_native_program(sink)
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertGreaterEqual(len(subtasks), 2)
++    self.assertTrue(subtasks[0].task.fp32_inputs)
++    self.assertTrue(subtasks[-1].task.fp32_output)
++
+   def test_reject_cmac_exceeds_cbuf(self):
+     # M=6000 with K=4: align_in=32, input_row_bytes=64, data_banks=ceil(6000*64/32768)=12 > 11
+     a = Tensor.rand(6000,4,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 5d94e51bb..e7fd1b543 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1382,3 +1382,27 @@ constant fp32 SUM remains another independent rejection group.
+ Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+ helps distinguish initial fp16 input rounding from accumulator error, but it
+ does not provide a scan, accumulation, or precision workaround.
++
++### Small direct fp32 SUM milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged normal-default `test_const_reduce` | **1 passed in 7.79s** |
++| small SUM + const reduce + product regression set | **4/4 in 12.67s** |
++| hardware-free PR1 contract | **82/82 in 7.00s** |
++| mypy | **pre-existing 13-error baseline** |
++
++A strict direct-INDEX matcher now handles fp32 SUM inputs of at most 16
++lanes.  CMAC input packing supplies a temporary fp16 ABI view, CMAC performs
++the addition, and a final DPU task widens the result to fp32.  No SUM
++arithmetic runs on the host.
++
++The first pre-CMAC DPU conversion design timed out and was replaced by the
++typed CMAC packing boundary.  The matcher deliberately excludes
++`test_sum_full`: applying the untiled path to 16,384 lanes overflowed to
++infinity, so large fp32 SUM remains a separate tiled/scale-safe group.
++
++The active forward census uses the normal dtype default with
++`FORWARD_ONLY=1`.  Adding `DEFAULT_FLOAT=HALF` hides this fp32 rejection but
++introduces official Torch/tinygrad dtype mismatches, beginning with scalar
++`test_add`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 29f744672..e61a24a6c 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -862,6 +862,14 @@ class RockchipProgram(Program['RockchipDevice']):
+       buf_map:dict[int, HCQBuffer] = {}
+       cmac_bufs: list[HCQBuffer] = []
+       if task.kind == "cmac":
++        cmac_sources = list(bufs)
++        for slot in task.fp32_inputs:
++          if slot in (_CONST_SLOT, _ZERO_SLOT): continue
++          source_n = cmac_sources[slot].size // 4
++          converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
++          temp.append(converted)
++          _convert_fp32_to_fp16_buf(cmac_sources[slot].va_addr, converted.va_addr, source_n)
++          cmac_sources[slot] = converted
+         layout = task.layout
+         M, N, K, align_in, align_out = layout[0], layout[1], layout[2], layout[3], layout[4]
+         a_s, b_s = self.relocs[0].globals_slot, self.relocs[1].globals_slot
+@@ -874,18 +882,18 @@ class RockchipProgram(Program['RockchipDevice']):
+         elif a_s == _CONST_SLOT:
+           ctypes.memmove(a_buf.va_addr, struct.pack('<e', task.const_val) * align_in, align_in * 2)  # type: ignore[arg-type]
+         else:
+-          _pad_a(bufs[a_s].va_addr, a_buf.va_addr, M, K, align_in)
++          _pad_a(cmac_sources[a_s].va_addr, a_buf.va_addr, M, K, align_in)
+         b_buf = dev._gpu_alloc(max(align_out*align_in*2, 4096), 0)
+         temp.append(b_buf)
+         if materialized:
+           assert decoded_materialized is not None
+-          b_src = None if b_s == _CONST_SLOT else bufs[b_s].va_addr
+-          _materialize_cmac_inputs(bufs[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
++          b_src = None if b_s == _CONST_SLOT else cmac_sources[b_s].va_addr
++          _materialize_cmac_inputs(cmac_sources[a_s].va_addr, b_src, a_buf.va_addr, b_buf.va_addr,
+                                    M, N, K, align_in, align_out, decoded_materialized)
+         elif b_s == _CONST_SLOT:
+           ctypes.memmove(b_buf.va_addr, struct.pack('<e', task.const_val) * (align_out * align_in), align_out * align_in * 2)  # type: ignore[arg-type]
+         else:
+-          _swizzle_b(bufs[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
++          _swizzle_b(cmac_sources[b_s].va_addr, b_buf.va_addr, K, N, align_out, align_in)
+         o_buf = dev._gpu_alloc(max(M*align_out*4, 4096), 0)
+         temp.append(o_buf)
+         cmac_bufs = [a_buf, b_buf, o_buf]  # ordered by reloc emission: A, B, output
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 3b3cda04c..d73df0c58 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10592,6 +10592,45 @@ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
+   return tuple(tasks)
+ 
++def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Give CMAC a typed half view of a small direct fp32 input, then widen its result."""
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
++     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
++  source = _unwrap(reduce.src[0])
++  if source.op is not Ops.INDEX or source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
++  reductions = list(reduce.src[1:])
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++
++  info = ProgramInfo.from_sink(sink)
++  source_slot = source.src[0].buf_uop.arg.slot
++  scratch_slot = max(info.globals, default=-1) + 1
++  if source_slot >= 7: return None
++  source_total, output_total = int(source.src[0].src[0].arg), prod(_shape_of_store(sink))
++  if source_total > 16: return None
++  tasks:list[RKSubTask] = []
++
++  device = store.src[0].src[0].device
++  converted_param = UOp.param(source_slot, dtypes.half, (source_total,), device=device)
++  converted_index = source.replace(dtype=dtypes.half, src=(converted_param, *source.src[1:]))
++  converted_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (converted_index,), arg=dtypes.float), *reductions))
++  scratch_param = UOp.param(scratch_slot, dtypes.half, (output_total,), device=device)
++  scratch_index = store.src[0].replace(dtype=dtypes.half, src=(scratch_param, *store.src[0].src[1:]))
++  stage_store = store.replace(src=(scratch_index, UOp(Ops.CAST, dtypes.half, (converted_reduce,), arg=dtypes.half)))
++  stage_sink = sink.substitute({store:stage_store})
++  stage_plan = plan_rk(stage_sink)
++  if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
++  if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
++  elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
++  else:
++    cmds, task, relocs = emit_rk(stage_plan)
++    tasks.append(RKSubTask(cmds, task, relocs))
++  tasks = [RKSubTask(st.cmds, replace(st.task, fp32_inputs=tuple(set(st.task.fp32_inputs+(source_slot,)))), st.relocs)
++           if st.task.kind == "cmac" and any(r.globals_slot == source_slot for r in st.relocs) else st for st in tasks]
++  tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
++  return tuple(tasks)
++
+ def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Inclusive 1-D float cumprod through a logarithmic Hillis-Steele scan."""
+   reduce, store = _reduce_node(sink), _store_node(sink)
+@@ -11838,10 +11877,10 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, movement_sum_tasks)
+   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, elementwise_sum_tasks)
+-  # WIP: this produces the explicitly requested float32 result correctly, but
+-  # the DEFAULT_FLOAT=HALF test harness compares it against a Torch fp16 sum.
+-  # if (fp32_sum_tasks := _wip_try_fp32_sum_output_subtasks(sink)) is not None:
+-  #   return build_native_program_multi(sink, fp32_sum_tasks)
++  # Retain the half-input WIP above for reference. The active path is narrower:
++  # it requires a direct fp32 INDEX and preserves the explicitly fp32 output.
++  if (fp32_sum_tasks := _try_fp32_sum_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_sum_tasks)
+   if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, relu_sum_tasks)
+   if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:
+-- 
+2.34.1
+
