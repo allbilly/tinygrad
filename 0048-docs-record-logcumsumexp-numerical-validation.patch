@@ -1,0 +1,43 @@
+From 902585fbe1757e611c9da35fa73da7620b20a71a Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:04:16 +0800
+Subject: [PATCH] docs: record logcumsumexp numerical validation
+
+---
+ progress.md        | 9 +++++++++
+ test_ops_status.md | 5 +++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 44d3322f2..e5094e030 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9461,3 +9461,12 @@ avoids a new runtime ABI. Scalar cases retain their existing simplified path.
+ No LUT changed; mypy remains at the exact 12-error baseline.
+ 
+ Next forward group: `TestOps.test_logcumsumexp_numerical`.
++
++## 2026-07-30 — logcumsumexp numerical validation
++
++The unchanged `TestOps.test_logcumsumexp_numerical` case with input
++`[0.0, 100.0]` passes in **2.92s**. This validates the cumulative-max
++stabilization across a large exponential gap. No additional code, LUT, or
++runtime ABI change was needed.
++
++Next forward group: `TestOps.test_sinh`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 4848868c8..d885f19a6 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2090,3 +2090,8 @@ both fused reductions. No LUT or runtime ABI changed. Next forward group:
+ Exact masked prefix-MAX and prefix-exp-sum signatures use bounded static
+ expansion in the serialized fp32 evaluator. No LUT or runtime ABI changed.
+ Next forward group: `TestOps.test_logcumsumexp_numerical`.
++
++### Logcumsumexp numerical stability
++
++The unchanged `[0.0, 100.0]` case passes in **2.92s** with no additional
++change. Next forward group: `TestOps.test_sinh`.
+-- 
+2.34.1
+
