@@ -1,0 +1,214 @@
+From 300419a6a02463edf9b50f12c09193843a167e8f Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 15:39:47 +0800
+Subject: [PATCH] rockchip: preserve normal fp32 relu sums
+
+---
+ progress.md                          | 33 ++++++++++++++
+ test/rockchip/test_hw.py             |  6 +++
+ test/rockchip/test_pr1.py            | 11 +++++
+ test_ops_status.md                   | 15 +++++++
+ tinygrad/runtime/support/rockchip.py | 66 +++++++++++++++++++++++++---
+ 5 files changed, 126 insertions(+), 5 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index ea44ee52d..94e92232f 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7683,6 +7683,39 @@ No LUT changed. The next sum group,
+ `TestOps.test_sum_relu`, rejects its fp32 WHERE form as
+ `RKPLAN_REJECT:unsupported_op:Ops.WHERE`.
+ 
++## 2026-07-30 — normal-fp32 ReLU-sum milestone
++
++The unchanged `TestOps.test_sum_relu` now passes
++`ReLU(x) → SUM → ReLU` for a `(3,4,5)` fp32 input. The established staged
++helper was half-only, so the normal-default WHERE graph previously rejected.
++
++The fp32 path preserves `x = high + residual/256`. DPU arithmetic derives a
++positive mask from both limbs:
++
++- positive/negative tests on the high limb identify ordinary signs;
++- when the high limb is zero, the residual sign handles tiny fp32 values;
++- the one mask selects both high and residual limbs, retaining negative
++  residual corrections for positive values.
++
++CMAC reduces the selected high and residual tensors independently, and DPU
++reconstructs the fp32 result. Since every selected input is nonnegative, the
++outer ReLU is an identity on the resulting finite sum. Host work is limited
++to the established fp32 limb representation.
++
++Validation with `. .venv/bin/activate` and
++`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
++
++- unchanged `TestOps.test_sum_relu`: pass before the next `test_sum_tiny`
++  numerical failure;
++- permanent signed random fp32 ReLU-sum: **1 passed in 3.69s**;
++- hardware-free planner/runtime contract: **108/108 in 6.51s**;
++- Python compilation and `git diff --check`: passing;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++No LUT changed. `TestOps.test_sum_tiny` now runs but one of two outputs misses
++tolerance (`-0.17614746` versus `-0.17683172`), indicating an fp16 CMAC
++output-rounding boundary rather than unsupported layout.
++
+ ## 2026-07-30 — normal-fp32 direct einsum sum milestone
+ 
+ The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index f11ed0379..f0c80e567 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -800,6 +800,12 @@ class TestCMAC(unittest.TestCase):
+     got = Tensor(a_np, device="ROCKCHIP").sum().realize().numpy()
+     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+ 
++  def test_cmac_fp32_relu_sum(self):
++    a_np = np.random.default_rng(6).standard_normal((3,4,5)).astype(np.float32)
++    expected = np.maximum(np.maximum(a_np, 0).sum(dtype=np.float32), 0)
++    got = Tensor(a_np, device="ROCKCHIP").relu().sum().relu().realize().numpy()
++    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
++
+   def test_cmac_nested_sum(self):
+     # This seed distinguishes the required fp16 intermediate boundary from a
+     # flattened fp32 accumulation: nested=-2.43359375, flat=-2.435546875.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 6d1a9b49d..a2de2a28d 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -410,6 +410,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(any(task.fp32_output for task in cmac_tasks))
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_fp32_relu_sum_preserves_both_input_limbs(self):
++    a = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a.relu().sum().relu()))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
++    self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
++    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
++    self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
++    self.assertTrue(subtasks[-1].task.fp32_output)
++
+   def test_fp32_add_uses_compensated_boundary(self):
+     a = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 96ec52126..6de5527b5 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1866,3 +1866,18 @@ multi-row boundary. All addition remains NPU work; no LUT changed.
+ 
+ Continue with `TestOps.test_sum_relu`, currently rejected as
+ `unsupported_op:Ops.WHERE`.
++
++### Normal-fp32 ReLU sum
++
++| Coverage | Result |
++|---|---:|
++| unchanged `TestOps.test_sum_relu` | pass |
++| permanent signed random fp32 ReLU-sum | **1 passed in 3.69s** |
++| hardware-free planner/runtime contract | **108/108 in 6.51s** |
++
++An NPU-derived sign mask selects both fp32 ABI limbs before two CMAC sums;
++DPU then reconstructs the fp32 result. No LUT or host operator arithmetic
++was added.
++
++Continue with `TestOps.test_sum_tiny`; it executes but currently has one
++small numerical miss from CMAC output rounding.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index af6679e00..18a9e358f 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10783,7 +10783,7 @@ def _try_nested_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Split ReLU(SUM(ReLU(x))) into ordered DPU, CMAC, and DPU stages."""
+   store = _store_node(sink)
+-  if store is None or store.src[0].dtype is not dtypes.half: return None
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
+ 
+   def relu_operand(u:UOp) -> UOp|None:
+     u = _unwrap(u)
+@@ -10796,18 +10796,74 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   reduce = relu_operand(store.src[1])
+   if reduce is None or reduce.op is not Ops.REDUCE or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+   source = relu_operand(reduce.src[0])
+-  if source is None or source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM: return None
++  if source is None or source.op is not Ops.INDEX or source.dtype is not store.src[0].dtype or source.src[0].op is not Ops.PARAM: return None
+   reductions = list(reduce.src[1:])
+   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+   if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+ 
+   info = ProgramInfo.from_sink(sink)
+-  relu_slot = max(info.globals, default=-1) + 1
+-  sum_slot = relu_slot + 1
+   input_total = int(source.src[0].src[0].arg)
+   output_total = prod(_shape_of_store(sink))
++  if source.dtype is dtypes.float:
++    source_slot = source.src[0].buf_uop.arg.slot
++    if source_slot >= 7: return None
++    next_slot = max(info.globals, default=-1)+1
++    tasks:list[RKSubTask] = []
++    def alloc() -> int:
++      nonlocal next_slot
++      ret, next_slot = next_slot, next_slot+1
++      return ret
++    def scalar(value:float) -> tuple[int,int]:
++      return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
++    def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False) -> int:
++      out = alloc()
++      tasks.append(_emit_where_stage(input_total, out, a, b, op, compare=compare))
++      return out
++    def view(tag:int) -> int:
++      out = alloc()
++      cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++      relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (input_total, tag), out, is_copy=True), relocs))
++      return out
++    high, residual = view(_HOST_FP32_HALF_LAYOUT), view(_HOST_FP32_RESIDUAL_LAYOUT)
++    high_positive = stage((high, 0), (high, 0), Ops.MAX, compare=True)
++    negative_high = stage((_ZERO_SLOT, 0), (high, 0), Ops.SUB)
++    high_negative = stage((negative_high, 0), (negative_high, 0), Ops.MAX, compare=True)
++    high_nonzero = stage((high_positive, 0), (high_negative, 0), Ops.MAX)
++    high_zero = stage(scalar(1.0), (high_nonzero, 0), Ops.SUB)
++    residual_positive = stage((residual, 0), (residual, 0), Ops.MAX, compare=True)
++    residual_only = stage((residual_positive, 0), (high_zero, 0), Ops.MUL)
++    positive = stage((high_positive, 0), (residual_only, 0), Ops.MAX)
++    relu_high = stage((high, 0), (positive, 0), Ops.MUL)
++    relu_residual = stage((residual, 0), (positive, 0), Ops.MUL)
++
++    def cmac_sum(input_slot:int) -> int|None:
++      out_slot = alloc()
++      half_param = UOp.param(input_slot, dtypes.half, (input_total,), device=source.src[0].device)
++      half_index = source.replace(dtype=dtypes.half, src=(half_param, *source.src[1:]))
++      half_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (half_index,), arg=dtypes.float), *reductions))
++      out_param = UOp.param(out_slot, dtypes.half, (output_total,), device=store.src[0].src[0].device)
++      out_index = store.src[0].replace(dtype=dtypes.half, src=(out_param, *store.src[0].src[1:]))
++      stage_store = store.replace(src=(out_index, UOp(Ops.CAST, dtypes.half, (half_reduce,), arg=dtypes.half)))
++      stage_plan = plan_rk(sink.substitute({store:stage_store}))
++      if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
++      if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
++      else:
++        cmds, task, relocs = emit_rk(stage_plan)
++        tasks.append(RKSubTask(cmds, task, relocs))
++      return out_slot
++
++    high_sum, residual_sum = cmac_sum(relu_high), cmac_sum(relu_residual)
++    if high_sum is None or residual_sum is None: return None
++    correction = alloc()
++    tasks.append(_emit_where_stage(output_total, correction, (residual_sum, 0), scalar(1/256), Ops.MUL))
++    tasks.append(_emit_where_stage(output_total, info.outs[0], (high_sum, 0), (correction, 0), Ops.ADD, fp32_output=True))
++    return tuple(tasks)
++
++  relu_slot = max(info.globals, default=-1) + 1
++  sum_slot = relu_slot + 1
+   zero_arg = (_ZERO_SLOT, 0)
+-  tasks:list[RKSubTask] = [_emit_where_stage(input_total, relu_slot, (source.src[0].buf_uop.arg.slot, 0), zero_arg, Ops.MAX)]
++  tasks = [_emit_where_stage(input_total, relu_slot, (source.src[0].buf_uop.arg.slot, 0), zero_arg, Ops.MAX)]
+ 
+   device = store.src[0].src[0].device
+   relu_param = UOp.param(relu_slot, dtypes.half, (input_total,), device=device)
+-- 
+2.34.1
+
