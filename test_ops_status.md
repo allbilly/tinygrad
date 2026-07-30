@@ -1850,3 +1850,19 @@ General fp32 CMAC remains on the compensated path.
 All official matmul/GEMM groups through `test_multidot` are green. No LUT
 change or host operator arithmetic was introduced. Continue with
 `TestOps.test_sum_simple`.
+
+### Normal-fp32 long full sum
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_sum_simple` | pass |
+| unchanged `TestOps.test_sum_full` | pass |
+| permanent random 16,384-element fp32 sum | **1 passed in 3.62s** |
+| hardware-free planner/runtime contract | **107/107 in 6.52s** |
+
+The long scalar sum uses four K=4096 CMAC chunks per fp32 limb and a second
+raw-fp32 CMAC reduction level. This scalar-safe K does not alter the K≤416
+multi-row boundary. All addition remains NPU work; no LUT changed.
+
+Continue with `TestOps.test_sum_relu`, currently rejected as
+`unsupported_op:Ops.WHERE`.

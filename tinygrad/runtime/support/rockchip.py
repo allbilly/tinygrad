@@ -10959,8 +10959,101 @@ def _wip_try_fp32_sum_output_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
   return tuple(tasks)
 
+def _try_long_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Reduce one long fp32 vector with scalar-safe CMAC chunks and raw fp32 partials."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
+     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  source = _unwrap(reduce.src[0])
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM or \
+     loops or len(reductions) != 1 or reductions[0].src[0].op is not Ops.CONST: return None
+  K = int(reductions[0].src[0].arg)
+  if K <= 256 or int(source.src[0].src[0].arg) != K or \
+     _affine_index(source.src[1]) != ({reductions[0].arg[0]:1}, 0): return None
+
+  info, device = ProgramInfo.from_sink(sink), store.src[0].src[0].device
+  source_slot = source.src[0].buf_uop.arg.slot
+  if source_slot >= 7: return None
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+  def view(source_slot:int, tag:int, total:int, layout:tuple[int,...]=(), out_slot:int|None=None) -> int:
+    out = alloc() if out_slot is None else out_slot
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag, *layout), out, is_copy=True), relocs))
+    return out
+  def stage(a:tuple[int,int], b:tuple[int,int], op:Ops) -> int:
+    out = alloc()
+    tasks.append(_emit_where_stage(1, out, a, b, op))
+    return out
+  def combine_raw(high_slot:int, low_slot:int, out_slot:int) -> None:
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, high_slot, 0, 0, 0xFFFFFFFF),
+              RKReloc(0, low_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (1, _HOST_FP32_COMBINE_LAYOUT),
+                                       out_slot, is_copy=True, fp32_output=True), relocs))
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+  def sum_half(input_slot:int, width:int, out_slot:int|None=None, out_offset=0, raw_fp32=False) -> int|None:
+    red = UOp.range(width, 5100, AxisType.REDUCE)
+    source_param = UOp.param(input_slot, dtypes.half, (width,), device=device)
+    source_index = UOp(Ops.INDEX, dtypes.half, (source_param, red))
+    acc = UOp(Ops.REDUCE, dtypes.float,
+              (UOp(Ops.CAST, dtypes.float, (source_index,), arg=dtypes.float), red), arg=(Ops.ADD, 0.0))
+    if out_slot is None: out_slot = alloc()
+    out_param = UOp.param(out_slot, dtypes.half, (1,), device=device)
+    out_index = UOp(Ops.INDEX, dtypes.half, (out_param, UOp.const(dtypes.weakint, 0)))
+    sum_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(out_index, UOp(Ops.CAST, dtypes.half, (acc,), arg=dtypes.half))),)))
+    sum_plan = plan_rk(sum_sink)
+    if isinstance(sum_plan, str) or sum_plan.kind != "cmac": return None
+    cmds, task, relocs = emit_rk(sum_plan)
+    tasks.append(RKSubTask(cmds, replace(task, fp32_output=raw_fp32, out_offset=out_offset), relocs))
+    return out_slot
+
+  chunk_width = min(K, 4096)
+  chunks = ceildiv(K, chunk_width)
+  high_partials, low_partials = alloc(), alloc()
+  high_chunk, low_chunk = alloc(), alloc()
+  for chunk in range(chunks):
+    start, count = chunk*chunk_width, min(chunk_width, K-chunk*chunk_width)
+    layout = (2, 1, count, K, 1, start)
+    view(source_slot, _HOST_FP32_HALF_LAYOUT, count, layout, high_chunk)
+    view(source_slot, _HOST_FP32_RESIDUAL_LAYOUT, count, layout, low_chunk)
+    if sum_half(high_chunk, count, high_partials, chunk*4, raw_fp32=True) is None or \
+       sum_half(low_chunk, count, low_partials, chunk*4, raw_fp32=True) is None: return None
+
+  def finish_raw(partials:int) -> int|None:
+    partial_high = view(partials, _HOST_FP32_HALF_LAYOUT, chunks)
+    partial_low = view(partials, _HOST_FP32_RESIDUAL_LAYOUT, chunks)
+    high_sum, low_sum = sum_half(partial_high, chunks, raw_fp32=True), sum_half(partial_low, chunks)
+    if high_sum is None or low_sum is None: return None
+    high_half = view(high_sum, _HOST_FP32_HALF_LAYOUT, 1)
+    high_residual = view(high_sum, _HOST_FP32_RESIDUAL_LAYOUT, 1)
+    combined_residual = stage((high_residual, 0), (low_sum, 0), Ops.ADD)
+    raw = alloc()
+    combine_raw(high_half, combined_residual, raw)
+    return raw
+
+  high_raw, low_raw = finish_raw(high_partials), finish_raw(low_partials)
+  if high_raw is None or low_raw is None: return None
+  high_half = view(high_raw, _HOST_FP32_HALF_LAYOUT, 1)
+  high_residual = view(high_raw, _HOST_FP32_RESIDUAL_LAYOUT, 1)
+  low_half = view(low_raw, _HOST_FP32_HALF_LAYOUT, 1)
+  low_residual = view(low_raw, _HOST_FP32_RESIDUAL_LAYOUT, 1)
+  low_value = stage((low_half, 0), (stage((low_residual, 0), scalar(1/256), Ops.MUL), 0), Ops.ADD)
+  final_residual = stage((high_residual, 0), (low_value, 0), Ops.ADD)
+  combine_raw(high_half, final_residual, info.outs[0])
+  return tuple(tasks)
+
 def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Give CMAC a typed half view of a small direct fp32 input, then widen its result."""
+  if (long_sum_tasks := _try_long_fp32_sum_subtasks(sink)) is not None: return long_sum_tasks
   store, reduce = _store_node(sink), _reduce_node(sink)
   if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
      reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None

@@ -7639,6 +7639,50 @@ Validation with `. .venv/bin/activate` and
 No LUT table changed. Resume the official census at
 `TestOps.test_sum_simple`.
 
+## 2026-07-30 — normal-fp32 long full-sum milestone
+
+The unchanged `TestOps.test_sum_full` now reduces 16,384 fp32 values
+natively. `test_sum_simple` already passed; the long case previously missed
+the 256-element direct-sum guard and ended at
+`RKPLAN_REJECT:unsupported_dtype:fp32_cmac`.
+
+The lowering is a two-level compensated reduction:
+
+1. split each input into `high` and `x256 residual` ABI limbs;
+2. reduce four scalar-safe K=4096 chunks per limb with CMAC, preserving raw
+   fp32 chunk outputs;
+3. split those raw partials and reduce them again with CMAC;
+4. reconstruct `sum(high) + sum(residual)/256` through DPU arithmetic and
+   the established fp32 ABI combine.
+
+K=4096 is used only for scalar `M=1` CMAC, already covered by the materialized
+scalar-dot path. The measured K≤416 constraint remains in force for
+multi-row CMAC; this change does not weaken it. No host partial addition is
+used.
+
+Useful debug sequence:
+
+1. distinguish scalar `M=1` long sums from multi-row reductions before
+   choosing K;
+2. keep CMAC output raw fp32 at both reduction levels;
+3. size packed partial buffers with four bytes per chunk;
+4. remember that the residual limb is already in x256 units—add its full
+   reconstructed value to the final high residual before ABI combine;
+5. compare random signed input, not only positive or constant tensors.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_sum_full`: pass before the next sum-ReLU failure;
+- permanent random 16,384-element fp32 sum: **1 passed in 3.62s**;
+- hardware-free planner/runtime contract: **107/107 in 6.52s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT changed. The next sum group,
+`TestOps.test_sum_relu`, rejects its fp32 WHERE form as
+`RKPLAN_REJECT:unsupported_op:Ops.WHERE`.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`

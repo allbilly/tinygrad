@@ -399,6 +399,17 @@ class TestClassifier(unittest.TestCase):
                         task.task.layout[1] == _HOST_FP32_HALF_LAYOUT for task in subtasks))
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_long_fp32_sum_uses_two_level_raw_cmac(self):
+    a = Tensor.empty(16384, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a.sum()))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    cmac_tasks = [task.task for task in subtasks if task.task.kind == "cmac"]
+    self.assertTrue(cmac_tasks)
+    self.assertLessEqual(max(task.layout[2] for task in cmac_tasks), 4096)
+    self.assertTrue(any(task.fp32_output for task in cmac_tasks))
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_fp32_add_uses_compensated_boundary(self):
     a = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
