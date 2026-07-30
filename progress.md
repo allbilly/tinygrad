@@ -7554,6 +7554,35 @@ Validation with `. .venv/bin/activate`:
   pass before the separately tracked bilinear rejection;
 - hardware-free planner/runtime contract: **100/100 in 5.71 seconds**.
 
+## 2026-07-30 — normal-fp32 multifactor einsum milestone
+
+The final unchanged `TestOps.test_einsum` case,
+`ik,jkl,il->ij`, now preserves its two-stage contraction order for normal
+fp32. The existing fp16 matcher already contracts the associated first pair
+over `k`, materializes the `ijl` intermediate, then contracts it with the
+third input over `l`.
+
+For fp32, both stages now invoke the compensated two-input CMAC lowering:
+each input is represented by high/residual limbs, CMAC performs the product
+reductions, DPU accumulates cross terms, and the intermediate remains fp32
+across its ABI boundary. Scratch slots are safely reused only after the first
+stage finishes. No host operator arithmetic or new register sequence was
+introduced.
+
+The isolated deterministic probe has maximum absolute error
+`7.152557373046875e-7`. The complete unchanged normal-fp32
+`TestOps.test_einsum` is now **1 passed in 67.27 seconds**, including all
+three large 30,030-output contraction variants and the final multifactor
+case.
+
+No LUT change is involved. Continue with the separate einsum ellipsis and
+trace groups.
+
+Permanent validation:
+
+- RK3588 normal-fp32 multifactor case: **1 passed in 3.10 seconds**;
+- hardware-free planner/runtime contract: **101/101 in 5.70 seconds**.
+
 ## 2026-07-30 — normal-fp32 stable argsort
 
 The unchanged forward-only `TestOps.test_argsort` now passes its

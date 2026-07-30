@@ -872,6 +872,16 @@ class TestCMAC(unittest.TestCase):
     expected = np.einsum("ijl,il->ij", intermediate.astype(np.float32), c_np.astype(np.float32)).astype(np.float16)
     np.testing.assert_array_equal(actual, expected)
 
+  def test_cmac_fp32_multifactor_einsum(self):
+    rng = np.random.default_rng(0)
+    a_np = rng.standard_normal((2,3)).astype(np.float32)
+    b_np = rng.standard_normal((5,3,7)).astype(np.float32)
+    c_np = rng.standard_normal((2,7)).astype(np.float32)
+    expected = np.einsum("ik,jkl,il->ij", a_np, b_np, c_np, dtype=np.float32)
+    tensors = (Tensor(x, device="ROCKCHIP") for x in (a_np, b_np, c_np))
+    actual = Tensor.einsum("ik,jkl,il->ij", *tensors).realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+
   def test_cmac_gemv_vector_a(self):
     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
     a_np = np.array([1,2,3,4], dtype=np.float16)

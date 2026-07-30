@@ -662,6 +662,16 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(len(subtasks), 2)
     self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
 
+  def test_fp32_multifactor_einsum_produces_compensated_cmac_stages(self):
+    a = Tensor.empty(2,3,dtype=dtypes.float,device="ROCKCHIP")
+    b = Tensor.empty(5,3,7,dtype=dtypes.float,device="ROCKCHIP")
+    c = Tensor.empty(2,7,dtype=dtypes.float,device="ROCKCHIP")
+    prg = build_native_program(_get_sink(Tensor.einsum("ik,jkl,il->ij", a, b, c)))
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(sum(st.task.kind == "cmac" for st in subtasks), 6)
+    self.assertEqual(sum(st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT for st in subtasks if st.task.is_copy), 2)
+    self.assertTrue(subtasks[-1].task.fp32_output)
+
   def test_avg_pool_variable_divisor_serializes_counts(self):
     x = Tensor.rand(1,1,6,6,dtype=dtypes.half).realize()
     prg = build_native_program(_get_sink(x.avg_pool2d(kernel_size=(3,3), padding=1, count_include_pad=False)))

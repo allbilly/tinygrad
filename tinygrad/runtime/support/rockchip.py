@@ -10623,7 +10623,7 @@ def _try_cat_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Split a three-factor einsum into PyTorch-ordered fp16 CMAC contractions."""
+  """Split a three-factor einsum into PyTorch-ordered CMAC contractions."""
   reduce = _reduce_node(sink)
   if reduce is None or reduce.arg[0] is not Ops.ADD: return None
   body = _reduce_body(reduce)
@@ -10631,7 +10631,9 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   first, last = _unwrap(body.src[0]), _unwrap(body.src[1])
   if first.op is not Ops.MUL or len(first.src) != 2 or _unwrap(last).op is not Ops.INDEX: return None
   factors = tuple(_unwrap(x) for x in first.src)
-  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half for x in (*factors, last)): return None
+  factor_dtype = factors[0].dtype
+  if factor_dtype not in (dtypes.half, dtypes.float) or \
+     any(x.op is not Ops.INDEX or x.dtype is not factor_dtype for x in (*factors, last)): return None
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
   reductions = list(reduce.src[1:])
   if not loops or not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
@@ -10652,6 +10654,28 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   info = ProgramInfo.from_sink(sink)
   intermediate_slot = max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
+
+  if factor_dtype is dtypes.float:
+    # Keep the associated first contraction in fp32, then feed its exact ABI
+    # result to the compensated fp32 CMAC wrapper for the remaining dot.
+    carry_map = dict(zip(remaining, carry_loops))
+    stage_product = first.substitute(carry_map)
+    stage_acc = UOp(Ops.REDUCE, dtypes.float, (stage_product, *contracted), arg=reduce.arg)
+    intermediate_param = UOp.param(intermediate_slot, dtypes.float, (stage_total,), device=factors[0].src[0].device)
+    stage_out = UOp(Ops.INDEX, dtypes.float, (intermediate_param, flat_index(stage_axes, stage_extents)))
+    stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_acc)), *stage_axes)))
+    if (stage_tasks := _try_small_fp32_cmac_subtasks(stage_sink)) is None: return None
+    tasks.extend(stage_tasks)
+
+    final_axes = [*loops, *remaining]
+    final_extents = [int(u.src[0].arg) for u in final_axes]
+    intermediate_index = UOp(Ops.INDEX, dtypes.float, (intermediate_param, flat_index(final_axes, final_extents)))
+    final_product = UOp(Ops.MUL, dtypes.float, (intermediate_index, last))
+    final_acc = UOp(Ops.REDUCE, dtypes.float, (final_product, *remaining), arg=reduce.arg)
+    final_sink = sink.substitute({reduce:final_acc})
+    if (final_tasks := _try_small_fp32_cmac_subtasks(final_sink)) is None: return None
+    tasks.extend(final_tasks)
+    return tuple(tasks)
 
   # PyTorch contracts the associated first pair over their common reduction
   # axes, casts that intermediate to fp16, then performs the remaining dot.

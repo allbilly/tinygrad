@@ -1752,3 +1752,18 @@ explicitly excluded from this forward path.
 
 Permanent RK3588 coverage passes in **17.35 seconds** and the hardware-free
 planner/runtime contract is **100/100**.
+
+### Normal-fp32 multifactor einsum
+
+| Coverage | Result |
+|---|---:|
+| deterministic `ik,jkl,il->ij` | max abs `7.153e-7` |
+| unchanged `TestOps.test_einsum` | **1 passed in 67.27s** |
+
+The established fp16 contraction order is retained, but both CMAC stages
+use compensated fp32 input/output ABI boundaries. This resolves the final
+case in the base einsum group without host operator arithmetic. Continue
+with `test_einsum_ellipsis` and `test_einsum_trace`.
+
+Permanent RK3588 coverage passes in **3.10 seconds**; the hardware-free
+planner/runtime contract is **101/101**.
