@@ -2095,3 +2095,15 @@ Next forward group: `TestOps.test_logcumsumexp_numerical`.
 
 The unchanged `[0.0, 100.0]` case passes in **2.92s** with no additional
 change. Next forward group: `TestOps.test_sinh`.
+
+### Normal-fp32 sinh/cosh
+
+| Group | Status |
+|---|---:|
+| `test_sinh` + `test_cosh` | **2 passed in 4.29s** |
+| hardware-free Rockchip contract | **121/121** |
+
+Exact fp32 `(exp(x) +/- exp(-x))/2` graphs use one serialized task instead of
+the timeout-prone 43–44-task generic DPU split. Folded `-log2(e)` and the old
+nested-negation recognition are both retained; fp16 LUT paths are unchanged.
+Next forward group: `TestOps.test_tanh`.

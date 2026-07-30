@@ -653,14 +653,14 @@ def _try_sinh_cosh(val:UOp) -> tuple[UOp,bool]|None:
     if scaled.op is not Ops.MUL: return None
     scaled_input = next((_unwrap(x) for x in scaled.src if x.op is not Ops.CONST), None)
     log2e = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
-    if scaled_input is None or log2e is None or abs(log2e-math.log2(math.e)) >= 1e-3: return None
-    input_sign = 1
+    if scaled_input is None or log2e is None or abs(abs(log2e)-math.log2(math.e)) >= 1e-3: return None
+    input_sign = -1 if log2e < 0 else 1
     if scaled_input.op is Ops.MUL:
       source, coefficient = scaled_input.src
       if coefficient.op is not Ops.CONST: source, coefficient = coefficient, source
       source = _unwrap(source)
       if coefficient.op is not Ops.CONST or float(coefficient.arg) != -1.0: return None
-      input_sign = -1
+      input_sign *= -1
     else: source = _unwrap(scaled_input)
     return (source, input_sign, outer_sign) if source.op is Ops.INDEX else None
 
@@ -4526,6 +4526,14 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   _emit_where_stage(total, info.outs[0], (exact_zeroed, 0), (factor, 0), Ops.MUL)))
   tasks = list(_fix_cmp_fp32(tuple(tasks), source))
   return _finalize_fp32_output(tasks, store)
+
+def _try_fp32_sinh_cosh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Keep exact normal-fp32 sinh/cosh off the reset-heavy generic DPU splitter."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float or (match := _try_sinh_cosh(store.src[1])) is None: return None
+  source, _ = match
+  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
 def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate sinh/cosh directly on [-2,2] and restore fp16 overflow outside the finite range."""
@@ -13528,6 +13536,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
   if (atanh_tasks := _try_atanh_subtasks(sink)) is not None: return build_native_program_multi(sink, atanh_tasks)
   if (asinh_acosh_tasks := _try_asinh_acosh_subtasks(sink)) is not None: return build_native_program_multi(sink, asinh_acosh_tasks)
+  if (fp32_sinh_cosh_tasks := _try_fp32_sinh_cosh_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_sinh_cosh_tasks)
   if (sinh_cosh_tasks := _try_sinh_cosh_subtasks(sink)) is not None: return build_native_program_multi(sink, sinh_cosh_tasks)
   if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
   if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)

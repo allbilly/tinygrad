@@ -9470,3 +9470,23 @@ stabilization across a large exponential gap. No additional code, LUT, or
 runtime ABI change was needed.
 
 Next forward group: `TestOps.test_sinh`.
+
+## 2026-07-30 — normal-fp32 sinh/cosh milestone
+
+The unchanged `TestOps.test_sinh` and `TestOps.test_cosh` groups pass together
+in **4.29s**, including ordinary inputs and the ±300 extreme ranges. The
+hardware-free Rockchip contract is **121/121 in 7.00s**.
+
+Before the fix, normal-fp32 sinh classified through the generic splitter as
+44 tasks (41 non-copy DPU tasks) and timed out during submission. Cosh used
+43/40 tasks. `_try_fp32_sinh_cosh_host_subtasks` now accepts only the exact
+`(exp(x) +/- exp(-x))/2` graph and runs it as one serialized fp32 task.
+The existing fp16 two-LUT sinh/cosh implementation remains unchanged.
+
+The optimizer folds `exp(-x)` to `EXP2(x * -log2(e))`; the shared recognizer
+now accepts that coefficient-sign form while retaining the previous nested
+`(-x) * log2(e)` form. Extreme overflow therefore follows NumPy/tinygrad
+fp32 semantics without exhausting the NPU reset budget. No LUT changed;
+mypy remains at the exact 12-error baseline.
+
+Next forward group: `TestOps.test_tanh`.
