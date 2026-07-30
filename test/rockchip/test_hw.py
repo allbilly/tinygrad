@@ -580,6 +580,13 @@ class TestDPU(unittest.TestCase):
                          (lambda: a != b, a_np != b_np), (lambda: a >= b, a_np >= b_np)):
       np.testing.assert_array_equal(op().realize().numpy(), expected)
 
+  def test_isclose_fp32_ieee_and_tolerance(self):
+    a_np = np.array([1e-7, 1e-8, 1e-9, 0.85, 0.041, np.inf, -np.inf, np.nan], dtype=np.float32)
+    b_np = np.array([0, 0, 0, 0.850001, 0.041001, np.inf, np.inf, np.nan], dtype=np.float32)
+    a, b = Tensor(a_np, device="ROCKCHIP").realize(), Tensor(b_np, device="ROCKCHIP").realize()
+    np.testing.assert_array_equal(a.isclose(b).realize().numpy(), np.isclose(a_np, b_np))
+    np.testing.assert_array_equal(a.isclose(b, equal_nan=True).realize().numpy(), np.isclose(a_np, b_np, equal_nan=True))
+
   def test_dpu_where_infinities(self):
     a_np = np.array([-np.inf, -1, 0, 0.5, 2, np.inf], dtype=np.float16)
     a = Tensor(a_np, device="ROCKCHIP").realize()

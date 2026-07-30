@@ -1908,3 +1908,27 @@ All base sum groups through `test_sum_dtype_arg` are green.
 
 The old constant-sum rejection is resolved. No code or LUT change was
 needed for this validation block. Continue with `TestOps.test_isclose`.
+
+### Forward isclose and comparison ABI
+
+| Group | Status |
+|---|---:|
+| `test_isclose` | pass |
+| `test_isclose_edge_cases` | pass |
+| `test_isclose_scalar` | pass |
+| combined official run | **3 passed in 9.59s** |
+| forward `cmp_eq/gt/ge/lt/le` regressions | pass |
+| hardware-free Rockchip contract | **110/110** |
+
+`isclose` uses one strict `_HOST_ELEMENTWISE_LAYOUT` task. The structural
+gate requires the complete IEEE isclose topology and does not enable a
+general host fallback. The retained native fp32 comparison WIP is accurate
+for ordinary tolerance cases but exhausts the RK3588 reset budget across the
+32-case IEEE matrix.
+
+Raw single-task DPU submission now mirrors multi-task preparation for fp32,
+int32, bool, comparison sanitization, and broadcast expansion. This fixed
+int/bool equality and broadcast comparison regressions found during the
+isclose milestone.
+
+Next forward group: `TestOps.test_mean`.

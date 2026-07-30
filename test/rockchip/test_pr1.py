@@ -8,7 +8,8 @@ from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
 from tinygrad.codegen import pm_to_program
 from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
-                                               _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT)
+                                               _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+                                               _HOST_ELEMENTWISE_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -807,6 +808,15 @@ class TestPipeline(unittest.TestCase):
     self.assertFalse(any(st.task.native_int32_input or st.task.native_int32_output for st in subtasks))
     self.assertFalse(any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
                          ((cmd >> 16) & 0xffffffff) == 0x3f800000 for st in subtasks for cmd in st.cmds))
+
+  def test_isclose_uses_one_strict_serialized_task(self):
+    a = Tensor.empty(8, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(8, dtype=dtypes.float, device="ROCKCHIP")
+    prg = build_native_program(_get_sink(a.isclose(b)))
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertTrue(subtasks[0].task.is_copy)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()

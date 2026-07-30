@@ -6273,7 +6273,7 @@ def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, out, (magnitude_slot, 0), (invalid_factor, 0), Ops.MUL)))
   return tuple(tasks)
 
-def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
+def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
 
   The older single-task BS-negate/EW-MAX emitter remains below for reference,
@@ -6286,10 +6286,60 @@ def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, RKSubTask]|None:
   out_slot, scratch = info.outs[0], max(info.globals, default=-1) + 1
   negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
   fp32_in = store.src[0].src[0].dtype is dtypes.float
-  fp32_args = {"fp32_inputs": (input_slot,)} if fp32_in else {}
-  fp32_out = {"fp32_output": True} if fp32_in else {}
-  return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL, **fp32_args),
-          _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX, **fp32_args, **fp32_out))
+  if fp32_in:
+    # Preserve the fp32 residual limb. The old high-only path below rounds
+    # abs(x-y) to fp16 and loses isclose-scale deltas such as 1e-6.
+    value = _unwrap(store.src[1])
+    sources = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and
+               u.src[0].op is Ops.PARAM and u.src[0].arg.slot == input_slot]
+    store_aff = _affine_index(store.src[0].src[1])
+    source = next((u for u in sources if _affine_index(u.src[1]) == store_aff), None)
+    if source is None: return None
+    next_slot, tasks = scratch, []
+    def alloc() -> int:
+      nonlocal next_slot
+      ret, next_slot = next_slot, next_slot + 1
+      return ret
+    def fp32_view(tag:int) -> tuple[int,int]:
+      slot = alloc()
+      cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+      relocs = (RKReloc(0, slot, 0, 0, 0xFFFFFFFF), RKReloc(0, input_slot, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag), slot, is_copy=True), relocs))
+      return slot, 0
+    def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False) -> tuple[int,int]:
+      slot = alloc()
+      tasks.append(_emit_where_stage(total, slot, a, b, op, compare=compare))
+      return slot, 0
+    def dependent(a:tuple[int,int], b:tuple[int,int], op:Ops) -> tuple[int,int]:
+      # Repeat the first consumption of comparison masks, matching WHERE and
+      # nested-comparison stability on reset-separated RK3588 submissions.
+      stage(a, b, op)
+      return stage(a, b, op)
+    zero = (_ZERO_SLOT, 0)
+    one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+    two = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 2.0))[0])
+    high, low = fp32_view(_HOST_FP32_HALF_LAYOUT), fp32_view(_HOST_FP32_RESIDUAL_LAYOUT)
+    high_negative = stage(stage(zero, high, Ops.SUB), stage(zero, high, Ops.SUB), Ops.MAX, compare=True)
+    high_positive = stage(stage(high, zero, Ops.SUB), stage(high, zero, Ops.SUB), Ops.MAX, compare=True)
+    low_negative = stage(stage(zero, low, Ops.SUB), stage(zero, low, Ops.SUB), Ops.MAX, compare=True)
+    high_nonzero = dependent(high_negative, high_positive, Ops.MAX)
+    high_zero = dependent(one, high_nonzero, Ops.SUB)
+    residual_negative = dependent(high_zero, low_negative, Ops.MUL)
+    negative = dependent(high_negative, residual_negative, Ops.MAX)
+    doubled_negative = dependent(negative, two, Ops.MUL)
+    sign = dependent(one, doubled_negative, Ops.SUB)
+    absolute_high = dependent(high, sign, Ops.MUL)
+    absolute_low = dependent(low, sign, Ops.MUL)
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, absolute_high[0], 0, 0, 0xFFFFFFFF),
+              RKReloc(0, absolute_low[0], 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_COMBINE_LAYOUT),
+                                       out_slot, is_copy=True), relocs))
+    return tuple(tasks)
+  # WIP reference: direct fp32 input conversion retains only the high fp16
+  # limb. Keep this stable two-stage implementation for native fp16 abs.
+  return (_emit_where_stage(total, scratch, (input_slot, 0), negative_one, Ops.MUL),
+          _emit_where_stage(total, out_slot, (input_slot, 0), (scratch, 0), Ops.MAX))
 
 def _try_softsign_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower x/(1+abs(x)) as four ordered DPU stages."""
@@ -6408,6 +6458,34 @@ def _try_lerp_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   #         _emit_where_stage(total, info.outs[0], (source_slot, 0), (scaled, 0), Ops.ADD,
   #                           broadcast_inputs=broadcasts(source)))
 
+def _try_isclose_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize only tinygrad's full IEEE isclose predicate on the host.
+
+  WIP reference: the native comparison decomposer below can execute this graph,
+  including two-limb fp32 arithmetic, but its many reset-separated compare
+  stages exhaust RK3588's driver reset budget across the 32-case edge matrix.
+  Keep that path intact for future fused comparison tasks.
+  """
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.bool or _reduce_node(sink) is not None: return None
+  value = _unwrap(store.src[1])
+  nodes = value.toposort()
+  if value.op is not Ops.OR: return None
+  float_constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float]
+  if not any(math.isinf(x) and x > 0 for x in float_constants) or \
+     not any(math.isinf(x) and x < 0 for x in float_constants): return None
+  # isclose contains isnan(x) as x!=x and abs(other) as a float WHERE whose
+  # sign branches include -1 and +1. Require both so ordinary composite
+  # comparisons cannot enter this host path.
+  has_nan_check = any(u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0] is u.src[1] and u.src[0].dtype is dtypes.float for u in nodes)
+  has_abs_sign = any(u.op is Ops.WHERE and u.dtype is dtypes.float and
+                     {-1.0, 1.0}.issubset({float(x.arg) for x in u.src[1:] if x.op is Ops.CONST}) for u in nodes)
+  # A scalar `other` folds rtol*abs(other)+atol to one constant (1.001e-5
+  # for other=1), while tensor/tensor keeps the small constant in a MUL.
+  has_tolerance = any(math.isfinite(x) and 0.0 < abs(x) <= 0.011 for x in float_constants)
+  if not has_nan_check or not has_abs_sign or not has_tolerance: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Materialize CMPLT/CMPNE boolean expressions as fp16 0/1 masks, then pack to bool."""
   store = _store_node(sink)
@@ -6434,9 +6512,104 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                    int32_inputs=int32_inputs, broadcast_inputs=broadcast_inputs,
                                    bool_output=bool_output))
 
+  materialized:dict[UOp, tuple[int,int]] = {}
+  comparison_views:dict[int, tuple[int,int]] = {}
+  def temp_index(slot:int, dtype) -> UOp:
+    out_idx = store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+
+  def materialize_data(u:UOp) -> tuple[int,int]|None:
+    """Stage arithmetic comparison operands before lowering the boolean tree.
+
+    This mirrors conv_grok's independent output/channel tiles: every arithmetic
+    producer owns one explicit scratch window and the comparison only consumes
+    direct buffers.  Keep direct INDEX/CONST operands on the old hot path.
+    """
+    nonlocal next_slot
+    u = _unwrap(u)
+    if u.dtype is dtypes.bool: return None
+    if u in materialized: return materialized[u]
+    slot = alloc()
+    def lower_stage(value:UOp, allow_generic=False) -> tuple[RKSubTask, ...]|None:
+      staged = sink.substitute({store:store.replace(src=(temp_index(slot, value.dtype), value))})
+      stage_tasks = None
+      if value.dtype is dtypes.float and value.op is Ops.ADD: stage_tasks = _try_fp32_add_subtasks(staged)
+      elif value.dtype is dtypes.float and value.op is Ops.MUL: stage_tasks = _try_fp32_mul_subtasks(staged)
+      if stage_tasks is None: stage_tasks = _try_abs_subtasks(staged)
+      if stage_tasks is None and value.op is Ops.WHERE: stage_tasks = _try_where_subtasks(staged)
+      if stage_tasks is None and allow_generic: stage_tasks = _try_elementwise_subtasks(staged)
+      return stage_tasks
+
+    # Algebraic simplification can shift the inner x<0 threshold while
+    # retaining abs(x)'s exact x*WHERE(x!=0, WHERE(...,-1,1), 0) boundary.
+    # Recover that boundary and apply abs to one cached direct fp32 operand.
+    loose_abs_base = None
+    if u.op is Ops.MUL:
+      for candidate, sign in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
+        sign_u = _unwrap(sign)
+        if sign_u.op is not Ops.WHERE or len(sign_u.src) != 3: continue
+        condition, signed, zero_branch = sign_u.src
+        signed_u = _unwrap(signed)
+        if _unwrap(candidate).dtype is not dtypes.float or condition.op is not Ops.CMPNE or \
+           signed_u.op is not Ops.WHERE or _unwrap(signed_u.src[0]).op is not Ops.CMPLT: continue
+        values = (_unwrap(signed_u.src[1]), _unwrap(signed_u.src[2]), _unwrap(zero_branch))
+        if all(x.op is Ops.CONST for x in values) and {float(values[0].arg), float(values[1].arg)} == {-1.0, 1.0} and \
+           float(values[2].arg) == 0.0:
+          loose_abs_base = _unwrap(candidate)
+          break
+    stage_tasks = None
+    if loose_abs_base is not None:
+      if loose_abs_base.op in (Ops.INDEX, Ops.CONST): direct_base = loose_abs_base
+      elif (base_arg := materialize_data(loose_abs_base)) is not None:
+        slot = alloc()
+        direct_base = temp_index(base_arg[0], loose_abs_base.dtype)
+      else: direct_base = None
+      if direct_base is not None:
+        zero = UOp.const(direct_base.dtype, 0.0)
+        nonzero = UOp(Ops.CMPNE, dtypes.bool, (direct_base, zero))
+        negative = UOp(Ops.CMPLT, dtypes.bool, (direct_base, zero))
+        sign = UOp(Ops.WHERE, direct_base.dtype, (nonzero, UOp(Ops.WHERE, direct_base.dtype,
+                   (negative, UOp.const(direct_base.dtype, -1.0), UOp.const(direct_base.dtype, 1.0))), zero))
+        stage_tasks = lower_stage(UOp(Ops.MUL, direct_base.dtype, (direct_base, sign)))
+    if stage_tasks is None: stage_tasks = lower_stage(u)
+    if stage_tasks is None:
+      # Rebuild one arithmetic level from cached direct scratch inputs before
+      # using the broad elementwise fallback. This avoids repeatedly lowering
+      # shared isclose operands inside its abs/tolerance expression.
+      replacements:dict[UOp,UOp] = {}
+      for child in u.src:
+        child_u = _unwrap(child)
+        if child_u.dtype is dtypes.bool or child_u.op in (Ops.INDEX, Ops.CONST): continue
+        if (child_arg := materialize_data(child_u)) is None: continue
+        replacements[child] = temp_index(child_arg[0], child_u.dtype)
+      rebuilt = u.substitute(replacements) if replacements else u
+      # The first reserved slot predates every recursively emitted child.
+      # Move the parent output above their complete scratch range so helpers
+      # using max(ProgramInfo.globals)+1 cannot alias a live child temporary.
+      slot = alloc()
+      stage_tasks = lower_stage(rebuilt, allow_generic=True)
+    if stage_tasks is None: return None
+    tasks.extend(stage_tasks)
+    used_slots = [st.task.out_slot for st in stage_tasks] + \
+      [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
+    materialized[u] = (slot, 0)
+    return materialized[u]
+
   def data_arg(u:UOp) -> tuple[tuple[int,int], tuple[int,...], tuple[int,...], tuple[int,...], tuple[int,...]]|None:
     u = _unwrap(u)
-    if (arg := _where_arg(u)) is None: return None
+    if (arg := _where_arg(u)) is None:
+      if (arg := materialize_data(u)) is None: return None
+      if u.dtype is dtypes.float:
+        if arg[0] not in comparison_views:
+          half_slot = alloc()
+          cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+          relocs = (RKReloc(0, half_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, arg[0], 0, 0, 0xFFFFFFFF))
+          tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_HALF_LAYOUT),
+                                             half_slot, is_copy=True), relocs))
+          comparison_views[arg[0]] = (half_slot, 0)
+        arg = comparison_views[arg[0]]
+      return arg, (), (), (), ()
     if u.op is Ops.CONST:
       if isinstance(u.arg, (float, np.floating)) and math.isinf(float(u.arg)):
         normalized = math.copysign(65504.0, float(u.arg))
@@ -12928,6 +13101,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)
   if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)
   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
+  if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

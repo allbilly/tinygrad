@@ -989,14 +989,51 @@ class RockchipProgram(Program['RockchipDevice']):
       fp32_out_temp = None  # (original_out_buf, fp16_temp_buf, n_elements) for fp16→fp32 after NPU
       if task.kind in ("dpu", "dpu_lut") and not task.is_copy:
         total = task.layout[0] if task.kind != "ppu" else task.layout[2]  # n_elements
+        source_counts:dict[int,int] = {}
         # Convert fp32 input buffers to fp16 temp buffers
         for slot in task.fp32_inputs:
           if slot in buf_map and slot != _CONST_SLOT and slot != _ZERO_SLOT:
             src_buf = buf_map[slot]
-            fp16_buf = dev._gpu_alloc(max(total * 2, 4096), 0)
+            source_counts[slot] = source_n = src_buf.size // 4
+            fp16_buf = dev._gpu_alloc(max(source_n * 2, 4096), 0)
             temp.append(fp16_buf)
-            _convert_fp32_to_fp16_buf(src_buf.va_addr, fp16_buf.va_addr, total)
+            _convert_fp32_to_fp16_buf(src_buf.va_addr, fp16_buf.va_addr, source_n)
             buf_map[slot] = fp16_buf  # type: ignore[assignment]
+        for slot in task.int32_inputs:
+          if slot in buf_map and slot != _CONST_SLOT and slot != _ZERO_SLOT:
+            src_buf = buf_map[slot]
+            source_counts[slot] = source_n = src_buf.size // 4
+            fp16_buf = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+            temp.append(fp16_buf)
+            _convert_int32_to_fp16_buf(src_buf.va_addr, fp16_buf.va_addr, source_n)
+            buf_map[slot] = fp16_buf  # type: ignore[assignment]
+        for slot in task.bool_inputs:
+          if slot in buf_map and slot != _CONST_SLOT and slot != _ZERO_SLOT:
+            src_buf = buf_map[slot]
+            source_counts[slot] = source_n = src_buf.size
+            fp16_buf = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+            temp.append(fp16_buf)
+            _convert_bool_to_fp16_buf(src_buf.va_addr, fp16_buf.va_addr, source_n)
+            buf_map[slot] = fp16_buf  # type: ignore[assignment]
+        # Match the multi-task path: comparisons operate on finite fp16
+        # sentinels for infinities so equal infinities subtract to zero.
+        for slot in task.comparison_inputs:
+          if slot in buf_map and slot != _CONST_SLOT and slot != _ZERO_SLOT:
+            src_buf = buf_map[slot]
+            source_counts.setdefault(slot, src_buf.size // 2)
+            source_n = source_counts[slot]
+            sanitized = dev._gpu_alloc(max(source_n * 2, 4096), 0)
+            temp.append(sanitized)
+            _sanitize_fp16_comparison_buf(src_buf.va_addr, sanitized.va_addr, source_n)
+            buf_map[slot] = sanitized  # type: ignore[assignment]
+        for slot in task.broadcast_inputs:
+          if slot in buf_map and slot != _CONST_SLOT and slot != _ZERO_SLOT:
+            src_buf = buf_map[slot]
+            source_n = source_counts.get(slot, src_buf.size // 2)
+            expanded = dev._gpu_alloc(max(total * 2, 4096), 0)
+            temp.append(expanded)
+            _broadcast_fp16_buf(src_buf.va_addr, expanded.va_addr, source_n, total)
+            buf_map[slot] = expanded  # type: ignore[assignment]
         # Redirect fp32 output to fp16 temp buffer
         if task.fp32_output and task.out_slot in buf_map:
           orig_out = buf_map[task.out_slot]
@@ -1481,8 +1518,14 @@ class RockchipProgram(Program['RockchipDevice']):
         def flush_pending() -> None:
           if not pending: return
           if any(st.task.native_int32_input or st.task.native_int32_output for st in pending): dev.reset_npu()
-          self.subtasks = list(pending)
-          self._submit_multi(tuple(ext))
+          if len(pending) == 1:
+            single = pending[0]
+            self.cmds, self.task, self.relocs = list(single.cmds), single.task, list(single.relocs)
+            self.subtasks = None
+            self(*tuple(ext))
+          else:
+            self.subtasks = list(pending)
+            self._submit_multi(tuple(ext))
           pending.clear()
         for st in subtasks:
           task = st.task
@@ -1530,10 +1573,26 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
                  ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds):
+            # A mixed host/NPU chain must reset before the ordinary difference
+            # producer as well as before compare mode. Otherwise that producer
+            # can be skipped and compare reads untouched fp32 scratch bytes.
+            producer = pending.pop() if pending else None
+            dev.reset_npu()
             flush_pending()
+            if producer is not None:
+              pending.append(producer)
+              flush_pending()
             dev.reset_npu()
             pending.append(st)
             flush_pending()
+            if getenv("ROCKCHIP_DEBUG_ISCLOSE"):
+              count = min(total, 8)
+              values = struct.unpack(f"<{count}e", ctypes.string_at(ext[task.out_slot].va_addr, count*2))
+              input_slots = tuple(r.globals_slot for r in st.relocs
+                                  if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, task.out_slot))
+              inputs = tuple((slot, struct.unpack(f"<{count}e", ctypes.string_at(ext[slot].va_addr, count*2)))
+                             for slot in input_slots)
+              print("RK_ISCLOSE_COMPARE", task.out_slot, inputs, values, flush=True)
             dev.reset_npu()
             continue
           # Rejected WIP: mode-transition tracking and eight-task native

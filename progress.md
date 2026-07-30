@@ -7470,6 +7470,93 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — forward `isclose` and raw comparison ABI parity
+
+All unchanged forward-only `isclose` groups now pass:
+
+| Coverage | Result |
+|---|---:|
+| `TestOps.test_isclose` (10 tolerance/value variants) | pass |
+| `TestOps.test_isclose_edge_cases` (32 IEEE pairs/settings) | pass |
+| `TestOps.test_isclose_scalar` | pass |
+| combined official group after final routing | **3 passed in 9.59s** |
+| permanent mixed tolerance/IEEE hardware regression | pass |
+| hardware-free planner/runtime contract | **110/110 in 6.18s** |
+
+### `conv_grok` insight rechecked
+
+`ref/rk3588`'s 217/217 native convolution sweep does not contain an
+`isclose` implementation. Its useful lesson is task ownership:
+
+- BY_YK splits output-space and K-space into independent tasks with explicit
+  windows;
+- multi-row GEMM is bounded by aligned K=384, while larger K uses row
+  serialization;
+- DMA/notch fields saturate at 13 channel groups;
+- a one-entry PC chain is not a substitute for a completed raw task.
+
+That last point exposed an ABI/runtime problem here. The native WIP initially
+compiled `isclose` as 184 reset-separated DPU stages. A pre-compare
+difference submitted through a mixed one-entry chain sometimes did not write
+its destination, so compare read old fp32 scratch bytes as alternating fp16
+lanes. `ROCKCHIP_DEBUG_ISCLOSE=1` showed values such as
+`(14.0, -0.4409, 0.046875, ...)`, which are the two halfwords of adjacent
+fp32 tolerance values, not mathematical comparison results.
+
+The ordered runner now:
+
+1. runs a one-task pending batch through the raw single-task path;
+2. isolates the direct producer immediately before compare mode;
+3. gives raw tasks the same typed ABI preparation as multi-task submission:
+   fp32, int32, and bool conversion, infinity sanitization, then broadcast
+   expansion using the true source length.
+
+This also fixed forward comparison regressions for int32/bool equality and
+`(3,4,5)` versus `(5,)` broadcasting. The unchanged forward
+`cmp_eq/gt/ge/lt/le` groups pass after the parity fix. Gradient-only
+`*_backwards` tests remain intentionally outside scope.
+
+### Native WIP versus active route
+
+The native comparison decomposer now knows how to cache nested fp32
+arithmetic, keep high/x256-residual limbs through abs, and cross an explicit
+fp32-to-fp16 comparison boundary. It passes the ten ordinary `isclose`
+variants, but the 32-case edge matrix eventually aborts in `reset_npu`
+because each separately compiled graph requires too many comparison resets.
+The code is retained as WIP for a future fused compare task.
+
+The active path is deliberately narrow: a strict structural matcher requires
+the full IEEE `isclose` graph (both infinity constants, `x!=x` NaN check,
+float abs-sign WHERE, and a tolerance constant), then uses the backend's
+existing serialized host elementwise task. It does not broaden the generic
+host fallback. Tensor/tensor and scalar-folded tolerance graphs both emit
+exactly one `_HOST_ELEMENTWISE_LAYOUT` task. This is host operator arithmetic
+and is documented honestly; it was selected under the earlier permission to
+use the backend's existing `run_host` model where necessary.
+
+Useful debug sequence:
+
+1. `ROCKCHIP_DEBUG_SINK=1` confirms the full finite/infinite/NaN predicate;
+2. `ROCKCHIP_DEBUG_SUBTASKS=1` should show exactly one serialized task for
+   the active route;
+3. `ROCKCHIP_DEBUG_ISCLOSE=1` prints every native WIP compare output and its
+   direct input buffers if the strict route is temporarily bypassed;
+4. alternating true/false lanes usually mean fp32 bytes were not converted,
+   while correct finite values but wrong `inf==inf` means comparison
+   sanitization was skipped;
+5. validate `1e-7/1e-8/1e-9` versus zero, equal/opposite infinities, and NaN
+   under both `equal_nan` settings before a long official run.
+
+Validation used `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`.
+`pytest-xdist` and Ruff are not installed in `.venv`. Python compilation and
+`git diff --check` pass. Mypy improved from the pre-existing 13 Rockchip
+errors to 12 after the fp16 abs path no longer needed ambiguous typed kwargs.
+No LUT coefficients or two-level LUT schedules changed, so `lut.md` needs no
+new entry.
+
+Continue with `TestOps.test_mean`.
+
 ## 2026-07-30 — normal-fp32 batched dot milestone
 
 The unchanged forward-only `TestOps.test_dot` now passes both
