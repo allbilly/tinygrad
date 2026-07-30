@@ -9375,3 +9375,27 @@ its row buffer index is `flat_index // 65`; this also avoids the existing
 
 No LUT or generic argmax fallback changed. Next forward group:
 `TestOps.test_log_softmax`.
+
+## 2026-07-30 — normal-fp32 log_softmax milestone
+
+| Coverage | Result |
+|---|---:|
+| `TestOps.test_log_softmax` | **1 passed in 11.46s** |
+| `TestOps.test_log_softmax_other_axis` | **1 passed in 7.12s** |
+| hardware-free Rockchip contract | **117/117 in 6.98s** |
+
+The strict softmax stage classifier now also accepts log-softmax's exact
+forms: centered `x-max`, `ln(sum(exp(x-max)))` represented as
+`LOG2(sum(EXP2(...)))*ln(2)`, and the final `x-max-logsum` subtraction. Full
+vectors may place centering in a separate stage, while rowwise schedules use
+the existing maximum producer.
+
+The final subtraction fingerprint additionally requires exactly one
+full-sized input plus one or two equal reduced auxiliary buffers. Full
+contract testing caught and rejected an earlier overly broad version that
+matched ordinary `a-b`; compensated fp32 subtraction remains on its original
+11-DPU-task path. Static reductions again use the serialized fp32 evaluator,
+and scalar log-softmax remains typed constant zero.
+
+No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_normalize`.

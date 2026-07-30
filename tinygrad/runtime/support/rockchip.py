@@ -9121,13 +9121,16 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   add_reductions = [u for u in reductions if u.arg[0] is Ops.ADD]
   max_reductions = [u for u in reductions if u.arg[0] is Ops.MAX]
   exponentials = [u for u in value.toposort() if u.op is Ops.EXP2]
+  logarithms = [u for u in value.toposort() if u.op is Ops.LOG2]
   if len(add_reductions)+len(max_reductions) != len(reductions) or \
      any(u.dtype is not dtypes.float or not u.src[1:] or any(r.src[0].op is not Ops.CONST for r in u.src[1:]) for u in reductions): return None
 
   # The reciprocal rewrite makes the two normalization stages direct FDIVs.
-  signature = (len(add_reductions), len(max_reductions), len(exponentials), value.op)
-  if signature not in ((1, 0, 1, Ops.REDUCE), (0, 1, 1, Ops.EXP2),
-                       (0, 0, 1, Ops.FDIV), (1, 0, 0, Ops.FDIV)): return None
+  signature = (len(add_reductions), len(max_reductions), len(exponentials), len(logarithms), value.op)
+  if signature not in ((1, 0, 1, 0, Ops.REDUCE), (0, 1, 1, 0, Ops.EXP2),
+                       (0, 0, 1, 0, Ops.FDIV), (1, 0, 0, 0, Ops.FDIV),
+                       (1, 0, 1, 1, Ops.MUL), (0, 1, 0, 0, Ops.ADD),
+                       (0, 0, 0, 0, Ops.ADD)): return None
   if value.op is Ops.REDUCE and (value is not add_reductions[0] or _unwrap(value.src[0]) is not exponentials[0]): return None
   if value.op is Ops.EXP2 and value is not exponentials[0]: return None
   if value.op is Ops.FDIV:
@@ -9136,6 +9139,25 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if not exponentials and numerator.op is not Ops.INDEX: return None
     if add_reductions and denominator is not add_reductions[0]: return None
     if not add_reductions and denominator.op is not Ops.INDEX: return None
+  if logarithms:
+    logarithm = logarithms[0]
+    ln2 = next((_unwrap(x) for x in value.src if _unwrap(x).op is Ops.CONST), None)
+    if logarithm not in value.src or _unwrap(logarithm.src[0]) is not add_reductions[0] or \
+       ln2 is None or ln2.dtype is not dtypes.float or not math.isclose(float(ln2.arg), math.log(2.0), rel_tol=1e-12): return None
+  if value.op is Ops.ADD and max_reductions:
+    indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float]
+    minus_ones = [u for u in value.toposort() if u.op is Ops.CONST and u.dtype is dtypes.float and float(u.arg) == -1.0]
+    if len(indexes) != 2 or len(minus_ones) != 1 or max_reductions[0] not in value.toposort(): return None
+  if value.op is Ops.ADD and not reductions:
+    indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float]
+    minus_ones = [u for u in value.toposort() if u.op is Ops.CONST and u.dtype is dtypes.float and float(u.arg) == -1.0]
+    output_total = prod(_shape_of_store(sink))
+    input_totals = [int(index.src[0].src[0].arg) for index in indexes]
+    if len(indexes) not in (2, 3) or len(minus_ones) != 1 or \
+       sum(u.op is Ops.MUL for u in value.toposort()) != len(indexes)-1 or \
+       any(index.src[0].op is not Ops.PARAM for index in indexes): return None
+    if input_totals.count(output_total) != 1 or len(set(total for total in input_totals if total != output_total)) != 1 or \
+       any(total >= output_total for total in input_totals if total != output_total): return None
 
   # EXP2 must be the stable exp(x-max) lowering, including its exact log2(e)
   # and negative-maximum factors. This excludes arbitrary EXP2 reductions.
@@ -9144,8 +9166,13 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
     log2e = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST), None)
     delta = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.ADD), None)
+    direct_centered = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.INDEX), None)
     if log2e is None or log2e.dtype is not dtypes.float or \
-       not math.isclose(float(log2e.arg), math.log2(math.e), rel_tol=1e-12) or delta is None or len(delta.src) != 2: return None
+       not math.isclose(float(log2e.arg), math.log2(math.e), rel_tol=1e-12): return None
+    if delta is None:
+      if not logarithms or direct_centered is None or direct_centered.src[0].op is not Ops.PARAM: return None
+      continue
+    if len(delta.src) != 2: return None
     positive = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.INDEX), None)
     negative = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.MUL), None)
     if positive is None or positive.src[0].op is not Ops.PARAM or negative is None: return None
@@ -9156,7 +9183,7 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if maximum.op is Ops.REDUCE and (maximum not in max_reductions or maximum.arg[0] is not Ops.MAX): return None
 
   allowed = {Ops.SINK, Ops.END, Ops.STORE, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.RANGE,
-             Ops.REDUCE, Ops.EXP2, Ops.MUL, Ops.ADD, Ops.FDIV}
+             Ops.REDUCE, Ops.EXP2, Ops.LOG2, Ops.MUL, Ops.ADD, Ops.FDIV}
   if any(u.op not in allowed for u in sink.toposort()): return None
 
   def expand(u:UOp) -> UOp:

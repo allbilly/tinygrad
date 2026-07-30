@@ -391,6 +391,18 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(subtasks[0].task.layout[1], _HOST_SOFTMAX_ARGMAX_LAYOUT)
       self.assertEqual(subtasks[0].task.layout[3], compact_mapping)
 
+  def test_fp32_log_softmax_stages_use_strict_serialized_tasks(self):
+    for shape, axis in (((45,65), 1), ((45,), 0)):
+      expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").log_softmax(axis)
+      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+      programs = [build_native_program(sink) for sink in sinks]
+      self.assertTrue(all(program is not None for program in programs))
+      for sink, program in zip(sinks, programs):
+        if any(u.op is Ops.LOG2 for u in sink.toposort()):
+          subtasks = program.src[1].src[0].arg
+          self.assertEqual(len(subtasks), 1)
+          self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")

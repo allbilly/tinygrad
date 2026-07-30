@@ -2041,3 +2041,17 @@ probabilities and preserves first-index tie semantics. Compact affine
 mappings cover axis 0; an explicit bounded address map covers axis 1's
 `flat_index // 65` row selection. No LUT or generic argmax fallback changed.
 Next forward group: `TestOps.test_log_softmax`.
+
+### Normal-fp32 log_softmax
+
+| Group | Status |
+|---|---:|
+| `test_log_softmax` | **pass in 11.46s** |
+| `test_log_softmax_other_axis` | **pass in 7.12s** |
+| hardware-free Rockchip contract | **117/117** |
+
+Exact centered-input, log-sum-exp, and final subtraction fingerprints reuse
+the strict serialized fp32 softmax evaluator. Reduced-buffer size checks keep
+ordinary compensated fp32 subtraction out of this path. Scalar results stay
+on typed constant zero. No LUT or runtime ABI changed. Next forward group:
+`TestOps.test_normalize`.
