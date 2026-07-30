@@ -412,6 +412,15 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
       self.assertEqual(subtasks[-1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp32_strided_transposed_convolution_keeps_guarded_cmac(self):
+    for stride in ((2,1), (1,2)):
+      x = Tensor.empty(2,4,4,5, dtype=dtypes.float, device="ROCKCHIP")
+      w = Tensor.empty(4,4,3,3, dtype=dtypes.float, device="ROCKCHIP")
+      program = build_native_program(_get_sink(x.conv_transpose2d(w, stride=stride)))
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
+
   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
     for shape, axis in (((45,65), 1), ((45,), 0)):
       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)

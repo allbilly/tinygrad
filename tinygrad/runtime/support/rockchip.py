@@ -12260,8 +12260,14 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   epilogue = _try_cmac_epilogue(sink, reduce)
   if epilogue is None: return None
   body = _unwrap(reduce.src[0])
+  outer_guard = None
+  if body.op is Ops.WHERE and len(body.src) == 3 and _unwrap(body.src[1]).op is Ops.MUL and \
+     body.src[2].op is Ops.CONST and (body.src[2].arg is Invalid or float(body.src[2].arg) == 0.0):
+    outer_guard, body = body.src[0], _unwrap(body.src[1])
   if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
   sources = tuple(_unwrap(x) for x in body.src)
+  if outer_guard is not None:
+    sources = (UOp(Ops.WHERE, dtypes.float, (outer_guard, sources[0], UOp.const(dtypes.float, 0.0))), sources[1])
   if any(x.op not in (Ops.INDEX, Ops.WHERE) or x.dtype is not dtypes.float for x in sources): return None
   source_indexes = tuple(tuple(u for u in source.toposort()
                                if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM)

@@ -9676,3 +9676,22 @@ for both conv3d groups. No additional code, host boundary, runtime ABI, or
 LUT change was needed.
 
 Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
+
+## 2026-07-30 — advanced/transpose convolution milestone
+
+Four unchanged layout variants (1x1-M4, nested, NHWC, and batched conv2d)
+pass in **8.49s**. All eight transpose-convolution groups pass together in
+**50.33s**, covering 2D/3D, bias, grouping, padding, dilation, asymmetric
+strides, and output padding. The hardware-free Rockchip contract is
+**128/128 in 7.42s**.
+
+The asymmetric-stride transpose2d schedule wraps its usual product in an
+outer validity `WHERE`; the input operand also contains the expected
+stride/modulo mask. `_try_small_fp32_cmac_subtasks` previously required a
+root MUL and rejected both `(2,1)` and `(1,2)` forms. It now recognizes only
+the outer `WHERE(valid, MUL(...), Invalid-or-zero)` form and folds `valid`
+into one zero-masked CMAC operand. All three official strides pass in
+**6.63s**, retaining the small K=36 CMAC materialization.
+
+No large-K geometry or LUT changed. Mypy remains at the exact 12-error
+baseline. Next forward group: `TestOps.test_conv1d`.

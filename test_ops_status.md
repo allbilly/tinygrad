@@ -2212,3 +2212,12 @@ broaden the unproven large-K `conv_grok` geometry. No LUT changed. Contract:
 Six convolution groups pass unchanged in **25.49s**: simple 3x3 with/without
 bias, simple/padded 3D, 16-channel 3x3, and simple 1x1. No code or LUT change
 was needed. Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
+
+### Advanced and transpose convolution
+
+The four 1x1-M4/nested/NHWC/batched groups pass in **8.49s**, and all eight
+transpose-convolution groups pass in **50.33s**. Asymmetric-stride transpose
+graphs now fold their outer validity WHERE into one zero-masked exact fp32
+CMAC operand, keeping K=36 on the established materializer. No large-K path
+or LUT changed. Contract: **128/128**. Next forward group:
+`TestOps.test_conv1d`.
