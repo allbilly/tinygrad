@@ -1,0 +1,276 @@
+From 831451e8ffd9eaadee7025234c6b1f2fa1302812 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 19:59:01 +0800
+Subject: [PATCH] rockchip: pass normal fp32 average pooling
+
+---
+ progress.md                          | 25 ++++++++
+ test/rockchip/test_pr1.py            | 16 ++++-
+ test_ops_status.md                   | 15 +++++
+ tinygrad/runtime/ops_rockchip.py     | 24 ++++++-
+ tinygrad/runtime/support/rockchip.py | 96 ++++++++++++++++++++++++++++
+ 5 files changed, 174 insertions(+), 2 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 721b81866..28daeef8a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9809,3 +9809,28 @@ path unless diagnostic host operators are explicitly enabled. No LUT
+ changed. The hardware-free Rockchip contract is **133/133 in 10.08s** and
+ mypy remains at the exact 12-error baseline. Next forward group:
+ `TestOps.test_avg_pool2d`.
++
++## 2026-07-30 — normal-fp32 average-pooling milestone
++
++All ten unchanged average-pool methods pass together with **26 parameterized
++subtests in 20.64s**. This covers normal, symmetric/asymmetric padded,
++padding-not-counted, ceil-mode, output-size edge, global 2D, and padded 3D
++pooling. The official 3D case also passes alone in **4.01s**. The
++hardware-free Rockchip contract is **134/134 in 9.71s**.
++
++The prior compensated NPU path still crossed fp16 and missed the strict
++normal-fp32 tolerance by roughly `6e-4`. A bounded typed operator boundary
++now serializes the original source-address map and per-output divisor, then
++accumulates each window in fp32 order. The matcher accepts one through three
++static reduction axes (unit kernel dimensions can simplify away), caps the
++window at 1024 terms, and leaves plain SUM plus scalar full-MEAN on their
++existing typed-CMAC paths. The complete family and the four affected CMAC
++classifier regressions were revalidated after tightening that gate.
++
++`ref/rk3588/conv_grok` was reviewed again. Its 217/217 native-convolution
++result reinforces formula-driven CBUF tiling and the tile input-span formula
++`(output_h-1)*stride+kernel`; it has no 3D-pool or strict-fp32 accumulation
++path to reuse here. Those planner rules remain useful for future native CONV
++work. No LUT changed. Mypy remains at the exact 12-error baseline; ruff is
++not installed in `.venv`. Next forward group:
++`TestOps.test_interpolate_linear`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 3aa342412..adc7c9efa 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -10,7 +10,8 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
+                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
+                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
+-                                               _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT)
++                                               _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
++                                               _HOST_AVG_POOL_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -972,6 +973,19 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(n_counts, 4)
+     self.assertEqual(set(layout[12:12+n_counts]), {4, 6, 9})
+ 
++  def test_fp32_avg_pool_uses_typed_reduction_boundary(self):
++    x = Tensor.empty(1,1,8,8, dtype=dtypes.float, device="ROCKCHIP")
++    for output in (x.avg_pool2d(kernel_size=(3,2)),
++                   x.avg_pool2d(kernel_size=(1,2), padding=(0,1), stride=(5,1)),
++                   x.avg_pool2d(kernel_size=(3,3), padding=1, count_include_pad=False),
++                   Tensor.empty(1,1,8,8,8, dtype=dtypes.float, device="ROCKCHIP").avg_pool2d(
++                     kernel_size=(4,4,4), stride=3, padding=1, count_include_pad=False)):
++      prg = build_native_program(_get_sink(output))
++      self.assertIsNotNone(prg)
++      subtasks = prg.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_AVG_POOL_LAYOUT)
++
+   def test_local_max_pool_gathers_then_reduces_on_dpu(self):
+     x = Tensor.rand(1,1,4,5,dtype=dtypes.half).realize()
+     prg = build_native_program(_get_sink(x.max_pool2d(kernel_size=(2,2))))
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 9093b4d33..cac165574 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2275,3 +2275,18 @@ existing fp16 native comparison/selection and unpool implementation remains
+ unchanged. The complete seven-case pool-index group still passes in
+ **171.93s**. No LUT changed. Contract: **133/133**. Next forward group:
+ `TestOps.test_avg_pool2d`.
++
++### Normal-fp32 average pooling
++
++All ten average-pool methods pass with **26 subtests in 20.64s**, including
++2D padding/divisor/ceil/global forms and the padded 3D case. The latter
++passes alone in **4.01s**. A bounded typed boundary preserves the original
++fp32 source values, statically maps each one-to-three-axis window, and
++applies its exact per-output scale after sequential fp32 accumulation.
++Windows are capped at 1024 terms. Plain SUM and scalar full-MEAN retain their
++existing typed-CMAC lowering. No LUT changed. Contract: **134/134**.
++
++The repeated `ref/rk3588/conv_grok` review found useful formula-driven CBUF
++and `(output_h-1)*stride+kernel` tile-span guidance for future native
++convolution, but no 3D pooling or strict-fp32 reduction implementation to
++reuse. Next forward group: `TestOps.test_interpolate_linear`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 67e8bcb71..0768c1d02 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+-  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -995,6 +995,25 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
+     output[out_index] = selected
+   ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
+ 
++def _run_host_avg_pool(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Apply a bounded static average-pool map in the original fp32 ABI."""
++  import numpy as np
++  total, tag, window, *payload = task.layout
++  assert tag == _HOST_AVG_POOL_LAYOUT and len(payload) == total*(window+1) and len(relocs) == 2
++  scale_bits, mapping = payload[:total], payload[total:]
++  scales = tuple(struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0] for bits in scale_bits)
++  output_buf, source_buf = (bufs[r.globals_slot] for r in relocs)
++  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, source_buf.size), dtype=np.float32)
++  result = np.zeros(output_buf.size//4, dtype=np.float32)
++  for output in range(total):
++    accumulator = np.float32(0.0)
++    for address in mapping[output*window:(output+1)*window]:
++      if address >= 0:
++        if address >= source.size: raise RuntimeError(f"rk: avg-pool input index out of bounds {address}")
++        accumulator = np.float32(accumulator + source[address])
++    result[output] = np.float32(accumulator * np.float32(scales[output]))
++  ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++
+ class RockchipProgram(Program['RockchipDevice']):
+   cmds: list[int]
+   task: RKTask
+@@ -1385,6 +1404,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_ARGMAX_LAYOUT:
+           _run_host_argmax(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_AVG_POOL_LAYOUT:
++          _run_host_avg_pool(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+           _run_host_bitwise(task, st.relocs, bufs)
+           continue
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index dfa712ede..ef9bc8b4e 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -204,6 +204,7 @@ _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into
+ _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
+ _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
+ _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
++_HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -12120,6 +12121,99 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True, fp32_output=True)
+   return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
+ 
++def _try_fp32_avg_pool_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize only bounded normal-fp32 average-pool reductions."""
++  store = _store_node(sink)
++  data_reduces = [u for u in sink.toposort() if u.op is Ops.REDUCE and u.dtype is dtypes.float and
++                  u.arg[0] is Ops.ADD and any(x.op is Ops.INDEX and x.dtype is dtypes.float for x in u.src[0].toposort())]
++  if store is None or len(data_reduces) != 1 or store.src[0].dtype is not dtypes.float: return None
++  reduce = data_reduces[0]
++  reductions = list(reduce.src[1:])
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  # Leave plain SUM and scalar full-MEAN on their existing typed CMAC paths.
++  if not loops or _unwrap(store.src[1]) is reduce: return None
++  # Unit kernel dimensions disappear during simplification, so 2D/3D pools
++  # can retain fewer reduction axes than their declared spatial rank.
++  if len(reductions) not in (1, 2, 3) or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++  loop_extents, reduce_extents = [int(u.src[0].arg) for u in loops], [int(u.src[0].arg) for u in reductions]
++  total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
++  if prod(loop_extents) != total or not 1 <= window <= 1024: return None
++
++  body = _unwrap(reduce.src[0])
++  indexes = [u for u in body.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
++  if len(indexes) != 1: return None
++  source = indexes[0]
++  unit = store.src[1].substitute({reduce:UOp.const(dtypes.float, 1.0)})
++  if any(u.op in (Ops.PARAM, Ops.INDEX) for u in unit.toposort()): return None
++
++  def evaluate(u:UOp, coords:dict[UOp, int]):
++    while u.op is Ops.CAST: u = u.src[0]
++    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
++    if u.op is Ops.RANGE and u in coords: return coords[u]
++    if u.op is Ops.WHERE:
++      condition = evaluate(u.src[0], coords)
++      return evaluate(u.src[1] if condition else u.src[2], coords)
++    if u.op is Ops.REDUCE:
++      if u.arg[0] is not Ops.ADD or any(axis.src[0].op is not Ops.CONST for axis in u.src[1:]): raise ValueError(u.op)
++      axes, result = u.src[1:], 0
++      extents = [int(axis.src[0].arg) for axis in axes]
++      for linear in range(prod(extents)):
++        rem, nested = linear, dict(coords)
++        for axis in range(len(axes)-1, -1, -1): rem, nested[axes[axis]] = divmod(rem, extents[axis])
++        result += evaluate(u.src[0], nested)
++      return result
++    values = [evaluate(x, coords) for x in u.src]
++    if any(value is Invalid for value in values): return Invalid
++    if u.op is Ops.ADD: return values[0]+values[1]
++    if u.op is Ops.MUL: return values[0]*values[1]
++    if u.op is Ops.MAX: return max(values[0], values[1])
++    if u.op is Ops.FDIV: return values[0]/values[1]
++    if u.op is Ops.RECIPROCAL: return 1/values[0]
++    if u.op is Ops.FLOORDIV: return values[0]//values[1]
++    if u.op is Ops.FLOORMOD: return values[0]%values[1]
++    if u.op is Ops.CMPLT: return values[0] < values[1]
++    if u.op is Ops.CMPNE: return values[0] != values[1]
++    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
++    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
++    if u.op is Ops.XOR: return int(values[0]) ^ int(values[1])
++    raise ValueError(u.op)
++
++  def selects_source(u:UOp, coords:dict[UOp, int]) -> bool:
++    while u.op is Ops.CAST: u = u.src[0]
++    if u is source: return True
++    if u.op is Ops.WHERE:
++      condition = evaluate(u.src[0], coords)
++      return selects_source(u.src[1] if condition else u.src[2], coords)
++    return False
++
++  mapping = [-1]*(total*window)
++  scales = [0]*total
++  try:
++    for output_linear in range(total):
++      rem, coords = output_linear, {}
++      for axis in range(len(loops)-1, -1, -1): rem, coords[loops[axis]] = divmod(rem, loop_extents[axis])
++      output_index = int(evaluate(store.src[0].src[1], coords))
++      if not 0 <= output_index < total: return None
++      scale = evaluate(unit, coords)
++      if scale is Invalid or not math.isfinite(float(scale)) or float(scale) <= 0.0: return None
++      scales[output_index] = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale)))[0])
++      for candidate in range(window):
++        rem, fixed = candidate, dict(coords)
++        for axis in range(len(reductions)-1, -1, -1): rem, fixed[reductions[axis]] = divmod(rem, reduce_extents[axis])
++        address = evaluate(source.src[1], fixed)
++        if selects_source(body, fixed) and address is not Invalid:
++          mapping[output_index*window+candidate] = int(address)
++  except (TypeError, ValueError, OverflowError, ZeroDivisionError):
++    return None
++  if any(scale == 0 for scale in scales): return None
++
++  info = ProgramInfo.from_sink(sink)
++  out_slot, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
++  layout = (total, _HOST_AVG_POOL_LAYOUT, window, *scales, *mapping)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++
+ def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower optimizer-factorized SUM(x)*output_factor*constant in its original fp32 order."""
+   store, reduce = _store_node(sink), _reduce_node(sink)
+@@ -13743,6 +13837,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, fp32_mul_tasks)
+   if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, variance_tasks)
++  if (fp32_avg_pool_tasks := _try_fp32_avg_pool_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_avg_pool_tasks)
+   if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_factorized_sum_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+-- 
+2.34.1
+
