@@ -204,6 +204,7 @@ _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into
 _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
 _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
 _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
+_HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -12120,6 +12121,99 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True, fp32_output=True)
   return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
 
+def _try_fp32_avg_pool_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize only bounded normal-fp32 average-pool reductions."""
+  store = _store_node(sink)
+  data_reduces = [u for u in sink.toposort() if u.op is Ops.REDUCE and u.dtype is dtypes.float and
+                  u.arg[0] is Ops.ADD and any(x.op is Ops.INDEX and x.dtype is dtypes.float for x in u.src[0].toposort())]
+  if store is None or len(data_reduces) != 1 or store.src[0].dtype is not dtypes.float: return None
+  reduce = data_reduces[0]
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  # Leave plain SUM and scalar full-MEAN on their existing typed CMAC paths.
+  if not loops or _unwrap(store.src[1]) is reduce: return None
+  # Unit kernel dimensions disappear during simplification, so 2D/3D pools
+  # can retain fewer reduction axes than their declared spatial rank.
+  if len(reductions) not in (1, 2, 3) or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  loop_extents, reduce_extents = [int(u.src[0].arg) for u in loops], [int(u.src[0].arg) for u in reductions]
+  total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
+  if prod(loop_extents) != total or not 1 <= window <= 1024: return None
+
+  body = _unwrap(reduce.src[0])
+  indexes = [u for u in body.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
+  if len(indexes) != 1: return None
+  source = indexes[0]
+  unit = store.src[1].substitute({reduce:UOp.const(dtypes.float, 1.0)})
+  if any(u.op in (Ops.PARAM, Ops.INDEX) for u in unit.toposort()): return None
+
+  def evaluate(u:UOp, coords:dict[UOp, int]):
+    while u.op is Ops.CAST: u = u.src[0]
+    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+    if u.op is Ops.RANGE and u in coords: return coords[u]
+    if u.op is Ops.WHERE:
+      condition = evaluate(u.src[0], coords)
+      return evaluate(u.src[1] if condition else u.src[2], coords)
+    if u.op is Ops.REDUCE:
+      if u.arg[0] is not Ops.ADD or any(axis.src[0].op is not Ops.CONST for axis in u.src[1:]): raise ValueError(u.op)
+      axes, result = u.src[1:], 0
+      extents = [int(axis.src[0].arg) for axis in axes]
+      for linear in range(prod(extents)):
+        rem, nested = linear, dict(coords)
+        for axis in range(len(axes)-1, -1, -1): rem, nested[axes[axis]] = divmod(rem, extents[axis])
+        result += evaluate(u.src[0], nested)
+      return result
+    values = [evaluate(x, coords) for x in u.src]
+    if any(value is Invalid for value in values): return Invalid
+    if u.op is Ops.ADD: return values[0]+values[1]
+    if u.op is Ops.MUL: return values[0]*values[1]
+    if u.op is Ops.MAX: return max(values[0], values[1])
+    if u.op is Ops.FDIV: return values[0]/values[1]
+    if u.op is Ops.RECIPROCAL: return 1/values[0]
+    if u.op is Ops.FLOORDIV: return values[0]//values[1]
+    if u.op is Ops.FLOORMOD: return values[0]%values[1]
+    if u.op is Ops.CMPLT: return values[0] < values[1]
+    if u.op is Ops.CMPNE: return values[0] != values[1]
+    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
+    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
+    if u.op is Ops.XOR: return int(values[0]) ^ int(values[1])
+    raise ValueError(u.op)
+
+  def selects_source(u:UOp, coords:dict[UOp, int]) -> bool:
+    while u.op is Ops.CAST: u = u.src[0]
+    if u is source: return True
+    if u.op is Ops.WHERE:
+      condition = evaluate(u.src[0], coords)
+      return selects_source(u.src[1] if condition else u.src[2], coords)
+    return False
+
+  mapping = [-1]*(total*window)
+  scales = [0]*total
+  try:
+    for output_linear in range(total):
+      rem, coords = output_linear, {}
+      for axis in range(len(loops)-1, -1, -1): rem, coords[loops[axis]] = divmod(rem, loop_extents[axis])
+      output_index = int(evaluate(store.src[0].src[1], coords))
+      if not 0 <= output_index < total: return None
+      scale = evaluate(unit, coords)
+      if scale is Invalid or not math.isfinite(float(scale)) or float(scale) <= 0.0: return None
+      scales[output_index] = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale)))[0])
+      for candidate in range(window):
+        rem, fixed = candidate, dict(coords)
+        for axis in range(len(reductions)-1, -1, -1): rem, fixed[reductions[axis]] = divmod(rem, reduce_extents[axis])
+        address = evaluate(source.src[1], fixed)
+        if selects_source(body, fixed) and address is not Invalid:
+          mapping[output_index*window+candidate] = int(address)
+  except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+    return None
+  if any(scale == 0 for scale in scales): return None
+
+  info = ProgramInfo.from_sink(sink)
+  out_slot, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
+  layout = (total, _HOST_AVG_POOL_LAYOUT, window, *scales, *mapping)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+
 def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower optimizer-factorized SUM(x)*output_factor*constant in its original fp32 order."""
   store, reduce = _store_node(sink), _reduce_node(sink)
@@ -13743,6 +13837,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fp32_mul_tasks)
   if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variance_tasks)
+  if (fp32_avg_pool_tasks := _try_fp32_avg_pool_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_avg_pool_tasks)
   if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_factorized_sum_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)

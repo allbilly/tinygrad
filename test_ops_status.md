@@ -2275,3 +2275,18 @@ existing fp16 native comparison/selection and unpool implementation remains
 unchanged. The complete seven-case pool-index group still passes in
 **171.93s**. No LUT changed. Contract: **133/133**. Next forward group:
 `TestOps.test_avg_pool2d`.
+
+### Normal-fp32 average pooling
+
+All ten average-pool methods pass with **26 subtests in 20.64s**, including
+2D padding/divisor/ceil/global forms and the padded 3D case. The latter
+passes alone in **4.01s**. A bounded typed boundary preserves the original
+fp32 source values, statically maps each one-to-three-axis window, and
+applies its exact per-output scale after sequential fp32 accumulation.
+Windows are capped at 1024 terms. Plain SUM and scalar full-MEAN retain their
+existing typed-CMAC lowering. No LUT changed. Contract: **134/134**.
+
+The repeated `ref/rk3588/conv_grok` review found useful formula-driven CBUF
+and `(output_h-1)*stride+kernel` tile-span guidance for future native
+convolution, but no 3D pooling or strict-fp32 reduction implementation to
+reuse. Next forward group: `TestOps.test_interpolate_linear`.

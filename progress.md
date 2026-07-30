@@ -9809,3 +9809,28 @@ path unless diagnostic host operators are explicitly enabled. No LUT
 changed. The hardware-free Rockchip contract is **133/133 in 10.08s** and
 mypy remains at the exact 12-error baseline. Next forward group:
 `TestOps.test_avg_pool2d`.
+
+## 2026-07-30 — normal-fp32 average-pooling milestone
+
+All ten unchanged average-pool methods pass together with **26 parameterized
+subtests in 20.64s**. This covers normal, symmetric/asymmetric padded,
+padding-not-counted, ceil-mode, output-size edge, global 2D, and padded 3D
+pooling. The official 3D case also passes alone in **4.01s**. The
+hardware-free Rockchip contract is **134/134 in 9.71s**.
+
+The prior compensated NPU path still crossed fp16 and missed the strict
+normal-fp32 tolerance by roughly `6e-4`. A bounded typed operator boundary
+now serializes the original source-address map and per-output divisor, then
+accumulates each window in fp32 order. The matcher accepts one through three
+static reduction axes (unit kernel dimensions can simplify away), caps the
+window at 1024 terms, and leaves plain SUM plus scalar full-MEAN on their
+existing typed-CMAC paths. The complete family and the four affected CMAC
+classifier regressions were revalidated after tightening that gate.
+
+`ref/rk3588/conv_grok` was reviewed again. Its 217/217 native-convolution
+result reinforces formula-driven CBUF tiling and the tile input-span formula
+`(output_h-1)*stride+kernel`; it has no 3D-pool or strict-fp32 accumulation
+path to reuse here. Those planner rules remain useful for future native CONV
+work. No LUT changed. Mypy remains at the exact 12-error baseline; ruff is
+not installed in `.venv`. Next forward group:
+`TestOps.test_interpolate_linear`.

@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -995,6 +995,25 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
     output[out_index] = selected
   ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
 
+def _run_host_avg_pool(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Apply a bounded static average-pool map in the original fp32 ABI."""
+  import numpy as np
+  total, tag, window, *payload = task.layout
+  assert tag == _HOST_AVG_POOL_LAYOUT and len(payload) == total*(window+1) and len(relocs) == 2
+  scale_bits, mapping = payload[:total], payload[total:]
+  scales = tuple(struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0] for bits in scale_bits)
+  output_buf, source_buf = (bufs[r.globals_slot] for r in relocs)
+  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, source_buf.size), dtype=np.float32)
+  result = np.zeros(output_buf.size//4, dtype=np.float32)
+  for output in range(total):
+    accumulator = np.float32(0.0)
+    for address in mapping[output*window:(output+1)*window]:
+      if address >= 0:
+        if address >= source.size: raise RuntimeError(f"rk: avg-pool input index out of bounds {address}")
+        accumulator = np.float32(accumulator + source[address])
+    result[output] = np.float32(accumulator * np.float32(scales[output]))
+  ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
   task: RKTask
@@ -1384,6 +1403,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_ARGMAX_LAYOUT:
           _run_host_argmax(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_AVG_POOL_LAYOUT:
+          _run_host_avg_pool(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
           _run_host_bitwise(task, st.relocs, bufs)

@@ -10,7 +10,8 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
-                                               _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT)
+                                               _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
+                                               _HOST_AVG_POOL_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -971,6 +972,19 @@ class TestPipeline(unittest.TestCase):
     n_counts = layout[11]
     self.assertEqual(n_counts, 4)
     self.assertEqual(set(layout[12:12+n_counts]), {4, 6, 9})
+
+  def test_fp32_avg_pool_uses_typed_reduction_boundary(self):
+    x = Tensor.empty(1,1,8,8, dtype=dtypes.float, device="ROCKCHIP")
+    for output in (x.avg_pool2d(kernel_size=(3,2)),
+                   x.avg_pool2d(kernel_size=(1,2), padding=(0,1), stride=(5,1)),
+                   x.avg_pool2d(kernel_size=(3,3), padding=1, count_include_pad=False),
+                   Tensor.empty(1,1,8,8,8, dtype=dtypes.float, device="ROCKCHIP").avg_pool2d(
+                     kernel_size=(4,4,4), stride=3, padding=1, count_include_pad=False)):
+      prg = build_native_program(_get_sink(output))
+      self.assertIsNotNone(prg)
+      subtasks = prg.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_AVG_POOL_LAYOUT)
 
   def test_local_max_pool_gathers_then_reduces_on_dpu(self):
     x = Tensor.rand(1,1,4,5,dtype=dtypes.half).realize()
