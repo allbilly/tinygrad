@@ -1783,3 +1783,11 @@ without changing arithmetic placement. Continue with `test_einsum_trace`.
 
 Permanent three-row RK3588 coverage passes in **37.19 seconds**; the
 hardware-free planner/runtime contract is **102/102**.
+
+### Remaining einsum validation
+
+| Coverage | Result |
+|---|---:|
+| trace, shape-check, arity-check1, arity-check2 | **4 passed in 5.07s** |
+
+All einsum-specific normal-fp32 groups are green. Resume at `test_dot_1d`.

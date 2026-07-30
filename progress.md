@@ -7627,6 +7627,15 @@ Permanent validation:
 
 No LUT change is involved. Continue with `test_einsum_trace`.
 
+## 2026-07-30 — remaining einsum validation
+
+The unchanged normal-fp32 trace, shape-check, and both arity-check groups
+pass: **4 passed in 5.07 seconds**. Combined with the base and ellipsis
+milestones, every einsum-specific `TestOps` group is now green.
+
+No code or LUT change was needed. Resume the forward-only census at
+`TestOps.test_dot_1d`.
+
 ## 2026-07-30 — normal-fp32 stable argsort
 
 The unchanged forward-only `TestOps.test_argsort` now passes its
