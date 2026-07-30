@@ -11,7 +11,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
-                                               _HOST_AVG_POOL_LAYOUT)
+                                               _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -418,6 +418,33 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertTrue(subtasks[0].task.is_copy)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
+  def test_fancy_index_preprocessing_uses_typed_host_boundary(self):
+    x = Tensor.empty(2,5,6,5,3,4, dtype=dtypes.float, device="ROCKCHIP")
+    indices = (Tensor.empty(2,1,1,1,1,1, dtype=dtypes.int, device="ROCKCHIP"),
+               Tensor.empty(1,3,1,1,1,1, dtype=dtypes.int, device="ROCKCHIP"),
+               Tensor.empty(1,1,4,1,1,1, dtype=dtypes.int, device="ROCKCHIP"),
+               Tensor.empty(2,1,1,5,1,1, dtype=dtypes.int, device="ROCKCHIP"),
+               Tensor.empty(1,1,1,1,6,1, dtype=dtypes.int, device="ROCKCHIP"))
+    sinks = [early_simplify(call.src[0]) for call in x[indices].schedule_linear().src if call.src[0].op is Ops.SINK]
+    self.assertEqual(len(sinks), 3)
+    for sink in sinks[:2]:
+      program = build_native_program(sink)
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    reduced = x[indices[0], ..., indices[-1]]
+    reduced_sinks = [early_simplify(call.src[0]) for call in reduced.schedule_linear().src if call.src[0].op is Ops.SINK]
+    self.assertEqual(len(reduced_sinks), 1)
+    reduced_program = build_native_program(reduced_sinks[0])
+    self.assertIsNotNone(reduced_program)
+    self.assertEqual(reduced_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+    injected = x[indices[0], indices[1], None, indices[3], indices[4]]
+    injected_sink = next(early_simplify(call.src[0]) for call in injected.schedule_linear().src if call.src[0].op is Ops.SINK)
+    injected_program = build_native_program(injected_sink)
+    self.assertIsNotNone(injected_program)
+    self.assertEqual(injected_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 
   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")

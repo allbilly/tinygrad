@@ -24,7 +24,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
+  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -551,8 +552,14 @@ def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
 def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
   import numpy as np
-  total, tag, out_dtype_code, n_ranges, *meta = task.layout
-  assert tag == _HOST_ELEMENTWISE_LAYOUT
+  total, tag, out_dtype_code, *layout = task.layout
+  assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+  if tag == _HOST_ELEMENTWISE_LAYOUT:
+    n_ranges, *meta = layout
+    nloops, nreductions = n_ranges, 0
+  else:
+    nloops, nreductions, *meta = layout
+    n_ranges = nloops+nreductions
   extents, cursor = meta[:n_ranges], n_ranges
   out_n = meta[cursor]
   out_code = meta[cursor+1:cursor+1+out_n]
@@ -641,9 +648,79 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
     assert len(stack) == 1
     return stack[0]
 
+  loop_extents, reduction_extents = extents[:nloops], extents[nloops:]
+  if nreductions:
+    reduction_total = int(np.prod(reduction_extents, dtype=np.int64))
+
+    def coordinate_vectors(shape, linear):
+      ret = []
+      for axis in range(len(shape)):
+        stride = int(np.prod(shape[axis+1:], dtype=np.int64))
+        ret.append((linear//stride) % shape[axis])
+      return ret
+
+    def evaluate_vector(code, coords):
+      stack:list = []
+      for pos in range(0, len(code), 4):
+        op, dtype_code, arg0, arg1 = code[pos:pos+4]
+        if op == 0:
+          bits = (arg0 & 0xFFFFFFFF) | ((arg1 & 0xFFFFFFFF) << 32)
+          if dtype_code == 0: value = bool(bits)
+          elif dtype_code == 6: value = struct.unpack('<e', struct.pack('<H', bits & 0xFFFF))[0]
+          elif dtype_code == 7: value = struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
+          elif dtype_code == 12: value = struct.unpack('<d', struct.pack('<Q', bits))[0]
+          else:
+            width = np.dtype(np_dtypes[dtype_code]).itemsize * 8
+            bits &= (1 << width)-1
+            if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
+            value = bits
+          stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
+          continue
+        if op == 1:
+          stack.append(np.asarray(coords[arg0], dtype=np_dtypes[dtype_code]))
+          continue
+        if op == 2:
+          indices = np.asarray(stack.pop(), dtype=np.int64)
+          source = inputs[arg0][dtype_code]
+          gathered = np.zeros(indices.shape, dtype=np_dtypes[dtype_code])
+          valid = (indices >= 0) & (indices < source.size)
+          gathered[valid] = source[indices[valid]]
+          stack.append(gathered)
+          continue
+        args = stack[-arg0:] if arg0 else []
+        if arg0: del stack[-arg0:]
+        if op == 3: value = args[0] + args[1]
+        elif op == 4: value = args[0] * args[1]
+        elif op == 8: value = args[0] < args[1]
+        elif op == 9: value = args[0] != args[1]
+        elif op == 10: value = np.where(args[0], args[1], args[2])
+        elif op == 11: value = args[0] & args[1]
+        elif op == 12: value = args[0] | args[1]
+        elif op == 13: value = args[0] ^ args[1]
+        elif op == 14: value = args[0]
+        else: raise RuntimeError(f"rk: invalid vector fancy-index opcode {op}")
+        stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
+      assert len(stack) == 1
+      return stack[0]
+
+    loop_linear = np.arange(total, dtype=np.int64)
+    loop_coords = coordinate_vectors(loop_extents, loop_linear)
+    output_coords = [*loop_coords, *(np.zeros(total, dtype=np.int64) for _ in reduction_extents)]
+    output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
+    if np.any(output_indices < 0) or np.any(output_indices >= result.size):
+      raise RuntimeError("rk: vector fancy-index output index out of bounds")
+    full_linear = np.arange(total*reduction_total, dtype=np.int64)
+    full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
+    coords = [*coordinate_vectors(loop_extents, full_loop_linear),
+              *coordinate_vectors(reduction_extents, reduction_linear)]
+    values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(total, reduction_total)
+    result[output_indices] = np.add.reduce(values, axis=1, dtype=np.float32)
+    ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+    return
+
   for linear in range(total):
     rem, coords = linear, [0] * n_ranges
-    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
+    for axis in range(nloops-1, -1, -1): rem, coords[axis] = divmod(rem, loop_extents[axis])
     out_index = int(evaluate(out_code, coords))
     if not 0 <= out_index < result.size: raise RuntimeError(f"rk: host elementwise output index out of bounds {out_index}")
     result[out_index] = evaluate(value_code, coords)
@@ -1416,7 +1493,7 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
           _run_host_copysign(task, st.relocs, bufs)
           continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
           _run_host_elementwise(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
@@ -1547,7 +1624,8 @@ class RockchipProgram(Program['RockchipDevice']):
               _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+            elif st.task.is_copy and len(st.task.layout) > 1 and \
+                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
               _run_host_elementwise(st.task, st.relocs, tuple(ext))
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
@@ -1581,7 +1659,8 @@ class RockchipProgram(Program['RockchipDevice']):
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+          if st.task.is_copy and len(st.task.layout) > 1 and \
+             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
             _run_host_elementwise(st.task, st.relocs, tuple(ext))
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
@@ -1835,7 +1914,7 @@ class RockchipProgram(Program['RockchipDevice']):
           if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
             _run_host_copysign(task, st.relocs, tuple(ext))
             continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
             _run_host_elementwise(task, st.relocs, tuple(ext))
             continue
           ct = task.layout[0]

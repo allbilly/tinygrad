@@ -2301,3 +2301,19 @@ this prevents `13/9` from becoming integer `1` and routes the unchanged graph
 to the exact typed conditional-movement evaluator. Pure integer movement is
 unchanged. No runtime ABI or LUT changed. Contract: **135/135**. Next forward
 group: `TestOps.test_cat`.
+
+### Fancy indexing and gather
+
+Ten fancy-index methods and explicit `gather` pass in **194.12s**, including
+dimension injection/collapse, ellipsis, lists/tuples/tensors, invalid cases,
+and infinity/NaN values. Dynamic bounds and negative-index preprocessing now
+uses the typed evaluator instead of lossy generic NPU int/bool arithmetic.
+Fused masked gathers use a new compact, vectorized, bounded
+`_HOST_ELEMENTWISE_REDUCE_LAYOUT` for up to 512 static candidates; the
+largest official form uses 300.
+
+Both a 300-term unrolled expression and scalar interpretation hit the
+roughly four-minute process watchdog. Keeping one bytecode body and
+vectorizing its output×candidate grid makes the 11-case injection group pass
+in **90.82s**. No LUT changed. Contract: **136/136**. Next forward group:
+`TestOps.test_scatter`.

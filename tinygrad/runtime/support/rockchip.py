@@ -205,6 +205,7 @@ _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI 
 _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
 _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
 _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
+_HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -9073,20 +9074,33 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
-def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTask, ...]|None:
+def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|None=None) -> tuple[RKSubTask, ...]|None:
   """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
   store = _store_node(sink)
-  if store is None or _reduce_node(sink) is not None: return None
-  output, val = store.src
+  if store is None: return None
+  if reduction is None:
+    if _reduce_node(sink) is not None: return None
+    output, val = store.src
+  else:
+    reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction: return None
+    output, val = store.src[0], reduction.src[0]
   out_dtype = _host_dtype_code(output.dtype)
   if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
   # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
   # gather/fancy-index kernels whose data INDEX address loads an index tensor.
   if not allow_plain and not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
-  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+  if reduction is None:
+    ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+    nloops, nreductions = len(ranges), 0
+  else:
+    loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+    ranges = [*loops, *reduction.src[1:]]
+    nloops, nreductions = len(loops), len(reduction.src)-1
+    if any(u.src[0].op is not Ops.CONST for u in ranges): return None
   range_ids = {u:i for i,u in enumerate(ranges)}
   extents = tuple(int(u.src[0].arg) for u in ranges)
-  total = prod(extents)
+  total = prod(extents[:nloops])
   if total != prod(_shape_of_store(sink)): return None
   input_slots:list[int] = []
   op_codes = {Ops.ADD:3, Ops.MUL:4, Ops.FDIV:5, Ops.RECIPROCAL:6, Ops.MAX:7,
@@ -9128,8 +9142,12 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTa
   value_code:list[int] = []
   if not emit(output.src[1], out_code) or not emit(val, value_code): return None
   out_slot = ProgramInfo.from_sink(sink).outs[0]
-  layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
-            len(out_code), *out_code, len(value_code), *value_code)
+  if reduction is None:
+    layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
+              len(out_code), *out_code, len(value_code), *value_code)
+  else:
+    layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions, *extents,
+              len(out_code), *out_code, len(value_code), *value_code)
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
@@ -9168,6 +9186,43 @@ def _try_conditional_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
   if not inputs or len({u.src[0].buf_uop.arg.slot for u in inputs}) != 1: return None
   if not any(any(x.op is Ops.WHERE for x in u.src[1].toposort()) for u in inputs): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
+def _try_fancy_index_preprocess_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve typed bounds/negative-index preprocessing for multi-index gathers."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype not in (dtypes.bool, dtypes.int): return None
+  value = _unwrap(store.src[1])
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and
+            u.dtype in (dtypes.bool, dtypes.int)]
+  if len({u.src[0].buf_uop.arg.slot for u in inputs}) < 2: return None
+  ops = {u.op for u in value.toposort()}
+  if not {Ops.WHERE, Ops.CMPLT}.issubset(ops): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
+def _try_fancy_index_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Unroll only bounded masked ADD reductions fused into multi-index gathers."""
+  store = _store_node(sink)
+  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
+  reduce = reductions[0]
+  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or not reduce.src[1:] or \
+     any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]): return None
+  extents = [int(axis.src[0].arg) for axis in reduce.src[1:]]
+  if prod(extents) > 512: return None
+  inputs = [u for u in reduce.src[0].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  input_dtypes = {u.dtype for u in inputs}
+  if dtypes.float not in input_dtypes or dtypes.int not in input_dtypes or \
+     len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) < 2: return None
+  if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
+
+  # WIP reference: the initial implementation expanded every reduction term
+  # into one giant elementwise expression. A 300-candidate injected-dimension
+  # gather ran for minutes and aborted inside NumPy scalar casting.
+  # terms = [reduce.src[0].substitute(fixed) for fixed in ...]
+  # expanded = functools.reduce(lambda a, b: UOp(Ops.ADD, dtypes.float, (a, b)), terms)
+  # return _try_elementwise_host_subtasks(sink.substitute(
+  #   {store:store.replace(src=(store.src[0], expanded))}), allow_plain=True)
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
 
 def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
@@ -13794,6 +13849,10 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
   if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, logcumsumexp_tasks)
+  if (fancy_index_tasks := _try_fancy_index_preprocess_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fancy_index_tasks)
+  if (fancy_index_reduce_tasks := _try_fancy_index_reduction_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fancy_index_reduce_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

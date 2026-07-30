@@ -9854,3 +9854,33 @@ and cast semantics. Pure integer movement remains on the compact path.
 
 No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_cat`.
+
+## 2026-07-30 — fancy-index and gather milestone
+
+Ten unchanged fancy-index methods plus explicit `gather` pass in **194.12s**
+across separate invocations. Coverage includes infinity/NaN values,
+dimension collapse/injection, mixed ellipsis and slices, tensor/list/tuple
+indices, invalid-index errors, and all gather dimensions. The largest
+no-collapse and injected-dimension groups pass in **39.62s** and **90.82s**.
+The hardware-free Rockchip contract is **136/136 in 10.18s**.
+
+The first multi-index gather originally produced almost all zeros because
+its dynamic negative-index/bounds preprocessing crossed generic NPU int/bool
+arithmetic. Those multi-input preprocessing kernels now use the existing
+typed evaluator. Some injected/mixed forms instead fuse a masked ADD
+reduction over up to 300 candidate coordinates. A new bounded
+`_HOST_ELEMENTWISE_REDUCE_LAYOUT` keeps the elementwise body and static loop
+and reduction axes compact, then vectorizes the candidate grid and performs
+one fp32 ADD reduction per output.
+
+Two rejected approaches are retained as debugging guidance. Expanding all
+300 candidates into one bytecode expression and interpreting the compact
+body one scalar at a time both hit the roughly four-minute process watchdog
+inside repeated NumPy scalar casts. Vectorization reduced the full
+11-subcase injection group to 90.82s without broadening beyond a masked
+multi-index fp32 ADD signature capped at 512 candidates.
+
+This milestone adds one runtime ABI tag but changes no LUT. Mypy remains at
+the exact 12-error baseline. The adjacent explicit scatter schedule is a
+different unsupported-WHERE signature. Next forward group:
+`TestOps.test_scatter`.
