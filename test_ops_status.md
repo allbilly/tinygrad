@@ -2221,3 +2221,9 @@ graphs now fold their outer validity WHERE into one zero-masked exact fp32
 CMAC operand, keeping K=36 on the established materializer. No large-K path
 or LUT changed. Contract: **128/128**. Next forward group:
 `TestOps.test_conv1d`.
+
+### Conv1d
+
+Four conv1d groups pass unchanged with **17 subtests in 22.24s**, including
+general, padded, strided, and asymmetric-padding cases. No code or LUT change
+was needed. Next forward group: `TestOps.test_conv2d`.

@@ -9695,3 +9695,12 @@ into one zero-masked CMAC operand. All three official strides pass in
 
 No large-K geometry or LUT changed. Mypy remains at the exact 12-error
 baseline. Next forward group: `TestOps.test_conv1d`.
+
+## 2026-07-30 — conv1d validation
+
+All four unchanged conv1d groups pass with **17 parameterized subtests in
+22.24s**, covering the general shape matrix, simple padding, simple stride,
+and asymmetric padding. No code, host boundary, runtime ABI, large-K
+geometry, or LUT change was needed.
+
+Next forward group: `TestOps.test_conv2d`.
