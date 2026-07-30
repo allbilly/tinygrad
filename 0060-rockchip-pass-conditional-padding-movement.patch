@@ -1,0 +1,108 @@
+From 37b43ca779f835e10c96d0e160fc158640f5f69d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:34:35 +0800
+Subject: [PATCH] rockchip: pass conditional padding movement
+
+---
+ progress.md                          | 18 ++++++++++++++++++
+ test/rockchip/test_pr1.py            | 10 ++++++++++
+ test_ops_status.md                   |  8 ++++++++
+ tinygrad/runtime/support/rockchip.py | 12 ++++++++++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 2f7ac6cfc..7db2b461c 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9617,3 +9617,21 @@ shapes/start-after-end, expected index errors, and chained double slices.
+ 
+ No code, host boundary, runtime ABI, or LUT change was needed. Next forward
+ group: `TestOps.test_pad`.
++
++## 2026-07-30 — padding milestone
++
++All six unchanged padding groups pass in **23.94s** across three invocations:
++constant/cropped padding, reflect, replicate, circular, pad-then-reshape, and
++pad-then-slice. Valid cases and each expected argument/domain error are
++covered. The hardware-free Rockchip contract is **126/126 in 7.15s**.
++
++Reflect and replicate lowering encode their source address with nested
++integer `WHERE` expressions. The old movement matcher rejected that form and
++the generic planner stopped at `unsupported_op:Ops.WHERE`.
++`_try_conditional_movement_host_subtasks` now recognizes only reduction-free,
++single-source graphs where a data-load address itself contains `WHERE`, then
++uses the existing typed serialized evaluator for exact mapped movement.
++Constant, circular, reshape, and slice padding retain their prior paths.
++
++No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
++Next forward group: `TestOps.test_stack_slice`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 141413dd7..fa2995c61 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -388,6 +388,16 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(subtasks[0].task.is_copy)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_conditional_movement_uses_exact_host_boundary(self):
++    for mode in ("reflect", "replicate"):
++      expression = Tensor.empty(1,1,5,5, dtype=dtypes.float, device="ROCKCHIP").pad((0,2,3,2), mode=mode)
++      program = build_native_program(_get_sink(expression))
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertTrue(subtasks[0].task.is_copy)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
+     for shape, axis in (((45,65), 1), ((45,), 0)):
+       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 35705671e..ab46b2db7 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2181,3 +2181,11 @@ Fifteen consecutive slice groups pass unchanged in **16.71s**, including
+ positive/negative strides, empty and out-of-bounds ranges, integer/constant
+ tensor indices, `None`, ellipsis, error checks, and double slicing. No code
+ or LUT change was needed. Next forward group: `TestOps.test_pad`.
++
++### Padding
++
++Six padding groups pass in **23.94s**: constant/cropped, reflect, replicate,
++circular, reshape, and sliced padding. Conditional-address reflect/replicate
++movement now uses one strict typed host task when the single source data-load
++index contains `WHERE`; other padding paths are unchanged. No LUT changed.
++Contract: **126/126**. Next forward group: `TestOps.test_stack_slice`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index c93a3f037..3a7ee6517 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9157,6 +9157,16 @@ def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if Ops.FDIV not in ops and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_conditional_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize reflected/replicated movement graphs whose source address contains a WHERE."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None: return None
++  value = _unwrap(store.src[1])
++  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++  if not inputs or len({u.src[0].buf_uop.arg.slot for u in inputs}) != 1: return None
++  if not any(any(x.op is Ops.WHERE for x in u.src[1].toposort()) for u in inputs): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
+   store = _store_node(sink)
+@@ -13621,6 +13631,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (one_hot_tasks := _try_one_hot_subtasks(sink)) is not None: return build_native_program_multi(sink, one_hot_tasks)
+   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
+   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
++  if (conditional_movement_tasks := _try_conditional_movement_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, conditional_movement_tasks)
+   # WIP: only valid when the producer was the fused one-dimensional long
+   # scan; multidimensional cumprod uses the same physical helper shape.
+   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
+-- 
+2.34.1
+
