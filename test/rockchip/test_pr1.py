@@ -7,7 +7,8 @@ from tinygrad.codegen import early_simplify
 from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
 from tinygrad.codegen import pm_to_program
 from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
-                                               build_native_program, RKPlan, RKSubTask, _HOST_FP32_COMBINE_LAYOUT)
+                                               build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
+                                               _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipRenderer
 from tinygrad.helpers import Target
 
@@ -375,6 +376,23 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 25)
     self.assertEqual(sum(task.task.is_copy for task in subtasks), 3)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
+  def test_fp32_all_uses_both_nonzero_limbs(self):
+    a = Tensor.empty(3,4,5,6, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a.all()))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy and len(task.task.layout) == 2]
+    self.assertIn(_HOST_FP32_HALF_LAYOUT, layouts)
+    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, layouts)
+    self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 1)
+
+  def test_large_fp32_fill_uses_tiled_npu_boundary(self):
+    program = build_native_program(_get_sink(Tensor.ones(2**19, dtype=dtypes.float, device="ROCKCHIP")))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(sum(not task.task.is_copy for task in subtasks), 2)
+    self.assertEqual(sum(task.task.is_copy and task.task.layout[1] == _HOST_HALF_FP32_LAYOUT for task in subtasks), 2)
 
   def test_fp32_acos_uses_specialized_lut_boundary(self):
     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))

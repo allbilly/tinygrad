@@ -23,7 +23,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
-  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT,
+  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
@@ -107,6 +107,13 @@ def _run_host_fp32_combine(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...]
     count = min(total, 32)
     print("RK_FP32_COMBINE", "high", high[:count], "low256", low[:count], "result", result[:count])
   ctypes.memmove(output.va_addr, result.ctypes.data, total*4)  # type: ignore[arg-type]
+
+def _run_host_half_fp32(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Widen an NPU-produced fp16 tile into an fp32 ABI buffer without operator arithmetic."""
+  total, tag = task.layout
+  assert tag == _HOST_HALF_FP32_LAYOUT and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  _convert_fp16_to_fp32_buf(source.va_addr, output.va_addr+task.out_offset, total)
 
 def _convert_bool_to_fp16_buf(src, dst, n):
   import numpy as np
@@ -1192,6 +1199,9 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
           _run_host_bool_half(task, st.relocs, bufs)
           continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
+          _run_host_half_fp32(task, st.relocs, bufs)
+          continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
           _run_host_static_select_half(task, st.relocs, bufs)
           continue
@@ -1409,6 +1419,8 @@ class RockchipProgram(Program['RockchipDevice']):
               _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
             elif len(task.layout) > 1 and task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
               _run_host_fp32_combine(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
+              _run_host_half_fp32(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
