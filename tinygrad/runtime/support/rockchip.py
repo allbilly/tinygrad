@@ -11573,6 +11573,8 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
      reduce.arg[0] is not Ops.ADD: return None
   val = _unwrap(store.src[1])
+  final_sqrt = val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1
+  if final_sqrt: val = _unwrap(val.src[0])
   if val.op is not Ops.MUL or len(val.src) != 2: return None
   scale, reduced = None, None
   for lhs, rhs in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
@@ -11623,7 +11625,7 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def mapping(aff:tuple[dict[int,int],int], ids:tuple[int,...]) -> tuple[int,...]:
     return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
   scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
-  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), *extents, scale_bits,
+  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt), *extents, scale_bits,
             *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
   info = ProgramInfo.from_sink(sink)
   slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)

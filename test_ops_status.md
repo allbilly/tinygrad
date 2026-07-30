@@ -1979,3 +1979,20 @@ A rejected native prototype used 114 tasks and returned NaN. It also exposed
 and fixed two-byte scratch underallocation for four-byte
 `_HOST_FP32_COMBINE_LAYOUT` writes. No LUT changed. Next forward group:
 `TestOps.test_std`.
+
+### Normal-fp32 standard deviation
+
+| Group | Status |
+|---|---:|
+| `test_std` | pass |
+| `test_std_axis` | pass |
+| `test_std_zero_in_axis` | pass |
+| `test_std_one_in_axis` | pass |
+| `test_std_keepdim` | pass |
+| combined official run | **5 passed in 101.51s** |
+| hardware-free Rockchip contract | **113/113** |
+
+The strict variance task now carries a `final_sqrt` bit because tinygrad
+fuses `SQRT` around the same centered-square reduction. All variance gates
+and affine mappings remain unchanged; runtime applies fp32 sqrt only for the
+std form. No LUT changed. Next forward group: `TestOps.test_std_mean`.

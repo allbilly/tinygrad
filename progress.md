@@ -9257,3 +9257,28 @@ commented as WIP reference.
 
 No LUT coefficient or two-task LUT schedule changed. The next forward group
 is `TestOps.test_std`.
+
+## 2026-07-30 — normal-fp32 standard deviation milestone
+
+All unchanged standard-deviation groups pass:
+
+| Coverage | Result |
+|---|---:|
+| `TestOps.test_std` | **1 passed in 28.57s** |
+| `TestOps.test_std_axis` | **1 passed in 42.28s** |
+| zero-axis + one-axis + keepdim | **3 passed in 37.50s** |
+| combined five official groups | **5 passed in 101.51s** |
+| hardware-free Rockchip contract | **113/113 in 6.38s** |
+
+Tinygrad fuses `SQRT` around the centered-square variance graph instead of
+scheduling a separate square-root kernel. The strict variance serializer now
+records a `final_sqrt` bit immediately after its LOOP/REDUCE counts. Runtime
+computes the same fp32 variance row and applies fp32 square root only when
+that bit is set. Permanent classifier coverage distinguishes variance
+(`final_sqrt=0`) from std (`final_sqrt=1`).
+
+The existing strict variance topology gates, affine bounds, correction
+handling, and K=875 row workaround are unchanged. Empty and invalid-degree
+std cases continue through constant NaN or positive-infinity semantics and
+retain their expected NumPy warnings. No LUT coefficient or two-task LUT
+schedule changed. Next forward group: `TestOps.test_std_mean`.

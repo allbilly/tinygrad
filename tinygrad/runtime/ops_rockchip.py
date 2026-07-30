@@ -652,7 +652,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
 def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
   import numpy as np
-  output_total, tag, nloops, nreductions, *meta = task.layout
+  output_total, tag, nloops, nreductions, final_sqrt, *meta = task.layout
   assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
   naxes, cursor = nloops+nreductions, 0
   extents = tuple(meta[cursor:cursor+naxes])
@@ -700,7 +700,8 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
       # full operator, so recompute its row mean from the original fp32 values.
       # delta = np.float32(data[data_index]-mean[mean_index])
       # accumulator = np.float32(accumulator + np.float32(delta*delta))
-      result[output_index] = np.var(values, dtype=np.float32, ddof=correction)
+      variance = np.var(values, dtype=np.float32, ddof=correction)
+      result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
