@@ -9399,3 +9399,27 @@ and scalar log-softmax remains typed constant zero.
 
 No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_normalize`.
+
+## 2026-07-30 — normal-fp32 normalize milestone
+
+The unchanged seven-case `TestOps.test_normalize` group passes in **11.27s**,
+covering p norms `2, 1, 3, 0, -1`, axes 0/1/2, and rank 2/3. The
+hardware-free Rockchip contract is **118/118 in 6.78s**.
+
+`_try_normalize_norm_host_subtasks` strictly recognizes the normalize
+denominator's fp32 `MAX(p_norm, 1e-12)` topology. Its measured signatures
+cover squared-sum/sqrt, absolute sum, cubic LOG2/EXP2 power, nonzero count,
+and reciprocal absolute sum. Each requires one static ADD reduction, one
+direct fp32 source, exactly one CMPNE, the epsilon constant, and only the
+bounded p-norm opcode family. Static reduction expansion reuses the serialized
+typed evaluator.
+
+The first denominator-only run still missed 15/2,925 p=2 outputs, with maximum
+relative error `0.00120325`; the remaining final division had rounded through
+fp16 NPU arithmetic. The strict output stage now requires
+`full_size_fp32_input / smaller_broadcast_norm`, equal output/input size, a
+positive proper-divisor norm buffer, and no other arithmetic. It preserves
+fp32 division without enabling general host division.
+
+No LUT or new runtime ABI changed. Mypy remains at the exact 12-error
+baseline. Next forward group: `TestOps.test_logsumexp`.

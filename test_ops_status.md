@@ -2055,3 +2055,15 @@ the strict serialized fp32 softmax evaluator. Reduced-buffer size checks keep
 ordinary compensated fp32 subtraction out of this path. Scalar results stay
 on typed constant zero. No LUT or runtime ABI changed. Next forward group:
 `TestOps.test_normalize`.
+
+### Normal-fp32 normalize
+
+| Group | Status |
+|---|---:|
+| `test_normalize` (seven p/axis cases) | **pass in 11.27s** |
+| hardware-free Rockchip contract | **118/118** |
+
+Exact p-norm denominator fingerprints for p=`2,1,3,0,-1` use the serialized
+fp32 evaluator. The final full-input/smaller-broadcast-norm division also
+stays fp32; leaving it on DPU caused 15 tolerance misses. No LUT or new
+runtime ABI changed. Next forward group: `TestOps.test_logsumexp`.
