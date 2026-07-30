@@ -1,0 +1,49 @@
+From 8b5d35a7d996a1728682728de5a0219d4b9bd2e8 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 15:09:09 +0800
+Subject: [PATCH] docs: record remaining einsum validation
+
+---
+ progress.md        | 9 +++++++++
+ test_ops_status.md | 8 ++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index a45715e15..60f83e47e 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7627,6 +7627,15 @@ Permanent validation:
+ 
+ No LUT change is involved. Continue with `test_einsum_trace`.
+ 
++## 2026-07-30 — remaining einsum validation
++
++The unchanged normal-fp32 trace, shape-check, and both arity-check groups
++pass: **4 passed in 5.07 seconds**. Combined with the base and ellipsis
++milestones, every einsum-specific `TestOps` group is now green.
++
++No code or LUT change was needed. Resume the forward-only census at
++`TestOps.test_dot_1d`.
++
+ ## 2026-07-30 — normal-fp32 stable argsort
+ 
+ The unchanged forward-only `TestOps.test_argsort` now passes its
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 96400b622..5f3f6399a 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1783,3 +1783,11 @@ without changing arithmetic placement. Continue with `test_einsum_trace`.
+ 
+ Permanent three-row RK3588 coverage passes in **37.19 seconds**; the
+ hardware-free planner/runtime contract is **102/102**.
++
++### Remaining einsum validation
++
++| Coverage | Result |
++|---|---:|
++| trace, shape-check, arity-check1, arity-check2 | **4 passed in 5.07s** |
++
++All einsum-specific normal-fp32 groups are green. Resume at `test_dot_1d`.
+-- 
+2.34.1
+
