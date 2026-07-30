@@ -2206,3 +2206,9 @@ epilogues consume typed accumulator scratch through the strict serialized
 fp32 evaluator, now supported by the mixed-CMAC dispatcher. This does not
 broaden the unproven large-K `conv_grok` geometry. No LUT changed. Contract:
 **127/127**. Next forward group: `TestOps.test_simple_conv2d`.
+
+### Basic convolution validation
+
+Six convolution groups pass unchanged in **25.49s**: simple 3x3 with/without
+bias, simple/padded 3D, 16-channel 3x3, and simple 1x1. No code or LUT change
+was needed. Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.

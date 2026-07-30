@@ -9666,3 +9666,13 @@ This stays within the small proven CMAC geometry: it does not enable the
 large-K multirow form that `allbilly/rk3588` `conv_grok` never demonstrated
 and that local K=875 probing corrupted. No LUT changed. Mypy remains at the
 exact 12-error baseline. Next forward group: `TestOps.test_simple_conv2d`.
+
+## 2026-07-30 — basic convolution validation
+
+Six unchanged convolution groups pass in **25.49s** across five invocations:
+simple 3x3 conv2d with and without bias, simple and padded conv3d, the
+16-channel conv2d case, and simple 1x1 conv2d. The slow-test gate was enabled
+for both conv3d groups. No additional code, host boundary, runtime ABI, or
+LUT change was needed.
+
+Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
