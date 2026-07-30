@@ -1,0 +1,44 @@
+From c802c27678b40003c030a94da0bd4dc9529d9d59 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:28:54 +0800
+Subject: [PATCH] docs: record partial broadcast validation
+
+---
+ progress.md        | 9 +++++++++
+ test_ops_status.md | 6 ++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 9a9a53ef0..5ab1b28cd 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9597,3 +9597,12 @@ covering `(45,65)/(45,1)` and `(45,65)/scalar`. No code, host boundary,
+ runtime ABI, or LUT change was needed.
+ 
+ Next forward group: `TestOps.test_broadcast_partial`.
++
++## 2026-07-30 — partial-broadcast validation
++
++All twenty unchanged `TestOps.test_broadcast_partial` subtests pass in
++**56.81s**, covering add/subtract/multiply/divide/power across large rank-4,
++rank-5, row-to-matrix, and column-to-matrix layouts. No additional code,
++host boundary, runtime ABI, or LUT change was needed.
++
++Next forward group: `TestOps.test_slice_in_bounds_1dim`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index a0ac85631..637242ea1 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2168,3 +2168,9 @@ No LUT changed. Contract: **125/125**. Next forward group:
+ `TestOps.test_broadcast_simple`: **pass in 3.11s** unchanged for column and
+ scalar division. No code or LUT change was needed. Next forward group:
+ `TestOps.test_broadcast_partial`.
++
++### Partial broadcasting
++
++`TestOps.test_broadcast_partial`: **20 subtests pass in 56.81s** unchanged
++across all five arithmetic families and four layout pairs. No code or LUT
++change was needed. Next forward group: `TestOps.test_slice_in_bounds_1dim`.
+-- 
+2.34.1
+
