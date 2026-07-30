@@ -1,0 +1,43 @@
+From 233add550258f3ecb1247e488d0b1ae641e1be4c Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:27:19 +0800
+Subject: [PATCH] docs: record simple broadcast validation
+
+---
+ progress.md        | 8 ++++++++
+ test_ops_status.md | 6 ++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 815f29ad4..9a9a53ef0 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9589,3 +9589,11 @@ NPU limb path. The final opcode gate preserves add/subtract/multiply on their
+ existing NPU implementations. No LUT or runtime ABI changed. Mypy remains at
+ the exact 12-error baseline. Next forward group:
+ `TestOps.test_broadcast_simple`.
++
++## 2026-07-30 — simple-broadcast validation
++
++The unchanged `TestOps.test_broadcast_simple` group passes in **3.11s**,
++covering `(45,65)/(45,1)` and `(45,65)/scalar`. No code, host boundary,
++runtime ABI, or LUT change was needed.
++
++Next forward group: `TestOps.test_broadcast_partial`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 4d52e32fe..a0ac85631 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2162,3 +2162,9 @@ rank-5 division tolerance misses and both rejected power graphs while
+ preserving the established NPU affine-limb paths for add/subtract/multiply.
+ No LUT changed. Contract: **125/125**. Next forward group:
+ `TestOps.test_broadcast_simple`.
++
++### Simple broadcasting
++
++`TestOps.test_broadcast_simple`: **pass in 3.11s** unchanged for column and
++scalar division. No code or LUT change was needed. Next forward group:
++`TestOps.test_broadcast_partial`.
+-- 
+2.34.1
+
