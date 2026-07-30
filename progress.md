@@ -9635,3 +9635,12 @@ Constant, circular, reshape, and slice padding retain their prior paths.
 
 No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_stack_slice`.
+
+## 2026-07-30 — movement/view validation milestone
+
+Fifteen unchanged movement and view groups pass in **14.84s** across three
+invocations: stack-then-slice, transpose, permute, reshape, view, flip,
+squeeze/unsqueeze, flatten/unflatten, diag/diagonal, roll, detach, and
+expand. No code, host boundary, runtime ABI, or LUT change was needed.
+
+Next forward group: `TestOps.test_sd_big_conv`.

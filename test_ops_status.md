@@ -2189,3 +2189,10 @@ circular, reshape, and sliced padding. Conditional-address reflect/replicate
 movement now uses one strict typed host task when the single source data-load
 index contains `WHERE`; other padding paths are unchanged. No LUT changed.
 Contract: **126/126**. Next forward group: `TestOps.test_stack_slice`.
+
+### Movement and views
+
+Fifteen movement/view groups pass unchanged in **14.84s**, covering stacked
+slicing through expand, including transpose/permute, reshape/view,
+flip/roll, dimension edits, diagonal operations, and detach. No code or LUT
+change was needed. Next forward group: `TestOps.test_sd_big_conv`.
