@@ -1,0 +1,45 @@
+From 4e6c42cd7a66c54f89993565e7c6a9ee6bc26a8e Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:32:00 +0800
+Subject: [PATCH] docs: record empty std_mean validation
+
+---
+ progress.md        | 10 ++++++++++
+ test_ops_status.md |  6 ++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 8dd6fc152..5e1b5b0d6 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9312,3 +9312,13 @@ limited to the approved strict variance/std_mean operator family. No LUT or
+ two-NPU-task LUT change was needed.
+ 
+ Next forward group: `TestOps.test_std_mean_loaded_nan`.
++
++## 2026-07-30 — empty-dimension std_mean validation
++
++The unchanged `TestOps.test_std_mean_loaded_nan` group passes in **3.23s**.
++Its empty reduction simplifies before the fused std_mean matcher and uses the
++existing typed NaN path. The runtime reports the same non-failing fp16-to-fp32
++invalid-cast warning already seen in empty reduction coverage. No code, host
++operator boundary, or LUT changed.
++
++Next forward group: `TestOps.test_softmax`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 71d1f3064..62d15ce51 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2012,3 +2012,9 @@ the two-element selector, normalization, affine bounds, and selector
+ independence. Runtime writes fp32 std and mean from the same gathered source
+ row, retaining the K=875 multi-row workaround. No LUT changed. Next forward
+ group: `TestOps.test_std_mean_loaded_nan`.
++
++### Empty-dimension std_mean
++
++`TestOps.test_std_mean_loaded_nan`: **pass in 3.23s**. The graph simplifies to
++the existing typed NaN path, so no code or LUT change was required. Next
++forward group: `TestOps.test_softmax`.
+-- 
+2.34.1
+
