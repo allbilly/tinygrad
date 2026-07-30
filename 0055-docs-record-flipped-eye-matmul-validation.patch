@@ -1,0 +1,43 @@
+From d134eb1b8bd6b09fedd7ac1093d68c956132f6c5 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:22:50 +0800
+Subject: [PATCH] docs: record flipped eye matmul validation
+
+---
+ progress.md        | 8 ++++++++
+ test_ops_status.md | 6 ++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 411867f59..38361c096 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9559,3 +9559,11 @@ unchanged `rtol=0.001` in 31/2925 lanes. A strict matcher for only the exact
+ canonical topology therefore evaluates it inside the existing serialized
+ fp32 boundary. No LUT or runtime ABI changed. Mypy remains at the exact
+ 12-error baseline. Next forward group: `TestOps.test_flip_eye_crash`.
++
++## 2026-07-30 — flipped-eye matmul validation
++
++The unchanged `TestOps.test_flip_eye_crash` case passes in **3.49s**. This
++validates `eye(10) @ flip(eye(10), axis=0)` without reproducing its historical
++crash. No code, host boundary, runtime ABI, or LUT change was needed.
++
++Next forward group: `TestOps.test_broadcast_full`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index c0970900f..3ff974ee1 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2146,3 +2146,9 @@ for the final result. The exact canonical `2*(x*x)` topology uses one
+ serialized fp32 task because an fp16 intermediate missed the unchanged
+ tolerance in 31/2925 lanes. No LUT changed. Contract: **124/124**. Next
+ forward group: `TestOps.test_flip_eye_crash`.
++
++### Flipped-eye matmul crash validation
++
++`TestOps.test_flip_eye_crash`: **pass in 3.49s** unchanged. The flipped
++identity-matrix matmul completes without the historical crash. No code or
++LUT change was needed. Next forward group: `TestOps.test_broadcast_full`.
+-- 
+2.34.1
+
