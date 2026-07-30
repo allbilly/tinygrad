@@ -1,0 +1,117 @@
+From 582135f57f1de80315806f2776bd6d44e43c1ac2 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:26:43 +0800
+Subject: [PATCH] rockchip: pass normal fp32 full broadcasting
+
+---
+ progress.md                          | 22 ++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 11 +++++++++++
+ test_ops_status.md                   | 10 ++++++++++
+ tinygrad/runtime/support/rockchip.py | 14 ++++++++++++++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 38361c096..815f29ad4 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9567,3 +9567,25 @@ validates `eye(10) @ flip(eye(10), axis=0)` without reproducing its historical
+ crash. No code, host boundary, runtime ABI, or LUT change was needed.
+ 
+ Next forward group: `TestOps.test_broadcast_full`.
++
++## 2026-07-30 — normal-fp32 full-broadcast milestone
++
++All ten unchanged `TestOps.test_broadcast_full` subtests pass in **9.16s**,
++covering add/subtract/multiply/divide/power across both rank-4 and rank-5
++broadcast layouts. The hardware-free Rockchip contract is **125/125 in
++7.03s**.
++
++The rank-5 division path previously missed `rtol=0.001` in 3/1680 lanes
++because the broadcast operands and result crossed fp16. Both dynamic tensor
++power layouts were rejected at the composite domain-protection `WHERE`
++graph. `_try_fp32_broadcast_host_subtasks` now uses the existing serialized
++fp32 evaluator only for reduction-free, multi-input graphs with distinct
++static address mappings and either FDIV or the complete WHERE/EXP2/LOG2
++power signature.
++
++The initial matcher also selected broadcast add; the full contract caught
++that overreach because affine fp32 add must retain its established nine-task
++NPU limb path. The final opcode gate preserves add/subtract/multiply on their
++existing NPU implementations. No LUT or runtime ABI changed. Mypy remains at
++the exact 12-error baseline. Next forward group:
++`TestOps.test_broadcast_simple`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a734599de..141413dd7 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -377,6 +377,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(subtasks[0].task.is_copy)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_broadcast_uses_exact_host_boundary(self):
++    for op in (Tensor.div, Tensor.pow):
++      a = Tensor.empty(1,3,1,7,1, dtype=dtypes.float, device="ROCKCHIP")
++      b = Tensor.empty(2,1,5,1,8, dtype=dtypes.float, device="ROCKCHIP")
++      program = build_native_program(_get_sink(op(a,b)))
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertTrue(subtasks[0].task.is_copy)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
+     for shape, axis in (((45,65), 1), ((45,), 0)):
+       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 3ff974ee1..4d52e32fe 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2152,3 +2152,13 @@ forward group: `TestOps.test_flip_eye_crash`.
+ `TestOps.test_flip_eye_crash`: **pass in 3.49s** unchanged. The flipped
+ identity-matrix matmul completes without the historical crash. No code or
+ LUT change was needed. Next forward group: `TestOps.test_broadcast_full`.
++
++### Normal-fp32 full broadcasting
++
++`TestOps.test_broadcast_full`: **10 subtests pass in 9.16s**. Exact serialized
++fp32 evaluation is limited to real static broadcasts containing FDIV or the
++complete WHERE/EXP2/LOG2 tensor-power signature. This fixes the 3/1680
++rank-5 division tolerance misses and both rejected power graphs while
++preserving the established NPU affine-limb paths for add/subtract/multiply.
++No LUT changed. Contract: **125/125**. Next forward group:
++`TestOps.test_broadcast_simple`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 6e636db4e..c93a3f037 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9145,6 +9145,18 @@ def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if square is None or scale is None or _unwrap(square.src[0]).op is not Ops.INDEX: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Preserve exact fp32 arithmetic for multi-input graphs with a real static broadcast."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
++  value = _unwrap(store.src[1])
++  if value.dtype is not dtypes.float: return None
++  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
++  if len({u.src[0].buf_uop.arg.slot for u in inputs}) < 2 or len({u.src[1] for u in inputs}) < 2: return None
++  ops = {u.op for u in value.toposort()}
++  if Ops.FDIV not in ops and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
+   store = _store_node(sink)
+@@ -13613,6 +13625,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   # scan; multidimensional cumprod uses the same physical helper shape.
+   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
+   #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
++  if (fp32_broadcast_tasks := _try_fp32_broadcast_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_broadcast_tasks)
+   if (fp32_topology_tasks := _try_fp32_topology_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_topology_tasks)
+   if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
+-- 
+2.34.1
+
