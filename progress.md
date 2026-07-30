@@ -7583,6 +7583,50 @@ Permanent validation:
 - RK3588 normal-fp32 multifactor case: **1 passed in 3.10 seconds**;
 - hardware-free planner/runtime contract: **101/101 in 5.70 seconds**.
 
+## 2026-07-30 — normal-fp32 long-K einsum ellipsis milestone
+
+The unchanged `TestOps.test_einsum_ellipsis` now passes its full broadcasting
+and exception matrix, including the large case:
+
+```text
+(32,7,24,24,24) × (32,7,24,24,24)
+ij...,ij...->ij
+224 independent rows, K=13824
+```
+
+`conv_grok` again supplied the key planning distinction: split by local CBUF
+and BO capacity, then reuse compact buffers. The long-dot lowering gathers
+one static fp32 row chunk at a time into reusable high/residual ABI buffers,
+uses DPU for compensated limb products, and CMAC for two reduction levels:
+per-chunk row sums followed by a sum over the chunk partials.
+
+Hardware probing found a stricter register boundary than the nominal 4096-K
+materialization tile. `CNA_DMA_CON1` represents at most 13 groups of 32:
+M>1 row sums pass exactly at K=384 and K=416, while K=512 corrupts every row
+after the first. The planner therefore selects the largest exact divisor at
+or below 416; K=13824 becomes 36 chunks of 384.
+
+Materializing `high_a*high_b` through DPU initially lost about 0.033 because
+the fp16 product rounded before CMAC. The established Dekker `2**6+1`
+TwoProduct sequence now produces an x256 product residual for every chunk.
+High, product-error, and both input-residual cross terms retain raw fp32
+CMAC partials across both sum levels. All operator arithmetic remains on
+DPU/CMAC; host work is limited to static gathers and ABI limb views/combine.
+
+The long graph has more than 128 subtasks. Consecutive DPU stages between
+host views and CMAC boundaries now use the existing PC-chain runner only for
+this mapped long-dot signature. This reduced the three-row probe from
+179.5 to 36.3 seconds without changing its result. The official 224-row
+case passed in 68.24 seconds with max absolute error `5.645751953125e-4`;
+the full unchanged ellipsis group is **1 passed in 73.56 seconds**.
+
+Permanent validation:
+
+- RK3588 three-row K=13824 regression: **1 passed in 37.19 seconds**;
+- hardware-free planner/runtime contract: **102/102 in 5.89 seconds**.
+
+No LUT change is involved. Continue with `test_einsum_trace`.
+
 ## 2026-07-30 — normal-fp32 stable argsort
 
 The unchanged forward-only `TestOps.test_argsort` now passes its

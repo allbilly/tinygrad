@@ -1767,3 +1767,19 @@ with `test_einsum_ellipsis` and `test_einsum_trace`.
 
 Permanent RK3588 coverage passes in **3.10 seconds**; the hardware-free
 planner/runtime contract is **101/101**.
+
+### Normal-fp32 long-K einsum ellipsis
+
+| Coverage | Result |
+|---|---:|
+| official 224-row, K=13824 dot | max abs `5.646e-4`, zero tolerance misses |
+| unchanged `TestOps.test_einsum_ellipsis` | **1 passed in 73.56s** |
+
+The lowering uses reusable fp32 limb gathers, DPU TwoProduct correction, and
+two CMAC sum levels. Hardware proves the safe multi-row CMAC K ceiling is
+416 (`13*32`); the official case uses 36 exact K=384 chunks. Long mapped
+mixed programs PC-chain consecutive DPU stages, reducing reset overhead
+without changing arithmetic placement. Continue with `test_einsum_trace`.
+
+Permanent three-row RK3588 coverage passes in **37.19 seconds**; the
+hardware-free planner/runtime contract is **102/102**.

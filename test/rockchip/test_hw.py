@@ -749,6 +749,15 @@ class TestCMAC(unittest.TestCase):
     got = Tensor.einsum("pqrs,tuqvr->pstuv", a, b).realize().numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
 
+  def test_cmac_long_fp32_batched_dot(self):
+    rng = np.random.default_rng(2)
+    a_np = rng.standard_normal((3,13824)).astype(np.float32)
+    b_np = rng.standard_normal((3,13824)).astype(np.float32)
+    expected = np.einsum("ij,ij->i", a_np, b_np, dtype=np.float32)
+    a, b = Tensor(a_np, device="ROCKCHIP"), Tensor(b_np, device="ROCKCHIP")
+    got = Tensor.einsum("ij,ij->i", a, b).realize().numpy()
+    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+
   def test_cmac_nested_sum(self):
     # This seed distinguishes the required fp16 intermediate boundary from a
     # flattened fp32 accumulation: nested=-2.43359375, flat=-2.435546875.

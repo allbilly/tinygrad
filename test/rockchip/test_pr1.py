@@ -344,6 +344,20 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(cmac_tasks[0].layout[0] * cmac_tasks[0].layout[1], 30030)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_long_fp32_batched_dot_uses_proven_cmac_k_chunks(self):
+    a = Tensor.empty(3,13824, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(3,13824, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(Tensor.einsum("ij,ij->i", a, b)))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    cmac_tasks = [task.task for task in subtasks if task.task.kind == "cmac"]
+    self.assertGreater(len(subtasks), 128)
+    self.assertTrue(cmac_tasks)
+    self.assertLessEqual(max(task.layout[2] for task in cmac_tasks), 416)
+    self.assertTrue(any(task.task.is_copy and len(task.task.layout) > 2 and
+                        task.task.layout[1] == _HOST_FP32_HALF_LAYOUT for task in subtasks))
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_fp32_add_uses_compensated_boundary(self):
     a = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")

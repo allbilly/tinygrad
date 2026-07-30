@@ -11223,8 +11223,156 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                      info.outs[0], is_copy=True), relocs))
   return tuple(tasks)
 
+def _try_long_fp32_batched_dot_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Reduce contiguous long fp32 row dots through DPU products and two CMAC sum levels."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
+     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  body = _unwrap(reduce.src[0])
+  if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
+  sources = tuple(_unwrap(x) for x in body.src)
+  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM for x in sources): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  reductions = list(reduce.src[1:])
+  if len(loops) != 1 or len(reductions) != 1 or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  rows, K = int(loops[0].src[0].arg), int(reductions[0].src[0].arg)
+  if K <= 4096: return None
+  # CNA_DMA_CON1 has only 13 useful 32-channel groups. K=512 corrupts rows
+  # after the first, while hardware probes prove both K=384 and K=416.
+  chunks = ceildiv(K, 416)
+  while chunks <= K and K % chunks: chunks += 1
+  if chunks > K: return None
+  chunk_k = K // chunks
+  out_aff = _affine_index(store.src[0].src[1])
+  if out_aff != ({loops[0].arg[0]:1}, 0): return None
+  for source in sources:
+    aff = _affine_index(source.src[1])
+    if aff != ({loops[0].arg[0]:K, reductions[0].arg[0]:1}, 0) or int(source.src[0].src[0].arg) != rows*K: return None
+
+  info, device = ProgramInfo.from_sink(sink), store.src[0].src[0].device
+  source_slots = tuple(x.src[0].buf_uop.arg.slot for x in sources)
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+  def view(source_slot:int, tag:int, total:int, layout:tuple[int,...]=(), out_slot:int|None=None) -> int:
+    out = alloc() if out_slot is None else out_slot
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag, *layout), out, is_copy=True), relocs))
+    return out
+  def stage(total:int, a:tuple[int,int], b:tuple[int,int], op:Ops, out_slot:int|None=None) -> int:
+    out = alloc() if out_slot is None else out_slot
+    tasks.append(_emit_where_stage(total, out, a, b, op))
+    return out
+  def row_sum(input_slot:int, nrows:int, width:int, raw_fp32=False, transposed=False,
+              out_slot:int|None=None, out_offset=0) -> int|None:
+    row, red = UOp.range(nrows, 5000), UOp.range(width, 5001, AxisType.REDUCE)
+    source_param = UOp.param(input_slot, dtypes.half, (nrows*width,), device=device)
+    source_index = UOp(Ops.INDEX, dtypes.half, (source_param, red*nrows+row if transposed else row*width+red))
+    acc = UOp(Ops.REDUCE, dtypes.float, (UOp(Ops.CAST, dtypes.float, (source_index,), arg=dtypes.float), red), arg=(Ops.ADD, 0.0))
+    if out_slot is None: out_slot = alloc()
+    out_param = UOp.param(out_slot, dtypes.half, (nrows,), device=device)
+    out_index = UOp(Ops.INDEX, dtypes.half, (out_param, row))
+    sum_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(out_index, UOp(Ops.CAST, dtypes.half, (acc,), arg=dtypes.half))), row)))
+    sum_plan = plan_rk(sum_sink)
+    if isinstance(sum_plan, str) or sum_plan.kind != "cmac": return None
+    cmds, task, relocs = emit_rk(sum_plan)
+    tasks.append(RKSubTask(cmds, replace(task, fp32_output=raw_fp32, out_offset=out_offset), relocs))
+    return out_slot
+  def combine_raw(high_slot:int, low_slot:int, out_slot:int, total:int) -> None:
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, high_slot, 0, 0, 0xFFFFFFFF),
+              RKReloc(0, low_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_COMBINE_LAYOUT),
+                                       out_slot, is_copy=True, fp32_output=True), relocs))
+
+  high_partials, error_partials, cross_partials = alloc(), alloc(), (alloc(), alloc())
+  compact_total = rows*chunk_k
+  limb_slots = ((alloc(), alloc()), (alloc(), alloc()))
+  product_slot = alloc()
+  split_slot, big_slot = alloc(), alloc()
+  head_a, tail_a, head_b, tail_b = alloc(), alloc(), alloc(), alloc()
+  error_slot, term_slot = alloc(), alloc()
+  scalar_65 = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 65.0))[0])
+  scalar_256 = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0])
+  for chunk in range(chunks):
+    layout = (2, rows, chunk_k, K, 1, chunk*chunk_k)
+    for source_slot, (high_slot, low_slot) in zip(source_slots, limb_slots):
+      view(source_slot, _HOST_FP32_HALF_LAYOUT, compact_total, layout, high_slot)
+      view(source_slot, _HOST_FP32_RESIDUAL_LAYOUT, compact_total, layout, low_slot)
+    stage(compact_total, (limb_slots[0][0], 0), (limb_slots[1][0], 0), Ops.MUL, product_slot)
+    if row_sum(product_slot, rows, chunk_k, raw_fp32=True,
+               out_slot=high_partials, out_offset=chunk*rows*4) is None: return None
+    # Recover the fp16 product-rounding error with Dekker's 2**6+1 split,
+    # then keep it in x256 residual units for the final split-fp32 sum.
+    stage(compact_total, (limb_slots[0][0], 0), scalar_65, Ops.MUL, split_slot)
+    stage(compact_total, (split_slot, 0), (limb_slots[0][0], 0), Ops.SUB, big_slot)
+    stage(compact_total, (split_slot, 0), (big_slot, 0), Ops.SUB, head_a)
+    stage(compact_total, (limb_slots[0][0], 0), (head_a, 0), Ops.SUB, tail_a)
+    stage(compact_total, (limb_slots[1][0], 0), scalar_65, Ops.MUL, split_slot)
+    stage(compact_total, (split_slot, 0), (limb_slots[1][0], 0), Ops.SUB, big_slot)
+    stage(compact_total, (split_slot, 0), (big_slot, 0), Ops.SUB, head_b)
+    stage(compact_total, (limb_slots[1][0], 0), (head_b, 0), Ops.SUB, tail_b)
+    stage(compact_total, (head_a, 0), (head_b, 0), Ops.MUL, term_slot)
+    stage(compact_total, (term_slot, 0), (product_slot, 0), Ops.SUB, error_slot)
+    for lhs, rhs in ((head_a, tail_b), (tail_a, head_b), (tail_a, tail_b)):
+      stage(compact_total, (lhs, 0), (rhs, 0), Ops.MUL, term_slot)
+      stage(compact_total, (error_slot, 0), (term_slot, 0), Ops.ADD, error_slot)
+    stage(compact_total, (error_slot, 0), scalar_256, Ops.MUL, error_slot)
+    if row_sum(error_slot, rows, chunk_k, raw_fp32=True,
+               out_slot=error_partials, out_offset=chunk*rows*4) is None: return None
+    for a_slot, b_slot, partial_slot in ((limb_slots[0][0], limb_slots[1][1], cross_partials[0]),
+                                        (limb_slots[0][1], limb_slots[1][0], cross_partials[1])):
+      stage(compact_total, (a_slot, 0), (b_slot, 0), Ops.MUL, product_slot)
+      if row_sum(product_slot, rows, chunk_k, raw_fp32=True,
+                 out_slot=partial_slot, out_offset=chunk*rows*4) is None: return None
+
+  # Every product keeps raw fp32 at both reduction levels. Chunk partials use
+  # chunk-major storage, so the second CMAC gathers red*rows+row.
+  def finish_raw(partials:int) -> int|None:
+    partial_high = view(partials, _HOST_FP32_HALF_LAYOUT, rows*chunks)
+    partial_low = view(partials, _HOST_FP32_RESIDUAL_LAYOUT, rows*chunks)
+    high_sum = row_sum(partial_high, rows, chunks, raw_fp32=True, transposed=True)
+    low_sum = row_sum(partial_low, rows, chunks, transposed=True)
+    if high_sum is None or low_sum is None: return None
+    high_half = view(high_sum, _HOST_FP32_HALF_LAYOUT, rows)
+    high_residual = view(high_sum, _HOST_FP32_RESIDUAL_LAYOUT, rows)
+    combined_residual = stage(rows, (high_residual, 0), (low_sum, 0), Ops.ADD)
+    raw = alloc()
+    combine_raw(high_half, combined_residual, raw, rows)
+    return raw
+
+  high_raw = finish_raw(high_partials)
+  error_raw = finish_raw(error_partials)
+  cross_raw = tuple(finish_raw(partials) for partials in cross_partials)
+  if high_raw is None or error_raw is None or any(x is None for x in cross_raw): return None
+  cross_values:list[int] = []
+  for raw in cross_raw:
+    assert raw is not None
+    cross_high = view(raw, _HOST_FP32_HALF_LAYOUT, rows)
+    cross_low = view(raw, _HOST_FP32_RESIDUAL_LAYOUT, rows)
+    scaled_low = stage(rows, (cross_low, 0), (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1/256))[0]), Ops.MUL)
+    cross_values.append(stage(rows, (cross_high, 0), (scaled_low, 0), Ops.ADD))
+  cross_sum = stage(rows, (cross_values[0], 0), (cross_values[1], 0), Ops.ADD)
+  error_high = view(error_raw, _HOST_FP32_HALF_LAYOUT, rows)
+  error_low = view(error_raw, _HOST_FP32_RESIDUAL_LAYOUT, rows)
+  scaled_error_low = stage(rows, (error_low, 0),
+                           (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1/256))[0]), Ops.MUL)
+  error_value = stage(rows, (error_high, 0), (scaled_error_low, 0), Ops.ADD)
+
+  final_high = view(high_raw, _HOST_FP32_HALF_LAYOUT, rows)
+  final_low = view(high_raw, _HOST_FP32_RESIDUAL_LAYOUT, rows)
+  final_residual = stage(rows, (final_low, 0), (cross_sum, 0), Ops.ADD)
+  final_residual = stage(rows, (final_residual, 0), (error_value, 0), Ops.ADD)
+  combine_raw(final_high, final_residual, info.outs[0], rows)
+  return tuple(tasks)
+
 def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run a direct fp32 matrix product through typed half CMAC views and CBUF-derived tiles."""
+  if (long_dot_tasks := _try_long_fp32_batched_dot_subtasks(sink)) is not None: return long_dot_tasks
   store, reduce = _store_node(sink), _reduce_node(sink)
   if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
      reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None

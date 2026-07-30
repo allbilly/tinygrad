@@ -353,7 +353,7 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
       b_out[dst_index] = _eval_static_value(b_code, coords, b_in)
 
 def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
-                                  n_start=0, cols=None, packed_inputs=None, fp32_output=False):
+                                  n_start=0, cols=None, packed_inputs=None, fp32_output=False, output_offset=0):
   _, _, _, bias_slot, bias_axis, relu, scale, scale_counts, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
     _, fixed_loops, out_code, _, _ = decoded
   s = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32))
@@ -386,7 +386,7 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
       a_addr, b_addr, K, align_in = packed_inputs
       converted = _fp32_to_fp16_group(raw, a_addr, b_addr, m-m_start, n-n_start, K, align_in)
     else: converted = _fp32_to_fp16(raw)
-    d[out_index] = converted
+    d[output_offset+out_index] = converted
 
 def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
   M, N, K, align_in, align_out = task.layout[:5]
@@ -449,7 +449,7 @@ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
         _unpack_materialized_cmac_out(o_buf.va_addr, bufs[task.out_slot].va_addr, M, N, align_out,
                                       decoded, bias, m_start, rows, n_start, cols,
                                       (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]) if tile_k >= K else None,
-                                      task.fp32_output)
+                                      task.fp32_output, task.out_offset // (4 if task.fp32_output else 2))
   finally:
     for b in temp: dev._gpu_free(b)
 
@@ -1135,7 +1135,8 @@ class RockchipProgram(Program['RockchipDevice']):
           bias = bufs[decoded[3]].va_addr if decoded[3] >= 0 else None
           _unpack_materialized_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, decoded, bias,
                                         packed_inputs=(cmac_bufs[0].va_addr, cmac_bufs[1].va_addr, task.layout[2], task.layout[3]),
-                                        fp32_output=task.fp32_output)
+                                        fp32_output=task.fp32_output,
+                                        output_offset=task.out_offset // (4 if task.fp32_output else 2))
         else:
           bias_slot, bias_axis, relu = task.layout[5:] if len(task.layout) >= 8 else (-1, -1, 0)
           bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
@@ -1319,7 +1320,9 @@ class RockchipProgram(Program['RockchipDevice']):
         while len(ext) <= max_slot:
           shared.append(b := dev._gpu_alloc(max(scratch_sizes.get(len(ext), 0), 4096), 0))
           ext.append(b)
-        if getenv("ROCKCHIP_MIXED_CHAIN_WIP"):
+        long_dot_chain = len(subtasks) > 128 and any(st.task.is_copy and len(st.task.layout) > 2 and
+          st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT) for st in subtasks)
+        if getenv("ROCKCHIP_MIXED_CHAIN_WIP") or long_dot_chain:
           # A real PC chain amortizes driver submit state; a one-entry chain
           # does not. Batch consecutive DPU work around host/CMAC boundaries.
           mixed_chain_pending:list[RKSubTask] = []
