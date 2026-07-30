@@ -11569,12 +11569,30 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
 def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Serialize only tinygrad's two-pass fp32 variance kernel after its mean kernel."""
-  store, reduce = _store_node(sink), _reduce_node(sink)
-  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
-     reduce.arg[0] is not Ops.ADD: return None
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float: return None
   val = _unwrap(store.src[1])
-  final_sqrt = val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1
-  if final_sqrt: val = _unwrap(val.src[0])
+  final_sqrt, stack_axis, mean_output = 0, None, None
+  if val.op is Ops.WHERE and len(val.src) == 3:
+    condition, mean_output, val = (_unwrap(x) for x in val.src)
+    if condition.op is not Ops.CMPNE or len(condition.src) != 2: return None
+    for candidate, zero in ((condition.src[0], condition.src[1]), (condition.src[1], condition.src[0])):
+      candidate, zero = _unwrap(candidate), _unwrap(zero)
+      if candidate.op is Ops.RANGE and getattr(candidate.arg[-1], "name", "") == "LOOP" and \
+         candidate.src[0].op is Ops.CONST and int(candidate.src[0].arg) == 2 and \
+         zero.op is Ops.CONST and int(zero.arg) == 0:
+        stack_axis = candidate
+        break
+    if stack_axis is None: return None
+    if val.op is not Ops.SQRT or val.dtype is not dtypes.float or len(val.src) != 1: return None
+    val = _unwrap(val.src[0])
+    final_sqrt = 2
+  elif val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1:
+    final_sqrt, val = 1, _unwrap(val.src[0])
+  reductions_in_value = [u for u in val.toposort() if u.op is Ops.REDUCE]
+  if len(reductions_in_value) != 1: return None
+  reduce = reductions_in_value[0]
+  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD: return None
   if val.op is not Ops.MUL or len(val.src) != 2: return None
   scale, reduced = None, None
   for lhs, rhs in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
@@ -11595,7 +11613,7 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     mean_candidate = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
     coefficient = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
     if mean_candidate is not None and mean_candidate.src[0].op is Ops.PARAM and coefficient is not None and \
-       float(coefficient.arg) == -1.0:
+       coefficient.dtype is dtypes.float and math.isfinite(float(coefficient.arg)) and float(coefficient.arg) < 0.0:
       data, mean = candidate, mean_candidate
       break
   if data is None or mean is None or data.dtype is not dtypes.float or mean.dtype is not dtypes.float: return None
@@ -11607,6 +11625,7 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   extents = tuple(int(u.src[0].arg) for u in axes)
   axis_ids = tuple(u.arg[0] for u in axes)
   loop_ids, reduction_ids = set(axis_ids[:len(loops)]), set(axis_ids[len(loops):])
+  if stack_axis is not None and stack_axis not in loops: return None
   data_aff, mean_aff, out_aff = _affine_index(data.src[1]), _affine_index(mean.src[1]), _affine_index(store.src[0].src[1])
   if data_aff is None or mean_aff is None or out_aff is None or \
      any(axis not in axis_ids or stride < 0 for aff in (data_aff, mean_aff) for axis, stride in aff[0].items()) or \
@@ -11621,11 +11640,39 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   output_total = prod(_shape_of_store(sink))
   if not bounded(data_aff, data_total, extents) or not bounded(mean_aff, mean_total, extents) or \
      not bounded(out_aff, output_total, (*extents[:len(loops)], *([1]*len(reductions)))): return None
+  if stack_axis is not None:
+    stack_id = stack_axis.arg[0]
+    if data_aff[0].get(stack_id, 0) != 0 or mean_aff[0].get(stack_id, 0) != 0: return None
+    assert mean_output is not None and coefficient is not None
+    mean_output = _unwrap(mean_output)
+    indexed_mean, output_scale = None, 1.0
+    if mean_output.op is Ops.INDEX: indexed_mean = mean_output
+    elif mean_output.op is Ops.MUL and len(mean_output.src) == 2:
+      indexed_mean = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.INDEX), None)
+      output_constant = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.CONST), None)
+      if output_constant is None or output_constant.dtype is not dtypes.float: return None
+      output_scale = float(output_constant.arg)
+    if indexed_mean is not None:
+      if indexed_mean.src[0] is not mean.src[0] or _affine_index(indexed_mean.src[1]) != mean_aff or \
+         not math.isclose(output_scale, -float(coefficient.arg), rel_tol=0.0, abs_tol=0.0): return None
+    else:
+      mean_reductions = [u for u in mean_output.toposort() if u.op is Ops.REDUCE]
+      if mean_output.op is not Ops.MUL or len(mean_reductions) != 1 or mean_reductions[0].arg[0] is not Ops.ADD: return None
+      mean_reduce = mean_reductions[0]
+      mean_source = _unwrap(mean_reduce.src[0])
+      mean_scale = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.CONST), None)
+      mean_axes = list(mean_reduce.src[1:])
+      if mean_source.op is not Ops.INDEX or mean_source.src[0] is not data.src[0] or mean_scale is None or \
+         mean_scale.dtype is not dtypes.float or any(axis.src[0].op is not Ops.CONST for axis in mean_axes) or \
+         prod(int(axis.src[0].arg) for axis in mean_axes) != prod(extents[len(loops):]) or \
+         not math.isclose(float(mean_scale.arg), 1.0/prod(extents[len(loops):]), rel_tol=1e-12): return None
 
   def mapping(aff:tuple[dict[int,int],int], ids:tuple[int,...]) -> tuple[int,...]:
     return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
   scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
-  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt), *extents, scale_bits,
+  stack_position = loops.index(stack_axis) if stack_axis is not None else -1
+  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt),
+            *((stack_position,) if stack_axis is not None else ()), *extents, scale_bits,
             *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
   info = ProgramInfo.from_sink(sink)
   slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)

@@ -655,6 +655,8 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
   output_total, tag, nloops, nreductions, final_sqrt, *meta = task.layout
   assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
   naxes, cursor = nloops+nreductions, 0
+  stack_position = meta[cursor] if final_sqrt == 2 else -1
+  cursor += int(final_sqrt == 2)
   extents = tuple(meta[cursor:cursor+naxes])
   cursor += naxes
   scale = struct.unpack('<f', struct.pack('<I', meta[cursor] & 0xFFFFFFFF))[0]
@@ -701,7 +703,10 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
       # delta = np.float32(data[data_index]-mean[mean_index])
       # accumulator = np.float32(accumulator + np.float32(delta*delta))
       variance = np.var(values, dtype=np.float32, ddof=correction)
-      result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
+      if final_sqrt == 2:
+        result[output_index] = np.mean(values, dtype=np.float32) if loop_coords[stack_position] else np.sqrt(variance, dtype=np.float32)
+      else:
+        result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:

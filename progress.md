@@ -9282,3 +9282,33 @@ handling, and K=875 row workaround are unchanged. Empty and invalid-degree
 std cases continue through constant NaN or positive-infinity semantics and
 retain their expected NumPy warnings. No LUT coefficient or two-task LUT
 schedule changed. Next forward group: `TestOps.test_std_mean`.
+
+## 2026-07-30 — fused normal-fp32 std_mean milestone
+
+The unchanged `TestOps.test_std_mean` group passes all four cases in
+**28.77s**. Axis variance/std regression passes **2/2 in 81.00s**, and the
+hardware-free Rockchip contract is **114/114 in 6.24s**.
+
+`Tensor.stack(*x.std_mean())` schedules the ordinary mean producer followed
+by one fused output sink:
+
+```text
+WHERE(stack_axis != 0, mean, SQRT(SUM((x-mean)^2) * correction_scale))
+```
+
+The strict variance serializer now recognizes only that exact two-lane stack
+epilogue. It requires a two-element LOOP selector compared with zero, the
+existing centered-square topology on the std lane, and a matching mean lane.
+The mean lane may read the same mean buffer (optionally applying the exact
+normalization used by the centered delta), or it may contain the exact direct
+fp32 sum times `1/K` used by full reduction. Data and mean mappings must be
+independent of the stack selector.
+
+Layout epilogue value `2` serializes the selector's LOOP position. Runtime
+reuses the already gathered original fp32 row, writing `sqrt(var)` for
+selector zero and fp32 mean for selector one. This deliberately avoids the
+known K=875 multi-row native mean corruption while keeping the host boundary
+limited to the approved strict variance/std_mean operator family. No LUT or
+two-NPU-task LUT change was needed.
+
+Next forward group: `TestOps.test_std_mean_loaded_nan`.

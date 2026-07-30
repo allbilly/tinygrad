@@ -1996,3 +1996,19 @@ The strict variance task now carries a `final_sqrt` bit because tinygrad
 fuses `SQRT` around the same centered-square reduction. All variance gates
 and affine mappings remain unchanged; runtime applies fp32 sqrt only for the
 std form. No LUT changed. Next forward group: `TestOps.test_std_mean`.
+
+### Fused normal-fp32 std_mean
+
+| Group | Status |
+|---|---:|
+| `test_std_mean` (four cases) | **1 passed in 28.77s** |
+| axis variance/std regression | **2 passed in 81.00s** |
+| hardware-free Rockchip contract | **114/114** |
+
+The exact fused `WHERE(stack_axis != 0, mean, sqrt(variance))` graph extends
+the strict variance task with epilogue value `2` and a serialized stack-axis
+position. The matcher verifies both std and mean lanes, their shared buffers,
+the two-element selector, normalization, affine bounds, and selector
+independence. Runtime writes fp32 std and mean from the same gathered source
+row, retaining the K=875 multi-row workaround. No LUT changed. Next forward
+group: `TestOps.test_std_mean_loaded_nan`.
