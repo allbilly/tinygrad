@@ -2906,6 +2906,13 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, info.outs[0], (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)))
   return tuple(tasks)
 
+def _try_fp32_tanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Keep exact normal-fp32 tanh out of the half-buffer two-LUT implementation."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float or (source := _try_tanh(store.src[1])) is None: return None
+  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Keep the staged QuickGELU interior and use its exact zero/x asymptotes."""
   store = _store_node(sink)
@@ -13525,6 +13532,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
   if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
+  if (fp32_tanh_tasks := _try_fp32_tanh_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_tanh_tasks)
   if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)
   if (quick_gelu_tasks := _try_quick_gelu_two_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
   if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)

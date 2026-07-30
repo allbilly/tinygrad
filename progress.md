@@ -9490,3 +9490,20 @@ fp32 semantics without exhausting the NPU reset budget. No LUT changed;
 mypy remains at the exact 12-error baseline.
 
 Next forward group: `TestOps.test_tanh`.
+
+## 2026-07-30 — normal-fp32 tanh milestone
+
+The unchanged `TestOps.test_tanh` and `TestOps.test_tanh_extreme` groups pass
+together in **3.57s**. The hardware-free Rockchip contract is **122/122 in
+7.10s**.
+
+The fp16 two-LUT saturation classifier previously accepted a fp32 source and
+then interpreted its four-byte storage through half-oriented tasks. Every
+ordinary lane was corrupt, with some outputs reaching approximately
+`2.7e36`. `_try_fp32_tanh_host_subtasks` now intercepts only the exact
+`2*sigmoid(2*x)-1` fp32 graph and uses one serialized fp32 task. The tuned
+broad/local two-LUT half implementation remains unchanged and exclusive to
+half storage.
+
+No LUT coefficient changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_hardtanh`.

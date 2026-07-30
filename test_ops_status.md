@@ -2107,3 +2107,14 @@ Exact fp32 `(exp(x) +/- exp(-x))/2` graphs use one serialized task instead of
 the timeout-prone 43–44-task generic DPU split. Folded `-log2(e)` and the old
 nested-negation recognition are both retained; fp16 LUT paths are unchanged.
 Next forward group: `TestOps.test_tanh`.
+
+### Normal-fp32 tanh
+
+| Group | Status |
+|---|---:|
+| `test_tanh` + `test_tanh_extreme` | **2 passed in 3.57s** |
+| hardware-free Rockchip contract | **122/122** |
+
+Exact fp32 tanh now uses one serialized task instead of entering the
+half-buffer two-LUT path, which had corrupted every lane. The tuned fp16 LUT
+implementation is unchanged. Next forward group: `TestOps.test_hardtanh`.

@@ -444,6 +444,14 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp32_tanh_avoids_half_two_lut_path(self):
+    expression = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").tanh()
+    program = build_native_program(_get_sink(expression))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
