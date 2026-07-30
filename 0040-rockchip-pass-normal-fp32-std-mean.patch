@@ -1,0 +1,222 @@
+From 0380976b372f4a8f252845648fb13442c129e18f Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:30:52 +0800
+Subject: [PATCH] rockchip: pass normal fp32 std_mean
+
+---
+ progress.md                          | 30 ++++++++++++++
+ test/rockchip/test_pr1.py            | 10 +++++
+ test_ops_status.md                   | 16 ++++++++
+ tinygrad/runtime/ops_rockchip.py     |  7 +++-
+ tinygrad/runtime/support/rockchip.py | 61 ++++++++++++++++++++++++----
+ 5 files changed, 116 insertions(+), 8 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 34ef0e109..8dd6fc152 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9282,3 +9282,33 @@ handling, and K=875 row workaround are unchanged. Empty and invalid-degree
+ std cases continue through constant NaN or positive-infinity semantics and
+ retain their expected NumPy warnings. No LUT coefficient or two-task LUT
+ schedule changed. Next forward group: `TestOps.test_std_mean`.
++
++## 2026-07-30 — fused normal-fp32 std_mean milestone
++
++The unchanged `TestOps.test_std_mean` group passes all four cases in
++**28.77s**. Axis variance/std regression passes **2/2 in 81.00s**, and the
++hardware-free Rockchip contract is **114/114 in 6.24s**.
++
++`Tensor.stack(*x.std_mean())` schedules the ordinary mean producer followed
++by one fused output sink:
++
++```text
++WHERE(stack_axis != 0, mean, SQRT(SUM((x-mean)^2) * correction_scale))
++```
++
++The strict variance serializer now recognizes only that exact two-lane stack
++epilogue. It requires a two-element LOOP selector compared with zero, the
++existing centered-square topology on the std lane, and a matching mean lane.
++The mean lane may read the same mean buffer (optionally applying the exact
++normalization used by the centered delta), or it may contain the exact direct
++fp32 sum times `1/K` used by full reduction. Data and mean mappings must be
++independent of the stack selector.
++
++Layout epilogue value `2` serializes the selector's LOOP position. Runtime
++reuses the already gathered original fp32 row, writing `sqrt(var)` for
++selector zero and fp32 mean for selector one. This deliberately avoids the
++known K=875 multi-row native mean corruption while keeping the host boundary
++limited to the approved strict variance/std_mean operator family. No LUT or
++two-NPU-task LUT change was needed.
++
++Next forward group: `TestOps.test_std_mean_loaded_nan`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index ff0f4283e..161a5262f 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -358,6 +358,16 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
+     self.assertEqual(subtasks[0].task.layout[4], 1)
+ 
++  def test_fp32_std_mean_sets_strict_stacked_epilogue(self):
++    expression = Tensor.stack(*Tensor.empty(3,4,5,6, dtype=dtypes.float, device="ROCKCHIP").std_mean(axis=(1,2)))
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    program = build_native_program(sinks[-1])
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
++    self.assertEqual(subtasks[0].task.layout[4], 2)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 0cae9bc6c..71d1f3064 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1996,3 +1996,19 @@ The strict variance task now carries a `final_sqrt` bit because tinygrad
+ fuses `SQRT` around the same centered-square reduction. All variance gates
+ and affine mappings remain unchanged; runtime applies fp32 sqrt only for the
+ std form. No LUT changed. Next forward group: `TestOps.test_std_mean`.
++
++### Fused normal-fp32 std_mean
++
++| Group | Status |
++|---|---:|
++| `test_std_mean` (four cases) | **1 passed in 28.77s** |
++| axis variance/std regression | **2 passed in 81.00s** |
++| hardware-free Rockchip contract | **114/114** |
++
++The exact fused `WHERE(stack_axis != 0, mean, sqrt(variance))` graph extends
++the strict variance task with epilogue value `2` and a serialized stack-axis
++position. The matcher verifies both std and mean lanes, their shared buffers,
++the two-element selector, normalization, affine bounds, and selector
++independence. Runtime writes fp32 std and mean from the same gathered source
++row, retaining the K=875 multi-row workaround. No LUT changed. Next forward
++group: `TestOps.test_std_mean_loaded_nan`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index c01d7f4e1..6830e1bd7 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -655,6 +655,8 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+   output_total, tag, nloops, nreductions, final_sqrt, *meta = task.layout
+   assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
+   naxes, cursor = nloops+nreductions, 0
++  stack_position = meta[cursor] if final_sqrt == 2 else -1
++  cursor += int(final_sqrt == 2)
+   extents = tuple(meta[cursor:cursor+naxes])
+   cursor += naxes
+   scale = struct.unpack('<f', struct.pack('<I', meta[cursor] & 0xFFFFFFFF))[0]
+@@ -701,7 +703,10 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+       # delta = np.float32(data[data_index]-mean[mean_index])
+       # accumulator = np.float32(accumulator + np.float32(delta*delta))
+       variance = np.var(values, dtype=np.float32, ddof=correction)
+-      result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
++      if final_sqrt == 2:
++        result[output_index] = np.mean(values, dtype=np.float32) if loop_coords[stack_position] else np.sqrt(variance, dtype=np.float32)
++      else:
++        result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
+   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+ 
+ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 85e2de31a..d467b3f38 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11569,12 +11569,30 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Serialize only tinygrad's two-pass fp32 variance kernel after its mean kernel."""
+-  store, reduce = _store_node(sink), _reduce_node(sink)
+-  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
+-     reduce.arg[0] is not Ops.ADD: return None
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float: return None
+   val = _unwrap(store.src[1])
+-  final_sqrt = val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1
+-  if final_sqrt: val = _unwrap(val.src[0])
++  final_sqrt, stack_axis, mean_output = 0, None, None
++  if val.op is Ops.WHERE and len(val.src) == 3:
++    condition, mean_output, val = (_unwrap(x) for x in val.src)
++    if condition.op is not Ops.CMPNE or len(condition.src) != 2: return None
++    for candidate, zero in ((condition.src[0], condition.src[1]), (condition.src[1], condition.src[0])):
++      candidate, zero = _unwrap(candidate), _unwrap(zero)
++      if candidate.op is Ops.RANGE and getattr(candidate.arg[-1], "name", "") == "LOOP" and \
++         candidate.src[0].op is Ops.CONST and int(candidate.src[0].arg) == 2 and \
++         zero.op is Ops.CONST and int(zero.arg) == 0:
++        stack_axis = candidate
++        break
++    if stack_axis is None: return None
++    if val.op is not Ops.SQRT or val.dtype is not dtypes.float or len(val.src) != 1: return None
++    val = _unwrap(val.src[0])
++    final_sqrt = 2
++  elif val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1:
++    final_sqrt, val = 1, _unwrap(val.src[0])
++  reductions_in_value = [u for u in val.toposort() if u.op is Ops.REDUCE]
++  if len(reductions_in_value) != 1: return None
++  reduce = reductions_in_value[0]
++  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD: return None
+   if val.op is not Ops.MUL or len(val.src) != 2: return None
+   scale, reduced = None, None
+   for lhs, rhs in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
+@@ -11595,7 +11613,7 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     mean_candidate = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
+     coefficient = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
+     if mean_candidate is not None and mean_candidate.src[0].op is Ops.PARAM and coefficient is not None and \
+-       float(coefficient.arg) == -1.0:
++       coefficient.dtype is dtypes.float and math.isfinite(float(coefficient.arg)) and float(coefficient.arg) < 0.0:
+       data, mean = candidate, mean_candidate
+       break
+   if data is None or mean is None or data.dtype is not dtypes.float or mean.dtype is not dtypes.float: return None
+@@ -11607,6 +11625,7 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   extents = tuple(int(u.src[0].arg) for u in axes)
+   axis_ids = tuple(u.arg[0] for u in axes)
+   loop_ids, reduction_ids = set(axis_ids[:len(loops)]), set(axis_ids[len(loops):])
++  if stack_axis is not None and stack_axis not in loops: return None
+   data_aff, mean_aff, out_aff = _affine_index(data.src[1]), _affine_index(mean.src[1]), _affine_index(store.src[0].src[1])
+   if data_aff is None or mean_aff is None or out_aff is None or \
+      any(axis not in axis_ids or stride < 0 for aff in (data_aff, mean_aff) for axis, stride in aff[0].items()) or \
+@@ -11621,11 +11640,39 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   output_total = prod(_shape_of_store(sink))
+   if not bounded(data_aff, data_total, extents) or not bounded(mean_aff, mean_total, extents) or \
+      not bounded(out_aff, output_total, (*extents[:len(loops)], *([1]*len(reductions)))): return None
++  if stack_axis is not None:
++    stack_id = stack_axis.arg[0]
++    if data_aff[0].get(stack_id, 0) != 0 or mean_aff[0].get(stack_id, 0) != 0: return None
++    assert mean_output is not None and coefficient is not None
++    mean_output = _unwrap(mean_output)
++    indexed_mean, output_scale = None, 1.0
++    if mean_output.op is Ops.INDEX: indexed_mean = mean_output
++    elif mean_output.op is Ops.MUL and len(mean_output.src) == 2:
++      indexed_mean = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.INDEX), None)
++      output_constant = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.CONST), None)
++      if output_constant is None or output_constant.dtype is not dtypes.float: return None
++      output_scale = float(output_constant.arg)
++    if indexed_mean is not None:
++      if indexed_mean.src[0] is not mean.src[0] or _affine_index(indexed_mean.src[1]) != mean_aff or \
++         not math.isclose(output_scale, -float(coefficient.arg), rel_tol=0.0, abs_tol=0.0): return None
++    else:
++      mean_reductions = [u for u in mean_output.toposort() if u.op is Ops.REDUCE]
++      if mean_output.op is not Ops.MUL or len(mean_reductions) != 1 or mean_reductions[0].arg[0] is not Ops.ADD: return None
++      mean_reduce = mean_reductions[0]
++      mean_source = _unwrap(mean_reduce.src[0])
++      mean_scale = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.CONST), None)
++      mean_axes = list(mean_reduce.src[1:])
++      if mean_source.op is not Ops.INDEX or mean_source.src[0] is not data.src[0] or mean_scale is None or \
++         mean_scale.dtype is not dtypes.float or any(axis.src[0].op is not Ops.CONST for axis in mean_axes) or \
++         prod(int(axis.src[0].arg) for axis in mean_axes) != prod(extents[len(loops):]) or \
++         not math.isclose(float(mean_scale.arg), 1.0/prod(extents[len(loops):]), rel_tol=1e-12): return None
+ 
+   def mapping(aff:tuple[dict[int,int],int], ids:tuple[int,...]) -> tuple[int,...]:
+     return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
+   scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
+-  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt), *extents, scale_bits,
++  stack_position = loops.index(stack_axis) if stack_axis is not None else -1
++  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt),
++            *((stack_position,) if stack_axis is not None else ()), *extents, scale_bits,
+             *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
+   info = ProgramInfo.from_sink(sink)
+   slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)
+-- 
+2.34.1
+
