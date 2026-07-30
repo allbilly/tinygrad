@@ -2129,3 +2129,10 @@ forward group: `TestOps.test_asinh`.
 Both ordinary/extreme groups pass together in **33.10s** with no change.
 Acosh negative-domain inputs retain the expected warning. Next forward group:
 `TestOps.test_atanh`.
+
+### Normal-fp32 atanh
+
+`TestOps.test_atanh`: **pass in 3.47s** for ordinary and ±300 extremes.
+The exact fp32 logarithmic graph uses one serialized task instead of the
+timeout-prone generic split; the half two-LUT path is unchanged. Contract:
+**123/123**. Next forward group: `TestOps.test_topo_sort`.

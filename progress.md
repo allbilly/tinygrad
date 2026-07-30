@@ -9524,3 +9524,18 @@ Acosh's negative-domain cases retain one non-failing invalid-cast warning.
 No code or LUT change was needed.
 
 Next forward group: `TestOps.test_atanh`.
+
+## 2026-07-30 — normal-fp32 atanh milestone
+
+The unchanged `TestOps.test_atanh` group passes all ordinary and ±300 extreme
+cases in **3.47s**. The hardware-free Rockchip contract is **123/123 in
+6.95s**.
+
+Before the fix, the fp32 composite timed out in the generic NPU splitter.
+The exact atanh recognizer now accepts both half and float
+`log((1+x)/(1-x))/2` graphs. `_try_fp32_atanh_host_subtasks` intercepts the
+float form as one serialized task before the existing half two-LUT
+implementation; half behavior and LUT tuning are unchanged.
+
+Mypy remains at the exact 12-error baseline. Next forward group:
+`TestOps.test_topo_sort`.

@@ -567,7 +567,7 @@ def _try_atanh(val:UOp) -> UOp|None:
   """Recognize log((1+x)/(1-x))/2 after reciprocal-to-FDIV rewriting."""
   val = _unwrap(val)
   indexes = list(dict.fromkeys(u for u in val.toposort() if u.op is Ops.INDEX))
-  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half or val.op is not Ops.MUL: return None
+  if len(indexes) != 1 or (source := indexes[0]).dtype not in (dtypes.half, dtypes.float) or val.op is not Ops.MUL: return None
   logarithm = next((_unwrap(x) for x in val.src if _unwrap(x).op is Ops.LOG2), None)
   scale = next((float(x.arg) for x in val.src if x.op is Ops.CONST), None)
   if logarithm is None or scale is None or not math.isclose(scale, math.log(2)/2): return None
@@ -4254,6 +4254,13 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, negative_selected, (negative_magnitude, 0), (negative, 0), Ops.MUL),
                 _emit_where_stage(total, info.outs[0], (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
   return tuple(tasks)
+
+def _try_fp32_atanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Keep exact normal-fp32 atanh out of the half-buffer two-LUT implementation."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float or (source := _try_atanh(store.src[1])) is None: return None
+  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
 def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Two-LUT atanh with explicit ±1 infinity and out-of-domain NaN handling."""
@@ -13543,6 +13550,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
   if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
   if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
+  if (fp32_atanh_tasks := _try_fp32_atanh_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_atanh_tasks)
   if (atanh_tasks := _try_atanh_subtasks(sink)) is not None: return build_native_program_multi(sink, atanh_tasks)
   if (asinh_acosh_tasks := _try_asinh_acosh_subtasks(sink)) is not None: return build_native_program_multi(sink, asinh_acosh_tasks)
   if (fp32_sinh_cosh_tasks := _try_fp32_sinh_cosh_host_subtasks(sink)) is not None:
