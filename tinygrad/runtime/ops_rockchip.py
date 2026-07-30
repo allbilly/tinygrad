@@ -23,7 +23,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
-  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT,
+  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
@@ -92,6 +92,18 @@ def _convert_fp16_to_fp32_buf(src, dst, n):
   import numpy as np
   arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.float32)
   ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
+
+def _run_host_fp32_combine(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Decode an NPU-produced high half and x256 residual half into fp32 ABI storage."""
+  import numpy as np
+  total, tag = task.layout
+  assert tag == _HOST_FP32_COMBINE_LAYOUT and len(relocs) == 3
+  output, high_buf, low_buf = (bufs[r.globals_slot] for r in relocs)
+  high = np.frombuffer(ctypes.string_at(high_buf.va_addr, total*2), dtype=np.float16).astype(np.float32)
+  low = np.frombuffer(ctypes.string_at(low_buf.va_addr, total*2), dtype=np.float16).astype(np.float32)
+  with np.errstate(invalid="ignore"):
+    result = np.where(np.isfinite(high), high+low/256.0, high).astype(np.float32)
+  ctypes.memmove(output.va_addr, result.ctypes.data, total*4)  # type: ignore[arg-type]
 
 def _convert_bool_to_fp16_buf(src, dst, n):
   import numpy as np
@@ -1369,6 +1381,10 @@ class RockchipProgram(Program['RockchipDevice']):
               _run_host_static_select_int(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
               _run_host_half_int(task, st.relocs, tuple(ext))
+            elif len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
+              _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+            elif len(task.layout) > 1 and task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+              _run_host_fp32_combine(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))

@@ -7532,6 +7532,54 @@ workaround.  Its reported `25.59` and `409.50` follow exactly from
 `fp16(0.1)=0.0999755859375`; the issue has no maintainer response, patch, or
 evidence of extra accumulator drift.
 
+## 2026-07-30 — compensated direct fp32 ADD milestone
+
+The resumed normal-default census passed five methods through ACOSH and then
+stopped at plain `TestOps.test_add`: **292/3060** values missed tolerance,
+with maximum absolute error **0.00103188**.  The old single DPU task rounded
+both fp32 inputs to fp16, added them, and widened the fp16 result.  Relative
+error was especially visible when the two inputs nearly cancelled.
+
+The strict new matcher accepts only a root ADD of two direct contiguous fp32
+buffers with the same physical size and fp32 output.  Each input is decoded
+into the established ABI pair:
+
+```text
+hi = fp16(x)
+lo = fp16(256*(x-float32(hi)))
+```
+
+Nine DPU stages use error-free TwoSum structure on the high limbs, add the
+two low limbs, and keep the final error in the x256 domain:
+
+```text
+s  = fl(ahi+bhi)
+bb = fl(s-ahi)
+e  = fl(fl(ahi-fl(s-bb)) + fl(bhi-bb))
+lo = fl(fl(alo+blo) + fl(256*e))
+```
+
+The final host step only decodes the NPU-produced `(s,lo)` representation
+into fp32 ABI storage as `float32(s)+float32(lo)/256`.  It never reads the
+original operands and does not evaluate ADD on their behalf.  This is the
+output counterpart of the already permitted fp32 high/residual input
+conversion.
+
+Pure fp16-stage simulation of the official tensor reduced the old 292
+misses to zero, with maximum absolute error `7.1525574e-7`.  Hardware
+validation with `. .venv/bin/activate`:
+
+- unchanged normal-default `test_add` + `test_tiny_add`:
+  **2 passed in 3.42 seconds**;
+- full hardware-free planner/codec contract: **86/86 in 6.74 seconds**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+Nested three-input ADD, broadcast ADD, and SUB remain separate matchers and
+are not claimed by this milestone.  Issue #471 again explains why retaining
+the fp32 residual is necessary, but it supplies neither TwoSum nor an output
+representation strategy.
+
 ## 2026-07-30 — logarithmic long cumulative products
 
 The unchanged forward-only `TestOps.test_simple_cumprod` now passes both

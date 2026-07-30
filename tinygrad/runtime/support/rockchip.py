@@ -199,6 +199,7 @@ _HOST_STATIC_SELECT_INT_LAYOUT = -1022  # interleave native int32 atoms by compi
 _HOST_HALF_INT_LAYOUT = -1023  # typed fp16-to-int32 ABI boundary after NPU selection
 _HOST_FP32_HALF_LAYOUT = -1024  # nearest-fp16 representation view of an fp32 ABI buffer
 _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of an fp32 ABI buffer
+_HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -10760,6 +10761,57 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
   return tuple(tasks)
 
+def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Add two direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
+  val = _unwrap(store.src[1])
+  if val.op is not Ops.ADD or val.dtype is not dtypes.float or len(val.src) != 2: return None
+  sources = tuple(_unwrap(x) for x in val.src)
+  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM or
+         not _is_flat_contiguous(x.src[1]) for x in sources) or not _is_flat_contiguous(store.src[0].src[1]): return None
+  total = prod(_shape_of_store(sink))
+  if any(int(x.src[0].src[0].arg) != total for x in sources): return None
+
+  info = ProgramInfo.from_sink(sink)
+  next_slot = max(info.globals, default=-1)+1
+  tasks:list[RKSubTask] = []
+  def alloc() -> int:
+    nonlocal next_slot
+    ret, next_slot = next_slot, next_slot+1
+    return ret
+  def view(source_slot:int, tag:int) -> int:
+    out = alloc()
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag), out, is_copy=True), relocs))
+    return out
+  def stage(a:int, b:int, op:Ops) -> int:
+    out = alloc()
+    tasks.append(_emit_where_stage(total, out, (a, 0), (b, 0), op))
+    return out
+
+  limbs = tuple((view(x.src[0].arg.slot, _HOST_FP32_HALF_LAYOUT),
+                 view(x.src[0].arg.slot, _HOST_FP32_RESIDUAL_LAYOUT)) for x in sources)
+  high = stage(limbs[0][0], limbs[1][0], Ops.ADD)
+  rounded_b = stage(high, limbs[0][0], Ops.SUB)
+  high_minus_rounded_b = stage(high, rounded_b, Ops.SUB)
+  error_a = stage(limbs[0][0], high_minus_rounded_b, Ops.SUB)
+  error_b = stage(limbs[1][0], rounded_b, Ops.SUB)
+  high_error = stage(error_a, error_b, Ops.ADD)
+  input_low = stage(limbs[0][1], limbs[1][1], Ops.ADD)
+  scaled_high_error = alloc()
+  tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
+                                 (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
+  low = stage(input_low, scaled_high_error, Ops.ADD)
+
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high, 0, 0, 0xFFFFFFFF),
+            RKReloc(0, low, 0, 0, 0xFFFFFFFF))
+  tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_COMBINE_LAYOUT),
+                                     info.outs[0], is_copy=True), relocs))
+  return tuple(tasks)
+
 def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run a small direct fp32 matrix product through typed half CMAC views."""
   store, reduce = _store_node(sink), _reduce_node(sink)
@@ -12067,6 +12119,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, movement_sum_tasks)
   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, elementwise_sum_tasks)
+  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_add_tasks)
   if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_cmac_tasks)
   # Retain the half-input WIP above for reference. The active path is narrower:

@@ -1481,3 +1481,24 @@ input limb, but it contains no accumulator fix or LUT tuning information.
 
 The next normal-default `FORWARD_ONLY=1` census starts after the now-passing
 ACOSH group.
+
+### Compensated direct fp32 ADD milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_add` + `test_tiny_add` | **2 passed in 3.42s** |
+| first official tensor before compensation | **292/3060 misses** |
+| fp16-stage TwoSum model | **0 misses, max abs 7.15e-7** |
+| full hardware-free planner/codec contract | **86/86 in 6.74s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Direct contiguous two-buffer fp32 ADD now uses high and x256-residual input
+views, nine NPU TwoSum/correction stages, and an fp32 ABI decode of the
+NPU-produced high/residual result.  Host code does not read or add the
+original operands.
+
+The matcher deliberately excludes nested ADD, broadcasting, scalar
+constants, and SUB.  Constant-folded `1+0.5` still passes through its
+existing fill path.  The next census should therefore treat `test_add3`,
+broadcast ADD, and SUB as independent extensions rather than assuming this
+milestone covers them.
