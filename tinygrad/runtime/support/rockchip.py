@@ -10943,10 +10943,46 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   scratch_slot = max(info.globals, default=-1) + 1
   if source_slot >= 7: return None
   source_total, output_total = int(source.src[0].src[0].arg), prod(_shape_of_store(sink))
-  if source_total > 16: return None
+  if source_total > 256: return None
   tasks:list[RKSubTask] = []
 
   device = store.src[0].src[0].device
+  if source_total > 16:
+    next_slot = scratch_slot
+    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    high_slot, low_slot = next_slot, next_slot+1
+    next_slot += 2
+    for out_slot, layout_tag in ((high_slot, _HOST_FP32_HALF_LAYOUT), (low_slot, _HOST_FP32_RESIDUAL_LAYOUT)):
+      host_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", (source_total, layout_tag),
+                                              out_slot, is_copy=True), host_relocs))
+
+    def cmac_sum(input_slot:int) -> int|None:
+      nonlocal next_slot
+      out_slot, next_slot = next_slot, next_slot+1
+      converted_param = UOp.param(input_slot, dtypes.half, (source_total,), device=device)
+      converted_index = source.replace(dtype=dtypes.half, src=(converted_param, *source.src[1:]))
+      converted_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (converted_index,), arg=dtypes.float), *reductions))
+      out_param = UOp.param(out_slot, dtypes.half, (output_total,), device=device)
+      out_index = store.src[0].replace(dtype=dtypes.half, src=(out_param, *store.src[0].src[1:]))
+      stage_store = store.replace(src=(out_index, UOp(Ops.CAST, dtypes.half, (converted_reduce,), arg=dtypes.half)))
+      stage_plan = plan_rk(sink.substitute({store:stage_store}))
+      if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+      if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+      elif (rounding_tasks := _try_cmac_rounding_subtasks(stage_plan)) is not None: tasks.extend(rounding_tasks)
+      else:
+        cmds, task, relocs = emit_rk(stage_plan)
+        tasks.append(RKSubTask(cmds, task, relocs))
+      return out_slot
+
+    high_sum, low_sum = cmac_sum(high_slot), cmac_sum(low_slot)
+    if high_sum is None or low_sum is None: return None
+    correction, next_slot = next_slot, next_slot+1
+    tasks.append(_emit_where_stage(output_total, correction, (low_sum, 0),
+                                   (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1/256))[0]), Ops.MUL))
+    tasks.append(_emit_where_stage(output_total, info.outs[0], (high_sum, 0), (correction, 0), Ops.ADD, fp32_output=True))
+    return tuple(tasks)
+
   converted_param = UOp.param(source_slot, dtypes.half, (source_total,), device=device)
   converted_index = source.replace(dtype=dtypes.half, src=(converted_param, *source.src[1:]))
   converted_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (converted_index,), arg=dtypes.float), *reductions))

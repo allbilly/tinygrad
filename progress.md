@@ -7470,6 +7470,46 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — normal-fp32 direct einsum sum milestone
+
+The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
+input, is now native. Direct fp32 sums through 256 lanes are represented as
+two fp16 limbs:
+
+```text
+x = high + residual / 256
+sum(x) = CMAC(high) + CMAC(residual) / 256
+```
+
+The two fp32-to-fp16 transformations are existing host ABI representation
+conversions only. Both reductions and the correction arithmetic execute on
+CMAC/DPU. Four deterministic 192-element seeds passed normal-fp32 tolerance;
+the permanent regression uses seed 0.
+
+The full unchanged `TestOps.test_einsum` now proceeds through scalar,
+transpose, ordinary reductions, matrix/vector products, outer products, and
+batched matrix products. Its next failure is the much larger contraction
+`pqrs,tuqvr->pstuv`: reduction K is 40 and output size is 30,030, while the
+small fp32 CMAC matcher currently rejects source or output tensors above 256
+lanes as `unsupported_layout`.
+
+Rechecking `allbilly/rk3588/conv_grok` identified the right next direction:
+its successful formula-only planner derives CBUF-safe M/Y and output-channel
+tiles from row bytes and available banks, then emits independent native
+tiles into output offsets. Our materialized CMAC runtime already has M/N/K
+tiling analogous to that planner; the next fix should remove the artificial
+whole-tensor gate while retaining the existing CBUF-derived tile sizes. No
+new CONV register program or host operator arithmetic is required.
+
+No LUT change is involved in this milestone.
+
+Validation with `. .venv/bin/activate`:
+
+- permanent RK3588 fp32 two-limb sum: **1 passed in 1.52 seconds**;
+- hardware-free planner/runtime contract: **99/99 in 5.65 seconds**;
+- Python compilation and `git diff --check`: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
 ## 2026-07-30 — normal-fp32 stable argsort
 
 The unchanged forward-only `TestOps.test_argsort` now passes its

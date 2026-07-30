@@ -312,6 +312,17 @@ class TestClassifier(unittest.TestCase):
     self.assertTrue(subtasks[0].task.fp32_inputs)
     self.assertTrue(subtasks[-1].task.fp32_output)
 
+  def test_large_fp32_sum_uses_two_limb_cmac_boundary(self):
+    sink = _get_sink(Tensor.empty(4,6,8, dtype=dtypes.float, device="ROCKCHIP").sum())
+    program = build_native_program(sink)
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
+    self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
+    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
+    self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
+    self.assertTrue(subtasks[-1].task.fp32_output)
+
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")

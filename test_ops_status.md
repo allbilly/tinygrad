@@ -1713,3 +1713,25 @@ No LUT change was involved. `test_sort` is resolved; continue with
 Topk values/indices, largest/smallest, axis selection, padding, duplicate
 stability, and exception behavior all pass through the exact sort path. No
 new code or LUT change was needed. Continue the census after `test_topk`.
+
+### Normal-fp32 einsum census
+
+| Case group | Status |
+|---|---:|
+| scalar / transpose / ordinary sum / matvec / matmul / outer / batched matmul | pass through first large contraction |
+| `einsum('ijk->')`, `(4,6,8)` fp32 direct sum | fixed with two-limb CMAC sum |
+| `einsum('pqrs,tuqvr->pstuv')` | next failure: `unsupported_layout` |
+
+The direct 192-element sum uses NPU CMAC for both high and residual limbs,
+then NPU DPU correction and fp32 reconstruction. Host work is limited to the
+established fp32 ABI limb views.
+
+The next contraction has K=40 and 30,030 outputs. `conv_grok` confirms that
+large geometries should be split by CBUF-derived M/N tiles rather than
+rejected by total tensor size. The existing materialized CMAC path already
+implements that tiled shape, so the next milestone is to generalize the
+fp32 wrapper around it.
+
+Permanent RK3588 numerical coverage passes, and the hardware-free
+planner/runtime contract is **99/99**. Mypy remains at the exact pre-existing
+13-error Rockchip baseline.
