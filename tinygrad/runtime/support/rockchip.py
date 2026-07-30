@@ -11614,7 +11614,7 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     negative_tiles, magnitude_tiles, nonzero_tiles = (alloc(), alloc()), (alloc(), alloc()), (alloc(), alloc())
     combined_tile, zero_tile = alloc(), alloc()
     host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
-    tile = 32768
+    tile = 262144
     for start in range(0, input_total, tile):
       count = min(tile, input_total-start)
       for limb, tag in ((high_tile, _HOST_FP32_HALF_LAYOUT), (low_tile, _HOST_FP32_RESIDUAL_LAYOUT)):

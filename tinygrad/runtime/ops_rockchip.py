@@ -1368,6 +1368,9 @@ class RockchipProgram(Program['RockchipDevice']):
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
+        # Rejected WIP: an additional reset here did not prevent the known
+        # all_large -> comparison stress-order timeout.
+        # dev.reset_npu()
       return
     # Native fp16->int32 writes use four-lane aligned atoms. Their source pack
     # happens after the preceding DPU selection chain, so preserve subtask
@@ -1868,3 +1871,6 @@ class RockchipDevice(Compiled):
 
   def reset_npu(self):
     rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, __payload=rk.struct_rknpu_action(flags=rk.RKNPU_ACT_RESET, value=0))
+    # Rejected WIP: a 1 ms settle delay after every reset did not prevent the
+    # known all_large -> comparison stress-order timeout.
+    # time.sleep(0.001)
