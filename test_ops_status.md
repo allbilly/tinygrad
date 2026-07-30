@@ -2146,3 +2146,9 @@ for the final result. The exact canonical `2*(x*x)` topology uses one
 serialized fp32 task because an fp16 intermediate missed the unchanged
 tolerance in 31/2925 lanes. No LUT changed. Contract: **124/124**. Next
 forward group: `TestOps.test_flip_eye_crash`.
+
+### Flipped-eye matmul crash validation
+
+`TestOps.test_flip_eye_crash`: **pass in 3.49s** unchanged. The flipped
+identity-matrix matmul completes without the historical crash. No code or
+LUT change was needed. Next forward group: `TestOps.test_broadcast_full`.

@@ -9559,3 +9559,11 @@ unchanged `rtol=0.001` in 31/2925 lanes. A strict matcher for only the exact
 canonical topology therefore evaluates it inside the existing serialized
 fp32 boundary. No LUT or runtime ABI changed. Mypy remains at the exact
 12-error baseline. Next forward group: `TestOps.test_flip_eye_crash`.
+
+## 2026-07-30 — flipped-eye matmul validation
+
+The unchanged `TestOps.test_flip_eye_crash` case passes in **3.49s**. This
+validates `eye(10) @ flip(eye(10), axis=0)` without reproducing its historical
+crash. No code, host boundary, runtime ABI, or LUT change was needed.
+
+Next forward group: `TestOps.test_broadcast_full`.
