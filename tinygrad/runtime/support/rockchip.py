@@ -9371,6 +9371,53 @@ def _try_normalize_norm_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
 
+def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float: return None
+  value = _unwrap(store.src[1])
+  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+  if len(reductions) != 1 or reductions[0].dtype is not dtypes.float or \
+     reductions[0].arg[0] not in (Ops.ADD, Ops.MAX) or not reductions[0].src[1:] or \
+     any(axis.src[0].op is not Ops.CONST for axis in reductions[0].src[1:]): return None
+  nodes = value.toposort()
+  counts = (sum(u.op is Ops.EXP2 for u in nodes), sum(u.op is Ops.LOG2 for u in nodes),
+            sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes),
+            sum(u.op is Ops.CMPNE for u in nodes), value.op, reductions[0].arg[0])
+  if counts not in ((0,0,3,1,1,Ops.REDUCE,Ops.MAX), (1,1,1,1,0,Ops.ADD,Ops.ADD)): return None
+  indexes = list(dict.fromkeys(u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM))
+  if not indexes: return None
+  if counts[0]:
+    constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float]
+    if not any(math.isclose(constant, math.log2(math.e), rel_tol=1e-12) for constant in constants) or \
+       not any(math.isclose(constant, math.log(2.0), rel_tol=1e-12) for constant in constants): return None
+  allowed = {Ops.REDUCE, Ops.EXP2, Ops.LOG2, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CAST,
+             Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+
+  def expand(u:UOp) -> UOp:
+    if u.op is Ops.REDUCE:
+      ranges = u.src[1:]
+      extents = [int(r.src[0].arg) for r in ranges]
+      terms:list[UOp] = []
+      for linear in range(prod(extents)):
+        rem, fixed = linear, {}
+        for axis in range(len(ranges)-1, -1, -1):
+          rem, coordinate = divmod(rem, extents[axis])
+          fixed[ranges[axis]] = UOp.const(ranges[axis].dtype, coordinate)
+        terms.append(expand(u.src[0].substitute(fixed)))
+      if not terms: raise ValueError("empty logcumsumexp reduction")
+      result = terms[0]
+      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
+      return result
+    new_src = tuple(expand(x) for x in u.src)
+    return u if new_src == u.src else u.replace(src=new_src)
+
+  try: expanded_value = expand(store.src[1])
+  except (TypeError, ValueError, OverflowError): return None
+  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
+  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+
 def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Unroll the static integer reductions used to choose max-pool indices."""
   store = _store_node(sink)
@@ -13489,6 +13536,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
   if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
+  if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, logcumsumexp_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

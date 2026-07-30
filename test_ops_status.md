@@ -2079,3 +2079,14 @@ Exact rowwise and full-vector `max + log(sum(exp(x-max)))` signatures reuse
 the strict serialized fp32 evaluator; the full-vector form safely expands
 both fused reductions. No LUT or runtime ABI changed. Next forward group:
 `TestOps.test_logcumsumexp`.
+
+### Normal-fp32 logcumsumexp
+
+| Group | Status |
+|---|---:|
+| `test_logcumsumexp` (nine cases) | **pass in 79.41s** |
+| hardware-free Rockchip contract | **120/120** |
+
+Exact masked prefix-MAX and prefix-exp-sum signatures use bounded static
+expansion in the serialized fp32 evaluator. No LUT or runtime ABI changed.
+Next forward group: `TestOps.test_logcumsumexp_numerical`.

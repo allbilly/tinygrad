@@ -9440,3 +9440,24 @@ scheduled fp32 buffer, and all prior exp/max constants and opcode gates.
 
 No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_logcumsumexp`.
+
+## 2026-07-30 — normal-fp32 logcumsumexp milestone
+
+The unchanged nine-case `TestOps.test_logcumsumexp` group passes in
+**79.41s**, covering axes 0/1/2/3, ranks 0 through 4, vectors, and scalars.
+The hardware-free Rockchip contract is **120/120 in 7.03s**.
+
+Tinygrad schedules non-scalar logcumsumexp as two masked prefix reductions.
+The first is a prefix MAX with three WHEREs, one CMPLT, and one CMPNE. The
+second is the matching prefix ADD over EXP2 followed by LOG2/ln(2), with one
+WHERE and one CMPLT. `_try_logcumsumexp_host_subtasks` requires exactly these
+two signatures, static ranges, direct fp32 inputs, and only their measured
+opcode families.
+
+Each bounded prefix reduction is statically expanded inside the existing
+typed fp32 evaluator. This is heavier than ordinary logsumexp because every
+output owns a prefix, but remains bounded by the official axis length and
+avoids a new runtime ABI. Scalar cases retain their existing simplified path.
+No LUT changed; mypy remains at the exact 12-error baseline.
+
+Next forward group: `TestOps.test_logcumsumexp_numerical`.

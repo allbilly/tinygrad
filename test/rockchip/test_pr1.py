@@ -424,6 +424,17 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp32_logcumsumexp_stages_use_strict_serialized_reductions(self):
+    expression = Tensor.empty(6,6,6, dtype=dtypes.float, device="ROCKCHIP").logcumsumexp(2)
+    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+    programs = [build_native_program(sink) for sink in sinks]
+    self.assertEqual(len(programs), 2)
+    for program in programs:
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
