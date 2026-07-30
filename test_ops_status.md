@@ -1656,3 +1656,26 @@ only the final logical output.
 
 The previous ArgMax entry is resolved. Resume the normal-default census
 after `test_argmin`; no LUT change was involved.
+
+### Normal-fp32 stable argsort milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_argsort` | **1 passed in 66.23s** |
+| permanent fp16+fp32 stable/duplicate hardware case | **1 passed in 24.75s** |
+| hardware-free planner/codec contract | **98/98 in 5.42s** |
+
+The argsort occurrence-count, bitonic compare/swap, and final selected-index
+lowerings now accept fp32 inputs. Four-byte static gathers are immediately
+converted through the existing fp32 ABI; operator arithmetic and stable
+selection stay on the NPU.
+
+The final mixed float/int kernel originally reserved its fp32 gather after
+native-int scratch and received slot 15. Version-4 encodes fp32 input types
+only for slots below 7, producing mostly zero indices despite successful
+matcher classification. Reserving that reusable gather first keeps it in
+slot 5; the permanent pipeline test asserts that every fp32 argsort typed
+slot is encodable.
+
+No LUT change was needed. Continue the normal-default census after
+`test_argsort`; sort/topk are related but are not claimed by this milestone.

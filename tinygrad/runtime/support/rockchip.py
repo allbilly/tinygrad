@@ -8944,13 +8944,13 @@ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
 def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower bitonic sort's static MAX/MIN lane choice without host value comparisons."""
   store = _store_node(sink)
-  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _reduce_node(sink) is not None: return None
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float, dtypes.int) or _reduce_node(sink) is not None: return None
   value = _unwrap(store.src[1])
   if value.op is not Ops.WHERE or any(u.op is Ops.INDEX for u in value.src[0].toposort()): return None
 
   def inverted(u:UOp) -> UOp|None:
     u = _unwrap(u)
-    inverse_op = Ops.MUL if store.src[0].dtype is dtypes.half else Ops.XOR
+    inverse_op = Ops.MUL if store.src[0].dtype in (dtypes.half, dtypes.float) else Ops.XOR
     if u.op is not inverse_op: return None
     for operand, inverse in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
       if inverse.op is Ops.CONST and int(inverse.arg) == -1: return _unwrap(operand)
@@ -9075,14 +9075,21 @@ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", convert_layout, out_slot, is_copy=True), convert_relocs))
     return tuple(tasks)
 
+  float_gather_slot = alloc() if store.src[0].dtype is dtypes.float else None
   gathered:list[int] = []
   for source_slot, mapping in zip(source_slots, mappings):
-    gathered_slot = alloc()
-    gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 2, *mapping)
+    gathered_slot = float_gather_slot if float_gather_slot is not None else alloc()
+    gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 4 if float_gather_slot is not None else 2, *mapping)
     gather_relocs = (RKReloc(0, gathered_slot, 0, 0, 0xFFFFFFFF),
                      RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered_slot, is_copy=True), gather_relocs))
-    gathered.append(gathered_slot)
+    if float_gather_slot is not None:
+      converted = alloc()
+      tasks.append(_emit_where_stage(total, converted, (gathered_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                     fp32_inputs=(gathered_slot,)))
+      gathered.append(converted)
+    else:
+      gathered.append(gathered_slot)
   maximum = alloc()
   tasks.append(_emit_where_stage(total, maximum, (gathered[0], 0), (gathered[1], 0), Ops.MAX))
   negative:list[int] = []
@@ -9096,18 +9103,23 @@ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(total, maximum_negative, (negative[0], 0), (negative[1], 0), Ops.MAX))
   tasks.append(_emit_where_stage(total, minimum_warm, (maximum_negative, 0), minus_one, Ops.MUL))
   tasks.append(_emit_where_stage(total, minimum, (maximum_negative, 0), minus_one, Ops.MUL))
+  selected_slot = out_slot
   if all(choose_max) or not any(choose_max):
     selected = maximum if all(choose_max) else minimum
-    tasks.append(_emit_where_stage(total, out_slot, (selected, 0), (_ZERO_SLOT, 0), Ops.ADD))
+    if store.src[0].dtype is dtypes.float: selected_slot = selected
+    else: tasks.append(_emit_where_stage(total, out_slot, (selected, 0), (_ZERO_SLOT, 0), Ops.ADD))
   else:
     # WIP reference: arithmetic selection used
     #   minimum + static_mask * (maximum-minimum)
     # but a padded sort lane can be -inf, making the unselected 0*inf term NaN.
     # The choice is compile-time wire topology, so interleave the already
     # NPU-computed extrema as representation-preserving layout work.
+    selected_slot = alloc() if store.src[0].dtype is dtypes.float else out_slot
     select_layout = (total, _HOST_STATIC_SELECT_HALF_LAYOUT, *(int(selected) for selected in choose_max))
-    select_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, maximum, minimum))
-    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", select_layout, out_slot, is_copy=True), select_relocs))
+    select_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (selected_slot, maximum, minimum))
+    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", select_layout, selected_slot, is_copy=True), select_relocs))
+  if store.src[0].dtype is dtypes.float:
+    tasks.append(_emit_where_stage(total, out_slot, (selected_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
   return tuple(tasks)
 
 def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -9134,11 +9146,12 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   any(x.op is Ops.CONST and x.dtype is dtypes.bool and bool(x.arg) for x in u.src)]
     if len(equalities) != 1: return None
     pair = tuple(_unwrap(x) for x in inequality.src)
-    if pair[0].dtype is not pair[1].dtype or pair[0].dtype not in (dtypes.half, dtypes.int) or \
+    if pair[0].dtype is not pair[1].dtype or pair[0].dtype not in (dtypes.half, dtypes.float, dtypes.int) or \
        any(x.src[0].op is not Ops.PARAM for x in pair): return None
     equality_pairs.append((equalities[0], (pair[0], pair[1])))
   pair_dtypes = tuple(pair[0].dtype for _, pair in equality_pairs)
-  if set(pair_dtypes) == {dtypes.half, dtypes.int}: value_pair_index = pair_dtypes.index(dtypes.half)
+  if set(pair_dtypes) in ({dtypes.half, dtypes.int}, {dtypes.float, dtypes.int}):
+    value_pair_index = next(i for i, dtype in enumerate(pair_dtypes) if dtype is not dtypes.int)
   elif pair_dtypes == (dtypes.int, dtypes.int): value_pair_index = 0
   else: return None
   static_body = body.substitute({equality:UOp.const(dtypes.bool, True) for equality, _ in equality_pairs})
@@ -9219,6 +9232,10 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, result, is_copy=True), unpack_relocs))
     return result
 
+  # Keep the reusable fp32 gather in the first available global slot.  The
+  # version-4 task header can encode fp32 input typing only for slots 0..6;
+  # native-int conversion scratch below may otherwise push it out of range.
+  float_gather_slot = alloc() if any(index.dtype is dtypes.float for index in flat_indexes) else None
   converted_int_slots:dict[int,int] = {}
   for index, source_slot, source_total in zip(flat_indexes, source_slots, source_totals):
     if index.dtype is dtypes.int and source_slot not in converted_int_slots:
@@ -9230,12 +9247,21 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     gathered:list[int] = []
     for index, source_slot, address_map in zip(flat_indexes, source_slots, selected_maps):
       effective_slot = converted_int_slots[source_slot] if index.dtype is dtypes.int else source_slot
-      gathered_slot = alloc()
-      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 2, *address_map)
+      if index.dtype is dtypes.float:
+        assert float_gather_slot is not None
+        gathered_slot = float_gather_slot
+      else: gathered_slot = alloc()
+      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 4 if index.dtype is dtypes.float else 2, *address_map)
       gather_relocs = (RKReloc(0, gathered_slot, 0, 0, 0xFFFFFFFF),
                        RKReloc(0, effective_slot, 0, 0, 0xFFFFFFFF))
       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered_slot, is_copy=True), gather_relocs))
-      gathered.append(gathered_slot)
+      if index.dtype is dtypes.float:
+        converted_float = alloc()
+        tasks.append(_emit_where_stage(total, converted_float, (gathered_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                       fp32_inputs=(gathered_slot,)))
+        gathered.append(converted_float)
+      else:
+        gathered.append(gathered_slot)
     value_distance, count_equal = None, None
     for pair_index, (left, right) in enumerate(((gathered[0], gathered[1]), (gathered[2], gathered[3]))):
       forward, reverse, distance = alloc(), alloc(), alloc()
@@ -9323,7 +9349,7 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if len(equalities) != 1: return None
   equality = equalities[0]
   indexes = tuple(_unwrap(x) for x in inequality.src)
-  if indexes[0].dtype is not indexes[1].dtype or indexes[0].dtype not in (dtypes.half, dtypes.int) or \
+  if indexes[0].dtype is not indexes[1].dtype or indexes[0].dtype not in (dtypes.half, dtypes.float, dtypes.int) or \
      any(x.src[0].op is not Ops.PARAM for x in indexes): return None
   static_body = body.substitute({equality:UOp.const(dtypes.bool, True)})
   if any(u.op is Ops.INDEX for u in static_body.toposort()): return None
@@ -9405,6 +9431,7 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     for source_slot, source_total in zip(source_slots, source_totals):
       if source_slot not in converted: converted[source_slot] = native_int_to_half(source_slot, source_total)
     effective_slots = tuple(converted[source_slot] for source_slot in source_slots)
+  float_gather_slot = alloc() if indexes[0].dtype is dtypes.float else None
 
   masks:list[int] = []
   one = (_CONST_SLOT, 0x3f800000)
@@ -9412,12 +9439,18 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if not any(valid_map): continue
     gathered:list[int] = []
     for source_slot, mapping in zip(effective_slots, (left_map, right_map)):
-      gathered_slot = alloc()
-      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 2, *mapping)
+      gathered_slot = float_gather_slot if float_gather_slot is not None else alloc()
+      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 4 if float_gather_slot is not None else 2, *mapping)
       gather_relocs = (RKReloc(0, gathered_slot, 0, 0, 0xFFFFFFFF),
                        RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered_slot, is_copy=True), gather_relocs))
-      gathered.append(gathered_slot)
+      if float_gather_slot is not None:
+        converted_float = alloc()
+        tasks.append(_emit_where_stage(total, converted_float, (gathered_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+                                       fp32_inputs=(gathered_slot,)))
+        gathered.append(converted_float)
+      else:
+        gathered.append(gathered_slot)
     forward, reverse, distance, unequal, equal_warm, equal = (alloc() for _ in range(6))
     tasks.append(_emit_where_stage(total, forward, (gathered[0], 0), (gathered[1], 0), Ops.SUB))
     tasks.append(_emit_where_stage(total, reverse, (gathered[1], 0), (gathered[0], 0), Ops.SUB))

@@ -671,6 +671,16 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(len(set(typed_slots)), 1)
     self.assertIsNotNone(build_native_program(sinks[1]))
 
+  def test_fp32_argsort_keeps_typed_gathers_in_encodable_slots(self):
+    x = Tensor.rand(1,8,2, dtype=dtypes.float).realize()
+    sinks = [c.src[0] for c in x.argsort(1, True).schedule_linear().src if c.src[0].op is Ops.SINK]
+    programs = [build_native_program(sink) for sink in sinks]
+    self.assertTrue(all(program is not None for program in programs))
+    typed_slots = [slot for program in programs if program is not None
+                   for st in program.src[1].src[0].arg for slot in st.task.fp32_inputs]
+    self.assertTrue(typed_slots)
+    self.assertLess(max(typed_slots), 7)
+
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()
     b = Tensor.rand(5000,dtype=dtypes.half).realize()

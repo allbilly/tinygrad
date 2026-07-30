@@ -124,11 +124,12 @@ class TestDPU(unittest.TestCase):
   def test_dpu_argsort_stable(self):
     # Close fp16 values exercise the few-ULP roundoff of DPU bitonic
     # compare/swap, while the explicit duplicate checks stable occurrence IDs.
-    values = np.random.default_rng(0).uniform(-2, 2, size=(1,8,2)).astype(np.float16)
-    values[0,6,0] = values[0,1,0]
-    actual = Tensor(values, device="ROCKCHIP").argsort(1, True).realize().numpy()
-    expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
-    np.testing.assert_array_equal(actual, expected)
+    for dtype in (np.float16, np.float32):
+      values = np.random.default_rng(0).uniform(-2, 2, size=(1,8,2)).astype(dtype)
+      values[0,6,0] = values[0,1,0]
+      actual = Tensor(values, device="ROCKCHIP").argsort(1, True).realize().numpy()
+      expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
+      np.testing.assert_array_equal(actual, expected)
 
   def test_dpu_topk_padded_sort(self):
     # Non-power-of-two half sorting uses -inf padding without 0*inf blending.

@@ -7470,6 +7470,69 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — normal-fp32 stable argsort
+
+The unchanged forward-only `TestOps.test_argsort` now passes its
+`(8,8,6)`, axis-1, descending, stable fp32 case. The fp16 implementation
+already had three strict argsort lowerings: stable occurrence counting,
+bitonic compare/swap, and final value/count-to-index reconstruction. Normal
+fp32 previously stopped at the first equality reduction with
+`unsupported_dtype`.
+
+All three lowerings now accept fp32 source values. Static host tasks only
+gather exact four-byte representations and perform fixed layout movement.
+Each gathered fp32 vector is immediately converted at the established ABI
+boundary; comparisons, absolute-distance scoring, stable occurrence masks,
+candidate selection, and integer result construction remain NPU tasks.
+Fp32 compare/swap writes its final logical value through the existing
+fp16-to-fp32 ABI conversion.
+
+The first complete run produced mostly zero indices even though every
+argsort matcher fired. `ROCKCHIP_DEBUG_SUBTASKS=1` showed the cause:
+
+- occurrence-count and compare/swap reused typed gather slot 2;
+- the mixed float/int selected-index kernel allocated native-int conversion
+  scratch first, pushing its fp32 gather to slot 15;
+- version-4 serializes `fp32_inputs` only for slots 0 through 6, so slot 15
+  silently lost its type and the DPU interpreted fp32 bytes as fp16.
+
+The selected-index lowering now reserves its reusable fp32 gather before
+allocating integer scratch. It therefore uses slot 5 in the permanent
+pipeline probe, and every other argsort typed gather uses slot 2. The ordered
+mixed runner flushes each conversion before the reusable gather is
+overwritten.
+
+Useful debug sequence:
+
+1. use `ROCKCHIP_DEBUG_ARGSORT=1`; an fp32 axis-1 case must print one
+   `RK_ARGSORT_INDEX`, the bitonic `RK_ARGSORT_COMPARE` stages, and one
+   `RK_ARGSORT_SELECTED`;
+2. use `ROCKCHIP_DEBUG_SUBTASKS=1` and inspect every nonempty
+   `task.fp32_inputs`; the maximum slot must be below 7;
+3. if the result is structurally wrong or mostly zero, diagnose metadata and
+   representation conversion before tuning comparison precision;
+4. if only close distinct fp32 values exchange order, compare their fp16
+   high limbs. That is a future two-limb comparison problem, not a LUT
+   problem and not justification for host sorting;
+5. retain duplicate values in the probe so stable occurrence IDs and final
+   index reconstruction are exercised.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- small explicit fp32 axis case: exact match with NumPy stable argsort;
+- unchanged `TestOps.test_argsort`: **1 passed in 66.23 seconds**;
+- permanent fp16+fp32 duplicate-stability hardware regression:
+  **1 passed in 24.75 seconds**;
+- hardware-free planner/codec contract: **98/98 in 5.42 seconds**,
+  including a full fp32 argsort pipeline typed-slot assertion.
+
+No LUT table or two-task LUT schedule changed. A two-level LUT would not
+solve ordering of close fp32 values; if that boundary is exposed by a future
+test, use a high/residual two-limb NPU comparison. Resume the normal-fp32
+census after `test_argsort`, with `test_sort`/`test_topk` as the adjacent
+families.
+
 ## 2026-07-30 — compensated fp32 MUL milestone
 
 Normal-default forward-only `TestOps.test_mul`, `test_scalar_mul`,
