@@ -1,0 +1,164 @@
+From 262622ff08664d07689ceb794741f288f425f0b9 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 21:01:52 +0800
+Subject: [PATCH] rockchip: pass tensor scatter reductions
+
+---
+ progress.md                          | 27 ++++++++++++++++
+ test/rockchip/test_pr1.py            | 18 +++++++++++
+ test_ops_status.md                   | 13 ++++++++
+ tinygrad/runtime/support/rockchip.py | 46 ++++++++++++++++++++++++++++
+ 4 files changed, 104 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index d6b8d948e..f0566a656 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9922,3 +9922,30 @@ overwriting.
+ This extends the existing reduction-layout ABI but adds no new tag or LUT.
+ Mypy remains at the exact 12-error baseline. Next forward group:
+ `TestOps.test_scatter_reduce`.
++
++## 2026-07-30 — tensor scatter-reduce milestone
++
++The unchanged `test_scatter_reduce`, `test_scatter_reduce_prod_zeros`, and
++`test_scatter_reduce_errors` methods pass together in **9.13s**. The main
++method passes alone in **7.71s** and covers all 30 combinations of five
++reductions (`sum`, `prod`, `mean`, `amin`, and `amax`), three signed
++dimensions, and both `include_self` modes. The adjacent methods cover the
++larger zero-base product geometry and both expected API errors. The
++hardware-free Rockchip contract is **139/139 in 9.90s**.
++
++Tinygrad lowers this family to one through three small static reductions:
++fp32 ADD/MUL/MAX for values, bool MAX for the no-self occupancy mask, and
++int32 ADD for the mean divisor. A strict matcher requires exactly one int32
++index input and two fp32 data inputs, accepts no more than three reductions,
++caps each static reduction at eight candidates and their combined expansion
++budget at 24, and then expands them into the existing typed fp32 elementwise
++boundary. `mean` is recognized after the normal reciprocal-to-FDIV compiler
++rewrite.
++
++The unequal `(4,5,6)` destination with a `(3,4,5)` index adds `CMPLT` and
++`AND` padding guards around the same bounded product signature; those guards
++are serialized by the same typed evaluator. This path remains separate from
++the compact staged implementation for legacy scalar scatter ADD/MUL.
++
++No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
++Next forward group: `TestOps.test_scaled_dot_product_attention`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index b2382f10e..132eccdc8 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -473,6 +473,24 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+       self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_scatter_reduce_tensor_uses_bounded_typed_boundary(self):
++    x = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
++    indices = Tensor.empty(3,4,5, dtype=dtypes.int, device="ROCKCHIP")
++    src = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
++    for mode in ("sum", "prod", "mean", "amin", "amax"):
++      for include_self in (True, False):
++        program = build_native_program(_get_sink(x.scatter_reduce(-1, indices, src, mode, include_self=include_self)))
++        self.assertIsNotNone(program)
++        subtasks = program.src[1].src[0].arg
++        self.assertEqual(len(subtasks), 1)
++        self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    padded = Tensor.zeros(4,5,6, dtype=dtypes.float, device="ROCKCHIP").scatter_reduce(
++      1, indices, Tensor.empty(4,5,6, dtype=dtypes.float, device="ROCKCHIP"), "prod")
++    padded_sinks = [early_simplify(call.src[0]) for call in padded.schedule_linear().src if call.src[0].op is Ops.SINK]
++    padded_program = build_native_program(padded_sinks[-1])
++    self.assertIsNotNone(padded_program)
++    self.assertEqual(padded_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
+     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
+     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index d79a64409..8a4a95c9b 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2335,3 +2335,16 @@ reduction layout now encodes ADD versus MUL and feeds a second typed
+ base-epilogue task, reusing the output buffer as safe all-host scratch. No
+ new tag or LUT changed. Contract: **138/138**. Next forward group:
+ `TestOps.test_scatter_reduce`.
++
++### Tensor scatter-reduce
++
++The three scatter-reduce methods pass together in **9.13s**. The main method
++passes all 30 `reduction × dimension × include_self` forms in **7.71s**;
++the zero-base product regression and invalid-mode/dtype errors also pass. A
++strict one-index/two-fp32-input matcher expands only one-to-three tiny static
++ADD/MUL/MAX reductions, capped at eight candidates apiece and a combined
++budget of 24, into the existing typed fp32 evaluator. The padded unequal-shape
++form additionally admits its exact `CMPLT/AND` guards, and mean is matched
++after reciprocal-to-FDIV rewriting. No runtime ABI or LUT changed. Contract:
++**139/139**. Next forward group:
++`TestOps.test_scaled_dot_product_attention`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 0773e467f..8d5e5fa1e 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9240,6 +9240,50 @@ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if not {Ops.WHERE, Ops.OR, Ops.CMPNE}.issubset({u.op for u in value.toposort()}): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_scatter_reduce_tensor_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Expand only tinygrad's bounded fp32 tensor scatter_reduce lowering."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float: return None
++  value = _unwrap(store.src[1])
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  if not 1 <= len(reductions) <= 3 or value.op not in (Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV): return None
++  if any(u.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or u.dtype not in (dtypes.bool, dtypes.int, dtypes.float) or
++         not u.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in u.src[1:]) for u in reductions): return None
++  reduction_sizes = [prod(int(axis.src[0].arg) for axis in u.src[1:]) for u in reductions]
++  if any(size > 8 for size in reduction_sizes) or sum(reduction_sizes) > 24: return None
++  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++  int_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}
++  float_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}
++  if len(int_slots) != 1 or len(float_slots) != 2: return None
++  nodes = value.toposort()
++  if not {Ops.WHERE, Ops.CMPNE}.issubset({u.op for u in nodes}): return None
++  allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.CAST,
++             Ops.ADD, Ops.MUL, Ops.MAX, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes): return None
++
++  def expand(u:UOp) -> UOp:
++    if u.op is Ops.REDUCE:
++      ranges = u.src[1:]
++      extents = [int(r.src[0].arg) for r in ranges]
++      terms:list[UOp] = []
++      for linear in range(prod(extents)):
++        rem, fixed = linear, {}
++        for reduce_axis in range(len(ranges)-1, -1, -1):
++          rem, coord = divmod(rem, extents[reduce_axis])
++          fixed[ranges[reduce_axis]] = UOp.const(ranges[reduce_axis].dtype, coord)
++        terms.append(expand(u.src[0].substitute(fixed)))
++      if not terms: raise ValueError("empty scatter_reduce reduction")
++      result = terms[0]
++      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
++      return result
++    new_src = tuple(expand(x) for x in u.src)
++    return u if new_src == u.src else u.replace(src=new_src)
++
++  try: expanded_value = expand(store.src[1])
++  except (TypeError, ValueError, OverflowError): return None
++  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
++  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
++
+ def _try_scatter_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Stage only legacy scalar scatter ADD/MUL reductions and their base epilogue."""
+   store = _store_node(sink)
+@@ -13903,6 +13947,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, fancy_index_reduce_tasks)
+   if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, scatter_tasks)
++  if (scatter_reduce_tensor_tasks := _try_scatter_reduce_tensor_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, scatter_reduce_tensor_tasks)
+   if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, scatter_reduce_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+-- 
+2.34.1
+
