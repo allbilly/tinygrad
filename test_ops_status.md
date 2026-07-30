@@ -2118,3 +2118,8 @@ Next forward group: `TestOps.test_tanh`.
 Exact fp32 tanh now uses one serialized task instead of entering the
 half-buffer two-LUT path, which had corrupted every lane. The tuned fp16 LUT
 implementation is unchanged. Next forward group: `TestOps.test_hardtanh`.
+
+### Normal-fp32 hardtanh
+
+All eight tensor/scalar clamp cases pass in **7.07s** with no change. Next
+forward group: `TestOps.test_asinh`.

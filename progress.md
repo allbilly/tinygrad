@@ -9507,3 +9507,11 @@ half storage.
 
 No LUT coefficient changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_hardtanh`.
+
+## 2026-07-30 — normal-fp32 hardtanh validation
+
+The unchanged eight-case `TestOps.test_hardtanh` group passes in **7.07s**,
+covering clamp limits 10/15/20/25 for both `(45,65)` tensors and scalars.
+No code, host boundary, or LUT change was needed.
+
+Next forward group: `TestOps.test_asinh`.
