@@ -1,0 +1,175 @@
+From c141cf7aafe9d9e6c1ef9e28d66940922451e8a6 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 15:44:12 +0800
+Subject: [PATCH] rockchip: preserve all normal fp32 direct sums
+
+---
+ progress.md                          | 41 ++++++++++++++++++++++++++++
+ test/rockchip/test_hw.py             |  8 ++++++
+ test/rockchip/test_pr1.py            | 17 ++++++++++--
+ test_ops_status.md                   | 15 ++++++++++
+ tinygrad/runtime/support/rockchip.py |  9 ++++--
+ 5 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 94e92232f..3149dc890 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7716,6 +7716,47 @@ No LUT changed. `TestOps.test_sum_tiny` now runs but one of two outputs misses
+ tolerance (`-0.17614746` versus `-0.17683172`), indicating an fp16 CMAC
+ output-rounding boundary rather than unsupported layout.
+ 
++## 2026-07-30 — normal-fp32 direct axis-sum milestone
++
++The unchanged `TestOps.test_sum_tiny`, `test_sum`, and
++`test_sum_dtype_arg` now all pass. Two stale restrictions were responsible:
++
++1. fp32 sources with at most 16 backing elements used a one-limb shortcut,
++   losing the residual correction visible in the tiny two-output case;
++2. the compensated path rejected source buffers above 256 elements even
++   when each resident reduction window was small (for example K=6 over a
++   360-element tensor).
++
++Every nonempty direct fp32 sum now uses the established high/residual CMAC
++pair. The old short-source and total-storage gates remain commented as WIP
++references. CBUF residency is decided by the materialized M/N/K planner,
++matching the `conv_grok` lesson that total tensor storage is not tile
++residency.
++
++Useful debug sequence:
++
++1. compare the reduction extent K separately from PARAM storage size;
++2. values exactly on the fp16 grid indicate the old one-limb result path;
++3. for near-zero sums, inspect the x256 residual CMAC before changing
++   tolerances;
++4. validate contiguous last-axis and noncontiguous multi-axis reductions;
++5. include keepdim, scalar, dtype, and exception cases in the unchanged
++   group.
++
++Validation with `. .venv/bin/activate` and
++`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
++
++- unchanged `TestOps.test_sum_tiny`: pass;
++- unchanged `TestOps.test_sum` and `test_sum_dtype_arg`:
++  **2 passed in 10.06s**;
++- permanent tiny and 360-element-backing axis sums:
++  **1 passed in 2.52s**;
++- hardware-free planner/runtime contract: **109/109 in 6.72s**;
++- Python compilation and `git diff --check`: passing;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++No LUT changed. All base sum cases through `test_sum_dtype_arg` are green.
++
+ ## 2026-07-30 — normal-fp32 direct einsum sum milestone
+ 
+ The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index f0c80e567..fec4fa7fa 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -800,6 +800,14 @@ class TestCMAC(unittest.TestCase):
+     got = Tensor(a_np, device="ROCKCHIP").sum().realize().numpy()
+     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
+ 
++  def test_cmac_small_axis_fp32_sum(self):
++    rng = np.random.default_rng(7)
++    for shape, axis in (((4,2,2), (0,2)), ((3,4,5,6), 3)):
++      a_np = rng.standard_normal(shape).astype(np.float32)
++      expected = a_np.sum(axis=axis, dtype=np.float32)
++      got = Tensor(a_np, device="ROCKCHIP").sum(axis).realize().numpy()
++      np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-6)
++
+   def test_cmac_fp32_relu_sum(self):
+     a_np = np.random.default_rng(6).standard_normal((3,4,5)).astype(np.float32)
+     expected = np.maximum(np.maximum(a_np, 0).sum(dtype=np.float32), 0)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a2de2a28d..5e008d190 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -308,8 +308,10 @@ class TestClassifier(unittest.TestCase):
+     program = build_native_program(sink)
+     self.assertIsNotNone(program)
+     subtasks = program.src[1].src[0].arg
+-    self.assertGreaterEqual(len(subtasks), 2)
+-    self.assertTrue(subtasks[0].task.fp32_inputs)
++    self.assertGreaterEqual(len(subtasks), 4)
++    copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
++    self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
++    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
+     self.assertTrue(subtasks[-1].task.fp32_output)
+ 
+   def test_large_fp32_sum_uses_two_limb_cmac_boundary(self):
+@@ -410,6 +412,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(any(task.fp32_output for task in cmac_tasks))
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_small_axis_fp32_sum_uses_both_input_limbs(self):
++    for shape, axis in (((4,2,2), (0,2)), ((3,4,5,6), 3)):
++      a = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP")
++      program = build_native_program(_get_sink(a.sum(axis)))
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
++      copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
++      self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
++      self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
++
+   def test_fp32_relu_sum_preserves_both_input_limbs(self):
+     a = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
+     program = build_native_program(_get_sink(a.relu().sum().relu()))
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 6de5527b5..57daaece8 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1881,3 +1881,18 @@ was added.
+ 
+ Continue with `TestOps.test_sum_tiny`; it executes but currently has one
+ small numerical miss from CMAC output rounding.
++
++### Normal-fp32 direct axis sums
++
++| Coverage | Result |
++|---|---:|
++| unchanged `TestOps.test_sum_tiny` | pass |
++| unchanged `test_sum` + `test_sum_dtype_arg` | **2 passed in 10.06s** |
++| permanent tiny + larger-backing axis sums | **1 passed in 2.52s** |
++| hardware-free planner/runtime contract | **109/109 in 6.72s** |
++
++All nonempty direct fp32 sums now use high/residual CMAC limbs. Total PARAM
++storage no longer acts as a CBUF gate; the materialized M/N/K planner owns
++residency. No LUT or host operator arithmetic changed.
++
++All base sum groups through `test_sum_dtype_arg` are green.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 18a9e358f..eb5ce91f7 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11124,11 +11124,13 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   scratch_slot = max(info.globals, default=-1) + 1
+   if source_slot >= 7: return None
+   source_total, output_total = int(source.src[0].src[0].arg), prod(_shape_of_store(sink))
+-  if source_total > 256: return None
++  # WIP reference: `if source_total > 256: return None` confused backing
++  # storage with resident CMAC geometry. Axis sums materialize only their
++  # CBUF-derived M/N/K tiles, just like conv_grok local windows.
+   tasks:list[RKSubTask] = []
+ 
+   device = store.src[0].src[0].device
+-  if source_total > 16:
++  if source_total > 0:
+     next_slot = scratch_slot
+     host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     high_slot, low_slot = next_slot, next_slot+1
+@@ -11164,6 +11166,9 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(_emit_where_stage(output_total, info.outs[0], (high_sum, 0), (correction, 0), Ops.ADD, fp32_output=True))
+     return tuple(tasks)
+ 
++  # WIP reference: the former <=16 shortcut tagged the fp32 source directly
++  # on one half CMAC and widened its rounded result. Axis sums near zero lost
++  # enough input residual to miss normal-fp32 tolerance.
+   converted_param = UOp.param(source_slot, dtypes.half, (source_total,), device=device)
+   converted_index = source.replace(dtype=dtypes.half, src=(converted_param, *source.src[1:]))
+   converted_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (converted_index,), arg=dtypes.float), *reductions))
+-- 
+2.34.1
+
