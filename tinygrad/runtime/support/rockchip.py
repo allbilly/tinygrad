@@ -197,6 +197,8 @@ _HOST_BOOL_HALF_LAYOUT = -1020  # widen byte-wide bool ABI storage to fp16 0/1 l
 _HOST_STATIC_SELECT_HALF_LAYOUT = -1021  # interleave two fp16 buffers by a compile-time lane mask
 _HOST_STATIC_SELECT_INT_LAYOUT = -1022  # interleave native int32 atoms by compile-time sort wires
 _HOST_HALF_INT_LAYOUT = -1023  # typed fp16-to-int32 ABI boundary after NPU selection
+_HOST_FP32_HALF_LAYOUT = -1024  # nearest-fp16 representation view of an fp32 ABI buffer
+_HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of an fp32 ABI buffer
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -10631,6 +10633,67 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
   return tuple(tasks)
 
+def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Run a small direct fp32 matrix product through typed half CMAC views."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
+     reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  body = _unwrap(reduce.src[0])
+  if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
+  sources = tuple(_unwrap(x) for x in body.src)
+  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM for x in sources): return None
+  source_slots = tuple(x.src[0].buf_uop.arg.slot for x in sources)
+  if any(slot >= 7 for slot in source_slots): return None
+  output_total = prod(_shape_of_store(sink))
+  if output_total > 256 or any(int(x.src[0].src[0].arg) > 256 for x in sources): return None
+
+  info, device = ProgramInfo.from_sink(sink), store.src[0].src[0].device
+  next_slot = max(info.globals, default=-1) + 1
+  tasks:list[RKSubTask] = []
+  views:list[tuple[int,int]] = []
+  for source, source_slot in zip(sources, source_slots):
+    source_total = int(source.src[0].src[0].arg)
+    high_slot, low_slot = next_slot, next_slot+1
+    next_slot += 2
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    high_relocs = (RKReloc(0, high_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    low_relocs = (RKReloc(0, low_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.extend((RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (source_total, _HOST_FP32_HALF_LAYOUT), high_slot, is_copy=True),
+                            high_relocs),
+                  RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (source_total, _HOST_FP32_RESIDUAL_LAYOUT), low_slot, is_copy=True),
+                            low_relocs)))
+    views.append((high_slot, low_slot))
+
+  def cmac(a_slot:int, b_slot:int) -> int|None:
+    nonlocal next_slot
+    out_slot, next_slot = next_slot, next_slot+1
+    half_sources:list[UOp] = []
+    for source, slot in zip(sources, (a_slot, b_slot)):
+      source_total = int(source.src[0].src[0].arg)
+      half_param = UOp.param(slot, dtypes.half, (source_total,), device=source.src[0].device)
+      half_sources.append(source.replace(dtype=dtypes.half, src=(half_param, *source.src[1:])))
+    half_product = UOp(Ops.MUL, dtypes.half, tuple(half_sources))
+    half_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (half_product,), arg=dtypes.float), *reduce.src[1:]))
+    out_param = UOp.param(out_slot, dtypes.half, (output_total,), device=device)
+    out_index = store.src[0].replace(dtype=dtypes.half, src=(out_param, *store.src[0].src[1:]))
+    stage_store = store.replace(src=(out_index, UOp(Ops.CAST, dtypes.half, (half_reduce,), arg=dtypes.half)))
+    stage_plan = plan_rk(sink.substitute({store:stage_store}))
+    if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+    cmds, task, relocs = emit_rk(stage_plan)
+    tasks.append(RKSubTask(cmds, task, relocs))
+    return out_slot
+
+  high = cmac(views[0][0], views[1][0])
+  cross0 = cmac(views[0][0], views[1][1])
+  cross1 = cmac(views[0][1], views[1][0])
+  if high is None or cross0 is None or cross1 is None: return None
+  cross_sum, correction = next_slot, next_slot+1
+  tasks.append(_emit_where_stage(output_total, cross_sum, (cross0, 0), (cross1, 0), Ops.ADD))
+  tasks.append(_emit_where_stage(output_total, correction, (cross_sum, 0),
+                                 (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1/256))[0]), Ops.MUL))
+  tasks.append(_emit_where_stage(output_total, info.outs[0], (high, 0), (correction, 0), Ops.ADD, fp32_output=True))
+  return tuple(tasks)
+
 def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Inclusive 1-D float cumprod through a logarithmic Hillis-Steele scan."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -11877,6 +11940,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, movement_sum_tasks)
   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, elementwise_sum_tasks)
+  if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_cmac_tasks)
   # Retain the half-input WIP above for reference. The active path is narrower:
   # it requires a direct fp32 INDEX and preserves the explicitly fp32 output.
   if (fp32_sum_tasks := _try_fp32_sum_subtasks(sink)) is not None:

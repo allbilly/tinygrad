@@ -7577,6 +7577,54 @@ official dtype mismatches such as the scalar subcase in `test_add`.
 Milestone census and fixes therefore continue with the normal dtype default
 plus `FORWARD_ONLY=1`.
 
+## 2026-07-30 — compensated small fp32 GEMM
+
+The first normal-default forward-suite failure, `TestOps.test_9_gemm`, now
+passes on RK3588.  A direct fp32→fp16 CMAC view computed structurally correct
+values but missed tolerance in 12/81 outputs.  Preserving the raw fp32 CACC
+output removed the output rounding but left 11/81 misses, proving that input
+rounding was the dominant error.
+
+The passing lowering reuses the two-limb ABI representation from compensated
+cumprod.  For each fp32 matrix, host-side ABI preparation creates:
+
+```text
+high = fp16(x)
+low  = fp16(256 * (x - float32(high)))
+```
+
+These are representation buffers, not host-computed matrix arithmetic.  The
+NPU then runs three CMAC tasks:
+
+```text
+high_product = high_a @ high_b
+cross0       = high_a @ low_b
+cross1       = low_a  @ high_b
+result       = high_product + (cross0 + cross1) / 256
+```
+
+The two additions, scale, and final write are DPU tasks.  The low×low term is
+bounded below the selected small-GEMM tolerance and was unnecessary for the
+official cases.  CMAC continues to expose its raw fp32 CACC output through a
+typed unpack option for future precision work, although the passing
+compensated path deliberately performs its final combination on the NPU.
+
+The matcher is strict: two direct fp32 INDEX operands, direct ADD reduction,
+at most 256 elements in each source and output.  Padded GEMM remains a
+separate indexed-WHERE/layout group, and `test_matmul` with a 64×99 operand
+remains a larger tiled-fp32 group.  The explicit 64×64 `gemm_fp16` graph also
+has a separate cast/output-boundary rejection and is not claimed here.
+
+Validation with `. .venv/bin/activate`, `DEV=ROCKCHIP FORWARD_ONLY=1`:
+
+- unchanged `test_9_gemm`: **1 passed in 3.77 seconds**;
+- `test_small_gemm`, `test_9_gemm`, `test_small_gemm_range`,
+  `test_small_gemm_eye`, and the prior `test_const_reduce`: **5/5 in 12.05
+  seconds**;
+- hardware-free PR1 contract: **83/83 in 6.67 seconds**;
+- Python compilation and whitespace checks: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
 ## 2026-07-30 — general fp16 runtime tensor POW with two-level EXP2
 
 The unchanged `TestOps.test_pow_full` now passes both `x**y` and `x.pow(y)`.

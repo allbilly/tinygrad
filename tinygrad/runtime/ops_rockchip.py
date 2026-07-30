@@ -23,6 +23,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT,
   _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
@@ -166,8 +167,9 @@ def _sanitize_fp16_comparison_buf(src, dst, n):
   np.nan_to_num(arr, copy=False, nan=float("nan"), posinf=65504.0, neginf=-65504.0)
   ctypes.memmove(dst, arr.ctypes.data, n * 2)  # type: ignore[arg-type]
 
-def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=False):
-  s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
+def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=False, fp32_output=False):
+  s = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32))
+  d = ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint32 if fp32_output else ctypes.c_uint16))
   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias is not None else None
   for i in range(M * N):
     raw = s[(i // N) * align_out + i % N]
@@ -177,7 +179,7 @@ def _unpack_cmac_out(src, dst, M, N, align_out, bias=None, bias_axis=-1, relu=Fa
       value = struct.unpack('<f', struct.pack('<f', value))[0]
       if relu: value = value if value > 0.0 else 0.0
       raw = struct.unpack('<I', struct.pack('<f', value))[0]
-    d[i] = _fp32_to_fp16(raw)
+    d[i] = raw if fp32_output else _fp32_to_fp16(raw)
 
 def _decode_materialized_cmac_layout(layout):
   _, _, _, _, _, tag, tile_m, bias_slot, bias_axis, relu, scale_bits, n_scale_counts, *tail = layout
@@ -677,6 +679,11 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   output = ctypes.cast(bufs[relocs[0].globals_slot].va_addr, ctypes.POINTER(ctypes.c_uint16))
   for i, value in enumerate(values): output[i] = value
 
+def _run_host_fp32_view(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple, residual:bool) -> None:
+  total, source_slot = task.layout[0], relocs[1].globals_slot
+  if residual: _convert_fp32_residual_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
+  else: _convert_fp32_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
+
 def _run_host_static_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Materialize compile-time int32 constants for a later NPU task."""
   total, tag, *values = task.layout
@@ -1073,7 +1080,7 @@ class RockchipProgram(Program['RockchipDevice']):
         else:
           bias_slot, bias_axis, relu = task.layout[5:] if len(task.layout) >= 8 else (-1, -1, 0)
           bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
-          _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, bias, bias_axis, bool(relu))
+          _unpack_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, bias, bias_axis, bool(relu), task.fp32_output)
       elif task.kind == "ppu" and ppu_padded is not None:
         channels, chan_padded, out_padded = ppu_padded
         ctypes.memmove(bufs[task.out_slot].va_addr, out_padded.va_addr, channels * 2)  # type: ignore[arg-type]
@@ -1268,6 +1275,9 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
             _run_host_half_int(st.task, st.relocs, tuple(ext))
+            continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
+            _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU

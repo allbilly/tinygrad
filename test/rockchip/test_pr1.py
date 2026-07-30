@@ -290,6 +290,15 @@ class TestClassifier(unittest.TestCase):
     self.assertTrue(subtasks[0].task.fp32_inputs)
     self.assertTrue(subtasks[-1].task.fp32_output)
 
+  def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+    a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a@b))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 3)
+    self.assertTrue(subtasks[-1].task.fp32_output)
+
   def test_reject_cmac_exceeds_cbuf(self):
     # M=6000 with K=4: align_in=32, input_row_bytes=64, data_banks=ceil(6000*64/32768)=12 > 11
     a = Tensor.rand(6000,4,dtype=dtypes.half).realize()

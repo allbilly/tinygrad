@@ -1406,3 +1406,23 @@ The active forward census uses the normal dtype default with
 `FORWARD_ONLY=1`.  Adding `DEFAULT_FLOAT=HALF` hides this fp32 rejection but
 introduces official Torch/tinygrad dtype mismatches, beginning with scalar
 `test_add`.
+
+### Compensated small fp32 GEMM milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_9_gemm` | **1 passed in 3.77s** |
+| selected small GEMM + const-reduce regression set | **5/5 in 12.05s** |
+| hardware-free PR1 contract | **83/83 in 6.67s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Small direct fp32 matrix products now use high and 256-scaled residual fp16
+ABI views for both inputs.  Three CMAC tasks compute high×high and both cross
+terms; DPU tasks add and rescale the correction before the final fp32 ABI
+write.  No GEMM arithmetic runs on the host.
+
+A direct half-view prototype missed 12/81 values.  Keeping raw fp32 CACC
+output reduced that only to 11/81, isolating input quantization.  The
+compensated path passes.  It is limited to direct source/output buffers of at
+most 256 elements.  Padded-WHERE GEMM, 64×99 matmul, and the explicit 64×64
+fp16 cast/output graph remain separate groups.
