@@ -1637,3 +1637,22 @@ The next low-hanging functional group is `argmax`: scalar duplicate-maximum
 cases pass, but the unchanged random `(10,20)` case returned index `0`
 instead of `149`. Continue from `TestOps.test_argmax`; the failure is an
 index-selection correctness issue, not an ioctl timeout.
+
+### Normal-fp32 extrema milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_argmax` | **1 passed in 72.47s** |
+| unchanged `test_argmin` | **1 passed in 70.28s** |
+| unchanged `test_max` + `test_min` | **2 passed in 8.88s** |
+| permanent fp32 axis extrema and index selection | **1 passed in 20.30s** |
+
+Fp32 local MAX/MIN and general ArgMax/ArgMin now reuse one low typed gather
+slot, avoiding version-4 `fp32_inputs` metadata loss after candidate two.
+Axis selected-index kernels may consume a separately materialized `MAX(x)`
+or `MAX(-x)` buffer; equality and first-tie coordinate selection remain DPU
+operations. Fp32 MIN keeps intermediate `MAX(-x)` in fp16 scratch and widens
+only the final logical output.
+
+The previous ArgMax entry is resolved. Resume the normal-default census
+after `test_argmin`; no LUT change was involved.

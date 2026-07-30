@@ -659,6 +659,18 @@ class TestPipeline(unittest.TestCase):
     self.assertTrue(all(st.task.kind == "dpu" for st in subtasks))
     self.assertEqual(subtasks[-1].task.out_slot, 0)
 
+  def test_fp32_axis_argmax_reuses_low_typed_gather_slot(self):
+    x = Tensor.rand(4,5, dtype=dtypes.float).realize()
+    sinks = [c.src[0] for c in x.argmax(0).schedule_linear().src if c.src[0].op is Ops.SINK]
+    self.assertEqual(len(sinks), 2)
+    max_program = build_native_program(sinks[0])
+    self.assertIsNotNone(max_program)
+    subtasks = max_program.src[1].src[0].arg
+    typed_slots = [slot for st in subtasks for slot in st.task.fp32_inputs]
+    self.assertEqual(len(typed_slots), 4)
+    self.assertEqual(len(set(typed_slots)), 1)
+    self.assertIsNotNone(build_native_program(sinks[1]))
+
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()
     b = Tensor.rand(5000,dtype=dtypes.half).realize()

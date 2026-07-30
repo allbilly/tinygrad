@@ -113,6 +113,13 @@ class TestDPU(unittest.TestCase):
       y = Tensor(values, device="ROCKCHIP").realize()
       np.testing.assert_array_equal(y.argmax().realize().numpy(), np.argmax(values).astype(np.int32))
       np.testing.assert_array_equal(y.argmin().realize().numpy(), np.argmin(values).astype(np.int32))
+    fp32 = np.array([[1,9,3,4,0], [4,2,8,1,7], [7,6,5,3,2], [0,10,-1,6,5]], dtype=np.float32)
+    z = Tensor(fp32, device="ROCKCHIP").realize()
+    for axis in (0, 1):
+      np.testing.assert_array_equal(z.max(axis).realize().numpy(), np.max(fp32, axis=axis))
+      np.testing.assert_array_equal(z.min(axis).realize().numpy(), np.min(fp32, axis=axis))
+      np.testing.assert_array_equal(z.argmax(axis).realize().numpy(), np.argmax(fp32, axis=axis).astype(np.int32))
+      np.testing.assert_array_equal(z.argmin(axis).realize().numpy(), np.argmin(fp32, axis=axis).astype(np.int32))
 
   def test_dpu_argsort_stable(self):
     # Close fp16 values exercise the few-ULP roundoff of DPU bitonic

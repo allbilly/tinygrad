@@ -8162,6 +8162,65 @@ Validation with `. .venv/bin/activate`:
 No LUT coefficients or two-level LUT schedules changed in this milestone,
 so `lut.md` needs no new tuning entry.
 
+## 2026-07-30 — normal-fp32 MAX/MIN and ArgMax/ArgMin
+
+The unchanged normal-default extrema group now passes. Two version-4 ABI
+limits and one split-kernel shape were missing from the older
+`DEFAULT_FLOAT=HALF` milestone:
+
+1. local fp32 MAX/MIN allocated one fp32 gather slot per reduction candidate.
+   Only the first low global slots retain `fp32_inputs` metadata in a
+   version-4 image; later candidates were interpreted as fp16 bytes and
+   produced corrupt extrema (including values near 270 for inputs near 3);
+2. general fp32 ArgMax/ArgMin had the same per-candidate gather-slot growth.
+   Global ArgMax therefore stopped updating after candidate two;
+3. axis fp32 ArgMax/ArgMin is scheduled as two kernels. The first materializes
+   `MAX(x)` or `MAX(-x)` and the second selects the matching coordinate. The
+   old recognizer required both reductions in one sink and rejected the
+   selected-index kernel.
+
+Both local extrema and general selected-index lowering now reuse one
+low-numbered fp32 gather slot. Host movement fills that slot with the next
+static candidate view; the ordered runtime flushes the pending NPU ABI
+conversion before allowing the next gather to overwrite it. MAX/MIN,
+candidate equality, first-tie selection, and native int32 coordinate
+assembly remain NPU work.
+
+The split selected-index matcher accepts only the narrow fp32 form with one
+original `total*window` input and one materialized `total`-element extrema
+input. It recognizes ArgMin's `-x` candidate wrapper and uses the existing
+NPU negation path against `MAX(-x)`.
+
+An additional fp32 MIN ABI bug was fixed: the intermediate `MAX(-x)` scratch
+stage had `fp32_output=True`, so runtime widened it before the final NPU
+negate, which then read fp32 bytes as fp16. Only the final logical MIN write
+now carries fp32 output conversion.
+
+Useful debug sequence:
+
+1. `ROCKCHIP_DEBUG_SUBTASKS=1` must show every fp32 candidate conversion
+   reading the same low slot (slot 2 in the `(4,20)` probe);
+2. compare `x.max(axis).numpy()` with the source winners before debugging
+   ArgMax equality;
+3. `ROCKCHIP_DEBUG_SINK=1` distinguishes fused global ArgMax from split axis
+   ArgMax;
+4. for ArgMin, verify the first kernel is `MAX(-x)` and the selected kernel
+   retains the `MUL(-1)` wrapper;
+5. a result stuck at candidate two indicates typed-input slot metadata, while
+   widespread zero indices with corrupt saved extrema indicates local MAX/MIN
+   failed before coordinate selection.
+
+Validation with `. .venv/bin/activate`,
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_argmax`: **1 passed in 72.47 seconds**;
+- unchanged `TestOps.test_argmin`: **1 passed in 70.28 seconds**;
+- unchanged `TestOps.test_max` and `test_min`: **2 passed in 8.88 seconds**;
+- permanent fp32 axis MAX/MIN/ArgMax/ArgMin plus existing dtype/tie coverage:
+  **1 passed in 20.30 seconds**.
+
+No LUT table or two-level LUT schedule changed.
+
 The interpretation of RKNN Toolkit2 issue #471 remains unchanged: its values
 are exactly fp16 quantization of `0.1`, not evidence for accumulator drift or
 a solution to this EXP2 range problem.
