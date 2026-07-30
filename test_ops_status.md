@@ -1578,3 +1578,25 @@ before scaling it, so all six scalar subcases pass. `NEG` and logical-not
 were already passing in the probe that identified MUL as the next failed
 group. This is an incremental normal-default milestone; the last complete
 suite census at the top of this file is not replaced by these focused runs.
+
+### Normal-fp32 ALL/ANY milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged ALL/ANY family (seven methods) | **7 passed in 89.58s** |
+| unchanged `test_all_large` (2^15, 2^16, 2^20) | **1 passed in 76.85s** |
+| fp32 limb and large-fill planner contracts | **2 passed in 2.14s** |
+| full hardware-free planner/codec contract | **95/95 in 24.04s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Normal-default boolean reductions now recognize `CMPNE(fp32, 0)`. Both the
+nearest-fp16 high limb and x256 residual limb receive NPU nonzero masks; NPU
+MAX combines them before the existing CMAC count reduction. This avoids
+misclassifying tiny nonzero fp32 values whose high limb is zero.
+
+At 2^20 lanes, the source fp32 fill and predicate buffers exceed the
+RK3588's mappable GEM boundary. The fill is generated in reusable
+262,144-lane NPU tiles and widened into host-backed fp32 ABI storage.
+Predicate processing uses reusable 32K high/residual tiles and gathers only
+the NPU-produced masks for CMAC. Host work is representation conversion and
+address movement only.

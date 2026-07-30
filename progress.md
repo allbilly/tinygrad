@@ -7501,6 +7501,35 @@ No LUT coefficients or task topology changed, so this milestone does not
 require a new `lut.md` tuning entry. RKNN Toolkit2 issue #471 remains only
 evidence of fp16 input rounding; it contains no product-error workaround.
 
+## 2026-07-30 — normal-fp32 boolean-reduction milestone
+
+All seven forward-only boolean-reduction methods now pass in normal-default
+mode. The existing matcher handled bool and fp16 sources, but normal `.all()`
+and `.any()` graphs compare a direct fp32 INDEX against zero. The new path
+creates nearest-fp16 high and x256-residual views, computes a nonzero mask for
+each limb on the NPU, combines the masks with NPU MAX, and reuses the proven
+CMAC count reduction. Testing both limbs preserves fp32 nonzero semantics
+when the high limb alone rounds to zero.
+
+The `2**20` constant `all` case also exposed the RK3588 two-megabyte GEM mmap
+boundary. Large fp32 fills now run in 262,144-lane DPU tiles and are widened
+into host-backed fp32 ABI storage without host operator arithmetic. Large
+boolean predicates are then read as 32K-lane high/residual tiles; all mask,
+zero-count, and reduction arithmetic remains NPU work.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged ALL/ANY family: **7 passed in 89.58s**;
+- unchanged `test_all_large` alone: **1 passed in 76.85s**;
+- small normal-fp32 ALL/ANY post-cleanup sanity: **2 passed in 11.92s**;
+- hardware-free Rockchip planner/codec contract: **95/95 in 24.04s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+This milestone changes no LUTs. Issue #471 does not address boolean
+comparison, large-buffer tiling, or the GEM mmap boundary.
+
 ## 2026-07-30 — normal-fp32 ASINH/ACOSH two-LUT milestone
 
 The normal-default forward census no longer times out in

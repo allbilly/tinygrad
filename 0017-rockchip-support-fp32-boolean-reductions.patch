@@ -1,0 +1,231 @@
+From 77033bd48f4fd7da58eb4d4f2a2e8ca5bdf5c608 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 10:54:48 +0800
+Subject: [PATCH] rockchip: support fp32 boolean reductions
+
+---
+ test/rockchip/test_pr1.py            | 20 ++++++-
+ tinygrad/runtime/ops_rockchip.py     | 14 ++++-
+ tinygrad/runtime/support/rockchip.py | 78 +++++++++++++++++++++++++---
+ 3 files changed, 104 insertions(+), 8 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index ab6e55dfd..086c4b061 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -7,7 +7,8 @@ from tinygrad.codegen import early_simplify
+ from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
+ from tinygrad.codegen import pm_to_program
+ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
+-                                               build_native_program, RKPlan, RKSubTask, _HOST_FP32_COMBINE_LAYOUT)
++                                               build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
++                                               _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipRenderer
+ from tinygrad.helpers import Target
+ 
+@@ -376,6 +377,23 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.task.is_copy for task in subtasks), 3)
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_fp32_all_uses_both_nonzero_limbs(self):
++    a = Tensor.empty(3,4,5,6, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a.all()))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy and len(task.task.layout) == 2]
++    self.assertIn(_HOST_FP32_HALF_LAYOUT, layouts)
++    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, layouts)
++    self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 1)
++
++  def test_large_fp32_fill_uses_tiled_npu_boundary(self):
++    program = build_native_program(_get_sink(Tensor.ones(2**19, dtype=dtypes.float, device="ROCKCHIP")))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(sum(not task.task.is_copy for task in subtasks), 2)
++    self.assertEqual(sum(task.task.is_copy and task.task.layout[1] == _HOST_HALF_FP32_LAYOUT for task in subtasks), 2)
++
+   def test_fp32_acos_uses_specialized_lut_boundary(self):
+     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
+     self.assertIsNotNone(program)
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index d7680ef3e..300fe924f 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -23,7 +23,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+-  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT,
++  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+   _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+@@ -108,6 +108,13 @@ def _run_host_fp32_combine(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...]
+     print("RK_FP32_COMBINE", "high", high[:count], "low256", low[:count], "result", result[:count])
+   ctypes.memmove(output.va_addr, result.ctypes.data, total*4)  # type: ignore[arg-type]
+ 
++def _run_host_half_fp32(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Widen an NPU-produced fp16 tile into an fp32 ABI buffer without operator arithmetic."""
++  total, tag = task.layout
++  assert tag == _HOST_HALF_FP32_LAYOUT and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  _convert_fp16_to_fp32_buf(source.va_addr, output.va_addr+task.out_offset, total)
++
+ def _convert_bool_to_fp16_buf(src, dst, n):
+   import numpy as np
+   arr = np.frombuffer(ctypes.string_at(src, n), dtype=np.bool_).astype(np.float16)
+@@ -1192,6 +1199,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
+           _run_host_bool_half(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
++          _run_host_half_fp32(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
+           _run_host_static_select_half(task, st.relocs, bufs)
+           continue
+@@ -1409,6 +1419,8 @@ class RockchipProgram(Program['RockchipDevice']):
+               _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+               _run_host_fp32_combine(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
++              _run_host_half_fp32(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 230357c5a..f92b60688 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -200,6 +200,7 @@ _HOST_HALF_INT_LAYOUT = -1023  # typed fp16-to-int32 ABI boundary after NPU sele
+ _HOST_FP32_HALF_LAYOUT = -1024  # nearest-fp16 representation view of an fp32 ABI buffer
+ _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of an fp32 ABI buffer
+ _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
++_HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -2501,7 +2502,7 @@ def _try_cast_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
+                             uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool,
+                             native_int32_input=source.dtype is dtypes.int and bool(getenv("ROCKCHIP_NATIVE_INT_CAST"))),)
+ 
+-def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
++def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Fill non-fp16 outputs through the DPU, then convert the fp16 result buffer."""
+   store = _store_node(sink)
+   if store is None or store.src[1].op is not Ops.CONST: return None
+@@ -2509,6 +2510,21 @@ def _try_typed_fill_subtasks(sink:UOp) -> tuple[RKSubTask]|None:
+   if output_dtype not in (dtypes.float, dtypes.int, dtypes.bool, dtypes.uint8): return None
+   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+   value = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', float(store.src[1].arg)))[0])
++  if output_dtype is dtypes.float and total*4 >= 2*1024*1024:
++    # Logical multi-megabyte buffers are host-backed because RK3588 GEM mmap
++    # rejects them. Generate reusable fp16 tiles on DPU, then widen only the
++    # ABI representation into the logical fp32 buffer on the host.
++    scratch_slot = max(info.globals, default=-1)+1
++    tasks:list[RKSubTask] = []
++    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    tile = 262144
++    for start in range(0, total, tile):
++      count = min(tile, total-start)
++      tasks.append(_emit_where_stage(count, scratch_slot, (_ZERO_SLOT, 0), value, Ops.ADD))
++      relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, scratch_slot, 0, 0, 0xFFFFFFFF))
++      task = RKTask(0, 0, 0, "dpu", (count, _HOST_HALF_FP32_LAYOUT), info.outs[0], is_copy=True, out_offset=start*4)
++      tasks.append(RKSubTask(host_cmds, task, relocs))
++    return tuple(tasks)
+   return (_emit_where_stage(total, info.outs[0], (_ZERO_SLOT, 0), value, Ops.ADD,
+                             fp32_output=output_dtype is dtypes.float, int32_output=output_dtype is dtypes.int,
+                             uint8_output=output_dtype is dtypes.uint8, bool_output=output_dtype is dtypes.bool),)
+@@ -11534,7 +11550,7 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       if zero.op is Ops.CONST and float(zero.arg) == 0.0 and candidate.op is Ops.INDEX:
+         source = candidate
+         break
+-  if source is None or source.src[0].op is not Ops.PARAM or source.dtype not in (dtypes.bool, dtypes.half): return None
++  if source is None or source.src[0].op is not Ops.PARAM or source.dtype not in (dtypes.bool, dtypes.half, dtypes.float): return None
+   if source.src[0].src[0].op is not Ops.CONST or store.src[0].src[0].src[0].op is not Ops.CONST: return None
+ 
+   info = ProgramInfo.from_sink(sink)
+@@ -11590,7 +11606,39 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   # Buffers at the RK3588 GEM mmap boundary cannot be submitted directly.
+   # Stage large predicates through reusable 32K-lane DMA tiles, then copy the
+   # exact fp16 mask bytes into one host-mapped tensor for tiled CMAC gathering.
+-  if source.dtype is dtypes.half and input_total*2 >= 2*1024*1024:
++  large_tiled = (source.dtype is dtypes.half and input_total*2 >= 2*1024*1024) or \
++                (source.dtype is dtypes.float and input_total*4 >= 2*1024*1024)
++  if source.dtype is dtypes.float and large_tiled:
++    counted = alloc()
++    high_tile, low_tile = alloc(), alloc()
++    negative_tiles, magnitude_tiles, nonzero_tiles = (alloc(), alloc()), (alloc(), alloc()), (alloc(), alloc())
++    combined_tile, zero_tile = alloc(), alloc()
++    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    tile = 32768
++    for start in range(0, input_total, tile):
++      count = min(tile, input_total-start)
++      for limb, tag in ((high_tile, _HOST_FP32_HALF_LAYOUT), (low_tile, _HOST_FP32_RESIDUAL_LAYOUT)):
++        layout = (count, tag, 1, count, 1, start)
++        tile_view_relocs = (RKReloc(0, limb, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++        tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", layout, limb, is_copy=True), tile_view_relocs))
++      for index, limb in enumerate((high_tile, low_tile)):
++        tasks.extend((_emit_where_stage(count, negative_tiles[index], (limb, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL),
++                      _emit_where_stage(count, magnitude_tiles[index], (limb, 0), (negative_tiles[index], 0), Ops.MAX),
++                      _emit_where_stage(count, nonzero_tiles[index], (magnitude_tiles[index], 0),
++                                        (magnitude_tiles[index], 0), Ops.MAX, compare=True)))
++      tasks.append(_emit_where_stage(count, combined_tile, (nonzero_tiles[0], 0), (nonzero_tiles[1], 0), Ops.MAX))
++      tile_result = combined_tile
++      if semantic_op is Ops.MUL:
++        tile_result = zero_tile
++        tasks.append(_emit_where_stage(count, tile_result, (_CONST_SLOT, 0x3f800000), (combined_tile, 0), Ops.SUB))
++      result_layout = (count, _HOST_MOVEMENT_LAYOUT, 2, 1, count,
++                       2, 1, 0,
++                       4, 1, 0, 10, 0)
++      result_relocs = (RKReloc(0, counted, 0, 0, 0xFFFFFFFF),
++                       RKReloc(0, tile_result, 0, 0, 0xFFFFFFFF))
++      result_task = RKTask(0, 0, 0, "dpu", result_layout, counted, is_copy=True, out_offset=start*2)
++      tasks.append(RKSubTask(host_cmds, result_task, result_relocs))
++  elif source.dtype is dtypes.half and large_tiled:
+     counted = alloc()
+     input_tile, negative_tile, magnitude_tile, nonzero_tile = (alloc() for _ in range(4))
+     host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+@@ -11621,10 +11669,28 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   # predicate arithmetic and both reductions execute on the NPU.
+   elif source.dtype is dtypes.bool:
+     nonzero = alloc()
+-    layout = (input_total, _HOST_BOOL_HALF_LAYOUT)
++    bool_layout = (input_total, _HOST_BOOL_HALF_LAYOUT)
+     host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     host_relocs = (RKReloc(0, nonzero, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+-    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", layout, nonzero, is_copy=True), host_relocs))
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", bool_layout, nonzero, is_copy=True), host_relocs))
++  elif source.dtype is dtypes.float:
++    # Test both split-fp32 limbs so values whose nearest fp16 high limb is zero
++    # retain fp32 nonzero semantics. Host work only changes ABI representation.
++    high, low = alloc(), alloc()
++    host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    for out_slot, layout_tag in ((high, _HOST_FP32_HALF_LAYOUT), (low, _HOST_FP32_RESIDUAL_LAYOUT)):
++      view_relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", (input_total, layout_tag),
++                                              out_slot, is_copy=True), view_relocs))
++    limb_masks:list[int] = []
++    for limb in (high, low):
++      negative, magnitude, mask = alloc(), alloc(), alloc()
++      tasks.extend((_emit_where_stage(input_total, negative, (limb, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL),
++                    _emit_where_stage(input_total, magnitude, (limb, 0), (negative, 0), Ops.MAX),
++                    _emit_where_stage(input_total, mask, (magnitude, 0), (magnitude, 0), Ops.MAX, compare=True)))
++      limb_masks.append(mask)
++    nonzero = alloc()
++    tasks.append(_emit_where_stage(input_total, nonzero, (limb_masks[0], 0), (limb_masks[1], 0), Ops.MAX))
+   else:
+     negative, magnitude, nonzero = (alloc() for _ in range(3))
+     # WIP reference: separate positive/negative comparisons also produce an
+@@ -11635,7 +11701,7 @@ def _try_bool_reduce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(input_total, magnitude, (source_slot, 0), (negative, 0), Ops.MAX),
+                   _emit_where_stage(input_total, nonzero, (magnitude, 0), (magnitude, 0), Ops.MAX, compare=True)))
+ 
+-  if not (source.dtype is dtypes.half and input_total*2 >= 2*1024*1024):
++  if not large_tiled:
+     counted = nonzero
+     if semantic_op is Ops.MUL:
+       counted = negative if source.dtype is dtypes.half else alloc()
+-- 
+2.34.1
+
