@@ -1520,3 +1520,23 @@ caller-visible fp32 buffer and raised `IndexError`.
 
 Three-input ADD uses eighteen NPU arithmetic stages.  Broadcast ADD and SUB
 remain open and are not covered by this milestone.
+
+### Affine broadcast fp32 ADD milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_broadcasted_add` + `test_broadcasted_add_2` | **2 passed in 3.11s** |
+| complete ADD family: direct, nested, scalar, row/vector broadcast | **5 passed in 4.35s** |
+| old row-broadcast path | **300/2925 misses, max abs 0.00092542** |
+| full hardware-free planner/codec contract | **89/89 in 6.99s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Static affine fp32 views now combine layout expansion with high/residual ABI
+encoding.  Source strides of zero perform scalar or dimension broadcast;
+all operand addition remains in the compensated NPU TwoSum stages.
+Early-simplified fp32 CONST operands are encoded as high/residual scalar
+operands rather than host-expanded tensors.
+
+Final emitter-sensitive validation disabled both `CACHELEVEL` and `CCACHE`.
+`ROCKCHIP_DEBUG_FP32_ADD=1` exposes the final NPU-produced limbs and decoded
+fp32 ABI result.  SUB remains the next distinct group.

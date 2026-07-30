@@ -7610,6 +7610,48 @@ The three-input program uses six input representation views, eighteen NPU
 arithmetic stages, and one final high/residual fp32 ABI decode.  Broadcast
 ADD and SUB remain separate groups.
 
+## 2026-07-30 — affine broadcast fp32 ADD milestone
+
+The next broadcast case reproduced the previously documented failure:
+`test_broadcasted_add` had **300/2925** misses and maximum absolute error
+**0.00092542**.  The one-stage broadcast path expanded fp32 operands but
+still rounded them to one fp16 limb before addition.
+
+The compensated ADD matcher now accepts affine direct INDEX operands whose
+static strides map into the logical output shape.  Each input view records:
+
+```text
+(ndim, output_shape..., source_strides..., source_offset)
+```
+
+The host uses only those compile-time strides to gather/broadcast fp32 ABI
+values while encoding high and x256-residual halves.  It does not combine
+operands.  Row broadcast `(45,1)`, scalar broadcast, and trailing vector
+`(65,)` therefore feed the same nine NPU TwoSum/correction stages used by
+direct ADD.
+
+Early simplification turns a scalar tensor operand into a fp32 CONST.
+Constants are now split into high/residual scalar register operands and stay
+inside the NPU sequence; no repeated host tensor is materialized.
+
+One debug trap mattered: an emitter-sensitive run initially reused the old
+one-stage image, so `ROCKCHIP_DEBUG_FP32_ADD` never reached the new final ABI
+decode.  Final measurements used both `CACHELEVEL=0` and `CCACHE=0`, as
+required for emitter changes.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `test_broadcasted_add` + `test_broadcasted_add_2`:
+  **2 passed in 3.11 seconds**;
+- complete direct/nested/broadcast ADD family: **5 passed in 4.35 seconds**;
+- full hardware-free planner/codec contract: **89/89 in 6.99 seconds**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+`ROCKCHIP_DEBUG_FP32_ADD=1` prints the final high limb, x256-low limb, and
+decoded fp32 values.  SUB is the next separate arithmetic group.
+
 ## 2026-07-30 — logarithmic long cumulative products
 
 The unchanged forward-only `TestOps.test_simple_cumprod` now passes both

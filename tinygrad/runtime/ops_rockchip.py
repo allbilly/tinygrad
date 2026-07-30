@@ -103,6 +103,9 @@ def _run_host_fp32_combine(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...]
   low = np.frombuffer(ctypes.string_at(low_buf.va_addr, total*2), dtype=np.float16).astype(np.float32)
   with np.errstate(invalid="ignore"):
     result = np.where(np.isfinite(high), high+low/256.0, high).astype(np.float32)
+  if getenv("ROCKCHIP_DEBUG_FP32_ADD"):
+    count = min(total, 32)
+    print("RK_FP32_COMBINE", "high", high[:count], "low256", low[:count], "result", result[:count])
   ctypes.memmove(output.va_addr, result.ctypes.data, total*4)  # type: ignore[arg-type]
 
 def _convert_bool_to_fp16_buf(src, dst, n):
@@ -692,9 +695,30 @@ def _run_host_static_half(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   for i, value in enumerate(values): output[i] = value
 
 def _run_host_fp32_view(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple, residual:bool) -> None:
-  total, source_slot = task.layout[0], relocs[1].globals_slot
-  if residual: _convert_fp32_residual_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
-  else: _convert_fp32_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
+  total, tag, *meta = task.layout
+  source_slot = relocs[1].globals_slot
+  if not meta:
+    if residual: _convert_fp32_residual_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
+    else: _convert_fp32_to_fp16_buf(bufs[source_slot].va_addr, bufs[task.out_slot].va_addr, total)
+    return
+  import numpy as np
+  ndim, *mapping = meta
+  shape, strides, offset = mapping[:ndim], mapping[ndim:2*ndim], mapping[-1]
+  assert tag in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT) and len(mapping) == 2*ndim+1 and np.prod(shape) == total
+  source_n = bufs[source_slot].size//4
+  source = np.frombuffer(ctypes.string_at(bufs[source_slot].va_addr, source_n*4), dtype=np.float32)
+  indexes = np.empty(total, dtype=np.int64)
+  for linear in range(total):
+    rem, source_index = linear, offset
+    for axis in range(ndim-1, -1, -1):
+      rem, coord = divmod(rem, shape[axis])
+      source_index += coord*strides[axis]
+    if not 0 <= source_index < source_n: raise RuntimeError(f"rk: fp32 view index out of bounds {source_index}")
+    indexes[linear] = source_index
+  gathered = source[indexes]
+  high = gathered.astype(np.float16)
+  result = ((gathered-high.astype(np.float32))*256.0).astype(np.float16) if residual else high
+  ctypes.memmove(bufs[task.out_slot].va_addr, result.ctypes.data, total*2)  # type: ignore[arg-type]
 
 def _run_host_static_int(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Materialize compile-time int32 constants for a later NPU task."""

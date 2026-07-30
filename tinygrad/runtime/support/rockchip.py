@@ -10776,10 +10776,30 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   flatten_add(val)
   sources = tuple(sources_list)
   if len(sources) not in (2, 3): return None
-  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM or
-         not _is_flat_contiguous(x.src[1]) for x in sources) or not _is_flat_contiguous(store.src[0].src[1]): return None
-  total = prod(_shape_of_store(sink))
-  if any(int(x.src[0].src[0].arg) != total for x in sources): return None
+  if any(x.dtype is not dtypes.float or x.op not in (Ops.INDEX, Ops.CONST) or
+         (x.op is Ops.INDEX and x.src[0].op is not Ops.PARAM) for x in sources): return None
+  store_aff = _affine_index(store.src[0].src[1])
+  if store_aff is None: return None
+  extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
+             if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
+  axes = sorted(store_aff[0], key=lambda x:store_aff[0][x], reverse=True)
+  if not axes or not all(axis in extents for axis in axes): return None
+  out_shape = tuple(extents[axis] for axis in axes)
+  total = prod(out_shape)
+  if total != prod(_shape_of_store(sink)): return None
+  source_layouts:list[tuple[int,...]|None] = []
+  for source in sources:
+    if source.op is Ops.CONST:
+      source_layouts.append(None)
+      continue
+    aff = _affine_index(source.src[1])
+    if aff is None: return None
+    if any(axis not in axes or stride < 0 for axis, stride in aff[0].items()): return None
+    strides = tuple(aff[0].get(axis, 0) for axis in axes)
+    source_total = int(source.src[0].src[0].arg)
+    max_index = aff[1] + sum((extent-1)*stride for extent, stride in zip(out_shape, strides))
+    if aff[1] < 0 or max_index >= source_total: return None
+    source_layouts.append((len(out_shape), *out_shape, *strides, aff[1]))
 
   info = ProgramInfo.from_sink(sink)
   next_slot = max(info.globals, default=-1)+1
@@ -10788,19 +10808,29 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def view(source_slot:int, tag:int) -> int:
+  def view(source_slot:int, tag:int, layout:tuple[int,...]) -> int:
     out = alloc()
     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
     relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
-    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag), out, is_copy=True), relocs))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag, *layout), out, is_copy=True), relocs))
     return out
-  def stage(a:int, b:int, op:Ops) -> int:
+  def scalar(value:float) -> tuple[int,int]:
+    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+  def stage(a:tuple[int,int], b:tuple[int,int], op:Ops) -> tuple[int,int]:
     out = alloc()
-    tasks.append(_emit_where_stage(total, out, (a, 0), (b, 0), op))
-    return out
+    tasks.append(_emit_where_stage(total, out, a, b, op))
+    return out, 0
+  def limb(source:UOp, tag:int, layout:tuple[int,...]|None) -> tuple[int,int]:
+    if source.op is Ops.CONST:
+      original = np.float32(source.arg)
+      high = np.float16(original)
+      value = high if tag == _HOST_FP32_HALF_LAYOUT else np.float16((original-np.float32(high))*256.0)
+      return scalar(float(value))
+    assert layout is not None
+    return view(source.src[0].arg.slot, tag, layout), 0
 
-  limbs = tuple((view(x.src[0].arg.slot, _HOST_FP32_HALF_LAYOUT),
-                 view(x.src[0].arg.slot, _HOST_FP32_RESIDUAL_LAYOUT)) for x in sources)
+  limbs = tuple((limb(x, _HOST_FP32_HALF_LAYOUT, layout), limb(x, _HOST_FP32_RESIDUAL_LAYOUT, layout))
+                for x, layout in zip(sources, source_layouts))
   high, low = limbs[0]
   for next_high, next_low in limbs[1:]:
     old_high = high
@@ -10811,14 +10841,12 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     error_b = stage(next_high, rounded_b, Ops.SUB)
     high_error = stage(error_a, error_b, Ops.ADD)
     input_low = stage(low, next_low, Ops.ADD)
-    scaled_high_error = alloc()
-    tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
-                                   (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
+    scaled_high_error = stage(high_error, scalar(256.0), Ops.MUL)
     low = stage(input_low, scaled_high_error, Ops.ADD)
 
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
-  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high, 0, 0, 0xFFFFFFFF),
-            RKReloc(0, low, 0, 0, 0xFFFFFFFF))
+  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high[0], 0, 0, 0xFFFFFFFF),
+            RKReloc(0, low[0], 0, 0, 0xFFFFFFFF))
   tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_COMBINE_LAYOUT),
                                      info.outs[0], is_copy=True), relocs))
   return tuple(tasks)
@@ -12094,6 +12122,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   # scan; multidimensional cumprod uses the same physical helper shape.
   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
   #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
+  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_add_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
   if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
@@ -12130,8 +12160,6 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, movement_sum_tasks)
   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
     return build_native_program_multi(sink, elementwise_sum_tasks)
-  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_add_tasks)
   if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_cmac_tasks)
   # Retain the half-input WIP above for reference. The active path is narrower:
