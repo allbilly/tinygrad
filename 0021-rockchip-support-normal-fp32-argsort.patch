@@ -1,0 +1,326 @@
+From 8a69909146c34b2e6898cbbe9d101133382b092c Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 12:35:59 +0800
+Subject: [PATCH] rockchip: support normal fp32 argsort
+
+---
+ progress.md                          | 63 ++++++++++++++++++++++++++
+ test/rockchip/test_hw.py             | 11 ++---
+ test/rockchip/test_pr1.py            | 10 +++++
+ test_ops_status.md                   | 23 ++++++++++
+ tinygrad/runtime/support/rockchip.py | 67 +++++++++++++++++++++-------
+ 5 files changed, 152 insertions(+), 22 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index e843d0fab..770a39ace 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7470,6 +7470,69 @@ Using `. .venv/bin/activate`,
+ - mypy: exact pre-existing **13-error** Rockchip baseline;
+ - ruff and pytest-xdist remain unavailable in `.venv`.
+ 
++## 2026-07-30 — normal-fp32 stable argsort
++
++The unchanged forward-only `TestOps.test_argsort` now passes its
++`(8,8,6)`, axis-1, descending, stable fp32 case. The fp16 implementation
++already had three strict argsort lowerings: stable occurrence counting,
++bitonic compare/swap, and final value/count-to-index reconstruction. Normal
++fp32 previously stopped at the first equality reduction with
++`unsupported_dtype`.
++
++All three lowerings now accept fp32 source values. Static host tasks only
++gather exact four-byte representations and perform fixed layout movement.
++Each gathered fp32 vector is immediately converted at the established ABI
++boundary; comparisons, absolute-distance scoring, stable occurrence masks,
++candidate selection, and integer result construction remain NPU tasks.
++Fp32 compare/swap writes its final logical value through the existing
++fp16-to-fp32 ABI conversion.
++
++The first complete run produced mostly zero indices even though every
++argsort matcher fired. `ROCKCHIP_DEBUG_SUBTASKS=1` showed the cause:
++
++- occurrence-count and compare/swap reused typed gather slot 2;
++- the mixed float/int selected-index kernel allocated native-int conversion
++  scratch first, pushing its fp32 gather to slot 15;
++- version-4 serializes `fp32_inputs` only for slots 0 through 6, so slot 15
++  silently lost its type and the DPU interpreted fp32 bytes as fp16.
++
++The selected-index lowering now reserves its reusable fp32 gather before
++allocating integer scratch. It therefore uses slot 5 in the permanent
++pipeline probe, and every other argsort typed gather uses slot 2. The ordered
++mixed runner flushes each conversion before the reusable gather is
++overwritten.
++
++Useful debug sequence:
++
++1. use `ROCKCHIP_DEBUG_ARGSORT=1`; an fp32 axis-1 case must print one
++   `RK_ARGSORT_INDEX`, the bitonic `RK_ARGSORT_COMPARE` stages, and one
++   `RK_ARGSORT_SELECTED`;
++2. use `ROCKCHIP_DEBUG_SUBTASKS=1` and inspect every nonempty
++   `task.fp32_inputs`; the maximum slot must be below 7;
++3. if the result is structurally wrong or mostly zero, diagnose metadata and
++   representation conversion before tuning comparison precision;
++4. if only close distinct fp32 values exchange order, compare their fp16
++   high limbs. That is a future two-limb comparison problem, not a LUT
++   problem and not justification for host sorting;
++5. retain duplicate values in the probe so stable occurrence IDs and final
++   index reconstruction are exercised.
++
++Validation with `. .venv/bin/activate` and
++`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
++
++- small explicit fp32 axis case: exact match with NumPy stable argsort;
++- unchanged `TestOps.test_argsort`: **1 passed in 66.23 seconds**;
++- permanent fp16+fp32 duplicate-stability hardware regression:
++  **1 passed in 24.75 seconds**;
++- hardware-free planner/codec contract: **98/98 in 5.42 seconds**,
++  including a full fp32 argsort pipeline typed-slot assertion.
++
++No LUT table or two-task LUT schedule changed. A two-level LUT would not
++solve ordering of close fp32 values; if that boundary is exposed by a future
++test, use a high/residual two-limb NPU comparison. Resume the normal-fp32
++census after `test_argsort`, with `test_sort`/`test_topk` as the adjacent
++families.
++
+ ## 2026-07-30 — compensated fp32 MUL milestone
+ 
+ Normal-default forward-only `TestOps.test_mul`, `test_scalar_mul`,
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 800f51dff..771597b56 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -124,11 +124,12 @@ class TestDPU(unittest.TestCase):
+   def test_dpu_argsort_stable(self):
+     # Close fp16 values exercise the few-ULP roundoff of DPU bitonic
+     # compare/swap, while the explicit duplicate checks stable occurrence IDs.
+-    values = np.random.default_rng(0).uniform(-2, 2, size=(1,8,2)).astype(np.float16)
+-    values[0,6,0] = values[0,1,0]
+-    actual = Tensor(values, device="ROCKCHIP").argsort(1, True).realize().numpy()
+-    expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
+-    np.testing.assert_array_equal(actual, expected)
++    for dtype in (np.float16, np.float32):
++      values = np.random.default_rng(0).uniform(-2, 2, size=(1,8,2)).astype(dtype)
++      values[0,6,0] = values[0,1,0]
++      actual = Tensor(values, device="ROCKCHIP").argsort(1, True).realize().numpy()
++      expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
++      np.testing.assert_array_equal(actual, expected)
+ 
+   def test_dpu_topk_padded_sort(self):
+     # Non-power-of-two half sorting uses -inf padding without 0*inf blending.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 2299276a4..ccf7ec3f5 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -671,6 +671,16 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(len(set(typed_slots)), 1)
+     self.assertIsNotNone(build_native_program(sinks[1]))
+ 
++  def test_fp32_argsort_keeps_typed_gathers_in_encodable_slots(self):
++    x = Tensor.rand(1,8,2, dtype=dtypes.float).realize()
++    sinks = [c.src[0] for c in x.argsort(1, True).schedule_linear().src if c.src[0].op is Ops.SINK]
++    programs = [build_native_program(sink) for sink in sinks]
++    self.assertTrue(all(program is not None for program in programs))
++    typed_slots = [slot for program in programs if program is not None
++                   for st in program.src[1].src[0].arg for slot in st.task.fp32_inputs]
++    self.assertTrue(typed_slots)
++    self.assertLess(max(typed_slots), 7)
++
+   def test_k_tiled_dot_produces_binary(self):
+     a = Tensor.rand(5000,dtype=dtypes.half).realize()
+     b = Tensor.rand(5000,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 3ff607c79..4ccd22e25 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1656,3 +1656,26 @@ only the final logical output.
+ 
+ The previous ArgMax entry is resolved. Resume the normal-default census
+ after `test_argmin`; no LUT change was involved.
++
++### Normal-fp32 stable argsort milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged `TestOps.test_argsort` | **1 passed in 66.23s** |
++| permanent fp16+fp32 stable/duplicate hardware case | **1 passed in 24.75s** |
++| hardware-free planner/codec contract | **98/98 in 5.42s** |
++
++The argsort occurrence-count, bitonic compare/swap, and final selected-index
++lowerings now accept fp32 inputs. Four-byte static gathers are immediately
++converted through the existing fp32 ABI; operator arithmetic and stable
++selection stay on the NPU.
++
++The final mixed float/int kernel originally reserved its fp32 gather after
++native-int scratch and received slot 15. Version-4 encodes fp32 input types
++only for slots below 7, producing mostly zero indices despite successful
++matcher classification. Reserving that reusable gather first keeps it in
++slot 5; the permanent pipeline test asserts that every fp32 argsort typed
++slot is encodable.
++
++No LUT change was needed. Continue the normal-default census after
++`test_argsort`; sort/topk are related but are not claimed by this milestone.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 3fd44e394..36af4deec 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -8944,13 +8944,13 @@ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
+ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower bitonic sort's static MAX/MIN lane choice without host value comparisons."""
+   store = _store_node(sink)
+-  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _reduce_node(sink) is not None: return None
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float, dtypes.int) or _reduce_node(sink) is not None: return None
+   value = _unwrap(store.src[1])
+   if value.op is not Ops.WHERE or any(u.op is Ops.INDEX for u in value.src[0].toposort()): return None
+ 
+   def inverted(u:UOp) -> UOp|None:
+     u = _unwrap(u)
+-    inverse_op = Ops.MUL if store.src[0].dtype is dtypes.half else Ops.XOR
++    inverse_op = Ops.MUL if store.src[0].dtype in (dtypes.half, dtypes.float) else Ops.XOR
+     if u.op is not inverse_op: return None
+     for operand, inverse in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
+       if inverse.op is Ops.CONST and int(inverse.arg) == -1: return _unwrap(operand)
+@@ -9075,14 +9075,21 @@ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", convert_layout, out_slot, is_copy=True), convert_relocs))
+     return tuple(tasks)
+ 
++  float_gather_slot = alloc() if store.src[0].dtype is dtypes.float else None
+   gathered:list[int] = []
+   for source_slot, mapping in zip(source_slots, mappings):
+-    gathered_slot = alloc()
+-    gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 2, *mapping)
++    gathered_slot = float_gather_slot if float_gather_slot is not None else alloc()
++    gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 4 if float_gather_slot is not None else 2, *mapping)
+     gather_relocs = (RKReloc(0, gathered_slot, 0, 0, 0xFFFFFFFF),
+                      RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered_slot, is_copy=True), gather_relocs))
+-    gathered.append(gathered_slot)
++    if float_gather_slot is not None:
++      converted = alloc()
++      tasks.append(_emit_where_stage(total, converted, (gathered_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                     fp32_inputs=(gathered_slot,)))
++      gathered.append(converted)
++    else:
++      gathered.append(gathered_slot)
+   maximum = alloc()
+   tasks.append(_emit_where_stage(total, maximum, (gathered[0], 0), (gathered[1], 0), Ops.MAX))
+   negative:list[int] = []
+@@ -9096,18 +9103,23 @@ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tasks.append(_emit_where_stage(total, maximum_negative, (negative[0], 0), (negative[1], 0), Ops.MAX))
+   tasks.append(_emit_where_stage(total, minimum_warm, (maximum_negative, 0), minus_one, Ops.MUL))
+   tasks.append(_emit_where_stage(total, minimum, (maximum_negative, 0), minus_one, Ops.MUL))
++  selected_slot = out_slot
+   if all(choose_max) or not any(choose_max):
+     selected = maximum if all(choose_max) else minimum
+-    tasks.append(_emit_where_stage(total, out_slot, (selected, 0), (_ZERO_SLOT, 0), Ops.ADD))
++    if store.src[0].dtype is dtypes.float: selected_slot = selected
++    else: tasks.append(_emit_where_stage(total, out_slot, (selected, 0), (_ZERO_SLOT, 0), Ops.ADD))
+   else:
+     # WIP reference: arithmetic selection used
+     #   minimum + static_mask * (maximum-minimum)
+     # but a padded sort lane can be -inf, making the unselected 0*inf term NaN.
+     # The choice is compile-time wire topology, so interleave the already
+     # NPU-computed extrema as representation-preserving layout work.
++    selected_slot = alloc() if store.src[0].dtype is dtypes.float else out_slot
+     select_layout = (total, _HOST_STATIC_SELECT_HALF_LAYOUT, *(int(selected) for selected in choose_max))
+-    select_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, maximum, minimum))
+-    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", select_layout, out_slot, is_copy=True), select_relocs))
++    select_relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (selected_slot, maximum, minimum))
++    tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", select_layout, selected_slot, is_copy=True), select_relocs))
++  if store.src[0].dtype is dtypes.float:
++    tasks.append(_emit_where_stage(total, out_slot, (selected_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
+   return tuple(tasks)
+ 
+ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -9134,11 +9146,12 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   any(x.op is Ops.CONST and x.dtype is dtypes.bool and bool(x.arg) for x in u.src)]
+     if len(equalities) != 1: return None
+     pair = tuple(_unwrap(x) for x in inequality.src)
+-    if pair[0].dtype is not pair[1].dtype or pair[0].dtype not in (dtypes.half, dtypes.int) or \
++    if pair[0].dtype is not pair[1].dtype or pair[0].dtype not in (dtypes.half, dtypes.float, dtypes.int) or \
+        any(x.src[0].op is not Ops.PARAM for x in pair): return None
+     equality_pairs.append((equalities[0], (pair[0], pair[1])))
+   pair_dtypes = tuple(pair[0].dtype for _, pair in equality_pairs)
+-  if set(pair_dtypes) == {dtypes.half, dtypes.int}: value_pair_index = pair_dtypes.index(dtypes.half)
++  if set(pair_dtypes) in ({dtypes.half, dtypes.int}, {dtypes.float, dtypes.int}):
++    value_pair_index = next(i for i, dtype in enumerate(pair_dtypes) if dtype is not dtypes.int)
+   elif pair_dtypes == (dtypes.int, dtypes.int): value_pair_index = 0
+   else: return None
+   static_body = body.substitute({equality:UOp.const(dtypes.bool, True) for equality, _ in equality_pairs})
+@@ -9219,6 +9232,10 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", unpack_layout, result, is_copy=True), unpack_relocs))
+     return result
+ 
++  # Keep the reusable fp32 gather in the first available global slot.  The
++  # version-4 task header can encode fp32 input typing only for slots 0..6;
++  # native-int conversion scratch below may otherwise push it out of range.
++  float_gather_slot = alloc() if any(index.dtype is dtypes.float for index in flat_indexes) else None
+   converted_int_slots:dict[int,int] = {}
+   for index, source_slot, source_total in zip(flat_indexes, source_slots, source_totals):
+     if index.dtype is dtypes.int and source_slot not in converted_int_slots:
+@@ -9230,12 +9247,21 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     gathered:list[int] = []
+     for index, source_slot, address_map in zip(flat_indexes, source_slots, selected_maps):
+       effective_slot = converted_int_slots[source_slot] if index.dtype is dtypes.int else source_slot
+-      gathered_slot = alloc()
+-      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 2, *address_map)
++      if index.dtype is dtypes.float:
++        assert float_gather_slot is not None
++        gathered_slot = float_gather_slot
++      else: gathered_slot = alloc()
++      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 4 if index.dtype is dtypes.float else 2, *address_map)
+       gather_relocs = (RKReloc(0, gathered_slot, 0, 0, 0xFFFFFFFF),
+                        RKReloc(0, effective_slot, 0, 0, 0xFFFFFFFF))
+       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered_slot, is_copy=True), gather_relocs))
+-      gathered.append(gathered_slot)
++      if index.dtype is dtypes.float:
++        converted_float = alloc()
++        tasks.append(_emit_where_stage(total, converted_float, (gathered_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                       fp32_inputs=(gathered_slot,)))
++        gathered.append(converted_float)
++      else:
++        gathered.append(gathered_slot)
+     value_distance, count_equal = None, None
+     for pair_index, (left, right) in enumerate(((gathered[0], gathered[1]), (gathered[2], gathered[3]))):
+       forward, reverse, distance = alloc(), alloc(), alloc()
+@@ -9323,7 +9349,7 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if len(equalities) != 1: return None
+   equality = equalities[0]
+   indexes = tuple(_unwrap(x) for x in inequality.src)
+-  if indexes[0].dtype is not indexes[1].dtype or indexes[0].dtype not in (dtypes.half, dtypes.int) or \
++  if indexes[0].dtype is not indexes[1].dtype or indexes[0].dtype not in (dtypes.half, dtypes.float, dtypes.int) or \
+      any(x.src[0].op is not Ops.PARAM for x in indexes): return None
+   static_body = body.substitute({equality:UOp.const(dtypes.bool, True)})
+   if any(u.op is Ops.INDEX for u in static_body.toposort()): return None
+@@ -9405,6 +9431,7 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     for source_slot, source_total in zip(source_slots, source_totals):
+       if source_slot not in converted: converted[source_slot] = native_int_to_half(source_slot, source_total)
+     effective_slots = tuple(converted[source_slot] for source_slot in source_slots)
++  float_gather_slot = alloc() if indexes[0].dtype is dtypes.float else None
+ 
+   masks:list[int] = []
+   one = (_CONST_SLOT, 0x3f800000)
+@@ -9412,12 +9439,18 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     if not any(valid_map): continue
+     gathered:list[int] = []
+     for source_slot, mapping in zip(effective_slots, (left_map, right_map)):
+-      gathered_slot = alloc()
+-      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 2, *mapping)
++      gathered_slot = float_gather_slot if float_gather_slot is not None else alloc()
++      gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, 4 if float_gather_slot is not None else 2, *mapping)
+       gather_relocs = (RKReloc(0, gathered_slot, 0, 0, 0xFFFFFFFF),
+                        RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", gather_layout, gathered_slot, is_copy=True), gather_relocs))
+-      gathered.append(gathered_slot)
++      if float_gather_slot is not None:
++        converted_float = alloc()
++        tasks.append(_emit_where_stage(total, converted_float, (gathered_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                       fp32_inputs=(gathered_slot,)))
++        gathered.append(converted_float)
++      else:
++        gathered.append(gathered_slot)
+     forward, reverse, distance, unequal, equal_warm, equal = (alloc() for _ in range(6))
+     tasks.append(_emit_where_stage(total, forward, (gathered[0], 0), (gathered[1], 0), Ops.SUB))
+     tasks.append(_emit_where_stage(total, reverse, (gathered[1], 0), (gathered[0], 0), Ops.SUB))
+-- 
+2.34.1
+
