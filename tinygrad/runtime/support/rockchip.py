@@ -9145,6 +9145,18 @@ def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if square is None or scale is None or _unwrap(square.src[0]).op is not Ops.INDEX: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve exact fp32 arithmetic for multi-input graphs with a real static broadcast."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
+  value = _unwrap(store.src[1])
+  if value.dtype is not dtypes.float: return None
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
+  if len({u.src[0].buf_uop.arg.slot for u in inputs}) < 2 or len({u.src[1] for u in inputs}) < 2: return None
+  ops = {u.op for u in value.toposort()}
+  if Ops.FDIV not in ops and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
   store = _store_node(sink)
@@ -13613,6 +13625,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   # scan; multidimensional cumprod uses the same physical helper shape.
   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
   #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
+  if (fp32_broadcast_tasks := _try_fp32_broadcast_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_broadcast_tasks)
   if (fp32_topology_tasks := _try_fp32_topology_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_topology_tasks)
   if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:

@@ -9567,3 +9567,25 @@ validates `eye(10) @ flip(eye(10), axis=0)` without reproducing its historical
 crash. No code, host boundary, runtime ABI, or LUT change was needed.
 
 Next forward group: `TestOps.test_broadcast_full`.
+
+## 2026-07-30 — normal-fp32 full-broadcast milestone
+
+All ten unchanged `TestOps.test_broadcast_full` subtests pass in **9.16s**,
+covering add/subtract/multiply/divide/power across both rank-4 and rank-5
+broadcast layouts. The hardware-free Rockchip contract is **125/125 in
+7.03s**.
+
+The rank-5 division path previously missed `rtol=0.001` in 3/1680 lanes
+because the broadcast operands and result crossed fp16. Both dynamic tensor
+power layouts were rejected at the composite domain-protection `WHERE`
+graph. `_try_fp32_broadcast_host_subtasks` now uses the existing serialized
+fp32 evaluator only for reduction-free, multi-input graphs with distinct
+static address mappings and either FDIV or the complete WHERE/EXP2/LOG2
+power signature.
+
+The initial matcher also selected broadcast add; the full contract caught
+that overreach because affine fp32 add must retain its established nine-task
+NPU limb path. The final opcode gate preserves add/subtract/multiply on their
+existing NPU implementations. No LUT or runtime ABI changed. Mypy remains at
+the exact 12-error baseline. Next forward group:
+`TestOps.test_broadcast_simple`.

@@ -2152,3 +2152,13 @@ forward group: `TestOps.test_flip_eye_crash`.
 `TestOps.test_flip_eye_crash`: **pass in 3.49s** unchanged. The flipped
 identity-matrix matmul completes without the historical crash. No code or
 LUT change was needed. Next forward group: `TestOps.test_broadcast_full`.
+
+### Normal-fp32 full broadcasting
+
+`TestOps.test_broadcast_full`: **10 subtests pass in 9.16s**. Exact serialized
+fp32 evaluation is limited to real static broadcasts containing FDIV or the
+complete WHERE/EXP2/LOG2 tensor-power signature. This fixes the 3/1680
+rank-5 division tolerance misses and both rejected power graphs while
+preserving the established NPU affine-limb paths for add/subtract/multiply.
+No LUT changed. Contract: **125/125**. Next forward group:
+`TestOps.test_broadcast_simple`.
