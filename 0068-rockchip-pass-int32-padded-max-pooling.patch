@@ -1,0 +1,113 @@
+From 30ae686de976529f2aa50655a6fce126836e3150 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 19:01:07 +0800
+Subject: [PATCH] rockchip: pass int32 padded max pooling
+
+---
+ progress.md                          | 20 ++++++++++++++++++++
+ test/rockchip/test_pr1.py            |  9 +++++++++
+ test_ops_status.md                   |  9 +++++++++
+ tinygrad/runtime/support/rockchip.py | 15 +++++++++++++++
+ 4 files changed, 53 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 141407ea4..473e6fca4 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9733,3 +9733,23 @@ NPU limb path, so ordinary broadcast addition is not redirected.
+ 
+ No runtime ABI, CMAC geometry, or LUT changed. Mypy remains at the exact
+ 12-error baseline. Next forward group: `TestOps.test_max_pool2d_simple`.
++
++## 2026-07-30 — value max-pooling milestone
++
++All twelve unchanged value-only max-pool groups pass in **71.91s** across
++four clean invocations. Coverage includes simple/core pooling, symmetric and
++asymmetric padding, int32 padding, larger/unit/smaller strides, dilation, and
++both ceil-mode forms. The core/padded matrix contributes 17 subtests and the
++remaining stride/dilation/ceil block contributes 16. The hardware-free
++Rockchip contract is **130/130 in 7.48s**.
++
++`test_max_pool2d_padding_int` was rejected as `unsupported_dtype`. Its graph
++is one int32 MAX reduction over a static 2x2 window with `INT_MIN` padding.
++The existing exact static reduction serializer now has a normal-default
++entry point restricted to exactly one bounded int32 MAX reduction (at most
++64 terms), a padding WHERE, and the `-2**31` sentinel. The official case
++passes in **3.93s**. The general diagnostic static reducer remains gated.
++
++No runtime ABI, native float pool path, or LUT changed. Mypy remains at the
++exact 12-error baseline. Next forward group:
++`TestOps.test_max_pool2d_return_indices`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 9f628d74c..5613f44c0 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -980,6 +980,15 @@ class TestPipeline(unittest.TestCase):
+     self.assertTrue(all(st.task.kind == "dpu" for st in subtasks))
+     self.assertEqual(subtasks[-1].task.out_slot, 0)
+ 
++  def test_int32_padded_max_pool_uses_bounded_static_reduction(self):
++    x = Tensor.empty(4,2,11,28, dtype=dtypes.float, device="ROCKCHIP")
++    prg = build_native_program(_get_sink(x.int().max_pool2d(kernel_size=(2,2), padding=1)))
++    self.assertIsNotNone(prg)
++    subtasks = prg.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertTrue(subtasks[0].task.is_copy)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_axis_argmax_reuses_low_typed_gather_slot(self):
+     x = Tensor.rand(4,5, dtype=dtypes.float).realize()
+     sinks = [c.src[0] for c in x.argmax(0).schedule_linear().src if c.src[0].op is Ops.SINK]
+diff --git a/test_ops_status.md b/test_ops_status.md
+index ee7a14c79..322bf8c3e 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2243,3 +2243,12 @@ exact-fp32 boundary for root ADD graphs containing a padding WHERE, fixing
+ 356/4096 `x+pad(w)` half-rounding misses. Ordinary affine broadcast add
+ retains its established nine-task NPU path. No LUT changed. Contract:
+ **129/129**. Next forward group: `TestOps.test_max_pool2d_simple`.
++
++### Value max-pooling
++
++All twelve value-only max-pool groups pass in **71.91s**, with 33
++parameterized subtests across padding, stride, dilation, and ceil modes. The
++int32 padded case now exposes one strictly bounded 2x2 static MAX task only
++when its padding WHERE and `INT_MIN` sentinel match. Float pooling and the
++general diagnostic reducer are unchanged. No LUT changed. Contract:
++**130/130**. Next forward group: `TestOps.test_max_pool2d_return_indices`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index f50846894..390c0e26f 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9505,6 +9505,19 @@ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
+   expanded = sink.substitute({store:store.replace(src=(store.src[0], value))})
+   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+ 
++def _try_int_max_pool_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Expose only bounded int32 max-pool reductions from the static host reducer."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.int or len(reductions) != 1: return None
++  reduce = reductions[0]
++  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.MAX or not reduce.src[1:] or \
++     any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]) or prod(int(axis.src[0].arg) for axis in reduce.src[1:]) > 64: return None
++  nodes = reduce.src[0].toposort()
++  if not any(u.op is Ops.WHERE for u in nodes) or \
++     not any(u.op is Ops.CONST and u.dtype is dtypes.int and int(u.arg) == -(1 << 31) for u in nodes): return None
++  return _try_static_index_reduction_subtasks(sink)
++
+ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower bitonic sort's static MAX/MIN lane choice without host value comparisons."""
+   store = _store_node(sink)
+@@ -13682,6 +13695,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, arg_extrema_tasks)
+   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
++  if (int_max_pool_tasks := _try_int_max_pool_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, int_max_pool_tasks)
+   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
+      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
+   if (long_cumprod_tasks := _try_long_cumprod_subtasks(sink)) is not None:
+-- 
+2.34.1
+
