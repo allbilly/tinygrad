@@ -1502,3 +1502,21 @@ constants, and SUB.  Constant-folded `1+0.5` still passes through its
 existing fill path.  The next census should therefore treat `test_add3`,
 broadcast ADD, and SUB as independent extensions rather than assuming this
 milestone covers them.
+
+### Nested three-input fp32 ADD milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_add` + `test_add3` + `test_tiny_add` | **3 passed in 3.46s** |
+| isolated unchanged `test_add3` | **1 passed in 2.90s** |
+| full hardware-free planner/codec contract | **87/87 in 6.79s** |
+| mypy | **pre-existing 13-error baseline** |
+
+The fp32 ADD matcher now flattens exactly two or three direct contiguous
+inputs.  It carries the split high/x256-low representation across the second
+NPU TwoSum block and decodes only the final logical output.  This avoids the
+generic nested-elementwise bug that treated an internal scratch slot as a
+caller-visible fp32 buffer and raised `IndexError`.
+
+Three-input ADD uses eighteen NPU arithmetic stages.  Broadcast ADD and SUB
+remain open and are not covered by this milestone.

@@ -10762,12 +10762,20 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Add two direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
+  """Add two or three direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
   val = _unwrap(store.src[1])
-  if val.op is not Ops.ADD or val.dtype is not dtypes.float or len(val.src) != 2: return None
-  sources = tuple(_unwrap(x) for x in val.src)
+  if val.op is not Ops.ADD or val.dtype is not dtypes.float: return None
+  sources_list:list[UOp] = []
+  def flatten_add(node:UOp) -> None:
+    node = _unwrap(node)
+    if node.op is Ops.ADD:
+      for child in node.src: flatten_add(child)
+    else: sources_list.append(node)
+  flatten_add(val)
+  sources = tuple(sources_list)
+  if len(sources) not in (2, 3): return None
   if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM or
          not _is_flat_contiguous(x.src[1]) for x in sources) or not _is_flat_contiguous(store.src[0].src[1]): return None
   total = prod(_shape_of_store(sink))
@@ -10793,17 +10801,20 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   limbs = tuple((view(x.src[0].arg.slot, _HOST_FP32_HALF_LAYOUT),
                  view(x.src[0].arg.slot, _HOST_FP32_RESIDUAL_LAYOUT)) for x in sources)
-  high = stage(limbs[0][0], limbs[1][0], Ops.ADD)
-  rounded_b = stage(high, limbs[0][0], Ops.SUB)
-  high_minus_rounded_b = stage(high, rounded_b, Ops.SUB)
-  error_a = stage(limbs[0][0], high_minus_rounded_b, Ops.SUB)
-  error_b = stage(limbs[1][0], rounded_b, Ops.SUB)
-  high_error = stage(error_a, error_b, Ops.ADD)
-  input_low = stage(limbs[0][1], limbs[1][1], Ops.ADD)
-  scaled_high_error = alloc()
-  tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
-                                 (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
-  low = stage(input_low, scaled_high_error, Ops.ADD)
+  high, low = limbs[0]
+  for next_high, next_low in limbs[1:]:
+    old_high = high
+    high = stage(old_high, next_high, Ops.ADD)
+    rounded_b = stage(high, old_high, Ops.SUB)
+    high_minus_rounded_b = stage(high, rounded_b, Ops.SUB)
+    error_a = stage(old_high, high_minus_rounded_b, Ops.SUB)
+    error_b = stage(next_high, rounded_b, Ops.SUB)
+    high_error = stage(error_a, error_b, Ops.ADD)
+    input_low = stage(low, next_low, Ops.ADD)
+    scaled_high_error = alloc()
+    tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
+                                   (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
+    low = stage(input_low, scaled_high_error, Ops.ADD)
 
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
   relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high, 0, 0, 0xFFFFFFFF),

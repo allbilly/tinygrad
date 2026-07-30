@@ -7580,6 +7580,36 @@ are not claimed by this milestone.  Issue #471 again explains why retaining
 the fp32 residual is necessary, but it supplies neither TwoSum nor an output
 representation strategy.
 
+## 2026-07-30 — nested three-input fp32 ADD milestone
+
+After direct ADD passed, the census stopped at `TestOps.test_add3` before
+comparison.  Generic nested-elementwise lowering materialized `x+y` into an
+internal slot, marked that scratch slot as an external fp32 output, and the
+runtime attempted to find it in the caller buffer list:
+
+```text
+IndexError: original_prepared[output_slot]
+```
+
+The compensated ADD matcher now flattens exactly two or three direct
+contiguous fp32 sources.  It carries `(high,x256-low)` across each
+left-to-right addition.  Every additional source contributes one more
+nine-stage NPU TwoSum/correction block; only the final logical result crosses
+the host ABI decode boundary.
+
+Validation with `. .venv/bin/activate`:
+
+- unchanged `test_add`, `test_add3`, and `test_tiny_add`:
+  **3 passed in 3.46 seconds**;
+- isolated unchanged `test_add3`: **1 passed in 2.90 seconds**;
+- full hardware-free planner/codec contract: **87/87 in 6.79 seconds**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+The three-input program uses six input representation views, eighteen NPU
+arithmetic stages, and one final high/residual fp32 ABI decode.  Broadcast
+ADD and SUB remain separate groups.
+
 ## 2026-07-30 — logarithmic long cumulative products
 
 The unchanged forward-only `TestOps.test_simple_cumprod` now passes both

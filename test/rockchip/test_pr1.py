@@ -309,6 +309,17 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.task.is_copy for task in subtasks), 5)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_fp32_add3_keeps_compensated_boundary(self):
+    a = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
+    c = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a+b+c))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 18)
+    self.assertEqual(sum(task.task.is_copy for task in subtasks), 7)
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_fp32_acos_uses_specialized_lut_boundary(self):
     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
     self.assertIsNotNone(program)
