@@ -1,0 +1,100 @@
+From ae8d7d757dea71f16e5d581d7ff78313f7f44237 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 20:10:26 +0800
+Subject: [PATCH] rockchip: pass interpolation family
+
+---
+ progress.md                          | 20 ++++++++++++++++++++
+ test/rockchip/test_pr1.py            |  9 +++++++++
+ test_ops_status.md                   | 11 +++++++++++
+ tinygrad/runtime/support/rockchip.py |  7 ++++++-
+ 4 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/progress.md b/progress.md
+index 28daeef8a..bd36922af 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9834,3 +9834,23 @@ path to reuse here. Those planner rules remain useful for future native CONV
+ work. No LUT changed. Mypy remains at the exact 12-error baseline; ruff is
+ not installed in `.venv`. Next forward group:
+ `TestOps.test_interpolate_linear`.
++
++## 2026-07-30 — interpolation milestone
++
++All eight unchanged interpolation groups pass in **318.00s** across separate
++invocations: 1D linear with and without aligned corners, nearest and
++nearest-exact across 1D/2D/3D shapes, bilinear with and without aligned
++corners, and trilinear with and without aligned corners. The two bilinear
++groups are the slowest at **131.39s** and **120.39s** respectively. The
++hardware-free Rockchip contract is **135/135 in 9.89s**.
++
++Nearest downsampling initially returned contiguous input values. Its source
++address casts a floating coordinate expression after multiplying by the
++input/output ratio; the compact integer movement serializer stripped those
++casts and encoded `13/9` as integer `1`. That serializer now rejects any
++float-derived address expression. The graph then reaches the existing exact
++typed conditional-movement evaluator, which preserves float multiplication
++and cast semantics. Pure integer movement remains on the compact path.
++
++No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
++Next forward group: `TestOps.test_cat`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index adc7c9efa..c9c8322b8 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -410,6 +410,15 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(subtasks[0].task.is_copy)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_nearest_interpolation_keeps_float_coordinate_scale(self):
++    expression = Tensor.empty(2,3,13, dtype=dtypes.float, device="ROCKCHIP").interpolate((9,), mode="nearest")
++    program = build_native_program(_get_sink(expression))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertTrue(subtasks[0].task.is_copy)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
+     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
+     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index cac165574..ac32cee63 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2290,3 +2290,14 @@ The repeated `ref/rk3588/conv_grok` review found useful formula-driven CBUF
+ and `(output_h-1)*stride+kernel` tile-span guidance for future native
+ convolution, but no 3D pooling or strict-fp32 reduction implementation to
+ reuse. Next forward group: `TestOps.test_interpolate_linear`.
++
++### Interpolation
++
++All eight interpolation groups pass in **318.00s** across separate
++invocations, covering linear/nearest/bilinear/trilinear, nearest-exact, and
++both aligned-corner linear variants. Nearest resize now rejects
++float-derived coordinates from the compact integer movement serializer;
++this prevents `13/9` from becoming integer `1` and routes the unchanged graph
++to the exact typed conditional-movement evaluator. Pure integer movement is
++unchanged. No runtime ABI or LUT changed. Contract: **135/135**. Next forward
++group: `TestOps.test_cat`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index ef9bc8b4e..18f81a02d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10885,7 +10885,12 @@ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     return input_slots.index(slot)
+ 
+   def emit_int(u:UOp, code:list[int]) -> bool:
+-    while u.op is Ops.CAST: u = u.src[0]
++    while u.op is Ops.CAST:
++      if dtypes.is_float(u.dtype) or dtypes.is_float(u.src[0].dtype): return False
++      u = u.src[0]
++    # This compact interpreter carries integer literals only. Accepting a
++    # float coordinate expression truncated constants such as 13/9 to one.
++    if dtypes.is_float(u.dtype): return False
+     if u.op is Ops.CONST:
+       if u.arg is Invalid:
+         code.extend((0, 0))
+-- 
+2.34.1
+
