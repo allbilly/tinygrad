@@ -1,0 +1,91 @@
+From 54f88978acd48c16c1402774a2fe78777a6e5376 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:55:28 +0800
+Subject: [PATCH] rockchip: pass normal fp32 padding add
+
+---
+ progress.md                          | 17 +++++++++++++++++
+ test/rockchip/test_pr1.py            | 10 ++++++++++
+ test_ops_status.md                   |  8 ++++++++
+ tinygrad/runtime/support/rockchip.py |  3 ++-
+ 4 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/progress.md b/progress.md
+index 106399b45..141407ea4 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9716,3 +9716,20 @@ including the slow-gated 4x16x64x64 case.
+ No code, host boundary, runtime ABI, CMAC geometry, or LUT change was needed.
+ After the LLVM-only `test_strided_conv2d_simple_vec`, next forward group:
+ `TestOps.test_strided_conv2d`.
++
++## 2026-07-30 — strided/padded/dilated conv2d milestone
++
++Ten unchanged stride, negative/simple/asymmetric padding, padded-convolution,
++padding-add, and dilation groups pass together with **7 parameterized
++subtests in 25.19s**. The hardware-free Rockchip contract is **129/129 in
++7.52s**.
++
++The convolution cases already passed. `test_padding_add` failed because
++normal-fp32 `x + pad(w)` crossed the DPU half boundary, producing 356/4096
++tolerance misses concentrated near zero. The strict fp32 broadcast matcher
++now accepts root ADD only when the graph also contains the padding `WHERE`.
++The existing affine broadcast-add contract test still selects its nine-task
++NPU limb path, so ordinary broadcast addition is not redirected.
++
++No runtime ABI, CMAC geometry, or LUT changed. Mypy remains at the exact
++12-error baseline. Next forward group: `TestOps.test_max_pool2d_simple`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index bfc82acc4..9f628d74c 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -388,6 +388,16 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(subtasks[0].task.is_copy)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_padded_add_uses_exact_host_boundary(self):
++    a = Tensor.empty(64,64, dtype=dtypes.float, device="ROCKCHIP")
++    b = Tensor.empty(60,60, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a+b.pad((2,2,2,2))))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertTrue(subtasks[0].task.is_copy)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_conditional_movement_uses_exact_host_boundary(self):
+     for mode in ("reflect", "replicate"):
+       expression = Tensor.empty(1,1,5,5, dtype=dtypes.float, device="ROCKCHIP").pad((0,2,3,2), mode=mode)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 150161235..ee7a14c79 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2235,3 +2235,11 @@ methods; seven more large-input/grouped/depthwise/fancy/strided groups pass.
+ Total measured time is **73.92s** across three invocations. No code or LUT
+ change was needed. After the LLVM-only `test_strided_conv2d_simple_vec`,
+ next forward group: `TestOps.test_strided_conv2d`.
++
++### Strided, padded, and dilated conv2d
++
++Ten groups pass with **7 subtests in 25.19s**. The only change is a strict
++exact-fp32 boundary for root ADD graphs containing a padding WHERE, fixing
++356/4096 `x+pad(w)` half-rounding misses. Ordinary affine broadcast add
++retains its established nine-task NPU path. No LUT changed. Contract:
++**129/129**. Next forward group: `TestOps.test_max_pool2d_simple`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index f3bed9082..f50846894 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9154,7 +9154,8 @@ def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
+   if len({u.src[0].buf_uop.arg.slot for u in inputs}) < 2 or len({u.src[1] for u in inputs}) < 2: return None
+   ops = {u.op for u in value.toposort()}
+-  if Ops.FDIV not in ops and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
++  padded_add = value.op is Ops.ADD and Ops.WHERE in ops
++  if Ops.FDIV not in ops and not padded_add and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
+ def _try_conditional_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-- 
+2.34.1
+
