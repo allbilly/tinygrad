@@ -1471,6 +1471,9 @@ class RockchipProgram(Program['RockchipDevice']):
           if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
             _run_host_half_int(task, st.relocs, tuple(ext))
             continue
+          if len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
+            _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+            continue
           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
             _run_host_bitwise(task, st.relocs, tuple(ext))
             continue
@@ -1537,16 +1540,20 @@ class RockchipProgram(Program['RockchipDevice']):
         dpu_pending:list[RKSubTask] = []
         def flush_pending() -> None:
           if not dpu_pending: return
+          if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_BEGIN", "dpu", tuple(st.task.out_slot for st in dpu_pending), flush=True)
           dev.reset_npu()
           self.subtasks = list(dpu_pending)
           self._submit_multi(tuple(ext))
+          if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_END", "dpu", tuple(st.task.out_slot for st in dpu_pending), flush=True)
           dpu_pending.clear()
         for st in subtasks:
           if is_cmp(st) or st.task.kind != "dpu":
             flush_pending()
+            if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_BEGIN", st.task.kind, (st.task.out_slot,), flush=True)
             dev.reset_npu()
             self.subtasks = [st]
             self._submit_multi(tuple(ext))
+            if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_END", st.task.kind, (st.task.out_slot,), flush=True)
           else:
             dpu_pending.append(st)
         flush_pending()

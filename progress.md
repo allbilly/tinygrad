@@ -7571,6 +7571,85 @@ Validation with `. .venv/bin/activate`, `DEV=ROCKCHIP FORWARD_ONLY=1`:
 - Python compilation and whitespace checks: **passing**;
 - mypy: exact pre-existing **13-error** Rockchip baseline.
 
+## 2026-07-30 — fp32 ASIN/ACOS specialized boundaries
+
+The unchanged normal-default `TestOps.test_asin` and `test_acos` now pass on
+RK3588.  Their fp32 graphs previously missed the proven inverse-trig matcher,
+whose recognizer required a half INDEX.  ACOS therefore fell through to a
+108-stage generic elementwise expansion.  The final 39-stage batch timed out
+even in isolation; splitting that batch down to individual submissions still
+timed out at the same graph region, proving this was not merely a PC-chain
+length limit.
+
+The recognizer now accepts direct fp16 or fp32 INDEX inputs.  For fp32,
+`_fix_cmp_fp32` marks only tasks which read the original logical input, and
+`_finalize_fp32_output` marks only the last logical output.  Internal scratch
+slots remain fp16.  This immediately removed the timeout and reduced ACOS to
+109/2,925 numerical misses.
+
+### Residual-aware endpoint coordinate
+
+Host ABI preparation supplies the established representation:
+
+```text
+residual = fp16(256 * (x - fp16(x)))
+```
+
+All inverse-trig arithmetic remains on the NPU.  DPU sign masks convert that
+signed residual into the residual of `abs(x)`, and endpoint distance becomes:
+
+```text
+d = (1 - abs(fp16(x))) - abs_residual / 256
+```
+
+This is important when a non-endpoint fp32 input rounds to fp16 `±1`.
+Exact-endpoint masking now tests corrected positive distance instead of
+testing rounded input against `0.99975`.  The change reduced ACOS from 109
+misses to eight.
+
+### Third fine endpoint LUT
+
+The coarse endpoint table is uniform in `d`.  Linear interpolation across its
+first interval underestimates `acos(1-d)`, whose endpoint shape is
+approximately `sqrt(2*d)`.  A third NPU LUT task handles `d<0.003`:
+
+```text
+address coordinate = 64*d
+stored value        = 8*acos(1-d)
+decoded value       = LUT / 8
+```
+
+The 64× coordinate gives roughly `7.6e-6` distance spacing.  The 8× stored
+value gives an effective Q15 output quantum near `3.8e-6`.  Coarse and fine
+outputs are selected by DPU masks.  ACOS endpoint handling starts at
+`abs(x)>0.85`; its fixed-seed progression was timeout → 109 misses → 8
+misses → 2 misses → passing.
+
+FP32 ASIN reuses the same endpoint tables through
+`asin(abs(x)) = pi/2 - acos(abs(x))`.  Outside its endpoint band
+(`abs(x)>0.875`), a separate NPU derivative LUT stores
+`0.5/sqrt(1-x*x)` and corrects the high-input result by the scaled residual.
+Its high-resolution local ASIN table is used through `abs(x)<0.24`; extending
+to 0.25 was rejected because the stored `4*asin(x)` reaches Q15 saturation
+before that boundary.
+
+Host work is limited to fp32/high-residual representation conversion and
+static scratch movement.  LUT evaluation, masks, derivative correction,
+selection, and final values are DPU/LUT tasks.
+
+Validation:
+
+- normal-default unchanged `test_asin` + `test_acos`: **2 passed in 48.65
+  seconds**;
+- `DEFAULT_FLOAT=HALF` regression pair: **2 passed in 15.38 seconds**;
+- hardware-free PR1 contract: **84/84 in 6.73 seconds**;
+- Python compilation and `git diff --check`: **passing**;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+`ROCKCHIP_DEBUG_STAGE=1` now prints begin/end boundaries and output slots for
+reset-separated DPU/LUT submissions.  It was used to prove the old generic
+ACOS timeout occurred in the final batch rather than in either LUT task.
+
 `DEFAULT_FLOAT=HALF` is not part of the requested forward command.  It makes
 `test_const_reduce` pass through the older half path, but also causes
 official dtype mismatches such as the scalar subcase in `test_add`.

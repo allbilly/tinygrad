@@ -2220,3 +2220,77 @@ from 37 misses to one with the fit and to zero with the two-knot correction.
 - Rejected Rockchip WIP is preserved as an apply-checkable patch.
 - `progress.md` and `test_ops_status.md` are updated before the milestone
   commit.
+
+## FP32 ASIN/ACOS endpoint tuning
+
+The fp16 ASIN/ACOS tables cannot be reused unchanged for fp32 inputs near
+`|x|=1`.  A non-endpoint fp32 value can round to fp16 `1`, erasing endpoint
+distance entirely.  Preserve a second ABI limb:
+
+```text
+hi = fp16(x)
+lo = fp16(256 * (x - float32(hi)))
+abs_residual = sign(x) * lo
+d = (1 - abs(hi)) - abs_residual/256
+```
+
+The host may construct `hi` and `lo` as representation conversion.  It must
+not evaluate ASIN, ACOS, derivative correction, masks, or selection.
+
+### Coarse and fine endpoint tables
+
+The ordinary endpoint table addresses `acos(1-d)` directly with
+`index_scale=65504`.  Its physical distance step is about `0.000488`.  This
+is adequate away from zero but not in the first interval because
+`acos(1-d)≈sqrt(2*d)`.
+
+For `d<0.003`, use another NPU LUT:
+
+| Quantity | Fine-table value |
+|---|---:|
+| address input | `64*d` |
+| physical distance step | approximately `7.6e-6` |
+| stored curve | `8*acos(1-d)` |
+| post-LUT DPU scale | `1/8` |
+| table format | signed Q15 |
+
+The input magnification improves interpolation.  The output magnification
+improves Q15 resolution for results around `0.01`, where an unscaled Q15
+quantum alone can exceed the official relative tolerance.  Select fine and
+coarse results with NPU masks; do not splice tables on the host.
+
+Observed ACOS progression on the fixed official tensor:
+
+```text
+generic fp32 expansion: ioctl timeout
+specialized coarse tables: 109 / 2925 misses
+residual-aware distance:      8 / 2925
+fine endpoint input only:     2 / 2925
+64x input + 8x output:        0 / 2925
+```
+
+### ASIN reuse and derivative correction
+
+For the endpoint band, reuse the same ACOS endpoint tables:
+
+```text
+asin(abs(x)) = pi/2 - acos(abs(x))
+```
+
+Outside that band, apply the original-input residual with a derivative LUT:
+
+```text
+derivative = 2 * LUT(abs(hi))       # LUT stores 0.5/sqrt(1-x*x)
+correction = derivative * lo / 256
+result     += correction
+```
+
+Mask this correction out in the endpoint band because endpoint distance was
+already corrected.  Use the high-resolution local ASIN table only through
+`|x|<0.24`; its stored curve is `4*asin(x)`, so extending it to `0.25`
+saturates Q15 and produces exact-looking but wrong `±0.25` plateaus.
+
+Always rerun both fp32 and fp16 ASIN/ACOS after changing their shared
+endpoint threshold.  ACOS benefits from a `0.85` endpoint handoff, while
+ASIN keeps `0.875`; forcing one common threshold regresses ASIN near
+`|x|≈0.86`.

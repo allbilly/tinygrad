@@ -1426,3 +1426,24 @@ output reduced that only to 11/81, isolating input quantization.  The
 compensated path passes.  It is limited to direct source/output buffers of at
 most 256 elements.  Padded-WHERE GEMM, 64×99 matmul, and the explicit 64×64
 fp16 cast/output graph remain separate groups.
+
+### FP32 ASIN/ACOS milestone
+
+| Coverage | Result |
+|---|---:|
+| normal-default unchanged `test_asin` + `test_acos` | **2 passed in 48.65s** |
+| half-mode ASIN/ACOS regression pair | **2 passed in 15.38s** |
+| hardware-free PR1 contract | **84/84 in 6.73s** |
+| mypy | **pre-existing 13-error baseline** |
+
+FP32 inverse-trig graphs now enter the specialized lowering rather than a
+108-stage generic expansion which timed out.  Only original fp32 inputs and
+the final logical output carry typed ABI metadata; scratch values stay fp16.
+
+Endpoint distance includes the 256-scaled fp32 input residual.  ACOS uses a
+coarse endpoint LUT plus a third 64×-magnified, 8×-output-scaled fine LUT for
+`d<0.003`.  ASIN reuses those endpoint values through `pi/2-acos`, and applies
+a derivative-LUT residual correction outside its endpoint band.  All
+inverse-trig operator arithmetic remains on DPU/LUT tasks.
+
+The next census must continue in normal-default `FORWARD_ONLY=1` mode.
