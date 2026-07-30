@@ -1,0 +1,98 @@
+From c289c6c2114503877326cabfa5e3812da6d87371 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:48:25 +0800
+Subject: [PATCH] rockchip: pass strided transposed convolution
+
+---
+ progress.md                          | 19 +++++++++++++++++++
+ test/rockchip/test_pr1.py            |  9 +++++++++
+ test_ops_status.md                   |  9 +++++++++
+ tinygrad/runtime/support/rockchip.py |  6 ++++++
+ 4 files changed, 43 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 4acae25b5..d0fecdcfb 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9676,3 +9676,22 @@ for both conv3d groups. No additional code, host boundary, runtime ABI, or
+ LUT change was needed.
+ 
+ Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
++
++## 2026-07-30 — advanced/transpose convolution milestone
++
++Four unchanged layout variants (1x1-M4, nested, NHWC, and batched conv2d)
++pass in **8.49s**. All eight transpose-convolution groups pass together in
++**50.33s**, covering 2D/3D, bias, grouping, padding, dilation, asymmetric
++strides, and output padding. The hardware-free Rockchip contract is
++**128/128 in 7.42s**.
++
++The asymmetric-stride transpose2d schedule wraps its usual product in an
++outer validity `WHERE`; the input operand also contains the expected
++stride/modulo mask. `_try_small_fp32_cmac_subtasks` previously required a
++root MUL and rejected both `(2,1)` and `(1,2)` forms. It now recognizes only
++the outer `WHERE(valid, MUL(...), Invalid-or-zero)` form and folds `valid`
++into one zero-masked CMAC operand. All three official strides pass in
++**6.63s**, retaining the small K=36 CMAC materialization.
++
++No large-K geometry or LUT changed. Mypy remains at the exact 12-error
++baseline. Next forward group: `TestOps.test_conv1d`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a1d1a9a04..bfc82acc4 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -412,6 +412,15 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
+       self.assertEqual(subtasks[-1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_strided_transposed_convolution_keeps_guarded_cmac(self):
++    for stride in ((2,1), (1,2)):
++      x = Tensor.empty(2,4,4,5, dtype=dtypes.float, device="ROCKCHIP")
++      w = Tensor.empty(4,4,3,3, dtype=dtypes.float, device="ROCKCHIP")
++      program = build_native_program(_get_sink(x.conv_transpose2d(w, stride=stride)))
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
++
+   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
+     for shape, axis in (((45,65), 1), ((45,), 0)):
+       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 4f9032ad7..28121b6e1 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2212,3 +2212,12 @@ broaden the unproven large-K `conv_grok` geometry. No LUT changed. Contract:
+ Six convolution groups pass unchanged in **25.49s**: simple 3x3 with/without
+ bias, simple/padded 3D, 16-channel 3x3, and simple 1x1. No code or LUT change
+ was needed. Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
++
++### Advanced and transpose convolution
++
++The four 1x1-M4/nested/NHWC/batched groups pass in **8.49s**, and all eight
++transpose-convolution groups pass in **50.33s**. Asymmetric-stride transpose
++graphs now fold their outer validity WHERE into one zero-masked exact fp32
++CMAC operand, keeping K=36 on the established materializer. No large-K path
++or LUT changed. Contract: **128/128**. Next forward group:
++`TestOps.test_conv1d`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index ebe2c933c..f3bed9082 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -12260,8 +12260,14 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   epilogue = _try_cmac_epilogue(sink, reduce)
+   if epilogue is None: return None
+   body = _unwrap(reduce.src[0])
++  outer_guard = None
++  if body.op is Ops.WHERE and len(body.src) == 3 and _unwrap(body.src[1]).op is Ops.MUL and \
++     body.src[2].op is Ops.CONST and (body.src[2].arg is Invalid or float(body.src[2].arg) == 0.0):
++    outer_guard, body = body.src[0], _unwrap(body.src[1])
+   if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
+   sources = tuple(_unwrap(x) for x in body.src)
++  if outer_guard is not None:
++    sources = (UOp(Ops.WHERE, dtypes.float, (outer_guard, sources[0], UOp.const(dtypes.float, 0.0))), sources[1])
+   if any(x.op not in (Ops.INDEX, Ops.WHERE) or x.dtype is not dtypes.float for x in sources): return None
+   source_indexes = tuple(tuple(u for u in source.toposort()
+                                if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM)
+-- 
+2.34.1
+
