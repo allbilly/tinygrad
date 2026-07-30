@@ -1,0 +1,203 @@
+From 263236487c6422adc1c5c88e68fe49303c54d26a Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 16:54:44 +0800
+Subject: [PATCH 37/37] rockchip: pass normal fp32 mean reductions
+
+---
+ progress.md                          | 82 ++++++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 10 ++++
+ test_ops_status.md                   | 22 ++++++++
+ tinygrad/runtime/support/rockchip.py | 15 ++++-
+ 4 files changed, 127 insertions(+), 2 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index c57a43bab..9e2b7867a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7470,6 +7470,80 @@ Using `. .venv/bin/activate`,
+ - mypy: exact pre-existing **13-error** Rockchip baseline;
+ - ruff and pytest-xdist remain unavailable in `.venv`.
+ 
++## Current forward continuation — mean complete
++
++The latest completed milestone is normal-fp32 mean. The detailed
++`allbilly/rk3588/conv_grok` scalar-geometry comparison, matcher trace, and
++validation are recorded above under **normal-fp32 mean and scalar factorized
++epilogue**. Final checks after narrowing the inactive scalar-ADD WIP remain
++green: all three official mean groups pass, the full hardware-free contract
++is **111/111**, Python compilation and `git diff --check` pass, and mypy
++retains the pre-existing **12-error** Rockchip baseline. Continue with
++`TestOps.test_var`.
++
++## 2026-07-30 — normal-fp32 mean and scalar factorized epilogue
++
++The unchanged forward-only mean group is green:
++
++| Coverage | Result |
++|---|---:|
++| `TestOps.test_mean` | pass |
++| `TestOps.test_mean_axis` | pass |
++| `TestOps.test_mean_zero_axis` | pass |
++| combined official run | **3 passed in 17.70s** |
++| shared sum/factorized-mulacc regression | **4 passed in 25.68s** |
++| hardware-free Rockchip contract | **111/111 in 6.32s** |
++
++### `allbilly/rk3588/conv_grok` re-check
++
++`ref/rk3588` is current with `origin/main` at
++`40fae7b1ade121bb91f3908f0bcfd1a2a8c350e6`. Its one-row GEMM is valid native
++geometry: `m=1` programs `CORE_DATAOUT_SIZE_0`, `DATA_CUBE_HEIGHT`, and
++`WDMA_SIZE_1` with `m-1 == 0`. The row planner also permits `m_tile=1`;
++it does not require an outer spatial loop before emitting a task.
++
++That is directly applicable to a full reduction. Tinygrad represents
++`mean((3,4,5,6))` as scalar `SUM(x) * (1/360)`: it has one REDUCE range but
++no LOOP range. The Rockchip factorized-sum matcher incorrectly treated the
++missing LOOP as invalid even though its staged sum already supports scalar
++output. After that guard was relaxed, tracing showed the CMAC sum succeeded
++and only the compensated fp32 MUL epilogue still rejected `axes=[]`.
++
++The fp32 view runtime already defines an `ndim=0` mapping:
++
++```text
++layout = (total=1, tag, ndim=0, offset=0)
++```
++
++The MUL matcher now accepts only that exact scalar case: output storage must
++contain one element and the affine store offset must be zero. Non-scalar
++axis validation is unchanged. The previous guards remain in source comments
++as WIP references. A candidate scalar-ADD relaxation found during tracing is
++also retained as a comment, but is deliberately inactive because mean does
++not require it.
++
++### Debug method
++
++1. Run with `ROCKCHIP_DEBUG_SINK=1`; full mean must show a scalar STORE of
++   `MUL(REDUCE_ADD(INDEX), CONST reciprocal)`.
++2. If the final rejection is `unsupported_dtype:fp32_cmac`, distinguish the
++   matcher stages rather than editing CMAC registers: first verify the staged
++   direct sum, then the factor epilogue.
++3. Python `sys.settrace` on
++   `_try_fp32_factorized_sum_subtasks` isolated the original zero-LOOP guard,
++   and then line-level tracing of `_try_fp32_mul_subtasks` isolated the empty
++   affine-axis guard. This avoids persistent debug-print changes.
++4. In the built program, require native CMAC work plus both scalar ABI views:
++   `(1, _HOST_FP32_HALF_LAYOUT, 0, 0)` and
++   `(1, _HOST_FP32_RESIDUAL_LAYOUT, 0, 0)`.
++5. Re-run direct sum and zero-stride mulacc groups because they share the
++   staged compensated reduction path.
++
++`test_mean_zero_axis` passes with the existing NumPy `invalid value
++encountered in cast` warning while producing the expected result. No LUT
++table, coefficient, host operator arithmetic, or two-task LUT schedule
++changed. Next forward group: `TestOps.test_var`.
++
+ ## 2026-07-30 — forward `isclose` and raw comparison ABI parity
+ 
+ All unchanged forward-only `isclose` groups now pass:
+@@ -9101,3 +9175,11 @@ Validation with `. .venv/bin/activate`,
+ - Python compilation and `git diff --check`: **passing**;
+ - mypy: exact pre-existing **13-error** Rockchip baseline;
+ - ruff and pytest-xdist remain unavailable in `.venv`.
++
++## Active continuation after historical entries
++
++Normal-fp32 mean is the latest completed milestone: all three official groups
++pass, the final hardware-free suite is **111/111**, and the current mypy
++baseline is the pre-existing **12 errors**. See the detailed
++**normal-fp32 mean and scalar factorized epilogue** section for the
++`conv_grok` comparison and debug method. Continue with `TestOps.test_var`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index ab1155f1d..4b23688da 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -326,6 +326,16 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
+     self.assertTrue(subtasks[-1].task.fp32_output)
+ 
++  def test_full_fp32_mean_uses_scalar_factorized_epilogue(self):
++    program = build_native_program(_get_sink(Tensor.empty(3,4,5,6, dtype=dtypes.float, device="ROCKCHIP").mean()))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
++    scalar_views = [task.task.layout for task in subtasks if task.task.is_copy and len(task.task.layout) == 4]
++    self.assertIn((1, _HOST_FP32_HALF_LAYOUT, 0, 0), scalar_views)
++    self.assertIn((1, _HOST_FP32_RESIDUAL_LAYOUT, 0, 0), scalar_views)
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index a5a949734..bb6560554 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1932,3 +1932,25 @@ int/bool equality and broadcast comparison regressions found during the
+ isclose milestone.
+ 
+ Next forward group: `TestOps.test_mean`.
++
++### Normal-fp32 mean
++
++| Group | Status |
++|---|---:|
++| `test_mean` | pass |
++| `test_mean_axis` | pass |
++| `test_mean_zero_axis` | pass |
++| combined official run | **3 passed in 17.70s** |
++| sum + factorized-mulacc regression | **4 passed in 25.68s** |
++| hardware-free Rockchip contract | **111/111** |
++
++Full mean lowers as scalar `SUM(x) * reciprocal`. Scalar output has no LOOP
++range; that is valid native geometry, consistent with the current
++`allbilly/rk3588` `conv_grok` one-row GEMM encoding (`m-1 == 0`). The
++factorized-sum matcher now accepts zero LOOP ranges, while compensated fp32
++MUL accepts only the exact one-element, zero-offset `ndim=0` view. All
++non-scalar affine checks remain active.
++
++No LUT or host operator arithmetic changed. `test_mean_zero_axis` retains a
++non-failing NumPy invalid-cast warning. Next forward group:
++`TestOps.test_var`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 98b623852..b0c9cb7ee 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11390,6 +11390,10 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
+              if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
+   axes = sorted(store_aff[0], key=lambda x:store_aff[0][x], reverse=True)
++  # WIP: ndim=0 fp32 views can represent scalar ADD, but full-tensor mean only
++  # needs scalar MUL and does not justify widening this separate matcher.
++  # if (not axes and (store_aff[1] != 0 or prod(_shape_of_store(sink)) != 1)) or \
++  #    not all(axis in extents for axis in axes): return None
+   if not axes or not all(axis in extents for axis in axes): return None
+   out_shape = tuple(extents[axis] for axis in axes)
+   total = prod(out_shape)
+@@ -11478,7 +11482,11 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
+              if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
+   axes = sorted(store_aff[0], key=lambda x:store_aff[0][x], reverse=True)
+-  if not axes or not all(axis in extents for axis in axes): return None
++  # WIP reference: `if not axes ...` rejected the one-element scalar epilogue
++  # of full-tensor mean. ndim=0 fp32 views are an established total=1 layout.
++  # if not axes or not all(axis in extents for axis in axes): return None
++  if (not axes and (store_aff[1] != 0 or prod(_shape_of_store(sink)) != 1)) or \
++     not all(axis in extents for axis in axes): return None
+   out_shape = tuple(extents[axis] for axis in axes)
+   total = prod(out_shape)
+   if total != prod(_shape_of_store(sink)): return None
+@@ -11583,7 +11591,10 @@ def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+          (factor.op is Ops.INDEX and factor.src[0].op is not Ops.PARAM) or
+          any(axis in factor.toposort() for axis in reductions) for factor in factors): return None
+   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+-  if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++  # WIP reference: requiring `loops` rejected scalar-output mean even though the
++  # staged SUM and factorized epilogue both support the zero-LOOP geometry.
++  # if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++  if any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+ 
+   info, output_total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+   tasks:list[RKSubTask] = []
+-- 
+2.34.1
+
