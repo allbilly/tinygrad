@@ -1866,3 +1866,18 @@ multi-row boundary. All addition remains NPU work; no LUT changed.
 
 Continue with `TestOps.test_sum_relu`, currently rejected as
 `unsupported_op:Ops.WHERE`.
+
+### Normal-fp32 ReLU sum
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_sum_relu` | pass |
+| permanent signed random fp32 ReLU-sum | **1 passed in 3.69s** |
+| hardware-free planner/runtime contract | **108/108 in 6.51s** |
+
+An NPU-derived sign mask selects both fp32 ABI limbs before two CMAC sums;
+DPU then reconstructs the fp32 result. No LUT or host operator arithmetic
+was added.
+
+Continue with `TestOps.test_sum_tiny`; it executes but currently has one
+small numerical miss from CMAC output rounding.

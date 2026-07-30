@@ -800,6 +800,12 @@ class TestCMAC(unittest.TestCase):
     got = Tensor(a_np, device="ROCKCHIP").sum().realize().numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
 
+  def test_cmac_fp32_relu_sum(self):
+    a_np = np.random.default_rng(6).standard_normal((3,4,5)).astype(np.float32)
+    expected = np.maximum(np.maximum(a_np, 0).sum(dtype=np.float32), 0)
+    got = Tensor(a_np, device="ROCKCHIP").relu().sum().relu().realize().numpy()
+    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
+
   def test_cmac_nested_sum(self):
     # This seed distinguishes the required fp16 intermediate boundary from a
     # flattened fp32 accumulation: nested=-2.43359375, flat=-2.435546875.

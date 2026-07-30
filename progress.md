@@ -7683,6 +7683,39 @@ No LUT changed. The next sum group,
 `TestOps.test_sum_relu`, rejects its fp32 WHERE form as
 `RKPLAN_REJECT:unsupported_op:Ops.WHERE`.
 
+## 2026-07-30 — normal-fp32 ReLU-sum milestone
+
+The unchanged `TestOps.test_sum_relu` now passes
+`ReLU(x) → SUM → ReLU` for a `(3,4,5)` fp32 input. The established staged
+helper was half-only, so the normal-default WHERE graph previously rejected.
+
+The fp32 path preserves `x = high + residual/256`. DPU arithmetic derives a
+positive mask from both limbs:
+
+- positive/negative tests on the high limb identify ordinary signs;
+- when the high limb is zero, the residual sign handles tiny fp32 values;
+- the one mask selects both high and residual limbs, retaining negative
+  residual corrections for positive values.
+
+CMAC reduces the selected high and residual tensors independently, and DPU
+reconstructs the fp32 result. Since every selected input is nonnegative, the
+outer ReLU is an identity on the resulting finite sum. Host work is limited
+to the established fp32 limb representation.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_sum_relu`: pass before the next `test_sum_tiny`
+  numerical failure;
+- permanent signed random fp32 ReLU-sum: **1 passed in 3.69s**;
+- hardware-free planner/runtime contract: **108/108 in 6.51s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT changed. `TestOps.test_sum_tiny` now runs but one of two outputs misses
+tolerance (`-0.17614746` versus `-0.17683172`), indicating an fp16 CMAC
+output-rounding boundary rather than unsupported layout.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`

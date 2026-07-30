@@ -10783,7 +10783,7 @@ def _try_nested_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Split ReLU(SUM(ReLU(x))) into ordered DPU, CMAC, and DPU stages."""
   store = _store_node(sink)
-  if store is None or store.src[0].dtype is not dtypes.half: return None
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
 
   def relu_operand(u:UOp) -> UOp|None:
     u = _unwrap(u)
@@ -10796,18 +10796,74 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   reduce = relu_operand(store.src[1])
   if reduce is None or reduce.op is not Ops.REDUCE or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
   source = relu_operand(reduce.src[0])
-  if source is None or source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM: return None
+  if source is None or source.op is not Ops.INDEX or source.dtype is not store.src[0].dtype or source.src[0].op is not Ops.PARAM: return None
   reductions = list(reduce.src[1:])
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
   if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
 
   info = ProgramInfo.from_sink(sink)
-  relu_slot = max(info.globals, default=-1) + 1
-  sum_slot = relu_slot + 1
   input_total = int(source.src[0].src[0].arg)
   output_total = prod(_shape_of_store(sink))
+  if source.dtype is dtypes.float:
+    source_slot = source.src[0].buf_uop.arg.slot
+    if source_slot >= 7: return None
+    next_slot = max(info.globals, default=-1)+1
+    tasks:list[RKSubTask] = []
+    def alloc() -> int:
+      nonlocal next_slot
+      ret, next_slot = next_slot, next_slot+1
+      return ret
+    def scalar(value:float) -> tuple[int,int]:
+      return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+    def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False) -> int:
+      out = alloc()
+      tasks.append(_emit_where_stage(input_total, out, a, b, op, compare=compare))
+      return out
+    def view(tag:int) -> int:
+      out = alloc()
+      cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+      relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+      tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (input_total, tag), out, is_copy=True), relocs))
+      return out
+    high, residual = view(_HOST_FP32_HALF_LAYOUT), view(_HOST_FP32_RESIDUAL_LAYOUT)
+    high_positive = stage((high, 0), (high, 0), Ops.MAX, compare=True)
+    negative_high = stage((_ZERO_SLOT, 0), (high, 0), Ops.SUB)
+    high_negative = stage((negative_high, 0), (negative_high, 0), Ops.MAX, compare=True)
+    high_nonzero = stage((high_positive, 0), (high_negative, 0), Ops.MAX)
+    high_zero = stage(scalar(1.0), (high_nonzero, 0), Ops.SUB)
+    residual_positive = stage((residual, 0), (residual, 0), Ops.MAX, compare=True)
+    residual_only = stage((residual_positive, 0), (high_zero, 0), Ops.MUL)
+    positive = stage((high_positive, 0), (residual_only, 0), Ops.MAX)
+    relu_high = stage((high, 0), (positive, 0), Ops.MUL)
+    relu_residual = stage((residual, 0), (positive, 0), Ops.MUL)
+
+    def cmac_sum(input_slot:int) -> int|None:
+      out_slot = alloc()
+      half_param = UOp.param(input_slot, dtypes.half, (input_total,), device=source.src[0].device)
+      half_index = source.replace(dtype=dtypes.half, src=(half_param, *source.src[1:]))
+      half_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (half_index,), arg=dtypes.float), *reductions))
+      out_param = UOp.param(out_slot, dtypes.half, (output_total,), device=store.src[0].src[0].device)
+      out_index = store.src[0].replace(dtype=dtypes.half, src=(out_param, *store.src[0].src[1:]))
+      stage_store = store.replace(src=(out_index, UOp(Ops.CAST, dtypes.half, (half_reduce,), arg=dtypes.half)))
+      stage_plan = plan_rk(sink.substitute({store:stage_store}))
+      if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+      if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None: tasks.extend(shared_tasks)
+      else:
+        cmds, task, relocs = emit_rk(stage_plan)
+        tasks.append(RKSubTask(cmds, task, relocs))
+      return out_slot
+
+    high_sum, residual_sum = cmac_sum(relu_high), cmac_sum(relu_residual)
+    if high_sum is None or residual_sum is None: return None
+    correction = alloc()
+    tasks.append(_emit_where_stage(output_total, correction, (residual_sum, 0), scalar(1/256), Ops.MUL))
+    tasks.append(_emit_where_stage(output_total, info.outs[0], (high_sum, 0), (correction, 0), Ops.ADD, fp32_output=True))
+    return tuple(tasks)
+
+  relu_slot = max(info.globals, default=-1) + 1
+  sum_slot = relu_slot + 1
   zero_arg = (_ZERO_SLOT, 0)
-  tasks:list[RKSubTask] = [_emit_where_stage(input_total, relu_slot, (source.src[0].buf_uop.arg.slot, 0), zero_arg, Ops.MAX)]
+  tasks = [_emit_where_stage(input_total, relu_slot, (source.src[0].buf_uop.arg.slot, 0), zero_arg, Ops.MAX)]
 
   device = store.src[0].src[0].device
   relu_param = UOp.param(relu_slot, dtypes.half, (input_total,), device=device)

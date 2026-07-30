@@ -410,6 +410,17 @@ class TestClassifier(unittest.TestCase):
     self.assertTrue(any(task.fp32_output for task in cmac_tasks))
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_fp32_relu_sum_preserves_both_input_limbs(self):
+    a = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a.relu().sum().relu()))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
+    self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
+    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
+    self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
+    self.assertTrue(subtasks[-1].task.fp32_output)
+
   def test_fp32_add_uses_compensated_boundary(self):
     a = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
