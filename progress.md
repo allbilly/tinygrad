@@ -9834,3 +9834,23 @@ path to reuse here. Those planner rules remain useful for future native CONV
 work. No LUT changed. Mypy remains at the exact 12-error baseline; ruff is
 not installed in `.venv`. Next forward group:
 `TestOps.test_interpolate_linear`.
+
+## 2026-07-30 — interpolation milestone
+
+All eight unchanged interpolation groups pass in **318.00s** across separate
+invocations: 1D linear with and without aligned corners, nearest and
+nearest-exact across 1D/2D/3D shapes, bilinear with and without aligned
+corners, and trilinear with and without aligned corners. The two bilinear
+groups are the slowest at **131.39s** and **120.39s** respectively. The
+hardware-free Rockchip contract is **135/135 in 9.89s**.
+
+Nearest downsampling initially returned contiguous input values. Its source
+address casts a floating coordinate expression after multiplying by the
+input/output ratio; the compact integer movement serializer stripped those
+casts and encoded `13/9` as integer `1`. That serializer now rejects any
+float-derived address expression. The graph then reaches the existing exact
+typed conditional-movement evaluator, which preserves float multiplication
+and cast semantics. Pure integer movement remains on the compact path.
+
+No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_cat`.

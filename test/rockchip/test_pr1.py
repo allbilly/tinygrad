@@ -410,6 +410,15 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(subtasks[0].task.is_copy)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_nearest_interpolation_keeps_float_coordinate_scale(self):
+    expression = Tensor.empty(2,3,13, dtype=dtypes.float, device="ROCKCHIP").interpolate((9,), mode="nearest")
+    program = build_native_program(_get_sink(expression))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertTrue(subtasks[0].task.is_copy)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")

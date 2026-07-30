@@ -2290,3 +2290,14 @@ The repeated `ref/rk3588/conv_grok` review found useful formula-driven CBUF
 and `(output_h-1)*stride+kernel` tile-span guidance for future native
 convolution, but no 3D pooling or strict-fp32 reduction implementation to
 reuse. Next forward group: `TestOps.test_interpolate_linear`.
+
+### Interpolation
+
+All eight interpolation groups pass in **318.00s** across separate
+invocations, covering linear/nearest/bilinear/trilinear, nearest-exact, and
+both aligned-corner linear variants. Nearest resize now rejects
+float-derived coordinates from the compact integer movement serializer;
+this prevents `13/9` from becoming integer `1` and routes the unchanged graph
+to the exact typed conditional-movement evaluator. Pure integer movement is
+unchanged. No runtime ABI or LUT changed. Contract: **135/135**. Next forward
+group: `TestOps.test_cat`.

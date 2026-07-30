@@ -10885,7 +10885,12 @@ def _try_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return input_slots.index(slot)
 
   def emit_int(u:UOp, code:list[int]) -> bool:
-    while u.op is Ops.CAST: u = u.src[0]
+    while u.op is Ops.CAST:
+      if dtypes.is_float(u.dtype) or dtypes.is_float(u.src[0].dtype): return False
+      u = u.src[0]
+    # This compact interpreter carries integer literals only. Accepting a
+    # float coordinate expression truncated constants such as 13/9 to one.
+    if dtypes.is_float(u.dtype): return False
     if u.op is Ops.CONST:
       if u.arg is Invalid:
         code.extend((0, 0))
