@@ -1,0 +1,105 @@
+From f736995c86d7170c5d144b4273a5c535a2bce5fc Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:11:10 +0800
+Subject: [PATCH] rockchip: pass normal fp32 tanh
+
+---
+ progress.md                          | 17 +++++++++++++++++
+ test/rockchip/test_pr1.py            |  8 ++++++++
+ test_ops_status.md                   | 11 +++++++++++
+ tinygrad/runtime/support/rockchip.py |  9 +++++++++
+ 4 files changed, 45 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 6d0455288..d82dbf256 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9490,3 +9490,20 @@ fp32 semantics without exhausting the NPU reset budget. No LUT changed;
+ mypy remains at the exact 12-error baseline.
+ 
+ Next forward group: `TestOps.test_tanh`.
++
++## 2026-07-30 — normal-fp32 tanh milestone
++
++The unchanged `TestOps.test_tanh` and `TestOps.test_tanh_extreme` groups pass
++together in **3.57s**. The hardware-free Rockchip contract is **122/122 in
++7.10s**.
++
++The fp16 two-LUT saturation classifier previously accepted a fp32 source and
++then interpreted its four-byte storage through half-oriented tasks. Every
++ordinary lane was corrupt, with some outputs reaching approximately
++`2.7e36`. `_try_fp32_tanh_host_subtasks` now intercepts only the exact
++`2*sigmoid(2*x)-1` fp32 graph and uses one serialized fp32 task. The tuned
++broad/local two-LUT half implementation remains unchanged and exclusive to
++half storage.
++
++No LUT coefficient changed. Mypy remains at the exact 12-error baseline.
++Next forward group: `TestOps.test_hardtanh`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 20d17d62e..ec4923c4d 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -444,6 +444,14 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_tanh_avoids_half_two_lut_path(self):
++    expression = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").tanh()
++    program = build_native_program(_get_sink(expression))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index c1e70bfd4..99e226422 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2107,3 +2107,14 @@ Exact fp32 `(exp(x) +/- exp(-x))/2` graphs use one serialized task instead of
+ the timeout-prone 43–44-task generic DPU split. Folded `-log2(e)` and the old
+ nested-negation recognition are both retained; fp16 LUT paths are unchanged.
+ Next forward group: `TestOps.test_tanh`.
++
++### Normal-fp32 tanh
++
++| Group | Status |
++|---|---:|
++| `test_tanh` + `test_tanh_extreme` | **2 passed in 3.57s** |
++| hardware-free Rockchip contract | **122/122** |
++
++Exact fp32 tanh now uses one serialized task instead of entering the
++half-buffer two-LUT path, which had corrupted every lane. The tuned fp16 LUT
++implementation is unchanged. Next forward group: `TestOps.test_hardtanh`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 89629ce37..acf5dbb83 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -2906,6 +2906,13 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, info.outs[0], (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)))
+   return tuple(tasks)
+ 
++def _try_fp32_tanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Keep exact normal-fp32 tanh out of the half-buffer two-LUT implementation."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float or (source := _try_tanh(store.src[1])) is None: return None
++  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Keep the staged QuickGELU interior and use its exact zero/x asymptotes."""
+   store = _store_node(sink)
+@@ -13525,6 +13532,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
+   if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
++  if (fp32_tanh_tasks := _try_fp32_tanh_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_tanh_tasks)
+   if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)
+   if (quick_gelu_tasks := _try_quick_gelu_two_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
+   if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
+-- 
+2.34.1
+
