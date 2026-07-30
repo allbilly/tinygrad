@@ -9589,3 +9589,11 @@ NPU limb path. The final opcode gate preserves add/subtract/multiply on their
 existing NPU implementations. No LUT or runtime ABI changed. Mypy remains at
 the exact 12-error baseline. Next forward group:
 `TestOps.test_broadcast_simple`.
+
+## 2026-07-30 — simple-broadcast validation
+
+The unchanged `TestOps.test_broadcast_simple` group passes in **3.11s**,
+covering `(45,65)/(45,1)` and `(45,65)/scalar`. No code, host boundary,
+runtime ABI, or LUT change was needed.
+
+Next forward group: `TestOps.test_broadcast_partial`.

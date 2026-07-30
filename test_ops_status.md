@@ -2162,3 +2162,9 @@ rank-5 division tolerance misses and both rejected power graphs while
 preserving the established NPU affine-limb paths for add/subtract/multiply.
 No LUT changed. Contract: **125/125**. Next forward group:
 `TestOps.test_broadcast_simple`.
+
+### Simple broadcasting
+
+`TestOps.test_broadcast_simple`: **pass in 3.11s** unchanged for column and
+scalar division. No code or LUT change was needed. Next forward group:
+`TestOps.test_broadcast_partial`.
