@@ -2174,3 +2174,10 @@ scalar division. No code or LUT change was needed. Next forward group:
 `TestOps.test_broadcast_partial`: **20 subtests pass in 56.81s** unchanged
 across all five arithmetic families and four layout pairs. No code or LUT
 change was needed. Next forward group: `TestOps.test_slice_in_bounds_1dim`.
+
+### Slicing
+
+Fifteen consecutive slice groups pass unchanged in **16.71s**, including
+positive/negative strides, empty and out-of-bounds ranges, integer/constant
+tensor indices, `None`, ellipsis, error checks, and double slicing. No code
+or LUT change was needed. Next forward group: `TestOps.test_pad`.

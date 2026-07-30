@@ -9606,3 +9606,14 @@ rank-5, row-to-matrix, and column-to-matrix layouts. No additional code,
 host boundary, runtime ABI, or LUT change was needed.
 
 Next forward group: `TestOps.test_slice_in_bounds_1dim`.
+
+## 2026-07-30 — slicing validation milestone
+
+Fifteen unchanged slicing groups pass in **16.71s** across five invocations:
+in-bounds 1D/multidimensional slicing, zero-dimensional and integer indexing,
+`None` and ellipsis insertion, constant-tensor indexing, one/both endpoints
+out of bounds, positive strides greater than one, negative strides, empty
+shapes/start-after-end, expected index errors, and chained double slices.
+
+No code, host boundary, runtime ABI, or LUT change was needed. Next forward
+group: `TestOps.test_pad`.
