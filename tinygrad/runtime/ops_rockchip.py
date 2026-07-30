@@ -420,6 +420,8 @@ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
             task_start=0, task_number=1, task_counter=0, priority=0,
             task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
             user_data=0, core_mask=1, fence_fd=-1,
+            # Rejected WIP: routing CMAC to core_mask=2 timed out even in an
+            # isolated test_all; current register programs are core-0-specific.
             subcore_task=(rk.struct_rknpu_subcore_task*5)(
               rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
               rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
@@ -1065,6 +1067,7 @@ class RockchipProgram(Program['RockchipDevice']):
         return
       n_cmds = len(self.cmds)
       assert n_cmds <= dev.cmd_buf_size
+      dev.refresh_submit_buffers()
       regcmd = ctypes.cast(dev.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * dev.cmd_buf_size)).contents  # type: ignore[arg-type]
       for i, cmd in enumerate(self.cmds): regcmd[i] = cmd
       for i, r in enumerate(self.relocs):
@@ -1105,9 +1108,13 @@ class RockchipProgram(Program['RockchipDevice']):
       t.regcmd_addr = dev.cmd_buf.meta.dma_addr
       rk.DRM_IOCTL_RKNPU_SUBMIT(dev.fd_ctl, __payload=rk.struct_rknpu_submit(
         flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
+        # Rejected WIP: dropping PINGPONG for raw DPU tasks did not prevent the
+        # cumulative GEM-cache timeout.
         task_start=0, task_number=1, task_counter=0, priority=0,
         task_obj_addr=dev.task_buf.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0,
         user_data=0, core_mask=1, fence_fd=-1,
+        # Rejected WIP: routing CMAC to core_mask=2 timed out even in isolated
+        # test_all; current register programs are core-0-specific.
         subcore_task=(rk.struct_rknpu_subcore_task*5)(
           rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
           rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
@@ -1131,6 +1138,9 @@ class RockchipProgram(Program['RockchipDevice']):
       if fp32_out_temp is not None:
         orig_out, fp16_out, n = fp32_out_temp
         _convert_fp16_to_fp32_buf(fp16_out.va_addr, orig_out.va_addr, n)
+      # Rejected WIP: a conv_grok-style post-submit barrier after every job did
+      # not prevent the cumulative mixed-program timeout.
+      # dev.post_submit_reset()
     finally:
       for b in temp: dev._gpu_free(b)
     self.submit_count += 1
@@ -1300,6 +1310,47 @@ class RockchipProgram(Program['RockchipDevice']):
         while len(ext) <= max_slot:
           shared.append(b := dev._gpu_alloc(max(scratch_sizes.get(len(ext), 0), 4096), 0))
           ext.append(b)
+        if getenv("ROCKCHIP_MIXED_CHAIN_WIP"):
+          # A real PC chain amortizes driver submit state; a one-entry chain
+          # does not. Batch consecutive DPU work around host/CMAC boundaries.
+          mixed_chain_pending:list[RKSubTask] = []
+          def flush_mixed_dpu() -> None:
+            if not mixed_chain_pending: return
+            dev.reset_npu()
+            self.subtasks = list(mixed_chain_pending)
+            self.force_dpu_chain = True
+            try: self._submit_multi(tuple(ext))
+            finally: self.force_dpu_chain = False
+            mixed_chain_pending.clear()
+          for st in subtasks:
+            if st.task.kind == "dpu" and not st.task.is_copy:
+              mixed_chain_pending.append(st)
+              continue
+            flush_mixed_dpu()
+            if st.task.kind == "cmac":
+              self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+              self.subtasks = None
+              self(*tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
+              _run_host_movement(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
+              _run_host_static_half(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
+              _pack_static_gather(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
+              _run_host_bool_half(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
+              _run_host_static_select_half(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
+              _run_host_static_select_int(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
+              _run_host_half_int(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
+              _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+            else:
+              raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
+          flush_mixed_dpu()
+          return
         for st in subtasks:
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
             _run_host_movement(st.task, st.relocs, tuple(ext))
@@ -1333,30 +1384,37 @@ class RockchipProgram(Program['RockchipDevice']):
             self.subtasks = None
             self(*tuple(ext))
           else:
-            stage_ext, stage_temp = list(ext), []
-            try:
-              for slot in st.task.bool_inputs:
-                source_n = ext[slot].size
-                converted = dev._gpu_alloc(max(source_n*2, 4096), 0)
-                stage_temp.append(converted)
-                _convert_bool_to_fp16_buf(ext[slot].va_addr, converted.va_addr, source_n)
-                stage_ext[slot] = converted
-              bool_output = None
-              if st.task.bool_output:
-                original_out = ext[st.task.out_slot]
-                out_n = original_out.size
-                converted = dev._gpu_alloc(max(out_n*2, 4096), 0)
-                stage_temp.append(converted)
-                stage_ext[st.task.out_slot] = converted
-                bool_output = (original_out, converted, out_n)
-              self.subtasks = None
-              dev.reset_npu()
-              self(*tuple(stage_ext))
-              if bool_output is not None:
-                original_out, converted, out_n = bool_output
-                _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, out_n)
-            finally:
-              for b in stage_temp: dev._gpu_free(b)
+            if getenv("ROCKCHIP_MIXED_DESCRIPTOR_WIP"):
+              # Use the descriptor path for a DPU stage embedded in a mixed
+              # CMAC program; it already owns typed ABI conversions.
+              self.subtasks = [st]
+              self._submit_multi(tuple(ext))
+            else:
+              # WIP reference: the former raw path is retained for comparison.
+              stage_ext, stage_temp = list(ext), []
+              try:
+                for slot in st.task.bool_inputs:
+                  source_n = ext[slot].size
+                  converted = dev._gpu_alloc(max(source_n*2, 4096), 0)
+                  stage_temp.append(converted)
+                  _convert_bool_to_fp16_buf(ext[slot].va_addr, converted.va_addr, source_n)
+                  stage_ext[slot] = converted
+                bool_output = None
+                if st.task.bool_output:
+                  original_out = ext[st.task.out_slot]
+                  out_n = original_out.size
+                  converted = dev._gpu_alloc(max(out_n*2, 4096), 0)
+                  stage_temp.append(converted)
+                  stage_ext[st.task.out_slot] = converted
+                  bool_output = (original_out, converted, out_n)
+                self.subtasks = None
+                dev.reset_npu()
+                self(*tuple(stage_ext))
+                if bool_output is not None:
+                  original_out, converted, out_n = bool_output
+                  _convert_fp16_to_bool_buf(converted.va_addr, original_out.va_addr, out_n)
+              finally:
+                for b in stage_temp: dev._gpu_free(b)
           if getenv("ROCKCHIP_DEBUG_BOOL_REDUCE") >= 2:
             out = ext[st.task.out_slot]
             if st.task.bool_output:
@@ -1368,8 +1426,11 @@ class RockchipProgram(Program['RockchipDevice']):
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
-        # Rejected WIP: an additional reset here did not prevent the known
-        # all_large -> comparison stress-order timeout.
+        # Rejected WIP: a conv_grok-style synchronous completion/reset barrier
+        # did not prevent the cumulative GEM-cache timeout.
+        # dev.post_submit_reset()
+        # Rejected WIP: an additional bare reset here did not prevent the known
+        # accumulated comparison stress timeout.
         # dev.reset_npu()
       return
     # Native fp16->int32 writes use four-lane aligned atoms. Their source pack
@@ -1458,6 +1519,9 @@ class RockchipProgram(Program['RockchipDevice']):
       finally:
         self.subtasks = original
         for b in shared: dev._gpu_free(b)
+        # Rejected WIP: a conv_grok-style completion/reset barrier here did not
+        # prevent the cumulative GEM-cache timeout.
+        # dev.post_submit_reset()
       return
     # Mixed copy + DPU: handle copy tasks host-side, then submit DPU tasks.
     copy_tasks = [st for st in subtasks if st.task.is_copy]
@@ -1580,7 +1644,8 @@ class RockchipProgram(Program['RockchipDevice']):
     # Keep those stages isolated and chain only consecutive ordinary DPU tasks.
     def is_cmp(st): return any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
                                ((cmd >> 16) & 0xffffffff) == 0x3f800000 for cmd in st.cmds)
-    if len(subtasks) > 1 and any(is_cmp(st) or st.task.kind == "dpu_lut" for st in subtasks):
+    if len(subtasks) > 1 and not getattr(self, "force_dpu_chain", False) and \
+       any(is_cmp(st) or st.task.kind == "dpu_lut" for st in subtasks):
       ext, shared, original = list(bufs), [], self.subtasks
       max_slot = max((r.globals_slot for st in subtasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)),
                      default=len(ext)-1)
@@ -1596,9 +1661,15 @@ class RockchipProgram(Program['RockchipDevice']):
         def flush_pending() -> None:
           if not dpu_pending: return
           if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_BEGIN", "dpu", tuple(st.task.out_slot for st in dpu_pending), flush=True)
-          dev.reset_npu()
-          self.subtasks = list(dpu_pending)
-          self._submit_multi(tuple(ext))
+          if len(dpu_pending) == 1:
+            st = dpu_pending[0]
+            self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+            self.subtasks = None
+            self(*tuple(ext))
+          else:
+            dev.reset_npu()
+            self.subtasks = list(dpu_pending)
+            self._submit_multi(tuple(ext))
           if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_END", "dpu", tuple(st.task.out_slot for st in dpu_pending), flush=True)
           dpu_pending.clear()
         for st in subtasks:
@@ -1606,8 +1677,12 @@ class RockchipProgram(Program['RockchipDevice']):
             flush_pending()
             if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_BEGIN", st.task.kind, (st.task.out_slot,), flush=True)
             dev.reset_npu()
-            self.subtasks = [st]
-            self._submit_multi(tuple(ext))
+            self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+            self.subtasks = None
+            self(*tuple(ext))
+            # Rejected WIP: a conv_grok-style completion barrier here also did
+            # not fix all/all_axis/all_zero_axis -> and.
+            # dev.post_submit_reset()
             if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_END", st.task.kind, (st.task.out_slot,), flush=True)
           else:
             dpu_pending.append(st)
@@ -1694,6 +1769,7 @@ class RockchipProgram(Program['RockchipDevice']):
       total_qwords = offset
       assert total_qwords <= dev.cmd_buf_size, f"PC chain: {total_qwords} qwords > cmd_buf {dev.cmd_buf_size}"
       # Pack cmds + PC chain tails into cmd_buf
+      dev.refresh_submit_buffers()
       regcmd = ctypes.cast(dev.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * dev.cmd_buf_size)).contents  # type: ignore[arg-type]
       for i in range(total_qwords): regcmd[i] = 0  # clear
       cmd_buf_dma = dev.cmd_buf.meta.dma_addr
@@ -1798,6 +1874,8 @@ class RockchipProgram(Program['RockchipDevice']):
         elif is_uint8: _convert_fp16_to_uint8_buf(converted.va_addr, original_out.va_addr, n)
         elif is_fp32: _convert_fp16_to_fp32_buf(converted.va_addr, original_out.va_addr, n)
         else: _convert_fp16_to_int32_buf(converted.va_addr, original_out.va_addr, n)
+      # Rejected WIP: see the raw one-task path above.
+      # dev.post_submit_reset()
       if getenv("DEBUG") >= 1: print(f"submit {self.name}: PC chain {n_tasks} tasks")
     finally:
       for b in temp: dev._gpu_free(b)
@@ -1830,6 +1908,10 @@ class RockchipRenderer(Renderer):
 class RockchipRegisterAllocator(HCQAllocatorBase):
   """DMA-backed allocator: buffers are NPU GEM objects with va_addr (CPU mmap) and dma_addr (NPU)."""
   def __init__(self, dev): super().__init__(dev, batch_cnt=0)
+  # Rejected WIP: disabling the Rockchip LRU cache did not prevent the
+  # cumulative mixed-program timeout (the cache was empty at each teardown).
+  # def free(self, opaque:HCQBuffer, size:int, options:BufferSpec|None=None):
+  #   self._free(opaque, options if options is not None else self.default_buffer_spec)
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size, 0)
   def _do_copy(self, s, d, sz): ctypes.memmove(d, s, sz)
   def _copyin(self, dest:HCQBuffer, src:memoryview): self._do_copy(mv_address(src), dest.va_addr, src.nbytes)
@@ -1845,6 +1927,15 @@ class RockchipDevice(Compiled):
     self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, "task_buf")
     self.submitted_masks: set[int] = set()
     super().__init__(device, RockchipRegisterAllocator(self), [RockchipRenderer], RockchipProgram)
+  def refresh_submit_buffers(self):
+    # conv_grok's original stable lifecycle uses fresh descriptor/register BOs
+    # per task. Allocate replacements before releasing the completed pair so
+    # the driver cannot immediately recycle the same object addresses.
+    old_cmd, old_task = self.cmd_buf, self.task_buf
+    self.cmd_buf = self._gpu_alloc(self.cmd_buf_size * 8, 0, "cmd_buf")
+    self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, "task_buf")
+    self._gpu_free(old_cmd)
+    self._gpu_free(old_task)
   def create_flink_name(self, handle:int, name:str="", **kw) -> int:
     fr = rk.struct_drm_gem_flink(handle=handle, name=0)
     rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=fr)
@@ -1874,3 +1965,9 @@ class RockchipDevice(Compiled):
     # Rejected WIP: a 1 ms settle delay after every reset did not prevent the
     # known all_large -> comparison stress-order timeout.
     # time.sleep(0.001)
+  def post_submit_reset(self):
+    # Rejected WIP: conv_grok brackets reset (6) with its legacy action 1
+    # (synchronous driver-version queries on this header), but this barrier did
+    # not prevent the cumulative GEM-cache timeout.
+    for flag in (rk.RKNPU_GET_DRV_VERSION, rk.RKNPU_ACT_RESET, rk.RKNPU_GET_DRV_VERSION):
+      rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, __payload=rk.struct_rknpu_action(flags=flag, value=0))

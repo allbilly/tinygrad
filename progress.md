@@ -8073,6 +8073,95 @@ Validation with `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — submit-buffer lifecycle stability (`conv_grok` follow-up)
+
+The normal-fp32 TestOps census no longer wedges at the accumulated
+`ALL/ANY -> comparison` boundary. Two independent descriptor-lifecycle
+details were required:
+
+1. comparison/LUT programs no longer wrap an isolated DPU stage in a
+   one-entry PC chain. A one-task stage uses the raw descriptor path
+   (`regcfg_amount=len(cmds)`); only two or more consecutive ordinary DPU
+   stages use a PC tail and multi-task descriptor;
+2. each hardware submit receives fresh internal register-command and task
+   BOs. The replacements are allocated before the completed pair is
+   destroyed, preventing immediate reuse of the same DRM object addresses.
+   User tensor BOs and all operator arithmetic are unchanged.
+
+This follows the useful boundary in `ref/rk3588/conv_grok`: its original
+stable tile path creates fresh descriptor/register BOs per job, and its raw
+one-task descriptor excludes the PC tail. `TileSession` demonstrates that
+BO reuse is safe inside one homogeneous conv family, but did not establish
+reuse across Tinygrad's DPU, LUT, CMAC, and PPU register families.
+
+### Reproducer and debug method
+
+The short deterministic reproducer was:
+
+```bash
+. .venv/bin/activate
+DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0 \
+  python -m pytest -q -x \
+  test/backend/test_ops.py::TestOps::test_all \
+  test/backend/test_ops.py::TestOps::test_all_axis \
+  test/backend/test_ops.py::TestOps::test_all_zero_axis \
+  test/backend/test_ops.py::TestOps::test_and
+```
+
+Before the fix it timed out in the first arithmetic stage of the final
+float comparison. `ROCKCHIP_DEBUG_STAGE=1` showed the following progression:
+
+- a one-entry ordinary PC chain timed out immediately;
+- changing only that stage to raw moved the timeout to the following
+  one-entry comparison PC chain;
+- making both isolated sides raw passed the short reproducer;
+- the longer `abs/acos/acosh/add/all` prefix still timed out until fresh
+  internal submit BOs were used.
+
+The longer discriminator is:
+
+```bash
+DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0 \
+  python -m pytest test/backend/test_ops.py -q -x \
+  -k 'test_abs or test_acos or test_acosh or test_add or test_all'
+```
+
+It now passes all ten selected methods, including `test_all_large`.
+The forward-only census excluding `test_all_large` reached **17 passes** in
+one process and then exposed the next functional group:
+`TestOps.test_argmax` returns `0` instead of the expected random maximum
+index (`149` in that run). This is no longer a driver timeout.
+
+### Rejected experiments retained in source
+
+- reset plus 1 ms settle delay;
+- the legacy `GET_DRV_VERSION, RESET, GET_DRV_VERSION` completion barrier,
+  both at mixed boundaries and after every submit;
+- routing CMAC to core mask `0x2` (timed out in isolated `test_all`);
+- removing `PINGPONG` from raw DPU submits;
+- disabling Rockchip's generic LRU cache (per-test probes showed the cache
+  already empty);
+- one-entry PC descriptors for mixed reduction DPU stages;
+- one large PC chain spanning the pre-CMAC boolean-reduction stages.
+
+The driver timeout signature was consistently task counter zero, core-0 raw
+status `0xc0010000`, and required interrupt mask `0x300`. A plain ADD could
+still pass after the reduction prefix, which distinguished stale submit
+descriptor state from a globally dead NPU.
+
+Validation with `. .venv/bin/activate`:
+
+- exact reduction/comparison reproducer: **4 passed in 12.58 seconds**;
+- mixed long prefix including `test_all_large`: **10 passed in 76.92
+  seconds**;
+- forward-only census before next functional failure: **17 passed**;
+- hardware-free planner/runtime contract: **96/96** after adding submit-BO
+  replacement coverage;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT coefficients or two-level LUT schedules changed in this milestone,
+so `lut.md` needs no new tuning entry.
+
 The interpretation of RKNN Toolkit2 issue #471 remains unchanged: its values
 are exactly fp16 quantization of `0.1`, not evidence for accumulator drift or
 a solution to this EXP2 range problem.

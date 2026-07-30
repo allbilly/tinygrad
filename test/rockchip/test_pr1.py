@@ -9,8 +9,29 @@ from tinygrad.codegen import pm_to_program
 from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT)
-from tinygrad.runtime.ops_rockchip import RockchipRenderer
+from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
+
+class TestSubmitBufferLifecycle(unittest.TestCase):
+  def test_refresh_replaces_then_frees_submit_buffers(self):
+    class FakeDevice:
+      cmd_buf_size = 16
+      cmd_buf, task_buf = object(), object()
+      def __init__(self): self.allocated, self.freed = [], []
+      def _gpu_alloc(self, size, flags, name):
+        ret = object()
+        self.allocated.append((size, flags, name, ret))
+        return ret
+      def _gpu_free(self, buf): self.freed.append(buf)
+    dev = FakeDevice()
+    old_cmd, old_task = dev.cmd_buf, dev.task_buf
+    RockchipDevice.refresh_submit_buffers(dev)
+    self.assertEqual([(x[0], x[1], x[2]) for x in dev.allocated],
+                     [(dev.cmd_buf_size * 8, 0, "cmd_buf"), (1024, rk.RKNPU_MEM_KERNEL_MAPPING, "task_buf")])
+    self.assertEqual(dev.freed, [old_cmd, old_task])
+    self.assertIs(dev.cmd_buf, dev.allocated[0][3])
+    self.assertIs(dev.task_buf, dev.allocated[1][3])
 
 def _get_sink(expr):
   lin = expr.schedule_linear()

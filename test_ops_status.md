@@ -1616,3 +1616,24 @@ Fp32 predicate tiles now contain 262,144 lanes, reducing the 2^20 case from
 and also reproduces with `DEFAULT_FLOAT=HALF`. Extra reset/sleep experiments
 did not fix it and remain commented for reference. Isolate `test_all_large`
 when continuing the functional failure census.
+
+### Submit-buffer lifecycle stability
+
+| Coverage | Result |
+|---|---:|
+| `all`, `all_axis`, `all_zero_axis` -> `and` in one process | **4 passed in 12.58s** |
+| `abs/acos/acosh/add/all` selection, including `all_large` | **10 passed in 76.92s** |
+| forward-only census before next functional failure | **17 passed** |
+| hardware-free planner/runtime contract | **96/96** |
+| mypy | **pre-existing 13-error baseline** |
+
+The prior `all_large -> comparison` warning is resolved by two runtime
+lifecycle changes derived from `allbilly/rk3588/conv_grok`: isolated
+one-task DPU stages use raw descriptors without a PC tail, and each hardware
+job receives fresh internal command/task BOs. Real multi-task DPU segments
+continue to use PC chains. Host arithmetic was not introduced.
+
+The next low-hanging functional group is `argmax`: scalar duplicate-maximum
+cases pass, but the unchanged random `(10,20)` case returned index `0`
+instead of `149`. Continue from `TestOps.test_argmax`; the failure is an
+index-selection correctness issue, not an ioctl timeout.
