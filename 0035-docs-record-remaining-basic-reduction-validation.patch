@@ -1,0 +1,67 @@
+From ae7cd4915c17c6e8d27629fb3fc28da8732530df Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 15:47:02 +0800
+Subject: [PATCH] docs: record remaining basic reduction validation
+
+---
+ progress.md        | 23 +++++++++++++++++++++++
+ test_ops_status.md | 12 ++++++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 3149dc890..74b30a080 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7757,6 +7757,29 @@ Validation with `. .venv/bin/activate` and
+ 
+ No LUT changed. All base sum cases through `test_sum_dtype_arg` are green.
+ 
++## 2026-07-30 — remaining basic reduction validation
++
++No code change was needed for the groups immediately following the direct
++sum milestone:
++
++- zero-shaped sums, product reductions, and product dtype validation:
++  **3 passed in 8.25s**;
++- min, max, and all constant sum/product/max reductions:
++  **3 passed in 12.59s**;
++- any/all scalar, axis, and empty-axis groups:
++  **6 passed in 16.82s**;
++- isolated `test_all_large` through `2**20` elements:
++  **1 passed in 26.28s**.
++
++The previously tracked constant-sum rejection is resolved by the direct
++fp32 sum work. `test_all_large` remains intentionally isolated from later
++comparison stress as a conservative driver-state practice, although the
++submit-buffer lifecycle fix has removed the old functional timeout in its
++own process.
++
++No LUT or runtime path changed in this validation milestone. Continue with
++`TestOps.test_isclose`.
++
+ ## 2026-07-30 — normal-fp32 direct einsum sum milestone
+ 
+ The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 57daaece8..02bdcf0cd 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1896,3 +1896,15 @@ storage no longer acts as a CBUF gate; the materialized M/N/K planner owns
+ residency. No LUT or host operator arithmetic changed.
+ 
+ All base sum groups through `test_sum_dtype_arg` are green.
++
++### Remaining basic reduction validation
++
++| Coverage | Result |
++|---|---:|
++| zero-shape sum + prod + prod dtype | **3 passed in 8.25s** |
++| min + max + constant reductions | **3 passed in 12.59s** |
++| any/all scalar, axis, empty-axis | **6 passed in 16.82s** |
++| isolated `test_all_large` | **1 passed in 26.28s** |
++
++The old constant-sum rejection is resolved. No code or LUT change was
++needed for this validation block. Continue with `TestOps.test_isclose`.
+-- 
+2.34.1
+
