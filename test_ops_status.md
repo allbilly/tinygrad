@@ -2090,3 +2090,8 @@ both fused reductions. No LUT or runtime ABI changed. Next forward group:
 Exact masked prefix-MAX and prefix-exp-sum signatures use bounded static
 expansion in the serialized fp32 evaluator. No LUT or runtime ABI changed.
 Next forward group: `TestOps.test_logcumsumexp_numerical`.
+
+### Logcumsumexp numerical stability
+
+The unchanged `[0.0, 100.0]` case passes in **2.92s** with no additional
+change. Next forward group: `TestOps.test_sinh`.

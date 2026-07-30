@@ -9461,3 +9461,12 @@ avoids a new runtime ABI. Scalar cases retain their existing simplified path.
 No LUT changed; mypy remains at the exact 12-error baseline.
 
 Next forward group: `TestOps.test_logcumsumexp_numerical`.
+
+## 2026-07-30 — logcumsumexp numerical validation
+
+The unchanged `TestOps.test_logcumsumexp_numerical` case with input
+`[0.0, 100.0]` passes in **2.92s**. This validates the cumulative-max
+stabilization across a large exponential gap. No additional code, LUT, or
+runtime ABI change was needed.
+
+Next forward group: `TestOps.test_sinh`.
