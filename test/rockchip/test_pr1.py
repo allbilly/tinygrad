@@ -308,8 +308,10 @@ class TestClassifier(unittest.TestCase):
     program = build_native_program(sink)
     self.assertIsNotNone(program)
     subtasks = program.src[1].src[0].arg
-    self.assertGreaterEqual(len(subtasks), 2)
-    self.assertTrue(subtasks[0].task.fp32_inputs)
+    self.assertGreaterEqual(len(subtasks), 4)
+    copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
+    self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
+    self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
     self.assertTrue(subtasks[-1].task.fp32_output)
 
   def test_large_fp32_sum_uses_two_limb_cmac_boundary(self):
@@ -409,6 +411,17 @@ class TestClassifier(unittest.TestCase):
     self.assertLessEqual(max(task.layout[2] for task in cmac_tasks), 4096)
     self.assertTrue(any(task.fp32_output for task in cmac_tasks))
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
+  def test_small_axis_fp32_sum_uses_both_input_limbs(self):
+    for shape, axis in (((4,2,2), (0,2)), ((3,4,5,6), 3)):
+      a = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP")
+      program = build_native_program(_get_sink(a.sum(axis)))
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
+      copy_layouts = [task.task.layout[1] for task in subtasks if task.task.is_copy]
+      self.assertIn(_HOST_FP32_HALF_LAYOUT, copy_layouts)
+      self.assertIn(_HOST_FP32_RESIDUAL_LAYOUT, copy_layouts)
 
   def test_fp32_relu_sum_preserves_both_input_limbs(self):
     a = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")

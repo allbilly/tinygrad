@@ -7716,6 +7716,47 @@ No LUT changed. `TestOps.test_sum_tiny` now runs but one of two outputs misses
 tolerance (`-0.17614746` versus `-0.17683172`), indicating an fp16 CMAC
 output-rounding boundary rather than unsupported layout.
 
+## 2026-07-30 — normal-fp32 direct axis-sum milestone
+
+The unchanged `TestOps.test_sum_tiny`, `test_sum`, and
+`test_sum_dtype_arg` now all pass. Two stale restrictions were responsible:
+
+1. fp32 sources with at most 16 backing elements used a one-limb shortcut,
+   losing the residual correction visible in the tiny two-output case;
+2. the compensated path rejected source buffers above 256 elements even
+   when each resident reduction window was small (for example K=6 over a
+   360-element tensor).
+
+Every nonempty direct fp32 sum now uses the established high/residual CMAC
+pair. The old short-source and total-storage gates remain commented as WIP
+references. CBUF residency is decided by the materialized M/N/K planner,
+matching the `conv_grok` lesson that total tensor storage is not tile
+residency.
+
+Useful debug sequence:
+
+1. compare the reduction extent K separately from PARAM storage size;
+2. values exactly on the fp16 grid indicate the old one-limb result path;
+3. for near-zero sums, inspect the x256 residual CMAC before changing
+   tolerances;
+4. validate contiguous last-axis and noncontiguous multi-axis reductions;
+5. include keepdim, scalar, dtype, and exception cases in the unchanged
+   group.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_sum_tiny`: pass;
+- unchanged `TestOps.test_sum` and `test_sum_dtype_arg`:
+  **2 passed in 10.06s**;
+- permanent tiny and 360-element-backing axis sums:
+  **1 passed in 2.52s**;
+- hardware-free planner/runtime contract: **109/109 in 6.72s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT changed. All base sum cases through `test_sum_dtype_arg` are green.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`

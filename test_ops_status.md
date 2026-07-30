@@ -1881,3 +1881,18 @@ was added.
 
 Continue with `TestOps.test_sum_tiny`; it executes but currently has one
 small numerical miss from CMAC output rounding.
+
+### Normal-fp32 direct axis sums
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_sum_tiny` | pass |
+| unchanged `test_sum` + `test_sum_dtype_arg` | **2 passed in 10.06s** |
+| permanent tiny + larger-backing axis sums | **1 passed in 2.52s** |
+| hardware-free planner/runtime contract | **109/109 in 6.72s** |
+
+All nonempty direct fp32 sums now use high/residual CMAC limbs. Total PARAM
+storage no longer acts as a CBUF gate; the materialized M/N/K planner owns
+residency. No LUT or host operator arithmetic changed.
+
+All base sum groups through `test_sum_dtype_arg` are green.

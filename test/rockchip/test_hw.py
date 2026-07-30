@@ -800,6 +800,14 @@ class TestCMAC(unittest.TestCase):
     got = Tensor(a_np, device="ROCKCHIP").sum().realize().numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-3)
 
+  def test_cmac_small_axis_fp32_sum(self):
+    rng = np.random.default_rng(7)
+    for shape, axis in (((4,2,2), (0,2)), ((3,4,5,6), 3)):
+      a_np = rng.standard_normal(shape).astype(np.float32)
+      expected = a_np.sum(axis=axis, dtype=np.float32)
+      got = Tensor(a_np, device="ROCKCHIP").sum(axis).realize().numpy()
+      np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-6)
+
   def test_cmac_fp32_relu_sum(self):
     a_np = np.random.default_rng(6).standard_normal((3,4,5)).astype(np.float32)
     expected = np.maximum(np.maximum(a_np, 0).sum(dtype=np.float32), 0)

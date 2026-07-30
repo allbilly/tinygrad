@@ -11124,11 +11124,13 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   scratch_slot = max(info.globals, default=-1) + 1
   if source_slot >= 7: return None
   source_total, output_total = int(source.src[0].src[0].arg), prod(_shape_of_store(sink))
-  if source_total > 256: return None
+  # WIP reference: `if source_total > 256: return None` confused backing
+  # storage with resident CMAC geometry. Axis sums materialize only their
+  # CBUF-derived M/N/K tiles, just like conv_grok local windows.
   tasks:list[RKSubTask] = []
 
   device = store.src[0].src[0].device
-  if source_total > 16:
+  if source_total > 0:
     next_slot = scratch_slot
     host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
     high_slot, low_slot = next_slot, next_slot+1
@@ -11164,6 +11166,9 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(_emit_where_stage(output_total, info.outs[0], (high_sum, 0), (correction, 0), Ops.ADD, fp32_output=True))
     return tuple(tasks)
 
+  # WIP reference: the former <=16 shortcut tagged the fp32 source directly
+  # on one half CMAC and widened its rounded result. Axis sums near zero lost
+  # enough input residual to miss normal-fp32 tolerance.
   converted_param = UOp.param(source_slot, dtypes.half, (source_total,), device=device)
   converted_index = source.replace(dtype=dtypes.half, src=(converted_param, *source.src[1:]))
   converted_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (converted_index,), arg=dtypes.float), *reductions))
