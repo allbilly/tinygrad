@@ -308,6 +308,15 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.task.fp32_output for task in subtasks), 1)
     self.assertTrue(subtasks[-1].task.fp32_output)
 
+  def test_fp32_acosh_uses_specialized_lut_boundary(self):
+    program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acosh()))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertLess(len(subtasks), 80)
+    self.assertEqual(sum(task.task.kind == "dpu_lut" for task in subtasks), 2)
+    self.assertEqual(sum(task.task.fp32_output for task in subtasks), 1)
+    self.assertTrue(subtasks[-1].task.fp32_output)
+
   def test_reject_cmac_exceeds_cbuf(self):
     # M=6000 with K=4: align_in=32, input_row_bytes=64, data_banks=ceil(6000*64/32768)=12 > 11
     a = Tensor.rand(6000,4,dtype=dtypes.half).realize()

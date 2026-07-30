@@ -7470,6 +7470,68 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## 2026-07-30 — normal-fp32 ASINH/ACOSH two-LUT milestone
+
+The normal-default forward census no longer times out in
+`TestOps.test_acosh`.  Both fp32 ASINH and ACOSH now enter the existing
+two-physical-LUT lowering instead of expanding the generic
+LOG2/SQRT/arithmetic graph.  Only source-reading tasks and the final logical
+output use fp32 ABI metadata; all operator arithmetic remains in DPU/LUT
+tasks.
+
+For ACOSH, a host representation view supplies
+`lo=fp16(256*(x-fp16(x)))`.  DPU stages form the endpoint distance before
+clamping:
+
+```text
+d = (fp16(x)-1) + lo/256
+```
+
+This preserves both the singular endpoint coordinate and the `x<1` invalid
+mask.  Forming the residual after `max(x,1)` was rejected because it changed
+some invalid-domain NaNs into zero.  The local half-table now addresses
+`-48*d` for `d<0.04`, stores `2*acosh(1+d)`, and decodes by `1/2`.
+The broad half-table covers the rest of the core range.  This remains two
+NPU LUT tasks; no host operator evaluation was added.
+
+Measured ACOSH progression on the unchanged fixed-seed fp32 test:
+
+```text
+generic fp32 graph:                  ioctl timeout
+two-LUT graph with fp16 coordinate: 93 / 2925 misses
+residual-aware endpoint coordinate:  1 / 2925 miss
+64x local coordinate:                1 handoff miss near d=0.0327
+48x coordinate, d<0.04:              0 / 2925 misses
+```
+
+ASINH initially had two misses at approximately `x=0.145` and `x=0.188`.
+A masked 1.5× residual-output nudge merely moved the misses to adjacent
+rounding bins and is retained disabled as rejected WIP.  The robust fix
+widened the local table from `|x|<0.125` to `|x|<0.25`: it now addresses
+`-8*|x|`, stores `4*asinh(|x|)`, and decodes by `1/4`.
+
+Validation with `. .venv/bin/activate`:
+
+- unchanged normal-default `test_asinh` + `test_acosh`:
+  **2 passed in 39.75 seconds**;
+- fp16 inverse-trig/hyperbolic hardware regression:
+  **1 passed in 14.23 seconds**;
+- fp32 ACOS/ACOSH planner boundary regressions:
+  **2 passed in 1.78 seconds**;
+- full hardware-free planner/codec contract: **85/85 in 7.09 seconds**;
+- post-gating isolated normal-fp32 ASINH: **1 passed in 9.59 seconds**;
+- mypy: exact pre-existing **13-error** Rockchip baseline;
+- `git diff --check`: passing;
+- pytest-xdist is unavailable in `.venv`, so `-n12` was attempted and then
+  the NPU tests were run serially.
+
+RKNN Toolkit2
+[#471](https://github.com/airockchip/rknn-toolkit2/issues/471) supports the
+need for the high/residual input representation but supplies no new
+workaround.  Its reported `25.59` and `409.50` follow exactly from
+`fp16(0.1)=0.0999755859375`; the issue has no maintainer response, patch, or
+evidence of extra accumulator drift.
+
 ## 2026-07-30 — logarithmic long cumulative products
 
 The unchanged forward-only `TestOps.test_simple_cumprod` now passes both

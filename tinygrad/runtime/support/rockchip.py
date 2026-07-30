@@ -578,7 +578,7 @@ def _try_asinh_acosh(val:UOp) -> tuple[UOp,bool]|None:
   """Recognize log(x+sqrt(x*x±1)); bool selects acosh's minus-one form."""
   val = _unwrap(val)
   indexes = list(dict.fromkeys(u for u in val.toposort() if u.op is Ops.INDEX))
-  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half or val.op is not Ops.MUL: return None
+  if len(indexes) != 1 or (source := indexes[0]).dtype not in (dtypes.half, dtypes.float) or val.op is not Ops.MUL: return None
   logarithm = next((_unwrap(x) for x in val.src if _unwrap(x).op is Ops.LOG2), None)
   scale = next((float(x.arg) for x in val.src if x.op is Ops.CONST), None)
   if logarithm is None or scale is None or not math.isclose(scale, math.log(2)): return None
@@ -1482,10 +1482,10 @@ def _build_asinh_acosh_core_lut(is_acosh:bool) -> tuple[list[int], int, float, f
   for i in range(_LUT_SIZE):
     negative_z, positive_z = -(512-i)*step, i*step
     if is_acosh:
-      negative_y = math.acosh(1.0+abs(negative_z)/16.0)
+      negative_y = 2.0*math.acosh(1.0+abs(negative_z)/48.0)
       positive_y = 0.5*math.acosh(1.0+positive_z/2.0)
     else:
-      negative_y = 4.0*math.asinh(abs(negative_z)/16.0)
+      negative_y = 4.0*math.asinh(abs(negative_z)/8.0)
       positive_y = 0.5*math.asinh(positive_z)
     negative_raw, positive_raw = int(round(negative_y*output_scale)), int(round(positive_y*output_scale))
     lut[i] = max(-32768, min(32767, negative_raw if negative_raw != 0 else 1))
@@ -4331,6 +4331,15 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return True
 
   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  # Rejected WIP: a 1.5*fp32 residual nudge for small ASINH inputs only
+  # moved which samples landed in the wrong fp16 output bin. Keep the path
+  # disabled for reference; ACOSH still needs the residual for its endpoint.
+  apply_small_residual = False
+  source_residual = alloc() if source.dtype is dtypes.float and (is_acosh or apply_small_residual) else -1
+  if source_residual >= 0:
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, source_residual, 0, 0, 0xFFFFFFFF), RKReloc(0, source_arg[0], 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_RESIDUAL_LAYOUT), source_residual, is_copy=True), relocs))
   invalid = -1
   if is_acosh:
     below_diff, below_scratch, invalid, magnitude = (alloc() for _ in range(4))
@@ -4366,16 +4375,24 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     distance, local_diff, local_scratch, local_outside = (alloc() for _ in range(4))
     local_inside, broad_region = alloc(), alloc()
     nonexact_diff, nonexact_scratch, nonexact = (alloc() for _ in range(3))
-    tasks.extend((_emit_where_stage(total, distance, (magnitude, 0), one, Ops.SUB),
-                  _emit_where_stage(total, local_diff, (distance, 0), scalar(.125), Ops.SUB),
+    tasks.append(_emit_where_stage(total, distance, source_arg if source_residual >= 0 else (magnitude, 0), one, Ops.SUB))
+    coordinate_source = distance
+    if source_residual >= 0:
+      scaled_residual, coordinate_source = alloc(), alloc()
+      refined_below_diff, refined_below_scratch, invalid = alloc(), alloc(), alloc()
+      tasks.extend((_emit_where_stage(total, scaled_residual, (source_residual, 0), scalar(1/256), Ops.MUL),
+                    _emit_where_stage(total, coordinate_source, (distance, 0), (scaled_residual, 0), Ops.ADD),
+                    _emit_where_stage(total, refined_below_diff, zero, (coordinate_source, 0), Ops.SUB),
+                    _emit_where_stage(total, refined_below_scratch, (refined_below_diff, 0), (refined_below_diff, 0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, invalid, (refined_below_diff, 0), (refined_below_diff, 0), Ops.MAX, compare=True)))
+    tasks.extend((_emit_where_stage(total, local_diff, (coordinate_source, 0), scalar(.04), Ops.SUB),
                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
                   _emit_where_stage(total, broad_region, (small, 0), (local_inside, 0), Ops.SUB),
-                  _emit_where_stage(total, nonexact_diff, (distance, 0), scalar(.0005), Ops.SUB),
+                  _emit_where_stage(total, nonexact_diff, (coordinate_source, 0), scalar(.0005), Ops.SUB),
                   _emit_where_stage(total, nonexact_scratch, (nonexact_diff, 0), (nonexact_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, nonexact, (nonexact_diff, 0), (nonexact_diff, 0), Ops.MAX, compare=True)))
-    coordinate_source = distance
   else:
     near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
     local_diff, local_scratch, local_outside, local_inside = (alloc() for _ in range(4))
@@ -4384,7 +4401,7 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
-                  _emit_where_stage(total, local_diff, (magnitude, 0), scalar(.125), Ops.SUB),
+                  _emit_where_stage(total, local_diff, (magnitude, 0), scalar(.25), Ops.SUB),
                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
@@ -4394,9 +4411,9 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   neg_coordinate, amplified_coordinate, local_coordinate = (alloc() for _ in range(3))
   broad_raw, broad_coordinate, core_input = alloc(), alloc(), alloc()
-  broad_gain = 2 if is_acosh else 1
+  local_gain, broad_gain = (48 if is_acosh else 8), (2 if is_acosh else 1)
   tasks.extend((_emit_where_stage(total, neg_coordinate, zero, (coordinate_source, 0), Ops.SUB),
-                _emit_where_stage(total, amplified_coordinate, (neg_coordinate, 0), scalar(16), Ops.MUL),
+                _emit_where_stage(total, amplified_coordinate, (neg_coordinate, 0), scalar(local_gain), Ops.MUL),
                 _emit_where_stage(total, local_coordinate, (amplified_coordinate, 0), (local_inside, 0), Ops.MUL),
                 _emit_where_stage(total, broad_raw, (coordinate_source, 0), scalar(broad_gain), Ops.MUL),
                 _emit_where_stage(total, broad_coordinate, (broad_raw, 0), (broad_region, 0), Ops.MUL),
@@ -4418,7 +4435,7 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   middle_scaled, middle_selected, huge_scaled_output, huge_selected = (alloc() for _ in range(4))
   near_selected = alloc() if not is_acosh else -1
   first, second, magnitude_result = alloc(), alloc(), alloc()
-  local_scale = 1 if is_acosh else .25
+  local_scale = .5 if is_acosh else .25
   tasks.extend((_emit_where_stage(total, local_scaled, (core_slot, 0), scalar(local_scale), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0),
                                   (local_inside if is_acosh else local_mask, 0), Ops.MUL),
@@ -4437,10 +4454,21 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     with_near = alloc()
     tasks.append(_emit_where_stage(total, with_near, (magnitude_result, 0), (near_selected, 0), Ops.ADD))
     negative_result, positive_selected, negative_selected = (alloc() for _ in range(3))
+    signed_result = info.outs[0] if source_residual < 0 or not apply_small_residual else alloc()
     tasks.extend((_emit_where_stage(total, negative_result, zero, (with_near, 0), Ops.SUB),
                   _emit_where_stage(total, positive_selected, (with_near, 0), (nonnegative, 0), Ops.MUL),
                   _emit_where_stage(total, negative_selected, (negative_result, 0), (negative, 0), Ops.MUL),
-                  _emit_where_stage(total, info.outs[0], (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+                  _emit_where_stage(total, signed_result, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+    if apply_small_residual and source_residual >= 0:
+      correction_diff, correction_scratch, correction_outside, correction_inside = (alloc() for _ in range(4))
+      scaled_residual, selected_correction = alloc(), alloc()
+      tasks.extend((_emit_where_stage(total, correction_diff, (magnitude, 0), scalar(.25), Ops.SUB),
+                    _emit_where_stage(total, correction_scratch, (correction_diff, 0), (correction_diff, 0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, correction_outside, (correction_diff, 0), (correction_diff, 0), Ops.MAX, compare=True),
+                    _emit_where_stage(total, correction_inside, one, (correction_outside, 0), Ops.SUB),
+                    _emit_where_stage(total, scaled_residual, (source_residual, 0), scalar(1.5/256), Ops.MUL),
+                    _emit_where_stage(total, selected_correction, (scaled_residual, 0), (correction_inside, 0), Ops.MUL),
+                    _emit_where_stage(total, info.outs[0], (signed_result, 0), (selected_correction, 0), Ops.ADD)))
   else:
     exact_zeroed = alloc()
     tasks.append(_emit_where_stage(total, exact_zeroed, (magnitude_result, 0), (nonexact, 0), Ops.MUL))
@@ -4450,7 +4478,8 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
                   _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
                   _emit_where_stage(total, info.outs[0], (exact_zeroed, 0), (factor, 0), Ops.MUL)))
-  return tuple(tasks)
+  tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+  return _finalize_fp32_output(tasks, store)
 
 def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate sinh/cosh directly on [-2,2] and restore fp16 overflow outside the finite range."""

@@ -1447,3 +1447,37 @@ a derivative-LUT residual correction outside its endpoint band.  All
 inverse-trig operator arithmetic remains on DPU/LUT tasks.
 
 The next census must continue in normal-default `FORWARD_ONLY=1` mode.
+
+### FP32 ASINH/ACOSH two-LUT milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged normal-default `test_asinh` + `test_acosh` | **2 passed in 39.75s** |
+| fp16 inverse-trig/hyperbolic hardware regression | **1 passed in 14.23s** |
+| fp32 ACOS/ACOSH planner boundary regressions | **2 passed in 1.78s** |
+| full hardware-free planner/codec contract | **85/85 in 7.09s** |
+| post-gating isolated normal-fp32 ASINH | **1 passed in 9.59s** |
+| mypy | **pre-existing 13-error baseline** |
+| LUT task count | **2 per ASINH/ACOSH program** |
+
+Normal fp32 ASINH/ACOSH graphs now use the specialized two-LUT path.  ACOSH
+forms `x-1` from the fp16 high limb plus the x256 input residual before
+domain masking, then uses a 48× endpoint coordinate through `d<0.04`.
+ASINH widens its local table through `|x|<0.25` with an 8× coordinate.
+
+The ACOSH timeout is gone.  Accuracy improved from 93/2925 misses after the
+first specialized fp32 run to zero after residual-aware distance and
+endpoint tuning.  ASINH improved from two misses to zero by widening its
+local table.  A residual-output nudge was rejected and remains disabled in
+the source for reference.
+
+Host work is limited to the established fp32 high/residual ABI
+representation.  ASINH, ACOSH, comparisons, invalid-domain NaN generation,
+LUT evaluation, scaling, and selection all remain NPU work.
+
+Issue [airockchip/rknn-toolkit2#471](https://github.com/airockchip/rknn-toolkit2/issues/471)
+confirms fp16 input rounding only.  It is consistent with using a residual
+input limb, but it contains no accumulator fix or LUT tuning information.
+
+The next normal-default `FORWARD_ONLY=1` census starts after the now-passing
+ACOSH group.

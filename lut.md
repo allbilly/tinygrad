@@ -2294,3 +2294,81 @@ Always rerun both fp32 and fp16 ASIN/ACOS after changing their shared
 endpoint threshold.  ACOS benefits from a `0.85` endpoint handoff, while
 ASIN keeps `0.875`; forcing one common threshold regresses ASIN near
 `|x|≈0.86`.
+
+## FP32 ASINH/ACOSH two-task tuning
+
+ASINH and ACOSH share two physical LUT tasks.  Each 1,024-entry table is
+split into a 512-entry negative (`LE`) half and a 512-entry positive (`LO`)
+half.  Tune the coordinate and stored-output gain together; changing only
+one side evaluates a different function.
+
+### ACOSH endpoint coordinate
+
+For fp32 input, do not compute endpoint distance from the rounded and
+clamped magnitude.  Preserve the ABI residual:
+
+```text
+hi = fp16(x)
+lo = fp16(256 * (x - float32(hi)))
+d  = (hi - 1) + lo/256
+```
+
+Computing `max(hi,1)-1+lo/256` loses the full negative distance when
+`hi<1`, so invalid values can incorrectly produce zero instead of NaN.
+Create `d` first, use it for the `x<1` comparison, and only mask/select after
+the LUT result exists.
+
+The tuned core table is:
+
+| Region | Address | Stored curve | Decode | Handoff |
+|---|---|---|---|---:|
+| local LE | `z=-48*d` | `2*acosh(1+abs(z)/48)` | `*0.5` | `d<0.04` |
+| broad LO | `z=2*d` | `0.5*acosh(1+z/2)` | `*2` | `0.04≤d<1` |
+
+The local output gain is safe because `2*acosh(1.04)<1`; it gains one Q15
+output bit.  A 64× coordinate resolved the singular endpoint but handed off
+too early and missed near `d=0.0327`.  A 32× coordinate retained the
+original miss near `d=0.00215`.  The measured 48×/0.04 balance passed both
+regions.
+
+### ASINH local range
+
+The broad positive half-table has much coarser input knots than the negative
+local half.  Two fixed-seed fp32 misses at approximately 0.145 and 0.188
+were interpolation errors in the old broad region, not a need for another
+physical table.
+
+Use:
+
+| Region | Address | Stored curve | Decode | Handoff |
+|---|---|---|---|---:|
+| near zero | direct magnitude | identity | none | `|x|<0.04` |
+| local LE | `z=-8*|x|` | `4*asinh(abs(z)/8)` | `*0.25` | `0.04≤|x|<0.25` |
+| broad LO | `z=|x|` | `0.5*asinh(z)` | `*2` | `0.25≤|x|<2` |
+
+At `|x|=0.25`, `4*asinh(x)` remains below one and does not saturate signed
+Q15.  A post-LUT correction proportional to the fp32 residual was rejected:
+the true correction was smaller than half an output ulp, while 1.5× merely
+moved different samples into the wrong adjacent bin.  Keep that experiment
+disabled and improve table spacing instead.
+
+### Debug sequence
+
+1. Confirm the fp32 graph reaches `_try_asinh_acosh_subtasks`; the generic
+   ACOSH expansion previously timed out.
+2. Run with `ROCKCHIP_DEBUG_STAGE=1`.  A successful program must complete
+   both `dpu_lut` stages and the final DPU stage.
+3. Print each failing input, `hi`, `256*(x-hi)`, output, reference, and
+   relative error.  Sort ACOSH failures by `d=x-1`.
+4. If invalid-domain NaN locations differ, inspect distance/clamp ordering
+   before changing LUT knots.
+5. Sweep local coordinate gain and handoff together.  A finer local table
+   can regress the first broad-table interval if the handoff moves too close
+   to the singularity.
+6. Rerun normal fp32 ASINH+ACOSH together and the fp16
+   `test_dpu_inverse_trig_two_lut` regression.
+
+RKNN Toolkit2 issue #471 is a useful reminder that a decimal fp32 input can
+already change when represented as fp16.  Its reported values are fully
+explained by `fp16(0.1)` and do not describe LUT interpolation, endpoint
+handoff, or an accumulator workaround.
