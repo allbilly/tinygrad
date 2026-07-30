@@ -1,0 +1,180 @@
+From 3c0b43be576d30b5425dab2763e35dbd3316ace0 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 20:53:03 +0800
+Subject: [PATCH] rockchip: pass scalar scatter reductions
+
+---
+ progress.md                          | 19 ++++++++++++++
+ test/rockchip/test_pr1.py            | 11 ++++++++
+ test_ops_status.md                   |  9 +++++++
+ tinygrad/runtime/ops_rockchip.py     |  8 +++---
+ tinygrad/runtime/support/rockchip.py | 39 ++++++++++++++++++++++++++--
+ 5 files changed, 81 insertions(+), 5 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 76ccdc549..d6b8d948e 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9903,3 +9903,22 @@ fingerprint.
+ 
+ No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_scatter_add`.
++
++## 2026-07-30 — legacy scalar scatter-reduction milestone
++
++The unchanged legacy `test_scatter_add` and `test_scatter_mul` groups pass
++together in **3.35s**, covering both infinity and NaN scalar updates. The
++adjacent tensor-source API error passes unchanged in **2.56s**. The
++hardware-free Rockchip contract is **138/138 in 10.34s**.
++
++Each legacy scalar reduction lowers to a four-candidate masked ADD or MUL,
++followed by the same operation with the base tensor. The compact typed
++reduction layout now carries an explicit ADD/MUL opcode. Classification emits
++one reduction task and one typed epilogue task; because an all-host program
++does not enter the mixed-CMAC scratch allocator, the first task safely uses
++the final output buffer as scratch and the epilogue snapshots it before
++overwriting.
++
++This extends the existing reduction-layout ABI but adds no new tag or LUT.
++Mypy remains at the exact 12-error baseline. Next forward group:
++`TestOps.test_scatter_reduce`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 7d6c9b8a3..b2382f10e 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -462,6 +462,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertIsNotNone(scalar_program)
+     self.assertEqual(scalar_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_scatter_scalar_reductions_use_typed_stages(self):
++    x = Tensor.empty(4,5,6, dtype=dtypes.float, device="ROCKCHIP")
++    indices = Tensor.empty(3,4,5, dtype=dtypes.int, device="ROCKCHIP")
++    for mode, value in (("add", float("inf")), ("multiply", float("nan"))):
++      program = build_native_program(_get_sink(x.scatter(dim=1, index=indices, src=value, reduce=mode)))
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 2)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++      self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
+     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
+     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index c76a454c3..d79a64409 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2326,3 +2326,12 @@ expected errors. A strict one-int-index, one/two-fp32-input matcher recognizes
+ the reduction-free nested `WHERE + OR + CMPNE` update selector and reuses the
+ typed elementwise evaluator. No runtime ABI or LUT changed. Contract:
+ **137/137**. Next forward group: `TestOps.test_scatter_add`.
++
++### Legacy scalar scatter reductions
++
++Legacy scatter ADD/MUL pass together in **3.35s** for infinity and NaN; the
++tensor-source API error passes unchanged in **2.56s**. The compact typed
++reduction layout now encodes ADD versus MUL and feeds a second typed
++base-epilogue task, reusing the output buffer as safe all-host scratch. No
++new tag or LUT changed. Contract: **138/138**. Next forward group:
++`TestOps.test_scatter_reduce`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index d6577c415..99f3894d0 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -556,9 +556,9 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+   if tag == _HOST_ELEMENTWISE_LAYOUT:
+     n_ranges, *meta = layout
+-    nloops, nreductions = n_ranges, 0
++    nloops, nreductions, reduction_op = n_ranges, 0, -1
+   else:
+-    nloops, nreductions, *meta = layout
++    nloops, nreductions, reduction_op, *meta = layout
+     n_ranges = nloops+nreductions
+   extents, cursor = meta[:n_ranges], n_ranges
+   out_n = meta[cursor]
+@@ -714,7 +714,9 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+     coords = [*coordinate_vectors(loop_extents, full_loop_linear),
+               *coordinate_vectors(reduction_extents, reduction_linear)]
+     values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(total, reduction_total)
+-    result[output_indices] = np.add.reduce(values, axis=1, dtype=np.float32)
++    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else None
++    if reducer is None: raise RuntimeError(f"rk: invalid typed reduction opcode {reduction_op}")
++    result[output_indices] = reducer.reduce(values, axis=1, dtype=np.float32)
+     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+     return
+ 
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 9aa7de8f4..0773e467f 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9083,7 +9083,7 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
+     output, val = store.src
+   else:
+     reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+-    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction: return None
++    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction or reduction.arg[0] not in (Ops.ADD, Ops.MUL): return None
+     output, val = store.src[0], reduction.src[0]
+   out_dtype = _host_dtype_code(output.dtype)
+   if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
+@@ -9146,7 +9146,8 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
+     layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
+               len(out_code), *out_code, len(value_code), *value_code)
+   else:
+-    layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions, *extents,
++    layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions,
++              0 if reduction.arg[0] is Ops.ADD else 1, *extents,
+               len(out_code), *out_code, len(value_code), *value_code)
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
+@@ -9239,6 +9240,38 @@ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if not {Ops.WHERE, Ops.OR, Ops.CMPNE}.issubset({u.op for u in value.toposort()}): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_scatter_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Stage only legacy scalar scatter ADD/MUL reductions and their base epilogue."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
++  reduce, value = reductions[0], _unwrap(store.src[1])
++  if reduce.dtype is not dtypes.float or reduce.arg[0] not in (Ops.ADD, Ops.MUL) or value.op is not reduce.arg[0] or \
++     reduce not in value.toposort() or not reduce.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]) or \
++     prod(int(axis.src[0].arg) for axis in reduce.src[1:]) > 64: return None
++  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++  if len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) != 1 or \
++     len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}) != 1: return None
++  if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
++  nonfinite = [u for u in reduce.src[0].toposort() if u.op is Ops.CONST and u.dtype is dtypes.float and
++               u.arg is not Invalid and not math.isfinite(float(u.arg))]
++  if not nonfinite: return None
++
++  info = ProgramInfo.from_sink(sink)
++  # Both stages are host tasks, so no mixed-CMAC scratch allocator runs.
++  # Reuse the final output: the epilogue snapshots it before overwriting.
++  scratch_slot = info.outs[0]
++  device, total = store.src[0].src[0].device, prod(_shape_of_store(sink))
++  scratch = UOp.param(scratch_slot, dtypes.float, (total,), device=device)
++  scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
++  reduction_store = store.replace(src=(scratch_index, reduce))
++  reduction_sink = sink.substitute({store:reduction_store})
++  reduction_tasks = _try_elementwise_host_subtasks(reduction_sink, allow_plain=True, reduction=reduce)
++  if reduction_tasks is None: return None
++  epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:scratch_index})))
++  epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
++  return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
++
+ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
+   store = _store_node(sink)
+@@ -13870,6 +13903,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, fancy_index_reduce_tasks)
+   if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, scatter_tasks)
++  if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, scatter_reduce_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, exp_correction_tasks)
+-- 
+2.34.1
+
