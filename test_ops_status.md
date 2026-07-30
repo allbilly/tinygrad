@@ -2263,3 +2263,15 @@ invalid padded candidates stay value-masked and carry a harmless zero index.
 The padding/ceil schedules therefore no longer require static evaluation of
 their nested compaction REDUCE. Ordinary axis argmax is unchanged. No runtime
 ABI or LUT changed. Next forward group: `TestOps.test_max_unpool2d`.
+
+### Normal-fp32 max-unpool
+
+The three finite cases pass in **9.54s**, and the infinity/NaN case passes in
+**3.47s**. Normal-fp32 pool indices now select from the original fp32
+candidate map, avoiding false ties introduced by half conversion; the fp32
+unpool consumer uses one typed int32-index/fp32-value scatter boundary. A
+collapsed single-output pool is identified by its two reduction axes. The
+existing fp16 native comparison/selection and unpool implementation remains
+unchanged. The complete seven-case pool-index group still passes in
+**171.93s**. No LUT changed. Contract: **133/133**. Next forward group:
+`TestOps.test_avg_pool2d`.

@@ -940,13 +940,16 @@ def _unpack_half_bits(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
     ctypes.memmove(output.va_addr + (start+element)*2, source.va_addr + element*4, 2)  # type: ignore[arg-type]
 
 def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
-  """Scatter pooled fp16 values by per-plane int32 indices, summing duplicates in fp32."""
+  """Scatter pooled fp16/fp32 values by per-plane int32 indices."""
   import numpy as np
-  total, tag, index_total, planes, out_spatial, pooled = task.layout
-  assert tag == _HOST_SCATTER_LAYOUT and index_total == planes*pooled and total == planes*out_spatial
+  total, tag, index_total, planes, out_spatial, pooled, *typed = task.layout
+  itemsize = typed[0] if typed else 2  # compatibility with the rejected older diagnostic layout
+  assert tag == _HOST_SCATTER_LAYOUT and itemsize in (2, 4) and \
+    index_total == planes*pooled and total == planes*out_spatial
   output, index_buf, value_buf = (bufs[r.globals_slot] for r in relocs)
   indices = np.frombuffer(ctypes.string_at(index_buf.va_addr, index_total*4), dtype=np.int32)
-  values = np.frombuffer(ctypes.string_at(value_buf.va_addr, index_total*2), dtype=np.float16)
+  value_dtype = np.float32 if itemsize == 4 else np.float16
+  values = np.frombuffer(ctypes.string_at(value_buf.va_addr, index_total*itemsize), dtype=value_dtype)
   accumulator = np.zeros(total, dtype=np.float32)
   for plane in range(planes):
     for update in range(pooled):
@@ -955,25 +958,40 @@ def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
       if 0 <= spatial < out_spatial:
         destination = plane*out_spatial+spatial
         accumulator[destination] = np.float32(accumulator[destination] + np.float32(values[source]))
-  result = accumulator.astype(np.float16)
-  ctypes.memmove(output.va_addr, result.ctypes.data, total*2)  # type: ignore[arg-type]
+  result = accumulator.astype(value_dtype)
+  ctypes.memmove(output.va_addr, result.ctypes.data, total*itemsize)  # type: ignore[arg-type]
 
 def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
-  """Choose the first valid static candidate equal to each max-pool output."""
+  """Choose the first valid maximum from a static fp16/fp32 candidate map."""
   import numpy as np
-  total, tag, window, input_spatial, *mapping = task.layout
+  total, tag, window, input_spatial, *payload = task.layout
+  itemsize = payload[0] if len(payload) == total*window+1 else 2
+  mapping = payload[1:] if len(payload) == total*window+1 else payload
   assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
   output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
-  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float16)
-  maximum = np.frombuffer(ctypes.string_at(maximum_buf.va_addr, total*2), dtype=np.float16)
+  data_dtype = np.float32 if itemsize == 4 else np.float16
+  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=data_dtype)
+  maximum = np.frombuffer(ctypes.string_at(maximum_buf.va_addr, total*itemsize), dtype=data_dtype)
   output = np.empty(total, dtype=np.int32)
   for out_index in range(total):
     selected = 0
-    for candidate in mapping[out_index*window:(out_index+1)*window]:
-      if candidate < 0 or candidate >= data.size: continue
-      if data[candidate] == maximum[out_index] or (np.isnan(data[candidate]) and np.isnan(maximum[out_index])):
-        selected = candidate % input_spatial
-        break
+    candidates = mapping[out_index*window:(out_index+1)*window]
+    if itemsize == 4:
+      selected_value = None
+      for candidate in candidates:
+        if candidate < 0 or candidate >= data.size: continue
+        value = data[candidate]
+        if np.isnan(value):
+          selected = candidate % input_spatial
+          break
+        if selected_value is None or value > selected_value:
+          selected_value, selected = value, candidate % input_spatial
+    else:
+      for candidate in candidates:
+        if candidate < 0 or candidate >= data.size: continue
+        if data[candidate] == maximum[out_index] or (np.isnan(data[candidate]) and np.isnan(maximum[out_index])):
+          selected = candidate % input_spatial
+          break
     output[out_index] = selected
   ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
 

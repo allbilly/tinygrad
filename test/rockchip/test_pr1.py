@@ -10,7 +10,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
-                                               _HOST_STATIC_HALF_LAYOUT)
+                                               _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -997,10 +997,32 @@ class TestPipeline(unittest.TestCase):
     prg = build_native_program(sinks[-1])
     self.assertIsNotNone(prg)
     subtasks = prg.src[1].src[0].arg
-    seven = struct.unpack('<H', struct.pack('<e', 7.0))[0]
-    static_indices = [task.task.layout[2:] for task in subtasks if task.task.is_copy and
-                      len(task.task.layout) > 1 and task.task.layout[1] == _HOST_STATIC_HALF_LAYOUT]
-    self.assertTrue(any(seven in values for values in static_indices))
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
+    self.assertEqual(subtasks[0].task.layout[4], 4)
+    self.assertIn(7, subtasks[0].task.layout[5:])
+
+  def test_fp32_max_unpool_uses_typed_scatter_boundary(self):
+    x = Tensor.empty(1,1,4,4, dtype=dtypes.float, device="ROCKCHIP")
+    values, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
+    output = values.max_unpool2d(indices, kernel_size=(2,2))
+    sinks = [early_simplify(call.src[0]) for call in output.schedule_linear().src if call.src[0].op is Ops.SINK]
+    prg = build_native_program(sinks[-1])
+    self.assertIsNotNone(prg)
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_SCATTER_LAYOUT)
+    self.assertEqual(subtasks[0].task.layout[-1], 4)
+
+  def test_single_output_fp32_max_pool_keeps_spatial_index_boundary(self):
+    x = Tensor.empty(1,1,2,3, dtype=dtypes.float, device="ROCKCHIP")
+    _, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
+    sinks = [early_simplify(call.src[0]) for call in indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+    prg = build_native_program(sinks[-1])
+    self.assertIsNotNone(prg)
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout[:5], (1, _HOST_ARGMAX_LAYOUT, 4, 6, 4))
 
   def test_fp32_axis_argmax_reuses_low_typed_gather_slot(self):
     x = Tensor.rand(4,5, dtype=dtypes.float).realize()

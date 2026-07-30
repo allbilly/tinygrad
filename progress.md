@@ -9776,3 +9776,36 @@ The global case deliberately expands to 1,564 serialized bounded subtasks;
 this is slow but exact and does not claim new DPU reduction geometry. No
 runtime ABI or LUT changed. Next forward group:
 `TestOps.test_max_unpool2d`.
+
+## 2026-07-30 — normal-fp32 max-unpool milestone
+
+All three unchanged finite `TestOps.test_max_unpool2d` cases pass in
+**9.54s**, covering 56,400- and 17,500-element outputs plus the
+batch/channel-ignored `output_size` form. The adjacent
+`TestOps.test_max_unpool2d_inf` passes in **3.47s**, preserving infinity and
+NaN behavior. The complete seven-case returned-index group was revalidated
+after the precision change and passes in **171.93s**.
+
+The preserved fp16 implementation still performs int32 index comparisons and
+selection on the NPU. Normal fp32 instead uses two strict typed operator
+boundaries:
+
+- returned max-pool indices select directly from the original fp32 candidate
+  map, excluding invalid padded addresses and retaining first-tie behavior;
+- max-unpool scatters the fp32 pooled values by their int32 per-plane spatial
+  indices into an fp32 output.
+
+This is required for correctness, not only speed. In the first large finite
+case, two distinct fp32 candidates rounded to the same fp16 value. The prior
+DPU selector therefore moved one maximum by one spatial row even though the
+value-only pool result was within tolerance. Direct fp32 selection removes
+that false tie. A total-one pool is recognized from its two reduction axes
+even after all loop axes collapse.
+
+The host layouts now carry an explicit 2/4-byte value width while retaining
+compatibility with the old diagnostic fp16 layout. The host scatter sums
+duplicates in fp32; ordinary fp16 max-unpool remains on the existing native
+path unless diagnostic host operators are explicitly enabled. No LUT
+changed. The hardware-free Rockchip contract is **133/133 in 10.08s** and
+mypy remains at the exact 12-error baseline. Next forward group:
+`TestOps.test_avg_pool2d`.

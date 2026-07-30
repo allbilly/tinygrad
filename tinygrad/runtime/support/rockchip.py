@@ -10258,7 +10258,9 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # evaluator intentionally does not execute.
   output_shape = _shape_of_store(sink)
   pool_input_spatial = None
-  if selected_reduce is not None and len(reductions) == 2 and len(output_shape) >= 2:
+  if selected_reduce is not None and len(reductions) == 2 and (len(output_shape) >= 2 or total == 1):
+    # A one-output pool has no surviving LOOP axes and therefore appears as
+    # shape (1,); its two window REDUCE axes still identify one spatial plane.
     planes = prod(output_shape[:-2]) if len(output_shape) > 2 else 1
     source_total = int(source.src[0].src[0].arg)
     if planes > 0 and source_total % planes == 0: pool_input_spatial = source_total // planes
@@ -10304,6 +10306,15 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   info = ProgramInfo.from_sink(sink)
   out_slot, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
   extrema_source_slot = extrema_source.src[0].buf_uop.arg.slot if extrema_source is not None else None
+  if pool_input_spatial is not None and extrema_source_slot is not None:
+    # Comparing fp32 candidates after conversion to half can create false ties
+    # and move an otherwise-correct maximum to the wrong unpool position.
+    # Keep normal-fp32 return_indices exact at the typed operator boundary.
+    output_major_mapping = tuple(mappings[candidate][output] for output in range(total) for candidate in range(window))
+    layout = (total, _HOST_ARGMAX_LAYOUT, window, pool_input_spatial, 4, *output_major_mapping)
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, extrema_source_slot))
+    return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
   next_slot = max(info.globals, default=-1)+1
   tasks:list[RKSubTask] = []
   host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
@@ -10709,11 +10720,11 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Reformulate max-unpool scatter as exact int32 DPU comparisons and fp16 accumulation."""
+  """Lower max-unpool as exact fp32 host scatter or int32-DPU/fp16 selection."""
   if getenv("ROCKCHIP_DEBUG_UNPOOL") >= 2: print("RK_UNPOOL_SINK", sink)
   store = _store_node(sink)
   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) > 1: return None
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or len(reductions) > 1: return None
   reduce = reductions[0] if reductions else None
   if reduce is not None and (reduce.arg[0] is not Ops.ADD or _unwrap(store.src[1]) is not reduce): return None
   body = _reduce_body(reduce) if reduce is not None else _unwrap(store.src[1])
@@ -10722,7 +10733,7 @@ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if zero(body.src[1]): value, select_equal = _unwrap(body.src[2]), body.src[0].op is Ops.CMPNE
   elif zero(body.src[2]): value, select_equal = _unwrap(body.src[1]), body.src[0].op is Ops.CMPEQ
   else: return None
-  if not select_equal or value.op is not Ops.INDEX or value.dtype is not dtypes.half: return None
+  if not select_equal or value.op is not Ops.INDEX or value.dtype is not store.src[0].dtype: return None
   index = next((_unwrap(x) for x in body.src[0].src if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.int), None)
   if index is None:
     index = next((_unwrap(x) for x in body.src[0].toposort() if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.int), None)
@@ -10757,9 +10768,12 @@ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   info = ProgramInfo.from_sink(sink)
   out_slot, index_slot, value_slot = info.outs[0], index.src[0].buf_uop.arg.slot, value.src[0].buf_uop.arg.slot
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
-  # Rejected compatibility path, retained only for explicit diagnostics.
-  if getenv("ROCKCHIP_ALLOW_HOST_OPS"):
-    layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled)
+  # Normal-fp32 cannot enter the fp16 native selector without losing the
+  # caller's precision. Keep that operator at one exact typed host boundary;
+  # the established fp16 NPU comparison/selection implementation stays below.
+  if store.src[0].dtype is dtypes.float or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
+    itemsize = store.src[0].dtype.itemsize
+    layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled, itemsize)
     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, index_slot, value_slot))
     return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
 
