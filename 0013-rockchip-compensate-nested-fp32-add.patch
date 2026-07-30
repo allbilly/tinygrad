@@ -1,0 +1,164 @@
+From f38a912ef52c87c958f28f06843d6899f7a532db Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 10:10:46 +0800
+Subject: [PATCH] rockchip: compensate nested fp32 add
+
+---
+ progress.md                          | 30 +++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 11 ++++++++
+ test_ops_status.md                   | 18 +++++++++++++
+ tinygrad/runtime/support/rockchip.py | 39 ++++++++++++++++++----------
+ 4 files changed, 84 insertions(+), 14 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 23479e80a..8853717d7 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7580,6 +7580,36 @@ are not claimed by this milestone.  Issue #471 again explains why retaining
+ the fp32 residual is necessary, but it supplies neither TwoSum nor an output
+ representation strategy.
+ 
++## 2026-07-30 — nested three-input fp32 ADD milestone
++
++After direct ADD passed, the census stopped at `TestOps.test_add3` before
++comparison.  Generic nested-elementwise lowering materialized `x+y` into an
++internal slot, marked that scratch slot as an external fp32 output, and the
++runtime attempted to find it in the caller buffer list:
++
++```text
++IndexError: original_prepared[output_slot]
++```
++
++The compensated ADD matcher now flattens exactly two or three direct
++contiguous fp32 sources.  It carries `(high,x256-low)` across each
++left-to-right addition.  Every additional source contributes one more
++nine-stage NPU TwoSum/correction block; only the final logical result crosses
++the host ABI decode boundary.
++
++Validation with `. .venv/bin/activate`:
++
++- unchanged `test_add`, `test_add3`, and `test_tiny_add`:
++  **3 passed in 3.46 seconds**;
++- isolated unchanged `test_add3`: **1 passed in 2.90 seconds**;
++- full hardware-free planner/codec contract: **87/87 in 6.79 seconds**;
++- Python compilation and `git diff --check`: passing;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++The three-input program uses six input representation views, eighteen NPU
++arithmetic stages, and one final high/residual fp32 ABI decode.  Broadcast
++ADD and SUB remain separate groups.
++
+ ## 2026-07-30 — logarithmic long cumulative products
+ 
+ The unchanged forward-only `TestOps.test_simple_cumprod` now passes both
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 102061da8..e65a9d637 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -309,6 +309,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.task.is_copy for task in subtasks), 5)
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_fp32_add3_keeps_compensated_boundary(self):
++    a = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
++    b = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
++    c = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a+b+c))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 18)
++    self.assertEqual(sum(task.task.is_copy for task in subtasks), 7)
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
++
+   def test_fp32_acos_uses_specialized_lut_boundary(self):
+     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
+     self.assertIsNotNone(program)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 839b9e48d..9abcf11d5 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1502,3 +1502,21 @@ constants, and SUB.  Constant-folded `1+0.5` still passes through its
+ existing fill path.  The next census should therefore treat `test_add3`,
+ broadcast ADD, and SUB as independent extensions rather than assuming this
+ milestone covers them.
++
++### Nested three-input fp32 ADD milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged `test_add` + `test_add3` + `test_tiny_add` | **3 passed in 3.46s** |
++| isolated unchanged `test_add3` | **1 passed in 2.90s** |
++| full hardware-free planner/codec contract | **87/87 in 6.79s** |
++| mypy | **pre-existing 13-error baseline** |
++
++The fp32 ADD matcher now flattens exactly two or three direct contiguous
++inputs.  It carries the split high/x256-low representation across the second
++NPU TwoSum block and decodes only the final logical output.  This avoids the
++generic nested-elementwise bug that treated an internal scratch slot as a
++caller-visible fp32 buffer and raised `IndexError`.
++
++Three-input ADD uses eighteen NPU arithmetic stages.  Broadcast ADD and SUB
++remain open and are not covered by this milestone.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 34d8e613d..d773c2109 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10762,12 +10762,20 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   return tuple(tasks)
+ 
+ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Add two direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
++  """Add two or three direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
+   store = _store_node(sink)
+   if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
+   val = _unwrap(store.src[1])
+-  if val.op is not Ops.ADD or val.dtype is not dtypes.float or len(val.src) != 2: return None
+-  sources = tuple(_unwrap(x) for x in val.src)
++  if val.op is not Ops.ADD or val.dtype is not dtypes.float: return None
++  sources_list:list[UOp] = []
++  def flatten_add(node:UOp) -> None:
++    node = _unwrap(node)
++    if node.op is Ops.ADD:
++      for child in node.src: flatten_add(child)
++    else: sources_list.append(node)
++  flatten_add(val)
++  sources = tuple(sources_list)
++  if len(sources) not in (2, 3): return None
+   if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM or
+          not _is_flat_contiguous(x.src[1]) for x in sources) or not _is_flat_contiguous(store.src[0].src[1]): return None
+   total = prod(_shape_of_store(sink))
+@@ -10793,17 +10801,20 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   limbs = tuple((view(x.src[0].arg.slot, _HOST_FP32_HALF_LAYOUT),
+                  view(x.src[0].arg.slot, _HOST_FP32_RESIDUAL_LAYOUT)) for x in sources)
+-  high = stage(limbs[0][0], limbs[1][0], Ops.ADD)
+-  rounded_b = stage(high, limbs[0][0], Ops.SUB)
+-  high_minus_rounded_b = stage(high, rounded_b, Ops.SUB)
+-  error_a = stage(limbs[0][0], high_minus_rounded_b, Ops.SUB)
+-  error_b = stage(limbs[1][0], rounded_b, Ops.SUB)
+-  high_error = stage(error_a, error_b, Ops.ADD)
+-  input_low = stage(limbs[0][1], limbs[1][1], Ops.ADD)
+-  scaled_high_error = alloc()
+-  tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
+-                                 (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
+-  low = stage(input_low, scaled_high_error, Ops.ADD)
++  high, low = limbs[0]
++  for next_high, next_low in limbs[1:]:
++    old_high = high
++    high = stage(old_high, next_high, Ops.ADD)
++    rounded_b = stage(high, old_high, Ops.SUB)
++    high_minus_rounded_b = stage(high, rounded_b, Ops.SUB)
++    error_a = stage(old_high, high_minus_rounded_b, Ops.SUB)
++    error_b = stage(next_high, rounded_b, Ops.SUB)
++    high_error = stage(error_a, error_b, Ops.ADD)
++    input_low = stage(low, next_low, Ops.ADD)
++    scaled_high_error = alloc()
++    tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
++                                   (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
++    low = stage(input_low, scaled_high_error, Ops.ADD)
+ 
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+   relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high, 0, 0, 0xFFFFFFFF),
+-- 
+2.34.1
+
