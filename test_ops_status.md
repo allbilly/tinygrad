@@ -1896,3 +1896,15 @@ storage no longer acts as a CBUF gate; the materialized M/N/K planner owns
 residency. No LUT or host operator arithmetic changed.
 
 All base sum groups through `test_sum_dtype_arg` are green.
+
+### Remaining basic reduction validation
+
+| Coverage | Result |
+|---|---:|
+| zero-shape sum + prod + prod dtype | **3 passed in 8.25s** |
+| min + max + constant reductions | **3 passed in 12.59s** |
+| any/all scalar, axis, empty-axis | **6 passed in 16.82s** |
+| isolated `test_all_large` | **1 passed in 26.28s** |
+
+The old constant-sum rejection is resolved. No code or LUT change was
+needed for this validation block. Continue with `TestOps.test_isclose`.

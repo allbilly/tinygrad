@@ -7757,6 +7757,29 @@ Validation with `. .venv/bin/activate` and
 
 No LUT changed. All base sum cases through `test_sum_dtype_arg` are green.
 
+## 2026-07-30 — remaining basic reduction validation
+
+No code change was needed for the groups immediately following the direct
+sum milestone:
+
+- zero-shaped sums, product reductions, and product dtype validation:
+  **3 passed in 8.25s**;
+- min, max, and all constant sum/product/max reductions:
+  **3 passed in 12.59s**;
+- any/all scalar, axis, and empty-axis groups:
+  **6 passed in 16.82s**;
+- isolated `test_all_large` through `2**20` elements:
+  **1 passed in 26.28s**.
+
+The previously tracked constant-sum rejection is resolved by the direct
+fp32 sum work. `test_all_large` remains intentionally isolated from later
+comparison stress as a conservative driver-state practice, although the
+submit-buffer lifecycle fix has removed the old functional timeout in its
+own process.
+
+No LUT or runtime path changed in this validation milestone. Continue with
+`TestOps.test_isclose`.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
