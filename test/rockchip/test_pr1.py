@@ -353,6 +353,26 @@ class TestClassifier(unittest.TestCase):
     self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_padded_fp32_gemm_materializes_where_sources(self):
+    a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP").pad(((0,7),(0,7)))
+    b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP").pad(((0,7),(0,7)))
+    program = build_native_program(_get_sink(a@b))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    cmac_tasks = [task.task for task in subtasks if task.task.kind == "cmac"]
+    self.assertEqual(len(cmac_tasks), 3)
+    self.assertTrue(all(task.layout[:3] == (16,16,16) for task in cmac_tasks))
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
+  def test_explicit_half_gemm_tags_fused_fp32_inputs(self):
+    a = Tensor.empty(64,64, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(64,64, dtype=dtypes.float, device="ROCKCHIP")
+    plan = plan_rk(_get_sink(a.half() @ b.half()))
+    self.assertIsInstance(plan, RKPlan)
+    self.assertEqual(plan.kind, "cmac")
+    self.assertEqual(plan.fp32_inputs, (1,2))
+    self.assertFalse(plan.fp32_output)
+
   def test_large_fp32_contraction_uses_tiled_raw_cmac_boundary(self):
     a = Tensor.empty(3,5,8,10, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(11,7,5,13,8, dtype=dtypes.float, device="ROCKCHIP")

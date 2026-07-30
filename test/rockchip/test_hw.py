@@ -766,6 +766,25 @@ class TestCMAC(unittest.TestCase):
     got = (a.expand(2,4,3)*b.expand(2,4,3)).sum((0,2)).realize().numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
 
+  def test_cmac_padded_fp32_matmul(self):
+    rng = np.random.default_rng(3)
+    a_np = rng.standard_normal((9,9)).astype(np.float32)
+    b_np = rng.standard_normal((9,9)).astype(np.float32)
+    expected = np.pad(a_np, ((0,7),(0,7))) @ np.pad(b_np, ((0,7),(0,7)))
+    a, b = Tensor(a_np, device="ROCKCHIP"), Tensor(b_np, device="ROCKCHIP")
+    got = (a.pad(((0,7),(0,7))) @ b.pad(((0,7),(0,7)))).realize().numpy()
+    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
+
+  def test_cmac_fused_explicit_half_inputs(self):
+    rng = np.random.default_rng(4)
+    a_np = rng.standard_normal((16,16)).astype(np.float32)
+    b_np = rng.standard_normal((16,16)).astype(np.float32)
+    expected = (a_np.astype(np.float16).astype(np.float32) @
+                b_np.astype(np.float16).astype(np.float32)).astype(np.float16)
+    a, b = Tensor(a_np, device="ROCKCHIP"), Tensor(b_np, device="ROCKCHIP")
+    got = (a.half() @ b.half()).realize().numpy()
+    np.testing.assert_allclose(got, expected, rtol=5e-3, atol=5e-3)
+
   def test_cmac_long_fp32_batched_dot(self):
     rng = np.random.default_rng(2)
     a_np = rng.standard_normal((3,13824)).astype(np.float32)

@@ -1828,3 +1828,25 @@ factor order. The matcher is restricted to direct factors independent of
 all reduction axes. No LUT change or host operator arithmetic was added.
 
 Continue with `TestOps.test_matmul_simple`.
+
+### Remaining normal-fp32 matmul/GEMM
+
+| Coverage | Result |
+|---|---:|
+| simple/vector/batched-vector + 8x8/9x9 GEMM | **6 groups pass** |
+| padded/range/identity small GEMM | **3 groups pass** |
+| unchanged fp16 + normal 64x64 GEMM | **2 passed in 3.87s** |
+| big/zero-shape/broadcast/multidot | **4 passed in 30.82s** |
+| permanent padded fp32 GEMM | **1 passed in 1.65s** |
+| permanent fused explicit-half inputs | **1 passed in 0.85s** |
+| hardware-free planner/runtime contract | **106/106 in 6.51s** |
+
+Padded fp32 INDEX/WHERE operands now receive the same high/residual ABI
+substitution as bare INDEX operands before existing CMAC materialization.
+Fused explicit `.half()` inputs may tag fp32 backing buffers only when every
+fp32 INDEX is consumed exclusively by a half CAST and the output is half.
+General fp32 CMAC remains on the compensated path.
+
+All official matmul/GEMM groups through `test_multidot` are green. No LUT
+change or host operator arithmetic was introduced. Continue with
+`TestOps.test_sum_simple`.

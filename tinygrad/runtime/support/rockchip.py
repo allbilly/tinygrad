@@ -2350,7 +2350,15 @@ def plan_rk(sink: UOp) -> RKPlan|str:
   wide_param_slots = fp32_param_slots | int_param_slots
   fp32_inputs = tuple(s for s in in_slots if s in wide_param_slots)  # four-byte input slots
   fp32_output = out_slots[0] in wide_param_slots
-  if (fp32_inputs or fp32_output) and kind not in ("dpu", "dpu_lut"):
+  # A fused explicit `.half()` leaves fp32 backing PARAMs below half CASTs.
+  # CMAC's runtime already converts tagged input buffers before pad/swizzle;
+  # permit only this strict typed boundary, never ordinary fp32 CMAC/output.
+  fp32_indexes = [u for u in sink.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and
+                  u.src[0].op is Ops.PARAM and u.src[0].buf_uop.arg.slot in fp32_inputs]
+  cmac_cast_inputs = kind == "cmac" and bool(fp32_inputs) and not fp32_output and bool(fp32_indexes) and \
+    all((consumers := [parent for parent in sink.toposort() if index in parent.src]) and
+        all(parent.op is Ops.CAST and parent.dtype is dtypes.half for parent in consumers) for index in fp32_indexes)
+  if (fp32_inputs or fp32_output) and kind not in ("dpu", "dpu_lut") and not cmac_cast_inputs:
     return f"RKPLAN_REJECT:unsupported_dtype:fp32_{kind}"
   return RKPlan(kind, sink, out_slots[0], in_slots, input_scale=input_scale, output_scale=output_scale, lut_op=lut_op,
                 fp32_inputs=fp32_inputs, fp32_output=fp32_output, is_abs=abs_slot is not None,
@@ -11438,8 +11446,13 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   body = _unwrap(reduce.src[0])
   if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
   sources = tuple(_unwrap(x) for x in body.src)
-  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM for x in sources): return None
-  source_slots = tuple(x.src[0].buf_uop.arg.slot for x in sources)
+  if any(x.op not in (Ops.INDEX, Ops.WHERE) or x.dtype is not dtypes.float for x in sources): return None
+  source_indexes = tuple(tuple(u for u in source.toposort()
+                               if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM)
+                         for source in sources)
+  if any(not indexes or len({u.src[0].buf_uop.arg.slot for u in indexes}) != 1 for indexes in source_indexes): return None
+  source_slots = tuple(indexes[0].src[0].buf_uop.arg.slot for indexes in source_indexes)
+  source_totals = tuple(int(indexes[0].src[0].src[0].arg) for indexes in source_indexes)
   if any(slot >= 7 for slot in source_slots): return None
   output_total = prod(_shape_of_store(sink))
   # Flat DPU correction stages have a 13-bit atom-width field. Larger exact
@@ -11451,8 +11464,7 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   next_slot = max(info.globals, default=-1) + 1
   tasks:list[RKSubTask] = []
   views:list[tuple[int,int]] = []
-  for source, source_slot in zip(sources, source_slots):
-    source_total = int(source.src[0].src[0].arg)
+  for source_slot, source_total in zip(source_slots, source_totals):
     high_slot, low_slot = next_slot, next_slot+1
     next_slot += 2
     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
@@ -11475,11 +11487,24 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def cmac(a_slot:int, b_slot:int, fp32_output=False) -> int|None:
     nonlocal next_slot
     out_slot, next_slot = next_slot, next_slot+1
+    def half_source(u:UOp, slot:int, source_slot:int, source_total:int) -> UOp|None:
+      u = _unwrap(u)
+      if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM and \
+         u.src[0].buf_uop.arg.slot == source_slot:
+        half_param = UOp.param(slot, dtypes.half, (source_total,), device=u.src[0].device)
+        return u.replace(dtype=dtypes.half, src=(half_param, *u.src[1:]))
+      if u.op is Ops.CONST and u.dtype is dtypes.float:
+        return UOp.const(dtypes.half, float(u.arg))
+      if u.op is Ops.WHERE and u.dtype is dtypes.float and len(u.src) == 3:
+        true, false = half_source(u.src[1], slot, source_slot, source_total), \
+                      half_source(u.src[2], slot, source_slot, source_total)
+        if true is not None and false is not None: return UOp(Ops.WHERE, dtypes.half, (u.src[0], true, false))
+      return None
     half_sources:list[UOp] = []
-    for source, slot in zip(sources, (a_slot, b_slot)):
-      source_total = int(source.src[0].src[0].arg)
-      half_param = UOp.param(slot, dtypes.half, (source_total,), device=source.src[0].device)
-      half_sources.append(source.replace(dtype=dtypes.half, src=(half_param, *source.src[1:])))
+    for source, source_slot, source_total, slot in zip(sources, source_slots, source_totals, (a_slot, b_slot)):
+      converted = half_source(source, slot, source_slot, source_total)
+      if converted is None: return None
+      half_sources.append(converted)
     half_product = UOp(Ops.MUL, dtypes.half, tuple(half_sources))
     half_reduce = reduce.replace(src=(UOp(Ops.CAST, dtypes.float, (half_product,), arg=dtypes.float), *reduce.src[1:]))
     out_param = UOp.param(out_slot, dtypes.half, (output_total,), device=device)

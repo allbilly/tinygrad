@@ -7579,6 +7579,66 @@ Validation with `. .venv/bin/activate` and
 No LUT coefficients or two-level LUT schedule changed. Continue with
 `TestOps.test_matmul_simple`.
 
+## 2026-07-30 — remaining normal-fp32 matmul/GEMM milestone
+
+All matrix groups from `test_matmul_simple` through `test_multidot` now pass
+forward-only. Six groups were already green: simple/vector matmul, both
+batched-vector forms, 8x8 GEMM, and 9x9 GEMM. Three more unchanged padded,
+range, and identity cases passed before the explicit-half boundary, and the
+final 64x64, 256x256, empty-shape, broadcast-dot, and multidot groups also
+pass.
+
+### Padded fp32 CMAC operands
+
+The 9→16 padded GEMM exposed source operands as
+`WHERE(in_bounds, INDEX, 0)`. The materialized half CMAC path already
+supports that representation, but the compensated fp32 wrapper accepted
+only bare INDEX children and therefore ended at
+`RKPLAN_REJECT:unsupported_op:Ops.WHERE`.
+
+The wrapper now finds the single backing fp32 PARAM under each INDEX/WHERE
+operand, creates its high/residual ABI buffers, and recursively substitutes
+only INDEX values and fp32 zero constants into a half-typed WHERE tree.
+Bounds predicates and address expressions remain unchanged. All three limb
+contractions then use the existing CMAC materializer. The permanent
+16x16-output case emits three `M=16,N=16,K=16` CMAC tasks.
+
+### Fused explicit-half inputs
+
+`x.half().matmul(y.half())` fuses the casts into the CMAC kernel: the
+arithmetic operands and output are half, while the backing PARAMs are fp32.
+The runtime already converts `task.fp32_inputs` before CMAC pad/swizzle, but
+the planner retained an older blanket `fp32_cmac` rejection.
+
+CMAC now accepts this boundary only when:
+
+- the output is not fp32;
+- every tagged fp32 INDEX is consumed directly and exclusively by a
+  fp32→fp16 CAST;
+- ordinary fp32 CMAC still goes through the compensated multi-task path.
+
+This does not enable general fp32 CMAC or host arithmetic.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- `test_matmul_simple`, `test_matmul`, both batched matmul groups,
+  `test_small_gemm`, and `test_9_gemm`: passed before the first padded
+  failure in a **6-pass** census;
+- unchanged padded/range/identity GEMM: passed in the later **3-pass**
+  prefix;
+- unchanged `test_gemm_fp16` and `test_gemm`: **2 passed in 3.87s**;
+- unchanged big GEMM, zero-shape GEMM, broadcast-dot, and multidot:
+  **4 passed in 30.82s**;
+- permanent padded fp32 GEMM: **1 passed in 1.65s**;
+- permanent fused explicit-half CMAC inputs: **1 passed in 0.85s**;
+- hardware-free planner/runtime contract: **106/106 in 6.51s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT table changed. Resume the official census at
+`TestOps.test_sum_simple`.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
