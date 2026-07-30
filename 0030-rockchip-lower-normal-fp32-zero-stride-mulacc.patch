@@ -1,0 +1,215 @@
+From ad990be167c18ad0b04a4bd1c491b1fbdc7340f7 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 15:23:55 +0800
+Subject: [PATCH] rockchip: lower normal fp32 zero-stride mulacc
+
+---
+ progress.md                          | 47 +++++++++++++++++++++
+ test/rockchip/test_hw.py             |  8 ++++
+ test/rockchip/test_pr1.py            |  9 ++++
+ test_ops_status.md                   | 15 +++++++
+ tinygrad/runtime/support/rockchip.py | 61 ++++++++++++++++++++++++++++
+ 5 files changed, 140 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index d302a7953..6201bcc38 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7532,6 +7532,53 @@ No LUT coefficients or schedules changed. The next group,
+ `TestOps.test_mulacc_with_zero_strides`, reaches its second case and rejects
+ with `RKPLAN_REJECT:unsupported_op:fused_epilogue`.
+ 
++## 2026-07-30 — normal-fp32 zero-stride mulacc milestone
++
++The unchanged forward-only `TestOps.test_mulacc_with_zero_strides` now
++passes all three cases. The second case was optimized from a broadcast
++multiply and reduction over axes `(0,2)` into:
++
++```text
++(SUM_axis0(a) * b) * 3
++```
++
++The output-dependent `b` and compile-time `3` sat above the REDUCE, so the
++ordinary CMAC epilogue classifier correctly refused to misidentify them as
++one scalar BS epilogue and returned
++`RKPLAN_REJECT:unsupported_op:fused_epilogue`.
++
++A strict factorized-sum matcher now peels only a multiplication tree with
++exactly one direct fp32 ADD reduction and one to three direct fp32
++INDEX/CONST factors independent of every reduction axis. It preserves the
++tree's factor order. The reduction runs through the compensated fp32 CMAC
++sum path, followed by the existing compensated fp32 TwoProduct DPU path for
++each factor. The host only forms high/residual ABI views and recombines the
++representation; all sum and multiply arithmetic runs on the NPU.
++
++Useful debug sequence:
++
++1. inspect `ROCKCHIP_DEBUG_SINK=1` before changing CMAC epilogue rules;
++2. distinguish a true scalar `SUM(x)*c` epilogue from an output-dependent
++   `SUM(x)*INDEX(y)` factor;
++3. verify eliminated zero-stride axes appear as a positive integer constant;
++4. retain factor order instead of algebraically flattening fp32 products;
++5. test nontrivial negative/fractional factors, not only the official all-one
++   tensors.
++
++Validation with `. .venv/bin/activate` and
++`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
++
++- unchanged `TestOps.test_mulacc_with_zero_strides`:
++  **1 passed in 15.91s**;
++- permanent negative/fractional zero-stride mulacc hardware case:
++  **1 passed in 12.16s**;
++- hardware-free planner/runtime contract: **104/104 in 6.61s**;
++- Python compilation and `git diff --check`: passing;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++No LUT coefficients or two-level LUT schedule changed. Continue with
++`TestOps.test_matmul_simple`.
++
+ ## 2026-07-30 — normal-fp32 direct einsum sum milestone
+ 
+ The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index 5cfc57cb7..12a065643 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -758,6 +758,14 @@ class TestCMAC(unittest.TestCase):
+     got = (a @ b).realize().numpy()
+     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
+ 
++  def test_cmac_fp32_zero_stride_mulacc(self):
++    a_np = np.arange(1,9, dtype=np.float32).reshape(2,4,1)
++    b_np = np.array([1.25,-2.5,0.75,3.0], dtype=np.float32).reshape(1,4,1)
++    expected = (np.broadcast_to(a_np, (2,4,3))*np.broadcast_to(b_np, (2,4,3))).sum(axis=(0,2), dtype=np.float32)
++    a, b = Tensor(a_np, device="ROCKCHIP"), Tensor(b_np, device="ROCKCHIP")
++    got = (a.expand(2,4,3)*b.expand(2,4,3)).sum((0,2)).realize().numpy()
++    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
++
+   def test_cmac_long_fp32_batched_dot(self):
+     rng = np.random.default_rng(2)
+     a_np = rng.standard_normal((3,13824)).astype(np.float32)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 227349c37..95eb25792 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -344,6 +344,15 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 8)
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_fp32_factorized_zero_stride_sum_stays_native(self):
++    a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
++    b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
++    program = build_native_program(_get_sink((a*b).sum((0,2))))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
++
+   def test_large_fp32_contraction_uses_tiled_raw_cmac_boundary(self):
+     a = Tensor.empty(3,5,8,10, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(11,7,5,13,8, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index dbf3e4935..01755d14e 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1813,3 +1813,18 @@ at 13. No LUT change or host operator arithmetic was introduced.
+ 
+ Continue with `TestOps.test_mulacc_with_zero_strides`; its first case passes
+ and its second currently rejects as `unsupported_op:fused_epilogue`.
++
++### Normal-fp32 zero-stride mulacc
++
++| Coverage | Result |
++|---|---:|
++| unchanged `TestOps.test_mulacc_with_zero_strides` | **1 passed in 15.91s** |
++| permanent negative/fractional broadcast reduction | **1 passed in 12.16s** |
++| hardware-free planner/runtime contract | **104/104 in 6.61s** |
++
++The optimizer's `(SUM_axis0(a)*b)*3` form now runs as a compensated fp32
++CMAC sum followed by compensated fp32 DPU multiplications in the original
++factor order. The matcher is restricted to direct factors independent of
++all reduction axes. No LUT change or host operator arithmetic was added.
++
++Continue with `TestOps.test_matmul_simple`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 0f3b4ae6d..bb4ed3092 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11223,6 +11223,65 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                                      info.outs[0], is_copy=True), relocs))
+   return tuple(tasks)
+ 
++def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Lower optimizer-factorized SUM(x)*output_factor*constant in its original fp32 order."""
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
++     reduce.arg[0] is not Ops.ADD or _unwrap(reduce.src[0]).op is not Ops.INDEX: return None
++
++  def contains_reduce(u:UOp) -> bool: return any(node is reduce for node in u.toposort())
++  def peel_factors(u:UOp) -> list[UOp]|None:
++    u = _unwrap(u)
++    if u is reduce: return []
++    if u.op is not Ops.MUL or len(u.src) != 2: return None
++    lhs, rhs = (_unwrap(x) for x in u.src)
++    lhs_has, rhs_has = contains_reduce(lhs), contains_reduce(rhs)
++    if lhs_has == rhs_has: return None
++    nested, factor = (lhs, rhs) if lhs_has else (rhs, lhs)
++    factors = peel_factors(nested)
++    return None if factors is None else [*factors, factor]
++
++  factors = peel_factors(store.src[1])
++  if factors is None or not 1 <= len(factors) <= 3: return None
++  reductions = list(reduce.src[1:])
++  if any(factor.dtype is not dtypes.float or factor.op not in (Ops.INDEX, Ops.CONST) or
++         (factor.op is Ops.INDEX and factor.src[0].op is not Ops.PARAM) or
++         any(axis in factor.toposort() for axis in reductions) for factor in factors): return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
++
++  info, output_total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  tasks:list[RKSubTask] = []
++  next_slot = max(info.globals, default=-1)+1
++  device = store.src[0].src[0].device
++
++  def index_for(slot:int) -> UOp:
++    param = UOp.param(slot, dtypes.float, (output_total,), device=device)
++    return store.src[0].replace(src=(param, *store.src[0].src[1:]))
++  def stage_sink(out_slot:int, value:UOp) -> UOp:
++    return UOp.sink(UOp(Ops.END, src=(store.replace(src=(index_for(out_slot), value)), *loops)))
++  def reserve_after(stage_tasks:tuple[RKSubTask, ...]) -> int:
++    used = [r.globals_slot for task in stage_tasks for r in task.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++    return max((next_slot, *used), default=next_slot-1)+1
++
++  sum_slot = next_slot
++  sum_tasks = _try_fp32_sum_subtasks(stage_sink(sum_slot, reduce))
++  if sum_tasks is None: return None
++  tasks.extend(sum_tasks)
++  next_slot = reserve_after(sum_tasks)
++  accumulator = sum_slot
++  for index, factor in enumerate(factors):
++    final = index == len(factors)-1
++    out_slot = info.outs[0] if final else next_slot
++    product = UOp(Ops.MUL, dtypes.float, (index_for(accumulator), factor))
++    product_tasks = _try_fp32_mul_subtasks(stage_sink(out_slot, product))
++    if product_tasks is None: return None
++    tasks.extend(product_tasks)
++    if not final:
++      next_slot = reserve_after(product_tasks)
++      accumulator = out_slot
++  return tuple(tasks)
++
+ def _try_long_fp32_batched_dot_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Reduce contiguous long fp32 row dots through DPU products and two CMAC sum levels."""
+   store, reduce = _store_node(sink), _reduce_node(sink)
+@@ -12730,6 +12789,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, fp32_add_tasks)
+   if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_mul_tasks)
++  if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_factorized_sum_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
+   if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
+-- 
+2.34.1
+
