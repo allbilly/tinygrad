@@ -1,0 +1,42 @@
+From 2ea86b2d00b944d355925db1e612f41985ae4ba0 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:11:57 +0800
+Subject: [PATCH] docs: record normal fp32 hardtanh validation
+
+---
+ progress.md        | 8 ++++++++
+ test_ops_status.md | 5 +++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index d82dbf256..90a9149ab 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9507,3 +9507,11 @@ half storage.
+ 
+ No LUT coefficient changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_hardtanh`.
++
++## 2026-07-30 — normal-fp32 hardtanh validation
++
++The unchanged eight-case `TestOps.test_hardtanh` group passes in **7.07s**,
++covering clamp limits 10/15/20/25 for both `(45,65)` tensors and scalars.
++No code, host boundary, or LUT change was needed.
++
++Next forward group: `TestOps.test_asinh`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 99e226422..015219d3e 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2118,3 +2118,8 @@ Next forward group: `TestOps.test_tanh`.
+ Exact fp32 tanh now uses one serialized task instead of entering the
+ half-buffer two-LUT path, which had corrupted every lane. The tuned fp16 LUT
+ implementation is unchanged. Next forward group: `TestOps.test_hardtanh`.
++
++### Normal-fp32 hardtanh
++
++All eight tensor/scalar clamp cases pass in **7.07s** with no change. Next
++forward group: `TestOps.test_asinh`.
+-- 
+2.34.1
+
