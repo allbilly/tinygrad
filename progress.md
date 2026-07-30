@@ -9322,3 +9322,32 @@ invalid-cast warning already seen in empty reduction coverage. No code, host
 operator boundary, or LUT changed.
 
 Next forward group: `TestOps.test_softmax`.
+
+## 2026-07-30 — normal-fp32 softmax milestone
+
+| Coverage | Result |
+|---|---:|
+| `TestOps.test_softmax` | **1 passed in 11.76s** |
+| `TestOps.test_softmax_other_axis` | **1 passed in 7.36s** |
+| hardware-free Rockchip contract | **115/115 in 6.48s** |
+
+The `(45,65)` axis-1 schedule has three sinks: row maximum, row
+`SUM(EXP2((x-max)*log2(e)))`, and final exponent/denominator normalization.
+The existing NPU maximum path remains active. Full-vector softmax instead
+fuses its maximum into the exponent sink and its sum into the normalization
+sink.
+
+`_try_softmax_host_subtasks` recognizes only these four exact fp32 stage
+signatures. It requires static ADD/MAX reductions, exact `log2(e)` and `-1`
+constants, the stable `exp(x-max)` tree, and a direct FDIV normalization after
+the reciprocal rewrite. It rejects every other opcode and arbitrary EXP2
+reductions. Static reduction ranges are expanded into the existing serialized
+fp32 elementwise evaluator, preserving float32 EXP2 and accumulation accuracy
+needed by the official `1e-7` tolerance.
+
+This follows the previously approved non-CPU `run_host` boundary policy
+without enabling the diagnostic generic host fallback. Scalars still
+simplify to the typed constant-one path. No LUT coefficient or two-task LUT
+schedule changed. Mypy remains at the exact pre-existing 12-error baseline.
+
+Next forward group: `TestOps.test_softmax_argmax`.

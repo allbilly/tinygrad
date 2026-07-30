@@ -9111,6 +9111,76 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTa
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float or store.src[1].dtype is not dtypes.float: return None
+  value = _unwrap(store.src[1])
+  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+  add_reductions = [u for u in reductions if u.arg[0] is Ops.ADD]
+  max_reductions = [u for u in reductions if u.arg[0] is Ops.MAX]
+  exponentials = [u for u in value.toposort() if u.op is Ops.EXP2]
+  if len(add_reductions)+len(max_reductions) != len(reductions) or \
+     any(u.dtype is not dtypes.float or not u.src[1:] or any(r.src[0].op is not Ops.CONST for r in u.src[1:]) for u in reductions): return None
+
+  # The reciprocal rewrite makes the two normalization stages direct FDIVs.
+  signature = (len(add_reductions), len(max_reductions), len(exponentials), value.op)
+  if signature not in ((1, 0, 1, Ops.REDUCE), (0, 1, 1, Ops.EXP2),
+                       (0, 0, 1, Ops.FDIV), (1, 0, 0, Ops.FDIV)): return None
+  if value.op is Ops.REDUCE and (value is not add_reductions[0] or _unwrap(value.src[0]) is not exponentials[0]): return None
+  if value.op is Ops.EXP2 and value is not exponentials[0]: return None
+  if value.op is Ops.FDIV:
+    numerator, denominator = (_unwrap(x) for x in value.src)
+    if exponentials and numerator is not exponentials[0]: return None
+    if not exponentials and numerator.op is not Ops.INDEX: return None
+    if add_reductions and denominator is not add_reductions[0]: return None
+    if not add_reductions and denominator.op is not Ops.INDEX: return None
+
+  # EXP2 must be the stable exp(x-max) lowering, including its exact log2(e)
+  # and negative-maximum factors. This excludes arbitrary EXP2 reductions.
+  for exponential in exponentials:
+    scaled = _unwrap(exponential.src[0])
+    if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
+    log2e = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST), None)
+    delta = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.ADD), None)
+    if log2e is None or log2e.dtype is not dtypes.float or \
+       not math.isclose(float(log2e.arg), math.log2(math.e), rel_tol=1e-12) or delta is None or len(delta.src) != 2: return None
+    positive = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.INDEX), None)
+    negative = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.MUL), None)
+    if positive is None or positive.src[0].op is not Ops.PARAM or negative is None: return None
+    minus_one = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
+    maximum = next((_unwrap(x) for x in negative.src if _unwrap(x).op in (Ops.INDEX, Ops.REDUCE)), None)
+    if minus_one is None or minus_one.dtype is not dtypes.float or float(minus_one.arg) != -1.0 or maximum is None: return None
+    if maximum.op is Ops.INDEX and maximum.src[0].op is not Ops.PARAM: return None
+    if maximum.op is Ops.REDUCE and (maximum not in max_reductions or maximum.arg[0] is not Ops.MAX): return None
+
+  allowed = {Ops.SINK, Ops.END, Ops.STORE, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.RANGE,
+             Ops.REDUCE, Ops.EXP2, Ops.MUL, Ops.ADD, Ops.FDIV}
+  if any(u.op not in allowed for u in sink.toposort()): return None
+
+  def expand(u:UOp) -> UOp:
+    if u.op is Ops.REDUCE:
+      ranges = u.src[1:]
+      extents = [int(r.src[0].arg) for r in ranges]
+      terms:list[UOp] = []
+      for linear in range(prod(extents)):
+        rem, fixed = linear, {}
+        for axis in range(len(ranges)-1, -1, -1):
+          rem, coordinate = divmod(rem, extents[axis])
+          fixed[ranges[axis]] = UOp.const(ranges[axis].dtype, coordinate)
+        terms.append(expand(u.src[0].substitute(fixed)))
+      if not terms: raise ValueError("empty softmax reduction")
+      result = terms[0]
+      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
+      return result
+    new_src = tuple(expand(x) for x in u.src)
+    return u if new_src == u.src else u.replace(src=new_src)
+
+  try: expanded_value = expand(store.src[1])
+  except (TypeError, ValueError, OverflowError): return None
+  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
+  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+
 def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Unroll the static integer reductions used to choose max-pool indices."""
   store = _store_node(sink)
@@ -13227,6 +13297,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)
   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
+  if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

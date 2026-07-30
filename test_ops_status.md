@@ -2018,3 +2018,17 @@ group: `TestOps.test_std_mean_loaded_nan`.
 `TestOps.test_std_mean_loaded_nan`: **pass in 3.23s**. The graph simplifies to
 the existing typed NaN path, so no code or LUT change was required. Next
 forward group: `TestOps.test_softmax`.
+
+### Normal-fp32 softmax
+
+| Group | Status |
+|---|---:|
+| `test_softmax` | **pass in 11.76s** |
+| `test_softmax_other_axis` | **pass in 7.36s** |
+| hardware-free Rockchip contract | **115/115** |
+
+The row-max stage stays on the NPU. Four exact EXP/reduction/normalization
+stage shapes use the existing serialized fp32 host evaluator after strict
+softmax fingerprinting and static reduction expansion. Scalar softmax remains
+the typed constant-one path. No generic host fallback or LUT change was
+introduced. Next forward group: `TestOps.test_softmax_argmax`.
