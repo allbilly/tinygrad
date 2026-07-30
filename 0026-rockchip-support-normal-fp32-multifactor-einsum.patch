@@ -1,0 +1,174 @@
+From a15c0f7428378d95887d0c21ebfe6a24a76de194 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 14:34:20 +0800
+Subject: [PATCH] rockchip: support normal fp32 multifactor einsum
+
+---
+ progress.md                          | 29 ++++++++++++++++++++++++++++
+ test/rockchip/test_hw.py             | 10 ++++++++++
+ test/rockchip/test_pr1.py            | 10 ++++++++++
+ test_ops_status.md                   | 15 ++++++++++++++
+ tinygrad/runtime/support/rockchip.py | 28 +++++++++++++++++++++++++--
+ 5 files changed, 90 insertions(+), 2 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index cb92ad3a2..9748301fb 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7554,6 +7554,35 @@ Validation with `. .venv/bin/activate`:
+   pass before the separately tracked bilinear rejection;
+ - hardware-free planner/runtime contract: **100/100 in 5.71 seconds**.
+ 
++## 2026-07-30 — normal-fp32 multifactor einsum milestone
++
++The final unchanged `TestOps.test_einsum` case,
++`ik,jkl,il->ij`, now preserves its two-stage contraction order for normal
++fp32. The existing fp16 matcher already contracts the associated first pair
++over `k`, materializes the `ijl` intermediate, then contracts it with the
++third input over `l`.
++
++For fp32, both stages now invoke the compensated two-input CMAC lowering:
++each input is represented by high/residual limbs, CMAC performs the product
++reductions, DPU accumulates cross terms, and the intermediate remains fp32
++across its ABI boundary. Scratch slots are safely reused only after the first
++stage finishes. No host operator arithmetic or new register sequence was
++introduced.
++
++The isolated deterministic probe has maximum absolute error
++`7.152557373046875e-7`. The complete unchanged normal-fp32
++`TestOps.test_einsum` is now **1 passed in 67.27 seconds**, including all
++three large 30,030-output contraction variants and the final multifactor
++case.
++
++No LUT change is involved. Continue with the separate einsum ellipsis and
++trace groups.
++
++Permanent validation:
++
++- RK3588 normal-fp32 multifactor case: **1 passed in 3.10 seconds**;
++- hardware-free planner/runtime contract: **101/101 in 5.70 seconds**.
++
+ ## 2026-07-30 — normal-fp32 stable argsort
+ 
+ The unchanged forward-only `TestOps.test_argsort` now passes its
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index ac101ce61..77472dba3 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -872,6 +872,16 @@ class TestCMAC(unittest.TestCase):
+     expected = np.einsum("ijl,il->ij", intermediate.astype(np.float32), c_np.astype(np.float32)).astype(np.float16)
+     np.testing.assert_array_equal(actual, expected)
+ 
++  def test_cmac_fp32_multifactor_einsum(self):
++    rng = np.random.default_rng(0)
++    a_np = rng.standard_normal((2,3)).astype(np.float32)
++    b_np = rng.standard_normal((5,3,7)).astype(np.float32)
++    c_np = rng.standard_normal((2,7)).astype(np.float32)
++    expected = np.einsum("ik,jkl,il->ij", a_np, b_np, c_np, dtype=np.float32)
++    tensors = (Tensor(x, device="ROCKCHIP") for x in (a_np, b_np, c_np))
++    actual = Tensor.einsum("ik,jkl,il->ij", *tensors).realize().numpy()
++    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
++
+   def test_cmac_gemv_vector_a(self):
+     # GEMV: (K,) @ (K,N) → (N,) — vector is A, M=1
+     a_np = np.array([1,2,3,4], dtype=np.float16)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 6f5edadd4..36958ff84 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -662,6 +662,16 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(len(subtasks), 2)
+     self.assertTrue(all(st.task.kind == "cmac" for st in subtasks))
+ 
++  def test_fp32_multifactor_einsum_produces_compensated_cmac_stages(self):
++    a = Tensor.empty(2,3,dtype=dtypes.float,device="ROCKCHIP")
++    b = Tensor.empty(5,3,7,dtype=dtypes.float,device="ROCKCHIP")
++    c = Tensor.empty(2,7,dtype=dtypes.float,device="ROCKCHIP")
++    prg = build_native_program(_get_sink(Tensor.einsum("ik,jkl,il->ij", a, b, c)))
++    subtasks = prg.src[1].src[0].arg
++    self.assertEqual(sum(st.task.kind == "cmac" for st in subtasks), 6)
++    self.assertEqual(sum(st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT for st in subtasks if st.task.is_copy), 2)
++    self.assertTrue(subtasks[-1].task.fp32_output)
++
+   def test_avg_pool_variable_divisor_serializes_counts(self):
+     x = Tensor.rand(1,1,6,6,dtype=dtypes.half).realize()
+     prg = build_native_program(_get_sink(x.avg_pool2d(kernel_size=(3,3), padding=1, count_include_pad=False)))
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 6009292dd..373ee333e 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1752,3 +1752,18 @@ explicitly excluded from this forward path.
+ 
+ Permanent RK3588 coverage passes in **17.35 seconds** and the hardware-free
+ planner/runtime contract is **100/100**.
++
++### Normal-fp32 multifactor einsum
++
++| Coverage | Result |
++|---|---:|
++| deterministic `ik,jkl,il->ij` | max abs `7.153e-7` |
++| unchanged `TestOps.test_einsum` | **1 passed in 67.27s** |
++
++The established fp16 contraction order is retained, but both CMAC stages
++use compensated fp32 input/output ABI boundaries. This resolves the final
++case in the base einsum group without host operator arithmetic. Continue
++with `test_einsum_ellipsis` and `test_einsum_trace`.
++
++Permanent RK3588 coverage passes in **3.10 seconds**; the hardware-free
++planner/runtime contract is **101/101**.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index ebfa53a9a..641f50105 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10623,7 +10623,7 @@ def _try_cat_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   return tuple(tasks)
+ 
+ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Split a three-factor einsum into PyTorch-ordered fp16 CMAC contractions."""
++  """Split a three-factor einsum into PyTorch-ordered CMAC contractions."""
+   reduce = _reduce_node(sink)
+   if reduce is None or reduce.arg[0] is not Ops.ADD: return None
+   body = _reduce_body(reduce)
+@@ -10631,7 +10631,9 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   first, last = _unwrap(body.src[0]), _unwrap(body.src[1])
+   if first.op is not Ops.MUL or len(first.src) != 2 or _unwrap(last).op is not Ops.INDEX: return None
+   factors = tuple(_unwrap(x) for x in first.src)
+-  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half for x in (*factors, last)): return None
++  factor_dtype = factors[0].dtype
++  if factor_dtype not in (dtypes.half, dtypes.float) or \
++     any(x.op is not Ops.INDEX or x.dtype is not factor_dtype for x in (*factors, last)): return None
+   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+   reductions = list(reduce.src[1:])
+   if not loops or not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+@@ -10653,6 +10655,28 @@ def _try_cmac_multifactor_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   intermediate_slot = max(info.globals, default=-1) + 1
+   tasks:list[RKSubTask] = []
+ 
++  if factor_dtype is dtypes.float:
++    # Keep the associated first contraction in fp32, then feed its exact ABI
++    # result to the compensated fp32 CMAC wrapper for the remaining dot.
++    carry_map = dict(zip(remaining, carry_loops))
++    stage_product = first.substitute(carry_map)
++    stage_acc = UOp(Ops.REDUCE, dtypes.float, (stage_product, *contracted), arg=reduce.arg)
++    intermediate_param = UOp.param(intermediate_slot, dtypes.float, (stage_total,), device=factors[0].src[0].device)
++    stage_out = UOp(Ops.INDEX, dtypes.float, (intermediate_param, flat_index(stage_axes, stage_extents)))
++    stage_sink = UOp.sink(UOp(Ops.END, src=(UOp(Ops.STORE, src=(stage_out, stage_acc)), *stage_axes)))
++    if (stage_tasks := _try_small_fp32_cmac_subtasks(stage_sink)) is None: return None
++    tasks.extend(stage_tasks)
++
++    final_axes = [*loops, *remaining]
++    final_extents = [int(u.src[0].arg) for u in final_axes]
++    intermediate_index = UOp(Ops.INDEX, dtypes.float, (intermediate_param, flat_index(final_axes, final_extents)))
++    final_product = UOp(Ops.MUL, dtypes.float, (intermediate_index, last))
++    final_acc = UOp(Ops.REDUCE, dtypes.float, (final_product, *remaining), arg=reduce.arg)
++    final_sink = sink.substitute({reduce:final_acc})
++    if (final_tasks := _try_small_fp32_cmac_subtasks(final_sink)) is None: return None
++    tasks.extend(final_tasks)
++    return tuple(tasks)
++
+   # PyTorch contracts the associated first pair over their common reduction
+   # axes, casts that intermediate to fp16, then performs the remaining dot.
+   carry_map = dict(zip(remaining, carry_loops))
+-- 
+2.34.1
+
