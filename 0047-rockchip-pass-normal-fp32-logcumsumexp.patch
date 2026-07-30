@@ -1,0 +1,152 @@
+From 3e9a804d57b0139959a647f2f63c4775cadebfa7 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:03:29 +0800
+Subject: [PATCH] rockchip: pass normal fp32 logcumsumexp
+
+---
+ progress.md                          | 21 ++++++++++++
+ test/rockchip/test_pr1.py            | 11 +++++++
+ test_ops_status.md                   | 11 +++++++
+ tinygrad/runtime/support/rockchip.py | 49 ++++++++++++++++++++++++++++
+ 4 files changed, 92 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index f7e4fb128..44d3322f2 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9440,3 +9440,24 @@ scheduled fp32 buffer, and all prior exp/max constants and opcode gates.
+ 
+ No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_logcumsumexp`.
++
++## 2026-07-30 — normal-fp32 logcumsumexp milestone
++
++The unchanged nine-case `TestOps.test_logcumsumexp` group passes in
++**79.41s**, covering axes 0/1/2/3, ranks 0 through 4, vectors, and scalars.
++The hardware-free Rockchip contract is **120/120 in 7.03s**.
++
++Tinygrad schedules non-scalar logcumsumexp as two masked prefix reductions.
++The first is a prefix MAX with three WHEREs, one CMPLT, and one CMPNE. The
++second is the matching prefix ADD over EXP2 followed by LOG2/ln(2), with one
++WHERE and one CMPLT. `_try_logcumsumexp_host_subtasks` requires exactly these
++two signatures, static ranges, direct fp32 inputs, and only their measured
++opcode families.
++
++Each bounded prefix reduction is statically expanded inside the existing
++typed fp32 evaluator. This is heavier than ordinary logsumexp because every
++output owns a prefix, but remains bounded by the official axis length and
++avoids a new runtime ABI. Scalar cases retain their existing simplified path.
++No LUT changed; mypy remains at the exact 12-error baseline.
++
++Next forward group: `TestOps.test_logcumsumexp_numerical`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 443e66cd2..69de03ff3 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -424,6 +424,17 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_logcumsumexp_stages_use_strict_serialized_reductions(self):
++    expression = Tensor.empty(6,6,6, dtype=dtypes.float, device="ROCKCHIP").logcumsumexp(2)
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    programs = [build_native_program(sink) for sink in sinks]
++    self.assertEqual(len(programs), 2)
++    for program in programs:
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 48bcb452a..4848868c8 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2079,3 +2079,14 @@ Exact rowwise and full-vector `max + log(sum(exp(x-max)))` signatures reuse
+ the strict serialized fp32 evaluator; the full-vector form safely expands
+ both fused reductions. No LUT or runtime ABI changed. Next forward group:
+ `TestOps.test_logcumsumexp`.
++
++### Normal-fp32 logcumsumexp
++
++| Group | Status |
++|---|---:|
++| `test_logcumsumexp` (nine cases) | **pass in 79.41s** |
++| hardware-free Rockchip contract | **120/120** |
++
++Exact masked prefix-MAX and prefix-exp-sum signatures use bounded static
++expansion in the serialized fp32 evaluator. No LUT or runtime ABI changed.
++Next forward group: `TestOps.test_logcumsumexp_numerical`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 0d0ee14ea..5b224280d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9371,6 +9371,53 @@ def _try_normalize_norm_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
+   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+ 
++def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float: return None
++  value = _unwrap(store.src[1])
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  if len(reductions) != 1 or reductions[0].dtype is not dtypes.float or \
++     reductions[0].arg[0] not in (Ops.ADD, Ops.MAX) or not reductions[0].src[1:] or \
++     any(axis.src[0].op is not Ops.CONST for axis in reductions[0].src[1:]): return None
++  nodes = value.toposort()
++  counts = (sum(u.op is Ops.EXP2 for u in nodes), sum(u.op is Ops.LOG2 for u in nodes),
++            sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes),
++            sum(u.op is Ops.CMPNE for u in nodes), value.op, reductions[0].arg[0])
++  if counts not in ((0,0,3,1,1,Ops.REDUCE,Ops.MAX), (1,1,1,1,0,Ops.ADD,Ops.ADD)): return None
++  indexes = list(dict.fromkeys(u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM))
++  if not indexes: return None
++  if counts[0]:
++    constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float]
++    if not any(math.isclose(constant, math.log2(math.e), rel_tol=1e-12) for constant in constants) or \
++       not any(math.isclose(constant, math.log(2.0), rel_tol=1e-12) for constant in constants): return None
++  allowed = {Ops.REDUCE, Ops.EXP2, Ops.LOG2, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CAST,
++             Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes): return None
++
++  def expand(u:UOp) -> UOp:
++    if u.op is Ops.REDUCE:
++      ranges = u.src[1:]
++      extents = [int(r.src[0].arg) for r in ranges]
++      terms:list[UOp] = []
++      for linear in range(prod(extents)):
++        rem, fixed = linear, {}
++        for axis in range(len(ranges)-1, -1, -1):
++          rem, coordinate = divmod(rem, extents[axis])
++          fixed[ranges[axis]] = UOp.const(ranges[axis].dtype, coordinate)
++        terms.append(expand(u.src[0].substitute(fixed)))
++      if not terms: raise ValueError("empty logcumsumexp reduction")
++      result = terms[0]
++      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
++      return result
++    new_src = tuple(expand(x) for x in u.src)
++    return u if new_src == u.src else u.replace(src=new_src)
++
++  try: expanded_value = expand(store.src[1])
++  except (TypeError, ValueError, OverflowError): return None
++  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
++  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
++
+ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Unroll the static integer reductions used to choose max-pool indices."""
+   store = _store_node(sink)
+@@ -13489,6 +13536,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
+   if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
+   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
++  if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, logcumsumexp_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, exp_correction_tasks)
+-- 
+2.34.1
+
