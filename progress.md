@@ -7510,6 +7510,50 @@ Validation with `. .venv/bin/activate`:
 - Python compilation and `git diff --check`: **passing**;
 - mypy: exact pre-existing **13-error** Rockchip baseline.
 
+## 2026-07-30 — tiled normal-fp32 einsum contraction milestone
+
+The three unchanged large two-input contraction cases in
+`TestOps.test_einsum` now pass, including:
+
+```text
+(3,5,8,10) × (11,7,5,13,8)
+pqrs,tuqvr->pstuv
+M=30, N=1001, K=40, output=30030
+```
+
+The earlier `<=256` fp32 CMAC wrapper limit was not a hardware limit.
+`allbilly/rk3588/conv_grok` made the missing distinction clear: whole tensor
+size is not CBUF residency. Its planner derives local tiles from row bytes,
+weight banks, and remaining feature banks. The existing materialized CMAC
+path already follows the same pattern: N tiles are capped at 32, M is
+derived from available CBUF banks, and each native tile writes its output
+window. Removing the whole-tensor gate activates that proven machinery.
+
+Accuracy needed a second correction. Converting the primary CMAC result to
+fp16 before adding residual cross terms produced a maximum error around
+`0.00395`. The primary accumulator now remains raw fp32 across the CMAC ABI,
+then is represented as fp16 high/residual limbs. DPU adds the cross terms to
+the residual limb, and the final host step only combines the ABI
+representation. Operator arithmetic remains on CMAC/DPU. K is limited to one
+native CMAC tile (`K<=4096`) so the old host partial-sum WIP cannot enter this
+path.
+
+The exact deterministic official-shape probe completed in about 18 seconds
+with maximum absolute error `2.86102294921875e-6` and zero `1e-5` tolerance
+misses. The full unchanged einsum test passes all scalar, movement, sum,
+two-factor, batched, and three large contraction cases; its next independent
+failure is the final bilinear three-factor expression
+`ik,jkl,il->ij`, rejected as `unsupported_op:Ops.MUL`.
+
+No LUT change is involved.
+
+Validation with `. .venv/bin/activate`:
+
+- permanent official-shape RK3588 contraction: **1 passed in 17.35 seconds**;
+- unchanged `TestOps.test_einsum`: all cases through the three contractions
+  pass before the separately tracked bilinear rejection;
+- hardware-free planner/runtime contract: **100/100 in 5.71 seconds**.
+
 ## 2026-07-30 — normal-fp32 stable argsort
 
 The unchanged forward-only `TestOps.test_argsort` now passes its

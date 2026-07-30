@@ -1735,3 +1735,20 @@ fp32 wrapper around it.
 Permanent RK3588 numerical coverage passes, and the hardware-free
 planner/runtime contract is **99/99**. Mypy remains at the exact pre-existing
 13-error Rockchip baseline.
+
+### Tiled normal-fp32 einsum contractions
+
+| Case group | Status |
+|---|---:|
+| three large two-input contraction variants | pass |
+| official `M=30, N=1001, K=40` deterministic probe | max abs `2.861e-6`, zero tolerance misses |
+| `einsum('ik,jkl,il->ij')` | next failure: `unsupported_op:Ops.MUL` |
+
+The obsolete 256-lane gate is replaced by the DPU atom-layout boundary and
+the existing CBUF-derived materialized CMAC tiles. The primary CMAC result
+stays raw fp32 until it is split into the established high/residual ABI;
+cross-term arithmetic remains on DPU. K-tiled host accumulation is
+explicitly excluded from this forward path.
+
+Permanent RK3588 coverage passes in **17.35 seconds** and the hardware-free
+planner/runtime contract is **100/100**.

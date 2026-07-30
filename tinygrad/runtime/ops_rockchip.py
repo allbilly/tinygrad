@@ -353,10 +353,11 @@ def _materialize_cmac_inputs(a_src, b_src, a_dst, b_dst, M, N, K, align_in, alig
       b_out[dst_index] = _eval_static_value(b_code, coords, b_in)
 
 def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None, m_start=0, rows=None,
-                                  n_start=0, cols=None, packed_inputs=None):
+                                  n_start=0, cols=None, packed_inputs=None, fp32_output=False):
   _, _, _, bias_slot, bias_axis, relu, scale, scale_counts, loop_extents, _, m_axes, n_axes, _, _, fixed_reductions, \
     _, fixed_loops, out_code, _, _ = decoded
-  s, d = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32)), ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint16))
+  s = ctypes.cast(src, ctypes.POINTER(ctypes.c_uint32))
+  d = ctypes.cast(dst, ctypes.POINTER(ctypes.c_uint32 if fp32_output else ctypes.c_uint16))
   b = ctypes.cast(bias, ctypes.POINTER(ctypes.c_uint16)) if bias_slot >= 0 and bias is not None else None
   total = 1
   for extent in loop_extents: total *= extent
@@ -380,7 +381,8 @@ def _unpack_materialized_cmac_out(src, dst, M, N, align_out, decoded, bias=None,
       value = struct.unpack('<f', struct.pack('<f', value))[0]
       if relu: value = value if value > 0.0 else 0.0
       raw = struct.unpack('<I', struct.pack('<f', value))[0]
-    if fixed_reductions and packed_inputs is not None:
+    if fp32_output: converted = raw
+    elif fixed_reductions and packed_inputs is not None:
       a_addr, b_addr, K, align_in = packed_inputs
       converted = _fp32_to_fp16_group(raw, a_addr, b_addr, m-m_start, n-n_start, K, align_in)
     else: converted = _fp32_to_fp16(raw)
@@ -446,7 +448,8 @@ def _run_tiled_materialized_cmac(dev, name, cmds, task, relocs, bufs):
         bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
         _unpack_materialized_cmac_out(o_buf.va_addr, bufs[task.out_slot].va_addr, M, N, align_out,
                                       decoded, bias, m_start, rows, n_start, cols,
-                                      (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]) if tile_k >= K else None)
+                                      (a_buf.va_addr, b_buf.va_addr, K, task.layout[3]) if tile_k >= K else None,
+                                      task.fp32_output)
   finally:
     for b in temp: dev._gpu_free(b)
 
@@ -1131,7 +1134,8 @@ class RockchipProgram(Program['RockchipDevice']):
           decoded = _decode_materialized_cmac_layout(task.layout)
           bias = bufs[decoded[3]].va_addr if decoded[3] >= 0 else None
           _unpack_materialized_cmac_out(cmac_bufs[2].va_addr, bufs[task.out_slot].va_addr, M, N, align_out, decoded, bias,
-                                        packed_inputs=(cmac_bufs[0].va_addr, cmac_bufs[1].va_addr, task.layout[2], task.layout[3]))
+                                        packed_inputs=(cmac_bufs[0].va_addr, cmac_bufs[1].va_addr, task.layout[2], task.layout[3]),
+                                        fp32_output=task.fp32_output)
         else:
           bias_slot, bias_axis, relu = task.layout[5:] if len(task.layout) >= 8 else (-1, -1, 0)
           bias = bufs[bias_slot].va_addr if bias_slot >= 0 else None
@@ -1309,7 +1313,7 @@ class RockchipProgram(Program['RockchipDevice']):
       for st in subtasks:
         if st.task.out_slot < len(ext): continue
         elements = st.task.layout[0]*st.task.layout[1] if st.task.kind == "cmac" else st.task.layout[0]
-        itemsize = 4 if st.task.native_int32_output else 2
+        itemsize = 4 if st.task.native_int32_output or st.task.fp32_output else 2
         scratch_sizes[st.task.out_slot] = max(scratch_sizes.get(st.task.out_slot, 0), st.task.out_offset+elements*itemsize)
       try:
         while len(ext) <= max_slot:
@@ -1352,6 +1356,8 @@ class RockchipProgram(Program['RockchipDevice']):
               _run_host_half_int(st.task, st.relocs, tuple(ext))
             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
               _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+              _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
           flush_mixed_dpu()
@@ -1380,6 +1386,9 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
             _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+            continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+            _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU

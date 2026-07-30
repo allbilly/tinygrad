@@ -11200,7 +11200,7 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Run a small direct fp32 matrix product through typed half CMAC views."""
+  """Run a direct fp32 matrix product through typed half CMAC views and CBUF-derived tiles."""
   store, reduce = _store_node(sink), _reduce_node(sink)
   if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
      reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
@@ -11211,7 +11211,10 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   source_slots = tuple(x.src[0].buf_uop.arg.slot for x in sources)
   if any(slot >= 7 for slot in source_slots): return None
   output_total = prod(_shape_of_store(sink))
-  if output_total > 256 or any(int(x.src[0].src[0].arg) > 256 for x in sources): return None
+  # Flat DPU correction stages have a 13-bit atom-width field. Larger exact
+  # rows are supported only when they can be represented without a partial
+  # final atom; CMAC itself is independently tiled from CBUF capacity.
+  if output_total > 4096*8 and output_total % 8: return None
 
   info, device = ProgramInfo.from_sink(sink), store.src[0].src[0].device
   next_slot = max(info.globals, default=-1) + 1
@@ -11230,7 +11233,15 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                             low_relocs)))
     views.append((high_slot, low_slot))
 
-  def cmac(a_slot:int, b_slot:int) -> int|None:
+  def view(source_slot:int, layout_tag:int) -> int:
+    nonlocal next_slot
+    out_slot, next_slot = next_slot, next_slot+1
+    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+    relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
+    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (output_total, layout_tag), out_slot, is_copy=True), relocs))
+    return out_slot
+
+  def cmac(a_slot:int, b_slot:int, fp32_output=False) -> int|None:
     nonlocal next_slot
     out_slot, next_slot = next_slot, next_slot+1
     half_sources:list[UOp] = []
@@ -11245,19 +11256,26 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     stage_store = store.replace(src=(out_index, UOp(Ops.CAST, dtypes.half, (half_reduce,), arg=dtypes.half)))
     stage_plan = plan_rk(sink.substitute({store:stage_store}))
     if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+    # Runtime K-tile accumulation is retained as WIP reference, but uses host
+    # addition between NPU partials. Keep this forward path NPU-arithmetic-only.
+    if stage_plan.cmac_materialization and stage_plan.cmac_materialization[2] > 4096: return None
     cmds, task, relocs = emit_rk(stage_plan)
-    tasks.append(RKSubTask(cmds, task, relocs))
+    tasks.append(RKSubTask(cmds, replace(task, fp32_output=fp32_output), relocs))
     return out_slot
 
-  high = cmac(views[0][0], views[1][0])
+  high = cmac(views[0][0], views[1][0], fp32_output=True)
   cross0 = cmac(views[0][0], views[1][1])
   cross1 = cmac(views[0][1], views[1][0])
   if high is None or cross0 is None or cross1 is None: return None
-  cross_sum, correction = next_slot, next_slot+1
+  high_half, high_residual = view(high, _HOST_FP32_HALF_LAYOUT), view(high, _HOST_FP32_RESIDUAL_LAYOUT)
+  cross_sum, residual = next_slot, next_slot+1
   tasks.append(_emit_where_stage(output_total, cross_sum, (cross0, 0), (cross1, 0), Ops.ADD))
-  tasks.append(_emit_where_stage(output_total, correction, (cross_sum, 0),
-                                 (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1/256))[0]), Ops.MUL))
-  tasks.append(_emit_where_stage(output_total, info.outs[0], (high, 0), (correction, 0), Ops.ADD, fp32_output=True))
+  tasks.append(_emit_where_stage(output_total, residual, (high_residual, 0), (cross_sum, 0), Ops.ADD))
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high_half, 0, 0, 0xFFFFFFFF),
+            RKReloc(0, residual, 0, 0, 0xFFFFFFFF))
+  tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (output_total, _HOST_FP32_COMBINE_LAYOUT),
+                                     info.outs[0], is_copy=True, fp32_output=True), relocs))
   return tuple(tasks)
 
 def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
