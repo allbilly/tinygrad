@@ -7530,6 +7530,32 @@ Validation with `. .venv/bin/activate` and
 This milestone changes no LUTs. Issue #471 does not address boolean
 comparison, large-buffer tiling, or the GEM mmap boundary.
 
+## 2026-07-30 — enlarged fp32 boolean-tile follow-up
+
+The large fp32 predicate path now uses the same 262,144-lane multi-row DPU
+geometry proven by the tiled fp32 fill, instead of 32K tiles. Unchanged
+`test_all_large` improves from **76.85s to 26.40s** while still passing
+2^15, 2^16, and 2^20.
+
+A same-process `test_all_large -> test_and` probe still reproduces the
+historically documented CMAC-to-comparison driver-state timeout. The older
+`DEFAULT_FLOAT=HALF` path reproduces it too, so it is not introduced by fp32
+limbs. An extra post-program reset, a 1 ms reset delay, and POWER_OFF/ON were
+rejected: the first two did not help, and this kernel returns `EINVAL` for
+the power actions. The reset/sleep experiments remain commented in the
+runtime for reference.
+
+Validation:
+
+- isolated unchanged `test_all_large`: **1 passed in 26.40s**;
+- hardware-free planner/codec contract: **95/95 in 23.92s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** baseline.
+
+Functional census runs should isolate `test_all_large` until the downstream
+driver transition is solved, so its timeout does not hide later deterministic
+operator failures.
+
 ## 2026-07-30 — normal-fp32 ASINH/ACOSH two-LUT milestone
 
 The normal-default forward census no longer times out in

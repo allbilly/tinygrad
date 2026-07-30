@@ -1600,3 +1600,19 @@ RK3588's mappable GEM boundary. The fill is generated in reusable
 Predicate processing uses reusable 32K high/residual tiles and gathers only
 the NPU-produced masks for CMAC. Host work is representation conversion and
 address movement only.
+
+### Enlarged fp32 boolean tiles
+
+| Coverage | Result |
+|---|---:|
+| isolated unchanged `test_all_large` | **1 passed in 26.40s** |
+| previous 32K-tile runtime | **76.85s** |
+| hardware-free planner/codec contract | **95/95 in 23.92s** |
+| mypy | **pre-existing 13-error baseline** |
+
+Fp32 predicate tiles now contain 262,144 lanes, reducing the 2^20 case from
+32 high/residual tile iterations to four. The same-process
+`all_large -> comparison` timeout remains a known driver-state stress issue
+and also reproduces with `DEFAULT_FLOAT=HALF`. Extra reset/sleep experiments
+did not fix it and remain commented for reference. Isolate `test_all_large`
+when continuing the functional failure census.
