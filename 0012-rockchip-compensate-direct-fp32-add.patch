@@ -1,0 +1,256 @@
+From 59384e9a21ae9ecc8e974b0c6258038d33bbc638 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 10:05:56 +0800
+Subject: [PATCH] rockchip: compensate direct fp32 add
+
+---
+ progress.md                          | 48 +++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 12 ++++++-
+ test_ops_status.md                   | 21 +++++++++++
+ tinygrad/runtime/ops_rockchip.py     | 18 +++++++++-
+ tinygrad/runtime/support/rockchip.py | 54 ++++++++++++++++++++++++++++
+ 5 files changed, 151 insertions(+), 2 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index a2a8f4b27..23479e80a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7532,6 +7532,54 @@ workaround.  Its reported `25.59` and `409.50` follow exactly from
+ `fp16(0.1)=0.0999755859375`; the issue has no maintainer response, patch, or
+ evidence of extra accumulator drift.
+ 
++## 2026-07-30 — compensated direct fp32 ADD milestone
++
++The resumed normal-default census passed five methods through ACOSH and then
++stopped at plain `TestOps.test_add`: **292/3060** values missed tolerance,
++with maximum absolute error **0.00103188**.  The old single DPU task rounded
++both fp32 inputs to fp16, added them, and widened the fp16 result.  Relative
++error was especially visible when the two inputs nearly cancelled.
++
++The strict new matcher accepts only a root ADD of two direct contiguous fp32
++buffers with the same physical size and fp32 output.  Each input is decoded
++into the established ABI pair:
++
++```text
++hi = fp16(x)
++lo = fp16(256*(x-float32(hi)))
++```
++
++Nine DPU stages use error-free TwoSum structure on the high limbs, add the
++two low limbs, and keep the final error in the x256 domain:
++
++```text
++s  = fl(ahi+bhi)
++bb = fl(s-ahi)
++e  = fl(fl(ahi-fl(s-bb)) + fl(bhi-bb))
++lo = fl(fl(alo+blo) + fl(256*e))
++```
++
++The final host step only decodes the NPU-produced `(s,lo)` representation
++into fp32 ABI storage as `float32(s)+float32(lo)/256`.  It never reads the
++original operands and does not evaluate ADD on their behalf.  This is the
++output counterpart of the already permitted fp32 high/residual input
++conversion.
++
++Pure fp16-stage simulation of the official tensor reduced the old 292
++misses to zero, with maximum absolute error `7.1525574e-7`.  Hardware
++validation with `. .venv/bin/activate`:
++
++- unchanged normal-default `test_add` + `test_tiny_add`:
++  **2 passed in 3.42 seconds**;
++- full hardware-free planner/codec contract: **86/86 in 6.74 seconds**;
++- Python compilation and `git diff --check`: passing;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++Nested three-input ADD, broadcast ADD, and SUB remain separate matchers and
++are not claimed by this milestone.  Issue #471 again explains why retaining
++the fp32 residual is necessary, but it supplies neither TwoSum nor an output
++representation strategy.
++
+ ## 2026-07-30 — logarithmic long cumulative products
+ 
+ The unchanged forward-only `TestOps.test_simple_cumprod` now passes both
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 1dc7e1a28..102061da8 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -7,7 +7,7 @@ from tinygrad.codegen import early_simplify
+ from tinygrad.uop.ops import Ops, ProgramInfo, graph_rewrite
+ from tinygrad.codegen import pm_to_program
+ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
+-                                               build_native_program, RKPlan, RKSubTask)
++                                               build_native_program, RKPlan, RKSubTask, _HOST_FP32_COMBINE_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipRenderer
+ from tinygrad.helpers import Target
+ 
+@@ -299,6 +299,16 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 3)
+     self.assertTrue(subtasks[-1].task.fp32_output)
+ 
++  def test_fp32_add_uses_compensated_boundary(self):
++    a = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
++    b = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink(a+b))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 9)
++    self.assertEqual(sum(task.task.is_copy for task in subtasks), 5)
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
++
+   def test_fp32_acos_uses_specialized_lut_boundary(self):
+     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
+     self.assertIsNotNone(program)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 7cbb1b3c6..839b9e48d 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1481,3 +1481,24 @@ input limb, but it contains no accumulator fix or LUT tuning information.
+ 
+ The next normal-default `FORWARD_ONLY=1` census starts after the now-passing
+ ACOSH group.
++
++### Compensated direct fp32 ADD milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged `test_add` + `test_tiny_add` | **2 passed in 3.42s** |
++| first official tensor before compensation | **292/3060 misses** |
++| fp16-stage TwoSum model | **0 misses, max abs 7.15e-7** |
++| full hardware-free planner/codec contract | **86/86 in 6.74s** |
++| mypy | **pre-existing 13-error baseline** |
++
++Direct contiguous two-buffer fp32 ADD now uses high and x256-residual input
++views, nine NPU TwoSum/correction stages, and an fp32 ABI decode of the
++NPU-produced high/residual result.  Host code does not read or add the
++original operands.
++
++The matcher deliberately excludes nested ADD, broadcasting, scalar
++constants, and SUB.  Constant-folded `1+0.5` still passes through its
++existing fill path.  The next census should therefore treat `test_add3`,
++broadcast ADD, and SUB as independent extensions rather than assuming this
++milestone covers them.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 8af6ecb05..49a844778 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -23,7 +23,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_STATIC_INT_LAYOUT, _HOST_PLANE_GATHER_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+-  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT,
++  _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT,
+   _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+@@ -93,6 +93,18 @@ def _convert_fp16_to_fp32_buf(src, dst, n):
+   arr = np.frombuffer(ctypes.string_at(src, n * 2), dtype=np.float16).astype(np.float32)
+   ctypes.memmove(dst, arr.ctypes.data, n * 4)  # type: ignore[arg-type]
+ 
++def _run_host_fp32_combine(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Decode an NPU-produced high half and x256 residual half into fp32 ABI storage."""
++  import numpy as np
++  total, tag = task.layout
++  assert tag == _HOST_FP32_COMBINE_LAYOUT and len(relocs) == 3
++  output, high_buf, low_buf = (bufs[r.globals_slot] for r in relocs)
++  high = np.frombuffer(ctypes.string_at(high_buf.va_addr, total*2), dtype=np.float16).astype(np.float32)
++  low = np.frombuffer(ctypes.string_at(low_buf.va_addr, total*2), dtype=np.float16).astype(np.float32)
++  with np.errstate(invalid="ignore"):
++    result = np.where(np.isfinite(high), high+low/256.0, high).astype(np.float32)
++  ctypes.memmove(output.va_addr, result.ctypes.data, total*4)  # type: ignore[arg-type]
++
+ def _convert_bool_to_fp16_buf(src, dst, n):
+   import numpy as np
+   arr = np.frombuffer(ctypes.string_at(src, n), dtype=np.bool_).astype(np.float16)
+@@ -1369,6 +1381,10 @@ class RockchipProgram(Program['RockchipDevice']):
+               _run_host_static_select_int(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
+               _run_host_half_int(task, st.relocs, tuple(ext))
++            elif len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
++              _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
++            elif len(task.layout) > 1 and task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
++              _run_host_fp32_combine(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
+             elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 8cd3c48c5..34d8e613d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -199,6 +199,7 @@ _HOST_STATIC_SELECT_INT_LAYOUT = -1022  # interleave native int32 atoms by compi
+ _HOST_HALF_INT_LAYOUT = -1023  # typed fp16-to-int32 ABI boundary after NPU selection
+ _HOST_FP32_HALF_LAYOUT = -1024  # nearest-fp16 representation view of an fp32 ABI buffer
+ _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of an fp32 ABI buffer
++_HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -10760,6 +10761,57 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tasks.append(_emit_where_stage(output_total, info.outs[0], (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD, fp32_output=True))
+   return tuple(tasks)
+ 
++def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Add two direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
++  val = _unwrap(store.src[1])
++  if val.op is not Ops.ADD or val.dtype is not dtypes.float or len(val.src) != 2: return None
++  sources = tuple(_unwrap(x) for x in val.src)
++  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.float or x.src[0].op is not Ops.PARAM or
++         not _is_flat_contiguous(x.src[1]) for x in sources) or not _is_flat_contiguous(store.src[0].src[1]): return None
++  total = prod(_shape_of_store(sink))
++  if any(int(x.src[0].src[0].arg) != total for x in sources): return None
++
++  info = ProgramInfo.from_sink(sink)
++  next_slot = max(info.globals, default=-1)+1
++  tasks:list[RKSubTask] = []
++  def alloc() -> int:
++    nonlocal next_slot
++    ret, next_slot = next_slot, next_slot+1
++    return ret
++  def view(source_slot:int, tag:int) -> int:
++    out = alloc()
++    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
++    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag), out, is_copy=True), relocs))
++    return out
++  def stage(a:int, b:int, op:Ops) -> int:
++    out = alloc()
++    tasks.append(_emit_where_stage(total, out, (a, 0), (b, 0), op))
++    return out
++
++  limbs = tuple((view(x.src[0].arg.slot, _HOST_FP32_HALF_LAYOUT),
++                 view(x.src[0].arg.slot, _HOST_FP32_RESIDUAL_LAYOUT)) for x in sources)
++  high = stage(limbs[0][0], limbs[1][0], Ops.ADD)
++  rounded_b = stage(high, limbs[0][0], Ops.SUB)
++  high_minus_rounded_b = stage(high, rounded_b, Ops.SUB)
++  error_a = stage(limbs[0][0], high_minus_rounded_b, Ops.SUB)
++  error_b = stage(limbs[1][0], rounded_b, Ops.SUB)
++  high_error = stage(error_a, error_b, Ops.ADD)
++  input_low = stage(limbs[0][1], limbs[1][1], Ops.ADD)
++  scaled_high_error = alloc()
++  tasks.append(_emit_where_stage(total, scaled_high_error, (high_error, 0),
++                                 (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 256.0))[0]), Ops.MUL))
++  low = stage(input_low, scaled_high_error, Ops.ADD)
++
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high, 0, 0, 0xFFFFFFFF),
++            RKReloc(0, low, 0, 0, 0xFFFFFFFF))
++  tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_COMBINE_LAYOUT),
++                                     info.outs[0], is_copy=True), relocs))
++  return tuple(tasks)
++
+ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run a small direct fp32 matrix product through typed half CMAC views."""
+   store, reduce = _store_node(sink), _reduce_node(sink)
+@@ -12067,6 +12119,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, movement_sum_tasks)
+   if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, elementwise_sum_tasks)
++  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_add_tasks)
+   if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_cmac_tasks)
+   # Retain the half-input WIP above for reference. The active path is narrower:
+-- 
+2.34.1
+
