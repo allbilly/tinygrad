@@ -2123,3 +2123,9 @@ implementation is unchanged. Next forward group: `TestOps.test_hardtanh`.
 
 All eight tensor/scalar clamp cases pass in **7.07s** with no change. Next
 forward group: `TestOps.test_asinh`.
+
+### Normal-fp32 asinh/acosh
+
+Both ordinary/extreme groups pass together in **33.10s** with no change.
+Acosh negative-domain inputs retain the expected warning. Next forward group:
+`TestOps.test_atanh`.

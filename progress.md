@@ -9515,3 +9515,12 @@ covering clamp limits 10/15/20/25 for both `(45,65)` tensors and scalars.
 No code, host boundary, or LUT change was needed.
 
 Next forward group: `TestOps.test_asinh`.
+
+## 2026-07-30 — normal-fp32 asinh/acosh validation
+
+The unchanged `TestOps.test_asinh` and `TestOps.test_acosh` groups pass
+together in **33.10s**, covering ordinary and both ±300 extreme ranges.
+Acosh's negative-domain cases retain one non-failing invalid-cast warning.
+No code or LUT change was needed.
+
+Next forward group: `TestOps.test_atanh`.
