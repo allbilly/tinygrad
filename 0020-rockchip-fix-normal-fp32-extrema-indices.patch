@@ -1,0 +1,326 @@
+From f65e8a9c2e35a90d4f75e042dcc30d5452a8903b Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 12:22:12 +0800
+Subject: [PATCH] rockchip: fix normal fp32 extrema indices
+
+---
+ progress.md                          |  59 ++++++++++++++++
+ test/rockchip/test_hw.py             |   7 ++
+ test/rockchip/test_pr1.py            |  12 ++++
+ test_ops_status.md                   |  19 +++++
+ tinygrad/runtime/support/rockchip.py | 102 ++++++++++++++++++---------
+ 5 files changed, 166 insertions(+), 33 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 1cba7ecca..e843d0fab 100644
+--- a/progress.md
++++ b/progress.md
+@@ -8162,6 +8162,65 @@ Validation with `. .venv/bin/activate`:
+ No LUT coefficients or two-level LUT schedules changed in this milestone,
+ so `lut.md` needs no new tuning entry.
+ 
++## 2026-07-30 — normal-fp32 MAX/MIN and ArgMax/ArgMin
++
++The unchanged normal-default extrema group now passes. Two version-4 ABI
++limits and one split-kernel shape were missing from the older
++`DEFAULT_FLOAT=HALF` milestone:
++
++1. local fp32 MAX/MIN allocated one fp32 gather slot per reduction candidate.
++   Only the first low global slots retain `fp32_inputs` metadata in a
++   version-4 image; later candidates were interpreted as fp16 bytes and
++   produced corrupt extrema (including values near 270 for inputs near 3);
++2. general fp32 ArgMax/ArgMin had the same per-candidate gather-slot growth.
++   Global ArgMax therefore stopped updating after candidate two;
++3. axis fp32 ArgMax/ArgMin is scheduled as two kernels. The first materializes
++   `MAX(x)` or `MAX(-x)` and the second selects the matching coordinate. The
++   old recognizer required both reductions in one sink and rejected the
++   selected-index kernel.
++
++Both local extrema and general selected-index lowering now reuse one
++low-numbered fp32 gather slot. Host movement fills that slot with the next
++static candidate view; the ordered runtime flushes the pending NPU ABI
++conversion before allowing the next gather to overwrite it. MAX/MIN,
++candidate equality, first-tie selection, and native int32 coordinate
++assembly remain NPU work.
++
++The split selected-index matcher accepts only the narrow fp32 form with one
++original `total*window` input and one materialized `total`-element extrema
++input. It recognizes ArgMin's `-x` candidate wrapper and uses the existing
++NPU negation path against `MAX(-x)`.
++
++An additional fp32 MIN ABI bug was fixed: the intermediate `MAX(-x)` scratch
++stage had `fp32_output=True`, so runtime widened it before the final NPU
++negate, which then read fp32 bytes as fp16. Only the final logical MIN write
++now carries fp32 output conversion.
++
++Useful debug sequence:
++
++1. `ROCKCHIP_DEBUG_SUBTASKS=1` must show every fp32 candidate conversion
++   reading the same low slot (slot 2 in the `(4,20)` probe);
++2. compare `x.max(axis).numpy()` with the source winners before debugging
++   ArgMax equality;
++3. `ROCKCHIP_DEBUG_SINK=1` distinguishes fused global ArgMax from split axis
++   ArgMax;
++4. for ArgMin, verify the first kernel is `MAX(-x)` and the selected kernel
++   retains the `MUL(-1)` wrapper;
++5. a result stuck at candidate two indicates typed-input slot metadata, while
++   widespread zero indices with corrupt saved extrema indicates local MAX/MIN
++   failed before coordinate selection.
++
++Validation with `. .venv/bin/activate`,
++`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
++
++- unchanged `TestOps.test_argmax`: **1 passed in 72.47 seconds**;
++- unchanged `TestOps.test_argmin`: **1 passed in 70.28 seconds**;
++- unchanged `TestOps.test_max` and `test_min`: **2 passed in 8.88 seconds**;
++- permanent fp32 axis MAX/MIN/ArgMax/ArgMin plus existing dtype/tie coverage:
++  **1 passed in 20.30 seconds**.
++
++No LUT table or two-level LUT schedule changed.
++
+ The interpretation of RKNN Toolkit2 issue #471 remains unchanged: its values
+ are exactly fp16 quantization of `0.1`, not evidence for accumulator drift or
+ a solution to this EXP2 range problem.
+diff --git a/test/rockchip/test_hw.py b/test/rockchip/test_hw.py
+index d6986b4df..800f51dff 100644
+--- a/test/rockchip/test_hw.py
++++ b/test/rockchip/test_hw.py
+@@ -113,6 +113,13 @@ class TestDPU(unittest.TestCase):
+       y = Tensor(values, device="ROCKCHIP").realize()
+       np.testing.assert_array_equal(y.argmax().realize().numpy(), np.argmax(values).astype(np.int32))
+       np.testing.assert_array_equal(y.argmin().realize().numpy(), np.argmin(values).astype(np.int32))
++    fp32 = np.array([[1,9,3,4,0], [4,2,8,1,7], [7,6,5,3,2], [0,10,-1,6,5]], dtype=np.float32)
++    z = Tensor(fp32, device="ROCKCHIP").realize()
++    for axis in (0, 1):
++      np.testing.assert_array_equal(z.max(axis).realize().numpy(), np.max(fp32, axis=axis))
++      np.testing.assert_array_equal(z.min(axis).realize().numpy(), np.min(fp32, axis=axis))
++      np.testing.assert_array_equal(z.argmax(axis).realize().numpy(), np.argmax(fp32, axis=axis).astype(np.int32))
++      np.testing.assert_array_equal(z.argmin(axis).realize().numpy(), np.argmin(fp32, axis=axis).astype(np.int32))
+ 
+   def test_dpu_argsort_stable(self):
+     # Close fp16 values exercise the few-ULP roundoff of DPU bitonic
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 923e0abc9..2299276a4 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -659,6 +659,18 @@ class TestPipeline(unittest.TestCase):
+     self.assertTrue(all(st.task.kind == "dpu" for st in subtasks))
+     self.assertEqual(subtasks[-1].task.out_slot, 0)
+ 
++  def test_fp32_axis_argmax_reuses_low_typed_gather_slot(self):
++    x = Tensor.rand(4,5, dtype=dtypes.float).realize()
++    sinks = [c.src[0] for c in x.argmax(0).schedule_linear().src if c.src[0].op is Ops.SINK]
++    self.assertEqual(len(sinks), 2)
++    max_program = build_native_program(sinks[0])
++    self.assertIsNotNone(max_program)
++    subtasks = max_program.src[1].src[0].arg
++    typed_slots = [slot for st in subtasks for slot in st.task.fp32_inputs]
++    self.assertEqual(len(typed_slots), 4)
++    self.assertEqual(len(set(typed_slots)), 1)
++    self.assertIsNotNone(build_native_program(sinks[1]))
++
+   def test_k_tiled_dot_produces_binary(self):
+     a = Tensor.rand(5000,dtype=dtypes.half).realize()
+     b = Tensor.rand(5000,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 90d010209..3ff607c79 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1637,3 +1637,22 @@ The next low-hanging functional group is `argmax`: scalar duplicate-maximum
+ cases pass, but the unchanged random `(10,20)` case returned index `0`
+ instead of `149`. Continue from `TestOps.test_argmax`; the failure is an
+ index-selection correctness issue, not an ioctl timeout.
++
++### Normal-fp32 extrema milestone
++
++| Coverage | Result |
++|---|---:|
++| unchanged `test_argmax` | **1 passed in 72.47s** |
++| unchanged `test_argmin` | **1 passed in 70.28s** |
++| unchanged `test_max` + `test_min` | **2 passed in 8.88s** |
++| permanent fp32 axis extrema and index selection | **1 passed in 20.30s** |
++
++Fp32 local MAX/MIN and general ArgMax/ArgMin now reuse one low typed gather
++slot, avoiding version-4 `fp32_inputs` metadata loss after candidate two.
++Axis selected-index kernels may consume a separately materialized `MAX(x)`
++or `MAX(-x)` buffer; equality and first-tie coordinate selection remain DPU
++operations. Fp32 MIN keeps intermediate `MAX(-x)` in fp16 scratch and widens
++only the final logical output.
++
++The previous ArgMax entry is resolved. Resume the normal-default census
++after `test_argmin`; no LUT change was involved.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 562469679..3fd44e394 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9461,29 +9461,46 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower general static-axis argmax/argmin with DPU comparison and index selection."""
+   store = _store_node(sink)
+   max_reduces = [u for u in sink.toposort() if u.op is Ops.REDUCE and u.arg[0] is Ops.MAX]
+-  if store is None or store.src[0].dtype is not dtypes.int or len(max_reduces) != 2: return None
+-  value_reduce = next((u for u in max_reduces if
+-                       sum(x.op is Ops.INDEX and x.dtype in (dtypes.bool, dtypes.half, dtypes.float, dtypes.int)
+-                           for x in u.src[0].toposort()) == 1), None)
+-  if value_reduce is None: return None
+-  body = _unwrap(value_reduce.src[0])
+-  sources = [u for u in body.toposort() if u.op is Ops.INDEX and u.dtype in (dtypes.bool, dtypes.half, dtypes.float, dtypes.int)]
+-  if len(sources) != 1 or (source := sources[0]).src[0].op is not Ops.PARAM: return None
+-  is_min = any(u.op in (Ops.MUL, Ops.XOR) and source in u.src and
+-               any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src) for u in body.toposort())
+-  is_min = is_min or (source.dtype is dtypes.bool and any(
+-    u.op is Ops.CMPNE and source in u.src and any(x.op is Ops.CONST and bool(x.arg) for x in u.src)
+-    for u in body.toposort()))
+-  if body is not source and not is_min: return None
+-  reductions = list(value_reduce.src[1:])
++  if store is None or store.src[0].dtype is not dtypes.int or len(max_reduces) not in (1, 2): return None
++  selected_reduce = max_reduces[0] if len(max_reduces) == 1 and max_reduces[0].dtype is dtypes.int else None
++  value_reduce = None if selected_reduce is not None else next((u for u in max_reduces if
++    sum(x.op is Ops.INDEX and x.dtype in (dtypes.bool, dtypes.half, dtypes.float, dtypes.int)
++        for x in u.src[0].toposort()) == 1), None)
++  if selected_reduce is None and value_reduce is None: return None
++  reductions = list((selected_reduce if selected_reduce is not None else value_reduce).src[1:])  # type: ignore[union-attr]
+   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+   if not reductions or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+   loop_extents = [int(u.src[0].arg) for u in loops]
+   reduce_extents = [int(u.src[0].arg) for u in reductions]
+   total, window = prod(_shape_of_store(sink)), prod(reduce_extents)
+   if prod(loop_extents) != total or not 2 <= window <= 65536: return None
++  extrema_source = None
++  if selected_reduce is not None:
++    # Normal-fp32 axis ArgMax/ArgMin materializes the extrema in a preceding
++    # kernel. Identify the original candidate tensor by its total*window
++    # storage and the saved extrema by its total-element storage.
++    indexes = [u for u in selected_reduce.src[0].toposort()
++               if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
++    sources = [u for u in indexes if int(u.src[0].src[0].arg) == total*window]
++    extrema = [u for u in indexes if int(u.src[0].src[0].arg) == total]
++    if len(sources) != 1 or len(extrema) != 1: return None
++    source, extrema_source, body = sources[0], extrema[0], sources[0]
++    is_min = any(u.op is Ops.MUL and source in u.src and
++                 any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src)
++                 for u in selected_reduce.src[0].toposort())
++  else:
++    assert value_reduce is not None
++    body = _unwrap(value_reduce.src[0])
++    sources = [u for u in body.toposort() if u.op is Ops.INDEX and u.dtype in (dtypes.bool, dtypes.half, dtypes.float, dtypes.int)]
++    if len(sources) != 1 or (source := sources[0]).src[0].op is not Ops.PARAM: return None
++    is_min = any(u.op in (Ops.MUL, Ops.XOR) and source in u.src and
++                 any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src) for u in body.toposort())
++    is_min = is_min or (source.dtype is dtypes.bool and any(
++      u.op is Ops.CMPNE and source in u.src and any(x.op is Ops.CONST and bool(x.arg) for x in u.src)
++      for u in body.toposort()))
++    if body is not source and not is_min: return None
+   if getenv("ROCKCHIP_DEBUG_ARG_EXTREMA"):
+-    print("RK_ARG_EXTREMA", "min" if is_min else "max", source.dtype, total, window)
++    print("RK_ARG_EXTREMA", "selected" if extrema_source is not None else ("min" if is_min else "max"), source.dtype, total, window)
+ 
+   def evaluate(u:UOp, coords:dict[UOp,int]):
+     while u.op is Ops.CAST: u = u.src[0]
+@@ -9530,6 +9547,7 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   info = ProgramInfo.from_sink(sink)
+   out_slot, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
++  extrema_source_slot = extrema_source.src[0].buf_uop.arg.slot if extrema_source is not None else None
+   next_slot = max(info.globals, default=-1)+1
+   tasks:list[RKSubTask] = []
+   host_cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+@@ -9571,9 +9589,13 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(_emit_where_stage(int(source.src[0].src[0].arg), gathered_source_slot, (source_slot, 0),
+                                    (_ZERO_SLOT, 0), Ops.ADD, int32_inputs=(source_slot,)))
+ 
++  # Version-4 task metadata encodes typed inputs only for low global slots.
++  # Reuse one gather slot sequentially; the ordered runtime flushes a pending
++  # conversion before the next host gather overwrites this input.
++  fp32_gather_slot = alloc() if source.dtype is dtypes.float else None
+   candidate_slots:list[int] = []
+   for mapping in mappings:
+-    gathered = alloc()
++    gathered = fp32_gather_slot if fp32_gather_slot is not None else alloc()
+     gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, gathered_itemsize, *mapping)
+     gather_relocs = (RKReloc(0, gathered, 0, 0, 0xFFFFFFFF),
+                      RKReloc(0, gathered_source_slot, 0, 0, 0xFFFFFFFF))
+@@ -9598,11 +9620,16 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+         candidate = clamped
+     candidate_slots.append(candidate)
+ 
+-  maximum = candidate_slots[0]
+-  for operand in candidate_slots[1:]:
+-    result = alloc()
+-    tasks.append(_emit_where_stage(total, result, (maximum, 0), (operand, 0), Ops.MAX))
+-    maximum = result
++  if extrema_source_slot is not None:
++    maximum = alloc()
++    tasks.append(_emit_where_stage(total, maximum, (extrema_source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                   fp32_inputs=(extrema_source_slot,)))
++  else:
++    maximum = candidate_slots[0]
++    for operand in candidate_slots[1:]:
++      result = alloc()
++      tasks.append(_emit_where_stage(total, result, (maximum, 0), (operand, 0), Ops.MAX))
++      maximum = result
+ 
+   index_bytes = max(1, ((window-1).bit_length()+7)//8)
+   if index_bytes > 4: return None
+@@ -11883,6 +11910,10 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   #   flat = loops[0]
+   #   for axis, extent in zip(loops[1:], loop_extents[1:]): flat = flat*extent + axis
+ 
++  # Version-4 typed-input metadata only covers low global slots. Reuse one
++  # fp32 movement target and convert it immediately before the next gather.
++  fp32_gather_slot = next_slot if value_dtype is dtypes.float else None
++  if fp32_gather_slot is not None: next_slot += 1
+   gathered_slots:list[int] = []
+   needs_trunc = False
+   gather_source = reduce.src[0]
+@@ -11897,7 +11928,8 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     gathered = gather_source.substitute(fixed)
+     gathered_half = casted_half_source(gathered) if value_dtype is dtypes.int else None
+     needs_trunc = needs_trunc or gathered_half is not None
+-    scratch_slot, next_slot = next_slot, next_slot+1
++    scratch_slot = fp32_gather_slot if fp32_gather_slot is not None else next_slot
++    if fp32_gather_slot is None: next_slot += 1
+     scratch_dtype = dtypes.half if gathered_half is not None or value_dtype is dtypes.half else value_dtype
+     scratch = UOp.param(scratch_slot, scratch_dtype, (total,), device=store.src[0].src[0].device)
+     movement_value = gathered_half if gathered_half is not None else gathered
+@@ -11909,16 +11941,17 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       if getenv("ROCKCHIP_DEBUG_LOCAL_MAX"): print("RK_LOCAL_MAX_GATHER_REJECT", gathered)
+       return None
+     tasks.extend(movement_tasks)
+-    gathered_slots.append(native_int_to_half(scratch_slot) if scratch_dtype is dtypes.int else scratch_slot)
+-
+-  if value_dtype is dtypes.float:
+-    half_slots:list[int] = []
+-    for source_slot in gathered_slots:
++    if value_dtype is dtypes.float:
+       half_slot, next_slot = next_slot, next_slot+1
+-      tasks.append(_emit_where_stage(total, half_slot, (source_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
+-                                     fp32_inputs=(source_slot,)))
+-      half_slots.append(half_slot)
+-    gathered_slots = half_slots
++      tasks.append(_emit_where_stage(total, half_slot, (scratch_slot, 0), (_ZERO_SLOT, 0), Ops.ADD,
++                                     fp32_inputs=(scratch_slot,)))
++      gathered_slots.append(half_slot)
++    else:
++      gathered_slots.append(native_int_to_half(scratch_slot) if scratch_dtype is dtypes.int else scratch_slot)
++
++  # WIP reference: allocating every fp32 movement target first and converting
++  # them later overflowed version-4 typed-input slot metadata after candidate
++  # two. The active loop above interleaves movement and conversion.
+ 
+   # Positive scaling commutes with MAX. Applying it to each compact candidate
+   # avoids the unstable scalar-DPU transition after a long global MAX chain.
+@@ -11946,7 +11979,10 @@ def _try_local_max_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       (not is_min or negated_only) else next_slot
+     if out_slot == next_slot: next_slot += 1
+     if value_dtype is dtypes.float:
+-      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX, fp32_output=final))
++      # MAX(-x) for fp32 MIN remains an fp16 scratch value until the final
++      # negate performs the one logical fp32 output conversion.
++      tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX,
++                                     fp32_output=final and out_slot == info.outs[0]))
+     else:
+       tasks.append(_emit_where_stage(total, out_slot, (accumulator, 0), (operand, 0), Ops.MAX))
+     accumulator = out_slot
+-- 
+2.34.1
+
