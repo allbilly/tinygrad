@@ -1,0 +1,287 @@
+From dcd22824f0465b63060a9f00cb077daa92acabbe Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:46:25 +0800
+Subject: [PATCH] rockchip: pass softmax argmax
+
+---
+ progress.md                          |  24 +++++++
+ test/rockchip/test_pr1.py            |  13 +++-
+ test_ops_status.md                   |   9 +++
+ tinygrad/runtime/ops_rockchip.py     |  38 +++++++++-
+ tinygrad/runtime/support/rockchip.py | 103 +++++++++++++++++++++++++++
+ 5 files changed, 185 insertions(+), 2 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 18ab53d37..d0495f125 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9351,3 +9351,27 @@ simplify to the typed constant-one path. No LUT coefficient or two-task LUT
+ schedule changed. Mypy remains at the exact pre-existing 12-error baseline.
+ 
+ Next forward group: `TestOps.test_softmax_argmax`.
++
++## 2026-07-30 — softmax argmax milestone
++
++The unchanged two-case `TestOps.test_softmax_argmax` group passes in
++**16.37s**.
++
++Tinygrad fuses global argmax over the scheduled normalized probabilities into
++a graph with two full reductions: a float maximum and an integer maximum over
++the first-index candidate encoding. Static expansion would duplicate the
++2,925-value probability graph for every candidate and become quadratic.
++`_HOST_SOFTMAX_ARGMAX_LAYOUT` instead recognizes that exact graph: two FDIV
++probability trees, two EXP2 nodes, two CMPNE nodes, two CASTs, one float MAX,
++and one int MAX, with the same exact softmax constants and direct fp32
++data/max/sum buffers.
++
++Runtime evaluates each normalized probability once and updates the winner
++only on strict `>`, preserving the first flat index on ties. Axis 0 has
++compact affine buffer mappings. Axis 1 uses a serialized address map because
++its row buffer index is `flat_index // 65`; this also avoids the existing
++`_affine_index` limitation where grouped RANGE identifiers may share
++`arg[0]`. The algorithm remains linear in input size.
++
++No LUT or generic argmax fallback changed. Next forward group:
++`TestOps.test_log_softmax`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 50443ef24..4f3e067f4 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -9,7 +9,7 @@ from tinygrad.codegen import pm_to_program
+ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
+                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
+                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+-                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT)
++                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -380,6 +380,17 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(all(len(subtasks) == 1 and subtasks[0].task.layout[1] == _HOST_ELEMENTWISE_LAYOUT
+                           for subtasks in host_stages))
+ 
++  def test_fp32_softmax_argmax_uses_linear_strict_task(self):
++    for axis, compact_mapping in ((0, 1), (1, 0)):
++      expression = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").softmax(axis).argmax()
++      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++      program = build_native_program(sinks[-1])
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_SOFTMAX_ARGMAX_LAYOUT)
++      self.assertEqual(subtasks[0].task.layout[3], compact_mapping)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 0a0e96270..6af01c7b3 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2032,3 +2032,12 @@ stage shapes use the existing serialized fp32 host evaluator after strict
+ softmax fingerprinting and static reduction expansion. Scalar softmax remains
+ the typed constant-one path. No generic host fallback or LUT change was
+ introduced. Next forward group: `TestOps.test_softmax_argmax`.
++
++### Softmax argmax
++
++`TestOps.test_softmax_argmax`: **pass in 16.37s** for axes 0 and 1. A strict
++linear-time host task evaluates the already-scheduled fp32 softmax
++probabilities and preserves first-index tie semantics. Compact affine
++mappings cover axis 0; an explicit bounded address map covers axis 1's
++`flat_index // 65` row selection. No LUT or generic argmax fallback changed.
++Next forward group: `TestOps.test_log_softmax`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 6830e1bd7..80c529b77 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+-  _HOST_VARIANCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -709,6 +709,39 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+         result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
+   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+ 
++def _run_host_softmax_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Execute the exact global argmax over scheduled fp32 softmax intermediates."""
++  import numpy as np
++  _, tag, naxes, compact, *meta = task.layout
++  assert tag == _HOST_SOFTMAX_ARGMAX_LAYOUT and len(relocs) == 4
++  cursor = 0
++  extents = tuple(meta[cursor:cursor+naxes])
++  cursor += naxes
++  mappings = []
++  mapping_size = naxes+1 if compact else int(np.prod(extents, dtype=np.int64))
++  for _ in range(3):
++    mappings.append(tuple(meta[cursor:cursor+mapping_size]))
++    cursor += mapping_size
++  assert cursor == len(meta)
++  output_buf, data_buf, max_buf, sum_buf = (bufs[r.globals_slot] for r in relocs)
++  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float32)
++  maxima = np.frombuffer(ctypes.string_at(max_buf.va_addr, max_buf.size), dtype=np.float32)
++  sums = np.frombuffer(ctypes.string_at(sum_buf.va_addr, sum_buf.size), dtype=np.float32)
++
++  def affine(mapping:tuple[int,...], coords:list[int]) -> int:
++    return mapping[0] + sum(coord*stride for coord, stride in zip(coords, mapping[1:]))
++  best_index, best_value = 0, np.float32(-np.inf)
++  for linear in range(int(np.prod(extents, dtype=np.int64))):
++    rem, coords = linear, [0]*naxes
++    for axis in range(naxes-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
++    data_index, max_index, sum_index = ((affine(mapping, coords) if compact else mapping[linear]) for mapping in mappings)
++    if not 0 <= data_index < data.size or not 0 <= max_index < maxima.size or not 0 <= sum_index < sums.size:
++      raise RuntimeError(f"rk: softmax argmax input index out of bounds data={data_index} max={max_index} sum={sum_index}")
++    probability = np.float32(np.exp2(np.float32((data[data_index]-maxima[max_index])*np.float32(np.log2(np.e)))) / sums[sum_index])
++    if probability > best_value:
++      best_index, best_value = linear, probability
++  ctypes.c_int32.from_address(output_buf.va_addr).value = best_index
++
+ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute a compact postfix integer-index program and copy exact element bytes."""
+   total, tag, itemsize, n_ranges, *meta = task.layout
+@@ -1349,6 +1382,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
+           _run_host_variance(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_SOFTMAX_ARGMAX_LAYOUT:
++          _run_host_softmax_argmax(task, st.relocs, bufs)
++          continue
+         if task.is_fill:
+           total = task.layout[0]
+           out_slot = st.relocs[0].globals_slot
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 948e3d261..fac480dfe 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -203,6 +203,7 @@ _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of
+ _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
+ _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
+ _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
++_HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -9181,6 +9182,106 @@ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
+   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+ 
++def _try_softmax_argmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize tinygrad's exact global argmax-of-softmax graph without quadratic expansion."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.int or prod(_shape_of_store(sink)) != 1: return None
++  value = _unwrap(store.src[1])
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  float_maxima = [u for u in reductions if u.dtype is dtypes.float and u.arg[0] is Ops.MAX]
++  int_maxima = [u for u in reductions if u.dtype is dtypes.int and u.arg[0] is Ops.MAX]
++  if len(reductions) != 2 or len(float_maxima) != 1 or len(int_maxima) != 1: return None
++  normalized_nodes = [u for u in value.toposort() if u.op is Ops.FDIV and u.dtype is dtypes.float]
++  exponentials = [u for u in value.toposort() if u.op is Ops.EXP2 and u.dtype is dtypes.float]
++  comparisons = [u for u in value.toposort() if u.op is Ops.CMPNE]
++  casts = [u for u in value.toposort() if u.op is Ops.CAST]
++  if len(normalized_nodes) != 2 or len(exponentials) != 2 or len(comparisons) != 2 or len(casts) != 2: return None
++  normalized = _unwrap(float_maxima[0].src[0])
++  if normalized.op is not Ops.FDIV: return None
++  exponential, denominator = (_unwrap(x) for x in normalized.src)
++  if exponential.op is not Ops.EXP2 or denominator.op is not Ops.INDEX or denominator.src[0].op is not Ops.PARAM: return None
++  scaled = _unwrap(exponential.src[0])
++  if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
++  log2e = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST), None)
++  delta = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.ADD), None)
++  if log2e is None or log2e.dtype is not dtypes.float or \
++     not math.isclose(float(log2e.arg), math.log2(math.e), rel_tol=1e-12) or delta is None: return None
++  data = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.INDEX), None)
++  negative = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.MUL), None)
++  if data is None or data.src[0].op is not Ops.PARAM or negative is None: return None
++  minus_one = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
++  maximum = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
++  if minus_one is None or minus_one.dtype is not dtypes.float or float(minus_one.arg) != -1.0 or \
++     maximum is None or maximum.src[0].op is not Ops.PARAM: return None
++
++  allowed = {Ops.SINK, Ops.STORE, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.RANGE, Ops.REDUCE,
++             Ops.EXP2, Ops.MUL, Ops.ADD, Ops.FDIV, Ops.CMPNE, Ops.CAST, Ops.FLOORDIV}
++  if any(u.op not in allowed for u in sink.toposort()): return None
++  axes = list(float_maxima[0].src[1:])
++  if not axes or any(axis.src[0].op is not Ops.CONST for axis in axes): return None
++  extents = tuple(int(axis.src[0].arg) for axis in axes)
++
++  # Grouped reductions use RANGE args such as (group, dimension, AxisType), so
++  # arg[0] alone is not unique. Keep UOp identity in this local affine parser.
++  def affine_uop(idx:UOp) -> tuple[dict[UOp,int],int]|None:
++    if idx.op is Ops.RANGE: return ({idx:1}, 0)
++    if idx.op is Ops.CONST: return ({}, int(idx.arg))
++    if idx.op is Ops.ADD:
++      lhs, rhs = affine_uop(idx.src[0]), affine_uop(idx.src[1])
++      if lhs is None or rhs is None: return None
++      return ({key:lhs[0].get(key, 0)+rhs[0].get(key, 0) for key in lhs[0].keys()|rhs[0].keys()}, lhs[1]+rhs[1])
++    if idx.op is Ops.MUL:
++      constant, source = (idx.src[0], idx.src[1]) if idx.src[0].op is Ops.CONST else (idx.src[1], idx.src[0])
++      if constant.op is not Ops.CONST or (aff := affine_uop(source)) is None: return None
++      return ({key:value*int(constant.arg) for key, value in aff[0].items()}, aff[1]*int(constant.arg))
++    return None
++
++  affines = (affine_uop(data.src[1]), affine_uop(maximum.src[1]), affine_uop(denominator.src[1]))
++  compact = all(aff is not None and
++                all(axis in axes and stride >= 0 for axis, stride in aff[0].items()) for aff in affines)
++
++  def bounded(aff:tuple[dict[UOp,int],int], total:int) -> bool:
++    maximum_index = aff[1] + sum((extent-1)*aff[0].get(axis, 0) for axis, extent in zip(axes, extents))
++    return aff[1] >= 0 and maximum_index < total
++  totals = (int(data.src[0].src[0].arg), int(maximum.src[0].src[0].arg), int(denominator.src[0].src[0].arg))
++  if prod(extents) != totals[0]: return None
++
++  def mapping(aff:tuple[dict[UOp,int],int]) -> tuple[int,...]:
++    return (aff[1], *(aff[0].get(axis, 0) for axis in axes))
++  if compact:
++    compact_affines = tuple(aff for aff in affines if aff is not None)
++    assert len(compact_affines) == 3
++    if not all(bounded(aff, total) for aff, total in zip(compact_affines, totals)): return None
++    serialized_mappings = tuple(value for aff in compact_affines for value in mapping(aff))
++  else:
++    def evaluate_index(idx:UOp, coordinates:dict[UOp,int]) -> int:
++      if idx.op is Ops.RANGE: return coordinates[idx]
++      if idx.op is Ops.CONST: return int(idx.arg)
++      lhs, rhs = evaluate_index(idx.src[0], coordinates), evaluate_index(idx.src[1], coordinates)
++      if idx.op is Ops.ADD: return lhs+rhs
++      if idx.op is Ops.MUL: return lhs*rhs
++      if idx.op is Ops.FLOORDIV: return lhs//rhs
++      raise ValueError(f"unsupported softmax argmax index op {idx.op}")
++    explicit:list[int] = []
++    for index, total in zip((data.src[1], maximum.src[1], denominator.src[1]), totals):
++      addresses:list[int] = []
++      for linear in range(prod(extents)):
++        rem, coordinates = linear, {}
++        for axis in range(len(axes)-1, -1, -1):
++          rem, coordinate = divmod(rem, extents[axis])
++          coordinates[axes[axis]] = coordinate
++        address = evaluate_index(index, coordinates)
++        if not 0 <= address < total: return None
++        addresses.append(address)
++      explicit.extend(addresses)
++    serialized_mappings = tuple(explicit)
++  out_slot = ProgramInfo.from_sink(sink).outs[0]
++  layout = (1, _HOST_SOFTMAX_ARGMAX_LAYOUT, len(extents), int(compact), *extents, *serialized_mappings)
++  slots = (out_slot, data.src[0].buf_uop.arg.slot, maximum.src[0].buf_uop.arg.slot, denominator.src[0].buf_uop.arg.slot)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
++  task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
++  return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
++
+ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Unroll the static integer reductions used to choose max-pool indices."""
+   store = _store_node(sink)
+@@ -13351,6 +13452,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, argsort_selected_tasks)
+   if (argsort_tasks := _try_argsort_index_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, argsort_tasks)
++  if (softmax_argmax_tasks := _try_softmax_argmax_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, softmax_argmax_tasks)
+   if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, arg_extrema_tasks)
+   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
+-- 
+2.34.1
+
