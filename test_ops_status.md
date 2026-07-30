@@ -2252,3 +2252,14 @@ int32 padded case now exposes one strictly bounded 2x2 static MAX task only
 when its padding WHERE and `INT_MIN` sentinel match. Float pooling and the
 general diagnostic reducer are unchanged. No LUT changed. Contract:
 **130/130**. Next forward group: `TestOps.test_max_pool2d_return_indices`.
+
+### Max-pool return indices
+
+All seven return-index cases pass in **192.28s**, including dilation,
+padding, ceil mode, global pooling, ties, and overlapping windows. The
+bounded extrema selector now publishes the original source address modulo
+each channel's spatial plane instead of its window-local candidate ordinal;
+invalid padded candidates stay value-masked and carry a harmless zero index.
+The padding/ceil schedules therefore no longer require static evaluation of
+their nested compaction REDUCE. Ordinary axis argmax is unchanged. No runtime
+ABI or LUT changed. Next forward group: `TestOps.test_max_unpool2d`.

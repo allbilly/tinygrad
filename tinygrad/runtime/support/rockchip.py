@@ -10197,12 +10197,13 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   extrema_source = None
   if selected_reduce is not None:
     # Normal-fp32 axis ArgMax/ArgMin materializes the extrema in a preceding
-    # kernel. Identify the original candidate tensor by its total*window
-    # storage and the saved extrema by its total-element storage.
+    # kernel. Identify the original candidate tensor by its reduction-dependent
+    # address and the saved extrema by its total-element storage.
     indexes = [u for u in selected_reduce.src[0].toposort()
                if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
-    sources = [u for u in indexes if int(u.src[0].src[0].arg) == total*window]
-    extrema = [u for u in indexes if int(u.src[0].src[0].arg) == total]
+    sources = [u for u in indexes if any(axis in u.src[1].toposort() for axis in reductions)]
+    extrema = [u for u in indexes if not any(axis in u.src[1].toposort() for axis in reductions) and
+               int(u.src[0].src[0].arg) == total]
     if len(sources) != 1 or len(extrema) != 1: return None
     source, extrema_source, body = sources[0], extrema[0], sources[0]
     is_min = any(u.op is Ops.MUL and source in u.src and
@@ -10243,7 +10244,26 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if u.op is Ops.NEG: return -values[0]
     raise ValueError(u.op)
 
+  scheduled_index = None
+  if selected_reduce is not None:
+    selected_body = _unwrap(selected_reduce.src[0])
+    if selected_body.op is Ops.MUL:
+      scheduled_index = next((operand for operand in selected_body.src
+                              if not any(u.op is Ops.INDEX for u in operand.toposort()) and
+                              any(axis in operand.toposort() for axis in reductions)), None)
+  # Max-pool return_indices reduces the two window axes and promises an index
+  # into the unpadded spatial plane, not a window-local candidate number.  The
+  # selected source address already contains that information even when the
+  # scheduled index expression has padding compaction REDUCEs that the static
+  # evaluator intentionally does not execute.
+  output_shape = _shape_of_store(sink)
+  pool_input_spatial = None
+  if selected_reduce is not None and len(reductions) == 2 and len(output_shape) >= 2:
+    planes = prod(output_shape[:-2]) if len(output_shape) > 2 else 1
+    source_total = int(source.src[0].src[0].arg)
+    if planes > 0 and source_total % planes == 0: pool_input_spatial = source_total // planes
   mappings:list[tuple[int,...]] = []
+  public_indices:list[tuple[int,...]] = []
   try:
     for candidate in range(window):
       rem, fixed = candidate, {}
@@ -10258,10 +10278,26 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
           coords[loops[axis]] = coord
         output_index = int(evaluate(store.src[0].src[1], coords))
         source_index = evaluate(source.src[1], coords)
-        if not 0 <= output_index < total or source_index is Invalid: return None
-        addresses[output_index] = int(source_index)
-      if any(address < 0 for address in addresses): return None
+        if not 0 <= output_index < total: return None
+        addresses[output_index] = -1 if source_index is Invalid else int(source_index)
+      indices = [candidate]*total
+      if pool_input_spatial is not None:
+        indices = [0 if address < 0 else address % pool_input_spatial for address in addresses]
+      elif scheduled_index is not None and selected_reduce is not None:
+        for output_linear in range(total):
+          rem, coords = output_linear, dict(fixed)
+          for axis in range(len(loops)-1, -1, -1):
+            rem, coord = divmod(rem, loop_extents[axis])
+            coords[loops[axis]] = coord
+          output_index = int(evaluate(store.src[0].src[1], coords))
+          if addresses[output_index] < 0:
+            indices[output_index] = 0
+            continue
+          encoded = int(evaluate(scheduled_index, coords))
+          decoded = store.src[1].substitute({selected_reduce:UOp.const(selected_reduce.dtype, encoded)})
+          indices[output_index] = int(evaluate(decoded, coords))
       mappings.append(tuple(addresses))
+      public_indices.append(tuple(indices))
   except (TypeError, ValueError, OverflowError, ZeroDivisionError):
     return None
 
@@ -10314,6 +10350,7 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # conversion before the next host gather overwrites this input.
   fp32_gather_slot = alloc() if source.dtype is dtypes.float else None
   candidate_slots:list[int] = []
+  valid_slots:list[int|None] = []
   for mapping in mappings:
     gathered = fp32_gather_slot if fp32_gather_slot is not None else alloc()
     gather_layout = (total, _HOST_GATHER_MAP_LAYOUT, gathered_itemsize, *mapping)
@@ -10339,6 +10376,13 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
         tasks.append(_emit_where_stage(total, clamped, (upper_negative, 0), (_CONST_SLOT, 0xbf800000), Ops.MUL))
         candidate = clamped
     candidate_slots.append(candidate)
+    if any(address < 0 for address in mapping):
+      valid = alloc()
+      valid_layout = (total, _HOST_STATIC_HALF_LAYOUT, *(0x0000 if address < 0 else 0x3c00 for address in mapping))
+      tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", valid_layout, valid, is_copy=True),
+                             (RKReloc(0, valid, 0, 0, 0xFFFFFFFF),)))
+      valid_slots.append(valid)
+    else: valid_slots.append(None)
 
   if extrema_source_slot is not None:
     maximum = alloc()
@@ -10351,7 +10395,9 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       tasks.append(_emit_where_stage(total, result, (maximum, 0), (operand, 0), Ops.MAX))
       maximum = result
 
-  index_bytes = max(1, ((window-1).bit_length()+7)//8)
+  max_public_index = max(index for indices in public_indices for index in indices)
+  if max_public_index < 0: return None
+  index_bytes = max(1, (max_public_index.bit_length()+7)//8)
   if index_bytes > 4: return None
   selected:list[tuple[int,int]] = [(_ZERO_SLOT, 0)]*index_bytes
   one = (_CONST_SLOT, 0x3f800000)
@@ -10362,11 +10408,15 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(_emit_where_stage(total, less, (diff, 0), (diff, 0), Ops.MAX, compare=True))
     tasks.append(_emit_where_stage(total, equal_warm, one, (less, 0), Ops.SUB))
     tasks.append(_emit_where_stage(total, equal, one, (less, 0), Ops.SUB))
+    if (valid_slot := valid_slots[candidate]) is not None:
+      valid_equal = alloc()
+      tasks.append(_emit_where_stage(total, valid_equal, (equal, 0), (valid_slot, 0), Ops.MUL))
+      equal = valid_equal
     for byte in range(index_bytes):
       index_slot = alloc()
-      index = (candidate >> (8*byte)) & 0xFF
-      index_bits = struct.unpack('<H', struct.pack('<e', float(index)))[0]
-      index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *(index_bits for _ in range(total)))
+      index_bits = tuple(struct.unpack('<H', struct.pack('<e', float((index >> (8*byte)) & 0xFF)))[0]
+                         for index in public_indices[candidate])
+      index_layout = (total, _HOST_STATIC_HALF_LAYOUT, *index_bits)
       tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", index_layout, index_slot, is_copy=True),
                              (RKReloc(0, index_slot, 0, 0, 0xFFFFFFFF),)))
       delta, weighted, selected_out = alloc(), alloc(), alloc()
@@ -10424,7 +10474,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # equality/index-selection graph.
   cumulative_index = store.src[1].op is Ops.CAST and store.src[1].dtype is dtypes.int and \
     store.src[1].src[0].dtype in (dtypes.half, dtypes.float)
-  relative_index = cumulative_index or (len(reductions) == 1 and input_total == total*window)
+  relative_index = cumulative_index
 
   def evaluate(u:UOp, coords:dict[UOp, int]):
     while u.op is Ops.CAST: u = u.src[0]

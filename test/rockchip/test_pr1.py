@@ -9,7 +9,8 @@ from tinygrad.codegen import pm_to_program
 from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
-                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT)
+                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
+                                               _HOST_STATIC_HALF_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -988,6 +989,18 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertTrue(subtasks[0].task.is_copy)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
+  def test_max_pool_indices_encode_spatial_not_window_offsets(self):
+    x = Tensor.empty(2,3,6,6, dtype=dtypes.float, device="ROCKCHIP")
+    _, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
+    sinks = [early_simplify(call.src[0]) for call in indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+    prg = build_native_program(sinks[-1])
+    self.assertIsNotNone(prg)
+    subtasks = prg.src[1].src[0].arg
+    seven = struct.unpack('<H', struct.pack('<e', 7.0))[0]
+    static_indices = [task.task.layout[2:] for task in subtasks if task.task.is_copy and
+                      len(task.task.layout) > 1 and task.task.layout[1] == _HOST_STATIC_HALF_LAYOUT]
+    self.assertTrue(any(seven in values for values in static_indices))
 
   def test_fp32_axis_argmax_reuses_low_typed_gather_slot(self):
     x = Tensor.rand(4,5, dtype=dtypes.float).realize()

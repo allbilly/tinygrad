@@ -9753,3 +9753,26 @@ passes in **3.93s**. The general diagnostic static reducer remains gated.
 No runtime ABI, native float pool path, or LUT changed. Mypy remains at the
 exact 12-error baseline. Next forward group:
 `TestOps.test_max_pool2d_return_indices`.
+
+## 2026-07-30 — max-pool spatial-index milestone
+
+All seven unchanged `TestOps.test_max_pool2d_return_indices` cases pass on
+RK3588 in **192.28s**. Coverage includes batch/multi-channel 2x2 pooling,
+dilation, padding, ceil mode, a global 12x13 window, identical-value tie
+breaking, and overlapping maxima. The hardware-free regression also checks
+that the first 2x2 window can publish spatial index 7 rather than only the
+window-local range 0..3.
+
+The scheduled integer selector was already lowered as a bounded extrema
+reduction, but its static table encoded the reduction candidate number.
+It now identifies the original float load by its reduction-dependent address
+and derives the public index from that original flattened address modulo the
+input spatial plane. Invalid padded candidates receive index zero and remain
+masked from the value comparison. This avoids trying to execute the nested
+padding-compaction REDUCE present in ceil/padded index expressions and keeps
+ordinary non-pool axis argmax on its existing decoded-index path.
+
+The global case deliberately expands to 1,564 serialized bounded subtasks;
+this is slow but exact and does not claim new DPU reduction geometry. No
+runtime ABI or LUT changed. Next forward group:
+`TestOps.test_max_unpool2d`.
