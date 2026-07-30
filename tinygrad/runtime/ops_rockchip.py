@@ -1895,9 +1895,12 @@ class RockchipProgram(Program['RockchipDevice']):
       temp.append(scratch := dev._gpu_alloc(max(total * 2, 4096), 0))
       prepared.append(scratch)
     source_counts:dict[int, int] = {}
+    # Inputs produced by an earlier task already live in the chain's fp16 scratch representation.
+    # Converting them here would read uninitialized scratch and replace it with an undersized buffer.
+    produced_slots = {st.task.out_slot for st in subtasks}
     periodic_slots = {s for st in subtasks if st.task.periodic_input for s in st.task.fp32_inputs}
     residual_slots = {s for st in subtasks if st.task.fp32_residual_input for s in st.task.fp32_inputs}
-    for slot in {s for st in subtasks for s in st.task.fp32_inputs}:
+    for slot in {s for st in subtasks for s in st.task.fp32_inputs} - produced_slots:
       source_counts[slot] = source_n = prepared[slot].size // 4
       converted = dev._gpu_alloc(max(source_n * 2, 4096), 0)
       temp.append(converted)
@@ -1928,9 +1931,12 @@ class RockchipProgram(Program['RockchipDevice']):
       temp.append(converted)
       _broadcast_fp16_buf(prepared[slot].va_addr, converted.va_addr, source_counts.get(slot, prepared[slot].size // 2), total)
       prepared[slot] = converted
+    # Intermediate typed outputs stay fp16 inside the chain. Only the final caller-owned output
+    # needs a temporary fp16 destination followed by host conversion to its declared dtype.
     converted_output = next(((st.task.out_slot, st.task.fp32_output, st.task.uint8_output, st.task.bool_output, st.task.trunc_output)
-                             for st in subtasks if st.task.fp32_output or (st.task.int32_output and not st.task.native_int32_output) or st.task.uint8_output or
-                             st.task.bool_output or st.task.trunc_output), None)
+                             for st in reversed(subtasks) if st.task.out_slot < len(original_prepared) and
+                             (st.task.fp32_output or (st.task.int32_output and not st.task.native_int32_output) or st.task.uint8_output or
+                              st.task.bool_output or st.task.trunc_output)), None)
     output_conversion = None
     if converted_output is not None:
       output_slot, is_fp32, is_uint8, is_bool, is_trunc = converted_output

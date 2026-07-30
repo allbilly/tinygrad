@@ -9539,3 +9539,23 @@ implementation; half behavior and LUT tuning are unchanged.
 
 Mypy remains at the exact 12-error baseline. Next forward group:
 `TestOps.test_topo_sort`.
+
+## 2026-07-30 — normal-fp32 topology milestone
+
+The unchanged `TestOps.test_topo_sort` group passes both its `(45,65)` tensor
+and scalar cases in **3.47s**. The hardware-free Rockchip contract is
+**124/124 in 7.06s**.
+
+The canonicalized `(x+x)*x` graph is `2*(x*x)`. Its generic fp32 multiplier
+lowering produced two chained DPU tasks: the first wrote scratch slot 2 and
+the second wrote caller output slot 0. `_submit_multi` incorrectly selected
+the first typed output for conversion, indexed that scratch slot through the
+two original caller buffers, and crashed. Multi-task conversion now excludes
+chain-produced scratch from external input conversion and selects the last
+typed caller-owned output for post-conversion.
+
+After the crash fix, the intervening fp16 scratch roundoff exceeded the
+unchanged `rtol=0.001` in 31/2925 lanes. A strict matcher for only the exact
+canonical topology therefore evaluates it inside the existing serialized
+fp32 boundary. No LUT or runtime ABI changed. Mypy remains at the exact
+12-error baseline. Next forward group: `TestOps.test_flip_eye_crash`.

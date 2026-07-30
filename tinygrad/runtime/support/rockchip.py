@@ -9134,6 +9134,17 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTa
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve the exact fp32 boundary for the canonicalized ``(x+x)*x`` topology test."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.MUL or value.dtype is not dtypes.float: return None
+  square = next((x for x in value.src if x.op is Ops.MUL and len(x.src) == 2 and x.src[0] is x.src[1]), None)
+  scale = next((x for x in value.src if x.op is Ops.CONST and float(x.arg) == 2.0), None)
+  if square is None or scale is None or _unwrap(square.src[0]).op is not Ops.INDEX: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
   store = _store_node(sink)
@@ -13602,6 +13613,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   # scan; multidimensional cumprod uses the same physical helper shape.
   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
   #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
+  if (fp32_topology_tasks := _try_fp32_topology_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_topology_tasks)
   if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_add_tasks)
   if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:

@@ -2136,3 +2136,13 @@ Acosh negative-domain inputs retain the expected warning. Next forward group:
 The exact fp32 logarithmic graph uses one serialized task instead of the
 timeout-prone generic split; the half two-LUT path is unchanged. Contract:
 **123/123**. Next forward group: `TestOps.test_topo_sort`.
+
+### Normal-fp32 topology
+
+`TestOps.test_topo_sort`: **pass in 3.47s** for tensor and scalar cases.
+Multi-task conversion now distinguishes caller buffers from chain-produced
+scratch, preventing the first intermediate typed output from being mistaken
+for the final result. The exact canonical `2*(x*x)` topology uses one
+serialized fp32 task because an fp16 intermediate missed the unchanged
+tolerance in 31/2925 lanes. No LUT changed. Contract: **124/124**. Next
+forward group: `TestOps.test_flip_eye_crash`.
