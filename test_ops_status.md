@@ -2196,3 +2196,13 @@ Fifteen movement/view groups pass unchanged in **14.84s**, covering stacked
 slicing through expand, including transpose/permute, reshape/view,
 flip/roll, dimension edits, diagonal operations, and detach. No code or LUT
 change was needed. Next forward group: `TestOps.test_sd_big_conv`.
+
+### Normal-fp32 biased convolution
+
+`TestOps.test_biased_conv2d`: **pass in 4.62s**; the preceding three
+large-convolution methods are upstream hard-coded skips. Both K=8 products
+remain on the exact split-fp32 CMAC path. Recognized bias and bias+ReLU
+epilogues consume typed accumulator scratch through the strict serialized
+fp32 evaluator, now supported by the mixed-CMAC dispatcher. This does not
+broaden the unproven large-K `conv_grok` geometry. No LUT changed. Contract:
+**127/127**. Next forward group: `TestOps.test_simple_conv2d`.

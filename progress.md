@@ -9644,3 +9644,25 @@ squeeze/unsqueeze, flatten/unflatten, diag/diagonal, roll, detach, and
 expand. No code, host boundary, runtime ABI, or LUT change was needed.
 
 Next forward group: `TestOps.test_sd_big_conv`.
+
+## 2026-07-30 — normal-fp32 biased convolution milestone
+
+The three upstream large-convolution methods are hard-coded skips. The first
+active convolution group, unchanged `TestOps.test_biased_conv2d`, passes in
+**4.62s**. It covers two sequential 1x1, C=8 convolutions with bias and an
+intervening ReLU. The hardware-free Rockchip contract is **127/127 in
+7.23s**.
+
+Both scheduled kernels were rejected as `unsupported_dtype:fp32_cmac`
+because `_try_small_fp32_cmac_subtasks` required the STORE value to be the
+bare reduction. The existing CMAC epilogue recognizer already identifies the
+first as `bias_relu` and the second as `bias`. The exact split-fp32 CMAC path
+now writes its K=8 accumulator to typed scratch and serializes only that
+recognized fp32 epilogue. The mixed-CMAC runtime dispatcher now executes its
+existing host-elementwise task type in both sequential and optional chained
+branches.
+
+This stays within the small proven CMAC geometry: it does not enable the
+large-K multirow form that `allbilly/rk3588` `conv_grok` never demonstrated
+and that local K=875 probing corrupted. No LUT changed. Mypy remains at the
+exact 12-error baseline. Next forward group: `TestOps.test_simple_conv2d`.

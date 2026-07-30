@@ -1507,6 +1507,8 @@ class RockchipProgram(Program['RockchipDevice']):
               _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+              _run_host_elementwise(st.task, st.relocs, tuple(ext))
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
           flush_mixed_dpu()
@@ -1538,6 +1540,9 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+            continue
+          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+            _run_host_elementwise(st.task, st.relocs, tuple(ext))
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU

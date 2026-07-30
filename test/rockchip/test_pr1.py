@@ -398,6 +398,20 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(subtasks[0].task.is_copy)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
+    x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
+    w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(8, dtype=dtypes.float, device="ROCKCHIP")
+    expression = x.conv2d(w,b).relu().conv2d(w,b)
+    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+    self.assertEqual(len(sinks), 2)
+    for sink in sinks:
+      program = build_native_program(sink)
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
+      self.assertEqual(subtasks[-1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
     for shape, axis in (((45,65), 1), ((45,), 0)):
       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)

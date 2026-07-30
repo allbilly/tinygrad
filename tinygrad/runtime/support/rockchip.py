@@ -12255,8 +12255,10 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run a direct fp32 matrix product through typed half CMAC views and CBUF-derived tiles."""
   if (long_dot_tasks := _try_long_fp32_batched_dot_subtasks(sink)) is not None: return long_dot_tasks
   store, reduce = _store_node(sink), _reduce_node(sink)
-  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or \
      reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
+  epilogue = _try_cmac_epilogue(sink, reduce)
+  if epilogue is None: return None
   body = _unwrap(reduce.src[0])
   if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
   sources = tuple(_unwrap(x) for x in body.src)
@@ -12346,13 +12348,23 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if high is None or cross0 is None or cross1 is None: return None
   high_half, high_residual = view(high, _HOST_FP32_HALF_LAYOUT), view(high, _HOST_FP32_RESIDUAL_LAYOUT)
   cross_sum, residual = next_slot, next_slot+1
+  next_slot += 2
   tasks.append(_emit_where_stage(output_total, cross_sum, (cross0, 0), (cross1, 0), Ops.ADD))
   tasks.append(_emit_where_stage(output_total, residual, (high_residual, 0), (cross_sum, 0), Ops.ADD))
+  reduction_out = info.outs[0]
+  if epilogue[0] != "none": reduction_out, next_slot = next_slot, next_slot+1
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
-  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high_half, 0, 0, 0xFFFFFFFF),
+  relocs = (RKReloc(0, reduction_out, 0, 0, 0xFFFFFFFF), RKReloc(0, high_half, 0, 0, 0xFFFFFFFF),
             RKReloc(0, residual, 0, 0, 0xFFFFFFFF))
   tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (output_total, _HOST_FP32_COMBINE_LAYOUT),
-                                     info.outs[0], is_copy=True, fp32_output=True), relocs))
+                                     reduction_out, is_copy=True, fp32_output=True), relocs))
+  if epilogue[0] != "none":
+    reduction_param = UOp.param(reduction_out, dtypes.float, (output_total,), device=device)
+    reduction_index = store.src[0].replace(src=(reduction_param, *store.src[0].src[1:]))
+    epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:reduction_index})))
+    epilogue_sink = sink.substitute({store:epilogue_store})
+    if (epilogue_tasks := _try_elementwise_host_subtasks(epilogue_sink, allow_plain=True)) is None: return None
+    tasks.extend(epilogue_tasks)
   return tuple(tasks)
 
 def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
