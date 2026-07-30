@@ -1679,3 +1679,27 @@ slot is encodable.
 
 No LUT change was needed. Continue the normal-default census after
 `test_argsort`; sort/topk are related but are not claimed by this milestone.
+
+### Exact normal-fp32 sort milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_sort` | **1 passed in 36.86s** |
+| unchanged `TestOps.test_argsort` regression | **1 passed in 4.91s** |
+| permanent fp16/fp32 duplicate + collision hardware test | **1 passed in 12.50s** |
+| deterministic 384-element later-axis index case | **0 mismatches** |
+| hardware-free planner/codec contract | **98/98 in 5.56s** |
+
+Bitonic fp32 compare/swap now preserves `high + residual/256`. Residuals
+decide ties between equal nearest-fp16 high limbs, and downstream occurrence
+equality and final candidate scoring consume both limbs.
+
+Argsort-specific boolean masks no longer enable reset-heavy DPU comparison
+mode. Ordinary NPU arithmetic computes exact positive/nonzero 0/1 masks
+using finite clamping and division by `max(value, 2^-24)`. Final small
+integral weights cross only the established fp16-to-int32 ABI representation
+boundary on the host; all operator arithmetic remains NPU work. The native
+four-lane WIP remains selectable with `ROCKCHIP_NATIVE_ARGSORT_PACK=1`.
+
+No LUT change was involved. `test_sort` is resolved; continue with
+`TestOps.test_topk`.

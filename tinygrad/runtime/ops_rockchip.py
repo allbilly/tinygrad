@@ -74,7 +74,12 @@ def _convert_fp32_residual_to_fp16_buf(src, dst, n):
   import numpy as np
   arr = np.frombuffer(ctypes.string_at(src, n * 4), dtype=np.float32)
   high = arr.astype(np.float16).astype(np.float32)
-  residual = ((arr-high)*256.0).astype(np.float16)
+  with np.errstate(invalid="ignore"):
+    residual = ((arr-high)*256.0).astype(np.float16)
+  # +/-inf is exactly represented by its high limb.  Canonicalize its
+  # otherwise undefined inf-inf residual so padded two-limb sort lanes remain
+  # selectable without NaN contaminating the finite operand.
+  residual[~np.isfinite(arr)] = np.float16(0)
   ctypes.memmove(dst, residual.ctypes.data, n * 2)  # type: ignore[arg-type]
 
 def _convert_periodic_fp32_to_fp16_buf(src, dst, n):
@@ -1512,6 +1517,9 @@ class RockchipProgram(Program['RockchipDevice']):
             flush_pending()
             dev.reset_npu()
             continue
+          # Rejected WIP: mode-transition tracking and eight-task native
+          # batches still exhausted RESET during the full fp32 sort matrix.
+          # Argsort now avoids those special modes in its normal path.
           pending.append(st)
           if len(pending) == 64: flush_pending()
         flush_pending()

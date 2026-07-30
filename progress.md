@@ -7533,6 +7533,101 @@ test, use a high/residual two-limb NPU comparison. Resume the normal-fp32
 census after `test_argsort`, with `test_sort`/`test_topk` as the adjacent
 families.
 
+## 2026-07-30 — exact normal-fp32 sort
+
+The unchanged forward-only `TestOps.test_sort` now passes empty and singleton
+shapes, all three `(8,8,6)` axes, both directions, both value/index outputs,
+and stable duplicate cases. The first argsort milestone passed its random
+axis-1 case but still compared only nearest-fp16 high limbs inside bitonic
+sort. A deterministic later-axis probe found two exchanged indices:
+
+```text
+-1.2183010578 -> fp16 -1.219
+-1.2191849947 -> fp16 -1.219
+```
+
+The fp32 compare/swap path now carries the existing two-limb representation
+through every bitonic stage:
+
+```text
+x = high + residual/256
+```
+
+It compares residuals only when high limbs tie, selects the corresponding
+high and residual on NPU, and reconstructs fp32 only at the ABI boundary for
+the next scheduled comparator. Argsort occurrence equality also requires
+both limbs, and final source-to-sorted matching scores
+`abs(high difference) + abs(residual difference)/256`. This fixes close
+distinct values without changing exact-duplicate stability.
+
+### Reset-free NPU masks
+
+The original `compare=True` DPU mode requires RESET transitions. Residual
+sorting substantially increased mask count, and unchanged `test_sort`
+repeatedly aborted in the reset ioctl after about four minutes. Experiments
+retained in comments/reference included:
+
+- reset before and after every comparison: correct small cases, cumulative
+  driver abort;
+- one-sided and mode-transition resets: either corrupt following ordinary
+  stages or still exhaust reset;
+- mixed comparison/ordinary PC chains: first chain times out even after a
+  clean reset;
+- native-int result chunks, bounded eight-task native chains, and phased
+  pack/submit/assemble: fewer resets but still not suite-stable.
+
+Argsort-specific masks now use ordinary DPU arithmetic. For a difference
+`d`, NPU stages compute a finite-clamped positive part `p=max(d,0)` and:
+
+```text
+mask = p / max(p, 2^-24)
+```
+
+This is exact fp16 `1` for positive `d` and `0` otherwise. Clamping `p` to
+65504 handles infinite padding without `inf/inf`. Equality uses the same
+mask on `abs(d)`. These stages are normal DPU programs and form stable PC
+chains without comparison-mode reset ioctls.
+
+The final NPU-selected stable occurrence/index weights are exact small fp16
+integers. Normal execution uses the already-established `_HOST_HALF_INT_LAYOUT`
+ABI representation conversion to int32. Likewise, bounded int32 occurrence
+counts enter selected-index scoring through the existing `int32_inputs` ABI
+conversion plus an ordinary NPU identity. No comparison, count, score,
+sort, or selection arithmetic runs on the host. The old four-lane native
+packing code remains available under `ROCKCHIP_NATIVE_ARGSORT_PACK=1`.
+
+Nonfinite fp32 residual encoding now canonicalizes the low limb of `+/-inf`
+to zero. Infinity is already exact in the high limb; this prevents padded
+sort lanes from injecting an undefined `inf-inf` NaN into residual
+selection.
+
+Useful debug sequence:
+
+1. reproduce close values whose `np.float16` representations are equal;
+2. compare sorted values before indices—correct values with exchanged indices
+   means occurrence/matching still lost the residual;
+3. inspect the whole scheduled pipeline and assert no default argsort subtask
+   has `native_int32_input`, `native_int32_output`, or the comparison-mode
+   RELUX register value;
+4. test a six-lane axis to exercise infinity padding and exact duplicates to
+   exercise stable occurrence IDs;
+5. use `ROCKCHIP_NATIVE_ARGSORT_PACK=1` only for isolated WIP probes, not the
+   forward-suite census.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_sort`: **1 passed in 36.86 seconds**;
+- unchanged `TestOps.test_argsort`: **1 passed in 4.91 seconds**;
+- permanent fp16/fp32 duplicate and close-fp32 collision regression:
+  **1 passed in 12.50 seconds**;
+- deterministic 384-element later-axis regression: **zero mismatches**;
+- hardware-free planner/codec contract: **98/98 in 5.56 seconds**.
+
+No LUT coefficients or task count changed; a two-level LUT is unrelated to
+lexicographic high/residual ordering. Continue the normal-fp32 census after
+`test_sort`, with `test_topk` as the next adjacent group.
+
 ## 2026-07-30 — compensated fp32 MUL milestone
 
 Normal-default forward-only `TestOps.test_mul`, `test_scalar_mul`,

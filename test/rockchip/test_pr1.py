@@ -680,6 +680,10 @@ class TestPipeline(unittest.TestCase):
                    for st in program.src[1].src[0].arg for slot in st.task.fp32_inputs]
     self.assertTrue(typed_slots)
     self.assertLess(max(typed_slots), 7)
+    subtasks = [st for program in programs if program is not None for st in program.src[1].src[0].arg]
+    self.assertFalse(any(st.task.native_int32_input or st.task.native_int32_output for st in subtasks))
+    self.assertFalse(any((cmd & 0xffff) == rk.REG_DPU_BN_RELUX_CMP_VALUE and
+                         ((cmd >> 16) & 0xffffffff) == 0x3f800000 for st in subtasks for cmd in st.cmds))
 
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()

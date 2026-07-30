@@ -130,6 +130,14 @@ class TestDPU(unittest.TestCase):
       actual = Tensor(values, device="ROCKCHIP").argsort(1, True).realize().numpy()
       expected = np.argsort(-values, axis=1, kind="stable").astype(np.int32)
       np.testing.assert_array_equal(actual, expected)
+    # These distinct fp32 values have the same nearest-fp16 high limb. Their
+    # residual limbs must decide order in both ascending and descending sorts.
+    collision = np.array([[[0.0],[-1.2183010578],[1.0],[-1.2191849947],
+                           [0.5],[-0.5],[2.0],[-2.0]]], dtype=np.float32)
+    for descending in (False, True):
+      actual = Tensor(collision, device="ROCKCHIP").sort(1, descending)[1].realize().numpy()
+      expected = np.argsort(-collision if descending else collision, axis=1, kind="stable").astype(np.int32)
+      np.testing.assert_array_equal(actual, expected)
 
   def test_dpu_topk_padded_sort(self):
     # Non-power-of-two half sorting uses -inf padding without 0*inf blending.
