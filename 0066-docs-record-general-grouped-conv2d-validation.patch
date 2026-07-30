@@ -1,0 +1,49 @@
+From 71aeb3ce588f86c068f85d150ba1f3cdb444eaf4 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:52:10 +0800
+Subject: [PATCH] docs: record general grouped conv2d validation
+
+---
+ progress.md        | 12 ++++++++++++
+ test_ops_status.md |  8 ++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 4ae2c4214..106399b45 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9704,3 +9704,15 @@ and asymmetric padding. No code, host boundary, runtime ABI, large-K
+ geometry, or LUT change was needed.
+ 
+ Next forward group: `TestOps.test_conv2d`.
++
++## 2026-07-30 — general/grouped conv2d validation
++
++The general conv2d matrix reports **3 passed methods, 2 upstream-gated
++skips, and 13 passing subtests in 14.97s**. Seven additional active groups
++pass: large-input, simple/medium/general grouped, depthwise, fancy, and
++simple-strided conv2d. Those groups take **58.95s** across two invocations,
++including the slow-gated 4x16x64x64 case.
++
++No code, host boundary, runtime ABI, CMAC geometry, or LUT change was needed.
++After the LLVM-only `test_strided_conv2d_simple_vec`, next forward group:
++`TestOps.test_strided_conv2d`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 26b45e759..150161235 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2227,3 +2227,11 @@ or LUT changed. Contract: **128/128**. Next forward group:
+ Four conv1d groups pass unchanged with **17 subtests in 22.24s**, including
+ general, padded, strided, and asymmetric-padding cases. No code or LUT change
+ was needed. Next forward group: `TestOps.test_conv2d`.
++
++### General and grouped conv2d
++
++The general matrix has **13 passing subtests** with two upstream-gated
++methods; seven more large-input/grouped/depthwise/fancy/strided groups pass.
++Total measured time is **73.92s** across three invocations. No code or LUT
++change was needed. After the LLVM-only `test_strided_conv2d_simple_vec`,
++next forward group: `TestOps.test_strided_conv2d`.
+-- 
+2.34.1
+
