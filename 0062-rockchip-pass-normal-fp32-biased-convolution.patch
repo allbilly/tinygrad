@@ -1,0 +1,154 @@
+From bbd6ff503cfd2029fab1aff332bec83ad297d140 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:41:13 +0800
+Subject: [PATCH] rockchip: pass normal fp32 biased convolution
+
+---
+ progress.md                          | 22 ++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 14 ++++++++++++++
+ test_ops_status.md                   | 10 ++++++++++
+ tinygrad/runtime/ops_rockchip.py     |  5 +++++
+ tinygrad/runtime/support/rockchip.py | 18 +++++++++++++++---
+ 5 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index d8469077e..915935967 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9644,3 +9644,25 @@ squeeze/unsqueeze, flatten/unflatten, diag/diagonal, roll, detach, and
+ expand. No code, host boundary, runtime ABI, or LUT change was needed.
+ 
+ Next forward group: `TestOps.test_sd_big_conv`.
++
++## 2026-07-30 — normal-fp32 biased convolution milestone
++
++The three upstream large-convolution methods are hard-coded skips. The first
++active convolution group, unchanged `TestOps.test_biased_conv2d`, passes in
++**4.62s**. It covers two sequential 1x1, C=8 convolutions with bias and an
++intervening ReLU. The hardware-free Rockchip contract is **127/127 in
++7.23s**.
++
++Both scheduled kernels were rejected as `unsupported_dtype:fp32_cmac`
++because `_try_small_fp32_cmac_subtasks` required the STORE value to be the
++bare reduction. The existing CMAC epilogue recognizer already identifies the
++first as `bias_relu` and the second as `bias`. The exact split-fp32 CMAC path
++now writes its K=8 accumulator to typed scratch and serializes only that
++recognized fp32 epilogue. The mixed-CMAC runtime dispatcher now executes its
++existing host-elementwise task type in both sequential and optional chained
++branches.
++
++This stays within the small proven CMAC geometry: it does not enable the
++large-K multirow form that `allbilly/rk3588` `conv_grok` never demonstrated
++and that local K=875 probing corrupted. No LUT changed. Mypy remains at the
++exact 12-error baseline. Next forward group: `TestOps.test_simple_conv2d`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index fa2995c61..a1d1a9a04 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -398,6 +398,20 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(subtasks[0].task.is_copy)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
++    x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
++    w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")
++    b = Tensor.empty(8, dtype=dtypes.float, device="ROCKCHIP")
++    expression = x.conv2d(w,b).relu().conv2d(w,b)
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    self.assertEqual(len(sinks), 2)
++    for sink in sinks:
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
++      self.assertEqual(subtasks[-1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
+     for shape, axis in (((45,65), 1), ((45,), 0)):
+       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 1e1e7217a..45ab26632 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2196,3 +2196,13 @@ Fifteen movement/view groups pass unchanged in **14.84s**, covering stacked
+ slicing through expand, including transpose/permute, reshape/view,
+ flip/roll, dimension edits, diagonal operations, and detach. No code or LUT
+ change was needed. Next forward group: `TestOps.test_sd_big_conv`.
++
++### Normal-fp32 biased convolution
++
++`TestOps.test_biased_conv2d`: **pass in 4.62s**; the preceding three
++large-convolution methods are upstream hard-coded skips. Both K=8 products
++remain on the exact split-fp32 CMAC path. Recognized bias and bias+ReLU
++epilogues consume typed accumulator scratch through the strict serialized
++fp32 evaluator, now supported by the mixed-CMAC dispatcher. This does not
++broaden the unproven large-K `conv_grok` geometry. No LUT changed. Contract:
++**127/127**. Next forward group: `TestOps.test_simple_conv2d`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index a96909533..3536263cd 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -1507,6 +1507,8 @@ class RockchipProgram(Program['RockchipDevice']):
+               _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
++            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++              _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             else:
+               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
+           flush_mixed_dpu()
+@@ -1539,6 +1541,9 @@ class RockchipProgram(Program['RockchipDevice']):
+           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+             continue
++          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++            _run_host_elementwise(st.task, st.relocs, tuple(ext))
++            continue
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
+           # stages also stay single-task for reset stability, with the typed
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 3a7ee6517..ebe2c933c 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -12255,8 +12255,10 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run a direct fp32 matrix product through typed half CMAC views and CBUF-derived tiles."""
+   if (long_dot_tasks := _try_long_fp32_batched_dot_subtasks(sink)) is not None: return long_dot_tasks
+   store, reduce = _store_node(sink), _reduce_node(sink)
+-  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or store.src[1] is not reduce or \
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or \
+      reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float: return None
++  epilogue = _try_cmac_epilogue(sink, reduce)
++  if epilogue is None: return None
+   body = _unwrap(reduce.src[0])
+   if body.op is not Ops.MUL or body.dtype is not dtypes.float or len(body.src) != 2: return None
+   sources = tuple(_unwrap(x) for x in body.src)
+@@ -12346,13 +12348,23 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if high is None or cross0 is None or cross1 is None: return None
+   high_half, high_residual = view(high, _HOST_FP32_HALF_LAYOUT), view(high, _HOST_FP32_RESIDUAL_LAYOUT)
+   cross_sum, residual = next_slot, next_slot+1
++  next_slot += 2
+   tasks.append(_emit_where_stage(output_total, cross_sum, (cross0, 0), (cross1, 0), Ops.ADD))
+   tasks.append(_emit_where_stage(output_total, residual, (high_residual, 0), (cross_sum, 0), Ops.ADD))
++  reduction_out = info.outs[0]
++  if epilogue[0] != "none": reduction_out, next_slot = next_slot, next_slot+1
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-  relocs = (RKReloc(0, info.outs[0], 0, 0, 0xFFFFFFFF), RKReloc(0, high_half, 0, 0, 0xFFFFFFFF),
++  relocs = (RKReloc(0, reduction_out, 0, 0, 0xFFFFFFFF), RKReloc(0, high_half, 0, 0, 0xFFFFFFFF),
+             RKReloc(0, residual, 0, 0, 0xFFFFFFFF))
+   tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (output_total, _HOST_FP32_COMBINE_LAYOUT),
+-                                     info.outs[0], is_copy=True, fp32_output=True), relocs))
++                                     reduction_out, is_copy=True, fp32_output=True), relocs))
++  if epilogue[0] != "none":
++    reduction_param = UOp.param(reduction_out, dtypes.float, (output_total,), device=device)
++    reduction_index = store.src[0].replace(src=(reduction_param, *store.src[0].src[1:]))
++    epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:reduction_index})))
++    epilogue_sink = sink.substitute({store:epilogue_store})
++    if (epilogue_tasks := _try_elementwise_host_subtasks(epilogue_sink, allow_plain=True)) is None: return None
++    tasks.extend(epilogue_tasks)
+   return tuple(tasks)
+ 
+ def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-- 
+2.34.1
+
