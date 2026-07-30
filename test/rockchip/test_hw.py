@@ -758,6 +758,14 @@ class TestCMAC(unittest.TestCase):
     got = (a @ b).realize().numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
 
+  def test_cmac_fp32_zero_stride_mulacc(self):
+    a_np = np.arange(1,9, dtype=np.float32).reshape(2,4,1)
+    b_np = np.array([1.25,-2.5,0.75,3.0], dtype=np.float32).reshape(1,4,1)
+    expected = (np.broadcast_to(a_np, (2,4,3))*np.broadcast_to(b_np, (2,4,3))).sum(axis=(0,2), dtype=np.float32)
+    a, b = Tensor(a_np, device="ROCKCHIP"), Tensor(b_np, device="ROCKCHIP")
+    got = (a.expand(2,4,3)*b.expand(2,4,3)).sum((0,2)).realize().numpy()
+    np.testing.assert_allclose(got, expected, rtol=1e-3, atol=1e-5)
+
   def test_cmac_long_fp32_batched_dot(self):
     rng = np.random.default_rng(2)
     a_np = rng.standard_normal((3,13824)).astype(np.float32)

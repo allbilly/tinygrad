@@ -7532,6 +7532,53 @@ No LUT coefficients or schedules changed. The next group,
 `TestOps.test_mulacc_with_zero_strides`, reaches its second case and rejects
 with `RKPLAN_REJECT:unsupported_op:fused_epilogue`.
 
+## 2026-07-30 — normal-fp32 zero-stride mulacc milestone
+
+The unchanged forward-only `TestOps.test_mulacc_with_zero_strides` now
+passes all three cases. The second case was optimized from a broadcast
+multiply and reduction over axes `(0,2)` into:
+
+```text
+(SUM_axis0(a) * b) * 3
+```
+
+The output-dependent `b` and compile-time `3` sat above the REDUCE, so the
+ordinary CMAC epilogue classifier correctly refused to misidentify them as
+one scalar BS epilogue and returned
+`RKPLAN_REJECT:unsupported_op:fused_epilogue`.
+
+A strict factorized-sum matcher now peels only a multiplication tree with
+exactly one direct fp32 ADD reduction and one to three direct fp32
+INDEX/CONST factors independent of every reduction axis. It preserves the
+tree's factor order. The reduction runs through the compensated fp32 CMAC
+sum path, followed by the existing compensated fp32 TwoProduct DPU path for
+each factor. The host only forms high/residual ABI views and recombines the
+representation; all sum and multiply arithmetic runs on the NPU.
+
+Useful debug sequence:
+
+1. inspect `ROCKCHIP_DEBUG_SINK=1` before changing CMAC epilogue rules;
+2. distinguish a true scalar `SUM(x)*c` epilogue from an output-dependent
+   `SUM(x)*INDEX(y)` factor;
+3. verify eliminated zero-stride axes appear as a positive integer constant;
+4. retain factor order instead of algebraically flattening fp32 products;
+5. test nontrivial negative/fractional factors, not only the official all-one
+   tensors.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged `TestOps.test_mulacc_with_zero_strides`:
+  **1 passed in 15.91s**;
+- permanent negative/fractional zero-stride mulacc hardware case:
+  **1 passed in 12.16s**;
+- hardware-free planner/runtime contract: **104/104 in 6.61s**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+No LUT coefficients or two-level LUT schedule changed. Continue with
+`TestOps.test_matmul_simple`.
+
 ## 2026-07-30 — normal-fp32 direct einsum sum milestone
 
 The first normal-fp32 einsum failure, `einsum('ijk->')` over a `(4,6,8)`

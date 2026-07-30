@@ -1813,3 +1813,18 @@ at 13. No LUT change or host operator arithmetic was introduced.
 
 Continue with `TestOps.test_mulacc_with_zero_strides`; its first case passes
 and its second currently rejects as `unsupported_op:fused_epilogue`.
+
+### Normal-fp32 zero-stride mulacc
+
+| Coverage | Result |
+|---|---:|
+| unchanged `TestOps.test_mulacc_with_zero_strides` | **1 passed in 15.91s** |
+| permanent negative/fractional broadcast reduction | **1 passed in 12.16s** |
+| hardware-free planner/runtime contract | **104/104 in 6.61s** |
+
+The optimizer's `(SUM_axis0(a)*b)*3` form now runs as a compensated fp32
+CMAC sum followed by compensated fp32 DPU multiplications in the original
+factor order. The matcher is restricted to direct factors independent of
+all reduction axes. No LUT change or host operator arithmetic was added.
+
+Continue with `TestOps.test_matmul_simple`.

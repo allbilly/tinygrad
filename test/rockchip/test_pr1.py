@@ -344,6 +344,15 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 8)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_fp32_factorized_zero_stride_sum_stays_native(self):
+    a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+    b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+    program = build_native_program(_get_sink((a*b).sum((0,2))))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_large_fp32_contraction_uses_tiled_raw_cmac_boundary(self):
     a = Tensor.empty(3,5,8,10, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(11,7,5,13,8, dtype=dtypes.float, device="ROCKCHIP")

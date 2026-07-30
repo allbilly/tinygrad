@@ -11223,6 +11223,65 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                      info.outs[0], is_copy=True), relocs))
   return tuple(tasks)
 
+def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Lower optimizer-factorized SUM(x)*output_factor*constant in its original fp32 order."""
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
+     reduce.arg[0] is not Ops.ADD or _unwrap(reduce.src[0]).op is not Ops.INDEX: return None
+
+  def contains_reduce(u:UOp) -> bool: return any(node is reduce for node in u.toposort())
+  def peel_factors(u:UOp) -> list[UOp]|None:
+    u = _unwrap(u)
+    if u is reduce: return []
+    if u.op is not Ops.MUL or len(u.src) != 2: return None
+    lhs, rhs = (_unwrap(x) for x in u.src)
+    lhs_has, rhs_has = contains_reduce(lhs), contains_reduce(rhs)
+    if lhs_has == rhs_has: return None
+    nested, factor = (lhs, rhs) if lhs_has else (rhs, lhs)
+    factors = peel_factors(nested)
+    return None if factors is None else [*factors, factor]
+
+  factors = peel_factors(store.src[1])
+  if factors is None or not 1 <= len(factors) <= 3: return None
+  reductions = list(reduce.src[1:])
+  if any(factor.dtype is not dtypes.float or factor.op not in (Ops.INDEX, Ops.CONST) or
+         (factor.op is Ops.INDEX and factor.src[0].op is not Ops.PARAM) or
+         any(axis in factor.toposort() for axis in reductions) for factor in factors): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+
+  info, output_total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  tasks:list[RKSubTask] = []
+  next_slot = max(info.globals, default=-1)+1
+  device = store.src[0].src[0].device
+
+  def index_for(slot:int) -> UOp:
+    param = UOp.param(slot, dtypes.float, (output_total,), device=device)
+    return store.src[0].replace(src=(param, *store.src[0].src[1:]))
+  def stage_sink(out_slot:int, value:UOp) -> UOp:
+    return UOp.sink(UOp(Ops.END, src=(store.replace(src=(index_for(out_slot), value)), *loops)))
+  def reserve_after(stage_tasks:tuple[RKSubTask, ...]) -> int:
+    used = [r.globals_slot for task in stage_tasks for r in task.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    return max((next_slot, *used), default=next_slot-1)+1
+
+  sum_slot = next_slot
+  sum_tasks = _try_fp32_sum_subtasks(stage_sink(sum_slot, reduce))
+  if sum_tasks is None: return None
+  tasks.extend(sum_tasks)
+  next_slot = reserve_after(sum_tasks)
+  accumulator = sum_slot
+  for index, factor in enumerate(factors):
+    final = index == len(factors)-1
+    out_slot = info.outs[0] if final else next_slot
+    product = UOp(Ops.MUL, dtypes.float, (index_for(accumulator), factor))
+    product_tasks = _try_fp32_mul_subtasks(stage_sink(out_slot, product))
+    if product_tasks is None: return None
+    tasks.extend(product_tasks)
+    if not final:
+      next_slot = reserve_after(product_tasks)
+      accumulator = out_slot
+  return tuple(tasks)
+
 def _try_long_fp32_batched_dot_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Reduce contiguous long fp32 row dots through DPU products and two CMAC sum levels."""
   store, reduce = _store_node(sink), _reduce_node(sink)
@@ -12730,6 +12789,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fp32_add_tasks)
   if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_mul_tasks)
+  if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_factorized_sum_tasks)
   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
   # Rejected CPU operator fallbacks remain opt-in diagnostics only.
   if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
