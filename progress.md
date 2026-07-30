@@ -9312,3 +9312,13 @@ limited to the approved strict variance/std_mean operator family. No LUT or
 two-NPU-task LUT change was needed.
 
 Next forward group: `TestOps.test_std_mean_loaded_nan`.
+
+## 2026-07-30 — empty-dimension std_mean validation
+
+The unchanged `TestOps.test_std_mean_loaded_nan` group passes in **3.23s**.
+Its empty reduction simplifies before the fused std_mean matcher and uses the
+existing typed NaN path. The runtime reports the same non-failing fp16-to-fp32
+invalid-cast warning already seen in empty reduction coverage. No code, host
+operator boundary, or LUT changed.
+
+Next forward group: `TestOps.test_softmax`.

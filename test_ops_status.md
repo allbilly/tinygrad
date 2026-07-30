@@ -2012,3 +2012,9 @@ the two-element selector, normalization, affine bounds, and selector
 independence. Runtime writes fp32 std and mean from the same gathered source
 row, retaining the K=875 multi-row workaround. No LUT changed. Next forward
 group: `TestOps.test_std_mean_loaded_nan`.
+
+### Empty-dimension std_mean
+
+`TestOps.test_std_mean_loaded_nan`: **pass in 3.23s**. The graph simplifies to
+the existing typed NaN path, so no code or LUT change was required. Next
+forward group: `TestOps.test_softmax`.
