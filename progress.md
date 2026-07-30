@@ -9704,3 +9704,15 @@ and asymmetric padding. No code, host boundary, runtime ABI, large-K
 geometry, or LUT change was needed.
 
 Next forward group: `TestOps.test_conv2d`.
+
+## 2026-07-30 — general/grouped conv2d validation
+
+The general conv2d matrix reports **3 passed methods, 2 upstream-gated
+skips, and 13 passing subtests in 14.97s**. Seven additional active groups
+pass: large-input, simple/medium/general grouped, depthwise, fancy, and
+simple-strided conv2d. Those groups take **58.95s** across two invocations,
+including the slow-gated 4x16x64x64 case.
+
+No code, host boundary, runtime ABI, CMAC geometry, or LUT change was needed.
+After the LLVM-only `test_strided_conv2d_simple_vec`, next forward group:
+`TestOps.test_strided_conv2d`.

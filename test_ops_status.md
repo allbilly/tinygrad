@@ -2227,3 +2227,11 @@ or LUT changed. Contract: **128/128**. Next forward group:
 Four conv1d groups pass unchanged with **17 subtests in 22.24s**, including
 general, padded, strided, and asymmetric-padding cases. No code or LUT change
 was needed. Next forward group: `TestOps.test_conv2d`.
+
+### General and grouped conv2d
+
+The general matrix has **13 passing subtests** with two upstream-gated
+methods; seven more large-input/grouped/depthwise/fancy/strided groups pass.
+Total measured time is **73.92s** across three invocations. No code or LUT
+change was needed. After the LLVM-only `test_strided_conv2d_simple_vec`,
+next forward group: `TestOps.test_strided_conv2d`.
