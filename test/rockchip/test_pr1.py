@@ -388,6 +388,16 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(subtasks[0].task.is_copy)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_conditional_movement_uses_exact_host_boundary(self):
+    for mode in ("reflect", "replicate"):
+      expression = Tensor.empty(1,1,5,5, dtype=dtypes.float, device="ROCKCHIP").pad((0,2,3,2), mode=mode)
+      program = build_native_program(_get_sink(expression))
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertTrue(subtasks[0].task.is_copy)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
     for shape, axis in (((45,65), 1), ((45,), 0)):
       expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)

@@ -9157,6 +9157,16 @@ def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if Ops.FDIV not in ops and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_conditional_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize reflected/replicated movement graphs whose source address contains a WHERE."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  value = _unwrap(store.src[1])
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if not inputs or len({u.src[0].buf_uop.arg.slot for u in inputs}) != 1: return None
+  if not any(any(x.op is Ops.WHERE for x in u.src[1].toposort()) for u in inputs): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
   store = _store_node(sink)
@@ -13621,6 +13631,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (one_hot_tasks := _try_one_hot_subtasks(sink)) is not None: return build_native_program_multi(sink, one_hot_tasks)
   if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
   if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
+  if (conditional_movement_tasks := _try_conditional_movement_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, conditional_movement_tasks)
   # WIP: only valid when the producer was the fused one-dimensional long
   # scan; multidimensional cumprod uses the same physical helper shape.
   # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:

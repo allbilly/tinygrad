@@ -2181,3 +2181,11 @@ Fifteen consecutive slice groups pass unchanged in **16.71s**, including
 positive/negative strides, empty and out-of-bounds ranges, integer/constant
 tensor indices, `None`, ellipsis, error checks, and double slicing. No code
 or LUT change was needed. Next forward group: `TestOps.test_pad`.
+
+### Padding
+
+Six padding groups pass in **23.94s**: constant/cropped, reflect, replicate,
+circular, reshape, and sliced padding. Conditional-address reflect/replicate
+movement now uses one strict typed host task when the single source data-load
+index contains `WHERE`; other padding paths are unchanged. No LUT changed.
+Contract: **126/126**. Next forward group: `TestOps.test_stack_slice`.

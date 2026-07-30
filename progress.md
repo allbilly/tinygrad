@@ -9617,3 +9617,21 @@ shapes/start-after-end, expected index errors, and chained double slices.
 
 No code, host boundary, runtime ABI, or LUT change was needed. Next forward
 group: `TestOps.test_pad`.
+
+## 2026-07-30 — padding milestone
+
+All six unchanged padding groups pass in **23.94s** across three invocations:
+constant/cropped padding, reflect, replicate, circular, pad-then-reshape, and
+pad-then-slice. Valid cases and each expected argument/domain error are
+covered. The hardware-free Rockchip contract is **126/126 in 7.15s**.
+
+Reflect and replicate lowering encode their source address with nested
+integer `WHERE` expressions. The old movement matcher rejected that form and
+the generic planner stopped at `unsupported_op:Ops.WHERE`.
+`_try_conditional_movement_host_subtasks` now recognizes only reduction-free,
+single-source graphs where a data-load address itself contains `WHERE`, then
+uses the existing typed serialized evaluator for exact mapped movement.
+Constant, circular, reshape, and slice padding retain their prior paths.
+
+No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_stack_slice`.
