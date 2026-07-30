@@ -9154,7 +9154,8 @@ def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.float and u.src[0].op is Ops.PARAM]
   if len({u.src[0].buf_uop.arg.slot for u in inputs}) < 2 or len({u.src[1] for u in inputs}) < 2: return None
   ops = {u.op for u in value.toposort()}
-  if Ops.FDIV not in ops and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
+  padded_add = value.op is Ops.ADD and Ops.WHERE in ops
+  if Ops.FDIV not in ops and not padded_add and not {Ops.WHERE, Ops.EXP2, Ops.LOG2}.issubset(ops): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
 def _try_conditional_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:

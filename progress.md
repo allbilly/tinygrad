@@ -9716,3 +9716,20 @@ including the slow-gated 4x16x64x64 case.
 No code, host boundary, runtime ABI, CMAC geometry, or LUT change was needed.
 After the LLVM-only `test_strided_conv2d_simple_vec`, next forward group:
 `TestOps.test_strided_conv2d`.
+
+## 2026-07-30 — strided/padded/dilated conv2d milestone
+
+Ten unchanged stride, negative/simple/asymmetric padding, padded-convolution,
+padding-add, and dilation groups pass together with **7 parameterized
+subtests in 25.19s**. The hardware-free Rockchip contract is **129/129 in
+7.52s**.
+
+The convolution cases already passed. `test_padding_add` failed because
+normal-fp32 `x + pad(w)` crossed the DPU half boundary, producing 356/4096
+tolerance misses concentrated near zero. The strict fp32 broadcast matcher
+now accepts root ADD only when the graph also contains the padding `WHERE`.
+The existing affine broadcast-add contract test still selects its nine-task
+NPU limb path, so ordinary broadcast addition is not redirected.
+
+No runtime ABI, CMAC geometry, or LUT changed. Mypy remains at the exact
+12-error baseline. Next forward group: `TestOps.test_max_pool2d_simple`.

@@ -2235,3 +2235,11 @@ methods; seven more large-input/grouped/depthwise/fancy/strided groups pass.
 Total measured time is **73.92s** across three invocations. No code or LUT
 change was needed. After the LLVM-only `test_strided_conv2d_simple_vec`,
 next forward group: `TestOps.test_strided_conv2d`.
+
+### Strided, padded, and dilated conv2d
+
+Ten groups pass with **7 subtests in 25.19s**. The only change is a strict
+exact-fp32 boundary for root ADD graphs containing a padding WHERE, fixing
+356/4096 `x+pad(w)` half-rounding misses. Ordinary affine broadcast add
+retains its established nine-task NPU path. No LUT changed. Contract:
+**129/129**. Next forward group: `TestOps.test_max_pool2d_simple`.
