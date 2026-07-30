@@ -1,0 +1,396 @@
+From f62827791bdc0dbf65d331518538049e75e6852d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 20:42:27 +0800
+Subject: [PATCH] rockchip: pass fancy indexing and gather
+
+---
+ progress.md                          | 30 +++++++++
+ test/rockchip/test_pr1.py            | 29 ++++++++-
+ test_ops_status.md                   | 16 +++++
+ tinygrad/runtime/ops_rockchip.py     | 95 +++++++++++++++++++++++++---
+ tinygrad/runtime/support/rockchip.py | 73 +++++++++++++++++++--
+ 5 files changed, 227 insertions(+), 16 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index bd36922af..21166b5b0 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9854,3 +9854,33 @@ and cast semantics. Pure integer movement remains on the compact path.
+ 
+ No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_cat`.
++
++## 2026-07-30 — fancy-index and gather milestone
++
++Ten unchanged fancy-index methods plus explicit `gather` pass in **194.12s**
++across separate invocations. Coverage includes infinity/NaN values,
++dimension collapse/injection, mixed ellipsis and slices, tensor/list/tuple
++indices, invalid-index errors, and all gather dimensions. The largest
++no-collapse and injected-dimension groups pass in **39.62s** and **90.82s**.
++The hardware-free Rockchip contract is **136/136 in 10.18s**.
++
++The first multi-index gather originally produced almost all zeros because
++its dynamic negative-index/bounds preprocessing crossed generic NPU int/bool
++arithmetic. Those multi-input preprocessing kernels now use the existing
++typed evaluator. Some injected/mixed forms instead fuse a masked ADD
++reduction over up to 300 candidate coordinates. A new bounded
++`_HOST_ELEMENTWISE_REDUCE_LAYOUT` keeps the elementwise body and static loop
++and reduction axes compact, then vectorizes the candidate grid and performs
++one fp32 ADD reduction per output.
++
++Two rejected approaches are retained as debugging guidance. Expanding all
++300 candidates into one bytecode expression and interpreting the compact
++body one scalar at a time both hit the roughly four-minute process watchdog
++inside repeated NumPy scalar casts. Vectorization reduced the full
++11-subcase injection group to 90.82s without broadening beyond a masked
++multi-index fp32 ADD signature capped at 512 candidates.
++
++This milestone adds one runtime ABI tag but changes no LUT. Mypy remains at
++the exact 12-error baseline. The adjacent explicit scatter schedule is a
++different unsupported-WHERE signature. Next forward group:
++`TestOps.test_scatter`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index c9c8322b8..3cd449408 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -11,7 +11,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
+                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
+                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
+-                                               _HOST_AVG_POOL_LAYOUT)
++                                               _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -419,6 +419,33 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(subtasks[0].task.is_copy)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fancy_index_preprocessing_uses_typed_host_boundary(self):
++    x = Tensor.empty(2,5,6,5,3,4, dtype=dtypes.float, device="ROCKCHIP")
++    indices = (Tensor.empty(2,1,1,1,1,1, dtype=dtypes.int, device="ROCKCHIP"),
++               Tensor.empty(1,3,1,1,1,1, dtype=dtypes.int, device="ROCKCHIP"),
++               Tensor.empty(1,1,4,1,1,1, dtype=dtypes.int, device="ROCKCHIP"),
++               Tensor.empty(2,1,1,5,1,1, dtype=dtypes.int, device="ROCKCHIP"),
++               Tensor.empty(1,1,1,1,6,1, dtype=dtypes.int, device="ROCKCHIP"))
++    sinks = [early_simplify(call.src[0]) for call in x[indices].schedule_linear().src if call.src[0].op is Ops.SINK]
++    self.assertEqual(len(sinks), 3)
++    for sink in sinks[:2]:
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    reduced = x[indices[0], ..., indices[-1]]
++    reduced_sinks = [early_simplify(call.src[0]) for call in reduced.schedule_linear().src if call.src[0].op is Ops.SINK]
++    self.assertEqual(len(reduced_sinks), 1)
++    reduced_program = build_native_program(reduced_sinks[0])
++    self.assertIsNotNone(reduced_program)
++    self.assertEqual(reduced_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++    injected = x[indices[0], indices[1], None, indices[3], indices[4]]
++    injected_sink = next(early_simplify(call.src[0]) for call in injected.schedule_linear().src if call.src[0].op is Ops.SINK)
++    injected_program = build_native_program(injected_sink)
++    self.assertIsNotNone(injected_program)
++    self.assertEqual(injected_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++
+   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
+     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
+     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index ac32cee63..f66527604 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2301,3 +2301,19 @@ this prevents `13/9` from becoming integer `1` and routes the unchanged graph
+ to the exact typed conditional-movement evaluator. Pure integer movement is
+ unchanged. No runtime ABI or LUT changed. Contract: **135/135**. Next forward
+ group: `TestOps.test_cat`.
++
++### Fancy indexing and gather
++
++Ten fancy-index methods and explicit `gather` pass in **194.12s**, including
++dimension injection/collapse, ellipsis, lists/tuples/tensors, invalid cases,
++and infinity/NaN values. Dynamic bounds and negative-index preprocessing now
++uses the typed evaluator instead of lossy generic NPU int/bool arithmetic.
++Fused masked gathers use a new compact, vectorized, bounded
++`_HOST_ELEMENTWISE_REDUCE_LAYOUT` for up to 512 static candidates; the
++largest official form uses 300.
++
++Both a 300-term unrolled expression and scalar interpretation hit the
++roughly four-minute process watchdog. Keeping one bytecode body and
++vectorizing its output×candidate grid makes the 11-case injection group pass
++in **90.82s**. No LUT changed. Contract: **136/136**. Next forward group:
++`TestOps.test_scatter`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 0768c1d02..d6577c415 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -24,7 +24,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+-  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
++  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -551,8 +552,14 @@ def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
+   import numpy as np
+-  total, tag, out_dtype_code, n_ranges, *meta = task.layout
+-  assert tag == _HOST_ELEMENTWISE_LAYOUT
++  total, tag, out_dtype_code, *layout = task.layout
++  assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++  if tag == _HOST_ELEMENTWISE_LAYOUT:
++    n_ranges, *meta = layout
++    nloops, nreductions = n_ranges, 0
++  else:
++    nloops, nreductions, *meta = layout
++    n_ranges = nloops+nreductions
+   extents, cursor = meta[:n_ranges], n_ranges
+   out_n = meta[cursor]
+   out_code = meta[cursor+1:cursor+1+out_n]
+@@ -641,9 +648,79 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+     assert len(stack) == 1
+     return stack[0]
+ 
++  loop_extents, reduction_extents = extents[:nloops], extents[nloops:]
++  if nreductions:
++    reduction_total = int(np.prod(reduction_extents, dtype=np.int64))
++
++    def coordinate_vectors(shape, linear):
++      ret = []
++      for axis in range(len(shape)):
++        stride = int(np.prod(shape[axis+1:], dtype=np.int64))
++        ret.append((linear//stride) % shape[axis])
++      return ret
++
++    def evaluate_vector(code, coords):
++      stack:list = []
++      for pos in range(0, len(code), 4):
++        op, dtype_code, arg0, arg1 = code[pos:pos+4]
++        if op == 0:
++          bits = (arg0 & 0xFFFFFFFF) | ((arg1 & 0xFFFFFFFF) << 32)
++          if dtype_code == 0: value = bool(bits)
++          elif dtype_code == 6: value = struct.unpack('<e', struct.pack('<H', bits & 0xFFFF))[0]
++          elif dtype_code == 7: value = struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
++          elif dtype_code == 12: value = struct.unpack('<d', struct.pack('<Q', bits))[0]
++          else:
++            width = np.dtype(np_dtypes[dtype_code]).itemsize * 8
++            bits &= (1 << width)-1
++            if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
++            value = bits
++          stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
++          continue
++        if op == 1:
++          stack.append(np.asarray(coords[arg0], dtype=np_dtypes[dtype_code]))
++          continue
++        if op == 2:
++          indices = np.asarray(stack.pop(), dtype=np.int64)
++          source = inputs[arg0][dtype_code]
++          gathered = np.zeros(indices.shape, dtype=np_dtypes[dtype_code])
++          valid = (indices >= 0) & (indices < source.size)
++          gathered[valid] = source[indices[valid]]
++          stack.append(gathered)
++          continue
++        args = stack[-arg0:] if arg0 else []
++        if arg0: del stack[-arg0:]
++        if op == 3: value = args[0] + args[1]
++        elif op == 4: value = args[0] * args[1]
++        elif op == 8: value = args[0] < args[1]
++        elif op == 9: value = args[0] != args[1]
++        elif op == 10: value = np.where(args[0], args[1], args[2])
++        elif op == 11: value = args[0] & args[1]
++        elif op == 12: value = args[0] | args[1]
++        elif op == 13: value = args[0] ^ args[1]
++        elif op == 14: value = args[0]
++        else: raise RuntimeError(f"rk: invalid vector fancy-index opcode {op}")
++        stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
++      assert len(stack) == 1
++      return stack[0]
++
++    loop_linear = np.arange(total, dtype=np.int64)
++    loop_coords = coordinate_vectors(loop_extents, loop_linear)
++    output_coords = [*loop_coords, *(np.zeros(total, dtype=np.int64) for _ in reduction_extents)]
++    output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
++    if np.any(output_indices < 0) or np.any(output_indices >= result.size):
++      raise RuntimeError("rk: vector fancy-index output index out of bounds")
++    full_linear = np.arange(total*reduction_total, dtype=np.int64)
++    full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
++    coords = [*coordinate_vectors(loop_extents, full_loop_linear),
++              *coordinate_vectors(reduction_extents, reduction_linear)]
++    values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(total, reduction_total)
++    result[output_indices] = np.add.reduce(values, axis=1, dtype=np.float32)
++    ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++    return
++
+   for linear in range(total):
+     rem, coords = linear, [0] * n_ranges
+-    for axis in range(n_ranges-1, -1, -1): rem, coords[axis] = divmod(rem, extents[axis])
++    for axis in range(nloops-1, -1, -1): rem, coords[axis] = divmod(rem, loop_extents[axis])
+     out_index = int(evaluate(out_code, coords))
+     if not 0 <= out_index < result.size: raise RuntimeError(f"rk: host elementwise output index out of bounds {out_index}")
+     result[out_index] = evaluate(value_code, coords)
+@@ -1416,7 +1493,7 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
+           _run_host_copysign(task, st.relocs, bufs)
+           continue
+-        if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+           _run_host_elementwise(task, st.relocs, bufs)
+           continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
+@@ -1547,7 +1624,8 @@ class RockchipProgram(Program['RockchipDevice']):
+               _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
+             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++            elif st.task.is_copy and len(st.task.layout) > 1 and \
++                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+               _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             else:
+               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
+@@ -1581,7 +1659,8 @@ class RockchipProgram(Program['RockchipDevice']):
+           if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+             continue
+-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++          if st.task.is_copy and len(st.task.layout) > 1 and \
++             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+             _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             continue
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+@@ -1835,7 +1914,7 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
+             _run_host_copysign(task, st.relocs, tuple(ext))
+             continue
+-          if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
++          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+             _run_host_elementwise(task, st.relocs, tuple(ext))
+             continue
+           ct = task.layout[0]
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 18f81a02d..43e8bad2c 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -205,6 +205,7 @@ _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI
+ _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
+ _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
+ _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
++_HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -9073,20 +9074,33 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
+-def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTask, ...]|None:
++def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|None=None) -> tuple[RKSubTask, ...]|None:
+   """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
+   store = _store_node(sink)
+-  if store is None or _reduce_node(sink) is not None: return None
+-  output, val = store.src
++  if store is None: return None
++  if reduction is None:
++    if _reduce_node(sink) is not None: return None
++    output, val = store.src
++  else:
++    reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction: return None
++    output, val = store.src[0], reduction.src[0]
+   out_dtype = _host_dtype_code(output.dtype)
+   if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
+   # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
+   # gather/fancy-index kernels whose data INDEX address loads an index tensor.
+   if not allow_plain and not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
+-  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
++  if reduction is None:
++    ranges = [u for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
++    nloops, nreductions = len(ranges), 0
++  else:
++    loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++    ranges = [*loops, *reduction.src[1:]]
++    nloops, nreductions = len(loops), len(reduction.src)-1
++    if any(u.src[0].op is not Ops.CONST for u in ranges): return None
+   range_ids = {u:i for i,u in enumerate(ranges)}
+   extents = tuple(int(u.src[0].arg) for u in ranges)
+-  total = prod(extents)
++  total = prod(extents[:nloops])
+   if total != prod(_shape_of_store(sink)): return None
+   input_slots:list[int] = []
+   op_codes = {Ops.ADD:3, Ops.MUL:4, Ops.FDIV:5, Ops.RECIPROCAL:6, Ops.MAX:7,
+@@ -9128,8 +9142,12 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTa
+   value_code:list[int] = []
+   if not emit(output.src[1], out_code) or not emit(val, value_code): return None
+   out_slot = ProgramInfo.from_sink(sink).outs[0]
+-  layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
+-            len(out_code), *out_code, len(value_code), *value_code)
++  if reduction is None:
++    layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
++              len(out_code), *out_code, len(value_code), *value_code)
++  else:
++    layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions, *extents,
++              len(out_code), *out_code, len(value_code), *value_code)
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+@@ -9169,6 +9187,43 @@ def _try_conditional_movement_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
+   if not any(any(x.op is Ops.WHERE for x in u.src[1].toposort()) for u in inputs): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_fancy_index_preprocess_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Preserve typed bounds/negative-index preprocessing for multi-index gathers."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None or store.src[0].dtype not in (dtypes.bool, dtypes.int): return None
++  value = _unwrap(store.src[1])
++  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and
++            u.dtype in (dtypes.bool, dtypes.int)]
++  if len({u.src[0].buf_uop.arg.slot for u in inputs}) < 2: return None
++  ops = {u.op for u in value.toposort()}
++  if not {Ops.WHERE, Ops.CMPLT}.issubset(ops): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
++def _try_fancy_index_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Unroll only bounded masked ADD reductions fused into multi-index gathers."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
++  reduce = reductions[0]
++  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or not reduce.src[1:] or \
++     any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]): return None
++  extents = [int(axis.src[0].arg) for axis in reduce.src[1:]]
++  if prod(extents) > 512: return None
++  inputs = [u for u in reduce.src[0].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++  input_dtypes = {u.dtype for u in inputs}
++  if dtypes.float not in input_dtypes or dtypes.int not in input_dtypes or \
++     len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) < 2: return None
++  if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
++
++  # WIP reference: the initial implementation expanded every reduction term
++  # into one giant elementwise expression. A 300-candidate injected-dimension
++  # gather ran for minutes and aborted inside NumPy scalar casting.
++  # terms = [reduce.src[0].substitute(fixed) for fixed in ...]
++  # expanded = functools.reduce(lambda a, b: UOp(Ops.ADD, dtypes.float, (a, b)), terms)
++  # return _try_elementwise_host_subtasks(sink.substitute(
++  #   {store:store.replace(src=(store.src[0], expanded))}), allow_plain=True)
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
++
+ def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
+   store = _store_node(sink)
+@@ -13794,6 +13849,10 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
+   if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, logcumsumexp_tasks)
++  if (fancy_index_tasks := _try_fancy_index_preprocess_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fancy_index_tasks)
++  if (fancy_index_reduce_tasks := _try_fancy_index_reduction_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fancy_index_reduce_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, exp_correction_tasks)
+-- 
+2.34.1
+
