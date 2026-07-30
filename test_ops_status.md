@@ -2326,3 +2326,12 @@ expected errors. A strict one-int-index, one/two-fp32-input matcher recognizes
 the reduction-free nested `WHERE + OR + CMPNE` update selector and reuses the
 typed elementwise evaluator. No runtime ABI or LUT changed. Contract:
 **137/137**. Next forward group: `TestOps.test_scatter_add`.
+
+### Legacy scalar scatter reductions
+
+Legacy scatter ADD/MUL pass together in **3.35s** for infinity and NaN; the
+tensor-source API error passes unchanged in **2.56s**. The compact typed
+reduction layout now encodes ADD versus MUL and feeds a second typed
+base-epilogue task, reusing the output buffer as safe all-host scratch. No
+new tag or LUT changed. Contract: **138/138**. Next forward group:
+`TestOps.test_scatter_reduce`.

@@ -556,9 +556,9 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
   if tag == _HOST_ELEMENTWISE_LAYOUT:
     n_ranges, *meta = layout
-    nloops, nreductions = n_ranges, 0
+    nloops, nreductions, reduction_op = n_ranges, 0, -1
   else:
-    nloops, nreductions, *meta = layout
+    nloops, nreductions, reduction_op, *meta = layout
     n_ranges = nloops+nreductions
   extents, cursor = meta[:n_ranges], n_ranges
   out_n = meta[cursor]
@@ -714,7 +714,9 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
     coords = [*coordinate_vectors(loop_extents, full_loop_linear),
               *coordinate_vectors(reduction_extents, reduction_linear)]
     values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(total, reduction_total)
-    result[output_indices] = np.add.reduce(values, axis=1, dtype=np.float32)
+    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else None
+    if reducer is None: raise RuntimeError(f"rk: invalid typed reduction opcode {reduction_op}")
+    result[output_indices] = reducer.reduce(values, axis=1, dtype=np.float32)
     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
     return
 

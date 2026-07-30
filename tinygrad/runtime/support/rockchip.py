@@ -9083,7 +9083,7 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
     output, val = store.src
   else:
     reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
-    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction: return None
+    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction or reduction.arg[0] not in (Ops.ADD, Ops.MUL): return None
     output, val = store.src[0], reduction.src[0]
   out_dtype = _host_dtype_code(output.dtype)
   if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
@@ -9146,7 +9146,8 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
     layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
               len(out_code), *out_code, len(value_code), *value_code)
   else:
-    layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions, *extents,
+    layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions,
+              0 if reduction.arg[0] is Ops.ADD else 1, *extents,
               len(out_code), *out_code, len(value_code), *value_code)
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
@@ -9238,6 +9239,38 @@ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                       u.arg is not Invalid and float(u.arg) != 0.0 for u in value.toposort()): return None
   if not {Ops.WHERE, Ops.OR, Ops.CMPNE}.issubset({u.op for u in value.toposort()}): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
+def _try_scatter_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Stage only legacy scalar scatter ADD/MUL reductions and their base epilogue."""
+  store = _store_node(sink)
+  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
+  reduce, value = reductions[0], _unwrap(store.src[1])
+  if reduce.dtype is not dtypes.float or reduce.arg[0] not in (Ops.ADD, Ops.MUL) or value.op is not reduce.arg[0] or \
+     reduce not in value.toposort() or not reduce.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]) or \
+     prod(int(axis.src[0].arg) for axis in reduce.src[1:]) > 64: return None
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) != 1 or \
+     len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}) != 1: return None
+  if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
+  nonfinite = [u for u in reduce.src[0].toposort() if u.op is Ops.CONST and u.dtype is dtypes.float and
+               u.arg is not Invalid and not math.isfinite(float(u.arg))]
+  if not nonfinite: return None
+
+  info = ProgramInfo.from_sink(sink)
+  # Both stages are host tasks, so no mixed-CMAC scratch allocator runs.
+  # Reuse the final output: the epilogue snapshots it before overwriting.
+  scratch_slot = info.outs[0]
+  device, total = store.src[0].src[0].device, prod(_shape_of_store(sink))
+  scratch = UOp.param(scratch_slot, dtypes.float, (total,), device=device)
+  scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
+  reduction_store = store.replace(src=(scratch_index, reduce))
+  reduction_sink = sink.substitute({store:reduction_store})
+  reduction_tasks = _try_elementwise_host_subtasks(reduction_sink, allow_plain=True, reduction=reduce)
+  if reduction_tasks is None: return None
+  epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:scratch_index})))
+  epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
+  return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
 
 def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
@@ -13870,6 +13903,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fancy_index_reduce_tasks)
   if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, scatter_tasks)
+  if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, scatter_reduce_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

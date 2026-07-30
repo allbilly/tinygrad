@@ -9903,3 +9903,22 @@ fingerprint.
 
 No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_scatter_add`.
+
+## 2026-07-30 — legacy scalar scatter-reduction milestone
+
+The unchanged legacy `test_scatter_add` and `test_scatter_mul` groups pass
+together in **3.35s**, covering both infinity and NaN scalar updates. The
+adjacent tensor-source API error passes unchanged in **2.56s**. The
+hardware-free Rockchip contract is **138/138 in 10.34s**.
+
+Each legacy scalar reduction lowers to a four-candidate masked ADD or MUL,
+followed by the same operation with the base tensor. The compact typed
+reduction layout now carries an explicit ADD/MUL opcode. Classification emits
+one reduction task and one typed epilogue task; because an all-host program
+does not enter the mixed-CMAC scratch allocator, the first task safely uses
+the final output buffer as scratch and the epilogue snapshots it before
+overwriting.
+
+This extends the existing reduction-layout ABI but adds no new tag or LUT.
+Mypy remains at the exact 12-error baseline. Next forward group:
+`TestOps.test_scatter_reduce`.
