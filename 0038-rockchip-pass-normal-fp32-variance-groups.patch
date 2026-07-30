@@ -1,0 +1,350 @@
+From 0d556107405306f39deead55b1e93b12b9a7b367 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:14:26 +0800
+Subject: [PATCH 38/38] rockchip: pass normal fp32 variance groups
+
+---
+ progress.md                          | 74 ++++++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 13 ++++-
+ test_ops_status.md                   | 25 ++++++++++
+ tinygrad/runtime/ops_rockchip.py     | 64 +++++++++++++++++++++++-
+ tinygrad/runtime/support/rockchip.py | 67 +++++++++++++++++++++++++
+ 5 files changed, 240 insertions(+), 3 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 9e2b7867a..9a16c209a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9183,3 +9183,77 @@ pass, the final hardware-free suite is **111/111**, and the current mypy
+ baseline is the pre-existing **12 errors**. See the detailed
+ **normal-fp32 mean and scalar factorized epilogue** section for the
+ `conv_grok` comparison and debug method. Continue with `TestOps.test_var`.
++
++## 2026-07-30 — normal-fp32 variance milestone
++
++All unchanged forward variance groups pass:
++
++| Coverage | Result |
++|---|---:|
++| `TestOps.test_var` | **1 passed in 27.72s** |
++| `TestOps.test_var_axis` | **1 passed in 41.92s** |
++| zero-axis + one-axis + keepdim | pass |
++| combined five official groups | **5 passed in 101.43s** |
++| mean/isclose/basic-DPU regression | **5 passed in 19.93s** |
++| hardware-free Rockchip contract | **112/112 in 8.13s** |
++
++Tinygrad schedules variance in two passes: first mean, then
++`SUM((x-mean)^2) * (1/(K-correction))`. A native prototype reused compensated
++fp32 ADD, MUL, long SUM, and scalar MUL. It classified to **114 tasks / 12
++CMAC tasks** for the full `(15,25,35)` case. Its first in-place probe exposed
++a real runtime bug: `_HOST_FP32_COMBINE_LAYOUT` always writes four-byte fp32
++values, but mixed scratch sizing allocated two bytes unless `fp32_output` was
++set. The allocator now recognizes the combine layout explicitly; its former
++size rule remains commented in source. After that fix the native prototype
++was memory-safe but returned NaN, so the 114-task design remains rejected WIP
++and was not installed.
++
++Under the user's explicit permission to use a host operator boundary where
++other non-CPU backends allow `run_host`, the active implementation is one
++strict `_HOST_VARIANCE_LAYOUT` task. It is not a generic reduction fallback.
++The matcher requires all of the following:
++
++- fp32 output and ADD reduction;
++- an exact `MUL(delta, delta)` square using the same UOp twice;
++- `delta = direct_fp32_INDEX + direct_fp32_INDEX * -1`;
++- a direct constant correction scale that is positive or `+inf`;
++- static LOOP/REDUCE ranges, affine nonnegative data/mean/output indexes,
++  a mean independent of every reduction axis, and bounded buffers.
++
++The serialized task carries range extents, affine mappings, and the scale.
++Runtime gathers original fp32 rows and executes NumPy fp32 variance with the
++correction inferred from `K - round(1/scale)`. Positive infinity therefore
++correctly represents `correction == K`; NaN and nonpositive scales remain
++rejected. Empty/invalid-degree cases that simplify to constant NaN continue
++through the existing typed-fill path.
++
++### Why the scheduled mean is not consumed
++
++Axis 0 and axis 2 passed when the strict task initially consumed the first
++kernel's mean. Axis `(1,2)` failed 7/15 rows, with maximum variance error
++`0.01523459`. That case is 15 independent rows at K=875. This matches the
++current `allbilly/rk3588/conv_grok` finding that multi-row GEMM is proven only
++through the small aligned-K region (roughly K<=416) and larger K must be row
++serialized. The variance boundary therefore recomputes each row mean from
++the original fp32 data it already owns, rather than consuming a known-bad
++multi-row K=875 native mean. The former mean-buffer delta calculation remains
++commented as WIP reference.
++
++### Debug method
++
++1. Print all scheduled sinks, not only the first: variance has a mean sink
++   followed by the centered-square sink.
++2. For the second sink, confirm one LOOP range for flattened output rows and
++   one REDUCE range for flattened K (full variance has zero LOOP ranges).
++3. Inspect the task layout prefix:
++   `(output_total, _HOST_VARIANCE_LAYOUT, nloops, nreductions, ...)`.
++4. If only a large-axis case drifts, compare `(rows,K)` against the proven
++   multi-row K boundary before changing correction arithmetic.
++5. For correction edges, distinguish a constant-NaN sink from the
++   centered-square graph with `scale=+inf`.
++6. If a future native scratch chain uses fp32 combine output, verify scratch
++   allocation is `4*elements`; a two-byte allocation can corrupt memory
++   before any numerical diagnosis is meaningful.
++
++No LUT coefficient or two-task LUT schedule changed. The next forward group
++is `TestOps.test_std`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 4b23688da..b5ca61ba3 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -9,7 +9,7 @@ from tinygrad.codegen import pm_to_program
+ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, decode_rk, encode_rk_multi, decode_rk_multi,
+                                                build_native_program, RKPlan, RKSubTask, _HOST_FP32_HALF_LAYOUT,
+                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+-                                               _HOST_ELEMENTWISE_LAYOUT)
++                                               _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -336,6 +336,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertIn((1, _HOST_FP32_RESIDUAL_LAYOUT, 0, 0), scalar_views)
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_fp32_variance_uses_one_strict_serialized_task(self):
++    expression = Tensor.empty(15,25,35, dtype=dtypes.float, device="ROCKCHIP").var((1,2))
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    program = build_native_program(sinks[-1])
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertTrue(subtasks[0].task.is_copy)
++    self.assertTrue(subtasks[0].task.fp32_output)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index bb6560554..e3e5107e8 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1954,3 +1954,28 @@ non-scalar affine checks remain active.
+ No LUT or host operator arithmetic changed. `test_mean_zero_axis` retains a
+ non-failing NumPy invalid-cast warning. Next forward group:
+ `TestOps.test_var`.
++
++### Normal-fp32 variance
++
++| Group | Status |
++|---|---:|
++| `test_var` | pass |
++| `test_var_axis` | pass |
++| `test_var_zero_in_axis` | pass |
++| `test_var_one_in_axis` | pass |
++| `test_var_keepdim` | pass |
++| combined official run | **5 passed in 101.43s** |
++| hardware-free Rockchip contract | **112/112** |
++
++Variance's exact second-pass topology is serialized as one strict
++`_HOST_VARIANCE_LAYOUT` task under the user's approved host-operator policy.
++The matcher requires `SUM((x-mean)^2)*scale`, static affine ranges, direct
++fp32 inputs, and bounded mappings; it is not a general reduction fallback.
++It recomputes each row mean from original fp32 data because the `(15,K=875)`
++axis case crosses the `conv_grok` multi-row K boundary and its scheduled
++native mean corrupts 7/15 rows.
++
++A rejected native prototype used 114 tasks and returned NaN. It also exposed
++and fixed two-byte scratch underallocation for four-byte
++`_HOST_FP32_COMBINE_LAYOUT` writes. No LUT changed. Next forward group:
++`TestOps.test_std`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 9c381634b..462030215 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -24,7 +24,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+-  _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_VARIANCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -649,6 +649,60 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+     result[out_index] = evaluate(value_code, coords)
+   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+ 
++def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
++  import numpy as np
++  output_total, tag, nloops, nreductions, *meta = task.layout
++  assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
++  naxes, cursor = nloops+nreductions, 0
++  extents = tuple(meta[cursor:cursor+naxes])
++  cursor += naxes
++  scale = struct.unpack('<f', struct.pack('<I', meta[cursor] & 0xFFFFFFFF))[0]
++  cursor += 1
++  data_mapping = tuple(meta[cursor:cursor+naxes+1])
++  cursor += naxes+1
++  mean_mapping = tuple(meta[cursor:cursor+naxes+1])
++  cursor += naxes+1
++  output_mapping = tuple(meta[cursor:cursor+nloops+1])
++  assert cursor+nloops+1 == len(meta)
++
++  output_buf, data_buf, mean_buf = (bufs[r.globals_slot] for r in relocs)
++  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float32)
++  mean = np.frombuffer(ctypes.string_at(mean_buf.va_addr, mean_buf.size), dtype=np.float32)
++  result = np.empty(output_buf.size//4, dtype=np.float32)
++  loop_extents, reduction_extents = extents[:nloops], extents[nloops:]
++  reduction_total = int(np.prod(reduction_extents, dtype=np.int64))
++  correction = reduction_total-round(1.0/float(scale))
++  if correction < 0 or correction > reduction_total:
++    raise RuntimeError(f"rk: variance invalid correction {correction} for K={reduction_total}")
++
++  def coordinates(linear:int, shape:tuple[int,...]) -> list[int]:
++    ret = [0]*len(shape)
++    for axis in range(len(shape)-1, -1, -1): linear, ret[axis] = divmod(linear, shape[axis])
++    return ret
++  def affine(mapping:tuple[int,...], coords:list[int]) -> int:
++    return mapping[0] + sum(coord*stride for coord, stride in zip(coords, mapping[1:]))
++
++  with np.errstate(all="ignore"):
++    for output_linear in range(output_total):
++      loop_coords = coordinates(output_linear, loop_extents)
++      output_index = affine(output_mapping, loop_coords)
++      if not 0 <= output_index < result.size: raise RuntimeError(f"rk: variance output index out of bounds {output_index}")
++      values = np.empty(reduction_total, dtype=np.float32)
++      for reduction_linear in range(reduction_total):
++        coords = [*loop_coords, *coordinates(reduction_linear, reduction_extents)]
++        data_index, mean_index = affine(data_mapping, coords), affine(mean_mapping, coords)
++        if not 0 <= data_index < data.size or not 0 <= mean_index < mean.size:
++          raise RuntimeError(f"rk: variance input index out of bounds data={data_index} mean={mean_index}")
++        values[reduction_linear] = data[data_index]
++      # WIP reference: consuming `mean[mean_index]` here exposed the native
++      # multi-row K=875 mean corruption. The strict variance boundary owns the
++      # full operator, so recompute its row mean from the original fp32 values.
++      # delta = np.float32(data[data_index]-mean[mean_index])
++      # accumulator = np.float32(accumulator + np.float32(delta*delta))
++      result[output_index] = np.var(values, dtype=np.float32, ddof=correction)
++  ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++
+ def _run_host_movement(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute a compact postfix integer-index program and copy exact element bytes."""
+   total, tag, itemsize, n_ranges, *meta = task.layout
+@@ -1286,6 +1340,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_ELEMENTWISE_LAYOUT:
+           _run_host_elementwise(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
++          _run_host_variance(task, st.relocs, bufs)
++          continue
+         if task.is_fill:
+           total = task.layout[0]
+           out_slot = st.relocs[0].globals_slot
+@@ -1358,7 +1415,10 @@ class RockchipProgram(Program['RockchipDevice']):
+           logical_extents = _decode_materialized_cmac_layout(st.task.layout)[8]
+           elements = 1
+           for extent in logical_extents: elements *= extent
+-        itemsize = 4 if st.task.native_int32_output or st.task.fp32_output else 2
++        # WIP reference: `4 if native_int32_output or fp32_output else 2`
++        # underallocated scratch written by the fp32-combine host ABI task.
++        fp32_combine = st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT
++        itemsize = 4 if st.task.native_int32_output or st.task.fp32_output or fp32_combine else 2
+         scratch_sizes[st.task.out_slot] = max(scratch_sizes.get(st.task.out_slot, 0), st.task.out_offset+elements*itemsize)
+       try:
+         while len(ext) <= max_slot:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b0c9cb7ee..0e96f29d7 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -202,6 +202,7 @@ _HOST_FP32_HALF_LAYOUT = -1024  # nearest-fp16 representation view of an fp32 AB
+ _HOST_FP32_RESIDUAL_LAYOUT = -1025  # 256-scaled residual representation view of an fp32 ABI buffer
+ _HOST_FP32_COMBINE_LAYOUT = -1026  # decode high + x256 residual fp16 limbs into an fp32 ABI buffer
+ _HOST_HALF_FP32_LAYOUT = -1027  # widen an NPU-produced fp16 tile into fp32 ABI storage
++_HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reduction
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -11566,6 +11567,70 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                                      info.outs[0], is_copy=True), relocs))
+   return tuple(tasks)
+ 
++def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize only tinygrad's two-pass fp32 variance kernel after its mean kernel."""
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  if store is None or reduce is None or store.src[0].dtype is not dtypes.float or reduce.dtype is not dtypes.float or \
++     reduce.arg[0] is not Ops.ADD: return None
++  val = _unwrap(store.src[1])
++  if val.op is not Ops.MUL or len(val.src) != 2: return None
++  scale, reduced = None, None
++  for lhs, rhs in ((val.src[0], val.src[1]), (val.src[1], val.src[0])):
++    if _unwrap(lhs) is reduce and _unwrap(rhs).op is Ops.CONST:
++      reduced, scale = _unwrap(lhs), _unwrap(rhs)
++      break
++  if reduced is None or scale is None or scale.dtype is not dtypes.float or \
++     math.isnan(float(scale.arg)) or float(scale.arg) <= 0.0: return None
++  square = _unwrap(reduce.src[0])
++  if square.op is not Ops.MUL or len(square.src) != 2 or _unwrap(square.src[0]) is not _unwrap(square.src[1]): return None
++  delta = _unwrap(square.src[0])
++  if delta.op is not Ops.ADD or len(delta.src) != 2: return None
++
++  data, mean = None, None
++  for candidate, negative in ((delta.src[0], delta.src[1]), (delta.src[1], delta.src[0])):
++    candidate, negative = _unwrap(candidate), _unwrap(negative)
++    if candidate.op is not Ops.INDEX or candidate.src[0].op is not Ops.PARAM or negative.op is not Ops.MUL: continue
++    mean_candidate = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
++    coefficient = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
++    if mean_candidate is not None and mean_candidate.src[0].op is Ops.PARAM and coefficient is not None and \
++       float(coefficient.arg) == -1.0:
++      data, mean = candidate, mean_candidate
++      break
++  if data is None or mean is None or data.dtype is not dtypes.float or mean.dtype is not dtypes.float: return None
++
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  reductions = list(reduce.src[1:])
++  axes = [*loops, *reductions]
++  if not reductions or any(u.src[0].op is not Ops.CONST for u in axes): return None
++  extents = tuple(int(u.src[0].arg) for u in axes)
++  axis_ids = tuple(u.arg[0] for u in axes)
++  loop_ids, reduction_ids = set(axis_ids[:len(loops)]), set(axis_ids[len(loops):])
++  data_aff, mean_aff, out_aff = _affine_index(data.src[1]), _affine_index(mean.src[1]), _affine_index(store.src[0].src[1])
++  if data_aff is None or mean_aff is None or out_aff is None or \
++     any(axis not in axis_ids or stride < 0 for aff in (data_aff, mean_aff) for axis, stride in aff[0].items()) or \
++     any(axis not in loop_ids or stride < 0 for axis, stride in out_aff[0].items()) or \
++     any(mean_aff[0].get(axis, 0) != 0 for axis in reduction_ids) or \
++     not any(data_aff[0].get(axis, 0) != 0 for axis in reduction_ids): return None
++
++  def bounded(aff:tuple[dict[int,int],int], total:int, used_extents:tuple[int,...]) -> bool:
++    maximum = aff[1] + sum((extent-1)*aff[0].get(axis, 0) for axis, extent in zip(axis_ids, used_extents))
++    return aff[1] >= 0 and maximum < total
++  data_total, mean_total = int(data.src[0].src[0].arg), int(mean.src[0].src[0].arg)
++  output_total = prod(_shape_of_store(sink))
++  if not bounded(data_aff, data_total, extents) or not bounded(mean_aff, mean_total, extents) or \
++     not bounded(out_aff, output_total, (*extents[:len(loops)], *([1]*len(reductions)))): return None
++
++  def mapping(aff:tuple[dict[int,int],int], ids:tuple[int,...]) -> tuple[int,...]:
++    return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
++  scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
++  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), *extents, scale_bits,
++            *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
++  info = ProgramInfo.from_sink(sink)
++  slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
++  task = RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True, fp32_output=True)
++  return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
++
+ def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower optimizer-factorized SUM(x)*output_factor*constant in its original fp32 order."""
+   store, reduce = _store_node(sink), _reduce_node(sink)
+@@ -13153,6 +13218,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, fp32_add_tasks)
+   if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_mul_tasks)
++  if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, variance_tasks)
+   if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_factorized_sum_tasks)
+   if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
+-- 
+2.34.1
+
