@@ -446,6 +446,22 @@ class TestClassifier(unittest.TestCase):
     self.assertIsNotNone(injected_program)
     self.assertEqual(injected_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 
+  def test_scatter_uses_typed_update_selection(self):
+    for shape in ((4,5,6), (3,4,5)):
+      x = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP")
+      src = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP")
+      indices = Tensor.empty(3,4,5, dtype=dtypes.int, device="ROCKCHIP")
+      program = build_native_program(_get_sink(x.scatter(dim=1, index=indices, src=src)))
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    x = Tensor.empty(4,5,6, dtype=dtypes.float, device="ROCKCHIP")
+    indices = Tensor.empty(3,4,5, dtype=dtypes.int, device="ROCKCHIP")
+    scalar_program = build_native_program(_get_sink(x.scatter(dim=1, index=indices, src=3)))
+    self.assertIsNotNone(scalar_program)
+    self.assertEqual(scalar_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
     w = Tensor.empty(8,8,1,1, dtype=dtypes.float, device="ROCKCHIP")

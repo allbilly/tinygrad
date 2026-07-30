@@ -9224,6 +9224,21 @@ def _try_fancy_index_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
   #   {store:store.replace(src=(store.src[0], expanded))}), allow_plain=True)
   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
 
+def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize only the direct fp32 scatter update-selection graph."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.WHERE: return None
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  int_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}
+  float_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}
+  if len(int_slots) != 1 or len(float_slots) not in (1, 2): return None
+  if len(float_slots) == 1 and not any(u.op is Ops.CONST and u.dtype is dtypes.float and
+                                      u.arg is not Invalid and float(u.arg) != 0.0 for u in value.toposort()): return None
+  if not {Ops.WHERE, Ops.OR, Ops.CMPNE}.issubset({u.op for u in value.toposort()}): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
   store = _store_node(sink)
@@ -13853,6 +13868,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fancy_index_tasks)
   if (fancy_index_reduce_tasks := _try_fancy_index_reduction_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fancy_index_reduce_tasks)
+  if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, scatter_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)

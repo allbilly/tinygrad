@@ -9884,3 +9884,22 @@ This milestone adds one runtime ABI tag but changes no LUT. Mypy remains at
 the exact 12-error baseline. The adjacent explicit scatter schedule is a
 different unsupported-WHERE signature. Next forward group:
 `TestOps.test_scatter`.
+
+## 2026-07-30 — direct-scatter milestone
+
+The unchanged direct `TestOps.test_scatter` method passes in **5.61s**.
+Coverage includes all six signed dimension spellings, equal and unequal
+base/source geometries, scalar `3` and infinity updates, overlapping indices
+with zero, and every expected argument/dtype/shape error. The hardware-free
+Rockchip contract is **137/137 in 10.21s**.
+
+Direct scatter lowers to a reduction-free nested update-selection graph. A
+strict matcher now requires exactly one int32 index input, one base fp32
+input plus either an fp32 source or nonzero fp32 scalar, and the shared
+`WHERE + OR + CMPNE` selection signature. It then reuses the existing typed
+elementwise evaluator. Equal-shape scatter simplifies away bounds
+`AND/CMPLT`, so those operations are deliberately not part of the final
+fingerprint.
+
+No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
+Next forward group: `TestOps.test_scatter_add`.

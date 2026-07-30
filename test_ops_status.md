@@ -2317,3 +2317,12 @@ roughly four-minute process watchdog. Keeping one bytecode body and
 vectorizing its output×candidate grid makes the 11-case injection group pass
 in **90.82s**. No LUT changed. Contract: **136/136**. Next forward group:
 `TestOps.test_scatter`.
+
+### Direct scatter
+
+`TestOps.test_scatter` passes in **5.61s** across signed dimensions,
+equal/unequal shapes, tensor/scalar/infinity updates, overlap ordering, and
+expected errors. A strict one-int-index, one/two-fp32-input matcher recognizes
+the reduction-free nested `WHERE + OR + CMPNE` update selector and reuses the
+typed elementwise evaluator. No runtime ABI or LUT changed. Contract:
+**137/137**. Next forward group: `TestOps.test_scatter_add`.
