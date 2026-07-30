@@ -357,6 +357,25 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 11)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_fp32_mul_uses_compensated_boundary(self):
+    a = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
+    b = Tensor.empty(45,68, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a*b))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 25)
+    self.assertEqual(sum(task.task.is_copy for task in subtasks), 5)
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
+  def test_fp32_scalar_mul_uses_compensated_constant_limbs(self):
+    a = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink(a*0.1251))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(sum(task.task.kind == "dpu" and not task.task.is_copy for task in subtasks), 25)
+    self.assertEqual(sum(task.task.is_copy for task in subtasks), 3)
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_fp32_acos_uses_specialized_lut_boundary(self):
     program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
     self.assertIsNotNone(program)
