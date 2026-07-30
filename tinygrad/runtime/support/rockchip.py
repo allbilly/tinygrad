@@ -10762,19 +10762,26 @@ def _try_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Add two or three direct fp32 buffers with fp16 TwoSum arithmetic and a split fp32 ABI result."""
+  """Add/subtract up to three direct fp32 operands with fp16 TwoSum arithmetic and a split fp32 ABI result."""
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
   val = _unwrap(store.src[1])
   if val.op is not Ops.ADD or val.dtype is not dtypes.float: return None
-  sources_list:list[UOp] = []
-  def flatten_add(node:UOp) -> None:
+  signed_sources:list[tuple[UOp,int]] = []
+  def flatten_add(node:UOp, sign:int=1) -> None:
     node = _unwrap(node)
     if node.op is Ops.ADD:
-      for child in node.src: flatten_add(child)
-    else: sources_list.append(node)
+      for child in node.src: flatten_add(child, sign)
+      return
+    if node.op is Ops.MUL and len(node.src) == 2:
+      for constant_pos, value_pos in ((0, 1), (1, 0)):
+        constant, value = node.src[constant_pos], node.src[value_pos]
+        if constant.op is Ops.CONST and float(constant.arg) == -1.0:
+          flatten_add(value, -sign)
+          return
+    signed_sources.append((node, sign))
   flatten_add(val)
-  sources = tuple(sources_list)
+  sources = tuple(source for source, _ in signed_sources)
   if len(sources) not in (2, 3): return None
   if any(x.dtype is not dtypes.float or x.op not in (Ops.INDEX, Ops.CONST) or
          (x.op is Ops.INDEX and x.src[0].op is not Ops.PARAM) for x in sources): return None
@@ -10820,17 +10827,23 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     out = alloc()
     tasks.append(_emit_where_stage(total, out, a, b, op))
     return out, 0
-  def limb(source:UOp, tag:int, layout:tuple[int,...]|None) -> tuple[int,int]:
+  def limb(source:UOp, sign:int, tag:int, layout:tuple[int,...]|None) -> tuple[int,int]:
     if source.op is Ops.CONST:
-      original = np.float32(source.arg)
+      original = np.float32(sign*float(source.arg))
       high = np.float16(original)
       value = high if tag == _HOST_FP32_HALF_LAYOUT else np.float16((original-np.float32(high))*256.0)
       return scalar(float(value))
     assert layout is not None
     return view(source.src[0].arg.slot, tag, layout), 0
 
-  limbs = tuple((limb(x, _HOST_FP32_HALF_LAYOUT, layout), limb(x, _HOST_FP32_RESIDUAL_LAYOUT, layout))
-                for x, layout in zip(sources, source_layouts))
+  limbs_list:list[tuple[tuple[int,int],tuple[int,int]]] = []
+  for (source, sign), layout in zip(signed_sources, source_layouts):
+    high_limb = limb(source, sign, _HOST_FP32_HALF_LAYOUT, layout)
+    low_limb = limb(source, sign, _HOST_FP32_RESIDUAL_LAYOUT, layout)
+    if sign < 0 and source.op is not Ops.CONST:
+      high_limb, low_limb = stage(scalar(0.0), high_limb, Ops.SUB), stage(scalar(0.0), low_limb, Ops.SUB)
+    limbs_list.append((high_limb, low_limb))
+  limbs = tuple(limbs_list)
   high, low = limbs[0]
   for next_high, next_low in limbs[1:]:
     old_high = high

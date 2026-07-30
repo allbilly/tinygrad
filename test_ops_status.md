@@ -1540,3 +1540,18 @@ operands rather than host-expanded tensors.
 Final emitter-sensitive validation disabled both `CACHELEVEL` and `CCACHE`.
 `ROCKCHIP_DEBUG_FP32_ADD=1` exposes the final NPU-produced limbs and decoded
 fp32 ABI result.  SUB remains the next distinct group.
+
+### Compensated fp32 SUB milestone
+
+| Coverage | Result |
+|---|---:|
+| unchanged `test_sub` + scalar SUB + reverse scalar SUB | **3 passed in 4.01s** |
+| complete compensated ADD/SUB regression | **8 passed in 5.22s** |
+| old direct SUB path | **288/2925 misses, max abs 0.00110734** |
+| full hardware-free planner/codec contract | **91/91 in 6.81s** |
+| mypy | **pre-existing 13-error baseline** |
+
+The ADD-tree parser recognizes multiplication by `-1` as a signed operand.
+Runtime fp32 sources are negated as high and x256-low limbs in two NPU
+SUB-from-zero stages.  Signed constants are split at compile time.  The
+remaining TwoSum and final ABI decode are shared with compensated ADD.

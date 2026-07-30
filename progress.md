@@ -7652,6 +7652,34 @@ Validation with `. .venv/bin/activate` and
 `ROCKCHIP_DEBUG_FP32_ADD=1` prints the final high limb, x256-low limb, and
 decoded fp32 values.  SUB is the next separate arithmetic group.
 
+## 2026-07-30 — compensated fp32 SUB milestone
+
+Direct fp32 SUB reproduced the input-rounding failure with **288/2925**
+misses and maximum absolute error **0.00110734**.  Tinygrad represents
+subtraction as an ADD tree with one operand multiplied by `-1`.
+
+The compensated parser now carries a sign with every flattened operand.
+For a runtime INDEX with negative sign, DPU stages compute both
+`-high` and `-x256-low` as zero-minus-limb before entering the ordinary
+TwoSum block.  For a compile-time scalar, the sign is incorporated while
+constructing its high/residual scalar constants.  Host code performs no
+runtime negation or subtraction.
+
+Validation with `. .venv/bin/activate` and
+`DEV=ROCKCHIP FORWARD_ONLY=1 CACHELEVEL=0 CCACHE=0`:
+
+- unchanged direct `test_sub`, `test_scalar_sub`, and `test_scalar_rsub`:
+  **3 passed in 4.01 seconds**;
+- combined direct/nested/broadcast ADD and SUB regression:
+  **8 passed in 5.22 seconds**;
+- full hardware-free planner/codec contract: **91/91 in 6.81 seconds**;
+- Python compilation and `git diff --check`: passing;
+- mypy: exact pre-existing **13-error** Rockchip baseline.
+
+Direct runtime SUB uses two additional NPU sign stages beyond compensated
+ADD.  Scalar `x-2` needs no runtime sign stage because `-2` is already a
+constant; `2-x` negates both runtime limbs on NPU.
+
 ## 2026-07-30 — logarithmic long cumulative products
 
 The unchanged forward-only `TestOps.test_simple_cumprod` now passes both
