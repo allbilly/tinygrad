@@ -1932,3 +1932,25 @@ int/bool equality and broadcast comparison regressions found during the
 isclose milestone.
 
 Next forward group: `TestOps.test_mean`.
+
+### Normal-fp32 mean
+
+| Group | Status |
+|---|---:|
+| `test_mean` | pass |
+| `test_mean_axis` | pass |
+| `test_mean_zero_axis` | pass |
+| combined official run | **3 passed in 17.70s** |
+| sum + factorized-mulacc regression | **4 passed in 25.68s** |
+| hardware-free Rockchip contract | **111/111** |
+
+Full mean lowers as scalar `SUM(x) * reciprocal`. Scalar output has no LOOP
+range; that is valid native geometry, consistent with the current
+`allbilly/rk3588` `conv_grok` one-row GEMM encoding (`m-1 == 0`). The
+factorized-sum matcher now accepts zero LOOP ranges, while compensated fp32
+MUL accepts only the exact one-element, zero-offset `ndim=0` view. All
+non-scalar affine checks remain active.
+
+No LUT or host operator arithmetic changed. `test_mean_zero_axis` retains a
+non-failing NumPy invalid-cast warning. Next forward group:
+`TestOps.test_var`.

@@ -7470,6 +7470,80 @@ Using `. .venv/bin/activate`,
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
 
+## Current forward continuation — mean complete
+
+The latest completed milestone is normal-fp32 mean. The detailed
+`allbilly/rk3588/conv_grok` scalar-geometry comparison, matcher trace, and
+validation are recorded above under **normal-fp32 mean and scalar factorized
+epilogue**. Final checks after narrowing the inactive scalar-ADD WIP remain
+green: all three official mean groups pass, the full hardware-free contract
+is **111/111**, Python compilation and `git diff --check` pass, and mypy
+retains the pre-existing **12-error** Rockchip baseline. Continue with
+`TestOps.test_var`.
+
+## 2026-07-30 — normal-fp32 mean and scalar factorized epilogue
+
+The unchanged forward-only mean group is green:
+
+| Coverage | Result |
+|---|---:|
+| `TestOps.test_mean` | pass |
+| `TestOps.test_mean_axis` | pass |
+| `TestOps.test_mean_zero_axis` | pass |
+| combined official run | **3 passed in 17.70s** |
+| shared sum/factorized-mulacc regression | **4 passed in 25.68s** |
+| hardware-free Rockchip contract | **111/111 in 6.32s** |
+
+### `allbilly/rk3588/conv_grok` re-check
+
+`ref/rk3588` is current with `origin/main` at
+`40fae7b1ade121bb91f3908f0bcfd1a2a8c350e6`. Its one-row GEMM is valid native
+geometry: `m=1` programs `CORE_DATAOUT_SIZE_0`, `DATA_CUBE_HEIGHT`, and
+`WDMA_SIZE_1` with `m-1 == 0`. The row planner also permits `m_tile=1`;
+it does not require an outer spatial loop before emitting a task.
+
+That is directly applicable to a full reduction. Tinygrad represents
+`mean((3,4,5,6))` as scalar `SUM(x) * (1/360)`: it has one REDUCE range but
+no LOOP range. The Rockchip factorized-sum matcher incorrectly treated the
+missing LOOP as invalid even though its staged sum already supports scalar
+output. After that guard was relaxed, tracing showed the CMAC sum succeeded
+and only the compensated fp32 MUL epilogue still rejected `axes=[]`.
+
+The fp32 view runtime already defines an `ndim=0` mapping:
+
+```text
+layout = (total=1, tag, ndim=0, offset=0)
+```
+
+The MUL matcher now accepts only that exact scalar case: output storage must
+contain one element and the affine store offset must be zero. Non-scalar
+axis validation is unchanged. The previous guards remain in source comments
+as WIP references. A candidate scalar-ADD relaxation found during tracing is
+also retained as a comment, but is deliberately inactive because mean does
+not require it.
+
+### Debug method
+
+1. Run with `ROCKCHIP_DEBUG_SINK=1`; full mean must show a scalar STORE of
+   `MUL(REDUCE_ADD(INDEX), CONST reciprocal)`.
+2. If the final rejection is `unsupported_dtype:fp32_cmac`, distinguish the
+   matcher stages rather than editing CMAC registers: first verify the staged
+   direct sum, then the factor epilogue.
+3. Python `sys.settrace` on
+   `_try_fp32_factorized_sum_subtasks` isolated the original zero-LOOP guard,
+   and then line-level tracing of `_try_fp32_mul_subtasks` isolated the empty
+   affine-axis guard. This avoids persistent debug-print changes.
+4. In the built program, require native CMAC work plus both scalar ABI views:
+   `(1, _HOST_FP32_HALF_LAYOUT, 0, 0)` and
+   `(1, _HOST_FP32_RESIDUAL_LAYOUT, 0, 0)`.
+5. Re-run direct sum and zero-stride mulacc groups because they share the
+   staged compensated reduction path.
+
+`test_mean_zero_axis` passes with the existing NumPy `invalid value
+encountered in cast` warning while producing the expected result. No LUT
+table, coefficient, host operator arithmetic, or two-task LUT schedule
+changed. Next forward group: `TestOps.test_var`.
+
 ## 2026-07-30 — forward `isclose` and raw comparison ABI parity
 
 All unchanged forward-only `isclose` groups now pass:
@@ -9101,3 +9175,11 @@ Validation with `. .venv/bin/activate`,
 - Python compilation and `git diff --check`: **passing**;
 - mypy: exact pre-existing **13-error** Rockchip baseline;
 - ruff and pytest-xdist remain unavailable in `.venv`.
+
+## Active continuation after historical entries
+
+Normal-fp32 mean is the latest completed milestone: all three official groups
+pass, the final hardware-free suite is **111/111**, and the current mypy
+baseline is the pre-existing **12 errors**. See the detailed
+**normal-fp32 mean and scalar factorized epilogue** section for the
+`conv_grok` comparison and debug method. Continue with `TestOps.test_var`.

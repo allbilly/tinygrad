@@ -326,6 +326,16 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 2)
     self.assertTrue(subtasks[-1].task.fp32_output)
 
+  def test_full_fp32_mean_uses_scalar_factorized_epilogue(self):
+    program = build_native_program(_get_sink(Tensor.empty(3,4,5,6, dtype=dtypes.float, device="ROCKCHIP").mean()))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertTrue(any(task.task.kind == "cmac" for task in subtasks))
+    scalar_views = [task.task.layout for task in subtasks if task.task.is_copy and len(task.task.layout) == 4]
+    self.assertIn((1, _HOST_FP32_HALF_LAYOUT, 0, 0), scalar_views)
+    self.assertIn((1, _HOST_FP32_RESIDUAL_LAYOUT, 0, 0), scalar_views)
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+
   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")

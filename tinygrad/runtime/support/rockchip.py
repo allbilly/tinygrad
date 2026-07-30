@@ -11390,6 +11390,10 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
              if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
   axes = sorted(store_aff[0], key=lambda x:store_aff[0][x], reverse=True)
+  # WIP: ndim=0 fp32 views can represent scalar ADD, but full-tensor mean only
+  # needs scalar MUL and does not justify widening this separate matcher.
+  # if (not axes and (store_aff[1] != 0 or prod(_shape_of_store(sink)) != 1)) or \
+  #    not all(axis in extents for axis in axes): return None
   if not axes or not all(axis in extents for axis in axes): return None
   out_shape = tuple(extents[axis] for axis in axes)
   total = prod(out_shape)
@@ -11478,7 +11482,11 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   extents = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort()
              if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP" and u.src[0].op is Ops.CONST}
   axes = sorted(store_aff[0], key=lambda x:store_aff[0][x], reverse=True)
-  if not axes or not all(axis in extents for axis in axes): return None
+  # WIP reference: `if not axes ...` rejected the one-element scalar epilogue
+  # of full-tensor mean. ndim=0 fp32 views are an established total=1 layout.
+  # if not axes or not all(axis in extents for axis in axes): return None
+  if (not axes and (store_aff[1] != 0 or prod(_shape_of_store(sink)) != 1)) or \
+     not all(axis in extents for axis in axes): return None
   out_shape = tuple(extents[axis] for axis in axes)
   total = prod(out_shape)
   if total != prod(_shape_of_store(sink)): return None
@@ -11583,7 +11591,10 @@ def _try_fp32_factorized_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
          (factor.op is Ops.INDEX and factor.src[0].op is not Ops.PARAM) or
          any(axis in factor.toposort() for axis in reductions) for factor in factors): return None
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
-  if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  # WIP reference: requiring `loops` rejected scalar-output mean even though the
+  # staged SUM and factorized epilogue both support the zero-LOOP geometry.
+  # if not loops or any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
+  if any(u.src[0].op is not Ops.CONST for u in (*loops, *reductions)): return None
 
   info, output_total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
   tasks:list[RKSubTask] = []
