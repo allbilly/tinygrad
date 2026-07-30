@@ -1,0 +1,108 @@
+From b11d73a7eb7a7b6e10689f08118c132adc04ea0f Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:16:32 +0800
+Subject: [PATCH] rockchip: pass normal fp32 atanh
+
+---
+ progress.md                          | 15 +++++++++++++++
+ test/rockchip/test_pr1.py            |  8 ++++++++
+ test_ops_status.md                   |  7 +++++++
+ tinygrad/runtime/support/rockchip.py | 11 ++++++++++-
+ 4 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/progress.md b/progress.md
+index 3985c4ada..158eaf568 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9524,3 +9524,18 @@ Acosh's negative-domain cases retain one non-failing invalid-cast warning.
+ No code or LUT change was needed.
+ 
+ Next forward group: `TestOps.test_atanh`.
++
++## 2026-07-30 — normal-fp32 atanh milestone
++
++The unchanged `TestOps.test_atanh` group passes all ordinary and ±300 extreme
++cases in **3.47s**. The hardware-free Rockchip contract is **123/123 in
++6.95s**.
++
++Before the fix, the fp32 composite timed out in the generic NPU splitter.
++The exact atanh recognizer now accepts both half and float
++`log((1+x)/(1-x))/2` graphs. `_try_fp32_atanh_host_subtasks` intercepts the
++float form as one serialized task before the existing half two-LUT
++implementation; half behavior and LUT tuning are unchanged.
++
++Mypy remains at the exact 12-error baseline. Next forward group:
++`TestOps.test_topo_sort`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index ec4923c4d..e92d973e0 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -452,6 +452,14 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(len(subtasks), 1)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp32_atanh_avoids_half_two_lut_path(self):
++    expression = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").atanh()
++    program = build_native_program(_get_sink(expression))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 395253344..06503fdd6 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2129,3 +2129,10 @@ forward group: `TestOps.test_asinh`.
+ Both ordinary/extreme groups pass together in **33.10s** with no change.
+ Acosh negative-domain inputs retain the expected warning. Next forward group:
+ `TestOps.test_atanh`.
++
++### Normal-fp32 atanh
++
++`TestOps.test_atanh`: **pass in 3.47s** for ordinary and ±300 extremes.
++The exact fp32 logarithmic graph uses one serialized task instead of the
++timeout-prone generic split; the half two-LUT path is unchanged. Contract:
++**123/123**. Next forward group: `TestOps.test_topo_sort`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index acf5dbb83..6ae5be37c 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -567,7 +567,7 @@ def _try_atanh(val:UOp) -> UOp|None:
+   """Recognize log((1+x)/(1-x))/2 after reciprocal-to-FDIV rewriting."""
+   val = _unwrap(val)
+   indexes = list(dict.fromkeys(u for u in val.toposort() if u.op is Ops.INDEX))
+-  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half or val.op is not Ops.MUL: return None
++  if len(indexes) != 1 or (source := indexes[0]).dtype not in (dtypes.half, dtypes.float) or val.op is not Ops.MUL: return None
+   logarithm = next((_unwrap(x) for x in val.src if _unwrap(x).op is Ops.LOG2), None)
+   scale = next((float(x.arg) for x in val.src if x.op is Ops.CONST), None)
+   if logarithm is None or scale is None or not math.isclose(scale, math.log(2)/2): return None
+@@ -4255,6 +4255,13 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, info.outs[0], (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+   return tuple(tasks)
+ 
++def _try_fp32_atanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Keep exact normal-fp32 atanh out of the half-buffer two-LUT implementation."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float or (source := _try_atanh(store.src[1])) is None: return None
++  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT atanh with explicit ±1 infinity and out-of-domain NaN handling."""
+   store = _store_node(sink)
+@@ -13543,6 +13550,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
+   if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
+   if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
++  if (fp32_atanh_tasks := _try_fp32_atanh_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_atanh_tasks)
+   if (atanh_tasks := _try_atanh_subtasks(sink)) is not None: return build_native_program_multi(sink, atanh_tasks)
+   if (asinh_acosh_tasks := _try_asinh_acosh_subtasks(sink)) is not None: return build_native_program_multi(sink, asinh_acosh_tasks)
+   if (fp32_sinh_cosh_tasks := _try_fp32_sinh_cosh_host_subtasks(sink)) is not None:
+-- 
+2.34.1
+
