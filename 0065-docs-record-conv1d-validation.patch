@@ -1,0 +1,44 @@
+From 21ba806c76237644b307c62f8f4ee1b517549f16 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:49:26 +0800
+Subject: [PATCH] docs: record conv1d validation
+
+---
+ progress.md        | 9 +++++++++
+ test_ops_status.md | 6 ++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index d0fecdcfb..4ae2c4214 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9695,3 +9695,12 @@ into one zero-masked CMAC operand. All three official strides pass in
+ 
+ No large-K geometry or LUT changed. Mypy remains at the exact 12-error
+ baseline. Next forward group: `TestOps.test_conv1d`.
++
++## 2026-07-30 — conv1d validation
++
++All four unchanged conv1d groups pass with **17 parameterized subtests in
++22.24s**, covering the general shape matrix, simple padding, simple stride,
++and asymmetric padding. No code, host boundary, runtime ABI, large-K
++geometry, or LUT change was needed.
++
++Next forward group: `TestOps.test_conv2d`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 28121b6e1..26b45e759 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2221,3 +2221,9 @@ graphs now fold their outer validity WHERE into one zero-masked exact fp32
+ CMAC operand, keeping K=36 on the established materializer. No large-K path
+ or LUT changed. Contract: **128/128**. Next forward group:
+ `TestOps.test_conv1d`.
++
++### Conv1d
++
++Four conv1d groups pass unchanged with **17 subtests in 22.24s**, including
++general, padded, strided, and asymmetric-padding cases. No code or LUT change
++was needed. Next forward group: `TestOps.test_conv2d`.
+-- 
+2.34.1
+
