@@ -1,0 +1,45 @@
+From b6e6963e112749af443905aff9b463f2e0cdb7be Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:42:59 +0800
+Subject: [PATCH] docs: record basic convolution validation
+
+---
+ progress.md        | 10 ++++++++++
+ test_ops_status.md |  6 ++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 915935967..4acae25b5 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9666,3 +9666,13 @@ This stays within the small proven CMAC geometry: it does not enable the
+ large-K multirow form that `allbilly/rk3588` `conv_grok` never demonstrated
+ and that local K=875 probing corrupted. No LUT changed. Mypy remains at the
+ exact 12-error baseline. Next forward group: `TestOps.test_simple_conv2d`.
++
++## 2026-07-30 — basic convolution validation
++
++Six unchanged convolution groups pass in **25.49s** across five invocations:
++simple 3x3 conv2d with and without bias, simple and padded conv3d, the
++16-channel conv2d case, and simple 1x1 conv2d. The slow-test gate was enabled
++for both conv3d groups. No additional code, host boundary, runtime ABI, or
++LUT change was needed.
++
++Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 45ab26632..4f9032ad7 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2206,3 +2206,9 @@ epilogues consume typed accumulator scratch through the strict serialized
+ fp32 evaluator, now supported by the mixed-CMAC dispatcher. This does not
+ broaden the unproven large-K `conv_grok` geometry. No LUT changed. Contract:
+ **127/127**. Next forward group: `TestOps.test_simple_conv2d`.
++
++### Basic convolution validation
++
++Six convolution groups pass unchanged in **25.49s**: simple 3x3 with/without
++bias, simple/padded 3D, 16-channel 3x3, and simple 1x1. No code or LUT change
++was needed. Next forward group: `TestOps.test_simple_conv2d_1x1_m4`.
+-- 
+2.34.1
+
