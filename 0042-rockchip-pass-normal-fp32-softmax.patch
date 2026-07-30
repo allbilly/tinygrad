@@ -1,0 +1,186 @@
+From 7428987e02aa1ad663fbc5eb240e171946afb070 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 17:37:45 +0800
+Subject: [PATCH] rockchip: pass normal fp32 softmax
+
+---
+ progress.md                          | 29 ++++++++++++
+ test/rockchip/test_pr1.py            | 12 +++++
+ test_ops_status.md                   | 14 ++++++
+ tinygrad/runtime/support/rockchip.py | 71 ++++++++++++++++++++++++++++
+ 4 files changed, 126 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 5e1b5b0d6..18ab53d37 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9322,3 +9322,32 @@ invalid-cast warning already seen in empty reduction coverage. No code, host
+ operator boundary, or LUT changed.
+ 
+ Next forward group: `TestOps.test_softmax`.
++
++## 2026-07-30 — normal-fp32 softmax milestone
++
++| Coverage | Result |
++|---|---:|
++| `TestOps.test_softmax` | **1 passed in 11.76s** |
++| `TestOps.test_softmax_other_axis` | **1 passed in 7.36s** |
++| hardware-free Rockchip contract | **115/115 in 6.48s** |
++
++The `(45,65)` axis-1 schedule has three sinks: row maximum, row
++`SUM(EXP2((x-max)*log2(e)))`, and final exponent/denominator normalization.
++The existing NPU maximum path remains active. Full-vector softmax instead
++fuses its maximum into the exponent sink and its sum into the normalization
++sink.
++
++`_try_softmax_host_subtasks` recognizes only these four exact fp32 stage
++signatures. It requires static ADD/MAX reductions, exact `log2(e)` and `-1`
++constants, the stable `exp(x-max)` tree, and a direct FDIV normalization after
++the reciprocal rewrite. It rejects every other opcode and arbitrary EXP2
++reductions. Static reduction ranges are expanded into the existing serialized
++fp32 elementwise evaluator, preserving float32 EXP2 and accumulation accuracy
++needed by the official `1e-7` tolerance.
++
++This follows the previously approved non-CPU `run_host` boundary policy
++without enabling the diagnostic generic host fallback. Scalars still
++simplify to the typed constant-one path. No LUT coefficient or two-task LUT
++schedule changed. Mypy remains at the exact pre-existing 12-error baseline.
++
++Next forward group: `TestOps.test_softmax_argmax`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 161a5262f..50443ef24 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -368,6 +368,18 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
+     self.assertEqual(subtasks[0].task.layout[4], 2)
+ 
++  def test_fp32_softmax_stages_use_strict_serialized_tasks(self):
++    for shape, axis in (((45,65), 1), ((45,), 0)):
++      expression = Tensor.empty(*shape, dtype=dtypes.float, device="ROCKCHIP").softmax(axis)
++      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++      programs = [build_native_program(sink) for sink in sinks]
++      self.assertTrue(all(program is not None for program in programs))
++      host_stages = [program.src[1].src[0].arg for sink, program in zip(sinks, programs)
++                     if any(u.op in (Ops.EXP2, Ops.RECIPROCAL) for u in sink.toposort())]
++      self.assertTrue(host_stages)
++      self.assertTrue(all(len(subtasks) == 1 and subtasks[0].task.layout[1] == _HOST_ELEMENTWISE_LAYOUT
++                          for subtasks in host_stages))
++
+   def test_small_fp32_gemm_uses_typed_cmac_boundary(self):
+     a = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(9,9, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 62d15ce51..0a0e96270 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2018,3 +2018,17 @@ group: `TestOps.test_std_mean_loaded_nan`.
+ `TestOps.test_std_mean_loaded_nan`: **pass in 3.23s**. The graph simplifies to
+ the existing typed NaN path, so no code or LUT change was required. Next
+ forward group: `TestOps.test_softmax`.
++
++### Normal-fp32 softmax
++
++| Group | Status |
++|---|---:|
++| `test_softmax` | **pass in 11.76s** |
++| `test_softmax_other_axis` | **pass in 7.36s** |
++| hardware-free Rockchip contract | **115/115** |
++
++The row-max stage stays on the NPU. Four exact EXP/reduction/normalization
++stage shapes use the existing serialized fp32 host evaluator after strict
++softmax fingerprinting and static reduction expansion. Scalar softmax remains
++the typed constant-one path. No generic host fallback or LUT change was
++introduced. Next forward group: `TestOps.test_softmax_argmax`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index d467b3f38..948e3d261 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9111,6 +9111,76 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False) -> tuple[RKSubTa
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
++def _try_softmax_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Run only the four exact fp32 softmax schedule stages through the serialized host evaluator."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float or store.src[1].dtype is not dtypes.float: return None
++  value = _unwrap(store.src[1])
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  add_reductions = [u for u in reductions if u.arg[0] is Ops.ADD]
++  max_reductions = [u for u in reductions if u.arg[0] is Ops.MAX]
++  exponentials = [u for u in value.toposort() if u.op is Ops.EXP2]
++  if len(add_reductions)+len(max_reductions) != len(reductions) or \
++     any(u.dtype is not dtypes.float or not u.src[1:] or any(r.src[0].op is not Ops.CONST for r in u.src[1:]) for u in reductions): return None
++
++  # The reciprocal rewrite makes the two normalization stages direct FDIVs.
++  signature = (len(add_reductions), len(max_reductions), len(exponentials), value.op)
++  if signature not in ((1, 0, 1, Ops.REDUCE), (0, 1, 1, Ops.EXP2),
++                       (0, 0, 1, Ops.FDIV), (1, 0, 0, Ops.FDIV)): return None
++  if value.op is Ops.REDUCE and (value is not add_reductions[0] or _unwrap(value.src[0]) is not exponentials[0]): return None
++  if value.op is Ops.EXP2 and value is not exponentials[0]: return None
++  if value.op is Ops.FDIV:
++    numerator, denominator = (_unwrap(x) for x in value.src)
++    if exponentials and numerator is not exponentials[0]: return None
++    if not exponentials and numerator.op is not Ops.INDEX: return None
++    if add_reductions and denominator is not add_reductions[0]: return None
++    if not add_reductions and denominator.op is not Ops.INDEX: return None
++
++  # EXP2 must be the stable exp(x-max) lowering, including its exact log2(e)
++  # and negative-maximum factors. This excludes arbitrary EXP2 reductions.
++  for exponential in exponentials:
++    scaled = _unwrap(exponential.src[0])
++    if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
++    log2e = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST), None)
++    delta = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.ADD), None)
++    if log2e is None or log2e.dtype is not dtypes.float or \
++       not math.isclose(float(log2e.arg), math.log2(math.e), rel_tol=1e-12) or delta is None or len(delta.src) != 2: return None
++    positive = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.INDEX), None)
++    negative = next((_unwrap(x) for x in delta.src if _unwrap(x).op is Ops.MUL), None)
++    if positive is None or positive.src[0].op is not Ops.PARAM or negative is None: return None
++    minus_one = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
++    maximum = next((_unwrap(x) for x in negative.src if _unwrap(x).op in (Ops.INDEX, Ops.REDUCE)), None)
++    if minus_one is None or minus_one.dtype is not dtypes.float or float(minus_one.arg) != -1.0 or maximum is None: return None
++    if maximum.op is Ops.INDEX and maximum.src[0].op is not Ops.PARAM: return None
++    if maximum.op is Ops.REDUCE and (maximum not in max_reductions or maximum.arg[0] is not Ops.MAX): return None
++
++  allowed = {Ops.SINK, Ops.END, Ops.STORE, Ops.INDEX, Ops.PARAM, Ops.CONST, Ops.RANGE,
++             Ops.REDUCE, Ops.EXP2, Ops.MUL, Ops.ADD, Ops.FDIV}
++  if any(u.op not in allowed for u in sink.toposort()): return None
++
++  def expand(u:UOp) -> UOp:
++    if u.op is Ops.REDUCE:
++      ranges = u.src[1:]
++      extents = [int(r.src[0].arg) for r in ranges]
++      terms:list[UOp] = []
++      for linear in range(prod(extents)):
++        rem, fixed = linear, {}
++        for axis in range(len(ranges)-1, -1, -1):
++          rem, coordinate = divmod(rem, extents[axis])
++          fixed[ranges[axis]] = UOp.const(ranges[axis].dtype, coordinate)
++        terms.append(expand(u.src[0].substitute(fixed)))
++      if not terms: raise ValueError("empty softmax reduction")
++      result = terms[0]
++      for term in terms[1:]: result = UOp(u.arg[0], u.dtype, (result, term))
++      return result
++    new_src = tuple(expand(x) for x in u.src)
++    return u if new_src == u.src else u.replace(src=new_src)
++
++  try: expanded_value = expand(store.src[1])
++  except (TypeError, ValueError, OverflowError): return None
++  expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
++  return _try_elementwise_host_subtasks(expanded, allow_plain=True)
++
+ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Unroll the static integer reductions used to choose max-pool indices."""
+   store = _store_node(sink)
+@@ -13227,6 +13297,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)
+   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
+   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
++  if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, exp_correction_tasks)
+-- 
+2.34.1
+
