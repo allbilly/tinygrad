@@ -2243,3 +2243,12 @@ exact-fp32 boundary for root ADD graphs containing a padding WHERE, fixing
 356/4096 `x+pad(w)` half-rounding misses. Ordinary affine broadcast add
 retains its established nine-task NPU path. No LUT changed. Contract:
 **129/129**. Next forward group: `TestOps.test_max_pool2d_simple`.
+
+### Value max-pooling
+
+All twelve value-only max-pool groups pass in **71.91s**, with 33
+parameterized subtests across padding, stride, dilation, and ceil modes. The
+int32 padded case now exposes one strictly bounded 2x2 static MAX task only
+when its padding WHERE and `INT_MIN` sentinel match. Float pooling and the
+general diagnostic reducer are unchanged. No LUT changed. Contract:
+**130/130**. Next forward group: `TestOps.test_max_pool2d_return_indices`.

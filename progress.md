@@ -9733,3 +9733,23 @@ NPU limb path, so ordinary broadcast addition is not redirected.
 
 No runtime ABI, CMAC geometry, or LUT changed. Mypy remains at the exact
 12-error baseline. Next forward group: `TestOps.test_max_pool2d_simple`.
+
+## 2026-07-30 — value max-pooling milestone
+
+All twelve unchanged value-only max-pool groups pass in **71.91s** across
+four clean invocations. Coverage includes simple/core pooling, symmetric and
+asymmetric padding, int32 padding, larger/unit/smaller strides, dilation, and
+both ceil-mode forms. The core/padded matrix contributes 17 subtests and the
+remaining stride/dilation/ceil block contributes 16. The hardware-free
+Rockchip contract is **130/130 in 7.48s**.
+
+`test_max_pool2d_padding_int` was rejected as `unsupported_dtype`. Its graph
+is one int32 MAX reduction over a static 2x2 window with `INT_MIN` padding.
+The existing exact static reduction serializer now has a normal-default
+entry point restricted to exactly one bounded int32 MAX reduction (at most
+64 terms), a padding WHERE, and the `-2**31` sentinel. The official case
+passes in **3.93s**. The general diagnostic static reducer remains gated.
+
+No runtime ABI, native float pool path, or LUT changed. Mypy remains at the
+exact 12-error baseline. Next forward group:
+`TestOps.test_max_pool2d_return_indices`.

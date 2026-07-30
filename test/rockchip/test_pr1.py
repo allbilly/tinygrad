@@ -980,6 +980,15 @@ class TestPipeline(unittest.TestCase):
     self.assertTrue(all(st.task.kind == "dpu" for st in subtasks))
     self.assertEqual(subtasks[-1].task.out_slot, 0)
 
+  def test_int32_padded_max_pool_uses_bounded_static_reduction(self):
+    x = Tensor.empty(4,2,11,28, dtype=dtypes.float, device="ROCKCHIP")
+    prg = build_native_program(_get_sink(x.int().max_pool2d(kernel_size=(2,2), padding=1)))
+    self.assertIsNotNone(prg)
+    subtasks = prg.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertTrue(subtasks[0].task.is_copy)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_axis_argmax_reuses_low_typed_gather_slot(self):
     x = Tensor.rand(4,5, dtype=dtypes.float).realize()
     sinks = [c.src[0] for c in x.argmax(0).schedule_linear().src if c.src[0].op is Ops.SINK]

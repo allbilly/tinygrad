@@ -9505,6 +9505,19 @@ def _try_static_index_reduction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
   expanded = sink.substitute({store:store.replace(src=(store.src[0], value))})
   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
 
+def _try_int_max_pool_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Expose only bounded int32 max-pool reductions from the static host reducer."""
+  store = _store_node(sink)
+  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if store is None or store.src[0].dtype is not dtypes.int or len(reductions) != 1: return None
+  reduce = reductions[0]
+  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.MAX or not reduce.src[1:] or \
+     any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]) or prod(int(axis.src[0].arg) for axis in reduce.src[1:]) > 64: return None
+  nodes = reduce.src[0].toposort()
+  if not any(u.op is Ops.WHERE for u in nodes) or \
+     not any(u.op is Ops.CONST and u.dtype is dtypes.int and int(u.arg) == -(1 << 31) for u in nodes): return None
+  return _try_static_index_reduction_subtasks(sink)
+
 def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower bitonic sort's static MAX/MIN lane choice without host value comparisons."""
   store = _store_node(sink)
@@ -13682,6 +13695,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
     return build_native_program_multi(sink, arg_extrema_tasks)
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
+  if (int_max_pool_tasks := _try_int_max_pool_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, int_max_pool_tasks)
   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
      (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
   if (long_cumprod_tasks := _try_long_cumprod_subtasks(sink)) is not None:
