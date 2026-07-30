@@ -1,0 +1,45 @@
+From f173907783ad0f265d159b76ad4de13a5201be97 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 18:35:54 +0800
+Subject: [PATCH] docs: record movement and view validation
+
+---
+ progress.md        | 9 +++++++++
+ test_ops_status.md | 7 +++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/progress.md b/progress.md
+index 7db2b461c..d8469077e 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9635,3 +9635,12 @@ Constant, circular, reshape, and slice padding retain their prior paths.
+ 
+ No LUT or runtime ABI changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_stack_slice`.
++
++## 2026-07-30 — movement/view validation milestone
++
++Fifteen unchanged movement and view groups pass in **14.84s** across three
++invocations: stack-then-slice, transpose, permute, reshape, view, flip,
++squeeze/unsqueeze, flatten/unflatten, diag/diagonal, roll, detach, and
++expand. No code, host boundary, runtime ABI, or LUT change was needed.
++
++Next forward group: `TestOps.test_sd_big_conv`.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index ab46b2db7..1e1e7217a 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2189,3 +2189,10 @@ circular, reshape, and sliced padding. Conditional-address reflect/replicate
+ movement now uses one strict typed host task when the single source data-load
+ index contains `WHERE`; other padding paths are unchanged. No LUT changed.
+ Contract: **126/126**. Next forward group: `TestOps.test_stack_slice`.
++
++### Movement and views
++
++Fifteen movement/view groups pass unchanged in **14.84s**, covering stacked
++slicing through expand, including transpose/permute, reshape/view,
++flip/roll, dimension edits, diagonal operations, and detach. No code or LUT
++change was needed. Next forward group: `TestOps.test_sd_big_conv`.
+-- 
+2.34.1
+
