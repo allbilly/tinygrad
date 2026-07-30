@@ -1,0 +1,530 @@
+From b9d73be51c5971c664da4c36b058cf8d81d7286d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 09:33:30 +0800
+Subject: [PATCH] rockchip: refine fp32 inverse trig
+
+---
+ lut.md                               |  74 ++++++++++++++++
+ progress.md                          |  79 +++++++++++++++++
+ test/rockchip/test_pr1.py            |   9 ++
+ test_ops_status.md                   |  21 +++++
+ tinygrad/runtime/ops_rockchip.py     |   7 ++
+ tinygrad/runtime/support/rockchip.py | 124 ++++++++++++++++++++++++---
+ 6 files changed, 301 insertions(+), 13 deletions(-)
+
+diff --git a/lut.md b/lut.md
+index acce40bc5..cd7046498 100644
+--- a/lut.md
++++ b/lut.md
+@@ -2220,3 +2220,77 @@ from 37 misses to one with the fit and to zero with the two-knot correction.
+ - Rejected Rockchip WIP is preserved as an apply-checkable patch.
+ - `progress.md` and `test_ops_status.md` are updated before the milestone
+   commit.
++
++## FP32 ASIN/ACOS endpoint tuning
++
++The fp16 ASIN/ACOS tables cannot be reused unchanged for fp32 inputs near
++`|x|=1`.  A non-endpoint fp32 value can round to fp16 `1`, erasing endpoint
++distance entirely.  Preserve a second ABI limb:
++
++```text
++hi = fp16(x)
++lo = fp16(256 * (x - float32(hi)))
++abs_residual = sign(x) * lo
++d = (1 - abs(hi)) - abs_residual/256
++```
++
++The host may construct `hi` and `lo` as representation conversion.  It must
++not evaluate ASIN, ACOS, derivative correction, masks, or selection.
++
++### Coarse and fine endpoint tables
++
++The ordinary endpoint table addresses `acos(1-d)` directly with
++`index_scale=65504`.  Its physical distance step is about `0.000488`.  This
++is adequate away from zero but not in the first interval because
++`acos(1-d)≈sqrt(2*d)`.
++
++For `d<0.003`, use another NPU LUT:
++
++| Quantity | Fine-table value |
++|---|---:|
++| address input | `64*d` |
++| physical distance step | approximately `7.6e-6` |
++| stored curve | `8*acos(1-d)` |
++| post-LUT DPU scale | `1/8` |
++| table format | signed Q15 |
++
++The input magnification improves interpolation.  The output magnification
++improves Q15 resolution for results around `0.01`, where an unscaled Q15
++quantum alone can exceed the official relative tolerance.  Select fine and
++coarse results with NPU masks; do not splice tables on the host.
++
++Observed ACOS progression on the fixed official tensor:
++
++```text
++generic fp32 expansion: ioctl timeout
++specialized coarse tables: 109 / 2925 misses
++residual-aware distance:      8 / 2925
++fine endpoint input only:     2 / 2925
++64x input + 8x output:        0 / 2925
++```
++
++### ASIN reuse and derivative correction
++
++For the endpoint band, reuse the same ACOS endpoint tables:
++
++```text
++asin(abs(x)) = pi/2 - acos(abs(x))
++```
++
++Outside that band, apply the original-input residual with a derivative LUT:
++
++```text
++derivative = 2 * LUT(abs(hi))       # LUT stores 0.5/sqrt(1-x*x)
++correction = derivative * lo / 256
++result     += correction
++```
++
++Mask this correction out in the endpoint band because endpoint distance was
++already corrected.  Use the high-resolution local ASIN table only through
++`|x|<0.24`; its stored curve is `4*asin(x)`, so extending it to `0.25`
++saturates Q15 and produces exact-looking but wrong `±0.25` plateaus.
++
++Always rerun both fp32 and fp16 ASIN/ACOS after changing their shared
++endpoint threshold.  ACOS benefits from a `0.85` endpoint handoff, while
++ASIN keeps `0.875`; forcing one common threshold regresses ASIN near
++`|x|≈0.86`.
+diff --git a/progress.md b/progress.md
+index 4cce6e8e4..1b05eb2ce 100644
+--- a/progress.md
++++ b/progress.md
+@@ -7571,6 +7571,85 @@ Validation with `. .venv/bin/activate`, `DEV=ROCKCHIP FORWARD_ONLY=1`:
+ - Python compilation and whitespace checks: **passing**;
+ - mypy: exact pre-existing **13-error** Rockchip baseline.
+ 
++## 2026-07-30 — fp32 ASIN/ACOS specialized boundaries
++
++The unchanged normal-default `TestOps.test_asin` and `test_acos` now pass on
++RK3588.  Their fp32 graphs previously missed the proven inverse-trig matcher,
++whose recognizer required a half INDEX.  ACOS therefore fell through to a
++108-stage generic elementwise expansion.  The final 39-stage batch timed out
++even in isolation; splitting that batch down to individual submissions still
++timed out at the same graph region, proving this was not merely a PC-chain
++length limit.
++
++The recognizer now accepts direct fp16 or fp32 INDEX inputs.  For fp32,
++`_fix_cmp_fp32` marks only tasks which read the original logical input, and
++`_finalize_fp32_output` marks only the last logical output.  Internal scratch
++slots remain fp16.  This immediately removed the timeout and reduced ACOS to
++109/2,925 numerical misses.
++
++### Residual-aware endpoint coordinate
++
++Host ABI preparation supplies the established representation:
++
++```text
++residual = fp16(256 * (x - fp16(x)))
++```
++
++All inverse-trig arithmetic remains on the NPU.  DPU sign masks convert that
++signed residual into the residual of `abs(x)`, and endpoint distance becomes:
++
++```text
++d = (1 - abs(fp16(x))) - abs_residual / 256
++```
++
++This is important when a non-endpoint fp32 input rounds to fp16 `±1`.
++Exact-endpoint masking now tests corrected positive distance instead of
++testing rounded input against `0.99975`.  The change reduced ACOS from 109
++misses to eight.
++
++### Third fine endpoint LUT
++
++The coarse endpoint table is uniform in `d`.  Linear interpolation across its
++first interval underestimates `acos(1-d)`, whose endpoint shape is
++approximately `sqrt(2*d)`.  A third NPU LUT task handles `d<0.003`:
++
++```text
++address coordinate = 64*d
++stored value        = 8*acos(1-d)
++decoded value       = LUT / 8
++```
++
++The 64× coordinate gives roughly `7.6e-6` distance spacing.  The 8× stored
++value gives an effective Q15 output quantum near `3.8e-6`.  Coarse and fine
++outputs are selected by DPU masks.  ACOS endpoint handling starts at
++`abs(x)>0.85`; its fixed-seed progression was timeout → 109 misses → 8
++misses → 2 misses → passing.
++
++FP32 ASIN reuses the same endpoint tables through
++`asin(abs(x)) = pi/2 - acos(abs(x))`.  Outside its endpoint band
++(`abs(x)>0.875`), a separate NPU derivative LUT stores
++`0.5/sqrt(1-x*x)` and corrects the high-input result by the scaled residual.
++Its high-resolution local ASIN table is used through `abs(x)<0.24`; extending
++to 0.25 was rejected because the stored `4*asin(x)` reaches Q15 saturation
++before that boundary.
++
++Host work is limited to fp32/high-residual representation conversion and
++static scratch movement.  LUT evaluation, masks, derivative correction,
++selection, and final values are DPU/LUT tasks.
++
++Validation:
++
++- normal-default unchanged `test_asin` + `test_acos`: **2 passed in 48.65
++  seconds**;
++- `DEFAULT_FLOAT=HALF` regression pair: **2 passed in 15.38 seconds**;
++- hardware-free PR1 contract: **84/84 in 6.73 seconds**;
++- Python compilation and `git diff --check`: **passing**;
++- mypy: exact pre-existing **13-error** Rockchip baseline.
++
++`ROCKCHIP_DEBUG_STAGE=1` now prints begin/end boundaries and output slots for
++reset-separated DPU/LUT submissions.  It was used to prove the old generic
++ACOS timeout occurred in the final batch rather than in either LUT task.
++
+ `DEFAULT_FLOAT=HALF` is not part of the requested forward command.  It makes
+ `test_const_reduce` pass through the older half path, but also causes
+ official dtype mismatches such as the scalar subcase in `test_add`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index dc2b15f42..799034130 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -299,6 +299,15 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.task.kind == "cmac" for task in subtasks), 3)
+     self.assertTrue(subtasks[-1].task.fp32_output)
+ 
++  def test_fp32_acos_uses_specialized_lut_boundary(self):
++    program = build_native_program(_get_sink(Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").acos()))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertLess(len(subtasks), 80)
++    self.assertTrue(any(task.task.kind == "dpu_lut" for task in subtasks))
++    self.assertEqual(sum(task.task.fp32_output for task in subtasks), 1)
++    self.assertTrue(subtasks[-1].task.fp32_output)
++
+   def test_reject_cmac_exceeds_cbuf(self):
+     # M=6000 with K=4: align_in=32, input_row_bytes=64, data_banks=ceil(6000*64/32768)=12 > 11
+     a = Tensor.rand(6000,4,dtype=dtypes.half).realize()
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 5d0f13ee3..73dcb1fb6 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -1426,3 +1426,24 @@ output reduced that only to 11/81, isolating input quantization.  The
+ compensated path passes.  It is limited to direct source/output buffers of at
+ most 256 elements.  Padded-WHERE GEMM, 64×99 matmul, and the explicit 64×64
+ fp16 cast/output graph remain separate groups.
++
++### FP32 ASIN/ACOS milestone
++
++| Coverage | Result |
++|---|---:|
++| normal-default unchanged `test_asin` + `test_acos` | **2 passed in 48.65s** |
++| half-mode ASIN/ACOS regression pair | **2 passed in 15.38s** |
++| hardware-free PR1 contract | **84/84 in 6.73s** |
++| mypy | **pre-existing 13-error baseline** |
++
++FP32 inverse-trig graphs now enter the specialized lowering rather than a
++108-stage generic expansion which timed out.  Only original fp32 inputs and
++the final logical output carry typed ABI metadata; scratch values stay fp16.
++
++Endpoint distance includes the 256-scaled fp32 input residual.  ACOS uses a
++coarse endpoint LUT plus a third 64×-magnified, 8×-output-scaled fine LUT for
++`d<0.003`.  ASIN reuses those endpoint values through `pi/2-acos`, and applies
++a derivative-LUT residual correction outside its endpoint band.  All
++inverse-trig operator arithmetic remains on DPU/LUT tasks.
++
++The next census must continue in normal-default `FORWARD_ONLY=1` mode.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index e3db93646..8af6ecb05 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -1471,6 +1471,9 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
+             _run_host_half_int(task, st.relocs, tuple(ext))
+             continue
++          if len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
++            _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
++            continue
+           if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
+             _run_host_bitwise(task, st.relocs, tuple(ext))
+             continue
+@@ -1537,16 +1540,20 @@ class RockchipProgram(Program['RockchipDevice']):
+         dpu_pending:list[RKSubTask] = []
+         def flush_pending() -> None:
+           if not dpu_pending: return
++          if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_BEGIN", "dpu", tuple(st.task.out_slot for st in dpu_pending), flush=True)
+           dev.reset_npu()
+           self.subtasks = list(dpu_pending)
+           self._submit_multi(tuple(ext))
++          if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_END", "dpu", tuple(st.task.out_slot for st in dpu_pending), flush=True)
+           dpu_pending.clear()
+         for st in subtasks:
+           if is_cmp(st) or st.task.kind != "dpu":
+             flush_pending()
++            if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_BEGIN", st.task.kind, (st.task.out_slot,), flush=True)
+             dev.reset_npu()
+             self.subtasks = [st]
+             self._submit_multi(tuple(ext))
++            if getenv("ROCKCHIP_DEBUG_STAGE"): print("RK_STAGE_END", st.task.kind, (st.task.out_slot,), flush=True)
+           else:
+             dpu_pending.append(st)
+         flush_pending()
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 718ab6ca3..a86e8ec70 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -502,10 +502,10 @@ def _try_gelu(val:UOp) -> tuple[UOp,bool]|None:
+   return None
+ 
+ def _try_asin_acos(val:UOp) -> tuple[UOp,bool]|None:
+-  """Recognize tinygrad's fp16 asin polynomial, optionally wrapped as pi/2-asin(x)."""
++  """Recognize tinygrad's asin polynomial, optionally wrapped as pi/2-asin(x)."""
+   val = _unwrap(val)
+   indexes = list(dict.fromkeys(u for u in val.toposort() if u.op is Ops.INDEX))
+-  if len(indexes) != 1 or (source := indexes[0]).dtype is not dtypes.half: return None
++  if len(indexes) != 1 or (source := indexes[0]).dtype not in (dtypes.half, dtypes.float): return None
+   core, is_acos = val, False
+   if val.op is Ops.ADD:
+     pi_half = next((x for x in val.src if x.op is Ops.CONST and math.isclose(float(x.arg), math.pi/2)), None)
+@@ -725,8 +725,10 @@ _LUT_COSH = Ops.ENDIF
+ _LUT_SINH_LOCAL = Ops.IF
+ _LUT_ASIN = Ops.WAIT
+ _LUT_ASIN_DETAIL = Ops.INS
++_LUT_ASIN_DERIVATIVE = Ops.INDEX
+ _LUT_ACOS = Ops.CONTIGUOUS
+ _LUT_ACOS_ENDPOINT = Ops.DETACH
++_LUT_ACOS_FINE_ENDPOINT = Ops.CAST
+ _LUT_ATAN = Ops.STAGE
+ _LUT_ATAN_LOCAL = Ops.SLICE
+ _LUT_ATANH = Ops.PAD
+@@ -1399,6 +1401,16 @@ def _build_acos_lut() -> tuple[list[int], int, float, float, int]:
+     lut[_LUT_SIZE+i] = max(-32768, min(32767, positive_raw if positive_raw != 0 else 1))
+   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+ 
++def _build_asin_derivative_lut() -> tuple[list[int], int, float, float, int]:
++  """Q15 half-scale derivative for fp32-residual correction on |x|≤0.85."""
++  index_scale, output_scale = 16384.0, 32768.0
++  step, lut = 32.0/float(np.float16(index_scale)), [1] * (_LUT_SIZE*2)
++  for i in range(_LUT_SIZE):
++    x = min(.85, i*step)
++    raw = int(round(.5/math.sqrt(1-x*x)*output_scale))
++    lut[_LUT_SIZE+i] = max(-32768, min(32767, raw))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
+ def _build_acos_endpoint_lut() -> tuple[list[int], int, float, float, int]:
+   """Direct Q15 acos(1-d) addressed by endpoint distance d∈[0,0.125]."""
+   index_scale, output_scale = 65504.0, 32768.0
+@@ -1409,6 +1421,16 @@ def _build_acos_endpoint_lut() -> tuple[list[int], int, float, float, int]:
+     lut[_LUT_SIZE+i] = max(-32768, min(32767, raw if raw != 0 else 1))
+   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
+ 
++def _build_acos_fine_endpoint_lut() -> tuple[list[int], int, float, float, int]:
++  """Q15 8*acos(1-d) addressed by 64*d for fine interpolation near d=0."""
++  index_scale, output_scale = 65504.0, 32768.0
++  step, lut = 32.0/float(np.float16(index_scale)), [1] * (_LUT_SIZE*2)
++  for i in range(_LUT_SIZE):
++    distance = i*step/64
++    raw = int(round(8*math.acos(max(-1.0, 1.0-distance))*output_scale))
++    lut[_LUT_SIZE+i] = max(-32768, min(32767, raw if raw != 0 else 1))
++  return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, 15
++
+ def _build_atan_lut() -> tuple[list[int], int, float, float, int]:
+   """Direct Q15 atan(x) for transformed x∈[0,1]."""
+   index_scale, output_scale = 16384.0, 32768.0
+@@ -1866,10 +1888,14 @@ def _try_lut(val: UOp) -> tuple[int, float, float, Ops]|None:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ASIN)
+   if val.op is Ops.CUSTOM and val.arg == "rk_asin_detail" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ASIN_DETAIL)
++  if val.op is Ops.CUSTOM and val.arg == "rk_asin_derivative" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ASIN_DERIVATIVE)
+   if val.op is Ops.CUSTOM and val.arg == "rk_acos" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ACOS)
+   if val.op is Ops.CUSTOM and val.arg == "rk_acos_endpoint" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ACOS_ENDPOINT)
++  if val.op is Ops.CUSTOM and val.arg == "rk_acos_fine_endpoint" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
++    return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ACOS_FINE_ENDPOINT)
+   if val.op is Ops.CUSTOM and val.arg == "rk_atan" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+     return (inner.src[0].buf_uop.arg.slot, 1.0, 1.0, _LUT_ATAN)
+   if val.op is Ops.CUSTOM and val.arg == "rk_atan_local" and (inner := _unwrap(val.src[0])).op is Ops.INDEX:
+@@ -3914,6 +3940,11 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     return True
+ 
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
++  source_residual = alloc() if source.dtype is dtypes.float else -1
++  if source_residual >= 0:
++    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    relocs = (RKReloc(0, source_residual, 0, 0, 0xFFFFFFFF), RKReloc(0, source_arg[0], 0, 0, 0xFFFFFFFF))
++    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_RESIDUAL_LAYOUT), source_residual, is_copy=True), relocs))
+   neg_source, abs_source, neg_abs, neg_clamped, bounded = (alloc() for _ in range(5))
+   negative_diff, negative_scratch, negative, positive = (alloc() for _ in range(4))
+   invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(3))
+@@ -3932,10 +3963,20 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   endpoint_diff, endpoint_scratch, endpoint = (alloc() for _ in range(3))
+   endpoint_distance = alloc()
+-  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), scalar(.875), Ops.SUB),
++  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), scalar(.85 if is_acos else .875), Ops.SUB),
+                 _emit_where_stage(total, endpoint_scratch, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
+                 _emit_where_stage(total, endpoint, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
+                 _emit_where_stage(total, endpoint_distance, one, (bounded, 0), Ops.SUB)))
++  endpoint_input = endpoint_distance
++  if source_residual >= 0:
++    negative_residual, positive_residual, selected_negative_residual = alloc(), alloc(), alloc()
++    absolute_residual, scaled_residual, endpoint_input = alloc(), alloc(), alloc()
++    tasks.extend((_emit_where_stage(total, negative_residual, zero, (source_residual, 0), Ops.SUB),
++                  _emit_where_stage(total, positive_residual, (source_residual, 0), (positive, 0), Ops.MUL),
++                  _emit_where_stage(total, selected_negative_residual, (negative_residual, 0), (negative, 0), Ops.MUL),
++                  _emit_where_stage(total, absolute_residual, (positive_residual, 0), (selected_negative_residual, 0), Ops.ADD),
++                  _emit_where_stage(total, scaled_residual, (absolute_residual, 0), scalar(1/256), Ops.MUL),
++                  _emit_where_stage(total, endpoint_input, (endpoint_distance, 0), (scaled_residual, 0), Ops.SUB)))
+ 
+   broad_slot = alloc()
+   if is_acos:
+@@ -3946,7 +3987,22 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, signed_bounded, (positive_bounded, 0), (negative_bounded, 0), Ops.ADD)))
+     endpoint_slot = alloc()
+     if not add_lut("rk_acos", signed_bounded, broad_slot) or \
+-       not add_lut("rk_acos_endpoint", endpoint_distance, endpoint_slot): return None
++       not add_lut("rk_acos_endpoint", endpoint_input, endpoint_slot): return None
++    decoded_endpoint_slot = endpoint_slot
++    if source_residual >= 0:
++      fine_input, fine_slot, decoded_fine_slot = alloc(), alloc(), alloc()
++      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), scalar(64), Ops.MUL))
++      if not add_lut("rk_acos_fine_endpoint", fine_input, fine_slot): return None
++      tasks.append(_emit_where_stage(total, decoded_fine_slot, (fine_slot, 0), scalar(1/8), Ops.MUL))
++      fine_diff, fine_scratch, coarse_mask, fine_mask = (alloc() for _ in range(4))
++      coarse_selected, fine_selected, decoded_endpoint_slot = (alloc() for _ in range(3))
++      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), scalar(.003), Ops.SUB),
++                    _emit_where_stage(total, fine_scratch, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
++                    _emit_where_stage(total, coarse_mask, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
++                    _emit_where_stage(total, fine_mask, one, (coarse_mask, 0), Ops.SUB),
++                    _emit_where_stage(total, coarse_selected, (endpoint_slot, 0), (coarse_mask, 0), Ops.MUL),
++                    _emit_where_stage(total, fine_selected, (decoded_fine_slot, 0), (fine_mask, 0), Ops.MUL),
++                    _emit_where_stage(total, decoded_endpoint_slot, (coarse_selected, 0), (fine_selected, 0), Ops.ADD)))
+     broad_mask, broad_positive, broad_negative = (alloc() for _ in range(3))
+     broad_positive_selected, broad_negative_selected, broad_decoded, broad_selected = (alloc() for _ in range(4))
+     exact_diff, exact_scratch, exact_one, not_exact = (alloc() for _ in range(4))
+@@ -3961,11 +4017,13 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, broad_selected, (broad_decoded, 0), (broad_mask, 0), Ops.MUL),
+                   # The hardware cannot safely emit a literal zero LUT entry.
+                   # Only fp16 x=1 exceeds this threshold, so mask its one-count substitute.
+-                  _emit_where_stage(total, exact_diff, (bounded, 0), scalar(.99975), Ops.SUB),
++                  _emit_where_stage(total, exact_diff, (endpoint_input, 0) if source_residual >= 0 else (bounded, 0),
++                                    zero if source_residual >= 0 else scalar(.99975), Ops.SUB),
+                   _emit_where_stage(total, exact_scratch, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
+                   _emit_where_stage(total, exact_one, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, not_exact, one, (exact_one, 0), Ops.SUB),
+-                  _emit_where_stage(total, endpoint_nonzero, (endpoint_slot, 0), (not_exact, 0), Ops.MUL),
++                  _emit_where_stage(total, not_exact, (exact_one, 0) if source_residual >= 0 else one,
++                                    zero if source_residual >= 0 else (exact_one, 0), Ops.SUB),
++                  _emit_where_stage(total, endpoint_nonzero, (decoded_endpoint_slot, 0), (not_exact, 0), Ops.MUL),
+                   _emit_where_stage(total, positive_endpoint, (endpoint_nonzero, 0), (positive, 0), Ops.MUL),
+                   _emit_where_stage(total, negative_endpoint, scalar(math.pi), (endpoint_nonzero, 0), Ops.SUB),
+                   _emit_where_stage(total, positive_endpoint_selected, (positive_endpoint, 0), (positive, 0), Ops.MUL),
+@@ -3982,7 +4040,8 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+                   _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+                   _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_diff, (bounded, 0), scalar(.125), Ops.SUB),
++                  _emit_where_stage(total, local_diff, (bounded, 0),
++                                    scalar(.24 if source_residual >= 0 else .125), Ops.SUB),
+                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+@@ -3990,20 +4049,41 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, middle_mask, (local_outside, 0), (endpoint, 0), Ops.SUB),
+                   _emit_where_stage(total, neg_bounded, zero, (bounded, 0), Ops.SUB),
+                   _emit_where_stage(total, local_coordinate, (neg_bounded, 0), (local_inside, 0), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_coordinate, (endpoint_distance, 0), (endpoint, 0), Ops.MUL),
++                  _emit_where_stage(total, endpoint_coordinate, (endpoint_input, 0), (endpoint, 0), Ops.MUL),
+                   _emit_where_stage(total, detail_input, (local_coordinate, 0), (endpoint_coordinate, 0), Ops.ADD)))
+     detail_slot = alloc()
+     if not add_lut("rk_asin", bounded, broad_slot) or not add_lut("rk_asin_detail", detail_input, detail_slot): return None
++    derivative_slot, fp32_endpoint_asin = -1, -1
++    if source_residual >= 0:
++      derivative_slot = alloc()
++      if not add_lut("rk_asin_derivative", bounded, derivative_slot): return None
++      coarse_acos, fine_input, fine_acos, decoded_fine_acos = alloc(), alloc(), alloc(), alloc()
++      if not add_lut("rk_acos_endpoint", endpoint_input, coarse_acos): return None
++      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), scalar(64), Ops.MUL))
++      if not add_lut("rk_acos_fine_endpoint", fine_input, fine_acos): return None
++      tasks.append(_emit_where_stage(total, decoded_fine_acos, (fine_acos, 0), scalar(1/8), Ops.MUL))
++      fine_diff, fine_scratch, coarse_mask, fine_mask = (alloc() for _ in range(4))
++      coarse_selected_acos, fine_selected_acos, decoded_acos, fp32_endpoint_asin = (alloc() for _ in range(4))
++      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), scalar(.003), Ops.SUB),
++                    _emit_where_stage(total, fine_scratch, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
++                    _emit_where_stage(total, coarse_mask, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
++                    _emit_where_stage(total, fine_mask, one, (coarse_mask, 0), Ops.SUB),
++                    _emit_where_stage(total, coarse_selected_acos, (coarse_acos, 0), (coarse_mask, 0), Ops.MUL),
++                    _emit_where_stage(total, fine_selected_acos, (decoded_fine_acos, 0), (fine_mask, 0), Ops.MUL),
++                    _emit_where_stage(total, decoded_acos, (coarse_selected_acos, 0), (fine_selected_acos, 0), Ops.ADD),
++                    _emit_where_stage(total, fp32_endpoint_asin, scalar(math.pi/2), (decoded_acos, 0), Ops.SUB)))
+     broad_scaled, broad_selected = alloc(), alloc()
+     local_scaled, local_selected = alloc(), alloc()
+     endpoint_scaled, endpoint_selected = alloc(), alloc()
+     near_selected, partial, absolute_partial, absolute_asin = alloc(), alloc(), alloc(), alloc()
+-    negative_asin, positive_selected, negative_selected, selected = (alloc() for _ in range(4))
++    negative_asin, positive_selected, negative_selected, base_selected = (alloc() for _ in range(4))
+     tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), scalar(2), Ops.MUL),
+                   _emit_where_stage(total, broad_selected, (broad_scaled, 0), (middle_mask, 0), Ops.MUL),
+                   _emit_where_stage(total, local_scaled, (detail_slot, 0), scalar(.25), Ops.MUL),
+                   _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_scaled, (detail_slot, 0), scalar(2), Ops.MUL),
++                  _emit_where_stage(total, endpoint_scaled,
++                                    (fp32_endpoint_asin, 0) if fp32_endpoint_asin >= 0 else (detail_slot, 0),
++                                    one if fp32_endpoint_asin >= 0 else scalar(2), Ops.MUL),
+                   _emit_where_stage(total, endpoint_selected, (endpoint_scaled, 0), (endpoint, 0), Ops.MUL),
+                   _emit_where_stage(total, near_selected, (bounded, 0), (near_inside, 0), Ops.MUL),
+                   _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+@@ -4012,7 +4092,16 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, negative_asin, zero, (absolute_asin, 0), Ops.SUB),
+                   _emit_where_stage(total, positive_selected, (absolute_asin, 0), (positive, 0), Ops.MUL),
+                   _emit_where_stage(total, negative_selected, (negative_asin, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, selected, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
++                  _emit_where_stage(total, base_selected, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
++    selected = base_selected
++    if source_residual >= 0:
++      derivative, scaled_residual, residual_correction, nonendpoint_mask, nonendpoint_correction, selected = (alloc() for _ in range(6))
++      tasks.extend((_emit_where_stage(total, derivative, (derivative_slot, 0), scalar(2), Ops.MUL),
++                    _emit_where_stage(total, scaled_residual, (source_residual, 0), scalar(1/256), Ops.MUL),
++                    _emit_where_stage(total, residual_correction, (derivative, 0), (scaled_residual, 0), Ops.MUL),
++                    _emit_where_stage(total, nonendpoint_mask, one, (endpoint, 0), Ops.SUB),
++                    _emit_where_stage(total, nonendpoint_correction, (residual_correction, 0), (nonendpoint_mask, 0), Ops.MUL),
++                    _emit_where_stage(total, selected, (base_selected, 0), (nonendpoint_correction, 0), Ops.ADD)))
+ 
+   valid_scratch, valid, factor_scratch, factor = (alloc() for _ in range(4))
+   tasks.extend((_emit_where_stage(total, valid_scratch, one, (invalid, 0), Ops.SUB),
+@@ -4020,7 +4109,8 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
+                 _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
+                 _emit_where_stage(total, info.outs[0], (selected, 0), (factor, 0), Ops.MUL)))
+-  return tuple(tasks)
++  tasks = list(_fix_cmp_fp32(tuple(tasks), source))
++  return _finalize_fp32_output(tasks, store)
+ 
+ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT atan after reciprocal folding maps every finite magnitude into [0,1]."""
+@@ -7923,6 +8013,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_detail_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_ASIN_DERIVATIVE:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_derivative_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+   elif lut_op is _LUT_ACOS:
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+@@ -7931,6 +8025,10 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_endpoint_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+     lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++  elif lut_op is _LUT_ACOS_FINE_ENDPOINT:
++    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_fine_endpoint_lut()
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+   elif lut_op is _LUT_ATAN:
+     lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_lut()
+     lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-- 
+2.34.1
+
