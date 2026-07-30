@@ -9597,3 +9597,12 @@ covering `(45,65)/(45,1)` and `(45,65)/scalar`. No code, host boundary,
 runtime ABI, or LUT change was needed.
 
 Next forward group: `TestOps.test_broadcast_partial`.
+
+## 2026-07-30 — partial-broadcast validation
+
+All twenty unchanged `TestOps.test_broadcast_partial` subtests pass in
+**56.81s**, covering add/subtract/multiply/divide/power across large rank-4,
+rank-5, row-to-matrix, and column-to-matrix layouts. No additional code,
+host boundary, runtime ABI, or LUT change was needed.
+
+Next forward group: `TestOps.test_slice_in_bounds_1dim`.

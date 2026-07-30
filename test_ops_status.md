@@ -2168,3 +2168,9 @@ No LUT changed. Contract: **125/125**. Next forward group:
 `TestOps.test_broadcast_simple`: **pass in 3.11s** unchanged for column and
 scalar division. No code or LUT change was needed. Next forward group:
 `TestOps.test_broadcast_partial`.
+
+### Partial broadcasting
+
+`TestOps.test_broadcast_partial`: **20 subtests pass in 56.81s** unchanged
+across all five arithmetic families and four layout pairs. No code or LUT
+change was needed. Next forward group: `TestOps.test_slice_in_bounds_1dim`.
