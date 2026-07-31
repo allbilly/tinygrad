@@ -125,6 +125,11 @@ class TestDPUCompiler(unittest.TestCase):
     a, b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(32,8,dtype=dtypes.half)
     self.assertIsNone(lower_contract(sink(a@b)))
 
+  def test_spatial_conv_rejects_without_device_layout_stage(self):
+    inp, weight = Tensor.empty(1,8,5,5,dtype=dtypes.half), Tensor.empty(8,8,3,3,dtype=dtypes.half)
+    with self.assertRaisesRegex(RuntimeError, "RKPLAN_REJECT:unsupported_graph"):
+      RockchipRenderer(Target("ROCKCHIP")).native_program(sink(inp.conv2d(weight)))
+
   def test_row_sum_is_constant_backed_contract(self):
     plan = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
     self.assertIsInstance(plan, RKContract)
