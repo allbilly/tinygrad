@@ -19,4 +19,10 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(Tensor.full((16,), 3.5, dtype=dtypes.half, device="ROCKCHIP").realize().numpy(),
                             np.full(16, 3.5, np.float16))
 
+  def test_direct_fp16_contract(self):
+    rng = np.random.default_rng(2)
+    a_np, packed_b_np = rng.uniform(-1,1,(1,32)).astype(np.float16), rng.uniform(-1,1,(8,32)).astype(np.float16)
+    a, packed_b = Tensor(a_np, device="ROCKCHIP").realize(), Tensor(packed_b_np, device="ROCKCHIP").realize()
+    np.testing.assert_allclose((a@packed_b.T).realize().numpy(), a_np@packed_b_np.T, rtol=5e-3, atol=5e-3)
+
 if __name__ == "__main__": unittest.main()

@@ -3,7 +3,8 @@ from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
 from tinygrad.helpers import Target
-from tinygrad.renderer.rockchip import (RKBufferKind, RKDPUProgram, RockchipRenderer, decode_image, emit_dpu, lower_dpu)
+from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RockchipRenderer, decode_image, emit_contract, emit_dpu,
+                                        lower_contract, lower_dpu)
 from tinygrad.uop.ops import Ops, UOp
 
 def sink(expr:Tensor) -> UOp:
@@ -73,5 +74,27 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsNone(lower_dpu(sink(a.T+b)))
     x, y = Tensor.empty(16,dtype=dtypes.float), Tensor.empty(16,dtype=dtypes.float)
     self.assertIsNone(lower_dpu(sink(x+y)))
+
+  def test_direct_affine_contract_is_typed(self):
+    a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
+    plan = lower_contract(sink(a@packed_b.T))
+    self.assertIsInstance(plan, RKContract)
+    self.assertFalse(contains_uop(plan))
+    image = emit_contract(plan)
+    self.assertEqual(len(image.stages[0].commands), 46)
+    self.assertEqual(tuple(r.word for r in image.stages[0].relocs), (18,24,31))
+    self.assertEqual(image.stages[0].commands[:30], (
+      0x10010000000e4004, 0x020120000120100c, 0x0201000040001010, 0x0201000000091014,
+      0x0201000100011020, 0x0201001f00201024, 0x0201000000011028, 0x020100000001102c,
+      0x0201000008001030, 0x0201000000401034, 0x0201010100201038, 0x0201000000b11040,
+      0x0201000000011044, 0x02010000000b104c, 0x0201000100001050, 0x0201000100001054,
+      0x0201000100001058, 0x020100010000105c, 0x0201000000001070, 0x0201000f000f1078,
+      0x020100000004107c, 0x0201000000001080, 0x0201000100011084, 0x0201000000201088,
+      0x0201000000001110, 0x0801000002013010, 0x0801000000003014, 0x08010000001f3018,
+      0x0801000000003030, 0x1001000001e4400c))
+
+  def test_contract_rejects_unpacked_rhs(self):
+    a, b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(32,8,dtype=dtypes.half)
+    self.assertIsNone(lower_contract(sink(a@b)))
 
 if __name__ == "__main__": unittest.main()
