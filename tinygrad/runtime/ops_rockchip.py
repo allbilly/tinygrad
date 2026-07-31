@@ -648,6 +648,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
         elif op == 28: value = int(args[0]) << int(args[1])
         elif op == 29: value = int(args[0]) >> int(args[1])
         elif op == 30: value = args[0]*args[1] + args[2]
+        elif op == 32: value = np.asarray(args[0], dtype=np_dtypes[arg1]).view(np_dtypes[dtype_code]).item()
         else: raise RuntimeError(f"rk: invalid host elementwise opcode {op}")
         stack.append(cast(value, dtype_code))
     assert len(stack) == 1
@@ -666,6 +667,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
 
     def evaluate_vector(code, coords, reduced=None):
       stack:list = []
+      value:object
       for pos in range(0, len(code), 4):
         op, dtype_code, arg0, arg1 = code[pos:pos+4]
         if op == 0:
@@ -726,6 +728,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
         elif op == 28: value = args[0] << args[1]
         elif op == 29: value = args[0] >> args[1]
         elif op == 30: value = args[0]*args[1] + args[2]
+        elif op == 32: value = np.asarray(args[0], dtype=np_dtypes[arg1]).view(np_dtypes[dtype_code])
         else: raise RuntimeError(f"rk: invalid vector fancy-index opcode {op}")
         stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
       assert len(stack) == 1

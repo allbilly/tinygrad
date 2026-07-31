@@ -9168,7 +9168,7 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
               Ops.XOR:13, Ops.CAST:14, Ops.TRUNC:15, Ops.SQRT:16, Ops.EXP2:17,
               Ops.LOG2:18, Ops.SIN:19, Ops.CMOD:20, Ops.CDIV:21, Ops.FLOORDIV:22,
               Ops.FLOORMOD:23, Ops.SUB:24, Ops.POW:25, Ops.NEG:26, Ops.CMPEQ:27,
-              Ops.SHL:28, Ops.SHR:29, Ops.MULACC:30}
+              Ops.SHL:28, Ops.SHR:29, Ops.MULACC:30, Ops.BITCAST:32}
 
   def input_id(slot:int) -> int:
     if slot not in input_slots: input_slots.append(slot)
@@ -9198,7 +9198,9 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
       return True
     if u.op not in op_codes: return False
     if not all(emit(x, code) for x in u.src): return False
-    code.extend((op_codes[u.op], dtype_code, len(u.src), 0))
+    source_dtype = _host_dtype_code(u.src[0].dtype) if u.op is Ops.BITCAST and len(u.src) == 1 else 0
+    if source_dtype is None: return False
+    code.extend((op_codes[u.op], dtype_code, len(u.src), source_dtype))
     return True
 
   out_code:list[int] = []
@@ -9219,6 +9221,18 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
+
+def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.int: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.BITCAST or value.dtype is not dtypes.int or len(value.src) != 1: return None
+  source = _unwrap(value.src[0])
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM: return None
+  total = prod(_shape_of_store(sink))
+  if not 1 <= total <= 1 << 20 or int(source.src[0].src[0].arg) != total: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
 def _try_mask_prefix_count_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Serialize bounded int32 prefix/count histograms used by masked_select."""
@@ -14548,6 +14562,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
+  if (bitcast_tasks := _try_bitcast_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitcast_tasks)
   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
