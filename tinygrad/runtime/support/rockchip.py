@@ -9257,6 +9257,24 @@ def _try_fp32_sin_cos_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
      int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_floor_ceil_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate exact fp16 floor/ceil expansions when native WHERE reverses their predicates."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half or _reduce_node(sink) is not None: return None
+  value = _unwrap(store.src[1])
+  if value.op is not Ops.WHERE or len(value.src) != 3: return None
+  condition, incremented, truncated = value.src
+  if truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or \
+     incremented.op is not Ops.ADD or len(incremented.src) != 2: return None
+  delta = next((float(x.arg) for x in incremented.src if x.op is Ops.CONST), None)
+  if delta not in (-1.0, 1.0) or not any(x is truncated for x in incremented.src): return None
+  source = _unwrap(truncated.src[0])
+  if condition.src != ((truncated, source) if delta == 1.0 else (source, truncated)): return None
+  total = prod(_shape_of_store(sink))
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM or \
+     int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
   store = _store_node(sink)
@@ -14594,6 +14612,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
   if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
+  if (floor_ceil_tasks := _try_floor_ceil_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, floor_ceil_tasks)
   if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
