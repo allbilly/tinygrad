@@ -928,6 +928,23 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_int_true_div_uses_one_typed_fp16_task(self):
+    default_float = dtypes.default_float
+    try:
+      dtypes.default_float = dtypes.half
+      lhs = Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")
+      rhs = Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")
+      sinks = [next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+               for expression in (lhs/rhs, lhs//rhs, lhs//2, lhs.div(rhs, rounding_mode="trunc"))]
+    finally:
+      dtypes.default_float = default_float
+    for sink in sinks:
+      program = build_native_program(sink)
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp16_cumprod_uses_one_typed_float32_reduction(self):
     for shape, axis in (((20,), 0), ((20,30), 0), ((20,30), 1), ((20,30,40), 2)):
       expression = Tensor.empty(*shape, dtype=dtypes.half, device="ROCKCHIP").cumprod(axis)

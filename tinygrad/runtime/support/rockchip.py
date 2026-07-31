@@ -9377,6 +9377,39 @@ def _try_fmod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if any(u.op not in allowed for u in value.toposort()): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_int_true_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate the exact int32/int32 true-division promotion as one typed fp16 task."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half or _reduce_node(sink) is not None: return None
+  value = store.src[1]
+  if value.op is not Ops.FDIV or value.dtype is not dtypes.half or len(value.src) != 2: return None
+  indexes = [_unwrap(u) for u in value.src]
+  if any(u.op is not Ops.INDEX or u.dtype is not dtypes.int or u.src[0].op is not Ops.PARAM for u in indexes) or \
+     indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1]: return None
+  nodes = value.toposort()
+  if any(u.op not in {Ops.FDIV, Ops.CAST, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in nodes): return None
+  total = prod(_shape_of_store(sink))
+  if not 1 <= total <= 1 << 20 or any(int(u.src[0].src[0].arg) != total for u in indexes): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
+def _try_int_rounded_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate direct int32 floor or truncating division as one typed host task."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.int or _reduce_node(sink) is not None: return None
+  value = store.src[1]
+  if value.op not in (Ops.FLOORDIV, Ops.CDIV) or value.dtype is not dtypes.int or len(value.src) != 2: return None
+  indexes = [u for u in value.src if u.op is Ops.INDEX]
+  constants = [u for u in value.src if u.op is Ops.CONST]
+  if len(indexes) + len(constants) != 2 or len(indexes) not in (1, 2): return None
+  if any(u.op is not Ops.INDEX or u.dtype is not dtypes.int or u.src[0].op is not Ops.PARAM for u in indexes) or \
+     (len(indexes) == 2 and
+      (indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1])): return None
+  nodes = value.toposort()
+  if any(u.op not in {Ops.FLOORDIV, Ops.CDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in nodes): return None
+  total = prod(_shape_of_store(sink))
+  if not 1 <= total <= 1 << 20 or any(int(u.src[0].src[0].arg) != total for u in indexes): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Collapse the canonical fp16 cumulative-prefix product to one typed float32 reduction."""
   store = _store_node(sink)
@@ -14828,6 +14861,10 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, round_quantization_tasks)
   if (mod_tasks := _try_mod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, mod_tasks)
   if (fmod_tasks := _try_fmod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, fmod_tasks)
+  if (int_true_div_tasks := _try_int_true_div_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, int_true_div_tasks)
+  if (int_rounded_div_tasks := _try_int_rounded_div_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, int_rounded_div_tasks)
   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
