@@ -3,8 +3,8 @@ from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
 from tinygrad.helpers import Target
-from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RockchipRenderer, decode_image, emit_contract, emit_dpu,
-                                        lower_contract, lower_dpu)
+from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RKPool, RockchipRenderer, decode_image, emit_contract, emit_dpu,
+                                        emit_pool, lower_contract, lower_dpu, lower_pool)
 from tinygrad.uop.ops import Ops, UOp
 
 def sink(expr:Tensor) -> UOp:
@@ -96,5 +96,15 @@ class TestDPUCompiler(unittest.TestCase):
   def test_contract_rejects_unpacked_rhs(self):
     a, b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(32,8,dtype=dtypes.half)
     self.assertIsNone(lower_contract(sink(a@b)))
+
+  def test_global_max_requires_explicit_hwc_layout(self):
+    source = Tensor.empty(8,8,dtype=dtypes.half)
+    plan = lower_pool(sink(source.max(axis=0)))
+    self.assertIsInstance(plan, RKPool)
+    self.assertFalse(contains_uop(plan))
+    image = emit_pool(plan)
+    self.assertEqual(len(image.stages[0].commands), 25)
+    self.assertEqual(tuple(r.word for r in image.stages[0].relocs), (10,17))
+    self.assertIsNone(lower_pool(sink(Tensor.empty(8,7,dtype=dtypes.half).max(axis=0))))
 
 if __name__ == "__main__": unittest.main()

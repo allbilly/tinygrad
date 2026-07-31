@@ -20,8 +20,14 @@ class TestRKImage(unittest.TestCase):
     patched = patch_image(image, lambda kind, index: 0x12345000)[0][0]
     self.assertEqual(patched & 0xffff000000000000, command & 0xffff000000000000)
     self.assertEqual(patched & 0xffff, command & 0xffff)
-    expected = ((((0x12345000 + 0x40) >> 4) << 0) & 0x00fffff0)
+    expected = ((0x12345000 + 0x40) >> 4) & 0x00fffff0
     self.assertEqual((patched >> 16) & 0x00fffff0, expected)
+
+  def test_relocation_field_shift_applies_after_source_mask(self):
+    image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.PPU, (0x4001000000006070,),
+      (RKReloc(0, 0, RKBufferKind.ARG, 0, shift=4, mask=0x0fffffff, field_shift=4),)),))
+    patched = patch_image(image, lambda kind, index: 0x12345670)[0][0]
+    self.assertEqual((patched >> 16) & 0xffffffff, 0x12345670)
 
   def test_rejects_malformed_images(self):
     image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (1,), dependencies=1),))

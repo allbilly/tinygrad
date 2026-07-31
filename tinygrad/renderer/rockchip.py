@@ -99,6 +99,12 @@ class RKContract:
   reduce_axes: tuple[int, ...]
 
 @dataclass(frozen=True)
+class RKPool:
+  out: RKView
+  inp: RKView
+  kernel: tuple[int, int]
+
+@dataclass(frozen=True)
 class _DPUExpr:
   op: RKDPUOp
   src: tuple[_DPUExpr|RKArg|float, ...]
@@ -177,8 +183,9 @@ def patch_image(image:RKImage, address:Callable[[RKBufferKind, int], int]) -> tu
     for reloc in stage.relocs:
       word = patched[reloc.stage][reloc.word]
       value = (word >> 16) & 0xffffffff
-      field = (((address(reloc.kind, reloc.index) + reloc.addend) >> reloc.shift) << reloc.field_shift) & reloc.mask
-      patched[reloc.stage][reloc.word] = (word & ~0xffffffff0000) | (((value & ~reloc.mask) | field) << 16)
+      field = ((address(reloc.kind, reloc.index) + reloc.addend) >> reloc.shift) & reloc.mask
+      field_mask = (reloc.mask << reloc.field_shift) & 0xffffffff
+      patched[reloc.stage][reloc.word] = (word & ~0xffffffff0000) | (((value & ~field_mask) | ((field << reloc.field_shift) & field_mask)) << 16)
   return tuple(tuple(stage) for stage in patched)
 
 def _unwrap_same_cast(u:UOp) -> UOp:
@@ -282,8 +289,28 @@ def lower_contract(sink:UOp) -> RKContract|None:
   return RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), RKView(lhs.src[0].arg.slot, (1,32), (32,1)),
                     RKView(rhs.src[0].arg.slot, (n,32), (32,1)), (red_axis,))
 
+def lower_pool(sink:UOp) -> RKPool|None:
+  """Recognize global MAX over an explicitly legal (K, 8) HWC surface."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return None
+  store, reduce = stores[0], reductions[0]
+  value = _strip_casts(reduce.src[0])
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) != 2 or value.op is not Ops.INDEX or value.dtype is not dtypes.half: return None
+  red, out_param, inp_param = reduce.src[1], store.src[0].src[0], value.src[0]
+  if red.op is not Ops.RANGE or store.src[0].op is not Ops.INDEX or out_param.op is not Ops.PARAM or inp_param.op is not Ops.PARAM: return None
+  out_aff, inp_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or inp_aff is None or out_aff[1] or inp_aff[1] or len(out_aff[0]) != 1: return None
+  channel_axis, red_axis = next(iter(out_aff[0])), red.arg[0]
+  k, channels = int(red.src[0].arg), int(out_param.src[0].arg)
+  if channels != 8 or out_aff[0] != {channel_axis:1} or inp_aff[0] != {red_axis:channels, channel_axis:1}: return None
+  split = next(((h, k//h) for h in range(2, min(k,16)+1) if k%h == 0 and 2 <= k//h <= 16 and h != 9 and k//h != 9 and
+                (h,k//h) not in ((3,6),(6,3),(12,12))), (1,k) if 4 <= k <= 16 else None)
+  if split is None or int(inp_param.src[0].arg) != k*channels: return None
+  return RKPool(RKView(out_param.arg.slot, (channels,), (1,)), RKView(inp_param.arg.slot, (k,channels), (channels,1)), split)
+
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
+_TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
 _EW_BASE = 0x108002c0
 _EW_CFG = {RKDPUOp.ADD:_EW_BASE | (2 << 16), RKDPUOp.MUL:_EW_BASE | (1 << 2) | (1 << 8),
            RKDPUOp.MAX:_EW_BASE, RKDPUOp.SUB:_EW_BASE | (4 << 16)}
@@ -361,6 +388,29 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
             RKReloc(0, 31, RKBufferKind.ARG, plan.out.slot))
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, (plan.lhs.slot, plan.rhs.slot), (plan.out.slot,), flags=RK_STAGE_RESET),))
 
+def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
+  if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
+  height, width = plan.kernel
+  h, w, c, stride = height-1, width-1, plan.out.shape[0]-1, width*plan.out.shape[0]*2
+  e = _command
+  commands = (e(_TARGET_PPU, rk.REG_PPU_S_POINTER, 0x0e), e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_S_POINTER, 0x0e),
+    e(_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_WIDTH, w), e(_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_HEIGHT, h),
+    e(_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_CHANNEL, c), e(_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_WIDTH, 0),
+    e(_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_HEIGHT, 0), e(_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_CHANNEL, c),
+    e(_TARGET_PPU, rk.REG_PPU_OPERATION_MODE_CFG, 0x11), e(_TARGET_PPU, rk.REG_PPU_POOLING_KERNEL_CFG, (h<<20)|(w<<16)|(h<<8)|w),
+    e(_TARGET_PPU, rk.REG_PPU_DST_BASE_ADDR, 0), e(_TARGET_PPU, rk.REG_PPU_DST_SURF_STRIDE, 1),
+    e(_TARGET_PPU, rk.REG_PPU_DATA_FORMAT, 0x10002), e(_TARGET_PPU, rk.REG_PPU_MISC_CTRL, 3),
+    e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH, w), e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT, h),
+    e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL, c), e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_BASE_ADDR, 0),
+    e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE, stride),
+    e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE, stride*height),
+    e(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_RDMA_DATA_FORMAT, 2), e(_TARGET_PPU_RDMA, 0x7038, 1),
+    e(_TARGET_PPU, rk.REG_PPU_RECIP_KERNEL_WIDTH, 0), e(_TARGET_PPU, rk.REG_PPU_RECIP_KERNEL_HEIGHT, 0),
+    e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x60))
+  relocs = (RKReloc(0, 10, RKBufferKind.ARG, plan.out.slot, shift=4, mask=0x0fffffff, field_shift=4),
+            RKReloc(0, 17, RKBufferKind.ARG, plan.inp.slot))
+  return RKImage(target, (RKStage(RKEngine.PPU, commands, relocs, (plan.inp.slot,), (plan.out.slot,), flags=RK_STAGE_RESET),))
+
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
@@ -368,6 +418,7 @@ class RockchipRenderer(Renderer):
   def native_program(self, ast:UOp) -> UOp|None:
     if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
     elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)
+    elif (pool:=lower_pool(ast)) is not None: image = emit_pool(pool)
     else: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
     return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR), UOp(Ops.SOURCE, arg=""),
       UOp(Ops.BINARY, arg=encode_image(image))), arg=ProgramInfo.from_sink(ast, self.target))

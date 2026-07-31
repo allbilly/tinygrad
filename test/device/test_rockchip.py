@@ -25,4 +25,8 @@ class TestRockchip(unittest.TestCase):
     a, packed_b = Tensor(a_np, device="ROCKCHIP").realize(), Tensor(packed_b_np, device="ROCKCHIP").realize()
     np.testing.assert_allclose((a@packed_b.T).realize().numpy(), a_np@packed_b_np.T, rtol=5e-3, atol=5e-3)
 
+  def test_explicit_hwc_global_max(self):
+    data = np.arange(64, dtype=np.float16).reshape(8,8)
+    np.testing.assert_equal(Tensor(data, device="ROCKCHIP").max(axis=0).realize().numpy(), data.max(axis=0))
+
 if __name__ == "__main__": unittest.main()
