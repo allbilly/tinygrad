@@ -9,7 +9,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 1, 1
 _HEADER = struct.Struct("<4sHHHHHHIII")
 _STAGE = struct.Struct("<BBHIIIIIQQ")
 _RELOC = struct.Struct("<HHBBHqII")
@@ -196,7 +196,9 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   root = _parse_dpu_expr(store.src[1], out_index, {})
   if root is None: return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
-  if not isinstance(root, _DPUExpr): return RKDPUProgram((RKDPUStage(RKDPUOp.COPY, output, root, None, count),), ())
+  if not isinstance(root, _DPUExpr):
+    stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count) if isinstance(root, float) else RKDPUStage(RKDPUOp.COPY, output, root, None, count)
+    return RKDPUProgram((stage,), ())
   order:list[_DPUExpr] = []
   def visit(expr:_DPUExpr) -> None:
     for src in expr.src:
@@ -269,7 +271,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     operands = (lhs,) if rhs is None else (lhs, rhs)
     reads = tuple(sorted({x.index for x in operands if x.kind is RKBufferKind.ARG}))
     writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
-    stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0))
+    stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET))
   return RKImage(target, tuple(stages), program.scratch, bytes(constants))
 
 class RockchipRenderer(Renderer):
@@ -278,4 +280,5 @@ class RockchipRenderer(Renderer):
   def supported_dtypes(self): return {dtypes.half}
   def native_program(self, ast:UOp) -> UOp|None:
     if (plan:=lower_dpu(ast)) is None: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-    return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.BINARY, arg=encode_image(emit_dpu(plan)))), arg=ProgramInfo.from_sink(ast, self.target))
+    return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR), UOp(Ops.SOURCE, arg=""),
+      UOp(Ops.BINARY, arg=encode_image(emit_dpu(plan)))), arg=ProgramInfo.from_sink(ast, self.target))

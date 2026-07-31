@@ -48,6 +48,12 @@ class TestDPUCompiler(unittest.TestCase):
       0x10010000000e4004, 0x1001000001e5400c, 0x1001480000024010,
       0x1001000000014030, 0x1001000000004034, 0x100100070007403c))
 
+  def test_fill_is_dpu_add_not_constant_copy(self):
+    plan = lower_dpu(sink(Tensor.full((16,), 3.5, dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.stages[0].op.name, "ADD")
+    self.assertEqual(len(emit_dpu(plan).constants), 64)
+
   def test_liveness_reuses_dead_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))
     plan = lower_dpu(sink(((a+b)*c)+d))
@@ -59,7 +65,7 @@ class TestDPUCompiler(unittest.TestCase):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(a.maximum(b)))
     self.assertIsNotNone(program)
-    image = decode_image(program.src[1].arg)
+    image = decode_image(program.src[3].arg)
     self.assertEqual(len(image.stages), 1)
 
   def test_rejects_noncontiguous_and_nonhalf(self):
