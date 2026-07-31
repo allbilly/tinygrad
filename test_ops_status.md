@@ -2759,3 +2759,28 @@ Contract: **161/161 in 9.15s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. The serialized inventory had 45 method passes and 40
 subtest passes before this failure; next inventory starts after it.
+
+### FP16 cumulative product
+
+The full fp16 cumprod family passes **4/4 in 13.30s**, including small,
+512/1022 long, ordinary multidimensional, and zero-axis methods. Commit
+`d0fc6cd0a`; saved patch
+`0099-rockchip-pass-fp16-cumulative-product.patch`.
+
+The ordinary prefix kernels expanded to 896–1,836 DPU subtasks, while the
+first padded length-1022 block emitted 11,988; both could leave the RK submit
+worker in uninterruptible driver sleep. A strict typed classifier now
+recognizes only the canonical fp16 prefix-product mask and the separately
+fingerprinted `1022 -> 1024 -> 4` padded/block-prefix stages. Each becomes
+one bounded `MUL` reduction using the existing float32 typed accumulator.
+The final block combine remains native, and no generic reduction fallback is
+enabled.
+
+`test_cumprod` passes alone in **12.48s**. Cummax passes alone in **62.93s**,
+and cummax-zero/cummin pass **3/3 in 77.78s**, confirming their prior
+post-cross-entropy driver sleep was state pollution rather than a numerical
+regression.
+
+Contract: **162/162 in 9.22s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. Next: fresh cumsum validation, then ordered inventory.

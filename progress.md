@@ -10858,3 +10858,66 @@ Pre-edit recovery copies:
 
 Next action: resume deterministic serialized `TestOps` inventory after
 `test_broadcast_full` and fix the next forward failure as milestone 99.
+
+## 2026-07-31 — fp16 cumulative-product milestone
+
+The complete fp16 forward cumprod family passes **4/4 in 13.30s**:
+`test_small_cumprod`, `test_simple_cumprod` (512 and 1022),
+`test_cumprod` (scalar, 1-D, both 2-D axes, and both 3-D last-axis forms),
+and `test_cumprod_zero_axis`. Implementation commit: `d0fc6cd0a`;
+portable patch: `0099-rockchip-pass-fp16-cumulative-product.patch`.
+
+The serialized inventory first appeared to hang when cummax followed the
+cross-entropy group. Process-state inspection showed an xdist worker in
+uninterruptible RK driver sleep (`D`, `msleep`). Cummax passed alone in
+**62.93s**, and cummax-zero plus both cummin methods passed **3/3 in
+77.78s**, proving that occurrence was shared-process state pollution.
+
+Cumprod then reproduced the driver sleep in a fresh process. Hardware-free
+task inspection found the cause before another submit:
+
+- ordinary prefix windows 20, 30, and 40 emitted respectively 896, 1,366,
+  and 1,836 DPU subtasks per scheduled sink;
+- the padded first stage of length 1022 emitted **11,988** subtasks;
+- the public cumprod graph is already one static `MUL` reduction with a
+  canonical prefix mask, but the old local-product path expanded every
+  candidate into a compensated DPU chain.
+
+The existing typed reducer already evaluates `MUL` reductions with a
+float32 accumulator and casts only the visible result to fp16, matching the
+documented PyTorch cumprod precision boundary. A strict classifier now uses
+that one-task path only for the canonical prefix topology: one fp16 input
+and output, one static `MUL` reduction, exact three-WHERE/one-CMPLT/
+one-CMPNE prefix mask, matching prefix loop/window, complete input/output
+size, at most 1,024 candidates per prefix, and at most `2**22` total
+candidates.
+
+Length 1022 has three scheduled stages. The first pads 1,022 inputs to four
+256-lane blocks and has an exact five-WHERE/two-CMPLT/two-CMPNE/one-AND
+fingerprint. The second computes four block prefixes with a guarded
+post-reduction WHERE epilogue and an exact six/two/two/one fingerprint.
+Both are separately constrained to their `1022 -> 1024 -> 4` geometry and
+now use one typed float32 reduction each. The final indexed block combine
+retains its existing native path. Length 512 uses the ordinary bounded
+prefix signature.
+
+The unchanged ordinary `test_cumprod` passes alone in **12.48s** instead of
+entering driver sleep; length-1022 `test_simple_cumprod` passes in the full
+family gate. No generic reduction fallback was enabled.
+
+Validation: hardware-free Rockchip **162/162 in 9.22s**; mypy remains at the
+exact 12-error baseline; touched-file Ruff remains at the exact nine
+pre-existing findings; `git diff --check` passes. No LUT, LUT tuning, or
+two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-143732`,
+`/tmp/test_pr1.py.20260731-143732`,
+`/tmp/rockchip.py.20260731-144022`,
+`/tmp/test_pr1.py.20260731-144022`,
+`/tmp/rockchip.py.20260731-144137`,
+`/tmp/progress.md.20260731-144331`, and
+`/tmp/test_ops_status.md.20260731-144331`.
+
+Next action: validate cumsum in a fresh process, then resume the ordered
+forward inventory after the cumulative family.

@@ -1,0 +1,108 @@
+From d0fc6cd0aa4900e08fc499e4d715fdba87e43760 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 14:43:26 +0800
+Subject: [PATCH] rockchip: pass fp16 cumulative product
+
+---
+ test/rockchip/test_pr1.py            | 21 +++++++++++++
+ tinygrad/runtime/support/rockchip.py | 45 ++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 3fa2c677f..b7dd2437d 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -928,6 +928,27 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp16_cumprod_uses_one_typed_float32_reduction(self):
++    for shape, axis in (((20,), 0), ((20,30), 0), ((20,30), 1), ((20,30,40), 2)):
++      expression = Tensor.empty(*shape, dtype=dtypes.half, device="ROCKCHIP").cumprod(axis)
++      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++      self.assertEqual(subtasks[0].task.layout[5], 1)
++    long_sinks = [early_simplify(call.src[0]) for call in
++                  Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP").cumprod(0).schedule_linear().src
++                  if call.src[0].op is Ops.SINK]
++    long_programs = [build_native_program(sink) for sink in long_sinks]
++    self.assertTrue(all(program is not None for program in long_programs))
++    for program in long_programs[:2]:
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++      self.assertEqual(subtasks[0].task.layout[5], 1)
++
+   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
+     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
+     for expression in (source.argmax(0, False), source.argmin(0, False)):
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 85fdb3653..76e4489f0 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9377,6 +9377,50 @@ def _try_fmod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if any(u.op not in allowed for u in value.toposort()): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Collapse the canonical fp16 cumulative-prefix product to one typed float32 reduction."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) != 1: return None
++  reduce = reductions[0]
++  if reduce.dtype is not dtypes.half or reduce.arg[0] is not Ops.MUL or len(reduce.src) != 2 or \
++     reduce.src[1].src[0].op is not Ops.CONST: return None
++  body = reduce.src[0]
++  body_nodes, value_nodes = body.toposort(), store.src[1].toposort()
++  indexes = [u for u in body_nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
++  if body.op is not Ops.WHERE or len(indexes) != 1: return None
++  source = indexes[0]
++  window = int(reduce.src[1].src[0].arg)
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if any(u.src[0].op is not Ops.CONST for u in loops): return None
++  total, input_total = prod(_shape_of_store(sink)), int(source.src[0].src[0].arg)
++  loop_extents = [int(u.src[0].arg) for u in loops]
++  if prod(loop_extents) != total or not 2 <= window <= 1024 or not 1 <= total*window <= 1 << 22: return None
++  allowed = {Ops.REDUCE, Ops.WHERE, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in value_nodes): return None
++
++  padded_blocks = store.src[1] is reduce and total == 1024 and input_total == 1022 and window == 256 and \
++                  sorted(loop_extents) == [4, 256] and sum(u.op is Ops.WHERE for u in body_nodes) == 5 and \
++                  sum(u.op is Ops.CMPLT for u in body_nodes) == 2 and sum(u.op is Ops.CMPNE for u in body_nodes) == 2 and \
++                  sum(u.op is Ops.AND for u in body_nodes) == 1
++  block_prefix = store.src[1].op is Ops.WHERE and reduce in value_nodes and total == 4 and input_total == 1024 and \
++                 window == 4 and loop_extents == [4] and sum(u.op is Ops.WHERE for u in value_nodes) == 6 and \
++                 sum(u.op is Ops.CMPLT for u in value_nodes) == 2 and sum(u.op is Ops.CMPNE for u in value_nodes) == 2 and \
++                 sum(u.op is Ops.AND for u in value_nodes) == 1
++  if padded_blocks or block_prefix:
++    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=block_prefix)
++
++  if store.src[1] is not reduce or input_total != total or sum(u.op is Ops.WHERE for u in body_nodes) != 3 or \
++     sum(u.op is Ops.CMPLT for u in body_nodes) != 1 or sum(u.op is Ops.CMPNE for u in body_nodes) != 1: return None
++  condition = next(u for u in body_nodes if u.op is Ops.CMPLT)
++  if condition.src[0].op is not Ops.ADD or condition.src[1].op is not Ops.CONST or int(condition.src[1].arg) != window-1 or \
++     body.src[0] is not condition or body.src[1].op is not Ops.CONST or float(body.src[1].arg) != 1.0: return None
++  condition_ranges = [u for u in condition.toposort() if u.op is Ops.RANGE]
++  prefix_loops = [u for u in condition_ranges if getattr(u.arg[-1], "name", "") == "LOOP"]
++  if reduce.src[1] not in condition_ranges or len(prefix_loops) != 1 or \
++     prefix_loops[0].src[0].op is not Ops.CONST or int(prefix_loops[0].src[0].arg) != window: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
++
+ def _try_axis_arg_extrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Preserve argmax/argmin's public axis coordinate instead of its flattened source address."""
+   store = _store_node(sink)
+@@ -14784,6 +14828,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, round_quantization_tasks)
+   if (mod_tasks := _try_mod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, mod_tasks)
+   if (fmod_tasks := _try_fmod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, fmod_tasks)
++  if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
+-- 
+2.34.1
+
