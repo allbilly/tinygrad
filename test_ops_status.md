@@ -2985,3 +2985,21 @@ Contract remains **167/167 in 10.59s**, now with fp16 reduced-gather PR1
 coverage. Mypy stays at the exact 12-error baseline and touched-file Ruff at
 nine pre-existing findings. No LUT or two-level LUT changed. Next: gather
 and scatter.
+
+### FP16 scatter operations
+
+Gather, scatter, scatter-add, and scatter-multiply pass **4/4 in 16.48s**.
+Commit `b872e10b2`; saved patch
+`0111-rockchip-pass-fp16-scatter-operations.patch`.
+
+The typed direct-scatter and scalar ADD/MUL paths now admit fp16 with their
+existing strict signatures and bounds. The only mixed-precision case is
+canonical fp16 scatter-add, whose reduction remains fp32 before cast-back.
+True-HALF add/multiply pass **2/2**. `test_scatter` alone restores normal
+fp32 construction because its intentional `x.half()`/fp32-source mismatch
+must raise.
+
+Contract remains **167/167 in 10.84s**, with new fp16 scatter PR1 coverage.
+Mypy stays at the exact 12-error baseline and touched-file Ruff at nine
+pre-existing findings. No LUT or two-level LUT changed. Next:
+scatter-reduce.

@@ -1,0 +1,122 @@
+From b872e10b2f6e9e5ed0344d297073f383377c9c70 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 16:06:31 +0800
+Subject: [PATCH] rockchip: pass fp16 scatter operations
+
+---
+ test/rockchip/conftest_rockchip.py   |  2 +-
+ test/rockchip/test_pr1.py            | 15 +++++++++++++++
+ tinygrad/runtime/support/rockchip.py | 27 +++++++++++++++------------
+ 3 files changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 13ba38e02..fc5b680f9 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -42,7 +42,7 @@ def pytest_runtest_call(item):
+     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+     "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
+     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
+-    "test_stack")
++    "test_scatter", "test_stack")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 062dcbd0b..f3be5c137 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -481,6 +481,13 @@ class TestClassifier(unittest.TestCase):
+     scalar_program = build_native_program(_get_sink(x.scatter(dim=1, index=indices, src=3)))
+     self.assertIsNotNone(scalar_program)
+     self.assertEqual(scalar_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    x_half = Tensor.empty(4,5,6, dtype=dtypes.half, device="ROCKCHIP")
++    src_half = Tensor.empty(4,5,6, dtype=dtypes.half, device="ROCKCHIP")
++    for expression in (x_half.scatter(dim=1, index=indices, src=src_half),
++                       x_half.scatter(dim=1, index=indices, src=3)):
++      half_program = build_native_program(_get_sink(expression))
++      self.assertIsNotNone(half_program)
++      self.assertEqual(half_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
+   def test_scatter_scalar_reductions_use_typed_stages(self):
+     x = Tensor.empty(4,5,6, dtype=dtypes.float, device="ROCKCHIP")
+@@ -492,6 +499,14 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 2)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+       self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    x_half = Tensor.empty(4,5,6, dtype=dtypes.half, device="ROCKCHIP")
++    for mode, value in (("add", float("inf")), ("multiply", float("nan"))):
++      half_program = build_native_program(_get_sink(x_half.scatter(dim=1, index=indices, src=value, reduce=mode)))
++      self.assertIsNotNone(half_program)
++      half_subtasks = half_program.src[1].src[0].arg
++      self.assertEqual(len(half_subtasks), 2)
++      self.assertEqual(half_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++      self.assertEqual(half_subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
+   def test_scatter_reduce_tensor_uses_bounded_typed_boundary(self):
+     x = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index ec54521d9..34db6371e 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9882,17 +9882,18 @@ def _try_fancy_index_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
+   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+ 
+ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Serialize only the direct fp32 scatter update-selection graph."""
++  """Serialize only the direct floating-point scatter update-selection graph."""
+   store = _store_node(sink)
+-  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.float: return None
++  if store is None or _reduce_node(sink) is not None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
++  data_dtype = store.src[0].dtype
+   value = _unwrap(store.src[1])
+-  if value.op is not Ops.WHERE: return None
++  if value.op is not Ops.WHERE or value.dtype is not data_dtype: return None
+   inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+   int_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}
+-  float_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}
+-  if len(int_slots) != 1 or len(float_slots) not in (1, 2): return None
+-  if len(float_slots) == 1 and not any(u.op is Ops.CONST and u.dtype is dtypes.float and
+-                                      u.arg is not Invalid and float(u.arg) != 0.0 for u in value.toposort()): return None
++  data_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is data_dtype}
++  if len(int_slots) != 1 or len(data_slots) not in (1, 2): return None
++  if len(data_slots) == 1 and not any(u.op is Ops.CONST and u.dtype is data_dtype and
++                                     u.arg is not Invalid and float(u.arg) != 0.0 for u in value.toposort()): return None
+   if not {Ops.WHERE, Ops.OR, Ops.CMPNE}.issubset({u.op for u in value.toposort()}): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
+@@ -9944,16 +9945,18 @@ def _try_scatter_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
+   """Stage only legacy scalar scatter ADD/MUL reductions and their base epilogue."""
+   store = _store_node(sink)
+   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+-  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or len(reductions) != 1: return None
++  data_dtype = store.src[0].dtype
+   reduce, value = reductions[0], _unwrap(store.src[1])
+-  if reduce.dtype is not dtypes.float or reduce.arg[0] not in (Ops.ADD, Ops.MUL) or value.op is not reduce.arg[0] or \
++  mixed_half_add = data_dtype is dtypes.half and reduce.dtype is dtypes.float and reduce.arg[0] is Ops.ADD
++  if (reduce.dtype is not data_dtype and not mixed_half_add) or reduce.arg[0] not in (Ops.ADD, Ops.MUL) or value.op is not reduce.arg[0] or \
+      reduce not in value.toposort() or not reduce.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]) or \
+      prod(int(axis.src[0].arg) for axis in reduce.src[1:]) > 64: return None
+   inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+   if len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) != 1 or \
+-     len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}) != 1: return None
++     len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is data_dtype}) != 1: return None
+   if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
+-  nonfinite = [u for u in reduce.src[0].toposort() if u.op is Ops.CONST and u.dtype is dtypes.float and
++  nonfinite = [u for u in reduce.src[0].toposort() if u.op is Ops.CONST and u.dtype is reduce.dtype and
+                u.arg is not Invalid and not math.isfinite(float(u.arg))]
+   if not nonfinite: return None
+ 
+@@ -9962,7 +9965,7 @@ def _try_scatter_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
+   # Reuse the final output: the epilogue snapshots it before overwriting.
+   scratch_slot = info.outs[0]
+   device, total = store.src[0].src[0].device, prod(_shape_of_store(sink))
+-  scratch = UOp.param(scratch_slot, dtypes.float, (total,), device=device)
++  scratch = UOp.param(scratch_slot, data_dtype, (total,), device=device)
+   scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
+   reduction_store = store.replace(src=(scratch_index, reduce))
+   reduction_sink = sink.substitute({store:reduction_store})
+-- 
+2.34.1
+

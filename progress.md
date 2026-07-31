@@ -11346,3 +11346,46 @@ Pre-edit recovery copies:
 Inventory note: the preceding matvec/NaN/Inf block passed **4/4** with one
 intentional skip in **13.63s**. Next action: continue with gather, scatter,
 and scatter-add as milestone 111.
+
+## 2026-07-31 — fp16 scatter milestone
+
+Gather, direct scatter, scalar scatter-add, and scalar scatter-multiply pass
+**4/4 in 16.48s**. Implementation commit: `b872e10b2`; portable patch:
+`0111-rockchip-pass-fp16-scatter-operations.patch`.
+
+Gather already passed. Direct scatter and the scalar ADD/MUL classifiers
+were restricted to fp32 even though their typed serializers and runtime
+support fp16. The direct path now accepts fp16 or fp32 only with a
+same-dtype WHERE result, exactly one int index buffer, one or two data
+buffers, and the existing OR/CMPNE signature.
+
+The scalar reduction path retains one int index buffer, one base-data
+buffer, static ADD/MUL reduction axes, at most 64 candidates, the
+WHERE/CMPLT/CMPNE signature, and a required nonfinite scalar. Same-dtype
+fp16/fp32 reductions are admitted. The sole mixed case is tinygrad's
+canonical fp16 scatter-add lowering: fp16 output with fp32 ADD accumulation
+and cast-back. Scatter-multiply remains a same-dtype fp16 reduction.
+
+Global HALF also invalidated `test_scatter`'s intentional error assertion:
+`x.half()` and its source were already both fp16, so PyTorch correctly did
+not raise. The adapter restores normal fp32 construction only for that
+method. Before the adapter change, hardware completed every valid direct
+fp16 scatter case and stopped only at this assertion. True-HALF scatter-add
+and scatter-multiply pass **2/2** after the classifier fix.
+
+Validation: hardware-free Rockchip remains **167/167 in 10.84s**, with new
+fp16 direct/scalar scatter classifier coverage; mypy remains at the exact
+12-error baseline; touched-file Ruff remains at the exact nine pre-existing
+findings; and `git diff --check` passes. No LUT, LUT tuning, or two-level NPU
+LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-160252`,
+`/tmp/test_pr1.py.20260731-160252`,
+`/tmp/rockchip.py.20260731-160451`,
+`/tmp/conftest_rockchip.py.20260731-160451`,
+`/tmp/progress.md.20260731-160631`, and
+`/tmp/test_ops_status.md.20260731-160631`.
+
+Next action: continue with scatter-reduce and the following ordered
+forward-only methods as milestone 112.
