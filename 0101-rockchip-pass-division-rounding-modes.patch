@@ -1,0 +1,127 @@
+From f29131cdfb503862f8b504e881652056d19124f4 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 15:02:49 +0800
+Subject: [PATCH] rockchip: pass division rounding modes
+
+---
+ test/rockchip/test_pr1.py            | 14 ++++++--
+ tinygrad/runtime/support/rockchip.py | 51 ++++++++++++++++++++++++----
+ 2 files changed, 55 insertions(+), 10 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index f73f301b5..bbcda941c 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -932,10 +932,18 @@ class TestClassifier(unittest.TestCase):
+     default_float = dtypes.default_float
+     try:
+       dtypes.default_float = dtypes.half
+-      lhs = Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")
+-      rhs = Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")
++      cases = [(dtypes.int, dtypes.int, 7, None), (dtypes.int, dtypes.int, 7, "floor"),
++               (dtypes.int, dtypes.int, 7, "trunc"), (dtypes.int, dtypes.int, 1, None),
++               (dtypes.int, dtypes.int, 1, "floor"), (dtypes.int, dtypes.int, 1, "trunc")]
++      cases += [(lhs_dtype, rhs_dtype, 1, mode)
++                for lhs_dtype, rhs_dtype in ((dtypes.half, dtypes.int), (dtypes.int, dtypes.half), (dtypes.half, dtypes.half))
++                for mode in (None, "trunc", "floor")]
++      expressions = [Tensor.empty(7, dtype=lhs_dtype, device="ROCKCHIP").div(
++        Tensor.empty(rhs_size, dtype=rhs_dtype, device="ROCKCHIP"), rounding_mode=mode)
++                     for lhs_dtype, rhs_dtype, rhs_size, mode in cases]
++      expressions.append(Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")//2)
+       sinks = [next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+-               for expression in (lhs/rhs, lhs//rhs, lhs//2, lhs.div(rhs, rounding_mode="trunc"))]
++               for expression in expressions]
+     finally:
+       dtypes.default_float = default_float
+     for sink in sinks:
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 255fea164..22fa683c8 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9377,19 +9377,27 @@ def _try_fmod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if any(u.op not in allowed for u in value.toposort()): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _is_direct_div_index(index:UOp, total:int, output_index:UOp) -> bool:
++  size = int(index.src[0].src[0].arg)
++  return (size == 1 and index.src[1].op is Ops.CONST and int(index.src[1].arg) == 0) or \
++         (size == total and index.src[1] is output_index)
++
+ def _try_int_true_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Evaluate the exact int32/int32 true-division promotion as one typed fp16 task."""
++  """Evaluate int32 promotion or direct scalar-broadcast true division as one typed fp16 task."""
+   store = _store_node(sink)
+   if store is None or store.src[0].dtype is not dtypes.half or _reduce_node(sink) is not None: return None
+   value = store.src[1]
+   if value.op is not Ops.FDIV or value.dtype is not dtypes.half or len(value.src) != 2: return None
+   indexes = [_unwrap(u) for u in value.src]
+-  if any(u.op is not Ops.INDEX or u.dtype is not dtypes.int or u.src[0].op is not Ops.PARAM for u in indexes) or \
+-     indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1]: return None
++  if any(u.op is not Ops.INDEX or u.dtype not in (dtypes.half, dtypes.int) or u.src[0].op is not Ops.PARAM for u in indexes) or \
++     indexes[0].src[0] is indexes[1].src[0]: return None
+   nodes = value.toposort()
+   if any(u.op not in {Ops.FDIV, Ops.CAST, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in nodes): return None
+   total = prod(_shape_of_store(sink))
+-  if not 1 <= total <= 1 << 20 or any(int(u.src[0].src[0].arg) != total for u in indexes): return None
++  sizes = [int(u.src[0].src[0].arg) for u in indexes]
++  if not 1 <= total <= 1 << 20 or not any(size == total for size in sizes) or \
++     not (all(u.dtype is dtypes.int for u in indexes) or 1 in sizes) or \
++     any(not _is_direct_div_index(u, total, store.src[0].src[1]) for u in indexes): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
+ def _try_int_rounded_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -9402,12 +9410,39 @@ def _try_int_rounded_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   constants = [u for u in value.src if u.op is Ops.CONST]
+   if len(indexes) + len(constants) != 2 or len(indexes) not in (1, 2): return None
+   if any(u.op is not Ops.INDEX or u.dtype is not dtypes.int or u.src[0].op is not Ops.PARAM for u in indexes) or \
+-     (len(indexes) == 2 and
+-      (indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1])): return None
++     (len(indexes) == 2 and indexes[0].src[0] is indexes[1].src[0]): return None
+   nodes = value.toposort()
+   if any(u.op not in {Ops.FLOORDIV, Ops.CDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in nodes): return None
+   total = prod(_shape_of_store(sink))
+-  if not 1 <= total <= 1 << 20 or any(int(u.src[0].src[0].arg) != total for u in indexes): return None
++  if not 1 <= total <= 1 << 20 or any(not _is_direct_div_index(u, total, store.src[0].src[1]) for u in indexes): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
++def _try_broadcast_rounded_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate the canonical fp16 trunc/floor epilogue over direct scalar-broadcast division."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half or _reduce_node(sink) is not None: return None
++  value = store.src[1]
++  if value.op is Ops.TRUNC and len(value.src) == 1:
++    truncated = value
++  elif value.op is Ops.WHERE and len(value.src) == 3:
++    condition, adjusted, truncated = value.src
++    if truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or \
++       condition.src != (truncated.src[0], truncated) or adjusted.op is not Ops.ADD or truncated not in adjusted.src or \
++       not any(u.op is Ops.CONST and float(u.arg) == -1.0 for u in adjusted.src): return None
++  else: return None
++  division = truncated.src[0]
++  if division.op is not Ops.FDIV or division.dtype is not dtypes.half or len(division.src) != 2: return None
++  indexes = [_unwrap(u) for u in division.src]
++  if any(u.op is not Ops.INDEX or u.dtype not in (dtypes.half, dtypes.int) or u.src[0].op is not Ops.PARAM for u in indexes) or \
++     indexes[0].src[0] is indexes[1].src[0]: return None
++  nodes = value.toposort()
++  allowed = {Ops.WHERE, Ops.CMPLT, Ops.ADD, Ops.TRUNC, Ops.FDIV, Ops.CAST, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes) or sum(u.op is Ops.FDIV for u in nodes) != 1 or \
++     sum(u.op is Ops.TRUNC for u in nodes) != 1: return None
++  total = prod(_shape_of_store(sink))
++  sizes = [int(u.src[0].src[0].arg) for u in indexes]
++  if not 1 <= total <= 1 << 20 or 1 not in sizes or not any(size == total for size in sizes) or \
++     any(not _is_direct_div_index(u, total, store.src[0].src[1]) for u in indexes): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
+ def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -14865,6 +14900,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, int_true_div_tasks)
+   if (int_rounded_div_tasks := _try_int_rounded_div_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, int_rounded_div_tasks)
++  if (broadcast_rounded_div_tasks := _try_broadcast_rounded_div_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, broadcast_rounded_div_tasks)
+   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+-- 
+2.34.1
+

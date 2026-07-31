@@ -10970,3 +10970,52 @@ Pre-edit recovery copies:
 
 Next action: resume the ordered forward inventory at
 `TestOps.test_div_rounding_mode`, then the dot/einsum family.
+
+## 2026-07-31 — division rounding-mode milestone
+
+The complete unchanged `TestOps.test_div_rounding_mode` passes in
+**27.94s**. It exercises 144 successful division comparisons plus the
+invalid-rounding-mode exception: negative and positive integer/fp16
+denominators, integer/fp16 numerators, and true, truncating, and floor
+division. Implementation commit: `f29131cdf`; portable patch:
+`0101-rockchip-pass-division-rounding-modes.patch`.
+
+The first failure was the milestone-100 int32 promotion over a length-1
+denominator. After admitting that canonical broadcast, native fp16
+scalar-broadcast FDIV exposed a hardware addressing defect: element zero was
+correct, while later outputs read invalid denominator lanes and became
+infinity or NaN. The composed truncating and floor epilogues then rejected
+at `Ops.TRUNC`.
+
+The direct division classifiers now validate each input address against the
+output loop: a complete parameter must use the output index, while a
+length-1 parameter must use constant address zero. The true-division path
+admits either the existing all-int promotion or a direct fp16/int32
+scalar-broadcast pair. A separate rounded-fp16 path requires exactly one
+`FDIV` and one `TRUNC`, with the floor variant additionally requiring the
+canonical `WHERE(FDIV < TRUNC(FDIV), TRUNC(FDIV)-1, TRUNC(FDIV))`
+epilogue. Only direct parameter operands, the exact small op allowlists,
+static geometry, and at most `2**20` outputs are accepted. Equal-shape fp16
+division remains on its existing NPU path.
+
+Validation: `test_div_int` plus `test_div_rounding_mode` pass **2/2 in
+29.25s**; hardware-free Rockchip passes **163/163 in 9.26s**; mypy remains
+at the exact 12-error baseline; touched-file Ruff remains at the exact nine
+pre-existing findings; `git diff --check` passes. No LUT, LUT tuning, or
+two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-145544`,
+`/tmp/test_pr1.py.20260731-145544`,
+`/tmp/rockchip.py.20260731-145607`,
+`/tmp/rockchip.py.20260731-145648`,
+`/tmp/rockchip.py.20260731-145737`,
+`/tmp/test_pr1.py.20260731-145737`,
+`/tmp/rockchip.py.20260731-145853`,
+`/tmp/test_pr1.py.20260731-145853`,
+`/tmp/test_pr1.py.20260731-150016`,
+`/tmp/progress.md.20260731-150256`, and
+`/tmp/test_ops_status.md.20260731-150256`.
+
+Next action: resume the ordered forward inventory with the dot/einsum
+family and fix its first genuine failure as milestone 102.

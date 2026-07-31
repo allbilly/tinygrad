@@ -2805,3 +2805,27 @@ subcases in the method pass. The nearby division/remainder family passes
 Contract: **163/163 in 9.40s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. Next: `test_div_rounding_mode`, then dot/einsum.
+
+### Division rounding modes
+
+The complete unchanged `test_div_rounding_mode` passes in **27.94s**:
+144 successful comparisons across integer/fp16 numerator and denominator
+types, ten positive/negative denominator values, and true/trunc/floor
+rounding, plus the invalid-mode exception. Commit `f29131cdf`; saved patch
+`0101-rockchip-pass-division-rounding-modes.patch`.
+
+Length-1 denominator parameters now have a strict typed boundary. Complete
+inputs must use the output loop index; scalar inputs must use constant
+address zero. True division accepts the direct fp16/int32 FDIV form.
+Rounded fp16 division accepts exactly one FDIV/TRUNC and, for floor, the
+canonical compare/negative-one WHERE epilogue. The scope is direct static
+parameters and at most `2**20` outputs; equal-shape fp16 division and generic
+host fallback are unchanged.
+
+This also avoids the native broadcast FDIV defect that produced a correct
+first lane followed by infinities/NaNs. `test_div_int` and this group pass
+**2/2 in 29.25s**.
+
+Contract: **163/163 in 9.26s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. Next: dot/einsum.
