@@ -7774,6 +7774,18 @@ removes **74 counted lines**, reaching **11,938**.
 PR1 passes **173/173 in 13.28s** and ERF passes **1/1 in 10.23s** on RK3588.
 Mypy/Ruff remain at 12/8.
 
+### Declarative QuickGELU graph
+
+Commit `4fe27953c`; patch
+`0144-rockchip-compose-quick-gelu-regional-graph.patch`.
+
+The active QuickGELU saturation/broad/local/polynomial graph now composes the
+shared builder; the older direct two-LUT WIP function is preserved unchanged.
+This removes **58 counted lines**, reaching **11,880**.
+
+PR1 passes **173/173 in 13.13s**. QuickGELU normal and extreme methods pass
+**2/2 in 11.56s**; mypy/Ruff remain at 12/8.
+
 ### Declarative CELU/Mish graphs
 
 Commit `ca3f8725e`; patch

@@ -3398,3 +3398,12 @@ Commit `afc93601e`; saved patch
 ERF uses the shared clamp/interval graph and reaches **11,938 support lines**.
 PR1 passes **173/173** and ERF passes its focused hardware method in 10.23s;
 static baselines are unchanged.
+
+### QuickGELU regional graph
+
+Commit `4fe27953c`; saved patch
+`0144-rockchip-compose-quick-gelu-regional-graph.patch`.
+
+The active QuickGELU graph uses shared regional primitives; its WIP alternative
+is retained. Support size is **11,880**. PR1 is **173/173**, and normal/extreme
+QuickGELU pass **2/2 in 11.56s** on hardware.
