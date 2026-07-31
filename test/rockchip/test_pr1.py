@@ -879,6 +879,25 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_mod_uses_one_typed_host_task(self):
+    expressions = []
+    for lhs_dtype in (dtypes.half, dtypes.int):
+      for rhs_dtype in (dtypes.half, dtypes.int):
+        lhs = Tensor.empty(7, dtype=lhs_dtype, device="ROCKCHIP")
+        rhs = Tensor.empty(7, dtype=rhs_dtype, device="ROCKCHIP")
+        expressions.append(lhs % rhs)
+    for dtype in (dtypes.half, dtypes.int):
+      source = Tensor.empty(7, dtype=dtype, device="ROCKCHIP")
+      expressions.extend((source % 2, source % 3, 100 % source))
+      if dtype is dtypes.half: expressions.extend((source % 3.5, 100.5 % source))
+    for expression in expressions:
+      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+      program = build_native_program(sink)
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
     for expression in (source.argmax(0, False), source.argmin(0, False)):

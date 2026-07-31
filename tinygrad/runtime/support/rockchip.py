@@ -9297,6 +9297,34 @@ def _try_round_quantization_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
   if int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_mod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate the exact tensor/tensor or tensor/finite-scalar remainder expansion."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _reduce_node(sink) is not None: return None
+  nodes = store.src[1].toposort()
+  ops = {u.op for u in nodes}
+  params = list(dict.fromkeys(u.src[0] for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM))
+  float_base = {Ops.ADD, Ops.MUL, Ops.TRUNC, Ops.CMPLT, Ops.WHERE}.issubset(ops)
+  ratio_op = bool({Ops.RECIPROCAL, Ops.FDIV} & ops)
+  half_constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.half]
+  scalar_numerator = ratio_op and len(half_constants) == 2 and -1.0 in half_constants and \
+                     any(math.isfinite(x) and x != -1.0 for x in half_constants)
+  divisor_constants = [x for x in half_constants if x != -1.0]
+  scalar_divisor = not ratio_op and len(half_constants) == 3 and -1.0 in half_constants and \
+                   len(divisor_constants) == 2 and all(math.isfinite(x) and x != 0.0 for x in divisor_constants) and \
+                   math.isclose(divisor_constants[0]*divisor_constants[1], -1.0, rel_tol=1e-12, abs_tol=1e-12)
+  float_signature = float_base and ((len(params) == 2 and ratio_op) or (len(params) == 1 and (
+    scalar_numerator or scalar_divisor)))
+  floormods = [u for u in nodes if u.op is Ops.FLOORMOD]
+  int_signature = len(floormods) == 1 and (len(params) == 2 or (len(params) == 1 and any(
+    u.op is Ops.CONST and u.dtype is dtypes.int for u in floormods[0].src)))
+  allowed = {Ops.ADD, Ops.MUL, Ops.TRUNC, Ops.RECIPROCAL, Ops.FDIV, Ops.CMPLT, Ops.WHERE, Ops.CAST,
+             Ops.FLOORMOD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  total = prod(_shape_of_store(sink))
+  if not (float_signature ^ int_signature) or any(u.op not in allowed for u in nodes) or \
+     any(int(u.src[0].arg) != total for u in params) or not 1 <= total <= 1 << 20: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_axis_arg_extrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve argmax/argmin's public axis coordinate instead of its flattened source address."""
   store = _store_node(sink)
@@ -14669,6 +14697,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
   if (round_quantization_tasks := _try_round_quantization_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, round_quantization_tasks)
+  if (mod_tasks := _try_mod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, mod_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
