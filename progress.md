@@ -10216,3 +10216,35 @@ bit-exact for all probability cases and for the nonzero smoothed index cases.
 No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline,
 and Ruff on the touched files remains at the same nine pre-existing findings.
 Next forward group: `TestOps.test_sparse_categorical_crossentropy`.
+
+## 2026-07-31 — sparse categorical cross-entropy milestone
+
+The four unchanged sparse categorical groups pass together in **12.49s**
+with the required HALF forward-only configuration:
+
+- base and batched inputs, plus combined mean/ignore-index/smoothing arguments;
+- `mean`, `sum`, and `none` reductions;
+- ignore indices `-1`, `0`, and `3`;
+- label smoothing `0.3` and `0.9`.
+
+The combined base method passes alone in **12.76s**. The hardware-free
+Rockchip contract is **146/146 in 8.73s**.
+
+The ordinary sparse loss already used the strict typed `CMPNE` one-hot path.
+The missing combined graph adds a second class reduction for the uniform
+smoothing term, a row loss reduction, and an int32 valid-count reduction
+used as the mean denominator. The class-index matcher now admits one through
+four ADD reductions with at most one int32 reduction, plus only the exact
+`AND`, `CMPNE`, cast, affine arithmetic, and reciprocal/FDIV nodes in this
+fingerprint.
+
+All static axes remain bounded: the official combined shape expands two
+10-class reductions over 12 rows (240 class terms) and one 12-element valid
+count. Its serialized task has five relocations for output, logits, MAX,
+normalizer, and class indices. The no-`CMPNE` guard from the previous
+milestone still excludes arbitrary reductions; the three-factor einsum
+continues to emit its expected two CMAC stages.
+
+No runtime ABI, LUT, or two-level LUT changed. Mypy remains at the exact
+12-error baseline and Ruff remains at the nine pre-existing touched-file
+findings. Next forward group: `TestOps.test_nll_loss`.

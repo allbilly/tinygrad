@@ -740,6 +740,18 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout, expected_layout)
 
+  def test_sparse_cross_entropy_combined_args_use_bounded_task(self):
+    source = Tensor.empty(12,10, dtype=dtypes.half, device="ROCKCHIP")
+    target = Tensor.empty(12, dtype=dtypes.int, device="ROCKCHIP")
+    expression = source.sparse_categorical_crossentropy(target, reduction="mean", ignore_index=3, label_smoothing=.3)
+    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+    program = build_native_program(sinks[-1])
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    self.assertEqual(len(subtasks[0].relocs), 5)
+
   def test_fp32_factorized_zero_stride_sum_stays_native(self):
     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)

@@ -2415,3 +2415,17 @@ removes the target buffer. Smoothed class-index one-hot graphs continue
 through the strict typed `CMPNE` path. No LUT changed. Contract remains
 **145/145** with expanded ABI coverage. Next forward group:
 `TestOps.test_sparse_categorical_crossentropy`.
+
+### Sparse categorical cross entropy
+
+All four sparse groups pass together in **12.49s**: base/batched/combined
+arguments, all reductions, three ignore-index values, and both smoothing
+values. The combined base method passes alone in **12.76s**.
+
+The strict class-index evaluator now accepts up to four bounded ADD
+reductions, including at most one int32 valid-count reduction, and the exact
+`AND` plus reciprocal/FDIV topology needed by ignored smoothed means. The
+official combined graph expands 240 class terms and 12 valid-count terms into
+one serialized typed task. The matcher still requires the `CMPNE` class-index
+fingerprint, so unrelated reductions remain excluded. No LUT changed.
+Contract: **146/146**. Next forward group: `TestOps.test_nll_loss`.

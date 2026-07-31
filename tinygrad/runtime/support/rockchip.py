@@ -9887,8 +9887,9 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
   nodes = store.src[1].toposort()
   reductions = [u for u in nodes if u.op is Ops.REDUCE]
   inputs = {u.src[0].buf_uop.arg.slot for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
-  if len(reductions) not in (1, 2) or len(inputs) not in (3, 4) or \
-     any(u.arg[0] is not Ops.ADD or u.dtype is not dtypes.float for u in reductions): return None
+  if not 1 <= len(reductions) <= 4 or len(inputs) not in (3, 4) or \
+     any(u.arg[0] is not Ops.ADD or u.dtype not in (dtypes.float, dtypes.int) for u in reductions) or \
+     sum(u.dtype is dtypes.int for u in reductions) > 1: return None
   # Probability-target 2-D/N-D kernels use the dedicated exact matcher above.
   # The remaining three-input probability form is only the scalar 1-D case;
   # this prevents arbitrary three-factor reductions (for example einsum) from
@@ -9898,11 +9899,12 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
                            if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}.values())
     if len(reductions) != 1 or prod(_shape_of_store(sink)) != 1 or len(input_totals) != 3 or \
        input_totals[0] != 1 or input_totals[1] != input_totals[2]: return None
-  allowed = {Ops.REDUCE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.AND, Ops.CAST, Ops.ADD, Ops.MUL,
+             Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
   if any(u.op not in allowed for u in nodes): return None
   budget = prod(int(axis.src[0].arg) for reduce in reductions for axis in reduce.src[1:]
                 if axis.src[0].op is Ops.CONST)
-  if not 1 <= budget <= 4096: return None
+  if not 1 <= budget <= 16384: return None
 
   def expand(u:UOp) -> UOp:
     if u.op is Ops.REDUCE:
