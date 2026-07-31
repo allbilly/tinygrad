@@ -3488,3 +3488,13 @@ Focused forward-only RK3588 status is **1/1 PASS in 4.20s** for
 `TestOps::test_hardswish`. PR1 passes **173/173 in 12.91s**; static baselines
 remain exactly 12 mypy errors and eight touched-file Ruff findings. The support
 file is now **11,416 counted lines**.
+
+### TAN task-graph compaction
+
+Commit `cdac721b3`; saved patch
+`0153-rockchip-compose-tangent-task-graph.patch`.
+
+Focused forward-only RK3588 status is **1/1 PASS in 1.66s** for
+`TestOps::test_tan`. PR1 passes **173/173 in 12.87s**; static baselines remain
+exactly 12 mypy errors and eight touched-file Ruff findings. The support file
+is now **11,381 counted lines**.

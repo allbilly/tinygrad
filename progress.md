@@ -12375,6 +12375,21 @@ PR1 passes **173/173 in 12.91s** and focused RK3588 Hardswish passes **1/1 in
 4.20s**. Static baselines remain exactly 12 mypy errors and eight touched-file
 Ruff findings; compilation and diff checking pass.
 
+### Tangent periodic graph
+
+Commit `cdac721b3`; saved patch
+`0153-rockchip-compose-tangent-task-graph.patch`.
+
+The active TAN lowerer now uses `_TaskGraph` for sign-aware period rounding,
+split-π reduction, ordered local/sine/wide/cosine LUTs, direct/local/quotient
+bands, pole-distance correction, fp32 validity, and periodic-input tagging.
+Its native one-stage truncation is intentionally retained. This removes **35
+counted lines** and all 82 direct `_emit_where_stage` calls from the function,
+reaching **11,381** in `support/rockchip.py`.
+
+PR1 passes **173/173 in 12.87s** and focused RK3588 TAN passes **1/1 in 1.66s**.
+Static baselines remain exactly 12 mypy errors and eight Ruff findings.
+
 ### Declarative GELU/ELU graphs
 
 Commit `1e4c75025`; patch
