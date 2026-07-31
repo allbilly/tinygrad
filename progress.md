@@ -10638,3 +10638,32 @@ Hardware-free Rockchip is **156/156 in 10.24s**. Mypy remains at the exact
 12-error baseline and touched-file Ruff at the exact nine pre-existing
 findings. No LUT or two-level LUT changed. Next: retest the remaining
 non-gradient failures from the partial tally, starting with argmin.
+
+## 2026-07-31 — axis arg-extrema milestone
+
+The complete unchanged `TestOps.test_argmin` passes in **153.64s** and
+`TestOps.test_argmax` passes in **141.46s**. Together they cover ties,
+global reduction, axis 0, axis 1, keepdim, argmax after bitwise-not, int32
+extremes, and bool inputs. Implementation commit: `9cb65791c`; portable
+patch: `0093-rockchip-pass-axis-arg-extrema.patch`.
+
+Both axis-0 failures had the same exact fingerprint:
+`actual[column] = expected_row * 20 + column`. The extrema comparison and
+tie choice were correct, but the existing multi-stage DPU lowering exposed
+the flattened source address instead of decoding the public axis coordinate.
+For example, a known row-three minimum returned `60..79` rather than twenty
+threes.
+
+A strict typed coordinate classifier now handles only the scheduled
+second-stage argmax/argmin graph: one int32 MAX reduction, exactly two nested
+equality comparisons over a full half input and saved half extrema, the
+reverse-stable integer coordinate weight/decode, static loop/reduction axes,
+and at most `2**20` candidates. The already-working extrema-value kernel
+remains on NPU. The coordinate reduction and its post-reduction epilogue run
+as one bounded typed task and return the scheduled public coordinate.
+
+Hardware-free Rockchip is **157/157 in 9.84s**. Mypy remains at the exact
+12-error baseline and touched-file Ruff at the exact nine pre-existing
+findings. No LUT or two-level LUT changed. Next: skip/defer the two explicitly
+gradient-only `*_backwards` methods under `FORWARD_ONLY=1`, then retally the
+remaining forward failures.

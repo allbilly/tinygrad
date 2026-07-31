@@ -2655,3 +2655,20 @@ a `2**20` bound. General WHERE and round paths are unchanged.
 
 Contract: **156/156 in 10.24s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. No LUT changed. Next candidate: `test_argmin`.
+
+### Axis argmax and argmin
+
+`test_argmin` passes in **153.64s** and `test_argmax` passes in **141.46s**,
+including all unchanged tie, global, axis, keepdim, bitwise-not, int32
+extreme, and bool cases. Commit `9cb65791c`; saved patch
+`0093-rockchip-pass-axis-arg-extrema.patch`.
+
+The failed axis-0 results were correct flattened addresses:
+`actual[j] = expected_row*20+j`. A strict typed second-stage classifier now
+keeps the existing NPU extrema-value reduction but evaluates the bounded
+equality/coordinate reduction and scheduled post-reduction decode as one
+typed task.
+
+Contract: **157/157 in 9.84s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. No LUT changed. Gradient-only backwards tests
+remain deferred under `FORWARD_ONLY=1`; next action is a forward retally.
