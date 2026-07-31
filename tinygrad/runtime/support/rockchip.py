@@ -9275,6 +9275,31 @@ def _try_floor_ceil_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
      int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_axis_arg_extrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve argmax/argmin's public axis coordinate instead of its flattened source address."""
+  store = _store_node(sink)
+  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if store is None or store.src[0].dtype is not dtypes.int or len(reductions) != 1: return None
+  reduce = reductions[0]
+  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.MAX or reduce not in store.src[1].toposort(): return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  axes = [*loops, *reduce.src[1:]]
+  if not reduce.src[1:] or any(u.src[0].op is not Ops.CONST for u in axes): return None
+  total, window = prod(_shape_of_store(sink)), prod(int(u.src[0].arg) for u in reduce.src[1:])
+  if prod(int(u.src[0].arg) for u in loops) != total or not 2 <= window <= 65536 or total*window > 1 << 20: return None
+  body_nodes = reduce.src[0].toposort()
+  half_params = list(dict.fromkeys(u.src[0] for u in body_nodes if u.op is Ops.INDEX and
+                                  u.dtype is dtypes.half and u.src[0].op is Ops.PARAM))
+  if len(half_params) != 2 or sorted(int(u.src[0].arg) for u in half_params) != sorted((total, total*window)): return None
+  if sum(u.op is Ops.CMPNE for u in body_nodes) != 2 or not any(
+      u.op is Ops.MUL and u.dtype is dtypes.int and any(x.op is Ops.CONST and int(x.arg) == -1 for x in u.src)
+      for u in body_nodes): return None
+  allowed = {Ops.ADD, Ops.MUL, Ops.CAST, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in body_nodes): return None
+  epilogue_nodes = store.src[1].substitute({reduce:UOp.const(reduce.dtype, 0)}).toposort()
+  if any(u.op not in {Ops.ADD, Ops.MUL, Ops.REDUCE, Ops.CONST} for u in epilogue_nodes): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
+
 def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
   store = _store_node(sink)
@@ -14752,6 +14777,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, argsort_tasks)
   if (softmax_argmax_tasks := _try_softmax_argmax_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, softmax_argmax_tasks)
+  if (axis_arg_extrema_tasks := _try_axis_arg_extrema_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, axis_arg_extrema_tasks)
   if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
     return build_native_program_multi(sink, arg_extrema_tasks)
   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
