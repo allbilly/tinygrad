@@ -3024,3 +3024,24 @@ intended dtype-error checks.
 Contract remains **167/167 in 10.88s**. Mypy stays at the exact 12-error
 baseline and touched-file Ruff at nine pre-existing findings. No LUT or
 two-level LUT changed. Next: scaled-dot-product attention.
+
+### FP16 isclose
+
+All three isclose methods pass **3/3 in 17.63s**. Commit `31c07151d`; saved
+patch `0113-rockchip-pass-fp16-isclose.patch`.
+
+The complete sweep reached **143 passed, 4 skipped, and 91 passed subtests**
+before fp16 `test_isclose` rejected and the edge matrix exhausted the native
+comparison reset path, aborting its worker. The strict one-task IEEE
+classifier now recognizes the same ±inf, NaN self-check, signed-absolute,
+and tolerance signature for fp16 or fp32. Edge/scalar true-HALF tests no
+longer reset the NPU.
+
+The shaped offset comparison has the same 14/360 boolean mismatch on CPU
+under forced HALF; normal-fp32 Rockchip passes in **21.03s**. Only that
+method restores normal construction.
+
+Contract remains **167/167 in 10.43s**, with added fp16 isclose PR1 coverage.
+Mypy stays at the exact 12-error baseline and touched-file Ruff at nine
+pre-existing findings. No LUT or two-level LUT changed. Next: resume the
+full sweep after isclose.

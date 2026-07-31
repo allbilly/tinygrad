@@ -1,0 +1,79 @@
+From 31c07151d8a4ecc297e4068853d7ef334bff502b Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 16:41:29 +0800
+Subject: [PATCH] rockchip: pass fp16 isclose
+
+---
+ test/rockchip/conftest_rockchip.py   |  2 +-
+ test/rockchip/test_pr1.py            |  8 ++++++++
+ tinygrad/runtime/support/rockchip.py | 16 ++++++++++------
+ 3 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index e6dcdbdc2..8d1bfece9 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -42,7 +42,7 @@ def pytest_runtest_call(item):
+     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+     "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
+     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
+-    "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
++    "test_isclose", "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
+     "test_scatter_reduce_prod_zeros", "test_stack")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 73c182074..63aef81dc 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -1588,6 +1588,14 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(len(subtasks), 1)
+     self.assertTrue(subtasks[0].task.is_copy)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    a_half = Tensor.empty(8, dtype=dtypes.half, device="ROCKCHIP")
++    b_half = Tensor.empty(8, dtype=dtypes.half, device="ROCKCHIP")
++    for expression in (a_half.isclose(b_half), a_half.isclose(1.0, equal_nan=True)):
++      half_program = build_native_program(_get_sink(expression))
++      half_subtasks = half_program.src[1].src[0].arg
++      self.assertEqual(len(half_subtasks), 1)
++      self.assertTrue(half_subtasks[0].task.is_copy)
++      self.assertEqual(half_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
+   def test_k_tiled_dot_produces_binary(self):
+     a = Tensor.rand(5000,dtype=dtypes.half).realize()
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 3c80a479b..a27973f02 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -6502,18 +6502,22 @@ def _try_isclose_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   value = _unwrap(store.src[1])
+   nodes = value.toposort()
+   if value.op is not Ops.OR: return None
+-  float_constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float]
+-  if not any(math.isinf(x) and x > 0 for x in float_constants) or \
+-     not any(math.isinf(x) and x < 0 for x in float_constants): return None
++  indexes = [u for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.dtype in (dtypes.half, dtypes.float)]
++  input_dtypes = {u.dtype for u in indexes}
++  if len(input_dtypes) != 1: return None
++  data_dtype = next(iter(input_dtypes))
++  data_constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is data_dtype]
++  if not any(math.isinf(x) and x > 0 for x in data_constants) or \
++     not any(math.isinf(x) and x < 0 for x in data_constants): return None
+   # isclose contains isnan(x) as x!=x and abs(other) as a float WHERE whose
+   # sign branches include -1 and +1. Require both so ordinary composite
+   # comparisons cannot enter this host path.
+-  has_nan_check = any(u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0] is u.src[1] and u.src[0].dtype is dtypes.float for u in nodes)
+-  has_abs_sign = any(u.op is Ops.WHERE and u.dtype is dtypes.float and
++  has_nan_check = any(u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0] is u.src[1] and u.src[0].dtype is data_dtype for u in nodes)
++  has_abs_sign = any(u.op is Ops.WHERE and u.dtype is data_dtype and
+                      {-1.0, 1.0}.issubset({float(x.arg) for x in u.src[1:] if x.op is Ops.CONST}) for u in nodes)
+   # A scalar `other` folds rtol*abs(other)+atol to one constant (1.001e-5
+   # for other=1), while tensor/tensor keeps the small constant in a MUL.
+-  has_tolerance = any(math.isfinite(x) and 0.0 < abs(x) <= 0.011 for x in float_constants)
++  has_tolerance = any(math.isfinite(x) and 0.0 < abs(x) <= 0.011 for x in data_constants)
+   if not has_nan_check or not has_abs_sign or not has_tolerance: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
+-- 
+2.34.1
+

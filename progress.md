@@ -11430,3 +11430,50 @@ Pre-edit recovery copies:
 `/tmp/test_ops_status.md.20260731-161118`.
 
 Next action: continue with scaled-dot-product attention as milestone 113.
+
+## 2026-07-31 — fp16 isclose milestone
+
+The three isclose methods pass **3/3 in 17.63s**, including the complete
+32-pair infinity/NaN/zero edge matrix and scalar comparisons.
+Implementation commit: `31c07151d`; portable patch:
+`0113-rockchip-pass-fp16-isclose.patch`.
+
+The full `TestOps` sweep first reached isclose with **143 passed, 4 skipped,
+and 91 subtests passed**. `test_isclose` rejected `unsupported_dtype`, then
+the native comparison decomposition for `test_isclose_edge_cases` entered
+repeated RKNPU reset ioctls and aborted the xdist worker from
+`reset_npu()`. The sweep was interrupted after **1,362.97s** because the
+replacement worker repeated the same reset storm.
+
+The existing strict isclose classifier already recognized the complete
+fp32 IEEE predicate and serialized it as one typed host task specifically
+to avoid exhausting the RK3588 reset budget. It now derives the one shared
+floating input dtype and accepts fp16 or fp32 constants/checks for the same
+strict signature: bool OR root, positive and negative infinity sentinels,
+self-CMPNE NaN checks, the signed-absolute WHERE with ±1 branches, and a
+small tolerance constant. Ordinary composite comparisons remain excluded.
+True-HALF edge and scalar tests pass through one task without reset churn.
+
+The shaped `x.isclose(x+1e-6)` test still differed from PyTorch in 14/360
+booleans under forced HALF. The CPU backend reproduces the exact mismatch,
+while normal-fp32 Rockchip passes in **21.03s**. Only `test_isclose` restores
+normal construction; edge/scalar remain true-HALF runtime coverage.
+
+Validation: hardware-free Rockchip remains **167/167 in 10.43s**; mypy
+remains at the exact 12-error baseline; touched-file Ruff remains at the
+exact nine pre-existing findings; and `git diff --check` passes. No LUT, LUT
+tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-163851`,
+`/tmp/test_pr1.py.20260731-163851`,
+`/tmp/conftest_rockchip.py.20260731-164020`,
+`/tmp/progress.md.20260731-164129`, and
+`/tmp/test_ops_status.md.20260731-164129`.
+
+Inventory note: scaled-dot-product attention passed **5/5 in 95.04s**,
+BCE/cross-entropy **7/7 in 18.62s**, sparse/NLL **10/10 in 21.45s**, and
+one-hot/masked-select/nonzero **6/6 in 22.08s**.
+
+Next action: resume the complete forward-only sweep after isclose, isolate
+the next failure, and commit milestone 114.
