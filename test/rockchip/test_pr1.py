@@ -391,6 +391,17 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(subtasks[0].task.is_copy)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp16_broadcast_pow_uses_exact_host_boundary(self):
+    for lhs_shape, rhs_shape in (((5,3,14,16), (5,1,14,1)), ((1,3,1,7,1), (2,1,5,1,8))):
+      lhs = Tensor.empty(*lhs_shape, dtype=dtypes.half, device="ROCKCHIP")
+      rhs = Tensor.empty(*rhs_shape, dtype=dtypes.half, device="ROCKCHIP")
+      program = build_native_program(_get_sink(lhs.pow(rhs)))
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertTrue(subtasks[0].task.is_copy)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_padded_add_uses_exact_host_boundary(self):
     a = Tensor.empty(64,64, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(60,60, dtype=dtypes.float, device="ROCKCHIP")

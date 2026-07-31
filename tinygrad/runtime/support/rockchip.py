@@ -9606,6 +9606,39 @@ def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if square is None or scale is None or _unwrap(square.src[0]).op is not Ops.INDEX: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_fp16_broadcast_pow_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize only the canonical two-input fp16 POW graph when an operand is broadcast."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
+  value = _unwrap(store.src[1])
+  nodes = value.toposort()
+  if value.op is not Ops.WHERE or value.dtype is not dtypes.half or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
+     sum(u.op is Ops.LOG2 for u in nodes) != 1 or sum(u.op is Ops.FLOORMOD for u in nodes) != 1: return None
+  exponential = next(u for u in nodes if u.op is Ops.EXP2)
+  scaled_log = _unwrap(exponential.src[0])
+  if scaled_log.op is not Ops.MUL or len(scaled_log.src) != 2: return None
+  logarithm = next((_unwrap(u) for u in scaled_log.src if _unwrap(u).op is Ops.LOG2), None)
+  exponent = next((_unwrap(u) for u in scaled_log.src if _unwrap(u).op is Ops.INDEX), None)
+  if logarithm is None or exponent is None or exponent.dtype is not dtypes.half: return None
+  absolute = _unwrap(logarithm.src[0])
+  if absolute.op is not Ops.WHERE: return None
+  base = next((_unwrap(u) for u in absolute.toposort() if _unwrap(u).op is Ops.INDEX and _unwrap(u) is not exponent), None)
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
+  if base is None or len(indexes) != 2 or set(indexes) != {base, exponent} or \
+     len({u.src[0].buf_uop.arg.slot for u in indexes}) != 2 or len({u.src[1] for u in indexes}) != 2: return None
+  total = prod(_shape_of_store(sink))
+  input_totals = [int(u.src[0].src[0].arg) for u in indexes]
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if not 1 <= total <= 1 << 20 or prod(int(u.src[0].arg) for u in loops) != total or \
+     any(not 1 <= size <= total for size in input_totals) or not any(size < total for size in input_totals): return None
+  allowed = {Ops.ADD, Ops.MUL, Ops.AND, Ops.CAST, Ops.CMPLT, Ops.CMPNE, Ops.EXP2, Ops.FLOORMOD,
+             Ops.INDEX, Ops.LOG2, Ops.PARAM, Ops.RANGE, Ops.WHERE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+  # Preserve the semantic POW boundary: replaying the scheduled LOG2/EXP2
+  # decomposition at fp16 rounds every intermediate, unlike the public op.
+  direct_store = store.replace(src=(store.src[0], UOp(Ops.POW, dtypes.half, (base, exponent))))
+  return _try_elementwise_host_subtasks(sink.substitute({store:direct_store}), allow_plain=True)
+
 def _try_fp32_broadcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve exact fp32 arithmetic for multi-input graphs with a real static broadcast."""
   store = _store_node(sink)
@@ -14844,6 +14877,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, zero_base_pow_tasks)
   if (tensor_pow_tasks := _try_tensor_pow_subtasks(sink)) is not None:
     return build_native_program_multi(sink, tensor_pow_tasks)
+  if (fp16_broadcast_pow_tasks := _try_fp16_broadcast_pow_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp16_broadcast_pow_tasks)
   if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fractional_pow_tasks)
   if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
