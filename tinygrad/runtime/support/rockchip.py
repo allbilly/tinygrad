@@ -2755,94 +2755,36 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate hardswish with a Q14 base LUT and a local Q15 correction LUT."""
   store = _store_node(sink)
   if store is None or (source := _try_hardswish(store.src[1])) is None: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  next_slot = max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  base_slot = alloc()
+  graph = _TaskGraph(sink, store, source)
+  base_slot = graph.alloc()
   lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_hardswish")
-  stage_store = store.replace(src=(temp_index(base_slot), lut_val))
-  lut_plan = plan_rk(sink.substitute({store:stage_store}))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not graph.emit_lut(lut_val, base_slot): return None
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
-  plus, positive, negative, clamped_negative, relu6, product, fallback = (alloc() for _ in range(7))
-  tasks.extend((_emit_where_stage(total, plus, source_arg, _float_arg(3.0), Ops.ADD),
-                _emit_where_stage(total, positive, (plus, 0), zero, Ops.MAX),
-                _emit_where_stage(total, negative, (positive, 0), _float_arg(-1.0), Ops.MUL),
-                _emit_where_stage(total, clamped_negative, (negative, 0), _float_arg(-6.0), Ops.MAX),
-                _emit_where_stage(total, relu6, (clamped_negative, 0), _float_arg(-1.0), Ops.MUL),
-                _emit_where_stage(total, product, source_arg, (relu6, 0), Ops.MUL),
-                _emit_where_stage(total, fallback, (product, 0), _float_arg(1/6), Ops.MUL)))
-  wide_negative_diff, wide_negative_mask, wide_positive_diff, wide_positive_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, wide_negative_diff, _float_arg(-2.0), source_arg, Ops.SUB),
-                _emit_where_stage(total, wide_negative_mask, (wide_negative_diff, 0), (wide_negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, wide_positive_diff, source_arg, _float_arg(2.0), Ops.SUB),
-                _emit_where_stage(total, wide_positive_mask, (wide_positive_diff, 0), (wide_positive_diff, 0), Ops.MAX, compare=True)))
-  wide_outside_scratch, wide_outside, wide_inside_scratch, wide_inside = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, wide_outside_scratch, (wide_negative_mask, 0), (wide_positive_mask, 0), Ops.MAX),
-                _emit_where_stage(total, wide_outside, (wide_negative_mask, 0), (wide_positive_mask, 0), Ops.MAX),
-                _emit_where_stage(total, wide_inside_scratch, one, (wide_outside, 0), Ops.SUB),
-                _emit_where_stage(total, wide_inside, one, (wide_outside, 0), Ops.SUB)))
-  base_inner_scratch, base_inner, fallback_outer_scratch, fallback_outer, wide = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, base_inner_scratch, (base_slot, 0), (wide_inside, 0), Ops.MUL),
-                _emit_where_stage(total, base_inner, (base_slot, 0), (wide_inside, 0), Ops.MUL),
-                _emit_where_stage(total, fallback_outer_scratch, (fallback, 0), (wide_outside, 0), Ops.MUL),
-                _emit_where_stage(total, fallback_outer, (fallback, 0), (wide_outside, 0), Ops.MUL),
-                _emit_where_stage(total, alloc(), (base_inner, 0), (fallback_outer, 0), Ops.ADD),
-                _emit_where_stage(total, wide, (base_inner, 0), (fallback_outer, 0), Ops.ADD)))
+  source_arg, zero = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0)
+  plus = graph.op(source_arg, _float_arg(3.0), Ops.ADD, repeat=False)
+  positive = graph.op(plus, zero, Ops.MAX, repeat=False)
+  negative = graph.op(positive, _float_arg(-1.0), Ops.MUL, repeat=False)
+  clamped_negative = graph.op(negative, _float_arg(-6.0), Ops.MAX, repeat=False)
+  relu6 = graph.op(clamped_negative, _float_arg(-1.0), Ops.MUL, repeat=False)
+  fallback = graph.op(graph.op(source_arg, relu6, Ops.MUL, repeat=False), _float_arg(1/6), Ops.MUL, repeat=False)
+  wide_outside, wide_inside = graph.interval_mask(source_arg, -2.0, 2.0)
+  base_inner = graph.op((base_slot,0), wide_inside, Ops.MUL)
+  fallback_outer = graph.op(fallback, wide_outside, Ops.MUL)
+  wide = graph.op(base_inner, fallback_outer, Ops.ADD)
 
-  scaled = alloc()
-  tasks.append(_emit_where_stage(total, scaled, source_arg, _float_arg(16.0), Ops.MUL))
-  local_slot = alloc()
-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_hardswish_correction")
-  local_store = store.replace(src=(temp_index(local_slot), local_val))
-  local_plan = plan_rk(sink.substitute({store:local_store}))
-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(local_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
-
-  local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(1/16), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(1/16), Ops.MUL)))
-  negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, negative_diff, _float_arg(-0.125), source_arg, Ops.SUB),
-                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_diff, source_arg, _float_arg(15/128), Ops.SUB),
-                _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True)))
-  outside_scratch, outside, inside_scratch, inside = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, outside_scratch, (negative_mask, 0), (positive_mask, 0), Ops.MAX),
-                _emit_where_stage(total, outside, (negative_mask, 0), (positive_mask, 0), Ops.MAX),
-                _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
-                _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
-  negative_zero_diff, negative_zero_mask, positive_zero_diff, positive_zero_mask = alloc(), alloc(), alloc(), alloc()
-  nonzero_scratch, nonzero = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, negative_zero_diff, zero, source_arg, Ops.SUB),
-                _emit_where_stage(total, negative_zero_mask, (negative_zero_diff, 0), (negative_zero_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_zero_diff, source_arg, zero, Ops.SUB),
-                _emit_where_stage(total, positive_zero_mask, (positive_zero_diff, 0), (positive_zero_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, nonzero_scratch, (negative_zero_mask, 0), (positive_zero_mask, 0), Ops.MAX),
-                _emit_where_stage(total, nonzero, (negative_zero_mask, 0), (positive_zero_mask, 0), Ops.MAX)))
-  local_nonzero_scratch, local_nonzero = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_nonzero_scratch, (local_scaled, 0), (nonzero, 0), Ops.MUL),
-                _emit_where_stage(total, local_nonzero, (local_scaled, 0), (nonzero, 0), Ops.MUL)))
-  base_selected_scratch, base_selected, local_selected_scratch, local_selected = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, base_selected_scratch, (wide, 0), (outside, 0), Ops.MUL),
-                _emit_where_stage(total, base_selected, (wide, 0), (outside, 0), Ops.MUL),
-                _emit_where_stage(total, local_selected_scratch, (local_nonzero, 0), (inside, 0), Ops.MUL),
-                _emit_where_stage(total, local_selected, (local_nonzero, 0), (inside, 0), Ops.MUL),
-                _emit_where_stage(total, alloc(), (base_selected, 0), (local_selected, 0), Ops.ADD),
-                _emit_where_stage(total, info.outs[0], (base_selected, 0), (local_selected, 0), Ops.ADD)))
-  return tuple(tasks)
+  scaled = graph.op(source_arg, _float_arg(16.0), Ops.MUL, repeat=False)
+  local_slot = graph.alloc()
+  if not graph.emit_named_lut("rk_hardswish_correction", scaled[0], local_slot): return None
+  local_scaled = graph.op((local_slot,0), _float_arg(1/16), Ops.MUL)
+  outside, inside = graph.interval_mask(source_arg, -0.125, 15/128)
+  negative_zero = graph.positive_mask(zero, source_arg)
+  positive_zero = graph.positive_mask(source_arg, zero)
+  nonzero = graph.op(negative_zero, positive_zero, Ops.MAX)
+  local_nonzero = graph.op(local_scaled, nonzero, Ops.MUL)
+  base_selected = graph.op(wide, outside, Ops.MUL)
+  local_selected = graph.op(local_nonzero, inside, Ops.MUL)
+  graph.op(base_selected, local_selected, Ops.ADD, out_slot=graph.out)
+  return tuple(graph.tasks)
 
 def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Use direct Q15 tanh in [-4,4], exact sign tails, and restore NaN."""
