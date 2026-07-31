@@ -5352,94 +5352,34 @@ def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if not any(u.op is Ops.CONST and isinstance(u.arg, float) and math.isnan(float(u.arg)) for u in nodes): return None
   if not any(u.op is Ops.CONST and float(u.arg) == -1.0 for u in nodes): return None
 
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  if int(source.src[0].src[0].arg) != total: return None
-  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
-  next_slot = max(info.globals, default=-1)+1
-  tasks:list[RKSubTask] = []
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot+1
-    return ret
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
-    diff, mask = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
-                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
-    return mask, 0
-
-  def temp_index(slot:int) -> UOp:
-    out_index = store.src[0]
-    return out_index.replace(dtype=dtypes.half,
-      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
-
-  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
-
-  # Reuse the proven positive-base magnitude path in a scratch output slot.
-  magnitude_slot = alloc()
+  graph = _TaskGraph(sink, store, source)
+  if int(source.src[0].src[0].arg) != graph.total: return None
+  source_slot = source.src[0].buf_uop.arg.slot
+  # Reuse the proven positive-base magnitude graph in a scratch output slot.
+  magnitude_slot = graph.alloc()
   magnitude_tasks = (_try_pow_base55_lut_subtasks if base_kind == "base55" else _try_pow_base2_lut_subtasks)(
-    stage_sink(exponential, magnitude_slot))
-  if magnitude_tasks is None: return None
-  tasks.extend(magnitude_tasks)
-  used_slots = [task.task.out_slot for task in magnitude_tasks] + \
-    [reloc.globals_slot for task in magnitude_tasks for reloc in task.relocs
-     if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-  next_slot = max(next_slot, max(used_slots, default=-1)+1)
+    graph.stage_sink(exponential, magnitude_slot))
+  if not graph.extend(magnitude_tasks): return None
 
-  def trunc_half(input_slot:int) -> int|None:
-    """Truncate a half scratch slot using only the native roundoff LUT and DPU masks."""
-    negative, magnitude, rounded = alloc(), alloc(), alloc()
-    dependent(negative, (_ZERO_SLOT,0), (input_slot,0), Ops.SUB)
-    dependent(magnitude, (input_slot,0), (negative,0), Ops.MAX)
-    roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(magnitude),), arg="rk_roundoff")
-    round_plan = plan_rk(stage_sink(roundoff, rounded))
-    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut": return None
-    cmds, task, relocs = emit_rk(round_plan)
-    tasks.append(RKSubTask(cmds, task, relocs))
-
-    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
-    dependent(overshoot_diff, (rounded,0), (magnitude,0), Ops.SUB)
-    tasks.append(_emit_where_stage(total, overshoot, (overshoot_diff,0), (overshoot_diff,0), Ops.MAX, compare=True))
-    dependent(truncated_abs, (rounded,0), (overshoot,0), Ops.SUB)
-    positive = positive_mask((input_slot,0), (_ZERO_SLOT,0))
-    negative_mask = positive_mask((_ZERO_SLOT,0), (input_slot,0))
-    sign, result = alloc(), alloc()
-    dependent(sign, positive, negative_mask, Ops.SUB)
-    dependent(result, (truncated_abs,0), (sign,0), Ops.MUL)
-    return result
-
-  truncated = trunc_half(source_slot)
+  truncated = graph.trunc_half(source_slot)
   if truncated is None: return None
-  half = alloc()
-  dependent(half, (truncated,0), _float_arg(0.5), Ops.MUL)
-  half_truncated = trunc_half(half)
+  half = graph.op(truncated, _float_arg(0.5), Ops.MUL)
+  half_truncated = graph.trunc_half(half[0])
   if half_truncated is None: return None
+  doubled = graph.op(half_truncated, _float_arg(2.0), Ops.MUL)
+  remainder = graph.op(truncated, doubled, Ops.SUB)
+  negative_remainder = graph.op((_ZERO_SLOT,0), remainder, Ops.SUB)
+  odd = graph.op(remainder, negative_remainder, Ops.MAX)
+  twice_odd = graph.op(odd, _float_arg(2.0), Ops.MUL)
+  sign = graph.op(_float_arg(1.0), twice_odd, Ops.SUB)
 
-  doubled, remainder, negative_remainder, odd = (alloc() for _ in range(4))
-  dependent(doubled, (half_truncated,0), _float_arg(2.0), Ops.MUL)
-  dependent(remainder, (truncated,0), (doubled,0), Ops.SUB)
-  dependent(negative_remainder, (_ZERO_SLOT,0), (remainder,0), Ops.SUB)
-  dependent(odd, (remainder,0), (negative_remainder,0), Ops.MAX)
-  twice_odd, sign = alloc(), alloc()
-  dependent(twice_odd, (odd,0), _float_arg(2.0), Ops.MUL)
-  dependent(sign, _float_arg(1.0), (twice_odd,0), Ops.SUB)
-
-  source_arg, truncated_arg = (source_slot,0), (truncated,0)
-  positive_fraction = positive_mask(source_arg, truncated_arg)
-  negative_fraction = positive_mask(truncated_arg, source_arg)
-  noninteger, valid_denom, valid_factor, signed = (alloc() for _ in range(4))
-  dependent(noninteger, positive_fraction, negative_fraction, Ops.ADD)
-  dependent(valid_denom, _float_arg(1.0), (noninteger,0), Ops.SUB)
-  dependent(valid_factor, (valid_denom,0), (valid_denom,0), Ops.FDIV)
-  dependent(signed, (magnitude_slot,0), (sign,0), Ops.MUL)
-  dependent(out, (signed,0), (valid_factor,0), Ops.MUL)
-  return tuple(tasks)
+  source_arg = (source_slot,0)
+  noninteger = graph.op(graph.positive_mask(source_arg, truncated), graph.positive_mask(truncated, source_arg), Ops.ADD)
+  valid_denom = graph.op(_float_arg(1.0), noninteger, Ops.SUB)
+  valid_factor = graph.op(valid_denom, valid_denom, Ops.FDIV)
+  signed = graph.op((magnitude_slot,0), sign, Ops.MUL)
+  graph.op(signed, valid_factor, Ops.MUL, out_slot=graph.out)
+  return tuple(graph.tasks)
 
 def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate 0**x directly from exponent sign, zero, infinity, and NaN masks."""
@@ -5458,68 +5398,23 @@ def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   scales = [float(u.arg) for u in product.src if u.op is Ops.CONST]
   if len(scales) != 1 or scales[0] != -math.inf: return None
 
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  if int(source.src[0].src[0].arg) != total: return None
-  out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
-  next_slot = max(info.globals, default=-1)+1
-  tasks:list[RKSubTask] = []
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot+1
-    return ret
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
-    diff, mask = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
-                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
-    return mask, 0
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_index = store.src[0]
-    return out_index.replace(dtype=dtype,
-      src=(out_index.src[0].param_like(slot).replace(dtype=dtype), *out_index.src[1:]))
-
-  def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    last = cmp_tasks[-1]
-    cmp_tasks = (*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
-    tasks.extend(cmp_tasks)
-    used_slots = [task.task.out_slot for task in cmp_tasks] + \
-      [reloc.globals_slot for task in cmp_tasks for reloc in task.relocs
-       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1)+1)
-    return mask_slot, 0
-
-  source_arg, one = (source_slot,0), _float_arg(1.0)
-  positive = positive_mask(source_arg, (_ZERO_SLOT,0))
-  negative = positive_mask((_ZERO_SLOT,0), source_arg)
-  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
+  graph = _TaskGraph(sink, store, source)
+  if int(source.src[0].src[0].arg) != graph.total: return None
+  source_arg, one = (source.src[0].buf_uop.arg.slot,0), _float_arg(1.0)
+  positive = graph.positive_mask(source_arg, (_ZERO_SLOT,0))
+  negative = graph.positive_mask((_ZERO_SLOT,0), source_arg)
+  not_number = graph.comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
   if not_number is None: return None
-  nonzero, zero_or_nan, zero_result = alloc(), alloc(), alloc()
-  dependent(nonzero, positive, negative, Ops.ADD)
-  dependent(zero_or_nan, one, (nonzero,0), Ops.SUB)
-  dependent(zero_result, (zero_or_nan,0), not_number, Ops.SUB)
-
-  infinity_denom, infinity = alloc(), alloc()
-  dependent(infinity_denom, one, negative, Ops.SUB)
-  dependent(infinity, negative, (infinity_denom,0), Ops.FDIV)
-  normal, nan_denom, nan_numerator = alloc(), alloc(), alloc()
-  dependent(normal, (zero_result,0), (infinity,0), Ops.ADD)
-  dependent(nan_denom, one, not_number, Ops.SUB)
-  dependent(nan_numerator, (normal,0), (nan_denom,0), Ops.MUL)
-  dependent(out, (nan_numerator,0), (nan_denom,0), Ops.FDIV)
-  return tuple(tasks)
+  nonzero = graph.op(positive, negative, Ops.ADD)
+  zero_or_nan = graph.op(one, nonzero, Ops.SUB)
+  zero_result = graph.op(zero_or_nan, not_number, Ops.SUB)
+  infinity_denom = graph.op(one, negative, Ops.SUB)
+  infinity = graph.op(negative, infinity_denom, Ops.FDIV)
+  normal = graph.op(zero_result, infinity, Ops.ADD)
+  nan_denom = graph.op(one, not_number, Ops.SUB)
+  nan_numerator = graph.op(normal, nan_denom, Ops.MUL)
+  graph.op(nan_numerator, nan_denom, Ops.FDIV, out_slot=graph.out)
+  return tuple(graph.tasks)
 
 def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate runtime tensor base/exponent POW with native magnitude and parity."""
@@ -5541,7 +5436,8 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if base is None or base.dtype not in (dtypes.half, dtypes.float) or exponent.dtype not in (dtypes.half, dtypes.float): return None
   if len({base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot}) != 2: return None
 
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  graph = _TaskGraph(sink, store, base)
+  total = graph.total
   scalar_fp32 = total == 1 and base.dtype is dtypes.float and exponent.dtype is dtypes.float and \
     store.src[0].src[0].dtype is dtypes.float
   tensor_fp16 = base.dtype is dtypes.half and exponent.dtype is dtypes.half and store.src[0].src[0].dtype is dtypes.half
@@ -5549,53 +5445,10 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # WIP gate used while the wide fp16 path was still being calibrated:
   # if not scalar_fp32 and not getenv("ROCKCHIP_WIP_TENSOR_POW"): return None
   if any(int(u.src[0].src[0].arg) != total for u in (base, exponent)): return None
-  out, next_slot = info.outs[0], max(info.globals, default=-1)+1
   base_slot, exponent_slot = base.src[0].buf_uop.arg.slot, exponent.src[0].buf_uop.arg.slot
-  tasks:list[RKSubTask] = []
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot+1
-    return ret
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, **kwargs) -> None:
-    # The first write is an fp16 visibility scratch. Typed output conversion
-    # belongs only to the logical destination on the second write.
-    scratch_kwargs = {key:value for key, value in kwargs.items() if not key.endswith("_output")}
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op, **scratch_kwargs))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op, **kwargs))
-
-  def positive_mask(lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
-    diff, mask = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, diff, lhs, rhs, Ops.SUB),
-                  _emit_where_stage(total, mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
-    return mask, 0
-
-  def exact_mask(arg:tuple[int,int], number:float) -> tuple[int,int]:
-    lower = positive_mask(arg, _float_arg(number))
-    upper = positive_mask(_float_arg(number), arg)
-    different, equal = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, different, lower, upper, Ops.MAX),
-                  _emit_where_stage(total, equal, one, (different,0), Ops.SUB)))
-    return equal, 0
-
-  def temp_index(slot:int) -> UOp:
-    out_index = store.src[0]
-    return out_index.replace(dtype=dtypes.half,
-      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
-
-  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
-
-  def extend(stage_tasks:tuple[RKSubTask, ...]|None) -> bool:
-    nonlocal next_slot
-    if stage_tasks is None: return False
-    tasks.extend(stage_tasks)
-    used_slots = [task.task.out_slot for task in stage_tasks] + \
-      [reloc.globals_slot for task in stage_tasks for reloc in task.relocs
-       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1)+1)
-    return True
+  out, tasks = graph.out, graph.tasks
+  alloc, dependent, positive_mask = graph.alloc, graph.dependent, graph.positive_mask
+  exact_mask, temp_index, stage_sink, extend = graph.exact_mask, graph.temp_index, graph.stage_sink, graph.extend
 
   zero, one = (_ZERO_SLOT,0), _float_arg(1.0)
   base_half = alloc() if base.dtype is dtypes.float else base_slot
@@ -5668,24 +5521,7 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude))): return None
 
   def trunc_half(input_slot:int) -> int|None:
-    negative, absolute_value, rounded = alloc(), alloc(), alloc()
-    dependent(negative, zero, (input_slot,0), Ops.SUB)
-    dependent(absolute_value, (input_slot,0), (negative,0), Ops.MAX)
-    roundoff = UOp(Ops.CUSTOM, dtypes.half, (temp_index(absolute_value),), arg="rk_roundoff")
-    round_plan = plan_rk(stage_sink(roundoff, rounded))
-    if isinstance(round_plan, str) or round_plan.kind != "dpu_lut": return None
-    cmds, task, relocs = emit_rk(round_plan)
-    tasks.append(RKSubTask(cmds, task, relocs))
-    overshoot_diff, overshoot, truncated_abs = alloc(), alloc(), alloc()
-    dependent(overshoot_diff, (rounded,0), (absolute_value,0), Ops.SUB)
-    tasks.append(_emit_where_stage(total, overshoot, (overshoot_diff,0), (overshoot_diff,0), Ops.MAX, compare=True))
-    dependent(truncated_abs, (rounded,0), (overshoot,0), Ops.SUB)
-    positive = positive_mask((input_slot,0), zero)
-    negative_mask = positive_mask(zero, (input_slot,0))
-    sign, result = alloc(), alloc()
-    dependent(sign, positive, negative_mask, Ops.SUB)
-    dependent(result, (truncated_abs,0), (sign,0), Ops.MUL)
-    return result
+    return None if (result := graph.trunc_half(input_slot)) is None else result[0]
 
   scaled_integer = trunc_half(scaled_log_slot)
   if scaled_integer is None: return None
@@ -5861,68 +5697,30 @@ def _try_fractional_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if absolute_expr.op is not Ops.WHERE or len(absolute_expr.src) != 3 or \
      _unwrap(absolute_expr.src[0]) is not condition or _unwrap(absolute_expr.src[2]) is not base: return None
   source_slot = source.src[0].buf_uop.arg.slot
-
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-
-  def temp_index(slot:int) -> UOp:
-    out_index = store.src[0]
-    return out_index.replace(dtype=dtypes.half,
-      src=(out_index.src[0].param_like(slot).replace(dtype=dtypes.half), *out_index.src[1:]))
-
-  def stage_sink(stage_value:UOp, out_slot:int) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot), stage_value))})
-
-  def extend(stage_tasks:tuple[RKSubTask, ...]|None) -> bool:
-    nonlocal next_slot
-    if stage_tasks is None: return False
-    tasks.extend(stage_tasks)
-    used_slots = [task.task.out_slot for task in stage_tasks] + \
-      [reloc.globals_slot for task in stage_tasks for reloc in task.relocs
-       if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return True
-
-  base_slot = alloc() if reciprocal else source_slot
+  graph = _TaskGraph(sink, store, source)
+  base_slot = graph.alloc() if reciprocal else source_slot
   if reciprocal:
-    one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-    tasks.append(_emit_where_stage(total, base_slot, one, (source_slot, 0), Ops.FDIV))
-  negative, absolute = alloc(), alloc()
-  negative_one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', -1.0))[0])
-  tasks.extend((_emit_where_stage(total, negative, (base_slot, 0), negative_one, Ops.MUL),
-                _emit_where_stage(total, absolute, (base_slot, 0), (negative, 0), Ops.MAX)))
+    graph.op(_float_arg(1.0), (source_slot,0), Ops.FDIV, out_slot=base_slot, repeat=False)
+  negative = graph.op((base_slot,0), _float_arg(-1.0), Ops.MUL, repeat=False)
+  absolute = graph.op((base_slot,0), negative, Ops.MAX, repeat=False)
 
-  scaled_log_slot = alloc()
+  scaled_log_slot = graph.alloc()
   staged_log = UOp(Ops.MUL, dtypes.half,
-                   (UOp(Ops.LOG2, dtypes.half, (temp_index(absolute),)), UOp.const(dtypes.half, exponent)))
-  if not extend(_try_log2_special_subtasks(stage_sink(staged_log, scaled_log_slot))): return None
+                   (UOp(Ops.LOG2, dtypes.half, (graph.temp_index(absolute[0]),)), UOp.const(dtypes.half, exponent)))
+  if not graph.extend(_try_log2_special_subtasks(graph.stage_sink(staged_log, scaled_log_slot))): return None
 
-  magnitude_slot = alloc()
-  staged_exp = UOp(Ops.EXP2, dtypes.half, (temp_index(scaled_log_slot),))
-  if not extend(_try_exp2_special_subtasks(stage_sink(staged_exp, magnitude_slot))): return None
+  magnitude_slot = graph.alloc()
+  staged_exp = UOp(Ops.EXP2, dtypes.half, (graph.temp_index(scaled_log_slot),))
+  if not graph.extend(_try_exp2_special_subtasks(graph.stage_sink(staged_exp, magnitude_slot))): return None
 
   # source < 0 mask, followed by (1-mask)/(1-mask).  The factor is one for
   # the valid domain and NaN for negative inputs without ever selecting a
   # literal NaN through arithmetic masking.
-  negative_diff, negative_mask = alloc(), alloc()
-  invalid_denom_scratch, invalid_denom, invalid_factor_scratch, invalid_factor = (alloc() for _ in range(4))
-  output_scratch = alloc()
-  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (base_slot, 0), Ops.SUB),
-                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, invalid_denom_scratch, one, (negative_mask, 0), Ops.SUB),
-                _emit_where_stage(total, invalid_denom, one, (negative_mask, 0), Ops.SUB),
-                _emit_where_stage(total, invalid_factor_scratch, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV),
-                _emit_where_stage(total, invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV),
-                _emit_where_stage(total, output_scratch, (magnitude_slot, 0), (invalid_factor, 0), Ops.MUL),
-                _emit_where_stage(total, out, (magnitude_slot, 0), (invalid_factor, 0), Ops.MUL)))
-  return tuple(tasks)
+  negative_mask = graph.positive_mask((_ZERO_SLOT,0), (base_slot,0))
+  invalid_denom = graph.op(_float_arg(1.0), negative_mask, Ops.SUB)
+  invalid_factor = graph.op(invalid_denom, invalid_denom, Ops.FDIV)
+  graph.op((magnitude_slot,0), invalid_factor, Ops.MUL, out_slot=graph.out)
+  return tuple(graph.tasks)
 
 def _try_abs_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower abs(x) as neg=x*-1 followed by max(x,neg).
@@ -6386,6 +6184,24 @@ class _TaskGraph:
 
   def weighted_sum(self, bands:tuple[tuple[int,int], ...], weights:tuple[float, ...]) -> tuple[int,int]:
     return self.sum([self.op(band, _float_arg(weight), Ops.MUL) for band, weight in zip(bands, weights)])
+
+  def exact_mask(self, arg:tuple[int,int], number:float) -> tuple[int,int]:
+    lower, upper = self.positive_mask(arg, _float_arg(number)), self.positive_mask(_float_arg(number), arg)
+    different = self.op(lower, upper, Ops.MAX, repeat=False)
+    return self.op(_float_arg(1.0), different, Ops.SUB, repeat=False)
+
+  def trunc_half(self, input_slot:int) -> tuple[int,int]|None:
+    """Truncate an fp16 scratch value with the native roundoff LUT and DPU masks."""
+    zero = (_ZERO_SLOT,0)
+    negative = self.op(zero, (input_slot,0), Ops.SUB)
+    absolute = self.op((input_slot,0), negative, Ops.MAX)
+    rounded = self.alloc()
+    if not self.emit_lut(UOp(Ops.CUSTOM, dtypes.half, (self.temp_index(absolute[0]),), arg="rk_roundoff"), rounded): return None
+    overshoot_diff = self.op((rounded,0), absolute, Ops.SUB)
+    overshoot = self.op(overshoot_diff, overshoot_diff, Ops.MAX, repeat=False, compare=True)
+    truncated_abs = self.op((rounded,0), overshoot, Ops.SUB)
+    sign = self.op(self.positive_mask((input_slot,0), zero), self.positive_mask(zero, (input_slot,0)), Ops.SUB)
+    return self.op(truncated_abs, sign, Ops.MUL)
 
   def extend(self, stage_tasks:tuple[RKSubTask, ...]|None) -> bool:
     if stage_tasks is None: return False
