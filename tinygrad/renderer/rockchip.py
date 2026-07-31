@@ -6,7 +6,7 @@ from typing import Callable
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.runtime.autogen import rockchip as rk
+from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
 RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 1, 1
@@ -31,6 +31,7 @@ class RKDPUOp(IntEnum):
   MUL = 2
   MAX = 3
   SUB = 4
+  EXP2 = 5
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -202,6 +203,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     src = tuple(_parse_dpu_expr(x, output_index, memo) for x in u.src)
     if any(x is None for x in src): return None
     ret = _DPUExpr({Ops.ADD:RKDPUOp.ADD, Ops.MUL:RKDPUOp.MUL, Ops.MAX:RKDPUOp.MAX}[u.op], src)  # type: ignore[arg-type]
+  elif u.op is Ops.EXP2:
+    operand = _parse_dpu_expr(u.src[0], output_index, memo)
+    if operand is None: return None
+    ret = _DPUExpr(RKDPUOp.EXP2, (operand,))
   else: return None
   memo[u] = ret
   return ret
@@ -226,6 +231,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       if isinstance(src, _DPUExpr) and src not in order: visit(src)
     if expr not in order: order.append(expr)
   visit(root)
+  if any(expr.op is RKDPUOp.EXP2 for expr in order) and count != 128: return None
   uses = {expr:sum(src is expr for node in order for src in node.src) for expr in order}
   values:dict[_DPUExpr, RKArg] = {}
   free:list[int] = []
@@ -239,7 +245,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    stages.append(RKDPUStage(expr.op, dst, src[0], src[1], count))
+    stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count))
     values[expr] = dst
     for source in expr.src:
       if isinstance(source, _DPUExpr):
@@ -318,6 +324,46 @@ _EW_CFG = {RKDPUOp.ADD:_EW_BASE | (2 << 16), RKDPUOp.MUL:_EW_BASE | (1 << 2) | (
 def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
 
+def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
+  """Emit one generated 128-element EXP2 LUT task; fitting stays in extra/rockchip/gen_lut.py."""
+  width, surf_stride = 15, 256
+  cmds = []
+  for table_id in range(2):
+    cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
+    for value in rklut.RK_LUT_EXP2[table_id*513:(table_id+1)*513]:
+      cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_DATA, value & 0xffffffff if value < 0 else value))
+  fixed = (
+    (_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x30), (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30),
+    (_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002),
+    (_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, surf_stride), (_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width),
+    (_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
+    (_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 2), (_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, 7),
+    (_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, width), (_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x20040),
+    (_TARGET_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000), (_TARGET_DPU, rk.REG_DPU_BN_MUL_CFG, rklut.RK_LUT_EXP2_BN_MUL << 16),
+    (_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x302), (_TARGET_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
+    (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001), (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SHIFT, rklut.RK_LUT_EXP2_MINUS_EXP << 12),
+    (_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 2*surf_stride), (_TARGET_DPU, 0x40c4, 0),
+    (_TARGET_DPU, rk.REG_DPU_LUT_CFG, 0x68), (_TARGET_DPU, rk.REG_DPU_LUT_INFO, 0x50500),
+    (_TARGET_DPU, rk.REG_DPU_LUT_LE_START, 0xffffc000), (_TARGET_DPU, rk.REG_DPU_LUT_LE_END, 0),
+    (_TARGET_DPU, rk.REG_DPU_LUT_LO_START, 0), (_TARGET_DPU, rk.REG_DPU_LUT_LO_END, 0x4000),
+    (_TARGET_DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 16434 << 16), (_TARGET_DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 13 << 5),
+    (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
+    (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
+    (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 1),
+    (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849),
+    (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_WEIGHT, 0x01010101), (_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18))
+  cmds.extend(_command(*x) for x in fixed[:4])
+  dst_word = len(cmds)
+  cmds.append(_command(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0))
+  cmds.extend(_command(*x) for x in fixed[4:30])
+  src_word = len(cmds)
+  cmds.append(_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0))
+  cmds.extend(_command(*x) for x in fixed[30:])
+  relocs = (RKReloc(stage_idx, dst_word, plan.dst.kind, plan.dst.index), RKReloc(stage_idx, src_word, src.kind, src.index))
+  reads = (src.index,) if src.kind is RKBufferKind.ARG else ()
+  writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
+  return RKStage(RKEngine.DPU, tuple(cmds), relocs, reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
+
 def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   constants, constant_offsets, stages = bytearray(), {}, []
@@ -331,6 +377,9 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     return RKArg(RKBufferKind.CONSTANT, constant_offsets[key])
   for stage_idx, plan in enumerate(program.stages):
     lhs, rhs = materialize(plan.lhs, plan.count), materialize(plan.rhs, plan.count) if plan.rhs is not None else None
+    if plan.op is RKDPUOp.EXP2:
+      stages.append(_emit_lut(stage_idx, plan, lhs))
+      continue
     width = (plan.count+7)//8-1
     cmds = [_command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), _command(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),
             _command(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width),

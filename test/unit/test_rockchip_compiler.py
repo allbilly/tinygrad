@@ -1,10 +1,11 @@
-import unittest
+import hashlib, struct, unittest
 from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
 from tinygrad.helpers import Target
 from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RKPool, RockchipRenderer, decode_image, emit_contract, emit_dpu,
                                         emit_pool, lower_contract, lower_dpu, lower_pool)
+from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, UOp
 
 def sink(expr:Tensor) -> UOp:
@@ -68,6 +69,20 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsNotNone(program)
     image = decode_image(program.src[3].arg)
     self.assertEqual(len(image.stages), 1)
+
+  def test_exp2_uses_generated_lut(self):
+    payload = struct.pack(f"<{len(rklut.RK_LUT_EXP2)}h", *rklut.RK_LUT_EXP2)
+    self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_EXP2_SHA256)
+    plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).exp2()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertFalse(contains_uop(plan))
+    self.assertEqual(plan.stages[0].op.name, "EXP2")
+    image = emit_dpu(plan)
+    self.assertEqual(len(image.stages[0].commands), 1064)
+    self.assertEqual(image.stages[0].commands[:3],
+      (0x1001000200004100, 0x1001000008004104, 0x1001000008064104))
+    self.assertEqual(tuple(r.word for r in image.stages[0].relocs), (1032, 1059))
+    self.assertIsNone(lower_dpu(sink(Tensor.empty(16, dtype=dtypes.half).exp2())))
 
   def test_rejects_noncontiguous_and_nonhalf(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
