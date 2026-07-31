@@ -2868,3 +2868,21 @@ at fp16. Backend and core semantics are unchanged.
 Adapter Ruff and `git diff --check` pass. Hardware-free remains **164/164**
 from milestone 102; no LUT or two-level LUT changed. Next:
 `test_fancy_conv2d`.
+
+### Constant integer powers
+
+`test_int_pow_const_int` passes in **11.57s** for powers 0, 1, 2, 7, and
+29, with the negative-power error preserved. Commit `463d0dfd6`; saved
+patch `0104-rockchip-pass-constant-integer-powers.patch`.
+
+A strict classifier recognizes only a repeated int32 MUL tree rooted in one
+complete same-index parameter, derives exponents 2–32, bounds output size,
+and uses one typed task. The disabled native-power WIP remains intact
+because native MUL is documented there to corrupt high product words.
+
+Contract: **165/165 in 9.21s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed.
+
+Next failure: `test_interpolate_bilinear`, with 79/1,674 first-shape
+mismatches and maximum absolute error `0.000977`.

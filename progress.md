@@ -11097,3 +11097,41 @@ Pre-edit recovery copies:
 
 Next action: resume at `test_fancy_conv2d` and continue the ordered forward
 inventory as milestone 104.
+
+## 2026-07-31 — constant integer-power milestone
+
+The complete unchanged `TestOps.test_int_pow_const_int` passes in
+**11.57s**. It covers exact powers 0, 1, 2, 7, and 29 plus the expected
+negative-exponent error. Implementation commit: `463d0dfd6`; portable
+patch: `0104-rockchip-pass-constant-integer-powers.patch`.
+
+Powers 0 and 1 already simplified to supported fill/copy paths. Power 2
+first rejected at int32 `MUL`. The preserved native-int-power WIP was not
+enabled: its own comment records that native RK MUL corrupts the high word
+of larger products.
+
+The active classifier recursively proves that the output is a repeated MUL
+tree of one complete, same-index int32 parameter, derives a constant
+exponent from 2 through 32, permits only MUL and direct indexing nodes,
+bounds the output to `2**20`, and evaluates the graph as one existing typed
+int32 task. This preserves exact int32 wrap behavior without broadening
+generic host admission or changing the disabled native WIP.
+
+Validation: hardware-free Rockchip passes **165/165 in 9.21s**; mypy
+remains at the exact 12-error baseline; touched-file Ruff remains at the
+exact nine pre-existing findings; `git diff --check` passes. No LUT, LUT
+tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-152102`,
+`/tmp/test_pr1.py.20260731-152102`,
+`/tmp/progress.md.20260731-152402`, and
+`/tmp/test_ops_status.md.20260731-152402`.
+
+Inventory note: `test_fancy_conv2d` through `test_flip_eye_crash` passed
+**5/5**, floor through fp16 GEMM passed **9/9**, and the next grouped block
+passed through `test_int_pow_const_int`. The next separate failure is
+`test_interpolate_bilinear`: 79/1,674 mismatches in its first shape, maximum
+absolute error `0.000977`.
+
+Next action: fix bilinear interpolation as milestone 105.

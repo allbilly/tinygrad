@@ -1,0 +1,74 @@
+From 463d0dfd6a8a070e88459dc1845f8aae3a2cc238 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 15:23:57 +0800
+Subject: [PATCH] rockchip: pass constant integer powers
+
+---
+ test/rockchip/test_pr1.py            | 10 ++++++++++
+ tinygrad/runtime/support/rockchip.py | 22 ++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a24c40ec4..fc1284163 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -985,6 +985,16 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(len(subtasks), 1)
+     self.assertEqual(subtasks[0].task.layout, (224, _HOST_EINSUM_LAYOUT, 13824))
+ 
++  def test_int_power_uses_one_typed_host_task(self):
++    for exponent in (2, 7, 29):
++      expression = Tensor.empty(3, dtype=dtypes.int, device="ROCKCHIP")**exponent
++      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
+     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
+     for expression in (source.argmax(0, False), source.argmin(0, False)):
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 3feb59542..d7cd07498 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -14075,6 +14075,26 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", identity_layout, info.outs[0], is_copy=True), identity_relocs))
+   return tuple(tasks)
+ 
++def _try_int_power_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate a bounded repeated int32 MUL tree as one typed task."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.int or _reduce_node(sink) is not None: return None
++  value = _unwrap(store.src[1])
++  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.int]
++  if len(indexes) != 1 or (source := indexes[0]).src[0].op is not Ops.PARAM: return None
++  def exponent(u:UOp) -> int|None:
++    u = _unwrap(u)
++    if u is source: return 1
++    if u.op is not Ops.MUL or len(u.src) != 2: return None
++    lhs, rhs = exponent(u.src[0]), exponent(u.src[1])
++    return None if lhs is None or rhs is None else lhs+rhs
++  power = exponent(value)
++  if power is None or not 2 <= power <= 32: return None
++  total = prod(_shape_of_store(sink))
++  if not 1 <= total <= 1 << 20 or int(source.src[0].src[0].arg) != total or source.src[1] is not store.src[0].src[1] or \
++     any(u.op not in {Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in value.toposort()): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _wip_try_native_small_int_power_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower a repeated int32 MUL tree through packed native DPU atoms."""
+   store = _store_node(sink)
+@@ -15083,6 +15103,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   #   return build_native_program_multi(sink, neutral_block_tasks)
+   if (product_tasks := _try_local_product_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, product_tasks)
++  if (int_power_tasks := _try_int_power_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, int_power_tasks)
+   # WIP: small official values pass, but native MUL corrupts the high word of
+   # 46340**2. Keep disabled until byte-limb multiplication is exact.
+   # if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
+-- 
+2.34.1
+
