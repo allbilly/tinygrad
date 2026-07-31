@@ -9325,6 +9325,58 @@ def _try_mod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
      any(int(u.src[0].arg) != total for u in params) or not 1 <= total <= 1 << 20: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_fmod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate the exact tensor/tensor or tensor/finite-scalar truncating remainder."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _reduce_node(sink) is not None: return None
+  value = store.src[1]
+  indexes:list[UOp] = []
+  if value.op is Ops.CMOD and value.dtype is dtypes.int and len(value.src) == 2:
+    numerator, denominator = _unwrap(value.src[0]), _unwrap(value.src[1])
+    if numerator.op is not Ops.INDEX or numerator.dtype is not dtypes.int: return None
+    indexes = [numerator]
+    if denominator.op is Ops.INDEX and denominator.dtype is dtypes.int: indexes.append(denominator)
+    elif denominator.op is not Ops.CONST or denominator.dtype is not dtypes.int or int(denominator.arg) == 0: return None
+  elif value.op is Ops.ADD and value.dtype is dtypes.half and len(value.src) == 2:
+    for numerator, negative in (value.src, value.src[::-1]):
+      if negative.op is not Ops.MUL or len(negative.src) != 2: continue
+      minus_one = next((u for u in negative.src if u.op is Ops.CONST and u.dtype is dtypes.half and float(u.arg) == -1.0), None)
+      product = next((u for u in negative.src if u is not minus_one), None)
+      if minus_one is None or product is None or product.op is not Ops.MUL or len(product.src) != 2: continue
+      truncated = next((u for u in product.src if u.op is Ops.TRUNC and len(u.src) == 1), None)
+      float_denominator = next((u for u in product.src if u is not truncated), None)
+      if truncated is None or float_denominator is None or truncated.src[0].op is not Ops.FDIV or \
+         truncated.src[0].src != (numerator, float_denominator): continue
+      indexes = [_unwrap(numerator), _unwrap(float_denominator)]
+      if any(u.op is not Ops.INDEX or u.dtype not in (dtypes.half, dtypes.int) for u in indexes): return None
+      break
+    if not indexes:
+      for numerator, negative in (value.src, value.src[::-1]):
+        if negative.op is not Ops.MUL or len(negative.src) != 2: continue
+        truncated = next((u for u in negative.src if u.op is Ops.TRUNC and len(u.src) == 1), None)
+        negative_divisor = next((u for u in negative.src if u is not truncated), None)
+        if truncated is None or negative_divisor is None or negative_divisor.op is not Ops.CONST or \
+           negative_divisor.dtype is not dtypes.half: continue
+        scaled = truncated.src[0]
+        if scaled.op is not Ops.MUL or len(scaled.src) != 2: continue
+        reciprocal = next((u for u in scaled.src if u.op is Ops.CONST and u.dtype is dtypes.half), None)
+        scaled_numerator = next((u for u in scaled.src if u is not reciprocal), None)
+        if reciprocal is None or scaled_numerator is not numerator or not all(
+            math.isfinite(x) and x != 0.0 for x in (float(reciprocal.arg), float(negative_divisor.arg))) or \
+           not math.isclose(float(reciprocal.arg)*float(negative_divisor.arg), -1.0, rel_tol=1e-12, abs_tol=1e-12): continue
+        indexes = [_unwrap(numerator)]
+        if indexes[0].op is not Ops.INDEX or indexes[0].dtype not in (dtypes.half, dtypes.int): return None
+        break
+    if not indexes: return None
+  else: return None
+  if any(u.src[0].op is not Ops.PARAM for u in indexes) or len(indexes) not in (1, 2): return None
+  if len(indexes) == 2 and (indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1]): return None
+  total = prod(_shape_of_store(sink))
+  if not 1 <= total <= 1 << 20 or any(int(u.src[0].src[0].arg) != total for u in indexes): return None
+  allowed = {Ops.ADD, Ops.MUL, Ops.FDIV, Ops.TRUNC, Ops.CMOD, Ops.CAST, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in value.toposort()): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_axis_arg_extrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve argmax/argmin's public axis coordinate instead of its flattened source address."""
   store = _store_node(sink)
@@ -14698,6 +14750,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (round_quantization_tasks := _try_round_quantization_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, round_quantization_tasks)
   if (mod_tasks := _try_mod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, mod_tasks)
+  if (fmod_tasks := _try_fmod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, fmod_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
