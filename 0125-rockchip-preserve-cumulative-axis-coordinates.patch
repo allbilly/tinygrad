@@ -1,0 +1,119 @@
+From 4099d23f3bb91714b251440b88caa75b8740409f Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 19:19:39 +0800
+Subject: [PATCH] rockchip: preserve cumulative axis coordinates
+
+---
+ test/rockchip/test_pr1.py            | 21 ++++++++++++++++++---
+ tinygrad/runtime/ops_rockchip.py     | 20 ++++++++++++--------
+ tinygrad/runtime/support/rockchip.py | 10 +++++++---
+ 3 files changed, 37 insertions(+), 14 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index ad952e4d7..504e1261e 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -349,9 +349,24 @@ class TestClassifier(unittest.TestCase):
+       index_subtasks = index_program.src[1].src[0].arg
+       self.assertEqual(len(index_subtasks), 1)
+       self.assertEqual(index_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
+-      self.assertEqual(index_subtasks[0].task.layout[4] == 10, kind == "min")
+-      mapping_offset = 5 if kind == "min" else 4
+-      self.assertEqual(index_subtasks[0].task.layout[mapping_offset+20:mapping_offset+25], (4, 3, 2, 1, 0))
++      self.assertEqual(index_subtasks[0].task.layout[4], 18 if kind == "min" else 14)
++      encoded = index_subtasks[0].task.layout[5+20:5+25]
++      self.assertEqual(tuple(value // 5 for value in encoded), (4, 3, 2, 1, 0))
++      self.assertEqual(tuple(value % 5 for value in encoded), (4, 3, 2, 1, 0))
++
++      matrix_source = Tensor.empty(5,6, dtype=dtypes.half, device="ROCKCHIP")
++      matrix_indices = (matrix_source.cummax(0) if kind == "max" else matrix_source.cummin(0))[1]
++      matrix_sinks = [early_simplify(call.src[0]) for call in matrix_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
++      matrix_program = build_native_program(matrix_sinks[-1])
++      self.assertIsNotNone(matrix_program)
++      matrix_subtasks = matrix_program.src[1].src[0].arg
++      self.assertEqual(len(matrix_subtasks), 1)
++      self.assertEqual(matrix_subtasks[0].task.layout[4], 18 if kind == "min" else 14)
++      encoded = matrix_subtasks[0].task.layout[5+120:5+125]
++      self.assertEqual(tuple(value // 30 for value in encoded), (4, 3, 2, 1, 0))
++      addresses = tuple(value % 30 for value in encoded)
++      self.assertEqual(tuple(addresses[i]-addresses[i+1] for i in range(4)), (6, 6, 6, 6))
++      self.assertEqual(len({address % 6 for address in addresses}), 1)
+ 
+       long_source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
+       long_indices = (long_source.cummax(0) if kind == "max" else long_source.cummin(0))[1]
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 1c7e6acaa..9ef64eec2 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -1288,7 +1288,8 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
+   total, tag, window, input_spatial, *payload = task.layout
+   dtype_marker = payload[0] if len(payload) == total*window+1 else 2
+   itemsize = 4 if dtype_marker in (4, 8) else 2
+-  negated = dtype_marker == 10
++  negated = dtype_marker in (10, 18)
++  cumulative = dtype_marker in (14, 18)
+   if window == 0:
+     assert tag == _HOST_ARGMAX_LAYOUT and total == input_spatial and dtype_marker in (2, 10) and len(relocs) == 2
+     output_buf, data_buf = (bufs[r.globals_slot] for r in relocs)
+@@ -1314,19 +1315,22 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
+     if itemsize == 4:
+       selected_value = None
+       for candidate in candidates:
+-        if candidate < 0 or candidate >= data.size: continue
+-        value = data[candidate]
++        address = candidate % data.size if cumulative and candidate >= 0 else candidate
++        if address < 0 or address >= data.size: continue
++        value = data[address]
+         if np.isnan(value):
+-          selected = candidate % input_spatial
++          selected = candidate // data.size if cumulative else address % input_spatial
+           break
+         if selected_value is None or value > selected_value:
+-          selected_value, selected = value, candidate % input_spatial
++          selected_value = value
++          selected = candidate // data.size if cumulative else address % input_spatial
+     else:
+       for candidate in candidates:
+-        if candidate < 0 or candidate >= data.size: continue
+-        value = -data[candidate] if negated else data[candidate]
++        address = candidate % data.size if cumulative and candidate >= 0 else candidate
++        if address < 0 or address >= data.size: continue
++        value = -data[address] if negated else data[address]
+         if value == maximum[out_index] or (np.isnan(value) and np.isnan(maximum[out_index])):
+-          selected = candidate % input_spatial
++          selected = candidate // data.size if cumulative else address % input_spatial
+           break
+     output[out_index] = selected
+   ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 2540f9e4b..4b134ab79 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11935,7 +11935,10 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+         # candidates beyond the current reduction-axis coordinate.
+         # if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
+         if source_index is not Invalid and (not cumulative_index or reduce_linear <= out_index % window):
+-          mapping[out_index*window+reduce_linear] = int(source_index)
++          address = int(source_index)
++          # Cumulative extrema return the reduction-axis coordinate, not the
++          # flattened source address. Pack both into one signed-layout word.
++          mapping[out_index*window+reduce_linear] = reduce_linear*input_total+address if cumulative_index else address
+   except (TypeError, ValueError, OverflowError, ZeroDivisionError): return None
+ 
+   info = ProgramInfo.from_sink(sink)
+@@ -11950,9 +11953,10 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     host_mapping = [
+       address for output in range(total)
+       for address in sorted(mapping[output*window:(output+1)*window],
+-                            key=lambda value: (value < 0, -(value % input_spatial) if cumulative_index and value >= 0
++                            key=lambda value: (value < 0, -(value // input_total) if cumulative_index and value >= 0
+                                                else value % input_spatial if value >= 0 else 0))]
+-    dtype_marker = (10,) if negated_data and data.dtype is dtypes.half else (8,) if data.dtype is dtypes.int else ()
++    dtype_marker = (18,) if cumulative_index and negated_data else (14,) if cumulative_index else \
++      (10,) if negated_data and data.dtype is dtypes.half else (8,) if data.dtype is dtypes.int else ()
+     layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *dtype_marker, *host_mapping)
+     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))
+-- 
+2.34.1
+

@@ -3243,3 +3243,20 @@ exercise the fp16 backend.
 Contract remains **173/173 in 10.31s**. Adapter Ruff and
 `git diff --check` pass. No backend or LUT changed. Next: one complete
 forward-only inventory sweep.
+
+### Multidimensional cumulative returned indices
+
+The first complete sweep exposed 2D `cummax`/`cummin` indices as flattened
+source addresses instead of reduction-axis coordinates. Commit
+`4099d23f3`; saved patch
+`0125-rockchip-preserve-cumulative-axis-coordinates.patch`.
+
+Cumulative candidate layout words now pack both the known reduction
+coordinate and source address. Typed runtime markers decode the address for
+comparison and return the coordinate; max-pool spatial-index semantics are
+unchanged. Full multidimensional cummax/cummin pass **2/2 in 31.52s**.
+
+Contract remains **173/173 in 10.08s**; mypy and touched-file Ruff remain
+at their 12- and 9-finding baselines. The stopped full sweep had reached
+**89 passed, 4 skipped, and 91 passed subtests in 652.13s**. No LUT changed.
+Next: rerun the complete inventory.

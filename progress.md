@@ -11983,3 +11983,47 @@ Pre-edit recovery copies:
 
 Next action: run the complete forward-only `TestOps` inventory in one
 process-wide sweep and fix any remaining cross-group failures.
+
+## 2026-07-31 — multidimensional cumulative-index milestone
+
+The first complete-sweep attempt reached 15% before exposing deterministic
+2D `cummax`/`cummin` returned-index failures. Implementation commit:
+`4099d23f3`; portable patch:
+`0125-rockchip-preserve-cumulative-axis-coordinates.patch`.
+
+The cumulative index classifier serialized only each candidate's flattened
+source address. Its runtime therefore returned `row*6+column` for
+`(5,6), axis=0`, while the public contract requires the reduction-axis
+coordinate. The compiler already tracked `reduce_linear`; cumulative
+candidates now pack both coordinate and source address into one signed
+32-bit layout word. Explicit cumulative-max/min markers let the runtime
+decode the address for value comparison and the coordinate for output.
+Ordinary max-pool continues to serialize and return spatial addresses.
+
+The full multidimensional `test_cummax` and `test_cummin` methods now pass
+together **2/2 in 31.52s**, covering scalar, `(5,)`, both `(5,6)` axes, and
+last-axis `(5,6,7)` values and indices. The classifier contract covers the
+axis-0 stride-6 address/coordinate invariant.
+
+Validation:
+
+- focused hardware cumulative methods: **2/2 in 31.52s**;
+- hardware-free Rockchip remains **173/173 in 10.08s**;
+- mypy remains at the exact 12-error baseline;
+- touched-file Ruff remains at the exact nine pre-existing findings;
+- `git diff --check` passes.
+
+The interrupted complete sweep had **89 passed, 4 skipped, and 91 passing
+subtests in 652.13s** before these two failures; it was intentionally
+stopped once their complete traces were available. No LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-191720`,
+`/tmp/ops_rockchip.py.20260731-191720`,
+`/tmp/test_pr1.py.20260731-191720`,
+`/tmp/test_pr1.py.20260731-191909`,
+`/tmp/progress.md.20260731-191944`, and
+`/tmp/test_ops_status.md.20260731-191944`.
+
+Next action: restart the complete uninterrupted forward-only inventory and
+fix the next failure group, if any.
