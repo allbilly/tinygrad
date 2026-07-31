@@ -10612,3 +10612,29 @@ backend patch.
 Hardware-free Rockchip remains **155/155 in 9.14s** and the adapter passes
 Ruff. No backend code, runtime tag, LUT, or two-level LUT changed. Next
 reproducible forward candidate: `TestOps.test_ceil`.
+
+## 2026-07-31 — floor/ceil milestone
+
+`TestOps.test_floor` and `TestOps.test_ceil` now pass all unchanged scalar,
+random `(45,35)`, and explicit boundary-value cases. The neighboring
+trunc/floor/ceil/round family passes **4/4 in 15.49s**. Implementation
+commit: `5619ceff8`; portable patch:
+`0092-rockchip-pass-floor-ceil.patch`.
+
+Both failures were exact one-unit selection errors. Ceil lowered to
+`WHERE(TRUNC(x) < x, TRUNC(x)+1, TRUNC(x))`, but the native WHERE path
+returned truncation for positive fractions. Floor lowered symmetrically to
+`WHERE(x < TRUNC(x), TRUNC(x)-1, TRUNC(x))` and returned truncation for
+negative fractions. Roughly half of each random tensor was therefore wrong.
+
+A narrow classifier accepts only these two direct fp16 graphs: one input and
+same-size output, no reduction, `TRUNC`, the correctly ordered `CMPLT`,
+an increment of exactly `+1` or `-1`, static size bounded by `2**20`, and
+shared source/truncation nodes. It serializes the graph through the typed
+evaluator. General WHERE lowering, truncation, and round-to-even are
+unchanged.
+
+Hardware-free Rockchip is **156/156 in 10.24s**. Mypy remains at the exact
+12-error baseline and touched-file Ruff at the exact nine pre-existing
+findings. No LUT or two-level LUT changed. Next: retest the remaining
+non-gradient failures from the partial tally, starting with argmin.

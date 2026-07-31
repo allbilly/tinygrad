@@ -1,0 +1,72 @@
+From 5619ceff89026614e5e119349406037ee15dc510 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 13:17:30 +0800
+Subject: [PATCH] rockchip: pass floor and ceil
+
+---
+ test/rockchip/test_pr1.py            | 10 ++++++++++
+ tinygrad/runtime/support/rockchip.py | 20 ++++++++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index bc94123c2..cdacec52e 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -859,6 +859,16 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(len(subtasks), 1)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp16_floor_ceil_use_typed_host_where(self):
++    for expression in (Tensor.empty(4, dtype=dtypes.half, device="ROCKCHIP").floor(),
++                       Tensor.empty(4, dtype=dtypes.half, device="ROCKCHIP").ceil()):
++      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b2e6a4839..e6f48e0db 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9257,6 +9257,24 @@ def _try_fp32_sin_cos_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+      int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_floor_ceil_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate exact fp16 floor/ceil expansions when native WHERE reverses their predicates."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half or _reduce_node(sink) is not None: return None
++  value = _unwrap(store.src[1])
++  if value.op is not Ops.WHERE or len(value.src) != 3: return None
++  condition, incremented, truncated = value.src
++  if truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or \
++     incremented.op is not Ops.ADD or len(incremented.src) != 2: return None
++  delta = next((float(x.arg) for x in incremented.src if x.op is Ops.CONST), None)
++  if delta not in (-1.0, 1.0) or not any(x is truncated for x in incremented.src): return None
++  source = _unwrap(truncated.src[0])
++  if condition.src != ((truncated, source) if delta == 1.0 else (source, truncated)): return None
++  total = prod(_shape_of_store(sink))
++  if source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM or \
++     int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
+   store = _store_node(sink)
+@@ -14594,6 +14612,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
+   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
+   if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
++  if (floor_ceil_tasks := _try_floor_ceil_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, floor_ceil_tasks)
+   if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
+   if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
+   if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
+-- 
+2.34.1
+

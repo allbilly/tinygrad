@@ -2641,3 +2641,17 @@ as an NPU error; explicit integer cases retain their requested dtypes.
 
 Contract remains **155/155 in 9.14s** and the adapter passes Ruff. No LUT or
 backend code changed. Next candidate: `test_ceil`.
+
+### Floor and ceil
+
+The trunc/floor/ceil/round family passes **4/4 in 15.49s**, including every
+unchanged scalar, random tensor, explicit-value, and round-even assertion.
+Commit `5619ceff8`; saved patch `0092-rockchip-pass-floor-ceil.patch`.
+
+Native WHERE selected truncation for the fractional branch of both canonical
+graphs. A strict typed matcher now recognizes only the mirrored fp16 forms
+with exact `+1`/`-1` increments, direct same-size storage, no reduction, and
+a `2**20` bound. General WHERE and round paths are unchanged.
+
+Contract: **156/156 in 10.24s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. No LUT changed. Next candidate: `test_argmin`.
