@@ -6795,56 +6795,67 @@ def _try_comparison_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(out_slot, result, (_ZERO_SLOT, 0), Ops.ADD, bool_output=True)
   return tuple(tasks)
 
+class _SpecialStages:
+  """Shared scratch-task builder for LUT lowerers that repair IEEE special values."""
+  def __init__(self, sink:UOp, store:UOp, source:UOp):
+    info = ProgramInfo.from_sink(sink)
+    self.sink, self.store, self.source = sink, store, source
+    self.total, self.out = prod(_shape_of_store(sink)), info.outs[0]
+    self.next_slot = max(info.globals, default=-1) + 1
+    self.tasks:list[RKSubTask] = []
+
+  def alloc(self) -> int:
+    ret, self.next_slot = self.next_slot, self.next_slot + 1
+    return ret
+
+  def temp_index(self, slot:int, dtype=dtypes.half) -> UOp:
+    out_idx = self.store.src[0]
+    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+
+  def stage_sink(self, stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+    return self.sink.substitute({self.store:self.store.replace(src=(self.temp_index(out_slot, dtype), stage_val))})
+
+  def dependent(self, out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
+    # Repeat the first read of each freshly materialized value. Comparison and
+    # LUT programs run as reset-separated stages and otherwise expose stale lanes.
+    self.tasks.append(_emit_where_stage(self.total, self.alloc(), lhs, rhs, op))
+    self.tasks.append(_emit_where_stage(self.total, out_slot, lhs, rhs, op))
+
+  def comparison_mask(self, expr:UOp) -> tuple[int,int]|None:
+    mask_slot = self.alloc()
+    cmp_tasks = _try_comparison_subtasks(self.stage_sink(expr, mask_slot, dtypes.bool))
+    if cmp_tasks is None: return None
+    # Intermediate masks stay as fp16 0/1 scratch. Only a user-visible boolean
+    # output should be packed to the byte-wide bool representation.
+    last = cmp_tasks[-1]
+    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), self.source)
+    self.tasks.extend(cmp_tasks)
+    used_slots = [st.task.out_slot for st in cmp_tasks] + \
+      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+    self.next_slot = max(self.next_slot, max(used_slots, default=-1) + 1)
+    return (mask_slot, 0)
+
+  def emit_lut(self, val:UOp, out_slot:int) -> bool:
+    plan = plan_rk(self.stage_sink(val, out_slot))
+    if isinstance(plan, str) or plan.kind != "dpu_lut": return False
+    cmds, task, relocs = emit_rk(plan)
+    self.tasks.append(RKSubTask(cmds, task, relocs))
+    return True
+
 def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve IEEE EXP2 results for infinities and NaN around the bounded LUT."""
   store = _store_node(sink)
   if store is None or _reduce_node(sink) is not None: return None
   val = _unwrap(store.src[1])
   if val.op is not Ops.EXP2 or len(val.src) != 1 or (source := _unwrap(val.src[0])).op is not Ops.INDEX: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
+  stages = _SpecialStages(sink, store, source)
+  out, tasks = stages.out, stages.tasks
+  alloc, dependent, comparison_mask = stages.alloc, stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    # Repeat the first read of each freshly materialized value. Comparison and
-    # LUT programs run as reset-separated stages and otherwise expose stale lanes.
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    # Intermediate masks stay as fp16 0/1 scratch. Only a user-visible boolean
-    # output should be packed to the byte-wide bool representation.
-    last = cmp_tasks[-1]
-    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
-    tasks.extend(cmp_tasks)
-    used_slots = [st.task.out_slot for st in cmp_tasks] + \
-      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return (mask_slot, 0)
 
   # First materialize the normal bounded-domain LUT result.
   lut_slot = alloc()
-  lut_plan = plan_rk(stage_sink(val, lut_slot))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(val, lut_slot): return None
 
   # Comparison inputs are normalized from infinities to the fp16 extrema by
   # the runtime. Values beyond these thresholds already overflow/underflow
@@ -6881,39 +6892,11 @@ def _try_exp_correction_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if inner.op is not Ops.MUL: return None
   source = next((_unwrap(x) for x in inner.src if _unwrap(x).op is Ops.INDEX), None)
   if source is None or source.dtype not in (dtypes.half, dtypes.float): return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
+  stages = _SpecialStages(sink, store, source)
+  out, total, tasks = stages.out, stages.total, stages.tasks
+  alloc, temp_index, stage_sink = stages.alloc, stages.temp_index, stages.stage_sink
+  dependent, comparison_mask = stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    last = cmp_tasks[-1]
-    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
-    tasks.extend(cmp_tasks)
-    used_slots = [st.task.out_slot for st in cmp_tasks] + \
-      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return (mask_slot, 0)
 
   exp_slot, shifted_slot, correction_input, correction_slot = alloc(), alloc(), alloc(), alloc()
   exp_plan = plan_rk(stage_sink(val, exp_slot))
@@ -6973,52 +6956,17 @@ def _try_sigmoid_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if _try_sigmoid(val) is None: return None
   indexes = [u for u in val.toposort() if u.op is Ops.INDEX]
   if len(indexes) != 1 or (source := _unwrap(indexes[0])).dtype is not dtypes.half: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
+  stages = _SpecialStages(sink, store, source)
+  out, total, tasks = stages.out, stages.total, stages.tasks
+  alloc, dependent, comparison_mask = stages.alloc, stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
 
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    last = cmp_tasks[-1]
-    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
-    tasks.extend(cmp_tasks)
-    used_slots = [st.task.out_slot for st in cmp_tasks] + \
-      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return (mask_slot, 0)
-
   lut_slot = alloc()
-  lut_plan = plan_rk(stage_sink(val, lut_slot))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(val, lut_slot): return None
 
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_sigmoid_local")
-  local_plan = plan_rk(stage_sink(local_val, local_slot))
-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(local_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(local_val, local_slot): return None
   local_low = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, UOp.const(dtypes.half, -2.0))))
   local_high = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 2.0), source)))
   if local_low is None or local_high is None: return None
@@ -7060,42 +7008,14 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     elif rhs.op is Ops.CONST and lhs.op is Ops.LOG2: output_scale, log2_val = float(rhs.arg), lhs
     else: return None
   if log2_val.op is not Ops.LOG2 or len(log2_val.src) != 1 or (source := _unwrap(log2_val.src[0])).op is not Ops.INDEX: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
+  stages = _SpecialStages(sink, store, source)
+  out, total, tasks = stages.out, stages.total, stages.tasks
+  alloc, temp_index = stages.alloc, stages.temp_index
+  dependent, comparison_mask = stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
 
   def scalar(value:float) -> tuple[int,int]:
     return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    last = cmp_tasks[-1]
-    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
-    tasks.extend(cmp_tasks)
-    used_slots = [st.task.out_slot for st in cmp_tasks] + \
-      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return (mask_slot, 0)
 
   source_arg = (source.src[0].buf_uop.arg.slot, 0)
   source_fp32 = (source_arg[0],) if source.dtype is dtypes.float else ()
@@ -7134,20 +7054,14 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   normalized_log2 = UOp(Ops.LOG2, dtypes.half, (temp_index(bounded),))
   normalized_val = normalized_log2 if output_scale == 1.0 else \
     UOp(Ops.MUL, dtypes.half, (normalized_log2, UOp.const(dtypes.half, output_scale)))
-  lut_plan = plan_rk(stage_sink(normalized_val, lut_slot))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(normalized_val, lut_slot): return None
 
   centered, zoomed = alloc(), alloc()
   tasks.extend((_emit_where_stage(total, centered, (bounded, 0), one, Ops.SUB),
                 _emit_where_stage(total, zoomed, (centered, 0), scalar(12.5), Ops.MUL)))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_log2_local", output_scale))
-  local_plan = plan_rk(stage_sink(local_val, local_slot))
-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(local_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(local_val, local_slot): return None
   local_scaled_scratch, local_scaled = alloc(), alloc()
   tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.25), Ops.MUL),
                 _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.25), Ops.MUL)))
@@ -7206,20 +7120,14 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     dependent(low_input, (low_centered, 0), scalar(16.0), Ops.MUL)
     low_lut = alloc()
     low_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(low_input),), arg="rk_log_half_low")
-    low_plan = plan_rk(stage_sink(low_val, low_lut))
-    if isinstance(low_plan, str) or low_plan.kind != "dpu_lut": return None
-    cmds, task, relocs = emit_rk(low_plan)
-    tasks.append(RKSubTask(cmds, task, relocs))
+    if not stages.emit_lut(low_val, low_lut): return None
 
     high_centered, high_input = alloc(), alloc()
     dependent(high_centered, (bounded, 0), scalar(0.75), Ops.SUB)
     dependent(high_input, (high_centered, 0), scalar(8.0), Ops.MUL)
     high_lut = alloc()
     high_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(high_input),), arg="rk_log_half_high")
-    high_plan = plan_rk(stage_sink(high_val, high_lut))
-    if isinstance(high_plan, str) or high_plan.kind != "dpu_lut": return None
-    cmds, task, relocs = emit_rk(high_plan)
-    tasks.append(RKSubTask(cmds, task, relocs))
+    if not stages.emit_lut(high_val, high_lut): return None
 
     below = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (temp_index(bounded), UOp.const(dtypes.half, 0.2498779296875))))
     above = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.99951171875), temp_index(bounded))))
@@ -7287,48 +7195,16 @@ def _try_sqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if store is None or _reduce_node(sink) is not None: return None
   val = _unwrap(store.src[1])
   if val.op is not Ops.SQRT or len(val.src) != 1 or (source := _unwrap(val.src[0])).op is not Ops.INDEX: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
+  stages = _SpecialStages(sink, store, source)
+  out, tasks = stages.out, stages.tasks
+  alloc, dependent, comparison_mask = stages.alloc, stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
   half = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 0.5))[0])
   zero = UOp.const(dtypes.half, 0.0)
   source_arg = (source.src[0].buf_uop.arg.slot, 0)
 
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    last = cmp_tasks[-1]
-    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
-    tasks.extend(cmp_tasks)
-    used_slots = [st.task.out_slot for st in cmp_tasks] + \
-      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return (mask_slot, 0)
-
   lut_slot = alloc()
-  lut_plan = plan_rk(stage_sink(val, lut_slot))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(val, lut_slot): return None
 
   # Three Newton steps remove the linear LUT's curvature error near zero:
   # yₙ₊₁ = (yₙ + x/yₙ) / 2. Special values are repaired by the masks below.
@@ -7372,41 +7248,12 @@ def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if val.op is not Ops.RECIPROCAL or len(val.src) != 1: return None
   sqrt = _unwrap(val.src[0])
   if sqrt.op is not Ops.SQRT or len(sqrt.src) != 1 or (source := _unwrap(sqrt.src[0])).op is not Ops.INDEX: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
-  tasks:list[RKSubTask] = []
+  stages = _SpecialStages(sink, store, source)
+  out, tasks = stages.out, stages.tasks
+  alloc, temp_index = stages.alloc, stages.temp_index
+  dependent, comparison_mask = stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
   zero = UOp.const(dtypes.half, 0.0)
-  out_idx = store.src[0]
-
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-
-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
-
-  def stage_sink(stage_val:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_val))})
-
-  def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
-    tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
-    tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
-
-  def comparison_mask(expr:UOp) -> tuple[int,int]|None:
-    nonlocal next_slot
-    mask_slot = alloc()
-    cmp_tasks = _try_comparison_subtasks(stage_sink(expr, mask_slot, dtypes.bool))
-    if cmp_tasks is None: return None
-    last = cmp_tasks[-1]
-    cmp_tasks = _fix_cmp_fp32((*cmp_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs)), source)
-    tasks.extend(cmp_tasks)
-    used_slots = [st.task.out_slot for st in cmp_tasks] + \
-      [r.globals_slot for st in cmp_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
-    next_slot = max(next_slot, max(used_slots, default=-1) + 1)
-    return (mask_slot, 0)
-
   hi = UOp.const(dtypes.half, 65472.0)
   positive = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
   negative = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (source, zero)))
@@ -7443,10 +7290,7 @@ def _try_rsqrt_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   scaled_source = temp_index(scaled_2)
   scaled_val = val.substitute({source:scaled_source})
   lut_slot = alloc()
-  lut_plan = plan_rk(stage_sink(scaled_val, lut_slot))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
+  if not stages.emit_lut(scaled_val, lut_slot): return None
 
   # One inverse-square-root Newton step removes residual linear interpolation
   # error. Clamp the refinement input at four so +inf stays a finite zero case.
