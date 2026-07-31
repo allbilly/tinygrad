@@ -73,6 +73,19 @@ class TestDPUCompiler(unittest.TestCase):
   def test_exp2_uses_generated_lut(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_EXP2)}h", *rklut.RK_LUT_EXP2)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_EXP2_SHA256)
+    errors = []
+    for bits in range(1 << 16):
+      x = struct.unpack("<e", struct.pack("<H", bits))[0]
+      if not -2 <= x <= 2: continue
+      position, base = ((x+2)*256, 0) if x < 0 else (x*256, rklut.RK_LUT_EXP2_ENTRIES)
+      index = min(511, max(0, int(position//1)))
+      got = struct.unpack("<e", struct.pack("<e", ((1-(position-index))*rklut.RK_LUT_EXP2[base+index] +
+        (position-index)*rklut.RK_LUT_EXP2[base+index+1]) / 8192))[0]
+      reference = 2**x
+      errors.append((abs(got-reference), abs(got-reference)/reference))
+    self.assertEqual(len(errors), rklut.RK_LUT_EXP2_VERIFIED_INPUTS)
+    self.assertEqual(max(x[0] for x in errors), rklut.RK_LUT_EXP2_SIM_MAX_ABS_ERROR)
+    self.assertEqual(max(x[1] for x in errors), rklut.RK_LUT_EXP2_SIM_MAX_REL_ERROR)
     plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).exp2()))
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertFalse(contains_uop(plan))
