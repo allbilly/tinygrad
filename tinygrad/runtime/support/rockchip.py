@@ -6502,18 +6502,22 @@ def _try_isclose_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   value = _unwrap(store.src[1])
   nodes = value.toposort()
   if value.op is not Ops.OR: return None
-  float_constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float]
-  if not any(math.isinf(x) and x > 0 for x in float_constants) or \
-     not any(math.isinf(x) and x < 0 for x in float_constants): return None
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.dtype in (dtypes.half, dtypes.float)]
+  input_dtypes = {u.dtype for u in indexes}
+  if len(input_dtypes) != 1: return None
+  data_dtype = next(iter(input_dtypes))
+  data_constants = [float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is data_dtype]
+  if not any(math.isinf(x) and x > 0 for x in data_constants) or \
+     not any(math.isinf(x) and x < 0 for x in data_constants): return None
   # isclose contains isnan(x) as x!=x and abs(other) as a float WHERE whose
   # sign branches include -1 and +1. Require both so ordinary composite
   # comparisons cannot enter this host path.
-  has_nan_check = any(u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0] is u.src[1] and u.src[0].dtype is dtypes.float for u in nodes)
-  has_abs_sign = any(u.op is Ops.WHERE and u.dtype is dtypes.float and
+  has_nan_check = any(u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0] is u.src[1] and u.src[0].dtype is data_dtype for u in nodes)
+  has_abs_sign = any(u.op is Ops.WHERE and u.dtype is data_dtype and
                      {-1.0, 1.0}.issubset({float(x.arg) for x in u.src[1:] if x.op is Ops.CONST}) for u in nodes)
   # A scalar `other` folds rtol*abs(other)+atol to one constant (1.001e-5
   # for other=1), while tensor/tensor keeps the small constant in a MUL.
-  has_tolerance = any(math.isfinite(x) and 0.0 < abs(x) <= 0.011 for x in float_constants)
+  has_tolerance = any(math.isfinite(x) and 0.0 < abs(x) <= 0.011 for x in data_constants)
   if not has_nan_check or not has_abs_sign or not has_tolerance: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 

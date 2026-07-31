@@ -42,7 +42,7 @@ def pytest_runtest_call(item):
     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
     "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
-    "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
+    "test_isclose", "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
     "test_scatter_reduce_prod_zeros", "test_stack")
   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
   if not needs_fp32_reference and not torch_only_fp32_reference:

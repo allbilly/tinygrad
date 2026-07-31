@@ -1588,6 +1588,14 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertTrue(subtasks[0].task.is_copy)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    a_half = Tensor.empty(8, dtype=dtypes.half, device="ROCKCHIP")
+    b_half = Tensor.empty(8, dtype=dtypes.half, device="ROCKCHIP")
+    for expression in (a_half.isclose(b_half), a_half.isclose(1.0, equal_nan=True)):
+      half_program = build_native_program(_get_sink(expression))
+      half_subtasks = half_program.src[1].src[0].arg
+      self.assertEqual(len(half_subtasks), 1)
+      self.assertTrue(half_subtasks[0].task.is_copy)
+      self.assertEqual(half_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
   def test_k_tiled_dot_produces_binary(self):
     a = Tensor.rand(5000,dtype=dtypes.half).realize()
