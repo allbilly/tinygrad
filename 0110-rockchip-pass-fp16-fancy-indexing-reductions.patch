@@ -1,0 +1,54 @@
+From 2feeb9252ca899354abdb80b624ae1a795c49858 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 16:01:38 +0800
+Subject: [PATCH] rockchip: pass fp16 fancy indexing reductions
+
+---
+ test/rockchip/test_pr1.py            | 7 +++++++
+ tinygrad/runtime/support/rockchip.py | 6 +++---
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index b33718f7b..062dcbd0b 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -458,6 +458,13 @@ class TestClassifier(unittest.TestCase):
+     injected_program = build_native_program(injected_sink)
+     self.assertIsNotNone(injected_program)
+     self.assertEqual(injected_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++    x_half = Tensor.empty(2,5,6,5,3,4, dtype=dtypes.half, device="ROCKCHIP")
++    for expression in (x_half[indices[0], ..., indices[-1]],
++                       x_half[indices[0], indices[1], None, indices[3], indices[4]]):
++      half_sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++      half_program = build_native_program(half_sink)
++      self.assertIsNotNone(half_program)
++      self.assertEqual(half_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+ 
+   def test_scatter_uses_typed_update_selection(self):
+     for shape in ((4,5,6), (3,4,5)):
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 8eb55353d..ec54521d9 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9860,15 +9860,15 @@ def _try_fancy_index_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
+   """Unroll only bounded masked ADD reductions fused into multi-index gathers."""
+   store = _store_node(sink)
+   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+-  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or len(reductions) != 1: return None
+   reduce = reductions[0]
+-  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or not reduce.src[1:] or \
++  if reduce.dtype is not store.src[0].dtype or reduce.arg[0] is not Ops.ADD or not reduce.src[1:] or \
+      any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]): return None
+   extents = [int(axis.src[0].arg) for axis in reduce.src[1:]]
+   if prod(extents) > 512: return None
+   inputs = [u for u in reduce.src[0].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+   input_dtypes = {u.dtype for u in inputs}
+-  if dtypes.float not in input_dtypes or dtypes.int not in input_dtypes or \
++  if store.src[0].dtype not in input_dtypes or dtypes.int not in input_dtypes or \
+      len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) < 2: return None
+   if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
+ 
+-- 
+2.34.1
+

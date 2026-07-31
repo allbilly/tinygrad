@@ -11309,3 +11309,40 @@ Pre-edit recovery copies:
 
 Next action: continue the ordered forward-only inventory with matvec,
 NaN/Inf selection, and fancy indexing.
+
+## 2026-07-31 — fp16 fancy-index reduction milestone
+
+The complete fancy-indexing subgroup passes **9/9 in 216.87s**.
+Implementation commit: `2feeb9252`; portable patch:
+`0110-rockchip-pass-fp16-fancy-indexing-reductions.patch`.
+
+Five methods already passed. Four methods rejected `Ops.WHERE` only when
+ellipsis, injected `None`, or tuple layouts made tinygrad express the
+multi-index gather as a masked ADD reduction. Schedule enumeration showed
+that every rejected graph had one static fp16 ADD reduction, at least two
+int index inputs, the existing WHERE/CMPLT/CMPNE signature, and no more
+than 512 candidates.
+
+The existing typed fancy-index reduction boundary and runtime already
+supported fp16 values and output. Its classifier alone required fp32.
+That gate now accepts fp16 or fp32 only when the reduction dtype equals the
+output/source dtype; all previous static-axis, op-signature, multi-index,
+and candidate bounds remain. Hardware checks passed the first formerly
+failing method in **58.50s** and the other three in **147.26s** before the
+full subgroup regression.
+
+Validation: hardware-free Rockchip remains **167/167 in 10.59s**, with new
+fp16 ellipsis and injected-dimension classifier coverage; mypy remains at
+the exact 12-error baseline; touched-file Ruff remains at the exact nine
+pre-existing findings; and `git diff --check` passes. No LUT, LUT tuning,
+or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-155254`,
+`/tmp/test_pr1.py.20260731-155254`,
+`/tmp/progress.md.20260731-160138`, and
+`/tmp/test_ops_status.md.20260731-160138`.
+
+Inventory note: the preceding matvec/NaN/Inf block passed **4/4** with one
+intentional skip in **13.63s**. Next action: continue with gather, scatter,
+and scatter-add as milestone 111.

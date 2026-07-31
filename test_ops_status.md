@@ -2968,3 +2968,20 @@ for only this method.
 Contract remains **167/167 in 9.96s**. Mypy stays at the exact 12-error
 baseline, adapter Ruff is clean, and no LUT or two-level LUT changed. Next:
 matvec and NaN/Inf indexing.
+
+### FP16 fancy-index reductions
+
+All nine fancy-indexing methods pass in **216.87s**. Commit `2feeb9252`;
+saved patch `0110-rockchip-pass-fp16-fancy-indexing-reductions.patch`.
+
+Four methods previously rejected `Ops.WHERE` when ellipsis, injected
+dimensions, or tuple layouts lowered a gather to one masked ADD reduction.
+The bounded typed reduction path already supported fp16 at serialization
+and runtime; its classifier now admits fp16 alongside fp32 while retaining
+same-dtype source/output, at least two int index buffers, static axes, the
+WHERE/CMPLT/CMPNE signature, and the 512-candidate bound.
+
+Contract remains **167/167 in 10.59s**, now with fp16 reduced-gather PR1
+coverage. Mypy stays at the exact 12-error baseline and touched-file Ruff at
+nine pre-existing findings. No LUT or two-level LUT changed. Next: gather
+and scatter.
