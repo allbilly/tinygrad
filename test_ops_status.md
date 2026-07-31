@@ -3319,3 +3319,19 @@ skips, and 126 subtests in 2373.12s (39:33)** with zero failures. PR1 remains
 Ruff has only eight pre-existing support-file findings. See
 `rockchip_size.md` for the line-category audit and external LUT compiler
 design. Saved implementation patches are `0127`, `0128`, and `0129`.
+
+### Declarative constant-base power graphs
+
+Commit `8ce4640b3`; saved patch
+`0137-rockchip-compile-constant-base-powers-from-graph-spe.patch`.
+
+One regional-LUT graph compiler now lowers `5.5**x`, `8**x`, `0.7**x`, and
+`2**x` from explicit descriptors while retaining their strict recognizers,
+fallback domains, decode scales, task order, and the integer-exponent 0.7 host
+case. This removes 182 counted support-file lines, reaching **12,465**.
+
+The hardware-free contract passes **173/173 in 13.04s**. Focused serialized
+RK3588 testing passes **4/4 in 12.48s**: base 5.5, four-region base 8, shifted
+base 0.7, and negative-base-2 parity (which exercises the shared positive
+base-2 magnitude graph). Mypy and touched-file Ruff remain at the exact 12-
+and 8-finding baselines; compilation and `git diff --check` pass.

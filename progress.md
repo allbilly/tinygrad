@@ -12192,3 +12192,40 @@ Pre-edit recovery copies include `/tmp/rockchip.py.20260801-001401` through
 Next lowering target: replace the 51 hand-written monotonic scratch-slot
 allocators in safe batches, keeping the nested-stage allocators that advance
 past relocation slots explicit until their task-list invariants are captured.
+
+## 2026-08-01 — declarative power graph lowering
+
+The first `_TaskGraph` batches replace per-operation scratch allocators with a
+single reset-separated graph builder. Commits `2a5ee353a` and `0c59e01bb`
+migrate the positive and reciprocal tensor-power LUT graphs; commit
+`8ce4640b3` compiles four constant-base power families from regional
+descriptors. Saved patches are `0135`, `0136`, and `0137`.
+
+The constant-base compiler centralizes fallback LUT emission, optional input
+shift, one/four regional LUT tasks, decode scaling, threshold masks, balanced
+selection, finite-interval guards, and debug taps. Recognition remains in the
+operation-specific front ends, and the integer `0.7**x` host path remains
+explicit. Task ordering is preserved, including base-8's mask-before-decode
+sequence and duplicate dependency writes required after reset-separated NPU
+tasks.
+
+Current `sz.py` size is **12,465 counted lines** in
+`support/rockchip.py`, down 303 lines from the 12,768 reusable-lowering
+baseline and down 957 from the pre-compaction 13,422 support-file baseline.
+The two-file Rockchip runtime is down 1,146 counted lines overall.
+The constant-base batch alone removes **182 counted lines** (12,647 to
+12,465) and 215 physical lines.
+
+Validation for the constant-base milestone:
+
+- hardware-free PR1 contract: **173/173 in 13.04s**;
+- RK3588 hardware descriptors: **4/4 in 12.48s** (`5.5**x`, `8**x`,
+  `0.7**x`, and the base-2 magnitude used by `(-2)**x`);
+- Python compilation and `git diff --check` pass;
+- mypy remains at the exact 12-error baseline and touched-file Ruff at the
+  exact eight-finding baseline.
+
+Next lowering targets are negative constant-base parity, zero-base power, and
+fractional/tensor power graphs, followed by activation families. The `<5000`
+goal requires migrating whole graph families; allocator cleanup alone is not
+large enough.
