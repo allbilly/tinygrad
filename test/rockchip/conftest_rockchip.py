@@ -1,12 +1,13 @@
 """Environment setup for running test_ops.py on ROCKCHIP.
 
 Sets DEFAULT_FLOAT=half (NPU's primary dtype) and torch default to fp16 for
-fair comparison. The 3x3 bitcast and CPU avg_pool3d references are
-temporarily run as fp32: PyTorch cannot reinterpret an odd-width fp16 row as
-int32 and does not implement CPU fp16 avg_pool3d. PyTorch's architecture-
-specific fused SDPA kernel is disabled so attention is compared with its
-portable MATH implementation. Unsupported ops raise RuntimeError
-(RKPLAN_REJECT:...) and fail the test honestly.
+fair comparison. The 3x3 bitcast, CPU avg_pool3d, and cosine reference are
+temporarily run as fp32: PyTorch cannot reinterpret an odd-width fp16 row,
+does not implement CPU fp16 avg_pool3d, and the cosine test compares a
+default-float Torch constant with an integer-promoted tinygrad constant.
+PyTorch's architecture-specific fused SDPA kernel is disabled so attention
+is compared with its portable MATH implementation. Unsupported ops raise
+RuntimeError(RKPLAN_REJECT:...) and fail the test honestly.
 
 PR1 is an inference/forward-only backend. Gradients are explicitly deferred
 (PR8). FORWARD_ONLY=1 must be passed on the command line, not hidden here, so
@@ -29,7 +30,7 @@ from tinygrad import dtypes
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
-  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d")
+  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d", "test_cos")
   if not needs_fp32_reference:
     yield
     return

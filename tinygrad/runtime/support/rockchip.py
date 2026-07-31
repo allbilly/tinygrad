@@ -9246,6 +9246,17 @@ def _try_uint8_min_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   if prod(int(u.src[0].arg) for u in reductions) != input_total or not 1 <= input_total <= 1 << 20: return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
 
+def _try_fp32_sin_cos_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Preserve normal-fp32 sin/cos instead of widening the fp16 LUT pipeline."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.float or _reduce_node(sink) is not None or \
+     (match := _try_sin_cos(store.src[1])) is None: return None
+  source, _ = match
+  total = prod(_shape_of_store(sink))
+  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM or \
+     int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
   store = _store_node(sink)
@@ -14601,6 +14612,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
   if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
   if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
+  if (fp32_sin_cos_tasks := _try_fp32_sin_cos_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_sin_cos_tasks)
   if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
   if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
   if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
