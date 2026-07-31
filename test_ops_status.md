@@ -3188,3 +3188,23 @@ only this method restores normal construction.
 
 Backend code and the **171/171** PR1 contract are unchanged; adapter Ruff is
 clean. No LUT or two-level LUT changed. Next: methods 351–375.
+
+### Softmax variants and FP16 standard deviation
+
+Ordered methods 351–375 pass **25 methods plus 2 subtests in 94.17s**.
+Commit `488cd2891`; saved patch
+`0122-rockchip-pass-softmax-variants-and-fp16-std.patch`.
+
+Forced-HALF softmax-other-axis reproduces its tolerance miss on CPU, so
+`softmax_other_axis` and `softmax_argmax` use their existing strict
+normal-fp32 paths.
+
+The five std failures are real backend coverage gaps because their CPU
+HALF controls pass. The strict variance task now preserves fp16 centered
+subtraction, square, fp32 accumulation, fp16 scaling/sqrt, correction NaNs,
+and stacked `std_mean`. Its separate fp16-to-fp32 row-sum producer is also
+one bounded typed reduction. Focused std-mean passes in **13.15s**.
+
+Contract advances to **172/172 in 10.95s**. Mypy and touched-file Ruff stay
+at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
+Next: methods 376–400.

@@ -11848,3 +11848,62 @@ Pre-edit recovery copy:
 
 Next action: continue ordered methods 351–375, beginning with softmax
 variants, softplus/softsign, splitting, stacking, and reductions.
+
+## 2026-07-31 — softmax variants and fp16 std milestone
+
+Ordered methods 351–375 pass **25 methods plus 2 subtests in 94.17s**.
+Implementation commit: `488cd2891`; portable patch:
+`0122-rockchip-pass-softmax-variants-and-fp16-std.patch`.
+
+The first run produced 18 passes, two passing subtests, and seven failures:
+`softmax_argmax`, `softmax_other_axis`, and five nonempty std methods. CPU
+controls separated the causes:
+
+- forced-HALF `softmax_other_axis` reproduces the same tolerance failure on
+  CPU (2/1000 elements, maximum `6.104e-05`);
+- all five std methods pass on CPU under forced HALF.
+
+The two softmax variants therefore join the normal-fp32 reference adapter.
+They use the existing strict fp32 softmax/argmax paths; no softmax
+classifier or LUT changed.
+
+For std, the existing strict variance boundary now supports fp16 as well
+as fp32. Its encoded mode records the output/input dtype and whether the
+scheduled mean producer is fp32. The fp16 runtime preserves tinygrad's
+actual graph semantics:
+
+- recompute and round the row mean to fp16;
+- subtract, square, and scale with fp16 rounding;
+- accumulate squared values in fp32;
+- preserve negative/infinite correction scales and resulting NaNs;
+- return either variance, std, or stacked `(std, mean)`.
+
+The final `(3,4,5,6)` `std_mean(axis=(1,2))` also schedules a separate
+fp16-to-fp32 row-sum producer. A strict bounded typed ADD reduction now
+handles that producer; the stacked variance task consumes the same affine
+layout. Focused `std_mean` passes in **13.15s**.
+
+Validation:
+
+- complete methods 351–375: **25 passed plus 2 subtests in 94.17s**;
+- hardware-free Rockchip advances to **172/172 in 10.95s**;
+- mypy remains at the exact 12-error baseline;
+- touched-file Ruff remains at the exact nine pre-existing findings;
+- `git diff --check` passes.
+
+No LUT table, LUT tuning parameter, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-184434`,
+`/tmp/ops_rockchip.py.20260731-184434`,
+`/tmp/test_pr1.py.20260731-184434`,
+`/tmp/conftest_rockchip.py.20260731-184434`,
+`/tmp/rockchip.py.20260731-184542`,
+`/tmp/rockchip.py.20260731-184737`,
+`/tmp/ops_rockchip.py.20260731-184737`,
+`/tmp/test_pr1.py.20260731-184737`,
+`/tmp/rockchip.py.20260731-184939`,
+`/tmp/test_pr1.py.20260731-184939`, and
+`/tmp/ops_rockchip.py.20260731-185254`.
+
+Next action: continue ordered methods 376–400.
