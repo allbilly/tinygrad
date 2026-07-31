@@ -10808,3 +10808,53 @@ Pre-edit recovery copies:
 
 Next action: continue the serialized standalone inventory and take the next
 small reproducible forward failure as milestone 98.
+
+## 2026-07-31 — fp16 broadcast tensor-power milestone
+
+`TestOps.test_broadcast_full` now passes all **10/10 subtests in 14.07s**.
+The broader broadcast validation passes **5 methods and 30 subtests in
+27.39s**: full, partial, simple, and both broadcasted-add methods.
+Implementation commit: `5ab383a8d`; portable patch:
+`0098-rockchip-pass-fp16-broadcast-pow.patch`.
+
+A serialized `TestOps` inventory (`-n12 --dist loadscope -x`, restricted to
+that class so no other class could submit concurrently) reached 45 method
+passes and 40 subtest passes before finding the first genuine failure. Only
+the two `pow` cases in `test_broadcast_full` failed; the other eight
+add/subtract/multiply/divide cases passed. Both pow shapes were honest
+`RKPLAN_REJECT:unsupported_op:Ops.WHERE` failures because the existing
+tensor-pow implementation requires both physical inputs to equal the output
+size and the existing broadcast typed boundary was fp32-only.
+
+The first strict fp16 broadcast matcher correctly admitted the graphs but
+replaying the scheduled `LOG2`/multiply/`EXP2` decomposition through the
+typed evaluator rounded every intermediate. This missed the fp16 tolerance
+on 148/3360 and 56/1680 outputs, with maximum absolute error `0.03125`.
+Direct NumPy fp16 `power`, like PyTorch's public fp16 pow boundary, performs
+the transcendental core without those scheduled half-rounding boundaries.
+
+The final matcher verifies the canonical two-input pow structure rather
+than only an op set: root domain `WHERE`, exactly one `LOG2`, `EXP2`, and
+`FLOORMOD`, the exponent in the scaled-log multiply, the base inside the
+absolute-value domain guard, two distinct fp16 parameter slots and address
+mappings, at least one physical input smaller than the logical output,
+complete static loop size, the exact pow expansion allowlist, and a
+`2**20` output bound. It then replaces only the serialized evaluator graph
+with semantic `POW(base, exponent)`, preserving the scheduled broadcast
+indices and original kernel ABI. Native add/mul/div broadcast lowering is
+not intercepted.
+
+Validation: hardware-free Rockchip **161/161 in 9.15s**; mypy remains at the
+exact 12-error baseline; touched-file Ruff remains at the exact nine
+pre-existing findings; `git diff --check` passes. No LUT, LUT tuning, or
+two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-141424`,
+`/tmp/test_pr1.py.20260731-141424`,
+`/tmp/rockchip.py.20260731-141636`,
+`/tmp/progress.md.20260731-141924`, and
+`/tmp/test_ops_status.md.20260731-141924`.
+
+Next action: resume deterministic serialized `TestOps` inventory after
+`test_broadcast_full` and fix the next forward failure as milestone 99.

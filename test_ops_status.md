@@ -2739,3 +2739,23 @@ small fmod op allowlist, complete static sizes, and the `2**20` bound.
 Contract: **160/160 in 9.05s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. Next: isolate the next forward-only failure group.
+
+### FP16 broadcast tensor power
+
+`test_broadcast_full` passes all **10/10 subtests in 14.07s**. The full,
+partial, simple, and broadcasted-add validation passes **5 methods plus 30
+subtests in 27.39s**. Commit `5ab383a8d`; saved patch
+`0098-rockchip-pass-fp16-broadcast-pow.patch`.
+
+The two fp16 pow graphs previously rejected at their domain-protection
+`WHERE`. A strict matcher now requires canonical tensor pow, two distinct
+broadcast mappings, a smaller physical input, exact static loop geometry,
+the pow-only op allowlist, no reduction, and a `2**20` bound. It serializes
+semantic `POW(base, exponent)` with the original indexed operands instead of
+replaying the scheduled half-rounded `LOG2`/`EXP2` decomposition. Existing
+native broadcast arithmetic remains unchanged.
+
+Contract: **161/161 in 9.15s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. The serialized inventory had 45 method passes and 40
+subtest passes before this failure; next inventory starts after it.
