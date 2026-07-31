@@ -5675,102 +5675,51 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     else: return None
   if log2_val.op is not Ops.LOG2 or len(log2_val.src) != 1 or (source := _unwrap(log2_val.src[0])).op is not Ops.INDEX: return None
   stages = _TaskGraph(sink, store, source)
-  out, total, tasks = stages.out, stages.total, stages.tasks
-  alloc, temp_index = stages.alloc, stages.temp_index
-  dependent, comparison_mask = stages.dependent, stages.comparison_mask
-  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
-
-  source_arg = (source.src[0].buf_uop.arg.slot, 0)
+  one, zero = _float_arg(1.0), (_ZERO_SLOT,0)
+  source_arg = (source.src[0].buf_uop.arg.slot,0)
   source_fp32 = (source_arg[0],) if source.dtype is dtypes.float else ()
   range_masks:list[tuple[int,int]] = []
   for threshold in (0.25, 0.0625, 0.015625, 0.00390625):
-    diff, mask = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, diff, _float_arg(threshold), source_arg, Ops.SUB, fp32_inputs=source_fp32),
-                  _emit_where_stage(total, mask, (diff, 0), (diff, 0), Ops.MAX, compare=True)))
-    range_masks.append((mask, 0))
+    diff = stages.op(_float_arg(threshold), source_arg, Ops.SUB, repeat=False, fp32_inputs=source_fp32)
+    range_masks.append(stages.op(diff, diff, Ops.MAX, repeat=False, compare=True))
 
-  weighted:list[tuple[int,int]] = []
-  for mask_arg, weight in zip(range_masks, (3.0, 12.0, 48.0, 192.0)):
-    slot = alloc()
-    tasks.append(_emit_where_stage(total, slot, mask_arg, _float_arg(weight), Ops.MUL))
-    weighted.append((slot, 0))
-  factor_lo, factor_hi, factor_delta, factor, normalized = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, factor_lo, weighted[0], weighted[1], Ops.ADD),
-                _emit_where_stage(total, factor_hi, weighted[2], weighted[3], Ops.ADD),
-                _emit_where_stage(total, factor_delta, (factor_lo, 0), (factor_hi, 0), Ops.ADD),
-                _emit_where_stage(total, factor, (factor_delta, 0), one, Ops.ADD),
-                _emit_where_stage(total, normalized, source_arg, (factor, 0), Ops.MUL, fp32_inputs=source_fp32)))
+  weighted = [stages.op(mask, _float_arg(weight), Ops.MUL, repeat=False)
+              for mask, weight in zip(range_masks, (3.0, 12.0, 48.0, 192.0))]
+  factor_lo = stages.op(weighted[0], weighted[1], Ops.ADD, repeat=False)
+  factor_hi = stages.op(weighted[2], weighted[3], Ops.ADD, repeat=False)
+  factor = stages.op(stages.op(factor_lo, factor_hi, Ops.ADD, repeat=False), one, Ops.ADD, repeat=False)
+  normalized = stages.op(source_arg, factor, Ops.MUL, repeat=False, fp32_inputs=source_fp32)
+  count_lo = stages.op(range_masks[0], range_masks[1], Ops.ADD, repeat=False)
+  count_hi = stages.op(range_masks[2], range_masks[3], Ops.ADD, repeat=False)
+  count = stages.op(count_lo, count_hi, Ops.ADD, repeat=False)
+  offset = stages.op(count, _float_arg(-2.0*output_scale), Ops.MUL, repeat=False)
+  bounded_low = stages.op(normalized, _float_arg(0.25), Ops.MAX, repeat=False)
+  negated = stages.op(zero, bounded_low, Ops.SUB, repeat=False)
+  bounded = stages.op(zero, stages.op(negated, _float_arg(-4.0), Ops.MAX, repeat=False), Ops.SUB, repeat=False)
 
-  count_lo, count_hi, count, offset = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, count_lo, range_masks[0], range_masks[1], Ops.ADD),
-                _emit_where_stage(total, count_hi, range_masks[2], range_masks[3], Ops.ADD),
-                _emit_where_stage(total, count, (count_lo, 0), (count_hi, 0), Ops.ADD),
-                _emit_where_stage(total, offset, (count, 0), _float_arg(-2.0*output_scale), Ops.MUL)))
-
-  bounded_low, negated, negated_bounded, bounded = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, bounded_low, (normalized, 0), _float_arg(0.25), Ops.MAX),
-                _emit_where_stage(total, negated, (_ZERO_SLOT, 0), (bounded_low, 0), Ops.SUB),
-                _emit_where_stage(total, negated_bounded, (negated, 0), _float_arg(-4.0), Ops.MAX),
-                _emit_where_stage(total, bounded, (_ZERO_SLOT, 0), (negated_bounded, 0), Ops.SUB)))
-
-  lut_slot = alloc()
-  normalized_log2 = UOp(Ops.LOG2, dtypes.half, (temp_index(bounded),))
+  lut_slot = stages.alloc()
+  normalized_log2 = UOp(Ops.LOG2, dtypes.half, (stages.temp_index(bounded[0]),))
   normalized_val = normalized_log2 if output_scale == 1.0 else \
     UOp(Ops.MUL, dtypes.half, (normalized_log2, UOp.const(dtypes.half, output_scale)))
   if not stages.emit_lut(normalized_val, lut_slot): return None
-
-  centered, zoomed = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, centered, (bounded, 0), one, Ops.SUB),
-                _emit_where_stage(total, zoomed, (centered, 0), _float_arg(12.5), Ops.MUL)))
-  local_slot = alloc()
-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_log2_local", output_scale))
+  centered = stages.op(bounded, one, Ops.SUB, repeat=False)
+  zoomed = stages.op(centered, _float_arg(12.5), Ops.MUL, repeat=False)
+  local_slot = stages.alloc()
+  local_val = UOp(Ops.CUSTOM, dtypes.half, (stages.temp_index(zoomed[0]),), arg=("rk_log2_local", output_scale))
   if not stages.emit_lut(local_val, local_slot): return None
-  local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(0.25), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(0.25), Ops.MUL)))
-
-  local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
-  local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, local_low_diff, _float_arg(0.85), (bounded, 0), Ops.SUB),
-                _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, (bounded, 0), _float_arg(1.15), Ops.SUB),
-                _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
-                _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
-                _emit_where_stage(total, local_inside_scratch, one, (local_outside, 0), Ops.SUB),
-                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB)))
-  near_low_diff, near_low, near_high_diff, near_high = (alloc() for _ in range(4))
-  near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
-  local_mask_scratch, local_mask = alloc(), alloc()
-  square, half_square, adjusted, polynomial = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, near_low_diff, _float_arg(-0.02), (centered, 0), Ops.SUB),
-                _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_high_diff, (centered, 0), _float_arg(0.02), Ops.SUB),
-                _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
-                _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
-                _emit_where_stage(total, near_inside_scratch, one, (near_outside, 0), Ops.SUB),
-                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
-                _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
-                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
-                _emit_where_stage(total, square, (centered, 0), (centered, 0), Ops.MUL),
-                _emit_where_stage(total, half_square, (square, 0), _float_arg(0.5), Ops.MUL),
-                _emit_where_stage(total, adjusted, (centered, 0), (half_square, 0), Ops.SUB),
-                _emit_where_stage(total, polynomial, (adjusted, 0), _float_arg(output_scale*math.log2(math.e)), Ops.MUL)))
-  broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
-  linear_selected_scratch, linear_selected, lut_sum_scratch, lut_sum, mantissa = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, broad_selected_scratch, (lut_slot, 0), (local_outside, 0), Ops.MUL),
-                _emit_where_stage(total, broad_selected, (lut_slot, 0), (local_outside, 0), Ops.MUL),
-                _emit_where_stage(total, local_selected_scratch, (local_scaled, 0), (local_mask, 0), Ops.MUL),
-                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
-                _emit_where_stage(total, linear_selected_scratch, (polynomial, 0), (near_inside, 0), Ops.MUL),
-                _emit_where_stage(total, linear_selected, (polynomial, 0), (near_inside, 0), Ops.MUL),
-                _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
-                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
-                _emit_where_stage(total, alloc(), (lut_sum, 0), (linear_selected, 0), Ops.ADD),
-                _emit_where_stage(total, mantissa, (lut_sum, 0), (linear_selected, 0), Ops.ADD)))
-  corrected = alloc()
-  dependent(corrected, (mantissa, 0), (offset, 0), Ops.ADD)
+  local_scaled = stages.op((local_slot,0), _float_arg(0.25), Ops.MUL)
+  local_outside, local_inside = stages.interval_mask(bounded, 0.85, 1.15)
+  near_outside, near_inside = stages.interval_mask(centered, -0.02, 0.02)
+  local_mask = stages.op(local_inside, near_inside, Ops.SUB)
+  square = stages.op(centered, centered, Ops.MUL, repeat=False)
+  adjusted = stages.op(centered, stages.op(square, _float_arg(0.5), Ops.MUL, repeat=False), Ops.SUB, repeat=False)
+  polynomial = stages.op(adjusted, _float_arg(output_scale*math.log2(math.e)), Ops.MUL, repeat=False)
+  broad_selected = stages.op((lut_slot,0), local_outside, Ops.MUL)
+  local_selected = stages.op(local_scaled, local_mask, Ops.MUL)
+  linear_selected = stages.op(polynomial, near_inside, Ops.MUL)
+  lut_sum = stages.op(broad_selected, local_selected, Ops.ADD)
+  mantissa = stages.op(lut_sum, linear_selected, Ops.ADD)
+  corrected = stages.op(mantissa, offset, Ops.ADD)
 
   # Natural log of fp16 probabilities needs more output precision than the
   # normalized Q13/Q15 path provides after BCE's two weighted products.  Use
@@ -5778,65 +5727,50 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # general result outside that narrow domain.
   refined = corrected
   if source.dtype is dtypes.half and math.isclose(output_scale, math.log(2.0), rel_tol=0.0, abs_tol=1e-3):
-    low_centered, low_input = alloc(), alloc()
-    dependent(low_centered, (bounded, 0), _float_arg(0.375), Ops.SUB)
-    dependent(low_input, (low_centered, 0), _float_arg(16.0), Ops.MUL)
-    low_lut = alloc()
-    low_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(low_input),), arg="rk_log_half_low")
+    low_centered = stages.op(bounded, _float_arg(0.375), Ops.SUB)
+    low_input = stages.op(low_centered, _float_arg(16.0), Ops.MUL)
+    low_lut = stages.alloc()
+    low_val = UOp(Ops.CUSTOM, dtypes.half, (stages.temp_index(low_input[0]),), arg="rk_log_half_low")
     if not stages.emit_lut(low_val, low_lut): return None
-
-    high_centered, high_input = alloc(), alloc()
-    dependent(high_centered, (bounded, 0), _float_arg(0.75), Ops.SUB)
-    dependent(high_input, (high_centered, 0), _float_arg(8.0), Ops.MUL)
-    high_lut = alloc()
-    high_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(high_input),), arg="rk_log_half_high")
+    high_centered = stages.op(bounded, _float_arg(0.75), Ops.SUB)
+    high_input = stages.op(high_centered, _float_arg(8.0), Ops.MUL)
+    high_lut = stages.alloc()
+    high_val = UOp(Ops.CUSTOM, dtypes.half, (stages.temp_index(high_input[0]),), arg="rk_log_half_high")
     if not stages.emit_lut(high_val, high_lut): return None
-
-    below = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (temp_index(bounded), UOp.const(dtypes.half, 0.2498779296875))))
-    above = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.99951171875), temp_index(bounded))))
-    high_region = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.5), temp_index(bounded))))
+    below = stages.comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (stages.temp_index(bounded[0]), UOp.const(dtypes.half, 0.2498779296875))))
+    above = stages.comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.99951171875), stages.temp_index(bounded[0]))))
+    high_region = stages.comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (UOp.const(dtypes.half, 0.5), stages.temp_index(bounded[0]))))
     if below is None or above is None or high_region is None: return None
-    outside, valid, low_region, low_mask, high_mask = (alloc() for _ in range(5))
-    tasks.extend((_emit_where_stage(total, outside, below, above, Ops.MAX),
-                  _emit_where_stage(total, valid, one, (outside, 0), Ops.SUB),
-                  _emit_where_stage(total, low_region, one, high_region, Ops.SUB),
-                  _emit_where_stage(total, low_mask, (valid, 0), (low_region, 0), Ops.MUL),
-                  _emit_where_stage(total, high_mask, (valid, 0), high_region, Ops.MUL)))
-    low_selected, high_selected, direct_mantissa, direct, fallback_mask, fallback, refined = (alloc() for _ in range(7))
-    tasks.extend((_emit_where_stage(total, low_selected, (low_lut, 0), (low_mask, 0), Ops.MUL),
-                  _emit_where_stage(total, high_selected, (high_lut, 0), (high_mask, 0), Ops.MUL),
-                  _emit_where_stage(total, direct_mantissa, (low_selected, 0), (high_selected, 0), Ops.ADD),
-                  _emit_where_stage(total, direct, (direct_mantissa, 0), (offset, 0), Ops.ADD),
-                  _emit_where_stage(total, fallback_mask, one, (valid, 0), Ops.SUB),
-                  _emit_where_stage(total, fallback, (corrected, 0), (fallback_mask, 0), Ops.MUL),
-                  _emit_where_stage(total, refined, (direct, 0), (fallback, 0), Ops.ADD)))
+    outside = stages.op(below, above, Ops.MAX, repeat=False)
+    valid = stages.op(one, outside, Ops.SUB, repeat=False)
+    low_region = stages.op(one, high_region, Ops.SUB, repeat=False)
+    low_mask = stages.op(valid, low_region, Ops.MUL, repeat=False)
+    high_mask = stages.op(valid, high_region, Ops.MUL, repeat=False)
+    low_selected = stages.op((low_lut,0), low_mask, Ops.MUL, repeat=False)
+    high_selected = stages.op((high_lut,0), high_mask, Ops.MUL, repeat=False)
+    direct = stages.op(stages.op(low_selected, high_selected, Ops.ADD, repeat=False), offset, Ops.ADD, repeat=False)
+    fallback_mask = stages.op(one, valid, Ops.SUB, repeat=False)
+    fallback = stages.op(corrected, fallback_mask, Ops.MUL, repeat=False)
+    refined = stages.op(direct, fallback, Ops.ADD, repeat=False)
 
   hi = UOp.const(dtypes.half, 65472.0)
-  positive_arg = comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
+  positive_arg = stages.comparison_mask(UOp(Ops.CMPLT, dtypes.bool, (hi, source)))
   if positive_arg is None: return None
-  negative_diff, negative, positive_diff, source_positive = (alloc() for _ in range(4))
-  nonzero_scratch, nonzero_slot = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), source_arg, Ops.SUB, fp32_inputs=source_fp32),
-                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_diff, source_arg, (_ZERO_SLOT, 0), Ops.SUB, fp32_inputs=source_fp32),
-                _emit_where_stage(total, source_positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, nonzero_scratch, (negative, 0), (source_positive, 0), Ops.MAX),
-                _emit_where_stage(total, nonzero_slot, (negative, 0), (source_positive, 0), Ops.MAX)))
-  negative_arg, nonzero = (negative, 0), (nonzero_slot, 0)
-  not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
+  negative_diff = stages.op(zero, source_arg, Ops.SUB, repeat=False, fp32_inputs=source_fp32)
+  negative = stages.op(negative_diff, negative_diff, Ops.MAX, repeat=False, compare=True)
+  positive_diff = stages.op(source_arg, zero, Ops.SUB, repeat=False, fp32_inputs=source_fp32)
+  source_positive = stages.op(positive_diff, positive_diff, Ops.MAX, repeat=False, compare=True)
+  nonzero = stages.op(negative, source_positive, Ops.MAX)
+  not_number = stages.comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
   if not_number is None: return None
-
-  zero_result = alloc()
-  dependent(zero_result, (refined, 0), nonzero, Ops.FDIV)
-  positive_denom, finite = alloc(), alloc()
-  dependent(positive_denom, one, positive_arg, Ops.SUB)
-  dependent(finite, (zero_result, 0), (positive_denom, 0), Ops.FDIV)
-  invalid, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
-  dependent(invalid, negative_arg, not_number, Ops.MAX)
-  dependent(invalid_denom, one, (invalid, 0), Ops.SUB)
-  dependent(invalid_factor, (invalid_denom, 0), (invalid_denom, 0), Ops.FDIV)
-  dependent(out, (finite, 0), (invalid_factor, 0), Ops.MUL)
-  return _finalize_fp32_output(tasks, store)
+  zero_result = stages.op(refined, nonzero, Ops.FDIV)
+  positive_denom = stages.op(one, positive_arg, Ops.SUB)
+  finite = stages.op(zero_result, positive_denom, Ops.FDIV)
+  invalid = stages.op(negative, not_number, Ops.MAX)
+  invalid_denom = stages.op(one, invalid, Ops.SUB)
+  invalid_factor = stages.op(invalid_denom, invalid_denom, Ops.FDIV)
+  stages.op(finite, invalid_factor, Ops.MUL, out_slot=stages.out)
+  return _finalize_fp32_output(stages.tasks, store)
 
 def _finalize_fp32_output(tasks:list[RKSubTask], store:UOp) -> tuple[RKSubTask, ...]:
   """Set fp32_output on the last task when the store's output PARAM is fp32."""
