@@ -11477,3 +11477,49 @@ one-hot/masked-select/nonzero **6/6 in 22.08s**.
 
 Next action: resume the complete forward-only sweep after isclose, isolate
 the next failure, and commit milestone 114.
+
+## 2026-07-31 — fp32 logarithmic-ops milestone
+
+The eight-method logarithmic block passes **8/8 in 148.57s**:
+`linspace`, `log`, both `log_softmax` axes, `logaddexp`, both
+`logcumsumexp` methods, and `logsumexp`. Implementation commit:
+`faaea60b5`; portable patch:
+`0114-rockchip-pass-fp32-logarithmic-ops.patch`.
+
+The resumed ordered sweep originally found eight failures in this block.
+A valid fp32 Rockchip control (without the HALF-setting pytest plugin)
+proved six methods already pass unchanged with normal construction:
+`linspace`, both `log_softmax` methods, both `logcumsumexp` methods, and
+`logsumexp`. Forced HALF changes their arithmetic/reference contract, so
+the adapter now restores fp32 only for these named methods.
+
+Raw fp32 `log` remained numerically wrong because its scheduled
+`LOG2(x)*ln(2)` graph entered the half-quantized native LUT. `logaddexp`
+timed out in that path. A strict classifier now admits only two bounded
+fp32 signatures: one direct contiguous natural-log graph, or tinygrad's
+stable two-input `MAX/EXP2/LOG2` logaddexp graph. Inputs must be complete
+same-index tensors, with only the official size-one constant-index
+broadcast additionally allowed for logaddexp; total output is bounded to
+`2**20`. These graphs execute as one typed serialized task over mapped
+Rockchip buffers. The first 45x65 logaddexp case passed immediately; its
+size-one/vector subcase exposed the broadcast gate and passed after that
+exact form was added.
+
+Validation: hardware-free Rockchip advances to **168/168 in 10.37s** with
+direct, two-input, and scalar-broadcast classifier coverage. Mypy remains
+at the exact 12-error baseline; touched-file Ruff remains at the exact nine
+pre-existing findings; and `git diff --check` passes. No LUT tables, LUT
+tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-170313`,
+`/tmp/test_pr1.py.20260731-170313`,
+`/tmp/conftest_rockchip.py.20260731-170313`,
+`/tmp/rockchip.py.20260731-170657`,
+`/tmp/test_pr1.py.20260731-170657`,
+`/tmp/progress.md.20260731-171111`, and
+`/tmp/test_ops_status.md.20260731-171111`.
+
+Next action: rerun the reset-polluted tail of ordered methods 151–200 in a
+fresh process, then continue methods 201–250 and fix the next genuine
+failure group.

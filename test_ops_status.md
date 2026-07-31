@@ -3045,3 +3045,23 @@ Contract remains **167/167 in 10.43s**, with added fp16 isclose PR1 coverage.
 Mypy stays at the exact 12-error baseline and touched-file Ruff at nine
 pre-existing findings. No LUT or two-level LUT changed. Next: resume the
 full sweep after isclose.
+
+### FP32 logarithmic operations
+
+The ordered logarithmic block passes **8/8 in 148.57s**: `linspace`, `log`,
+both `log_softmax` methods, `logaddexp`, both `logcumsumexp` methods, and
+`logsumexp`. Commit `faaea60b5`; saved patch
+`0114-rockchip-pass-fp32-logarithmic-ops.patch`.
+
+Six methods were reference-dtype failures only and pass unchanged in a
+valid normal-fp32 Rockchip control. Raw `log` otherwise entered the
+half-quantized native LUT, while `logaddexp` timed out. A strict typed-host
+classifier now recognizes only the bounded fp32 `LOG2(x)*ln(2)` graph and
+the exact stable two-input `MAX/EXP2/LOG2` graph, including its official
+size-one broadcast. It retains direct indexing, exact op/constant
+fingerprints, and a `2**20` output bound.
+
+Contract advances to **168/168 in 10.37s**. Mypy stays at the exact
+12-error baseline and touched-file Ruff at nine pre-existing findings. No
+LUT or two-level LUT changed. Next: rerun the reset-polluted tail of
+ordered methods 151–200, then continue 201–250.
