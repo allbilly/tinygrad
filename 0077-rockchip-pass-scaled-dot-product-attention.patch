@@ -1,0 +1,627 @@
+From cd95d765c2f39568f5cc5bd615f7be97111aebaa Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 10:47:51 +0800
+Subject: [PATCH] rockchip: pass scaled dot product attention
+
+---
+ progress.md                          | 140 +++++++++++++++++++++++++
+ test/rockchip/conftest_rockchip.py   |   7 +-
+ test/rockchip/test_pr1.py            |  71 +++++++++++++
+ test_ops_status.md                   |  18 ++++
+ tinygrad/mixin/rand.py               |   6 +-
+ tinygrad/runtime/ops_rockchip.py     |  57 +++++++---
+ tinygrad/runtime/support/rockchip.py | 151 +++++++++++++++++++++++++--
+ 7 files changed, 426 insertions(+), 24 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index f0566a656..f9db36a1f 100644
+--- a/progress.md
++++ b/progress.md
+@@ -9949,3 +9949,143 @@ the compact staged implementation for legacy scalar scatter ADD/MUL.
+ 
+ No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
+ Next forward group: `TestOps.test_scaled_dot_product_attention`.
++
++## 2026-07-31 — full test_ops.py hardware suite baseline (424 cases)
++
++Ran the complete `test/backend/test_ops.py` suite (424 cases) on the ROCKCHIP
++NPU backend for the first time, to establish a hardware pass/fail baseline.
++
++Command:
++
++```sh
++FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest \
++  test/backend/test_ops.py -p test.rockchip.conftest_rockchip \
++  --forked --tb=line -q -rN
++```
++
++`--forked` is required: several tests (the cum* family, `test_isclose_edge_cases`,
++`test_cast`, `test_abs_exact`, `test_9_gemm`, `test_acos`, `test_zeros_like`,
++`test_cast_relu`) poison NPU state so the subsequent `reset_npu` ioctl raises
++SIGABRT/SIGSEGV. Without `--forked` the whole run aborts at the first such test;
++with `--forked` each crash is contained to a child process and the parent
++continues. `pytest-forked` was installed via `uv pip install pytest-forked`.
++
++### Tally — 424 total
++
++| Status | Count |
++|---|---|
++| PASS    | 129 |
++| FAIL    | 287 |
++| SKIP    |   8 |
++| Total   | 424 |
++
++Runtime: 1153.84s (19m13s). NPU health (`ref/rk3588/examples/simple_add.py`)
++PASS before and after the run.
++
++### Failure breakdown by root cause
++
++| Error class | Count | Notes |
++|---|---|---|
++| `RKPLAN_REJECT:unsupported_op`        | 94 | Honest planner rejects — op not implemented |
++| `AssertionError`                      | 42 | Numerical mismatch vs torch reference |
++| `RKPLAN_REJECT:unsupported_dtype`     | 22 | dtype not supported on NPU |
++| `TimeoutError` (Errno 110)            |  6 | NPU job timeout — state pollution class |
++| `OverflowError` (uint8 bounds)        |  6 | Python int → uint8 cast overflow |
++| `RuntimeError not raised`             |  2 | Expected error didn't fire |
++| `NotImplementedError`                 |  2 | Path not implemented |
++| `RKPLAN_REJECT:unsupported_layout`    |  2 | Layout not supported |
++
++### `unsupported_op` sub-breakdown
++
++| Rejected op | Count |
++|---|---|
++| `fused_epilogue`          | 27 |
++| `fus*` (fused variants)   | 27 |
++| `Ops.*` (generic)         | 17 |
++| `Ops.MUL`                 |  6 |
++| `Ops.EXP2`                |  6 |
++| `Ops.WHERE`               |  5 |
++| `non_index_operand`       |  3 |
++
++### Interpretation
++
++- 118 failures (94 unsupported_op + 22 unsupported_dtype + 2 unsupported_layout)
++  are **honest `RKPLAN_REJECT`** from the PR1 planner — ops/dtypes/layouts not
++  yet implemented on the NPU. These are not bugs; they are deferred work.
++- 42 `AssertionError` are real numerical mismatches that need investigation.
++- 6 `TimeoutError` are the same NPU state-pollution class documented in
++  `ref/rk3588/progress.md` (C64/H56 blocker): the job submits but the NPU never
++  raises the completion IRQ, so the driver times out and soft-resets.
++- 6 `OverflowError` are uint8 cast bounds errors in the test harness path.
++- The 8 skips are pytest skips, not rockchip-specific.
++
++This is the first full-suite hardware baseline. The hardware-free Rockchip
++contract (test/rockchip/test_pr1.py, DEV=NULL) remains at 139/139.
++
++## 2026-07-31 — scaled-dot-product attention milestone
++
++All five unchanged attention methods now pass with `FORWARD_ONLY=1`,
++`DEFAULT_FLOAT=HALF`, `DEV=ROCKCHIP`, `--forked`, and `-n12`:
++
++| Method | Result |
++|---|---|
++| `test_scaled_dot_product_attention` (base + additive mask) | PASS, 32.93s |
++| `test_scaled_dot_product_attention_mismatch_ls` | PASS, 13.95s |
++| `test_scaled_dot_product_attention_causal` | PASS, 23.73s |
++| `test_scaled_dot_product_attention_gqa` | PASS, 41.40s |
++| `test_scaled_dot_product_attention_gqa_errors` | PASS, 11.03s |
++
++The hardware-free Rockchip contract is **143/143 in 8.98s**. The shared
++attention dtype and four-kernel scheduling checks also pass.
++
++### Debug sequence and root causes
++
++1. The original fp16 attention result had 31.2% mismatches and maximum error
++   near 2.318. Capturing each mapped input immediately before the final value
++   contraction showed that the score buffer had changed by as much as 7.697,
++   the MAX buffer was all zero, and the denominator contained values around
++   182–270 instead of the expected 1–16 range.
++2. The softmax MAX kernel was a 31-task program: 16 host gather stages followed
++   by 15 native DPU MAX stages. Although no logical task wrote the score slot,
++   this mixed path mutated the mapped score input. A strict bounded floating
++   MAX classifier now emits one compact typed reduction. The large error
++   disappeared, leaving only a one-half-ULP (`0.001953`) precision mismatch.
++3. A CPU control with `DEFAULT_FLOAT=HALF` reproduced the one-ULP mismatch:
++   PyTorch selected its architecture-specific CPU flash SDPA implementation,
++   while tinygrad explicitly narrowed scores before softmax. PyTorch's official
++   MATH SDPA backend is now selected by the Rockchip test plugin, and tinygrad
++   keeps score, softmax, and value accumulation in fp32 before narrowing only
++   the public result. The CPU control then passed.
++4. The Rockchip path still differed by up to `0.0011` in the first score
++   intermediate. Stage-level capture isolated this to the dot product:
++   generic UOp evaluation rounded every fp16 product before its fp32 sum,
++   whereas CPU/NPU `MULACC` widens operands before multiplication. The strict
++   attention score stage now widens Q/K first. The base hardware test then
++   passed.
++
++### Runtime/compiler details
++
++- The compact typed reduction ABI now carries ADD, MUL, or MAX and can append
++  an exact post-reduction expression. Opcode 31 injects the fp32 reduced value
++  into that epilogue, allowing the final attention division to occur after,
++  rather than inside, the value sum.
++- Scaled QK, optional additive/causal masking, softmax denominator, and final
++  value contraction have strict attention fingerprints. Their reduction width
++  is bounded at 128 for QK and 64 for softmax/value work.
++- GQA's folded two-dimensional score/value schedules use the same bounded
++  tasks. Candidate grids are processed in chunks of at most four million
++  values, preserving per-row reduction order while avoiding a single 16M-value
++  allocation.
++- The rejected first GQA approach produced 49,152 CMAC tasks and tripped the
++  process watchdog. That path is not active. A later 1.125 MiB Rockchip GEM
++  allocation also returned `ENXIO`; small failed allocations now use the
++  existing mapped host-backed buffer fallback after destroying the unusable
++  GEM handle.
++- `ref/rk3588/conv_grok` was reviewed again. Its useful transferable ideas are
++  formula-driven chunk bounds and preserving fp32 accumulation surfaces. It
++  contains no attention/softmax implementation to copy.
++
++No LUT or two-level LUT changed. `lut.md` therefore remains unchanged. Mypy is
++back at the exact 12-error baseline. Ruff reports nine pre-existing issues in
++the touched legacy files and no issue on the new attention lines. Next forward
++group: `TestOps.test_binary_crossentropy`.
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index e573d7106..dce21eb8b 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -1,8 +1,10 @@
+ """Environment setup for running test_ops.py on ROCKCHIP.
+ 
+ Sets DEFAULT_FLOAT=half (NPU's only supported dtype) and torch default to fp16
+-for fair comparison. Unsupported ops raise RuntimeError(RKPLAN_REJECT:...) and
+-fail the test honestly — no skip conversion, no monkeypatch.
++for fair comparison. PyTorch's architecture-specific fused SDPA kernel is
++disabled so attention is compared with its portable MATH implementation.
++Unsupported ops raise RuntimeError(RKPLAN_REJECT:...) and fail the test
++honestly — no skip conversion, no monkeypatch.
+ 
+ PR1 is an inference/forward-only backend. Gradients are explicitly deferred
+ (PR8). FORWARD_ONLY=1 must be passed on the command line, not hidden here, so
+@@ -17,3 +19,4 @@ os.environ.setdefault("DEFAULT_FLOAT", "half")
+ 
+ import torch
+ torch.set_default_dtype(torch.float16)
++torch.backends.cuda.enable_flash_sdp(False)
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 132eccdc8..7e0288ed0 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -627,6 +627,77 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 8)
+     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
+ 
++  def test_large_shared_fp32_gemm_serializes_before_k_limit(self):
++    query = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    key = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink((query @ key.transpose(-2,-1)) * 0.25))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    cmac_tasks = [task.task for task in subtasks if task.task.kind == "cmac"]
++    self.assertEqual(len(cmac_tasks), 3*256)
++    self.assertTrue(all(task.layout[:3] == (16,16,64) for task in cmac_tasks))
++    self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 256)
++    self.assertEqual(subtasks[-1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
++  def test_attention_score_gemm_uses_bounded_typed_reduction(self):
++    query = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    key = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    program = build_native_program(_get_sink((query @ key.transpose(-2,-1)) * 0.125))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 2)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++    self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    causal_query = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    causal_key = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    causal_value = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    causal_sink = next(early_simplify(call.src[0]) for call in
++                       causal_query.scaled_dot_product_attention(causal_key, causal_value, is_causal=True).schedule_linear().src
++                       if call.src[0].op is Ops.SINK)
++    causal_program = build_native_program(causal_sink)
++    self.assertIsNotNone(causal_program)
++    self.assertEqual([task.task.layout[1] for task in causal_program.src[1].src[0].arg],
++                     [_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_LAYOUT])
++
++  def test_attention_value_gemm_uses_bounded_typed_reduction(self):
++    query = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    key = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    value = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    sinks = [early_simplify(call.src[0]) for call in query.scaled_dot_product_attention(key, value).schedule_linear().src
++             if call.src[0].op is Ops.SINK]
++    program = build_native_program(sinks[-1])
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 2)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++    self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    gqa_query = Tensor.empty(32,32,16,64, dtype=dtypes.float, device="ROCKCHIP")
++    gqa_sinks = [early_simplify(call.src[0]) for call in
++                 gqa_query.scaled_dot_product_attention(key, value, enable_gqa=True).schedule_linear().src
++                 if call.src[0].op is Ops.SINK]
++    for sink in (gqa_sinks[0], gqa_sinks[-1]):
++      gqa_program = build_native_program(sink)
++      self.assertIsNotNone(gqa_program)
++      self.assertEqual([task.task.layout[1] for task in gqa_program.src[1].src[0].arg],
++                       [_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_LAYOUT])
++
++  def test_half_attention_uses_typed_score_and_softmax_reductions(self):
++    query = Tensor.empty(32,8,16,64, dtype=dtypes.half, device="ROCKCHIP")
++    key = Tensor.empty(32,8,16,64, dtype=dtypes.half, device="ROCKCHIP")
++    value = Tensor.empty(32,8,16,64, dtype=dtypes.half, device="ROCKCHIP")
++    sinks = [early_simplify(call.src[0]) for call in query.scaled_dot_product_attention(key, value).schedule_linear().src
++             if call.src[0].op is Ops.SINK]
++    for sink_index, expected_count in ((0, 2), (1, 1), (3, 1)):
++      program = build_native_program(sinks[sink_index])
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), expected_count)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++      if expected_count == 2: self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    denominator_program = build_native_program(sinks[2])
++    self.assertIsNotNone(denominator_program)
++    self.assertEqual(denominator_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 8a4a95c9b..46d57c153 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2348,3 +2348,21 @@ form additionally admits its exact `CMPLT/AND` guards, and mean is matched
+ after reciprocal-to-FDIV rewriting. No runtime ABI or LUT changed. Contract:
+ **139/139**. Next forward group:
+ `TestOps.test_scaled_dot_product_attention`.
++
++### Scaled-dot-product attention
++
++All attention methods pass under the required HALF forward-only configuration:
++base plus additive mask (**32.93s**), mismatched sequence lengths (**13.95s**),
++causal plus its expected error (**23.73s**), GQA (**41.40s**), and invalid GQA
++heads (**11.03s**).
++
++The strict backend path uses fp32 score/softmax/value accumulation, one bounded
++typed MAX task instead of the corrupting 31-stage mixed MAX tree, widened
++fp16 Q/K operands at the fp32 `MULACC` boundary, chunked GQA candidate grids,
++and a typed post-reduction epilogue for final division. The Rockchip test plugin
++selects PyTorch's portable MATH SDPA reference because its aarch64 flash kernel
++has architecture-specific fp16 rounding that also disagrees with PyTorch MATH.
++
++No LUT changed. Contract: **143/143**. The 424-case full-suite tally above is
++still the pre-attention baseline and has not been relabeled. Next forward
++group: `TestOps.test_binary_crossentropy`.
+diff --git a/tinygrad/mixin/rand.py b/tinygrad/mixin/rand.py
+index 003af96cd..b1ca7309d 100644
+--- a/tinygrad/mixin/rand.py
++++ b/tinygrad/mixin/rand.py
+@@ -324,4 +324,8 @@ class RandMixin(OpMixin):
+     if attn_mask is not None:
+       if attn_mask.dtype == dtypes.bool: attn_mask = attn_mask.where(0, -float("inf"))
+       qk = qk + attn_mask
+-    return qk.cast(self.dtype).softmax(-1).dropout(dropout_p) @ value
++    # Match SDPA's reference precision: reduced-width Q/K/V keep fp32 score,
++    # softmax, and value accumulation, with only the public result narrowed.
++    attention_dtype = least_upper_dtype(q.dtype, key.dtype, value.dtype, dtypes.float32)
++    attention = qk.softmax(-1, dtype=attention_dtype).dropout(dropout_p)
++    return attention.matmul(value.cast(attention_dtype), dtype=attention_dtype).cast(self.dtype)
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 99f3894d0..2d785e353 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -566,6 +566,11 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+   cursor += out_n+1
+   value_n = meta[cursor]
+   value_code = meta[cursor+1:cursor+1+value_n]
++  cursor += value_n+1
++  epilogue_code:list[int] = []
++  if tag == _HOST_ELEMENTWISE_REDUCE_LAYOUT and cursor < len(meta):
++    epilogue_n = meta[cursor]
++    epilogue_code = meta[cursor+1:cursor+1+epilogue_n]
+   np_dtypes = (np.bool_, np.int32, np.uint32, np.int64, np.uint64, np.uint8,
+                np.float16, np.float32, np.int64, np.int16, np.uint16, np.int8, np.float64)
+   inputs:list[dict] = []
+@@ -659,7 +664,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+         ret.append((linear//stride) % shape[axis])
+       return ret
+ 
+-    def evaluate_vector(code, coords):
++    def evaluate_vector(code, coords, reduced=None):
+       stack:list = []
+       for pos in range(0, len(code), 4):
+         op, dtype_code, arg0, arg1 = code[pos:pos+4]
+@@ -687,10 +692,17 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+           gathered[valid] = source[indices[valid]]
+           stack.append(gathered)
+           continue
++        if op == 31:
++          if reduced is None: raise RuntimeError("rk: typed reduction epilogue used without reduced value")
++          stack.append(np.asarray(reduced, dtype=np_dtypes[dtype_code]))
++          continue
+         args = stack[-arg0:] if arg0 else []
+         if arg0: del stack[-arg0:]
+         if op == 3: value = args[0] + args[1]
+         elif op == 4: value = args[0] * args[1]
++        elif op == 5: value = np.divide(args[0], args[1])
++        elif op == 17: value = np.exp2(args[0])
++        elif op == 22: value = args[0] // args[1]
+         elif op == 8: value = args[0] < args[1]
+         elif op == 9: value = args[0] != args[1]
+         elif op == 10: value = np.where(args[0], args[1], args[2])
+@@ -703,20 +715,27 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+       assert len(stack) == 1
+       return stack[0]
+ 
+-    loop_linear = np.arange(total, dtype=np.int64)
+-    loop_coords = coordinate_vectors(loop_extents, loop_linear)
+-    output_coords = [*loop_coords, *(np.zeros(total, dtype=np.int64) for _ in reduction_extents)]
+-    output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
+-    if np.any(output_indices < 0) or np.any(output_indices >= result.size):
+-      raise RuntimeError("rk: vector fancy-index output index out of bounds")
+-    full_linear = np.arange(total*reduction_total, dtype=np.int64)
+-    full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
+-    coords = [*coordinate_vectors(loop_extents, full_loop_linear),
+-              *coordinate_vectors(reduction_extents, reduction_linear)]
+-    values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(total, reduction_total)
+-    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else None
++    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else np.maximum if reduction_op == 2 else None
+     if reducer is None: raise RuntimeError(f"rk: invalid typed reduction opcode {reduction_op}")
+-    result[output_indices] = reducer.reduce(values, axis=1, dtype=np.float32)
++    # Bound coordinate/value grids to four million candidates. GQA attention
++    # reaches 16M candidates per contraction; one giant grid spends minutes in
++    # allocation/RCU teardown, while row chunks preserve identical reductions.
++    row_chunk = max(1, (1 << 22) // reduction_total)
++    for row_start in range(0, total, row_chunk):
++      row_end = min(total, row_start+row_chunk)
++      loop_linear = np.arange(row_start, row_end, dtype=np.int64)
++      loop_coords = coordinate_vectors(loop_extents, loop_linear)
++      output_coords = [*loop_coords, *(np.zeros(row_end-row_start, dtype=np.int64) for _ in reduction_extents)]
++      output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
++      if np.any(output_indices < 0) or np.any(output_indices >= result.size):
++        raise RuntimeError("rk: vector fancy-index output index out of bounds")
++      full_linear = np.arange(row_start*reduction_total, row_end*reduction_total, dtype=np.int64)
++      full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
++      coords = [*coordinate_vectors(loop_extents, full_loop_linear),
++                *coordinate_vectors(reduction_extents, reduction_linear)]
++      values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(row_end-row_start, reduction_total)
++      reduced = reducer.reduce(values, axis=1, dtype=np.float32)
++      result[output_indices] = evaluate_vector(epilogue_code, output_coords, reduced) if epilogue_code else reduced
+     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+     return
+ 
+@@ -2271,7 +2290,15 @@ class RockchipDevice(Compiled):
+       return HCQBuffer(va_addr=va, size=size)
+     mc = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags|rk.RKNPU_MEM_NON_CACHEABLE)
+     mm = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mc.handle, offset=0)
+-    va = self.fd_ctl.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mm.offset)
++    try: va = self.fd_ctl.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mm.offset)
++    except OSError:
++      # Some RK3588 driver/object-size combinations return an unusable >4 GiB
++      # map offset even below the conservative proactive host-buffer threshold.
++      rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, __payload=rk.struct_rknpu_mem_destroy(
++        handle=mc.handle, reserved=0, obj_addr=mc.obj_addr))
++      va = FileIOInterface.anon_mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE,
++                                     mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS, 0)
++      return HCQBuffer(va_addr=va, size=size)
+     mc.flink_name = self.create_flink_name(mc.handle, name)
+     return HCQBuffer(va_addr=va, size=size, meta=mc)
+ 
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 8d5e5fa1e..e3054aa9d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9074,7 +9074,8 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
+-def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|None=None) -> tuple[RKSubTask, ...]|None:
++def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|None=None,
++                                    post_reduction=False) -> tuple[RKSubTask, ...]|None:
+   """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
+   store = _store_node(sink)
+   if store is None: return None
+@@ -9083,10 +9084,12 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
+     output, val = store.src
+   else:
+     reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+-    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction or reduction.arg[0] not in (Ops.ADD, Ops.MUL): return None
++    if reductions != [reduction] or reduction.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or \
++       (reduction not in store.src[1].toposort() if post_reduction else _unwrap(store.src[1]) is not reduction): return None
+     output, val = store.src[0], reduction.src[0]
+   out_dtype = _host_dtype_code(output.dtype)
+-  if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
++  if output.op is not Ops.INDEX or out_dtype is None or \
++     (val.dtype is not output.dtype and not (reduction is not None and output.dtype is dtypes.half and val.dtype is dtypes.float)): return None
+   # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
+   # gather/fancy-index kernels whose data INDEX address loads an index tensor.
+   if not allow_plain and not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
+@@ -9117,6 +9120,9 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
+   def emit(u:UOp, code:list[int]) -> bool:
+     dtype_code = _host_dtype_code(u.dtype)
+     if dtype_code is None: return False
++    if post_reduction and u is reduction:
++      code.extend((31, dtype_code, 0, 0))
++      return True
+     if u.op is Ops.CONST:
+       if u.arg is Invalid: bits = 0
+       elif dtype_code == 0: bits = int(bool(u.arg))
+@@ -9141,14 +9147,17 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
+   out_code:list[int] = []
+   value_code:list[int] = []
+   if not emit(output.src[1], out_code) or not emit(val, value_code): return None
++  epilogue_code:list[int] = []
++  if post_reduction and not emit(store.src[1], epilogue_code): return None
+   out_slot = ProgramInfo.from_sink(sink).outs[0]
+   if reduction is None:
+     layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
+               len(out_code), *out_code, len(value_code), *value_code)
+   else:
++    epilogue_layout = (len(epilogue_code), *epilogue_code) if post_reduction else ()
+     layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions,
+-              0 if reduction.arg[0] is Ops.ADD else 1, *extents,
+-              len(out_code), *out_code, len(value_code), *value_code)
++              {Ops.ADD:0, Ops.MUL:1, Ops.MAX:2}[reduction.arg[0]], *extents,
++              len(out_code), *out_code, len(value_code), *value_code, *epilogue_layout)
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
+   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
+@@ -9575,6 +9584,130 @@ def _try_normalize_norm_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
+   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+ 
++def _try_attention_score_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Stage scaled batched attention scores and their optional additive mask."""
++  store = _store_node(sink)
++  shape = _shape_of_store(sink)
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or len(shape) not in (2, 3) or \
++     not any(extent <= 64 for extent in shape) or prod(shape) > 1 << 20: return None
++  value = _unwrap(store.src[1])
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  if len(reductions) != 1 or value.op not in (Ops.MUL, Ops.ADD): return None
++  reduce = reductions[0]
++  if reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or len(reduce.src) != 2 or \
++     reduce.src[1].src[0].op is not Ops.CONST: return None
++  width = int(reduce.src[1].src[0].arg)
++  body = _unwrap(reduce.src[0])
++  body_sources = tuple(_unwrap(x) for x in body.src)
++  if not 1 <= width <= 128 or body.op is not Ops.MUL or len(body_sources) != 2 or \
++     any(x.op is not Ops.INDEX or x.dtype not in (dtypes.half, dtypes.float) or x.src[0].op is not Ops.PARAM for x in body_sources) or \
++     len({x.dtype for x in body_sources}) != 1 or \
++     len({x.src[0].buf_uop.arg.slot for x in body_sources}) != 2: return None
++  constants = [float(u.arg) for u in value.toposort() if u.op is Ops.CONST and u.dtype in (dtypes.half, dtypes.float)]
++  if sum(math.isclose(constant, width**-0.5, rel_tol=1e-12) for constant in constants) != 1: return None
++  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++  if len({u.src[0].buf_uop.arg.slot for u in inputs}) not in (2, 3): return None
++  nodes = value.toposort()
++  causal = any(u.op is Ops.WHERE for u in nodes)
++  causal_casts = 3 if body_sources[0].dtype is dtypes.half and store.src[0].dtype is dtypes.float else 2
++  if causal and (sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes),
++                 sum(u.op is Ops.CAST for u in nodes)) != (1, 1, causal_casts): return None
++  if causal and not (0.0 in constants and -math.inf in constants): return None
++  allowed = {Ops.REDUCE, Ops.ADD, Ops.MUL, Ops.FLOORDIV, Ops.WHERE, Ops.CMPLT, Ops.CAST,
++             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes): return None
++
++  info, total = ProgramInfo.from_sink(sink), prod(shape)
++  scratch = UOp.param(info.outs[0], store.src[0].dtype, (total,), device=store.src[0].src[0].device)
++  scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
++  # CPU and NPU fp32-accumulating matmul widen fp16 operands before their
++  # product. Preserve that MULACC boundary instead of rounding every product
++  # to fp16 in the generic UOp evaluator.
++  staged_reduce = reduce
++  if body_sources[0].dtype is dtypes.half:
++    widened_sources = tuple(UOp(Ops.CAST, dtypes.float, (x,), arg=dtypes.float) for x in body_sources)
++    staged_reduce = reduce.replace(src=(UOp(Ops.MUL, dtypes.float, widened_sources), *reduce.src[1:]))
++  reduction_store = store.replace(src=(scratch_index, staged_reduce))
++  reduction_tasks = _try_elementwise_host_subtasks(sink.substitute({store:reduction_store}),
++                                                    allow_plain=True, reduction=staged_reduce)
++  if reduction_tasks is None: return None
++  reduction_value = scratch_index if scratch_index.dtype is reduce.dtype else \
++    UOp(Ops.CAST, reduce.dtype, (scratch_index,), arg=reduce.dtype)
++  epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:reduction_value})))
++  epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
++  return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
++
++def _try_bounded_attention_max_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Keep a compact floating-point MAX reduction in one typed task.
++
++  Attention softmax emits this exact boundary between its score and
++  denominator kernels. Serializing it also avoids the 31-stage mixed
++  host/native tree mutating the mapped score input on RK3588.
++  """
++  store, reduce = _store_node(sink), _reduce_node(sink)
++  shape = _shape_of_store(sink)
++  if store is None or reduce is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or \
++     _unwrap(store.src[1]) is not reduce or reduce.arg[0] is not Ops.MAX or reduce.dtype is not store.src[0].dtype or \
++     len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or \
++     not 1 <= int(reduce.src[1].src[0].arg) <= 64 or not 256 <= prod(shape) <= 1 << 20: return None
++  body = _unwrap(reduce.src[0])
++  if body.op is not Ops.INDEX or body.dtype is not reduce.dtype or body.src[0].op is not Ops.PARAM: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
++
++def _try_attention_value_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Stage the exact fused softmax-value contraction through a bounded typed reduction."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
++  value = _unwrap(store.src[1])
++  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
++  if value.op is Ops.REDUCE:
++    if len(reductions) != 1: return None
++    reduce = reductions[0]
++    if reduce is not value or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or \
++       len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or \
++       not 1 <= int(reduce.src[1].src[0].arg) <= 64: return None
++    body_nodes = reduce.src[0].toposort()
++    body_inputs = [u for u in body_nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++    input_slots = {u.src[0].buf_uop.arg.slot for u in body_inputs}
++    if len(input_slots) not in (2, 4) or any(u.dtype is not dtypes.half for u in body_inputs) or \
++       sum(u.op is Ops.EXP2 for u in body_nodes) != 1: return None
++    shape = _shape_of_store(sink)
++    if (len(input_slots) == 2 and len(shape) != 1) or (len(input_slots) == 4 and len(shape) not in (2, 3)): return None
++    if len(input_slots) == 2 and any(u.op is Ops.FDIV for u in body_nodes): return None
++    if len(input_slots) == 4 and sum(u.op is Ops.FDIV for u in body_nodes) != 1: return None
++    allowed = {Ops.EXP2, Ops.ADD, Ops.MUL, Ops.FDIV, Ops.CAST, Ops.FLOORDIV,
++               Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++    if any(u.op not in allowed for u in body_nodes): return None
++    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
++  if len(_shape_of_store(sink)) not in (2, 3): return None
++  if value.op is not Ops.FDIV or len(reductions) != 1: return None
++  reduce = reductions[0]
++  denominator = _unwrap(value.src[1])
++  if _unwrap(value.src[0]) is not reduce or denominator.op is not Ops.INDEX or denominator.dtype is not dtypes.float or \
++     denominator.src[0].op is not Ops.PARAM or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or \
++     len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or not 1 <= int(reduce.src[1].src[0].arg) <= 64: return None
++  body_nodes = reduce.src[0].toposort()
++  body_inputs = [u for u in body_nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
++  if reduce.src[0].op is not Ops.MUL or sum(u.op is Ops.EXP2 for u in body_nodes) != 1 or \
++     len({u.src[0].buf_uop.arg.slot for u in body_inputs}) != 3: return None
++  allowed = {Ops.EXP2, Ops.ADD, Ops.MUL, Ops.CAST, Ops.FLOORDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in body_nodes): return None
++  if store.src[0].dtype is dtypes.half:
++    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
++
++  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++  # Both stages are typed host tasks. Reuse the final output as scratch; the
++  # elementwise runner snapshots every mapped input before writing its result.
++  scratch = UOp.param(info.outs[0], dtypes.float, (total,), device=store.src[0].src[0].device)
++  scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
++  reduction_store = store.replace(src=(scratch_index, reduce))
++  reduction_tasks = _try_elementwise_host_subtasks(sink.substitute({store:reduction_store}),
++                                                    allow_plain=True, reduction=reduce)
++  if reduction_tasks is None: return None
++  epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:scratch_index})))
++  epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
++  return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
++
+ def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
+   store = _store_node(sink)
+@@ -12660,7 +12793,6 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
+     # Runtime K-tile accumulation is retained as WIP reference, but uses host
+     # addition between NPU partials. Keep this forward path NPU-arithmetic-only.
+-    if stage_plan.cmac_materialization and stage_plan.cmac_materialization[2] > 4096: return None
+     # Shared batch/group axes expand direct materialization into a block-diagonal
+     # K. Serialize them like conv_grok's cartesian local tiles: besides avoiding
+     # unused cross-batch cells, this keeps multi-row CMAC below the proven
+@@ -12668,6 +12800,7 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None:
+       tasks.extend(RKSubTask(st.cmds, replace(st.task, fp32_output=fp32_output), st.relocs) for st in shared_tasks)
+     else:
++      if stage_plan.cmac_materialization and stage_plan.cmac_materialization[2] > 4096: return None
+       cmds, task, relocs = emit_rk(stage_plan)
+       tasks.append(RKSubTask(cmds, replace(task, fp32_output=fp32_output), relocs))
+     return out_slot
+@@ -13938,6 +14071,12 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
+   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
+   if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
++  if (bounded_attention_max_tasks := _try_bounded_attention_max_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, bounded_attention_max_tasks)
++  if (attention_score_tasks := _try_attention_score_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, attention_score_tasks)
++  if (attention_value_tasks := _try_attention_value_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, attention_value_tasks)
+   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
+   if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, logcumsumexp_tasks)
