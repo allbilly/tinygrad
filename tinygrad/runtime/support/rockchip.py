@@ -3424,124 +3424,89 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Piecewise tangent using direct local/wide LUTs and a pole-safe trig quotient."""
   store = _store_node(sink)
   if store is None or (source := _try_tan(store.src[1])) is None: return None
-  info, total, next_slot = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink)), max(ProgramInfo.from_sink(sink).globals, default=-1)+1
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot+1
-    return ret
-  def temp_index(slot:int) -> UOp:
-    idx = store.src[0]
-    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
+  graph = _TaskGraph(sink, store, source)
   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
-  ns, ab, idiff, isc, invalid, low, nl, nc, bounded = (alloc() for _ in range(9))
-  tasks = [_emit_where_stage(total, ns, zero, source_arg, Ops.SUB),
-           _emit_where_stage(total, ab, source_arg, (ns,0), Ops.MAX),
-           _emit_where_stage(total, idiff, (ab,0), _float_arg(20000), Ops.SUB),
-           _emit_where_stage(total, isc, (idiff,0), (idiff,0), Ops.MAX, compare=True),
-           _emit_where_stage(total, invalid, (idiff,0), (idiff,0), Ops.MAX, compare=True),
-           _emit_where_stage(total, bounded, source_arg, zero, Ops.ADD)]
-  if source.src[0].dtype is dtypes.half:
-    tasks = [_emit_where_stage(total, ns, zero, source_arg, Ops.SUB),
-             _emit_where_stage(total, ab, source_arg, (ns,0), Ops.MAX),
-             _emit_where_stage(total, bounded, source_arg, zero, Ops.ADD)]
-  q,nq,aq,aq_corrected,bias,nabs,pd,pos,neg,pn,nn,snn,n = (alloc() for _ in range(13))
-  tasks += [_emit_where_stage(total,q,(bounded,0),_float_arg(1/math.pi),Ops.MUL),
-            _emit_where_stage(total,nq,zero,(q,0),Ops.SUB), _emit_where_stage(total,aq,(q,0),(nq,0),Ops.MAX),
-            # fp16 1/pi can round values just below every odd pi/2 to an exact .5 tie.
-            # Bias toward the lower magnitude period; no fp16 input is exactly pi/2.
-            _emit_where_stage(total,aq_corrected,(aq,0),_float_arg(.0005),Ops.SUB),
-            _emit_where_stage(total,bias,(aq_corrected,0),_float_arg(.5),Ops.ADD), _emit_trunc_stage(total,nabs,(bias,0)),
-            _emit_where_stage(total,pd,(q,0),zero,Ops.SUB), _emit_where_stage(total,pos,(pd,0),(pd,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,neg,one,(pos,0),Ops.SUB), _emit_where_stage(total,pn,(nabs,0),(pos,0),Ops.MUL),
-            _emit_where_stage(total,nn,(nabs,0),(neg,0),Ops.MUL), _emit_where_stage(total,snn,zero,(nn,0),Ops.SUB),
-            _emit_where_stage(total,n,(pn,0),(snn,0),Ops.ADD)]
+  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
+  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
+  invalid = graph.positive_mask(abs_source, _float_arg(20000), repeat=True) if source.src[0].dtype is dtypes.float else None
+  bounded = graph.op(source_arg, zero, Ops.ADD, repeat=False)
+  quotient = graph.op(bounded, _float_arg(1/math.pi), Ops.MUL, repeat=False)
+  neg_quotient = graph.op(zero, quotient, Ops.SUB, repeat=False)
+  abs_quotient = graph.op(quotient, neg_quotient, Ops.MAX, repeat=False)
+  # fp16 1/pi can round values just below every odd pi/2 to an exact .5 tie.
+  # Bias toward the lower magnitude period; no fp16 input is exactly pi/2.
+  corrected = graph.op(abs_quotient, _float_arg(.0005), Ops.SUB, repeat=False)
+  biased = graph.op(corrected, _float_arg(.5), Ops.ADD, repeat=False)
+  rounded_abs = graph.alloc()
+  graph.tasks.append(_emit_trunc_stage(graph.total, rounded_abs, biased))
+  positive = graph.positive_mask(quotient, zero)
+  negative = graph.op(one, positive, Ops.SUB, repeat=False)
+  positive_n = graph.op((rounded_abs,0), positive, Ops.MUL, repeat=False)
+  negative_n = graph.op((rounded_abs,0), negative, Ops.MUL, repeat=False)
+  rounded = graph.op(positive_n, graph.op(zero, negative_n, Ops.SUB, repeat=False), Ops.ADD, repeat=False)
   reduced = bounded
   for coefficient in (3.140625, math.pi-3.140625):
-    product_slot, next_reduced = alloc(), alloc()
-    tasks += [_emit_where_stage(total,product_slot,(n,0),_float_arg(coefficient),Ops.MUL),
-              _emit_where_stage(total,next_reduced,(reduced,0),(product_slot,0),Ops.SUB)]
-    reduced = next_reduced
-  def add_value(val:UOp, out:int) -> bool:
-    plan=plan_rk(sink.substitute({store:store.replace(src=(temp_index(out),val))}))
-    if isinstance(plan,str) or plan.kind!="dpu_lut": return False
-    cmds,task,relocs=emit_rk(plan)
-    tasks.append(RKSubTask(cmds,task,relocs))
-    return True
-  def add_lut(arg:str, out:int) -> bool: return add_value(UOp(Ops.CUSTOM,dtypes.half,(temp_index(reduced),),arg=arg),out)
-  local, wide, sine, cos_local = alloc(), alloc(), alloc(), alloc()
-  if not add_lut("rk_tan_local",local) or not add_value(UOp(Ops.SIN,dtypes.half,(temp_index(reduced),)),sine) or \
-     not add_lut("rk_tan_wide",wide) or not add_lut("rk_cos_local",cos_local): return None
-  nr,ar,diff,outside,inside = (alloc() for _ in range(5))
-  tan_near_diff,tan_near_outside,tan_near_inside,tan_local_mask = (alloc() for _ in range(4))
-  center_hi,center,ncenter,acenter,cdiff,coutside,cinside,cmask = (alloc() for _ in range(8))
-  pole_diff,pole_group,base_extra,pole_base,pole_dist,rem_extra,pole_rem,source_center = (alloc() for _ in range(8))
-  qdiff,qoutside,middle_mask = alloc(),alloc(),alloc()
-  neg_sine,abs_sine,center_sq,center_term,center_factor,center_cos = (alloc() for _ in range(6))
-  cos_scaled,cos_center_sel,cos_local_sel,cosine_partial,safe_cos,cosine,quotient = (alloc() for _ in range(7))
-  quotient_adjusted,quotient_center,quotient_middle = alloc(),alloc(),alloc()
-  local_scaled,wide_scaled,qs,ws,ls,near_sel,tmp_sel,tmp2,selected = (alloc() for _ in range(9))
-  tasks += [_emit_where_stage(total,nr,zero,(reduced,0),Ops.SUB), _emit_where_stage(total,ar,(reduced,0),(nr,0),Ops.MAX),
-            _emit_where_stage(total,diff,(ar,0),_float_arg(.45),Ops.SUB),
-            _emit_where_stage(total,outside,(diff,0),(diff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,inside,one,(outside,0),Ops.SUB),
-            _emit_where_stage(total,tan_near_diff,(ar,0),_float_arg(.04),Ops.SUB),
-            _emit_where_stage(total,tan_near_outside,(tan_near_diff,0),(tan_near_diff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,tan_near_inside,one,(tan_near_outside,0),Ops.SUB),
-            _emit_where_stage(total,tan_local_mask,(inside,0),(tan_near_inside,0),Ops.SUB),
-            _emit_where_stage(total,qdiff,(ar,0),_float_arg(1.05),Ops.SUB),
-            _emit_where_stage(total,qoutside,(qdiff,0),(qdiff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,pole_diff,(ab,0),_float_arg(3.0),Ops.SUB),
-            _emit_where_stage(total,pole_group,(pole_diff,0),(pole_diff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,base_extra,(pole_group,0),_float_arg(3.0),Ops.MUL),
-            _emit_where_stage(total,pole_base,_float_arg(1.5),(base_extra,0),Ops.ADD),
-            _emit_where_stage(total,pole_dist,(pole_base,0),(ab,0),Ops.SUB),
-            _emit_where_stage(total,rem_extra,(pole_group,0),_float_arg(.140625),Ops.MUL),
-            _emit_where_stage(total,pole_rem,_float_arg(.0703125),(rem_extra,0),Ops.ADD),
-            _emit_where_stage(total,center_hi,(pole_dist,0),(pole_rem,0),Ops.ADD),
-            _emit_where_stage(total,local_scaled,(pole_group,0),_float_arg(math.pi-3.140625),Ops.MUL),
-            _emit_where_stage(total,center,_float_arg(math.pi/2-1.5703125),(local_scaled,0),Ops.ADD),
-            _emit_where_stage(total,source_center,(center_hi,0),(center,0),Ops.ADD),
-            _emit_where_stage(total,ncenter,zero,(source_center,0),Ops.SUB),
-            _emit_where_stage(total,acenter,(source_center,0),(ncenter,0),Ops.MAX),
-            _emit_where_stage(total,cdiff,(acenter,0),_float_arg(.05),Ops.SUB),
-            _emit_where_stage(total,coutside,(cdiff,0),(cdiff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,cinside,one,(coutside,0),Ops.SUB),
-            _emit_where_stage(total,cmask,(qoutside,0),(cinside,0),Ops.SUB),
-            _emit_where_stage(total,cos_scaled,(cos_local,0),_float_arg(.5),Ops.MUL),
-            # In the closest pole band, cot(d) ~= 1/d. Cancelling the sine LUT
-            # magnitude avoids amplifying its Q15 quantization in the quotient.
-            _emit_where_stage(total,neg_sine,zero,(sine,0),Ops.SUB),
-            _emit_where_stage(total,abs_sine,(sine,0),(neg_sine,0),Ops.MAX),
-            _emit_where_stage(total,center_sq,(acenter,0),(acenter,0),Ops.MUL),
-            _emit_where_stage(total,center_term,(center_sq,0),_float_arg(1/3),Ops.MUL),
-            _emit_where_stage(total,center_factor,one,(center_term,0),Ops.SUB),
-            _emit_where_stage(total,center_cos,(acenter,0),(abs_sine,0),Ops.MUL),
-            _emit_where_stage(total,cos_center_sel,(center_cos,0),(cinside,0),Ops.MUL),
-            _emit_where_stage(total,cos_local_sel,(cos_scaled,0),(cmask,0),Ops.MUL),
-            _emit_where_stage(total,cosine_partial,(cos_center_sel,0),(cos_local_sel,0),Ops.ADD),
-            _emit_where_stage(total,safe_cos,one,(qoutside,0),Ops.SUB),
-            _emit_where_stage(total,cosine,(cosine_partial,0),(safe_cos,0),Ops.ADD),
-            _emit_where_stage(total,quotient,(sine,0),(cosine,0),Ops.FDIV),
-            _emit_where_stage(total,quotient_adjusted,(quotient,0),(center_factor,0),Ops.MUL),
-            _emit_where_stage(total,quotient_center,(quotient_adjusted,0),(cinside,0),Ops.MUL),
-            _emit_where_stage(total,quotient_middle,(quotient,0),(cmask,0),Ops.MUL),
-            _emit_where_stage(total,qs,(quotient_center,0),(quotient_middle,0),Ops.ADD),
-            _emit_where_stage(total,middle_mask,(outside,0),(qoutside,0),Ops.SUB),
-            _emit_where_stage(total,wide_scaled,(wide,0),_float_arg(2.0),Ops.MUL),
-            _emit_where_stage(total,ws,(wide_scaled,0),(middle_mask,0),Ops.MUL),
-            _emit_where_stage(total,ls,(local,0),(tan_local_mask,0),Ops.MUL),
-            _emit_where_stage(total,near_sel,(reduced,0),(tan_near_inside,0),Ops.MUL),
-            _emit_where_stage(total,tmp_sel,(qs,0),(ws,0),Ops.ADD),
-            _emit_where_stage(total,tmp2,(tmp_sel,0),(ls,0),Ops.ADD),
-            _emit_where_stage(total,selected,(tmp2,0),(near_sel,0),Ops.ADD)]
+    product = graph.op(rounded, _float_arg(coefficient), Ops.MUL, repeat=False)
+    reduced = graph.op(reduced, product, Ops.SUB, repeat=False)
+  local, sine, wide, cos_local = (graph.alloc() for _ in range(4))
+  if not graph.emit_named_lut("rk_tan_local", reduced[0], local) or \
+     not graph.emit_lut(UOp(Ops.SIN, dtypes.half, (graph.temp_index(reduced[0]),)), sine) or \
+     not graph.emit_named_lut("rk_tan_wide", reduced[0], wide) or \
+     not graph.emit_named_lut("rk_cos_local", reduced[0], cos_local): return None
+  neg_reduced = graph.op(zero, reduced, Ops.SUB, repeat=False)
+  abs_reduced = graph.op(reduced, neg_reduced, Ops.MAX, repeat=False)
+  outside = graph.positive_mask(abs_reduced, _float_arg(.45))
+  inside = graph.op(one, outside, Ops.SUB, repeat=False)
+  tan_near_outside = graph.positive_mask(abs_reduced, _float_arg(.04))
+  tan_near_inside = graph.op(one, tan_near_outside, Ops.SUB, repeat=False)
+  tan_local_mask = graph.op(inside, tan_near_inside, Ops.SUB, repeat=False)
+  quotient_outside = graph.positive_mask(abs_reduced, _float_arg(1.05))
+  pole_group = graph.positive_mask(abs_source, _float_arg(3.0))
+  base_extra = graph.op(pole_group, _float_arg(3.0), Ops.MUL, repeat=False)
+  pole_base = graph.op(_float_arg(1.5), base_extra, Ops.ADD, repeat=False)
+  pole_distance = graph.op(pole_base, abs_source, Ops.SUB, repeat=False)
+  remainder = graph.op(_float_arg(.0703125), graph.op(pole_group, _float_arg(.140625), Ops.MUL, repeat=False), Ops.ADD, repeat=False)
+  center_hi = graph.op(pole_distance, remainder, Ops.ADD, repeat=False)
+  center = graph.op(_float_arg(math.pi/2-1.5703125),
+                    graph.op(pole_group, _float_arg(math.pi-3.140625), Ops.MUL, repeat=False), Ops.ADD, repeat=False)
+  source_center = graph.op(center_hi, center, Ops.ADD, repeat=False)
+  neg_center = graph.op(zero, source_center, Ops.SUB, repeat=False)
+  abs_center = graph.op(source_center, neg_center, Ops.MAX, repeat=False)
+  center_outside = graph.positive_mask(abs_center, _float_arg(.05))
+  center_inside = graph.op(one, center_outside, Ops.SUB, repeat=False)
+  center_mask = graph.op(quotient_outside, center_inside, Ops.SUB, repeat=False)
+  cos_scaled = graph.op((cos_local,0), _float_arg(.5), Ops.MUL, repeat=False)
+  # In the closest pole band, cot(d) ~= 1/d. Cancelling the sine LUT magnitude
+  # avoids amplifying its Q15 quantization in the quotient.
+  neg_sine = graph.op(zero, (sine,0), Ops.SUB, repeat=False)
+  abs_sine = graph.op((sine,0), neg_sine, Ops.MAX, repeat=False)
+  center_sq = graph.op(abs_center, abs_center, Ops.MUL, repeat=False)
+  center_term = graph.op(center_sq, _float_arg(1/3), Ops.MUL, repeat=False)
+  center_factor = graph.op(one, center_term, Ops.SUB, repeat=False)
+  center_cos = graph.op(abs_center, abs_sine, Ops.MUL, repeat=False)
+  center_selected = graph.op(center_cos, center_inside, Ops.MUL, repeat=False)
+  local_cos_selected = graph.op(cos_scaled, center_mask, Ops.MUL, repeat=False)
+  cosine_partial = graph.op(center_selected, local_cos_selected, Ops.ADD, repeat=False)
+  safe_cos = graph.op(one, quotient_outside, Ops.SUB, repeat=False)
+  cosine = graph.op(cosine_partial, safe_cos, Ops.ADD, repeat=False)
+  tangent = graph.op((sine,0), cosine, Ops.FDIV, repeat=False)
+  center_quotient = graph.op(graph.op(tangent, center_factor, Ops.MUL, repeat=False), center_inside, Ops.MUL, repeat=False)
+  middle_quotient = graph.op(tangent, center_mask, Ops.MUL, repeat=False)
+  quotient_selected = graph.op(center_quotient, middle_quotient, Ops.ADD, repeat=False)
+  middle_mask = graph.op(outside, quotient_outside, Ops.SUB, repeat=False)
+  wide_selected = graph.op(graph.op((wide,0), _float_arg(2.0), Ops.MUL, repeat=False), middle_mask, Ops.MUL, repeat=False)
+  local_selected = graph.op((local,0), tan_local_mask, Ops.MUL, repeat=False)
+  near_selected = graph.op(reduced, tan_near_inside, Ops.MUL, repeat=False)
+  selected = graph.op(graph.op(graph.op(quotient_selected, wide_selected, Ops.ADD, repeat=False),
+                                local_selected, Ops.ADD, repeat=False), near_selected, Ops.ADD, repeat=False)
   if source.src[0].dtype is dtypes.half:
-    tasks += [_emit_where_stage(total,info.outs[0],(selected,0),one,Ops.MUL)]
+    graph.op(selected, one, Ops.MUL, out_slot=graph.out, repeat=False)
   else:
-    ds,vd,fs,vf=(alloc() for _ in range(4))
-    tasks += [_emit_where_stage(total,ds,one,(invalid,0),Ops.SUB),_emit_where_stage(total,vd,one,(invalid,0),Ops.SUB),
-              _emit_where_stage(total,fs,(vd,0),(vd,0),Ops.FDIV),_emit_where_stage(total,vf,(vd,0),(vd,0),Ops.FDIV),
-              _emit_where_stage(total,info.outs[0],(selected,0),(vf,0),Ops.MUL)]
-  tasks=list(_fix_cmp_fp32(tuple(tasks),source))
+    assert invalid is not None
+    valid = graph.op(one, invalid, Ops.SUB)
+    factor = graph.op(valid, valid, Ops.FDIV)
+    graph.op(selected, factor, Ops.MUL, out_slot=graph.out, repeat=False)
+  tasks=list(_fix_cmp_fp32(tuple(graph.tasks),source))
   if source.src[0].dtype is dtypes.float:
     slot=source.src[0].arg.slot
     tasks=[RKSubTask(st.cmds,replace(st.task,periodic_input=True),st.relocs) if slot in st.task.fp32_inputs else st for st in tasks]
