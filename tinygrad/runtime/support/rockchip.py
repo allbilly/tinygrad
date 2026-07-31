@@ -3226,50 +3226,24 @@ def _try_logsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       [(u.dtype, u.src[0].buf_uop.arg.slot) for u in val.toposort() if u.op is Ops.INDEX],
       set(u.op for u in val.toposort()))
   if store is None or source is None: return None
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  next_slot = max(info.globals, default=-1) + 1
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-  def temp_index(slot:int) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-
-  correction = alloc()
-  lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_correction")
-  lut_store = store.replace(src=(temp_index(correction), lut_val))
-  lut_plan = plan_rk(sink.substitute({store:lut_store}))
-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(lut_plan)
-  tasks = [RKSubTask(cmds, task, relocs)]
-
-  tail = alloc()
-  tail_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_tail")
-  tail_store = store.replace(src=(temp_index(tail), tail_val))
-  tail_plan = plan_rk(sink.substitute({store:tail_store}))
-  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut": return None
-  cmds, task, relocs = emit_rk(tail_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
-
+  graph = _TaskGraph(sink, store, source)
+  correction, tail = graph.alloc(), graph.alloc()
+  if not graph.emit_lut(UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_correction"), correction): return None
+  if not graph.emit_lut(UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_tail"), tail): return None
   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
-  positive, minimum, tail_diff, tail_mask, broad_mask = (alloc() for _ in range(5))
-  broad_selected, tail_scaled, tail_selected, selected_correction = (alloc() for _ in range(4))
-  raw_output, negated_output, clamped_output = alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, positive, source_arg, zero, Ops.MAX),
-                _emit_where_stage(total, minimum, source_arg, (positive, 0), Ops.SUB),
-                _emit_where_stage(total, tail_diff, source_arg, _float_arg(3.5), Ops.SUB),
-                _emit_where_stage(total, tail_mask, (tail_diff, 0), (tail_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, broad_mask, one, (tail_mask, 0), Ops.SUB),
-                _emit_where_stage(total, broad_selected, (correction, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, tail_scaled, (tail, 0), _float_arg(1/32), Ops.MUL),
-                _emit_where_stage(total, tail_selected, (tail_scaled, 0), (tail_mask, 0), Ops.MUL),
-                _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
-                _emit_where_stage(total, raw_output, (minimum, 0), (selected_correction, 0), Ops.ADD),
-                _emit_where_stage(total, negated_output, (raw_output, 0), _float_arg(-1.0), Ops.MUL),
-                _emit_where_stage(total, clamped_output, (negated_output, 0), zero, Ops.MAX),
-                _emit_where_stage(total, info.outs[0], (clamped_output, 0), _float_arg(-1.0), Ops.MUL)))
-  return tuple(tasks)
+  positive = graph.op(source_arg, zero, Ops.MAX, repeat=False)
+  minimum = graph.op(source_arg, positive, Ops.SUB, repeat=False)
+  tail_mask = graph.positive_mask(source_arg, _float_arg(3.5))
+  broad_mask = graph.op(one, tail_mask, Ops.SUB, repeat=False)
+  broad_selected = graph.op((correction,0), broad_mask, Ops.MUL, repeat=False)
+  tail_scaled = graph.op((tail,0), _float_arg(1/32), Ops.MUL, repeat=False)
+  tail_selected = graph.op(tail_scaled, tail_mask, Ops.MUL, repeat=False)
+  selected_correction = graph.op(broad_selected, tail_selected, Ops.ADD, repeat=False)
+  raw_output = graph.op(minimum, selected_correction, Ops.ADD, repeat=False)
+  negated_output = graph.op(raw_output, _float_arg(-1.0), Ops.MUL, repeat=False)
+  clamped_output = graph.op(negated_output, zero, Ops.MAX, repeat=False)
+  graph.op(clamped_output, _float_arg(-1.0), Ops.MUL, out_slot=graph.out, repeat=False)
+  return tuple(graph.tasks)
 
 def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate Softplus as max(x,0) minus broad/amplified-tail correction LUTs."""
@@ -3282,79 +3256,51 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       for op in (Ops.EXP2, Ops.LOG2, Ops.MAX, Ops.CAST)})
   if store is None or match is None: return None
   source, beta = match
-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  next_slot = max(info.globals, default=-1) + 1
-  def alloc() -> int:
-    nonlocal next_slot
-    ret, next_slot = next_slot, next_slot + 1
-    return ret
-  def temp_index(slot:int) -> UOp:
-    out_idx = store.src[0]
-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-
-  tasks:list[RKSubTask] = []
+  graph = _TaskGraph(sink, store, source)
   if source.op is not Ops.INDEX or not _is_flat_contiguous(source.src[1]):
-    materialized_source = alloc()
-    source_store = store.replace(src=(temp_index(materialized_source), source))
-    source_plan = plan_rk(sink.substitute({store:source_store}))
+    materialized_source = graph.alloc()
+    source_plan = plan_rk(graph.stage_sink(source, materialized_source))
     if isinstance(source_plan, str) or source_plan.kind != "dpu":
       if getenv("RK_TRACE_MATCH"): print("rk softplus source reject", source_plan)
       return None
     cmds, task, relocs = emit_rk(source_plan)
-    tasks.append(RKSubTask(cmds, task, relocs))
-    source = temp_index(materialized_source)
+    graph.tasks.append(RKSubTask(cmds, task, relocs))
+    source = graph.temp_index(materialized_source)
   source_arg = (source.src[0].buf_uop.arg.slot, 0)
   if beta < 1.0:
-    correction, positive, raw_output = alloc(), alloc(), alloc()
-    far_diff, far_mask, finite_mask, finite_output = (alloc() for _ in range(4))
+    correction = graph.alloc()
     wide_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_softplus_wide", beta))
-    wide_store = store.replace(src=(temp_index(correction), wide_val))
-    wide_plan = plan_rk(sink.substitute({store:wide_store}))
-    if isinstance(wide_plan, str) or wide_plan.kind != "dpu_lut": return None
-    cmds, task, relocs = emit_rk(wide_plan)
-    return (*tasks, RKSubTask(cmds, task, relocs),
-            _emit_where_stage(total, positive, source_arg, (_ZERO_SLOT, 0), Ops.MAX),
-            _emit_where_stage(total, raw_output, (positive, 0), (correction, 0), Ops.SUB),
-            _emit_where_stage(total, far_diff, _float_arg(-100.0), source_arg, Ops.SUB),
-            _emit_where_stage(total, far_mask, (far_diff, 0), (far_diff, 0), Ops.MAX, compare=True),
-            _emit_where_stage(total, finite_mask, _float_arg(1.0), (far_mask, 0), Ops.SUB),
-            _emit_where_stage(total, finite_output, (raw_output, 0), (finite_mask, 0), Ops.MUL),
-            _emit_where_stage(total, info.outs[0], (finite_output, 0), (_ZERO_SLOT, 0), Ops.MAX))
+    if not graph.emit_lut(wide_val, correction): return None
+    positive = graph.op(source_arg, (_ZERO_SLOT,0), Ops.MAX, repeat=False)
+    raw_output = graph.op(positive, (correction,0), Ops.SUB, repeat=False)
+    far_mask = graph.positive_mask(_float_arg(-100.0), source_arg)
+    finite_mask = graph.op(_float_arg(1.0), far_mask, Ops.SUB, repeat=False)
+    finite_output = graph.op(raw_output, finite_mask, Ops.MUL, repeat=False)
+    graph.op(finite_output, (_ZERO_SLOT,0), Ops.MAX, out_slot=graph.out, repeat=False)
+    return tuple(graph.tasks)
 
-  correction = alloc()
+  correction = graph.alloc()
   broad_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_logsigmoid_correction", beta, 1/beta))
-  broad_store = store.replace(src=(temp_index(correction), broad_val))
-  broad_plan = plan_rk(sink.substitute({store:broad_store}))
-  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut":
-    if getenv("RK_TRACE_MATCH"): print("rk softplus broad reject", broad_plan)
+  if not graph.emit_lut(broad_val, correction):
+    if getenv("RK_TRACE_MATCH"): print("rk softplus broad reject")
     return None
-  cmds, task, relocs = emit_rk(broad_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
-
-  tail = alloc()
+  tail = graph.alloc()
   tail_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=("rk_softplus_tail", beta, 1/beta))
-  tail_store = store.replace(src=(temp_index(tail), tail_val))
-  tail_plan = plan_rk(sink.substitute({store:tail_store}))
-  if isinstance(tail_plan, str) or tail_plan.kind != "dpu_lut":
-    if getenv("RK_TRACE_MATCH"): print("rk softplus tail reject", tail_plan)
+  if not graph.emit_lut(tail_val, tail):
+    if getenv("RK_TRACE_MATCH"): print("rk softplus tail reject")
     return None
-  cmds, task, relocs = emit_rk(tail_plan)
-  tasks.append(RKSubTask(cmds, task, relocs))
 
   zero, one = (_ZERO_SLOT, 0), _float_arg(1.0)
-  positive, tail_diff, tail_mask, broad_mask = (alloc() for _ in range(4))
-  broad_selected, tail_scaled, tail_selected, selected_correction, raw_output = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, positive, source_arg, zero, Ops.MAX),
-                _emit_where_stage(total, tail_diff, _float_arg(-3.05/beta), source_arg, Ops.SUB),
-                _emit_where_stage(total, tail_mask, (tail_diff, 0), (tail_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, broad_mask, one, (tail_mask, 0), Ops.SUB),
-                _emit_where_stage(total, broad_selected, (correction, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, tail_scaled, (tail, 0), _float_arg(1/21), Ops.MUL),
-                _emit_where_stage(total, tail_selected, (tail_scaled, 0), (tail_mask, 0), Ops.MUL),
-                _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
-                _emit_where_stage(total, raw_output, (positive, 0), (selected_correction, 0), Ops.SUB),
-                _emit_where_stage(total, info.outs[0], (raw_output, 0), zero, Ops.MAX)))
-  return tuple(tasks)
+  positive = graph.op(source_arg, zero, Ops.MAX, repeat=False)
+  tail_mask = graph.positive_mask(_float_arg(-3.05/beta), source_arg)
+  broad_mask = graph.op(one, tail_mask, Ops.SUB, repeat=False)
+  broad_selected = graph.op((correction,0), broad_mask, Ops.MUL, repeat=False)
+  tail_scaled = graph.op((tail,0), _float_arg(1/21), Ops.MUL, repeat=False)
+  tail_selected = graph.op(tail_scaled, tail_mask, Ops.MUL, repeat=False)
+  selected_correction = graph.op(broad_selected, tail_selected, Ops.ADD, repeat=False)
+  raw_output = graph.op(positive, selected_correction, Ops.SUB, repeat=False)
+  graph.op(raw_output, zero, Ops.MAX, out_slot=graph.out, repeat=False)
+  return tuple(graph.tasks)
 
 def _try_mish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate Mish with broad/local LUTs and a near-zero Taylor interval."""
