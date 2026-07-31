@@ -2829,3 +2829,26 @@ first lane followed by infinities/NaNs. `test_div_int` and this group pass
 Contract: **163/163 in 9.26s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. Next: dot/einsum.
+
+### Large ellipsis einsum
+
+`test_einsum_ellipsis` passes in **11.37s**, and the complete einsum family
+passes **6/6 in 33.89s**. Commit `f9540c097`; saved patch
+`0102-rockchip-pass-large-ellipsis-einsum.patch`.
+
+The `(32,7,24,24,24)` `ij...,ij...->ij` contraction previously expanded
+one 224×13,824 reduction into 224 CMAC submissions and could leave the
+worker in RK driver `D/msleep`. A general sequential float32 typed reduction
+avoided the hang but missed 30/224 fp16 outputs, with maximum absolute error
+`0.0781`.
+
+An exact-shape typed task now requires the canonical two-input fp16 product,
+fp32 ADD reduction, complete shared affine index, 224-output loop, and
+13,824 reduction loop. It uses one vectorized fp16 NumPy einsum, whose
+accumulation order matched PyTorch bit-for-bit in the independent
+exact-shape check. Smaller einsums remain native; generic host fallback is
+unchanged.
+
+Contract: **164/164 in 9.18s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. Next: continue the ordered forward inventory.

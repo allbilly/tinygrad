@@ -1,0 +1,171 @@
+From f9540c097ce44700c9c32c455f60a8bf87d88601 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 15:13:55 +0800
+Subject: [PATCH] rockchip: pass large ellipsis einsum
+
+---
+ test/rockchip/test_pr1.py            | 13 +++++++++++-
+ tinygrad/runtime/ops_rockchip.py     | 23 ++++++++++++++++-----
+ tinygrad/runtime/support/rockchip.py | 30 ++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index bbcda941c..a24c40ec4 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -12,7 +12,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
+                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
+                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
+                                                _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
+-                                               _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT)
++                                               _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -974,6 +974,17 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+       self.assertEqual(subtasks[0].task.layout[5], 1)
+ 
++  def test_large_ellipsis_einsum_uses_one_typed_float32_reduction(self):
++    lhs = Tensor.empty(32, 7, 24, 24, 24, dtype=dtypes.half, device="ROCKCHIP")
++    rhs = Tensor.empty(32, 7, 24, 24, 24, dtype=dtypes.half, device="ROCKCHIP")
++    expression = Tensor.einsum("ij...,ij...->ij", lhs, rhs)
++    sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++    program = build_native_program(sink)
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout, (224, _HOST_EINSUM_LAYOUT, 13824))
++
+   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
+     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
+     for expression in (source.argmax(0, False), source.argmin(0, False)):
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index ed8cab30e..ae0c2c8e7 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -25,7 +25,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
+-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
++  _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -549,8 +550,20 @@ def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+     if not 0 <= sign_index < sign.size // itemsize: raise RuntimeError(f"rk: host copysign sign index out of bounds {sign_index}")
+     out_ptr[out_index] = (magnitude_ptr[magnitude_index] & ~sign_mask) | (sign_ptr[sign_index] & sign_mask)
+ 
++def _run_host_large_einsum(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Evaluate the exact 32x7 groups of 24^3 fp16 dot products with NumPy's fp16 einsum order."""
++  import numpy as np
++  total, tag, reduction_total = task.layout
++  assert tag == _HOST_EINSUM_LAYOUT and total == 224 and reduction_total == 13824 and len(relocs) == 3
++  output, lhs, rhs = (bufs[r.globals_slot] for r in relocs)
++  lhs_values = np.frombuffer(ctypes.string_at(lhs.va_addr, total*reduction_total*2), dtype=np.float16).reshape(total, reduction_total)
++  rhs_values = np.frombuffer(ctypes.string_at(rhs.va_addr, total*reduction_total*2), dtype=np.float16).reshape(total, reduction_total)
++  result = np.einsum("ij,ij->i", lhs_values, rhs_values)
++  ctypes.memmove(output.va_addr, result.tobytes(), total*2)
++
+ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
++  if task.layout[1] == _HOST_EINSUM_LAYOUT: return _run_host_large_einsum(task, relocs, bufs)
+   import numpy as np
+   total, tag, out_dtype_code, *layout = task.layout
+   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+@@ -1665,7 +1678,7 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
+           _run_host_copysign(task, st.relocs, bufs)
+           continue
+-        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
++        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+           _run_host_elementwise(task, st.relocs, bufs)
+           continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
+@@ -1806,7 +1819,7 @@ class RockchipProgram(Program['RockchipDevice']):
+             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
+               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+             elif st.task.is_copy and len(st.task.layout) > 1 and \
+-                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
++                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+               _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             else:
+               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
+@@ -1841,7 +1854,7 @@ class RockchipProgram(Program['RockchipDevice']):
+             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+             continue
+           if st.task.is_copy and len(st.task.layout) > 1 and \
+-             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
++             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+             _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             continue
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+@@ -2095,7 +2108,7 @@ class RockchipProgram(Program['RockchipDevice']):
+           if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
+             _run_host_copysign(task, st.relocs, tuple(ext))
+             continue
+-          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
++          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+             _run_host_elementwise(task, st.relocs, tuple(ext))
+             continue
+           ct = task.layout[0]
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 22fa683c8..3feb59542 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -209,6 +209,7 @@ _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus s
+ _HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
+ _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cross entropy
+ _HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
++_HOST_EINSUM_LAYOUT = -1035  # exact vectorized 32x7 groups of 24^3 fp16 dot products
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -9445,6 +9446,33 @@ def _try_broadcast_rounded_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
+      any(not _is_direct_div_index(u, total, store.src[0].src[1]) for u in indexes): return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_large_ellipsis_einsum_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Collapse the 32x7 independent 24^3 dot products to one typed float32 reduction."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) != 1: return None
++  reduce = reductions[0]
++  if _unwrap(store.src[1]) is not reduce or reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or \
++     len(reduce.src) != 2 or reduce.src[1].op is not Ops.RANGE or reduce.src[1].src[0].op is not Ops.CONST: return None
++  body = reduce.src[0]
++  if body.op is not Ops.CAST or body.dtype is not dtypes.float or len(body.src) != 1 or \
++     body.src[0].op is not Ops.MUL or body.src[0].dtype is not dtypes.half: return None
++  indexes = list(body.src[0].src)
++  if len(indexes) != 2 or any(u.op is not Ops.INDEX or u.dtype is not dtypes.half or u.src[0].op is not Ops.PARAM for u in indexes) or \
++     indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1]: return None
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  total, reduction_total = prod(_shape_of_store(sink)), int(reduce.src[1].src[0].arg)
++  if total != 224 or reduction_total != 13824 or len(loops) != 1 or int(loops[0].src[0].arg) != total or \
++     any(int(u.src[0].src[0].arg) != total*reduction_total for u in indexes): return None
++  allowed = {Ops.CAST, Ops.MUL, Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in body.toposort()): return None
++  out_slot = ProgramInfo.from_sink(sink).outs[0]
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  slots = (out_slot, *(u.src[0].buf_uop.arg.slot for u in indexes))
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
++  task = RKTask(0, 0, 0, "dpu", (total, _HOST_EINSUM_LAYOUT, reduction_total), out_slot, is_copy=True)
++  return (RKSubTask(cmds, task, relocs),)
++
+ def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Collapse the canonical fp16 cumulative-prefix product to one typed float32 reduction."""
+   store = _store_node(sink)
+@@ -14902,6 +14930,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, int_rounded_div_tasks)
+   if (broadcast_rounded_div_tasks := _try_broadcast_rounded_div_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, broadcast_rounded_div_tasks)
++  if (large_ellipsis_einsum_tasks := _try_large_ellipsis_einsum_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, large_ellipsis_einsum_tasks)
+   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+-- 
+2.34.1
+

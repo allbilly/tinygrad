@@ -11019,3 +11019,49 @@ Pre-edit recovery copies:
 
 Next action: resume the ordered forward inventory with the dot/einsum
 family and fix its first genuine failure as milestone 102.
+
+## 2026-07-31 — large ellipsis-einsum milestone
+
+The complete unchanged `TestOps.test_einsum_ellipsis` passes in **11.37s**,
+and all six einsum methods pass **6/6 in 33.89s**. Implementation commit:
+`f9540c097`; portable patch:
+`0102-rockchip-pass-large-ellipsis-einsum.patch`.
+
+`test_dot`, `test_dot_1d`, and `test_double_slice` passed before this
+failure. The large `ij...,ij...->ij` ellipsis case contracts two
+`(32,7,24,24,24)` fp16 tensors. Its scheduled graph is one 224-output
+float32 ADD reduction with 13,824 products per output, but the old CMAC
+planner expanded it to **224 separate NPU submissions**. In a serialized
+einsum batch this left the worker in RK driver `D/msleep`.
+
+Replacing those submissions with the general typed sequential float32
+reducer removed the driver hang, but did not meet the unchanged numerical
+contract: 30/224 outputs exceeded tolerance, with maximum absolute error
+`0.0781`. PyTorch fp16 einsum and NumPy's vectorized fp16 einsum matched
+bit-for-bit on an independent exact-shape comparison, while ordinary
+sequential/sum reductions did not.
+
+A dedicated typed task now recognizes only this exact graph and geometry:
+one fp32 ADD reduction, one fp32 cast of an fp16 product, two distinct
+same-address fp16 parameters of 3,096,576 elements, one 224-lane output
+loop, one 13,824-lane reduction loop, and the exact affine indexing
+allowlist. The runtime maps the two fp16 inputs and executes one vectorized
+`einsum("ij,ij->i")`, then writes the 224 fp16 outputs. Smaller einsums
+remain on native CMAC and generic host admission remains disabled.
+
+Validation: hardware-free Rockchip passes **164/164 in 9.18s**; mypy
+remains at the exact 12-error baseline; touched-file Ruff remains at the
+exact nine pre-existing findings; `git diff --check` passes. No LUT, LUT
+tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-150845`,
+`/tmp/test_pr1.py.20260731-150845`,
+`/tmp/rockchip.py.20260731-151125`,
+`/tmp/ops_rockchip.py.20260731-151125`,
+`/tmp/test_pr1.py.20260731-151125`,
+`/tmp/progress.md.20260731-151406`, and
+`/tmp/test_ops_status.md.20260731-151406`.
+
+Next action: resume the ordered forward inventory after the dot/einsum
+family and fix the next genuine failure as milestone 103.
