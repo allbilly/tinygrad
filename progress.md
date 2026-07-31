@@ -7749,6 +7749,19 @@ range, and identity cases passed before the explicit-half boundary, and the
 final 64x64, 256x256, empty-shape, broadcast-dot, and multidot groups also
 pass.
 
+### Softplus correction graphs
+
+Commit `283c27de1`; patch
+`0142-rockchip-compose-softplus-correction-graphs.patch`.
+
+LogSigmoid and Softplus now share graph allocation/LUT emission and express
+their broad/tail correction selection directly. Softplus retains its beta<1
+wide table and noncontiguous-source materialization. This removes **49 counted
+lines**, reaching **12,012**.
+
+PR1 passes **173/173 in 13.73s**; LogSigmoid and Softplus pass **2/2 in 7.33s**
+on hardware. Mypy/Ruff remain at 12/8.
+
 ### Declarative CELU/Mish graphs
 
 Commit `ca3f8725e`; patch

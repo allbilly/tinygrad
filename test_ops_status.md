@@ -3380,3 +3380,12 @@ Commit `ca3f8725e`; saved patch
 CELU and Mish now use the shared regional activation graph. Support size is
 **12,061 counted lines**. PR1 passes **173/173**; focused CELU and Mish hardware
 methods both pass, with static baselines unchanged.
+
+### Softplus correction graphs
+
+Commit `283c27de1`; saved patch
+`0142-rockchip-compose-softplus-correction-graphs.patch`.
+
+LogSigmoid and Softplus use the shared graph, including Softplus beta<1 and
+materialization paths. Support size is **12,012**. PR1 is **173/173** and both
+focused hardware methods pass in 7.33s; static baselines are unchanged.
