@@ -11822,3 +11822,29 @@ Pre-edit recovery copies:
 
 Next action: continue ordered methods 326–350, starting with the remaining
 fancy-indexing and slicing cases.
+
+## 2026-07-31 — softmax reference-dtype milestone
+
+Ordered methods 326–350 pass **25/25 in 92.97s**. The focused
+`test_softmax` rerun passes in **20.77s**. Implementation commit:
+`c03ea5936`; portable patch:
+`0121-rockchip-align-softmax-reference-dtype.patch`.
+
+Methods 326–349 already passed unchanged, covering the remaining
+fancy-indexing group, ordinary slicing, small cumulative scans, and small
+GEMMs. `test_softmax` alone rejected `Ops.EXP2` because its explicit
+`atol=1e-7` contract had been forced into HALF. The unchanged normal-fp32
+Rockchip softmax path passes with maximum absolute error
+`2.2351742e-08`. Only this named method now restores normal tensor/reference
+construction.
+
+No backend classifier, runtime, LUT, LUT tuning parameter, or two-level NPU
+LUT changed. Adapter Ruff and `git diff --check` pass. Hardware-free
+Rockchip remains **171/171** from milestone 120; mypy and touched backend
+Ruff remain at their exact 12- and 9-finding baselines.
+
+Pre-edit recovery copy:
+`/tmp/conftest_rockchip.py.20260731-183659`.
+
+Next action: continue ordered methods 351–375, beginning with softmax
+variants, softplus/softsign, splitting, stacking, and reductions.

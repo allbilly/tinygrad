@@ -3174,3 +3174,17 @@ construction, whose strict Rockchip path passes without approximation.
 Contract advances to **171/171 in 10.80s**. Mypy and touched-file Ruff stay
 at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
 Next: ordered methods 326–350.
+
+### Softmax reference dtype
+
+Ordered methods 326–350 pass **25/25 in 92.97s**; focused softmax passes in
+**20.77s**. Commit `c03ea5936`; saved patch
+`0121-rockchip-align-softmax-reference-dtype.patch`.
+
+The first 24 methods passed unchanged. Forced-HALF `test_softmax` rejected
+its fp32 EXP2 schedule despite an explicit `1e-7` contract. The unchanged
+normal-fp32 Rockchip path passes with maximum error `2.2351742e-08`, so
+only this method restores normal construction.
+
+Backend code and the **171/171** PR1 contract are unchanged; adapter Ruff is
+clean. No LUT or two-level LUT changed. Next: methods 351–375.

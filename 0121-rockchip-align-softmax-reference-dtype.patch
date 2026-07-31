@@ -1,0 +1,25 @@
+From c03ea59365d13613ec33787cc84cb2001b9ef018 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 18:39:35 +0800
+Subject: [PATCH] rockchip: align softmax reference dtype
+
+---
+ test/rockchip/conftest_rockchip.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 074256600..5e46d388a 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -41,7 +41,7 @@ def pytest_runtest_call(item):
+   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
+   needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
+     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+-    "test_simple_cumsum",
++    "test_simple_cumsum", "test_softmax",
+     "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
+     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
+     "test_isclose", "test_linspace", "test_log", "test_log_softmax", "test_log_softmax_other_axis",
+-- 
+2.34.1
+
