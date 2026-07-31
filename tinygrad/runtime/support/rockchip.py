@@ -9898,20 +9898,21 @@ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
 def _try_scatter_reduce_tensor_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Expand only tinygrad's bounded fp32 tensor scatter_reduce lowering."""
+  """Expand only tinygrad's bounded floating-point tensor scatter_reduce lowering."""
   store = _store_node(sink)
-  if store is None or store.src[0].dtype is not dtypes.float: return None
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
+  data_dtype = store.src[0].dtype
   value = _unwrap(store.src[1])
   reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
   if not 1 <= len(reductions) <= 3 or value.op not in (Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV): return None
-  if any(u.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or u.dtype not in (dtypes.bool, dtypes.int, dtypes.float) or
+  if any(u.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or u.dtype not in (dtypes.bool, dtypes.int, dtypes.half, dtypes.float) or
          not u.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in u.src[1:]) for u in reductions): return None
   reduction_sizes = [prod(int(axis.src[0].arg) for axis in u.src[1:]) for u in reductions]
   if any(size > 8 for size in reduction_sizes) or sum(reduction_sizes) > 24: return None
   inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   int_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}
-  float_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}
-  if len(int_slots) != 1 or len(float_slots) != 2: return None
+  data_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is data_dtype}
+  if len(int_slots) != 1 or len(data_slots) != 2: return None
   nodes = value.toposort()
   if not {Ops.WHERE, Ops.CMPNE}.issubset({u.op for u in nodes}): return None
   allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.CAST,

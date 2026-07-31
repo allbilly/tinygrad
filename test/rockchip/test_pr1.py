@@ -525,6 +525,14 @@ class TestClassifier(unittest.TestCase):
     padded_program = build_native_program(padded_sinks[-1])
     self.assertIsNotNone(padded_program)
     self.assertEqual(padded_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    x_half = Tensor.empty(3,4,5, dtype=dtypes.half, device="ROCKCHIP")
+    src_half = Tensor.empty(3,4,5, dtype=dtypes.half, device="ROCKCHIP")
+    for mode in ("sum", "prod", "mean", "amin", "amax"):
+      for include_self in (True, False):
+        half_program = build_native_program(_get_sink(x_half.scatter_reduce(
+          -1, indices, src_half, mode, include_self=include_self)))
+        self.assertIsNotNone(half_program)
+        self.assertEqual(half_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
