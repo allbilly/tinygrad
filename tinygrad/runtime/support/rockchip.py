@@ -9553,6 +9553,54 @@ def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
   relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, in_slot, 0, 0, 0xFFFFFFFF))
   return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
 
+def _try_cumsum_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Collapse the canonical fp16/fp32 cumulative sum stages to bounded typed tasks."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
+  dtype = store.src[0].dtype
+  nodes = sink.toposort()
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  loops = [u for u in nodes if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if any(u.src[0].op is not Ops.CONST for u in loops): return None
+  total, loop_extents = prod(_shape_of_store(sink)), [int(u.src[0].arg) for u in loops]
+  if prod(loop_extents) != total: return None
+
+  if len(reductions) == 1:
+    reduce = reductions[0]
+    if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2 or \
+       reduce.src[1].src[0].op is not Ops.CONST or \
+       ((store.src[1].op is not Ops.CAST or store.src[1].src[0] is not reduce)
+        if dtype is dtypes.half else store.src[1] is not reduce):
+      return None
+    body, window = reduce.src[0], int(reduce.src[1].src[0].arg)
+    body_nodes = body.toposort()
+    indexes = [u for u in body_nodes if u.op is Ops.INDEX and u.dtype is dtype and u.src[0].op is Ops.PARAM]
+    if body.op is not Ops.WHERE or len(indexes) != 1: return None
+    input_total = int(indexes[0].src[0].src[0].arg)
+    allowed = {Ops.REDUCE, Ops.WHERE, Ops.OR, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL,
+               Ops.CAST, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+    if any(u.op not in allowed for u in store.src[1].toposort()): return None
+    signature = tuple(sum(u.op is op for u in nodes) for op in
+                      (Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CAST, Ops.OR, Ops.AND, Ops.MUL))
+    cast_count = 2 if dtype is dtypes.half else 0
+    direct = total == input_total == window == 512 and loop_extents == [512] and \
+      signature == (2, 1, 1, cast_count, 0, 0, 0)
+    padded_blocks = total == 1024 and input_total == 1022 and window == 256 and sorted(loop_extents) == [4, 256] and \
+      signature == (2, 2, 2, cast_count, 1, 1, 1)
+    block_prefix = total == 4 and input_total == 1024 and window == 4 and loop_extents == [4] and \
+      signature == (2, 1, 1, cast_count, 0, 0, 2)
+    if not (direct or padded_blocks or block_prefix): return None
+    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+
+  if reductions or total != 1024 or sorted(loop_extents) != [4, 256] or store.src[1].op is not Ops.ADD: return None
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtype and u.src[0].op is Ops.PARAM]
+  if sorted(int(u.src[0].src[0].arg) for u in indexes) != [4, 1024, 1024]: return None
+  allowed = {Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in store.src[1].toposort()): return None
+  signature = tuple(sum(u.op is op for u in nodes) for op in (Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL))
+  if signature != (2, 1, 1, 3, 1): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Collapse the canonical fp16 cumulative-prefix product to one typed float32 reduction."""
   store = _store_node(sink)
@@ -15151,6 +15199,7 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, large_ellipsis_einsum_tasks)
   if (bilinear_interpolate_tasks := _try_bilinear_interpolate_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, bilinear_interpolate_tasks)
+  if (cumsum_tasks := _try_cumsum_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumsum_tasks)
   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
   if (cumextrema_tasks := _try_cumextrema_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, cumextrema_tasks)

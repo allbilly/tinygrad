@@ -308,6 +308,21 @@ class TestClassifier(unittest.TestCase):
     self.assertTrue(all(isinstance(task, RKSubTask) for task in subtasks))
     self.assertLess(len(subtasks), 600)
 
+  def test_cumsum_uses_bounded_typed_stages(self):
+    for dtype in (dtypes.half, dtypes.float):
+      for size, expected_tags in ((512, (_HOST_ELEMENTWISE_REDUCE_LAYOUT,)),
+                                  (1022, (_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+                                          _HOST_ELEMENTWISE_LAYOUT))):
+        source = Tensor.empty(size, dtype=dtype, device="ROCKCHIP")
+        sinks = [early_simplify(call.src[0]) for call in source.cumsum(0).schedule_linear().src if call.src[0].op is Ops.SINK]
+        self.assertEqual(len(sinks), len(expected_tags))
+        for sink, expected_tag in zip(sinks, expected_tags):
+          program = build_native_program(sink)
+          self.assertIsNotNone(program)
+          subtasks = program.src[1].src[0].arg
+          self.assertEqual(len(subtasks), 1)
+          self.assertEqual(subtasks[0].task.layout[1], expected_tag)
+
   def test_fp16_cumulative_extrema_use_typed_reductions_and_indices(self):
     for kind in ("max", "min"):
       source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
