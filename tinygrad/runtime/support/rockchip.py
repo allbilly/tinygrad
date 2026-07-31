@@ -13411,10 +13411,31 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                      info.outs[0], is_copy=True), relocs))
   return tuple(tasks)
 
-def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Serialize only tinygrad's two-pass fp32 variance kernel after its mean kernel."""
+def _try_half_to_fp32_sum_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize the bounded fp16-to-fp32 row sum feeding stacked std_mean."""
   store = _store_node(sink)
-  if store is None or store.src[0].dtype is not dtypes.float: return None
+  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1 or store.src[1] is not reductions[0]:
+    return None
+  reduce = reductions[0]
+  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or len(reduce.src) < 2 or \
+     any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]): return None
+  body = reduce.src[0]
+  if body.op is not Ops.CAST or body.dtype is not dtypes.float or len(body.src) != 1: return None
+  source = body.src[0]
+  if source.op is not Ops.INDEX or source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM: return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if any(loop.src[0].op is not Ops.CONST for loop in loops): return None
+  total = prod(_shape_of_store(sink))
+  reduction_total = prod(int(axis.src[0].arg) for axis in reduce.src[1:])
+  if not 1 <= total <= 1 << 16 or not 1 <= reduction_total <= 1 << 16 or total*reduction_total > 1 << 22: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+
+def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize only tinygrad's two-pass fp16/fp32 variance kernel after its mean kernel."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
+  dtype = store.src[0].dtype
   val = _unwrap(store.src[1])
   final_sqrt, stack_axis, mean_output = 0, None, None
   if val.op is Ops.WHERE and len(val.src) == 3:
@@ -13428,10 +13449,10 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
         stack_axis = candidate
         break
     if stack_axis is None: return None
-    if val.op is not Ops.SQRT or val.dtype is not dtypes.float or len(val.src) != 1: return None
+    if val.op is not Ops.SQRT or val.dtype is not dtype or len(val.src) != 1: return None
     val = _unwrap(val.src[0])
     final_sqrt = 2
-  elif val.op is Ops.SQRT and val.dtype is dtypes.float and len(val.src) == 1:
+  elif val.op is Ops.SQRT and val.dtype is dtype and len(val.src) == 1:
     final_sqrt, val = 1, _unwrap(val.src[0])
   reductions_in_value = [u for u in val.toposort() if u.op is Ops.REDUCE]
   if len(reductions_in_value) != 1: return None
@@ -13443,24 +13464,32 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if _unwrap(lhs) is reduce and _unwrap(rhs).op is Ops.CONST:
       reduced, scale = _unwrap(lhs), _unwrap(rhs)
       break
-  if reduced is None or scale is None or scale.dtype is not dtypes.float or \
-     math.isnan(float(scale.arg)) or float(scale.arg) <= 0.0: return None
+  if reduced is None or scale is None or scale.dtype is not dtype or \
+     math.isnan(float(scale.arg)) or float(scale.arg) == 0.0: return None
   square = _unwrap(reduce.src[0])
   if square.op is not Ops.MUL or len(square.src) != 2 or _unwrap(square.src[0]) is not _unwrap(square.src[1]): return None
   delta = _unwrap(square.src[0])
   if delta.op is not Ops.ADD or len(delta.src) != 2: return None
 
-  data, mean = None, None
+  data, mean, mean_input_scale = None, None, 1.0
   for candidate, negative in ((delta.src[0], delta.src[1]), (delta.src[1], delta.src[0])):
     candidate, negative = _unwrap(candidate), _unwrap(negative)
     if candidate.op is not Ops.INDEX or candidate.src[0].op is not Ops.PARAM or negative.op is not Ops.MUL: continue
-    mean_candidate = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.INDEX), None)
     coefficient = next((_unwrap(x) for x in negative.src if _unwrap(x).op is Ops.CONST), None)
+    mean_value = next((_unwrap(x) for x in negative.src if _unwrap(x).op is not Ops.CONST), None)
+    mean_candidate, candidate_scale = (mean_value, 1.0) if mean_value is not None and mean_value.op is Ops.INDEX else (None, 1.0)
+    if mean_candidate is None and mean_value is not None and mean_value.op is Ops.MUL:
+      mean_candidate = next((_unwrap(x) for x in mean_value.src if _unwrap(x).op is Ops.INDEX), None)
+      mean_scale = next((_unwrap(x) for x in mean_value.src if _unwrap(x).op is Ops.CONST), None)
+      if mean_candidate is None or mean_scale is None or mean_scale.dtype is not dtypes.float or \
+         not math.isfinite(float(mean_scale.arg)) or float(mean_scale.arg) <= 0.0: continue
+      candidate_scale = float(mean_scale.arg)
     if mean_candidate is not None and mean_candidate.src[0].op is Ops.PARAM and coefficient is not None and \
-       coefficient.dtype is dtypes.float and math.isfinite(float(coefficient.arg)) and float(coefficient.arg) < 0.0:
-      data, mean = candidate, mean_candidate
+       coefficient.dtype is dtype and math.isfinite(float(coefficient.arg)) and float(coefficient.arg) < 0.0:
+      data, mean, mean_input_scale = candidate, mean_candidate, candidate_scale
       break
-  if data is None or mean is None or data.dtype is not dtypes.float or mean.dtype is not dtypes.float: return None
+  if data is None or mean is None or data.dtype is not dtype or \
+     (mean.dtype is not dtype and not (dtype is dtypes.half and mean.dtype is dtypes.float)): return None
 
   loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
   reductions = list(reduce.src[1:])
@@ -13494,11 +13523,11 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     elif mean_output.op is Ops.MUL and len(mean_output.src) == 2:
       indexed_mean = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.INDEX), None)
       output_constant = next((_unwrap(x) for x in mean_output.src if _unwrap(x).op is Ops.CONST), None)
-      if output_constant is None or output_constant.dtype is not dtypes.float: return None
+      if output_constant is None or output_constant.dtype not in (dtype, dtypes.float): return None
       output_scale = float(output_constant.arg)
     if indexed_mean is not None:
       if indexed_mean.src[0] is not mean.src[0] or _affine_index(indexed_mean.src[1]) != mean_aff or \
-         not math.isclose(output_scale, -float(coefficient.arg), rel_tol=0.0, abs_tol=0.0): return None
+         not math.isclose(output_scale, mean_input_scale*-float(coefficient.arg), rel_tol=1e-12): return None
     else:
       mean_reductions = [u for u in mean_output.toposort() if u.op is Ops.REDUCE]
       if mean_output.op is not Ops.MUL or len(mean_reductions) != 1 or mean_reductions[0].arg[0] is not Ops.ADD: return None
@@ -13515,13 +13544,14 @@ def _try_variance_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return (aff[1], *(aff[0].get(axis, 0) for axis in ids))
   scale_bits = _signed_i32(struct.unpack('<I', struct.pack('<f', float(scale.arg)))[0])
   stack_position = loops.index(stack_axis) if stack_axis is not None else -1
-  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), int(final_sqrt),
+  mode = int(final_sqrt) + (4 if dtype is dtypes.half else 0) + (8 if mean.dtype is dtypes.float and dtype is dtypes.half else 0)
+  layout = (output_total, _HOST_VARIANCE_LAYOUT, len(loops), len(reductions), mode,
             *((stack_position,) if stack_axis is not None else ()), *extents, scale_bits,
             *mapping(data_aff, axis_ids), *mapping(mean_aff, axis_ids), *mapping(out_aff, axis_ids[:len(loops)]))
   info = ProgramInfo.from_sink(sink)
   slots = (info.outs[0], data.src[0].buf_uop.arg.slot, mean.src[0].buf_uop.arg.slot)
   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
-  task = RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True, fp32_output=True)
+  task = RKTask(0, 0, 0, "dpu", layout, info.outs[0], is_copy=True, fp32_output=dtype is dtypes.float)
   return (RKSubTask((RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),), task, relocs),)
 
 def _try_fp32_avg_pool_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -15324,6 +15354,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, fp32_add_tasks)
   if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_mul_tasks)
+  if (half_fp32_sum_tasks := _try_half_to_fp32_sum_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, half_fp32_sum_tasks)
   if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, variance_tasks)
   if (fp32_avg_pool_tasks := _try_fp32_avg_pool_host_subtasks(sink)) is not None:

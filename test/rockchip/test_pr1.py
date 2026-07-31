@@ -436,6 +436,27 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
     self.assertEqual(subtasks[0].task.layout[4], 2)
 
+  def test_fp16_std_and_std_mean_use_strict_typed_variance(self):
+    expressions = (
+      Tensor.empty(15,25,35, dtype=dtypes.half, device="ROCKCHIP").std((1,2)),
+      Tensor.stack(*Tensor.empty(3,4,5,6, dtype=dtypes.half, device="ROCKCHIP").std_mean(axis=(1,2))),
+    )
+    for expression, expected_mode in zip(expressions, (5, 14)):
+      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+      program = build_native_program(sinks[-1])
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_VARIANCE_LAYOUT)
+      self.assertEqual(subtasks[0].task.layout[4], expected_mode)
+      self.assertFalse(subtasks[0].task.fp32_output)
+      if expected_mode == 14:
+        producer = build_native_program(sinks[0])
+        self.assertIsNotNone(producer)
+        producer_subtasks = producer.src[1].src[0].arg
+        self.assertEqual(len(producer_subtasks), 1)
+        self.assertEqual(producer_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+
   def test_fp32_topology_uses_exact_host_boundary(self):
     x = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
     program = build_native_program(_get_sink((x+x)*x))

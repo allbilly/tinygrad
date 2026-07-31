@@ -944,9 +944,11 @@ def _run_host_nll(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tu
   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
-  """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
+  """Execute the serialized second pass of tinygrad's strict fp16/fp32 variance graph."""
   import numpy as np
-  output_total, tag, nloops, nreductions, final_sqrt, *meta = task.layout
+  output_total, tag, nloops, nreductions, encoded_sqrt, *meta = task.layout
+  mean_fp32, encoded_sqrt = encoded_sqrt >= 8, encoded_sqrt % 8
+  is_half, final_sqrt = encoded_sqrt >= 4, encoded_sqrt % 4
   assert tag == _HOST_VARIANCE_LAYOUT and len(relocs) == 3
   naxes, cursor = nloops+nreductions, 0
   stack_position = meta[cursor] if final_sqrt == 2 else -1
@@ -963,13 +965,15 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
   assert cursor+nloops+1 == len(meta)
 
   output_buf, data_buf, mean_buf = (bufs[r.globals_slot] for r in relocs)
-  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=np.float32)
-  mean = np.frombuffer(ctypes.string_at(mean_buf.va_addr, mean_buf.size), dtype=np.float32)
-  result = np.empty(output_buf.size//4, dtype=np.float32)
+  data_dtype = np.float16 if is_half else np.float32
+  data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=data_dtype)
+  mean_dtype = np.float32 if mean_fp32 else data_dtype
+  mean = np.frombuffer(ctypes.string_at(mean_buf.va_addr, mean_buf.size), dtype=mean_dtype)
+  result = np.empty(output_buf.size//(2 if is_half else 4), dtype=data_dtype)
   loop_extents, reduction_extents = extents[:nloops], extents[nloops:]
   reduction_total = int(np.prod(reduction_extents, dtype=np.int64))
   correction = reduction_total-round(1.0/float(scale))
-  if correction < 0 or correction > reduction_total:
+  if correction < 0:
     raise RuntimeError(f"rk: variance invalid correction {correction} for K={reduction_total}")
 
   def coordinates(linear:int, shape:tuple[int,...]) -> list[int]:
@@ -984,7 +988,7 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
       loop_coords = coordinates(output_linear, loop_extents)
       output_index = affine(output_mapping, loop_coords)
       if not 0 <= output_index < result.size: raise RuntimeError(f"rk: variance output index out of bounds {output_index}")
-      values = np.empty(reduction_total, dtype=np.float32)
+      values = np.empty(reduction_total, dtype=data_dtype)
       for reduction_linear in range(reduction_total):
         coords = [*loop_coords, *coordinates(reduction_linear, reduction_extents)]
         data_index, mean_index = affine(data_mapping, coords), affine(mean_mapping, coords)
@@ -996,11 +1000,22 @@ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
       # full operator, so recompute its row mean from the original fp32 values.
       # delta = np.float32(data[data_index]-mean[mean_index])
       # accumulator = np.float32(accumulator + np.float32(delta*delta))
-      variance = np.var(values, dtype=np.float32, ddof=correction)
-      if final_sqrt == 2:
-        result[output_index] = np.mean(values, dtype=np.float32) if loop_coords[stack_position] else np.sqrt(variance, dtype=np.float32)
+      if is_half:
+        mean_value = np.float16(np.mean(values.astype(np.float32), dtype=np.float32))
+        centered = np.subtract(values, mean_value, dtype=np.float16)
+        squares = np.multiply(centered, centered, dtype=np.float16)
+        accumulator = np.sum(squares.astype(np.float32), dtype=np.float32)
+        variance = np.multiply(np.float16(accumulator), np.float16(scale), dtype=np.float16)
+        standard_deviation = np.sqrt(variance, dtype=np.float16)
       else:
-        result[output_index] = np.sqrt(variance, dtype=np.float32) if final_sqrt else variance
+        float_values = values.astype(np.float32)
+        mean_value = np.mean(float_values, dtype=np.float32)
+        variance = np.var(float_values, dtype=np.float32, ddof=correction)
+        standard_deviation = np.sqrt(variance, dtype=np.float32)
+      if final_sqrt == 2:
+        result[output_index] = mean_value if loop_coords[stack_position] else standard_deviation
+      else:
+        result[output_index] = standard_deviation if final_sqrt else variance
   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_softmax_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
