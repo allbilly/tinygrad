@@ -1,0 +1,131 @@
+From f4b1f1db82082b795ae4ee0511bee9f1b884ed68 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 11:38:43 +0800
+Subject: [PATCH] rockchip: pass sparse categorical cross entropy
+
+---
+ progress.md                          | 32 ++++++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 12 +++++++++++
+ test_ops_status.md                   | 14 ++++++++++++
+ tinygrad/runtime/support/rockchip.py | 10 +++++----
+ 4 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index a19415a55..6dd7d799e 100644
+--- a/progress.md
++++ b/progress.md
+@@ -10216,3 +10216,35 @@ bit-exact for all probability cases and for the nonzero smoothed index cases.
+ No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline,
+ and Ruff on the touched files remains at the same nine pre-existing findings.
+ Next forward group: `TestOps.test_sparse_categorical_crossentropy`.
++
++## 2026-07-31 — sparse categorical cross-entropy milestone
++
++The four unchanged sparse categorical groups pass together in **12.49s**
++with the required HALF forward-only configuration:
++
++- base and batched inputs, plus combined mean/ignore-index/smoothing arguments;
++- `mean`, `sum`, and `none` reductions;
++- ignore indices `-1`, `0`, and `3`;
++- label smoothing `0.3` and `0.9`.
++
++The combined base method passes alone in **12.76s**. The hardware-free
++Rockchip contract is **146/146 in 8.73s**.
++
++The ordinary sparse loss already used the strict typed `CMPNE` one-hot path.
++The missing combined graph adds a second class reduction for the uniform
++smoothing term, a row loss reduction, and an int32 valid-count reduction
++used as the mean denominator. The class-index matcher now admits one through
++four ADD reductions with at most one int32 reduction, plus only the exact
++`AND`, `CMPNE`, cast, affine arithmetic, and reciprocal/FDIV nodes in this
++fingerprint.
++
++All static axes remain bounded: the official combined shape expands two
++10-class reductions over 12 rows (240 class terms) and one 12-element valid
++count. Its serialized task has five relocations for output, logits, MAX,
++normalizer, and class indices. The no-`CMPNE` guard from the previous
++milestone still excludes arbitrary reductions; the three-factor einsum
++continues to emit its expected two CMAC stages.
++
++No runtime ABI, LUT, or two-level LUT changed. Mypy remains at the exact
++12-error baseline and Ruff remains at the nine pre-existing touched-file
++findings. Next forward group: `TestOps.test_nll_loss`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 6ead93d0b..5fcfc24f9 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -740,6 +740,18 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout, expected_layout)
+ 
++  def test_sparse_cross_entropy_combined_args_use_bounded_task(self):
++    source = Tensor.empty(12,10, dtype=dtypes.half, device="ROCKCHIP")
++    target = Tensor.empty(12, dtype=dtypes.int, device="ROCKCHIP")
++    expression = source.sparse_categorical_crossentropy(target, reduction="mean", ignore_index=3, label_smoothing=.3)
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    program = build_native_program(sinks[-1])
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    self.assertEqual(len(subtasks[0].relocs), 5)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index ea217bd0e..2bfd477bb 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2415,3 +2415,17 @@ removes the target buffer. Smoothed class-index one-hot graphs continue
+ through the strict typed `CMPNE` path. No LUT changed. Contract remains
+ **145/145** with expanded ABI coverage. Next forward group:
+ `TestOps.test_sparse_categorical_crossentropy`.
++
++### Sparse categorical cross entropy
++
++All four sparse groups pass together in **12.49s**: base/batched/combined
++arguments, all reductions, three ignore-index values, and both smoothing
++values. The combined base method passes alone in **12.76s**.
++
++The strict class-index evaluator now accepts up to four bounded ADD
++reductions, including at most one int32 valid-count reduction, and the exact
++`AND` plus reciprocal/FDIV topology needed by ignored smoothed means. The
++official combined graph expands 240 class terms and 12 valid-count terms into
++one serialized typed task. The matcher still requires the `CMPNE` class-index
++fingerprint, so unrelated reductions remain excluded. No LUT changed.
++Contract: **146/146**. Next forward group: `TestOps.test_nll_loss`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index c8e510a14..24260997c 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9887,8 +9887,9 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
+   nodes = store.src[1].toposort()
+   reductions = [u for u in nodes if u.op is Ops.REDUCE]
+   inputs = {u.src[0].buf_uop.arg.slot for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+-  if len(reductions) not in (1, 2) or len(inputs) not in (3, 4) or \
+-     any(u.arg[0] is not Ops.ADD or u.dtype is not dtypes.float for u in reductions): return None
++  if not 1 <= len(reductions) <= 4 or len(inputs) not in (3, 4) or \
++     any(u.arg[0] is not Ops.ADD or u.dtype not in (dtypes.float, dtypes.int) for u in reductions) or \
++     sum(u.dtype is dtypes.int for u in reductions) > 1: return None
+   # Probability-target 2-D/N-D kernels use the dedicated exact matcher above.
+   # The remaining three-input probability form is only the scalar 1-D case;
+   # this prevents arbitrary three-factor reductions (for example einsum) from
+@@ -9898,11 +9899,12 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
+                            if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}.values())
+     if len(reductions) != 1 or prod(_shape_of_store(sink)) != 1 or len(input_totals) != 3 or \
+        input_totals[0] != 1 or input_totals[1] != input_totals[2]: return None
+-  allowed = {Ops.REDUCE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.AND, Ops.CAST, Ops.ADD, Ops.MUL,
++             Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+   if any(u.op not in allowed for u in nodes): return None
+   budget = prod(int(axis.src[0].arg) for reduce in reductions for axis in reduce.src[1:]
+                 if axis.src[0].op is Ops.CONST)
+-  if not 1 <= budget <= 4096: return None
++  if not 1 <= budget <= 16384: return None
+ 
+   def expand(u:UOp) -> UOp:
+     if u.op is Ops.REDUCE:
+-- 
+2.34.1
+
