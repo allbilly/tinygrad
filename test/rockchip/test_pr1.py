@@ -792,6 +792,16 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 
+  def test_nonzero_expanded_prefix_uses_bounded_typed_reduction(self):
+    source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+    mask = source > 0.5
+    expression = mask.unsqueeze(-1).expand(*mask.shape, mask.ndim).flatten().cumsum()[-1]
+    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+    programs = [build_native_program(sink) for sink in sinks]
+    self.assertTrue(all(program is not None for program in programs))
+    layouts = [program.src[1].src[0].arg[0].task.layout[1] for program in programs]
+    self.assertEqual(layouts[:2], [_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT])
+
   def test_constant_true_masked_select_uses_typed_copy(self):
     source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
     expression = source.masked_select(Tensor(True, device="ROCKCHIP"))
