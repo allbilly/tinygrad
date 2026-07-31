@@ -38,7 +38,9 @@ def pytest_collection_modifyitems(items):
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
-  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_arange", "test_bitcast", "test_avg_pool3d", "test_cos")
+  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
+    "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+    "test_interpolate_linear", "test_interpolate_linear_corners_aligned")
   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
   if not needs_fp32_reference and not torch_only_fp32_reference:
     yield

@@ -1010,6 +1010,18 @@ class TestClassifier(unittest.TestCase):
           self.assertEqual(len(subtasks), 1)
           self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
 
+  def test_linear_interpolate_uses_one_typed_host_stage(self):
+    for input_size, output_size in ((52,29), (29,52)):
+      for align_corners in (False, True):
+        expression = Tensor.empty(2,3,input_size, dtype=dtypes.half, device="ROCKCHIP").interpolate(
+          size=(output_size,), mode="linear", align_corners=align_corners)
+        sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+        program = build_native_program(sink)
+        self.assertIsNotNone(program)
+        subtasks = program.src[1].src[0].arg
+        self.assertEqual(len(subtasks), 1)
+        self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
+
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
     for expression in (source.argmax(0, False), source.argmin(0, False)):

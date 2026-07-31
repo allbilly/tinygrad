@@ -9487,14 +9487,18 @@ def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
     ((72,31),1440):(72,20,31), ((72,20),648):(72,9,20), ((54,12),1674):(54,31,12)}
   vertical:dict[tuple[tuple[int, ...], int], tuple[int, ...]] = {
     ((6,9,31),2232):(6,12,9,31), ((6,31,20),1440):(6,12,31,20), ((6,20,12),648):(6,9,20,12)}
+  linear:dict[tuple[tuple[int, ...], int], tuple[int, ...]] = {((6,29),312):(6,52,29), ((6,52),174):(6,29,52)}
   horizontal_counts = {Ops.ADD:10, Ops.AND:2, Ops.CAST:9, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
                        Ops.INDEX:2, Ops.MUL:5, Ops.PARAM:1, Ops.RANGE:2, Ops.TRUNC:1, Ops.WHERE:10}
   vertical_counts = {Ops.ADD:12, Ops.AND:2, Ops.CAST:8, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
                      Ops.INDEX:2, Ops.MUL:7, Ops.PARAM:1, Ops.RANGE:3, Ops.TRUNC:1, Ops.WHERE:9}
   horizontal_aligned_counts = {**horizontal_counts, Ops.ADD:9, Ops.CONST:15}
   vertical_aligned_counts = {**vertical_counts, Ops.ADD:11, Ops.CONST:15}
+  linear_counts = {**horizontal_counts, Ops.CAST:10}
+  linear_aligned_counts = {**linear_counts, Ops.ADD:9, Ops.CONST:15}
   horizontal_mode = 0 if counts == horizontal_counts else 1 if counts == horizontal_aligned_counts else None
   vertical_mode = 0 if counts == vertical_counts else 1 if counts == vertical_aligned_counts else None
+  linear_mode = 0 if counts == linear_counts else 1 if counts == linear_aligned_counts else None
   layout:tuple[int, ...]
   if store.src[0].dtype is dtypes.float and indexes[0].dtype is dtypes.half and \
      (dims := horizontal.get((shape, input_total))) is not None and horizontal_mode is not None:
@@ -9502,6 +9506,9 @@ def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
   elif store.src[0].dtype is dtypes.half and indexes[0].dtype is dtypes.float and \
        (dims := vertical.get((shape, input_total))) is not None and vertical_mode is not None:
     layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 1, vertical_mode, *dims)
+  elif store.src[0].dtype is dtypes.half and indexes[0].dtype is dtypes.half and \
+       (dims := linear.get((shape, input_total))) is not None and linear_mode is not None:
+    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 2, linear_mode, *dims)
   else: return None
   out_slot, in_slot = ProgramInfo.from_sink(sink).outs[0], indexes[0].src[0].buf_uop.arg.slot
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)

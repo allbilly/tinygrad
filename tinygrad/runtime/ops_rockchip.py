@@ -567,7 +567,7 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
   total, tag, stage, align_corners, *dims = task.layout
   assert tag == _HOST_BILINEAR_LAYOUT and len(relocs) == 2
   output, source = (bufs[r.globals_slot] for r in relocs)
-  if stage == 0:
+  if stage in (0, 2):
     rows, input_width, output_width = dims
     horizontal_values = np.frombuffer(ctypes.string_at(source.va_addr, rows*input_width*2),
                                       dtype=np.float16).reshape(rows, input_width)
@@ -578,7 +578,8 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     result = horizontal_values[:,lower].astype(np.float32)*(np.float32(1)-weight) + \
              horizontal_values[:,upper].astype(np.float32)*weight
     assert result.size == total
-    ctypes.memmove(output.va_addr, result.tobytes(), total*4)
+    if stage == 0: ctypes.memmove(output.va_addr, result.tobytes(), total*4)
+    else: ctypes.memmove(output.va_addr, result.astype(np.float16).tobytes(), total*2)
   else:
     planes, input_height, output_height, width = dims
     vertical_values = np.frombuffer(ctypes.string_at(source.va_addr, planes*input_height*width*4),
