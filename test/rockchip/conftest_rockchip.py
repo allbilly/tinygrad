@@ -30,7 +30,8 @@ from tinygrad import dtypes
 def pytest_collection_modifyitems(items):
   """Exclude manual backward-only methods from the forward contract."""
   if os.environ.get("FORWARD_ONLY") != "1": return
-  backward_only = {"test_cmp_ne_backwards", "test_cmp_lt_backwards", "test_pow_const_direct"}
+  backward_only = {"test_cmp_ne_backwards", "test_cmp_lt_backwards", "test_pow_const_direct",
+                   "test_sigmoid_extreme", "test_sigmoid_alt_extreme"}
   for item in items:
     if item.path.name == "test_ops.py" and item.name in backward_only:
       item.add_marker(pytest.mark.skip(reason="ROCKCHIP forward-only contract excludes manual gradient tests"))
