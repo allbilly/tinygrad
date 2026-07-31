@@ -1,0 +1,173 @@
+From 54ca139c99a081e2b91b9e6e3af3833d3f38791b Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 12:08:12 +0800
+Subject: [PATCH] rockchip: pass fixed masked select
+
+---
+ progress.md                          | 34 ++++++++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 14 +++++++++++-
+ test_ops_status.md                   | 17 ++++++++++++++
+ tinygrad/runtime/support/rockchip.py | 32 ++++++++++++++++++++++++++
+ 4 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/progress.md b/progress.md
+index 59863ad96..134938b1a 100644
+--- a/progress.md
++++ b/progress.md
+@@ -10357,3 +10357,37 @@ No new runtime tag, LUT, or two-level LUT was needed. Mypy remains at the
+ exact 12-error baseline and touched-file Ruff remains at the exact nine
+ pre-existing findings. Next forward group:
+ `TestOps.test_masked_select_size`.
++
++## 2026-07-31 — fixed-size masked-select milestone
++
++`TestOps.test_masked_select_size` passes all unchanged cases in **11.99s**:
++exact size four, padded size six with fill `-1`, truncated size two, empty
++input padded to two, and output-dtype preservation. Dynamic and fixed masked
++select pass together in **12.19s**. The hardware-free contract is now
++**150/150 in 9.46s**.
++
++The fixed-size schedule differs from dynamic selection in two places. Its
++mask is an explicit bool buffer, so the first cumsum is a bool-to-int32
++prefix reduction rather than a half comparison prefix. Its final result also
++keeps `mask.sum()` nested in the gather/fill expression to decide which
++requested positions are valid.
++
++The bounded prefix matcher now admits that exact bool-input cumsum
++fingerprint. A new fixed-select matcher requires:
++
++- one bool mask and one int32 ADD reduction over the complete mask;
++- one same-dtype source of mask length and one int32 gather map of output
++  length;
++- a single dynamic gather under the expected `AND/CMPLT/CMPNE/WHERE`
++  bounds topology;
++- `1 <= requested_size <= mask_length <= 2**20`.
++
++It serializes the bool count as the reduction body and the guarded
++gather/fill as the typed post-reduction epilogue. This naturally handles
++both truncation and fill values without a new runtime tag. The empty-input
++case continues through the existing constant-fill path.
++
++No LUT or two-level LUT changed. Mypy is back at the exact 12-error baseline
++after removing one newly introduced type-narrowing ambiguity; touched-file
++Ruff remains at nine pre-existing findings. Next forward group:
++`TestOps.test_nonzero`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index bc1059e93..07b1fc828 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -780,9 +780,10 @@ class TestClassifier(unittest.TestCase):
+   def test_masked_select_prefix_count_uses_bounded_typed_reduction(self):
+     source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+     prefix = (source > 0.5).flatten().cumsum()
++    bool_prefix = Tensor.empty(9, dtype=dtypes.bool, device="ROCKCHIP").cumsum()
+     indices = Tensor.empty(320, dtype=dtypes.int, device="ROCKCHIP")
+     histogram = Tensor.zeros(118, dtype=dtypes.int, device="ROCKCHIP", buffer=False).scatter(0, indices, 1, reduce="add")
+-    for expression in (prefix, histogram, histogram.cumsum()):
++    for expression in (prefix, bool_prefix, histogram, histogram.cumsum()):
+       sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+       sink = sinks[-1]
+       program = build_native_program(sink)
+@@ -801,6 +802,17 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(len(subtasks), 1)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fixed_masked_select_uses_bounded_typed_reduction(self):
++    source = Tensor.empty(9, dtype=dtypes.int, device="ROCKCHIP")
++    mask = Tensor.empty(9, dtype=dtypes.bool, device="ROCKCHIP")
++    expression = source.masked_select(mask, size=4)
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    program = build_native_program(sinks[-1])
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index a8c83588b..26426b200 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2476,3 +2476,20 @@ The hardware-free contract is **149/149 in 8.79s**. No new runtime tag, LUT,
+ or two-level LUT changed; mypy remains at 12 pre-existing errors and
+ touched-file Ruff at nine pre-existing findings. Next forward group:
+ `TestOps.test_masked_select_size`.
++
++### Fixed-size masked select
++
++`test_masked_select_size` passes all exact, padded, truncated, empty, fill,
++and dtype-preservation cases in **11.99s**. Both masked-select methods pass
++together in **12.19s**.
++
++The count/prefix matcher now accepts the exact bool-to-int32 cumsum emitted
++for an explicit mask. The final fixed-size topology is serialized as one
++bounded typed reduction: `mask.sum()` is the int32 body and the guarded
++source gather plus fill value is its post-reduction epilogue. It requires
++one bool mask, one same-dtype source, one output-sized int32 gather map, and
++the exact bounds fingerprint, capped at `2**20` mask elements.
++
++Contract: **150/150 in 9.46s**. No new runtime tag, LUT, or two-level LUT
++changed. Mypy remains at 12 and touched-file Ruff at nine pre-existing
++findings. Next forward group: `TestOps.test_nonzero`.
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index f35014648..55c2599cd 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9245,6 +9245,9 @@ def _try_mask_prefix_count_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
+     if post_reduction or cast_count != 1 or (where_count, compare_count) not in ((0, 1), (2, 2)) or \
+        unequal_count != int(bool(where_count)) or \
+        len(ranges) != 1+int(bool(where_count)) or any(int(u.src[0].arg) != input_total for u in ranges): return None
++  elif inputs[0].dtype is dtypes.bool:
++    if post_reduction or (where_count, compare_count, unequal_count, cast_count) != (2, 1, 1, 1) or \
++       len(ranges) != 2 or any(int(u.src[0].arg) != input_total for u in ranges): return None
+   elif inputs[0].dtype is dtypes.int:
+     loops = [u for u in ranges if getattr(u.arg[-1], "name", "") == "LOOP"]
+     reduced = [u for u in ranges if getattr(u.arg[-1], "name", "") == "REDUCE"]
+@@ -9276,6 +9279,33 @@ def _try_constant_true_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask,
+   direct_store = store.replace(src=(store.src[0], direct_source))
+   return _try_elementwise_host_subtasks(sink.substitute({store:direct_store}), allow_plain=True)
+ 
++def _try_fixed_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize fixed-size masked-select's bool count and typed final gather."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _unwrap(store.src[1]).op is not Ops.WHERE: return None
++  nodes = store.src[1].toposort()
++  reductions = [u for u in nodes if u.op is Ops.REDUCE]
++  allowed = {Ops.REDUCE, Ops.WHERE, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.CAST,
++             Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if len(reductions) != 1 or any(u.op not in allowed for u in nodes): return None
++  reduce = reductions[0]
++  body = _unwrap(reduce.src[0])
++  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.ADD or \
++     reduce.src[0].op is not Ops.CAST or body.op is not Ops.INDEX: return None
++  mask_index = body
++  if mask_index.op is not Ops.INDEX or mask_index.dtype is not dtypes.bool or mask_index.src[0].op is not Ops.PARAM: return None
++  output_total, mask_total = prod(_shape_of_store(sink)), int(mask_index.src[0].src[0].arg)
++  params = {u.arg.slot:(u.dtype, int(u.src[0].arg)) for u in nodes if u.op is Ops.PARAM}
++  bool_inputs = [(slot, total) for slot, (dtype, total) in params.items() if dtype is dtypes.bool]
++  value_inputs = [(slot, total) for slot, (dtype, total) in params.items() if dtype is store.src[0].dtype]
++  if bool_inputs != [(mask_index.src[0].buf_uop.arg.slot, mask_total)] or len(value_inputs) != 2 or \
++     sorted(total for _, total in value_inputs) != sorted((output_total, mask_total)) or \
++     not 1 <= output_total <= mask_total <= 1 << 20: return None
++  dynamic_gathers = [u for u in nodes if u.op is Ops.INDEX and u.dtype is store.src[0].dtype and
++                     u.src[0].op is Ops.PARAM and any(x.op is Ops.INDEX for x in u.src[1].toposort())]
++  if len(dynamic_gathers) != 1: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
++
+ def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Preserve the exact fp32 boundary for the canonicalized ``(x+x)*x`` topology test."""
+   store = _store_node(sink)
+@@ -14485,6 +14515,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, mask_prefix_count_tasks)
+   if (constant_true_masked_select_tasks := _try_constant_true_masked_select_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, constant_true_masked_select_tasks)
++  if (fixed_masked_select_tasks := _try_fixed_masked_select_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fixed_masked_select_tasks)
+   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, exp_correction_tasks)
+   if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)
+-- 
+2.34.1
+
