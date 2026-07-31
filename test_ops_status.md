@@ -3260,3 +3260,22 @@ Contract remains **173/173 in 10.08s**; mypy and touched-file Ruff remain
 at their 12- and 9-finding baselines. The stopped full sweep had reached
 **89 passed, 4 skipped, and 91 passed subtests in 652.13s**. No LUT changed.
 Next: rerun the complete inventory.
+
+### Complete forward-only inventory
+
+The definitive uninterrupted suite passes **405 methods, 13 expected
+skips, and 126 subtests in 2372.12s (39:32)**: zero failures across all
+418 collected `TestOps` methods. The independently resumed suffix also
+passed **328 methods, 9 skips, and 37 subtests in 1744.26s (29:04)**.
+
+The 13 skips are not backend failures: five are the explicit manual-gradient
+methods excluded by `FORWARD_ONLY=1`; eight are upstream declarations for
+unsupported integer power, intentionally slow/redundant convolutions, an
+LLVM-only vectorization check, and broken `max_nan`.
+
+Final contract is **173/173 in 9.84s**. Mypy remains at its exact 12-error
+baseline and touched-file Ruff at nine pre-existing findings. The only
+suite warning is the known nonfinite fp16-to-fp32 NumPy cast in `test_exp`,
+whose assertions pass. Worktree is clean except intentional `ref/` clones.
+
+**Final status: all runnable forward-only Rockchip TestOps cases pass.**

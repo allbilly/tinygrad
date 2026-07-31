@@ -12027,3 +12027,49 @@ Pre-edit recovery copies:
 
 Next action: restart the complete uninterrupted forward-only inventory and
 fix the next failure group, if any.
+
+## 2026-07-31 — complete forward-only TestOps milestone
+
+The complete uninterrupted Rockchip `TestOps` inventory passes with
+**405 passed, 13 skipped, and 126 passing subtests in 2372.12s (39:32)**.
+There are **zero failures** across all 418 collected methods under the
+required `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF` contract.
+
+Before the definitive run, the complete post-cummin suffix also passed
+**328 methods, 9 skips, and 37 subtests in 1744.26s (29:04)**. The final
+full replay crossed the previously failing cumulative block at 15% and
+continued to 100% without a timeout, reset, worker loss, or numerical
+mismatch. This validates both standalone coverage and accumulated NPU
+state.
+
+The 13 skips are fully accounted for:
+
+- five explicit manual-gradient methods excluded by the user-approved
+  forward-only contract: `cmp_ne_backwards`, `cmp_lt_backwards`,
+  `pow_const_direct`, `sigmoid_extreme`, and `sigmoid_alt_extreme`;
+- eight upstream-declared skips already outside the runnable inventory:
+  unsupported integer power, three intentionally slow convolution cases,
+  two redundant convolution cases, the LLVM-only vectorization case, and
+  the upstream-broken `max_nan` case.
+
+Final validation:
+
+- complete hardware TestOps: **405 passed, 13 skipped, 126 subtests passed**;
+- hardware-free Rockchip contract: **173/173 in 9.84s**;
+- mypy remains at the exact 12-error baseline in
+  `tinygrad/runtime/support/rockchip.py`;
+- touched-file Ruff remains at the exact nine pre-existing findings;
+- `git diff --check` passes;
+- worktree is clean except the intentionally untracked `ref/` repository
+  collection.
+
+The one suite warning is the known NumPy invalid cast while widening
+nonfinite fp16 values in `test_exp`; the test passes and output semantics
+are correct. No LUT table, tuning parameter, or two-level NPU LUT changed
+in the final verification milestone.
+
+Pre-edit recovery copies:
+`/tmp/progress.md.20260731-203002` and
+`/tmp/test_ops_status.md.20260731-203002`.
+
+Result: the requested forward-only Rockchip `TestOps` goal is complete.
