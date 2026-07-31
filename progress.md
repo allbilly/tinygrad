@@ -12397,3 +12397,19 @@ regional composition, and duplicated overflow-denominator visibility through
 PR1 passes **173/173 in 12.90s** and focused serialized RK3588 SINH/COSH passes
 **2/2 in 11.34s**. Mypy/Ruff remain at the exact 12/8 baselines; compilation
 and `git diff --check` pass.
+
+### ASIN/ACOS endpoint graphs
+
+Commit `62e420637`; saved patch
+`0149-rockchip-compose-asin-acos-task-graphs.patch`.
+
+ASIN/ACOS now share `_TaskGraph` allocation, host fp32 residual views, regional
+masks, and validity restoration. One local endpoint decoder owns the common
+coarse ACOS table, 64x fine coordinate, fine-table 1/8 decode, 0.003 split, and
+coarse/fine selection used by both operations. ASIN retains its fp32 derivative
+correction and ACOS retains its fp16 exact-one substitute mask.
+
+This removes **74 counted lines**, reaching **11,609** in
+`support/rockchip.py`. PR1 passes **173/173 in 12.94s** and focused serialized
+RK3588 ASIN/ACOS passes **2/2 in 20.38s**. Mypy/Ruff remain exactly 12/8;
+compilation and `git diff --check` pass.

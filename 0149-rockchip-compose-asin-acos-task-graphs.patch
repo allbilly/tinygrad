@@ -1,0 +1,353 @@
+From 62e420637216d224480956f7d90c179cbd17fc33 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 02:33:20 +0800
+Subject: [PATCH] rockchip: compose asin acos task graphs
+
+---
+ tinygrad/runtime/support/rockchip.py | 301 ++++++++++-----------------
+ 1 file changed, 115 insertions(+), 186 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index e33d6560b..1639734ad 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -3692,195 +3692,119 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (match := _try_asin_acos(store.src[1])) is None: return None
+   source, is_acos = match
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1)+1
+-  tasks:list[RKSubTask] = []
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot+1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    idx = store.src[0]
+-    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
+-  def add_lut(arg:str, source_slot:int, out_slot:int) -> bool:
+-    value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(source_slot),), arg=arg)
+-    plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(out_slot), value))}))
+-    if isinstance(plan, str) or plan.kind != "dpu_lut": return False
+-    cmds, task, relocs = emit_rk(plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-    return True
+-
++  graph = _TaskGraph(sink, store, source)
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+-  source_residual = alloc() if source.dtype is dtypes.float else -1
+-  if source_residual >= 0:
+-    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-    relocs = (RKReloc(0, source_residual, 0, 0, 0xFFFFFFFF), RKReloc(0, source_arg[0], 0, 0, 0xFFFFFFFF))
+-    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_RESIDUAL_LAYOUT), source_residual, is_copy=True), relocs))
+-  neg_source, abs_source, neg_abs, neg_clamped, bounded = (alloc() for _ in range(5))
+-  negative_diff, negative_scratch, negative, positive = (alloc() for _ in range(4))
+-  invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(3))
+-  tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
+-                _emit_where_stage(total, neg_abs, zero, (abs_source, 0), Ops.SUB),
+-                _emit_where_stage(total, neg_clamped, (neg_abs, 0), _float_arg(-1), Ops.MAX),
+-                _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB),
+-                _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, positive, one, (negative, 0), Ops.SUB),
+-                _emit_where_stage(total, invalid_diff, (abs_source, 0), one, Ops.SUB),
+-                _emit_where_stage(total, invalid_scratch, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, invalid, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True)))
+-
+-  endpoint_diff, endpoint_scratch, endpoint = (alloc() for _ in range(3))
+-  endpoint_distance = alloc()
+-  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), _float_arg(.85 if is_acos else .875), Ops.SUB),
+-                _emit_where_stage(total, endpoint_scratch, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, endpoint, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, endpoint_distance, one, (bounded, 0), Ops.SUB)))
++  source_residual = graph.host_view(source_arg[0], _HOST_FP32_RESIDUAL_LAYOUT)[0] if source.dtype is dtypes.float else -1
++  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
++  neg_abs = graph.op(zero, abs_source, Ops.SUB, repeat=False)
++  bounded = graph.op(zero, graph.op(neg_abs, _float_arg(-1), Ops.MAX, repeat=False), Ops.SUB, repeat=False)
++  negative = graph.positive_mask(zero, source_arg, repeat=True)
++  positive = graph.op(one, negative, Ops.SUB, repeat=False)
++  invalid = graph.positive_mask(abs_source, one, repeat=True)
++  endpoint = graph.positive_mask(bounded, _float_arg(.85 if is_acos else .875), repeat=True)
++  endpoint_distance = graph.op(one, bounded, Ops.SUB, repeat=False)
+   endpoint_input = endpoint_distance
+   if source_residual >= 0:
+-    negative_residual, positive_residual, selected_negative_residual = alloc(), alloc(), alloc()
+-    absolute_residual, scaled_residual, endpoint_input = alloc(), alloc(), alloc()
+-    tasks.extend((_emit_where_stage(total, negative_residual, zero, (source_residual, 0), Ops.SUB),
+-                  _emit_where_stage(total, positive_residual, (source_residual, 0), (positive, 0), Ops.MUL),
+-                  _emit_where_stage(total, selected_negative_residual, (negative_residual, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, absolute_residual, (positive_residual, 0), (selected_negative_residual, 0), Ops.ADD),
+-                  _emit_where_stage(total, scaled_residual, (absolute_residual, 0), _float_arg(1/256), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_input, (endpoint_distance, 0), (scaled_residual, 0), Ops.SUB)))
++    negative_residual = graph.op(zero, (source_residual,0), Ops.SUB, repeat=False)
++    positive_residual = graph.op((source_residual,0), positive, Ops.MUL, repeat=False)
++    selected_negative_residual = graph.op(negative_residual, negative, Ops.MUL, repeat=False)
++    absolute_residual = graph.op(positive_residual, selected_negative_residual, Ops.ADD, repeat=False)
++    scaled_residual = graph.op(absolute_residual, _float_arg(1/256), Ops.MUL, repeat=False)
++    endpoint_input = graph.op(endpoint_distance, scaled_residual, Ops.SUB, repeat=False)
++
++  def refine_endpoint(coarse_slot:int) -> tuple[int,int]|None:
++    fine_input = graph.op(endpoint_input, _float_arg(64), Ops.MUL, repeat=False)
++    fine_slot = graph.alloc()
++    if not graph.emit_named_lut("rk_acos_fine_endpoint", fine_input[0], fine_slot): return None
++    decoded_fine = graph.op((fine_slot,0), _float_arg(1/8), Ops.MUL, repeat=False)
++    coarse_mask = graph.positive_mask(endpoint_input, _float_arg(.003), repeat=True)
++    fine_mask = graph.op(one, coarse_mask, Ops.SUB, repeat=False)
++    coarse_selected = graph.op((coarse_slot,0), coarse_mask, Ops.MUL, repeat=False)
++    fine_selected = graph.op(decoded_fine, fine_mask, Ops.MUL, repeat=False)
++    return graph.op(coarse_selected, fine_selected, Ops.ADD, repeat=False)
+ 
+-  broad_slot = alloc()
++  broad_slot = graph.alloc()
+   if is_acos:
+-    neg_bounded, positive_bounded, negative_bounded, signed_bounded = (alloc() for _ in range(4))
+-    tasks.extend((_emit_where_stage(total, neg_bounded, zero, (bounded, 0), Ops.SUB),
+-                  _emit_where_stage(total, positive_bounded, (bounded, 0), (positive, 0), Ops.MUL),
+-                  _emit_where_stage(total, negative_bounded, (neg_bounded, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, signed_bounded, (positive_bounded, 0), (negative_bounded, 0), Ops.ADD)))
+-    endpoint_slot = alloc()
+-    if not add_lut("rk_acos", signed_bounded, broad_slot) or \
+-       not add_lut("rk_acos_endpoint", endpoint_input, endpoint_slot): return None
+-    decoded_endpoint_slot = endpoint_slot
++    neg_bounded = graph.op(zero, bounded, Ops.SUB, repeat=False)
++    positive_bounded = graph.op(bounded, positive, Ops.MUL, repeat=False)
++    negative_bounded = graph.op(neg_bounded, negative, Ops.MUL, repeat=False)
++    signed_bounded = graph.op(positive_bounded, negative_bounded, Ops.ADD, repeat=False)
++    endpoint_slot = graph.alloc()
++    if not graph.emit_named_lut("rk_acos", signed_bounded[0], broad_slot) or \
++       not graph.emit_named_lut("rk_acos_endpoint", endpoint_input[0], endpoint_slot): return None
++    decoded_endpoint = (endpoint_slot,0)
+     if source_residual >= 0:
+-      fine_input, fine_slot, decoded_fine_slot = alloc(), alloc(), alloc()
+-      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), _float_arg(64), Ops.MUL))
+-      if not add_lut("rk_acos_fine_endpoint", fine_input, fine_slot): return None
+-      tasks.append(_emit_where_stage(total, decoded_fine_slot, (fine_slot, 0), _float_arg(1/8), Ops.MUL))
+-      fine_diff, fine_scratch, coarse_mask, fine_mask = (alloc() for _ in range(4))
+-      coarse_selected, fine_selected, decoded_endpoint_slot = (alloc() for _ in range(3))
+-      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), _float_arg(.003), Ops.SUB),
+-                    _emit_where_stage(total, fine_scratch, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, coarse_mask, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, fine_mask, one, (coarse_mask, 0), Ops.SUB),
+-                    _emit_where_stage(total, coarse_selected, (endpoint_slot, 0), (coarse_mask, 0), Ops.MUL),
+-                    _emit_where_stage(total, fine_selected, (decoded_fine_slot, 0), (fine_mask, 0), Ops.MUL),
+-                    _emit_where_stage(total, decoded_endpoint_slot, (coarse_selected, 0), (fine_selected, 0), Ops.ADD)))
+-    broad_mask, broad_positive, broad_negative = (alloc() for _ in range(3))
+-    broad_positive_selected, broad_negative_selected, broad_decoded, broad_selected = (alloc() for _ in range(4))
+-    exact_diff, exact_scratch, exact_one, not_exact = (alloc() for _ in range(4))
+-    endpoint_nonzero, positive_endpoint, negative_endpoint = (alloc() for _ in range(3))
+-    positive_endpoint_selected, negative_endpoint_selected, endpoint_decoded, endpoint_selected, selected = (alloc() for _ in range(5))
+-    tasks.extend((_emit_where_stage(total, broad_mask, one, (endpoint, 0), Ops.SUB),
+-                  _emit_where_stage(total, broad_positive, (broad_slot, 0), _float_arg(2), Ops.MUL),
+-                  _emit_where_stage(total, broad_negative, (broad_slot, 0), _float_arg(4), Ops.MUL),
+-                  _emit_where_stage(total, broad_positive_selected, (broad_positive, 0), (positive, 0), Ops.MUL),
+-                  _emit_where_stage(total, broad_negative_selected, (broad_negative, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, broad_decoded, (broad_positive_selected, 0), (broad_negative_selected, 0), Ops.ADD),
+-                  _emit_where_stage(total, broad_selected, (broad_decoded, 0), (broad_mask, 0), Ops.MUL),
+-                  # The hardware cannot safely emit a literal zero LUT entry.
+-                  # Only fp16 x=1 exceeds this threshold, so mask its one-count substitute.
+-                  _emit_where_stage(total, exact_diff, (endpoint_input, 0) if source_residual >= 0 else (bounded, 0),
+-                                    zero if source_residual >= 0 else _float_arg(.99975), Ops.SUB),
+-                  _emit_where_stage(total, exact_scratch, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, exact_one, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, not_exact, (exact_one, 0) if source_residual >= 0 else one,
+-                                    zero if source_residual >= 0 else (exact_one, 0), Ops.SUB),
+-                  _emit_where_stage(total, endpoint_nonzero, (decoded_endpoint_slot, 0), (not_exact, 0), Ops.MUL),
+-                  _emit_where_stage(total, positive_endpoint, (endpoint_nonzero, 0), (positive, 0), Ops.MUL),
+-                  _emit_where_stage(total, negative_endpoint, _float_arg(math.pi), (endpoint_nonzero, 0), Ops.SUB),
+-                  _emit_where_stage(total, positive_endpoint_selected, (positive_endpoint, 0), (positive, 0), Ops.MUL),
+-                  _emit_where_stage(total, negative_endpoint_selected, (negative_endpoint, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_decoded, (positive_endpoint_selected, 0), (negative_endpoint_selected, 0), Ops.ADD),
+-                  _emit_where_stage(total, endpoint_selected, (endpoint_decoded, 0), (endpoint, 0), Ops.MUL),
+-                  _emit_where_stage(total, selected, (broad_selected, 0), (endpoint_selected, 0), Ops.ADD)))
++      refined_endpoint = refine_endpoint(endpoint_slot)
++      if refined_endpoint is None: return None
++      decoded_endpoint = refined_endpoint
++    broad_mask = graph.op(one, endpoint, Ops.SUB, repeat=False)
++    broad_positive = graph.op((broad_slot,0), _float_arg(2), Ops.MUL, repeat=False)
++    broad_negative = graph.op((broad_slot,0), _float_arg(4), Ops.MUL, repeat=False)
++    broad_positive_selected = graph.op(broad_positive, positive, Ops.MUL, repeat=False)
++    broad_negative_selected = graph.op(broad_negative, negative, Ops.MUL, repeat=False)
++    broad_decoded = graph.op(broad_positive_selected, broad_negative_selected, Ops.ADD, repeat=False)
++    broad_selected = graph.op(broad_decoded, broad_mask, Ops.MUL, repeat=False)
++    # The hardware cannot safely emit a literal zero LUT entry. Only fp16 x=1
++    # exceeds this threshold, so mask its one-count substitute.
++    exact_one = graph.positive_mask(endpoint_input if source_residual >= 0 else bounded,
++                                    zero if source_residual >= 0 else _float_arg(.99975), repeat=True)
++    not_exact = graph.op(exact_one if source_residual >= 0 else one,
++                         zero if source_residual >= 0 else exact_one, Ops.SUB, repeat=False)
++    endpoint_nonzero = graph.op(decoded_endpoint, not_exact, Ops.MUL, repeat=False)
++    positive_endpoint = graph.op(endpoint_nonzero, positive, Ops.MUL, repeat=False)
++    negative_endpoint = graph.op(_float_arg(math.pi), endpoint_nonzero, Ops.SUB, repeat=False)
++    positive_endpoint_selected = graph.op(positive_endpoint, positive, Ops.MUL, repeat=False)
++    negative_endpoint_selected = graph.op(negative_endpoint, negative, Ops.MUL, repeat=False)
++    endpoint_decoded = graph.op(positive_endpoint_selected, negative_endpoint_selected, Ops.ADD, repeat=False)
++    endpoint_selected = graph.op(endpoint_decoded, endpoint, Ops.MUL, repeat=False)
++    selected = graph.op(broad_selected, endpoint_selected, Ops.ADD, repeat=False)
+   else:
+-    near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
+-    local_diff, local_scratch, local_outside, local_inside = (alloc() for _ in range(4))
+-    local_mask, middle_mask = alloc(), alloc()
+-    neg_bounded, local_coordinate, endpoint_coordinate, detail_input = (alloc() for _ in range(4))
+-    tasks.extend((_emit_where_stage(total, near_diff, (bounded, 0), _float_arg(.04), Ops.SUB),
+-                  _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_diff, (bounded, 0),
+-                                    _float_arg(.24 if source_residual >= 0 else .125), Ops.SUB),
+-                  _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                  _emit_where_stage(total, middle_mask, (local_outside, 0), (endpoint, 0), Ops.SUB),
+-                  _emit_where_stage(total, neg_bounded, zero, (bounded, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_coordinate, (neg_bounded, 0), (local_inside, 0), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_coordinate, (endpoint_input, 0), (endpoint, 0), Ops.MUL),
+-                  _emit_where_stage(total, detail_input, (local_coordinate, 0), (endpoint_coordinate, 0), Ops.ADD)))
+-    detail_slot = alloc()
+-    if not add_lut("rk_asin", bounded, broad_slot) or not add_lut("rk_asin_detail", detail_input, detail_slot): return None
+-    derivative_slot, fp32_endpoint_asin = -1, -1
++    near_outside = graph.positive_mask(bounded, _float_arg(.04), repeat=True)
++    near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++    local_outside = graph.positive_mask(bounded, _float_arg(.24 if source_residual >= 0 else .125), repeat=True)
++    local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++    local_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++    middle_mask = graph.op(local_outside, endpoint, Ops.SUB, repeat=False)
++    neg_bounded = graph.op(zero, bounded, Ops.SUB, repeat=False)
++    local_coordinate = graph.op(neg_bounded, local_inside, Ops.MUL, repeat=False)
++    endpoint_coordinate = graph.op(endpoint_input, endpoint, Ops.MUL, repeat=False)
++    detail_input = graph.op(local_coordinate, endpoint_coordinate, Ops.ADD, repeat=False)
++    detail_slot = graph.alloc()
++    if not graph.emit_named_lut("rk_asin", bounded[0], broad_slot) or \
++       not graph.emit_named_lut("rk_asin_detail", detail_input[0], detail_slot): return None
+     if source_residual >= 0:
+-      derivative_slot = alloc()
+-      if not add_lut("rk_asin_derivative", bounded, derivative_slot): return None
+-      coarse_acos, fine_input, fine_acos, decoded_fine_acos = alloc(), alloc(), alloc(), alloc()
+-      if not add_lut("rk_acos_endpoint", endpoint_input, coarse_acos): return None
+-      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), _float_arg(64), Ops.MUL))
+-      if not add_lut("rk_acos_fine_endpoint", fine_input, fine_acos): return None
+-      tasks.append(_emit_where_stage(total, decoded_fine_acos, (fine_acos, 0), _float_arg(1/8), Ops.MUL))
+-      fine_diff, fine_scratch, coarse_mask, fine_mask = (alloc() for _ in range(4))
+-      coarse_selected_acos, fine_selected_acos, decoded_acos, fp32_endpoint_asin = (alloc() for _ in range(4))
+-      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), _float_arg(.003), Ops.SUB),
+-                    _emit_where_stage(total, fine_scratch, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, coarse_mask, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, fine_mask, one, (coarse_mask, 0), Ops.SUB),
+-                    _emit_where_stage(total, coarse_selected_acos, (coarse_acos, 0), (coarse_mask, 0), Ops.MUL),
+-                    _emit_where_stage(total, fine_selected_acos, (decoded_fine_acos, 0), (fine_mask, 0), Ops.MUL),
+-                    _emit_where_stage(total, decoded_acos, (coarse_selected_acos, 0), (fine_selected_acos, 0), Ops.ADD),
+-                    _emit_where_stage(total, fp32_endpoint_asin, _float_arg(math.pi/2), (decoded_acos, 0), Ops.SUB)))
+-    broad_scaled, broad_selected = alloc(), alloc()
+-    local_scaled, local_selected = alloc(), alloc()
+-    endpoint_scaled, endpoint_selected = alloc(), alloc()
+-    near_selected, partial, absolute_partial, absolute_asin = alloc(), alloc(), alloc(), alloc()
+-    negative_asin, positive_selected, negative_selected, base_selected = (alloc() for _ in range(4))
+-    tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), _float_arg(2), Ops.MUL),
+-                  _emit_where_stage(total, broad_selected, (broad_scaled, 0), (middle_mask, 0), Ops.MUL),
+-                  _emit_where_stage(total, local_scaled, (detail_slot, 0), _float_arg(.25), Ops.MUL),
+-                  _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_scaled,
+-                                    (fp32_endpoint_asin, 0) if fp32_endpoint_asin >= 0 else (detail_slot, 0),
+-                                    one if fp32_endpoint_asin >= 0 else _float_arg(2), Ops.MUL),
+-                  _emit_where_stage(total, endpoint_selected, (endpoint_scaled, 0), (endpoint, 0), Ops.MUL),
+-                  _emit_where_stage(total, near_selected, (bounded, 0), (near_inside, 0), Ops.MUL),
+-                  _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                  _emit_where_stage(total, absolute_partial, (partial, 0), (endpoint_selected, 0), Ops.ADD),
+-                  _emit_where_stage(total, absolute_asin, (absolute_partial, 0), (near_selected, 0), Ops.ADD),
+-                  _emit_where_stage(total, negative_asin, zero, (absolute_asin, 0), Ops.SUB),
+-                  _emit_where_stage(total, positive_selected, (absolute_asin, 0), (positive, 0), Ops.MUL),
+-                  _emit_where_stage(total, negative_selected, (negative_asin, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, base_selected, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+-    selected = base_selected
++      derivative_slot, coarse_acos = graph.alloc(), graph.alloc()
++      if not graph.emit_named_lut("rk_asin_derivative", bounded[0], derivative_slot) or \
++         not graph.emit_named_lut("rk_acos_endpoint", endpoint_input[0], coarse_acos): return None
++      if (decoded_acos := refine_endpoint(coarse_acos)) is None: return None
++      endpoint_asin = graph.op(_float_arg(math.pi/2), decoded_acos, Ops.SUB, repeat=False)
++    else: endpoint_asin = (detail_slot,0)
++    broad_scaled = graph.op((broad_slot,0), _float_arg(2), Ops.MUL, repeat=False)
++    broad_selected = graph.op(broad_scaled, middle_mask, Ops.MUL, repeat=False)
++    local_scaled = graph.op((detail_slot,0), _float_arg(.25), Ops.MUL, repeat=False)
++    local_selected = graph.op(local_scaled, local_mask, Ops.MUL, repeat=False)
++    endpoint_scaled = graph.op(endpoint_asin, one if source_residual >= 0 else _float_arg(2), Ops.MUL, repeat=False)
++    endpoint_selected = graph.op(endpoint_scaled, endpoint, Ops.MUL, repeat=False)
++    near_selected = graph.op(bounded, near_inside, Ops.MUL, repeat=False)
++    absolute_asin = graph.op(graph.op(graph.op(broad_selected, local_selected, Ops.ADD, repeat=False),
++                                      endpoint_selected, Ops.ADD, repeat=False), near_selected, Ops.ADD, repeat=False)
++    negative_asin = graph.op(zero, absolute_asin, Ops.SUB, repeat=False)
++    positive_selected = graph.op(absolute_asin, positive, Ops.MUL, repeat=False)
++    negative_selected = graph.op(negative_asin, negative, Ops.MUL, repeat=False)
++    selected = graph.op(positive_selected, negative_selected, Ops.ADD, repeat=False)
+     if source_residual >= 0:
+-      derivative, scaled_residual, residual_correction, nonendpoint_mask, nonendpoint_correction, selected = (alloc() for _ in range(6))
+-      tasks.extend((_emit_where_stage(total, derivative, (derivative_slot, 0), _float_arg(2), Ops.MUL),
+-                    _emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1/256), Ops.MUL),
+-                    _emit_where_stage(total, residual_correction, (derivative, 0), (scaled_residual, 0), Ops.MUL),
+-                    _emit_where_stage(total, nonendpoint_mask, one, (endpoint, 0), Ops.SUB),
+-                    _emit_where_stage(total, nonendpoint_correction, (residual_correction, 0), (nonendpoint_mask, 0), Ops.MUL),
+-                    _emit_where_stage(total, selected, (base_selected, 0), (nonendpoint_correction, 0), Ops.ADD)))
+-
+-  valid_scratch, valid, factor_scratch, factor = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, valid_scratch, one, (invalid, 0), Ops.SUB),
+-                _emit_where_stage(total, valid, one, (invalid, 0), Ops.SUB),
+-                _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
+-                _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
+-                _emit_where_stage(total, info.outs[0], (selected, 0), (factor, 0), Ops.MUL)))
+-  tasks = list(_fix_cmp_fp32(tuple(tasks), source))
++      derivative = graph.op((derivative_slot,0), _float_arg(2), Ops.MUL, repeat=False)
++      scaled_residual = graph.op((source_residual,0), _float_arg(1/256), Ops.MUL, repeat=False)
++      residual_correction = graph.op(derivative, scaled_residual, Ops.MUL, repeat=False)
++      nonendpoint_mask = graph.op(one, endpoint, Ops.SUB, repeat=False)
++      nonendpoint_correction = graph.op(residual_correction, nonendpoint_mask, Ops.MUL, repeat=False)
++      selected = graph.op(selected, nonendpoint_correction, Ops.ADD, repeat=False)
++
++  valid = graph.op(one, invalid, Ops.SUB)
++  factor = graph.op(valid, valid, Ops.FDIV)
++  graph.op(selected, factor, Ops.MUL, out_slot=graph.out, repeat=False)
++  tasks = list(_fix_cmp_fp32(tuple(graph.tasks), source))
+   return _finalize_fp32_output(tasks, store)
+ 
+ def _try_fp16_tan_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -4014,18 +3938,15 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if store is None or (match := _try_asinh_acosh(store.src[1])) is None: return None
+   source, is_acosh = match
+   graph = _TaskGraph(sink, store, source)
+-  total, out, tasks = graph.total, graph.out, graph.tasks
++  out, tasks = graph.out, graph.tasks
+ 
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+   # Rejected WIP: a 1.5*fp32 residual nudge for small ASINH inputs only
+   # moved which samples landed in the wrong fp16 output bin. Keep the path
+   # disabled for reference; ACOSH still needs the residual for its endpoint.
+   apply_small_residual = False
+-  source_residual = graph.alloc() if source.dtype is dtypes.float and (is_acosh or apply_small_residual) else -1
+-  if source_residual >= 0:
+-    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-    relocs = (RKReloc(0, source_residual, 0, 0, 0xFFFFFFFF), RKReloc(0, source_arg[0], 0, 0, 0xFFFFFFFF))
+-    tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_RESIDUAL_LAYOUT), source_residual, is_copy=True), relocs))
++  source_residual = graph.host_view(source_arg[0], _HOST_FP32_RESIDUAL_LAYOUT)[0] \
++    if source.dtype is dtypes.float and (is_acosh or apply_small_residual) else -1
+   invalid = -1
+   if is_acosh:
+     invalid = graph.positive_mask(one, source_arg, repeat=True)[0]
+@@ -5472,6 +5393,14 @@ class _TaskGraph:
+     ret, self.next_slot = self.next_slot, self.next_slot + 1
+     return ret
+ 
++  def host_view(self, input_slot:int, layout:int) -> tuple[int,int]:
++    """Expose a host ABI view as a reset-separated copy task."""
++    out_slot = self.alloc()
++    cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++    relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, input_slot, 0, 0, 0xFFFFFFFF))
++    self.tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (self.total, layout), out_slot, is_copy=True), relocs))
++    return out_slot, 0
++
+   def temp_index(self, slot:int, dtype=dtypes.half) -> UOp:
+     out_idx = self.store.src[0]
+     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+-- 
+2.34.1
+
