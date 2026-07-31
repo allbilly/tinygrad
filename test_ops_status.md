@@ -2476,3 +2476,20 @@ The hardware-free contract is **149/149 in 8.79s**. No new runtime tag, LUT,
 or two-level LUT changed; mypy remains at 12 pre-existing errors and
 touched-file Ruff at nine pre-existing findings. Next forward group:
 `TestOps.test_masked_select_size`.
+
+### Fixed-size masked select
+
+`test_masked_select_size` passes all exact, padded, truncated, empty, fill,
+and dtype-preservation cases in **11.99s**. Both masked-select methods pass
+together in **12.19s**.
+
+The count/prefix matcher now accepts the exact bool-to-int32 cumsum emitted
+for an explicit mask. The final fixed-size topology is serialized as one
+bounded typed reduction: `mask.sum()` is the int32 body and the guarded
+source gather plus fill value is its post-reduction epilogue. It requires
+one bool mask, one same-dtype source, one output-sized int32 gather map, and
+the exact bounds fingerprint, capped at `2**20` mask elements.
+
+Contract: **150/150 in 9.46s**. No new runtime tag, LUT, or two-level LUT
+changed. Mypy remains at 12 and touched-file Ruff at nine pre-existing
+findings. Next forward group: `TestOps.test_nonzero`.

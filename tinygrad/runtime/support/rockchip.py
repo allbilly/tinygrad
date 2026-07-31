@@ -9245,6 +9245,9 @@ def _try_mask_prefix_count_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
     if post_reduction or cast_count != 1 or (where_count, compare_count) not in ((0, 1), (2, 2)) or \
        unequal_count != int(bool(where_count)) or \
        len(ranges) != 1+int(bool(where_count)) or any(int(u.src[0].arg) != input_total for u in ranges): return None
+  elif inputs[0].dtype is dtypes.bool:
+    if post_reduction or (where_count, compare_count, unequal_count, cast_count) != (2, 1, 1, 1) or \
+       len(ranges) != 2 or any(int(u.src[0].arg) != input_total for u in ranges): return None
   elif inputs[0].dtype is dtypes.int:
     loops = [u for u in ranges if getattr(u.arg[-1], "name", "") == "LOOP"]
     reduced = [u for u in ranges if getattr(u.arg[-1], "name", "") == "REDUCE"]
@@ -9275,6 +9278,33 @@ def _try_constant_true_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask,
   direct_source = source_indexes[0].replace(src=(source_indexes[0].src[0], store.src[0].src[1]))
   direct_store = store.replace(src=(store.src[0], direct_source))
   return _try_elementwise_host_subtasks(sink.substitute({store:direct_store}), allow_plain=True)
+
+def _try_fixed_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize fixed-size masked-select's bool count and typed final gather."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _unwrap(store.src[1]).op is not Ops.WHERE: return None
+  nodes = store.src[1].toposort()
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  allowed = {Ops.REDUCE, Ops.WHERE, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.CAST,
+             Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if len(reductions) != 1 or any(u.op not in allowed for u in nodes): return None
+  reduce = reductions[0]
+  body = _unwrap(reduce.src[0])
+  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.ADD or \
+     reduce.src[0].op is not Ops.CAST or body.op is not Ops.INDEX: return None
+  mask_index = body
+  if mask_index.op is not Ops.INDEX or mask_index.dtype is not dtypes.bool or mask_index.src[0].op is not Ops.PARAM: return None
+  output_total, mask_total = prod(_shape_of_store(sink)), int(mask_index.src[0].src[0].arg)
+  params = {u.arg.slot:(u.dtype, int(u.src[0].arg)) for u in nodes if u.op is Ops.PARAM}
+  bool_inputs = [(slot, total) for slot, (dtype, total) in params.items() if dtype is dtypes.bool]
+  value_inputs = [(slot, total) for slot, (dtype, total) in params.items() if dtype is store.src[0].dtype]
+  if bool_inputs != [(mask_index.src[0].buf_uop.arg.slot, mask_total)] or len(value_inputs) != 2 or \
+     sorted(total for _, total in value_inputs) != sorted((output_total, mask_total)) or \
+     not 1 <= output_total <= mask_total <= 1 << 20: return None
+  dynamic_gathers = [u for u in nodes if u.op is Ops.INDEX and u.dtype is store.src[0].dtype and
+                     u.src[0].op is Ops.PARAM and any(x.op is Ops.INDEX for x in u.src[1].toposort())]
+  if len(dynamic_gathers) != 1: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
 
 def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve the exact fp32 boundary for the canonicalized ``(x+x)*x`` topology test."""
@@ -14485,6 +14515,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, mask_prefix_count_tasks)
   if (constant_true_masked_select_tasks := _try_constant_true_masked_select_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, constant_true_masked_select_tasks)
+  if (fixed_masked_select_tasks := _try_fixed_masked_select_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fixed_masked_select_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)
   if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)

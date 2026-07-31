@@ -10357,3 +10357,37 @@ No new runtime tag, LUT, or two-level LUT was needed. Mypy remains at the
 exact 12-error baseline and touched-file Ruff remains at the exact nine
 pre-existing findings. Next forward group:
 `TestOps.test_masked_select_size`.
+
+## 2026-07-31 — fixed-size masked-select milestone
+
+`TestOps.test_masked_select_size` passes all unchanged cases in **11.99s**:
+exact size four, padded size six with fill `-1`, truncated size two, empty
+input padded to two, and output-dtype preservation. Dynamic and fixed masked
+select pass together in **12.19s**. The hardware-free contract is now
+**150/150 in 9.46s**.
+
+The fixed-size schedule differs from dynamic selection in two places. Its
+mask is an explicit bool buffer, so the first cumsum is a bool-to-int32
+prefix reduction rather than a half comparison prefix. Its final result also
+keeps `mask.sum()` nested in the gather/fill expression to decide which
+requested positions are valid.
+
+The bounded prefix matcher now admits that exact bool-input cumsum
+fingerprint. A new fixed-select matcher requires:
+
+- one bool mask and one int32 ADD reduction over the complete mask;
+- one same-dtype source of mask length and one int32 gather map of output
+  length;
+- a single dynamic gather under the expected `AND/CMPLT/CMPNE/WHERE`
+  bounds topology;
+- `1 <= requested_size <= mask_length <= 2**20`.
+
+It serializes the bool count as the reduction body and the guarded
+gather/fill as the typed post-reduction epilogue. This naturally handles
+both truncation and fill values without a new runtime tag. The empty-input
+case continues through the existing constant-fill path.
+
+No LUT or two-level LUT changed. Mypy is back at the exact 12-error baseline
+after removing one newly introduced type-narrowing ambiguity; touched-file
+Ruff remains at nine pre-existing findings. Next forward group:
+`TestOps.test_nonzero`.

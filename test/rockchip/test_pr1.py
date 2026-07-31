@@ -780,9 +780,10 @@ class TestClassifier(unittest.TestCase):
   def test_masked_select_prefix_count_uses_bounded_typed_reduction(self):
     source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
     prefix = (source > 0.5).flatten().cumsum()
+    bool_prefix = Tensor.empty(9, dtype=dtypes.bool, device="ROCKCHIP").cumsum()
     indices = Tensor.empty(320, dtype=dtypes.int, device="ROCKCHIP")
     histogram = Tensor.zeros(118, dtype=dtypes.int, device="ROCKCHIP", buffer=False).scatter(0, indices, 1, reduce="add")
-    for expression in (prefix, histogram, histogram.cumsum()):
+    for expression in (prefix, bool_prefix, histogram, histogram.cumsum()):
       sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
       sink = sinks[-1]
       program = build_native_program(sink)
@@ -800,6 +801,17 @@ class TestClassifier(unittest.TestCase):
     subtasks = program.src[1].src[0].arg
     self.assertEqual(len(subtasks), 1)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
+  def test_fixed_masked_select_uses_bounded_typed_reduction(self):
+    source = Tensor.empty(9, dtype=dtypes.int, device="ROCKCHIP")
+    mask = Tensor.empty(9, dtype=dtypes.bool, device="ROCKCHIP")
+    expression = source.masked_select(mask, size=4)
+    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+    program = build_native_program(sinks[-1])
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 
   def test_fp32_factorized_zero_stride_sum_stays_native(self):
     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
