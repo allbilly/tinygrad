@@ -2722,3 +2722,20 @@ bounded by `2**20`. Generic host execution remains opt-in and unchanged.
 Contract: **159/159 in 8.93s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. Next: isolate the next forward-only failure group.
+
+### Truncating modulo (`fmod`)
+
+The complete unchanged `test_fmod` passes in **11.82s**, and `test_mod` plus
+`test_fmod` pass **2/2 in 15.94s** with `-n12 --dist loadscope`. Commit
+`86b0f1c6f`; saved patch `0097-rockchip-pass-fmod-ops.patch`.
+
+The former `non_index_operand` reject came from the nested truncating
+remainder expansion. A strict typed classifier now recognizes only exact
+tensor/tensor `a + -1*(TRUNC(a/b)*b)`, integer `CMOD`, and scalar-divisor
+forms whose folded finite constants multiply to `-1`. It verifies direct
+same-index parameters, scalar placement, output dtype, no reduction, the
+small fmod op allowlist, complete static sizes, and the `2**20` bound.
+
+Contract: **160/160 in 9.05s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. Next: isolate the next forward-only failure group.

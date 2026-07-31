@@ -10761,3 +10761,50 @@ Pre-edit recovery copies for this milestone:
 Next action: refresh the forward-only failure inventory using serialized
 load-scope groups, reproduce the next candidate alone, and commit the next
 passing group as milestone 97.
+
+## 2026-07-31 — truncating modulo (`fmod`) milestone
+
+The complete unchanged `TestOps.test_fmod` passes in **11.82s**. It covers
+all four float/int tensor pairings plus scalar divisors `2` and `3.5`.
+`test_mod` and `test_fmod` pass together **2/2 in 15.94s** with
+`-n12 --dist loadscope`. Implementation commit: `86b0f1c6f`; portable
+patch: `0097-rockchip-pass-fmod-ops.patch`.
+
+The isolated failure was again
+`RKPLAN_REJECT:unsupported_op:non_index_operand`, but `fmod` cannot reuse
+floor modulo semantics for negative inputs. Scheduled-sink inspection found
+three truncating-remainder forms:
+
+- fp16/mixed tensor pairs are exactly
+  `a + -1*(TRUNC(FDIV(a,b))*b)` after the backend's reciprocal rewrite;
+- integer pairs and integer scalar divisors use one `CMOD`;
+- fp16 scalar divisors fold to
+  `a + TRUNC(a*reciprocal)*negative_divisor`, where both finite nonzero
+  constants multiply to `-1`.
+
+The new classifier structurally verifies operand identity through the ratio,
+truncation, and multiply nodes rather than matching only an op set. Indexed
+inputs must be distinct direct parameters sharing the same flat index, or
+the denominator must be one finite nonzero scalar constant. Every parameter
+must equal the complete output size, output is fp16/int32, reductions are
+rejected, the graph has a small exact allowlist, and total size is bounded
+by `2**20`. The full graph is serialized as one typed task; generic host
+execution remains opt-in and unchanged.
+
+Validation: hardware-free Rockchip **160/160 in 9.05s**; mypy remains at the
+exact 12-error baseline after separating an optional float-denominator local
+from the integer branch; touched-file Ruff remains at the exact nine
+pre-existing findings; `git diff --check` passes. No LUT, LUT tuning, or
+two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-135513`,
+`/tmp/test_pr1.py.20260731-135513`,
+`/tmp/rockchip.py.20260731-135647`,
+`/tmp/test_pr1.py.20260731-135647`,
+`/tmp/rockchip.py.20260731-135947`,
+`/tmp/progress.md.20260731-140034`, and
+`/tmp/test_ops_status.md.20260731-140034`.
+
+Next action: continue the serialized standalone inventory and take the next
+small reproducible forward failure as milestone 98.
