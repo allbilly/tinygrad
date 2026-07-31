@@ -928,6 +928,27 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp16_cumprod_uses_one_typed_float32_reduction(self):
+    for shape, axis in (((20,), 0), ((20,30), 0), ((20,30), 1), ((20,30,40), 2)):
+      expression = Tensor.empty(*shape, dtype=dtypes.half, device="ROCKCHIP").cumprod(axis)
+      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+      program = build_native_program(sink)
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+      self.assertEqual(subtasks[0].task.layout[5], 1)
+    long_sinks = [early_simplify(call.src[0]) for call in
+                  Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP").cumprod(0).schedule_linear().src
+                  if call.src[0].op is Ops.SINK]
+    long_programs = [build_native_program(sink) for sink in long_sinks]
+    self.assertTrue(all(program is not None for program in long_programs))
+    for program in long_programs[:2]:
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+      self.assertEqual(subtasks[0].task.layout[5], 1)
+
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
     for expression in (source.argmax(0, False), source.argmin(0, False)):
