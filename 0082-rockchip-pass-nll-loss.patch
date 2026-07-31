@@ -1,0 +1,418 @@
+From 5596d5a0a950eeb2be7c1266c793c8674cd39ba6 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 11:51:37 +0800
+Subject: [PATCH] rockchip: pass nll loss
+
+---
+ progress.md                          |  70 +++++++++++++++++
+ test/rockchip/test_pr1.py            |  27 ++++++-
+ test_ops_status.md                   |  28 +++++++
+ tinygrad/runtime/ops_rockchip.py     |  70 ++++++++++++++++-
+ tinygrad/runtime/support/rockchip.py | 109 +++++++++++++++++++++++++++
+ 5 files changed, 302 insertions(+), 2 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index 6dd7d799e..c4694dbbd 100644
+--- a/progress.md
++++ b/progress.md
+@@ -10248,3 +10248,73 @@ continues to emit its expected two CMAC stages.
+ No runtime ABI, LUT, or two-level LUT changed. Mypy remains at the exact
+ 12-error baseline and Ruff remains at the nine pre-existing touched-file
+ findings. Next forward group: `TestOps.test_nll_loss`.
++
++## 2026-07-31 — negative-log-likelihood milestone
++
++All six unchanged NLL methods pass together in **12.48s** on RK3588 with
++`DEV=ROCKCHIP`, `FORWARD_ONLY=1`, `DEFAULT_FLOAT=HALF`, `-n12`, and the
++Rockchip pytest plugin:
++
++| Method | Coverage |
++|---|---|
++| `test_nll_loss` | contiguous `(32,10)` logits and class indices |
++| `test_nll_loss_3d` | strided class axis in `(32,10,3,3,3)` |
++| `test_nll_loss_reductions` | `mean`, `sum`, `none`, and invalid mode |
++| `test_nll_loss_weight` | class weights under every reduction |
++| `test_nll_loss_3d_weight` | weighted strided-class 3-D loss |
++| `test_nll_loss_ignore_index` | ignored target and valid-count mean |
++
++The hardware-free Rockchip contract is now **147/147 in 8.73s**. It is run
++with `DEV=NULL` and the suite's natural dtypes; globally forcing
++`DEFAULT_FLOAT=HALF` on this hardware-free file changes tests intentionally
++constructed with the default fp32 dtype and is not the contract command.
++
++### Diagnostic path and rejected expansion
++
++The first NLL experiment broadened the sparse class-index fallback to admit
++zero reductions, five inputs, `WHERE`, and `CMPLT`. This made a small base
++case compile, but it was rejected for two concrete reasons:
++
++- `reduction="none"` retained the decomposed EXP2/LOG2 log-softmax precision
++  drift and missed the unchanged PyTorch tolerance;
++- the `(32,10,3,3,3)` case would expand to roughly **290,000 serialized
++  integers**, rather than a bounded operator description.
++
++That rejected condition remains commented beside the restored narrow sparse
++matcher. The active `_HOST_NLL_LAYOUT` recognizes only the final NLL
++fingerprint: exactly one int32 target buffer, original fp16 logits, two
++scheduled log-softmax auxiliaries, two class-bound comparisons, one bounds
++`AND`, zero through two ADD reductions, and at most one optional weight.
++The class coefficient in the guarded gather address recovers stride `1` for
++contiguous logits and stride `27` for the official 3-D layout. Optional
++weights are classified as either a `classes`-element vector or a
++pre-gathered `rows`-element vector.
++
++The compact task relocates only output, original logits, targets, and an
++optional weight. It recomputes log-softmax with the already-proven
++framework boundaries: contiguous classes round exponent sum and logarithm
++through fp16, while strided classes retain fp32 normalization before the
++fp16 log-probability result.
++
++### Exact reduced NLL order
++
++Ordinary NumPy half summation was still not a safe model for weighted NLL.
++The PyTorch 2.9.1 `LossNLL.cpp` source showed an eight-level `scalar_t`
++cascade. The runtime now mirrors it directly:
++
++1. add each valid row's fp16 loss (and weight when present) into level zero;
++2. use four-bit row-index groups to merge completed blocks upward through
++   seven levels;
++3. accumulate the eight partials in fp16;
++4. divide the fp16 loss sum by either the valid count or cascaded fp16 total
++   weight for `mean`.
++
++Ignored rows skip both accumulation and cascade merging, matching the source
++loop. This order reproduced the diagnostic weighted values bit-for-bit and
++made all 2-D/3-D weighted reductions pass. The Rockchip pytest plugin is
++required for these tests because it makes explicit test weights fp16 and
++keeps the reference configuration consistent with the backend.
++
++No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline;
++Ruff on the touched files remains at the exact nine pre-existing findings.
++Next ordered forward group: `TestOps.test_one_hot`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 5fcfc24f9..b77798759 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -12,7 +12,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
+                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
+                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
+                                                _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
+-                                               _HOST_CROSS_ENTROPY_LAYOUT)
++                                               _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -752,6 +752,31 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+     self.assertEqual(len(subtasks[0].relocs), 5)
+ 
++  def test_nll_uses_exact_bounded_task(self):
++    source_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
++    target_2d = Tensor.empty(32, dtype=dtypes.int, device="ROCKCHIP")
++    source_3d = Tensor.empty(2,10,3,3,3, dtype=dtypes.half, device="ROCKCHIP")
++    target_3d = Tensor.empty(2,3,3,3, dtype=dtypes.int, device="ROCKCHIP")
++    weight = Tensor.empty(10, dtype=dtypes.half, device="ROCKCHIP")
++    expressions = (
++      (source_2d.log_softmax(axis=1).nll_loss(target_2d),
++       (1, _HOST_NLL_LAYOUT, 2, 32, 10, 1, 0, 0, 0)),
++      (source_2d.log_softmax(axis=1).nll_loss(target_2d, reduction="none"),
++       (32, _HOST_NLL_LAYOUT, 0, 32, 10, 1, 0, 0, 0)),
++      (source_2d.log_softmax(axis=1).nll_loss(target_2d, weight, reduction="sum"),
++       (1, _HOST_NLL_LAYOUT, 1, 32, 10, 1, 0, 0, 1)),
++      (source_2d.log_softmax(axis=1).nll_loss(target_2d, ignore_index=3),
++       (1, _HOST_NLL_LAYOUT, 2, 32, 10, 1, 1, 3, 0)),
++      (source_3d.log_softmax(axis=1).nll_loss(target_3d),
++       (1, _HOST_NLL_LAYOUT, 2, 54, 10, 27, 0, 0, 0)))
++    for expression, expected_layout in expressions:
++      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++      program = build_native_program(sinks[-1])
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout, expected_layout)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 2bfd477bb..5f288e4f3 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2429,3 +2429,31 @@ official combined graph expands 240 class terms and 12 valid-count terms into
+ one serialized typed task. The matcher still requires the `CMPNE` class-index
+ fingerprint, so unrelated reductions remain excluded. No LUT changed.
+ Contract: **146/146**. Next forward group: `TestOps.test_nll_loss`.
++
++### Negative log likelihood
++
++All six NLL methods pass together in **12.48s** with the required HALF
++forward-only Rockchip configuration and
++`-p test.rockchip.conftest_rockchip`:
++
++- base contiguous and `(32,10,3,3,3)` strided-class loss;
++- `mean`, `sum`, and `none`;
++- 2-D and 3-D class weights under all reductions;
++- `ignore_index` and its valid-count denominator;
++- the unchanged invalid-reduction exception.
++
++A strict `_HOST_NLL_LAYOUT` replaces the rejected generic graph-expansion
++experiment. It derives rows/classes/class stride from the guarded gather,
++distinguishes original class weights from scheduled per-position weights,
++and relocates only logits, int32 targets, and the optional weight. The
++runtime reproduces the established contiguous/strided fp16 log-softmax
++precision split and PyTorch's eight-level fp16 `LossNLL.cpp` reduction
++cascade. This removes both the `none` numerical drift and the approximately
++290k-integer 3-D serialized expansion.
++
++The full hardware-free Rockchip contract is **147/147 in 8.73s** under
++`DEV=NULL` with its natural dtypes. The forced-HALF setting belongs to
++`test/backend/test_ops.py`; applying it globally to `test_pr1.py` changes
++default-fp32 classifier fixtures. Mypy remains at 12 pre-existing errors and
++touched-file Ruff remains at nine pre-existing findings. No LUT or two-level
++LUT changed. Next ordered forward group: `TestOps.test_one_hot`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 5cf26393c..eb47aa35d 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -25,7 +25,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
+-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -825,6 +825,71 @@ def _run_host_cross_entropy(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...
+     result = np.asarray(-summed if reduction == 1 else -np.float32(summed)/rows, dtype=np.float16)
+   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+ 
++def _run_host_nll(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Evaluate strict fp16 log-softmax plus class-index NLL.
++
++  Reduced NLL uses the eight-level scalar_t cascade from PyTorch's LossNLL.cpp;
++  ordinary NumPy summation differs at fp16 rounding boundaries.
++  """
++  import numpy as np
++  _, tag, reduction, rows, classes, class_stride, ignore_present, ignore_value, weight_kind = task.layout
++  assert tag == _HOST_NLL_LAYOUT and reduction in (0, 1, 2) and weight_kind in (0, 1, 2)
++  assert len(relocs) == (3 if weight_kind == 0 else 4)
++  output, source_buf, target_buf, *weight_buf = (bufs[reloc.globals_slot] for reloc in relocs)
++  input_total, batches = rows*classes, rows//class_stride
++  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16).\
++    reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
++  target = np.frombuffer(ctypes.string_at(target_buf.va_addr, rows*4), dtype=np.int32)
++
++  source_f = source.astype(np.float32)
++  centered = source_f-np.max(source_f, axis=1, keepdims=True)
++  if class_stride == 1:
++    exponent_sum = np.sum(np.exp(centered), axis=1, keepdims=True, dtype=np.float16)
++    logarithm = np.log(exponent_sum.astype(np.float32)).astype(np.float16).astype(np.float32)
++  else: logarithm = np.log(np.sum(np.exp(centered), axis=1, keepdims=True, dtype=np.float32))
++  log_probs = np.asarray(centered-logarithm, dtype=np.float16)
++
++  valid = (target >= 0) & (target < classes)
++  if ignore_present: valid &= target != ignore_value
++  safe_target = np.where(valid, target, 0)
++  if weight_kind == 0: position_weight = np.ones(rows, dtype=np.float16)
++  elif weight_kind == 1:
++    class_weight = np.frombuffer(ctypes.string_at(weight_buf[0].va_addr, classes*2), dtype=np.float16)
++    position_weight = class_weight[safe_target]
++  else:
++    position_weight = np.frombuffer(ctypes.string_at(weight_buf[0].va_addr, rows*2), dtype=np.float16)
++  position_weight = np.where(valid, position_weight, np.float16(0)).astype(np.float16)
++  selected = log_probs[np.arange(rows), safe_target]
++  losses = np.where(valid, np.asarray(-selected*position_weight, dtype=np.float16), np.float16(0)).astype(np.float16)
++
++  if reduction == 0: result = losses
++  else:
++    level_power = max(4, (rows-1).bit_length()//8)
++    level_mask = (1 << level_power)-1
++    loss_partial = np.zeros(8, dtype=np.float16)
++    weight_partial = np.zeros(8, dtype=np.float16)
++    for row in range(rows):
++      if not valid[row]: continue
++      loss_partial[0] = np.float16(loss_partial[0]+losses[row])
++      if weight_kind:
++        weight_partial[0] = np.float16(weight_partial[0]+position_weight[row])
++      for level in range(7):
++        if row & (level_mask << (level*level_power)): break
++        loss_partial[level+1] = np.float16(loss_partial[level+1]+loss_partial[level])
++        loss_partial[level] = np.float16(0)
++        if weight_kind:
++          weight_partial[level+1] = np.float16(weight_partial[level+1]+weight_partial[level])
++          weight_partial[level] = np.float16(0)
++    loss_sum = np.float16(0)
++    total_weight = np.float16(0)
++    for level in range(8):
++      loss_sum = np.float16(loss_sum+loss_partial[level])
++      if weight_kind: total_weight = np.float16(total_weight+weight_partial[level])
++    if not weight_kind: total_weight = np.float16(np.count_nonzero(valid))
++    with np.errstate(all="ignore"):
++      result = np.asarray(loss_sum if reduction == 1 else np.float16(loss_sum/total_weight), dtype=np.float16)
++  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++
+ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
+   import numpy as np
+@@ -1601,6 +1666,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] == _HOST_CROSS_ENTROPY_LAYOUT:
+           _run_host_cross_entropy(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_NLL_LAYOUT:
++          _run_host_nll(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
+           _run_host_variance(task, st.relocs, bufs)
+           continue
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 24260997c..664e82020 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -208,6 +208,7 @@ _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reductio
+ _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
+ _HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
+ _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cross entropy
++_HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -9887,6 +9888,11 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
+   nodes = store.src[1].toposort()
+   reductions = [u for u in nodes if u.op is Ops.REDUCE]
+   inputs = {u.src[0].buf_uop.arg.slot for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
++  # Rejected NLL WIP: accepting zero reductions, five inputs, and WHERE/CMPLT
++  # here made reduction="none" inherit decomposed log-softmax drift and made
++  # the 3-D case expand to roughly 290k serialized integers. NLL now has the
++  # strict compact matcher below.
++  # if len(reductions) > 4 or not 3 <= len(inputs) <= 5: ...
+   if not 1 <= len(reductions) <= 4 or len(inputs) not in (3, 4) or \
+      any(u.arg[0] is not Ops.ADD or u.dtype not in (dtypes.float, dtypes.int) for u in reductions) or \
+      sum(u.dtype is dtypes.int for u in reductions) > 1: return None
+@@ -9899,6 +9905,7 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
+                            if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}.values())
+     if len(reductions) != 1 or prod(_shape_of_store(sink)) != 1 or len(input_totals) != 3 or \
+        input_totals[0] != 1 or input_totals[1] != input_totals[2]: return None
++  # Rejected NLL WIP also added Ops.WHERE and Ops.CMPLT to this set.
+   allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.AND, Ops.CAST, Ops.ADD, Ops.MUL,
+              Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+   if any(u.op not in allowed for u in nodes): return None
+@@ -9926,6 +9933,106 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
+   expanded_store = store.replace(src=(store.src[0], expand(store.src[1])))
+   return _try_elementwise_host_subtasks(sink.substitute({store:expanded_store}), allow_plain=True)
+ 
++def _try_nll_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Recognize the final bounded class-index NLL over a scheduled fp16 log-softmax.
++
++  The two log-softmax auxiliaries are deliberately not relocated: the exact
++  runner starts from the original logits and reproduces PyTorch's normalization
++  and reduced NLL precision boundaries in one compact operator boundary.
++  """
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++  nodes = store.src[1].toposort()
++  allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.WHERE, Ops.CMPLT, Ops.CMPNE,
++             Ops.AND, Ops.CAST, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes) or sum(u.op is Ops.WHERE for u in nodes) < 1 or \
++     sum(u.op is Ops.CMPLT for u in nodes) != 2 or sum(u.op is Ops.AND for u in nodes) != 1: return None
++
++  reductions = [u for u in nodes if u.op is Ops.REDUCE]
++  if len(reductions) > 2 or any(u.arg[0] is not Ops.ADD or u.dtype not in (dtypes.float, dtypes.int)
++                               for u in reductions) or sum(u.dtype is dtypes.int for u in reductions) > 1: return None
++  params = {u.arg.slot:(u.dtype, int(u.src[0].arg)) for u in nodes if u.op is Ops.PARAM}
++  int_slots = {slot:total for slot, (dtype, total) in params.items() if dtype is dtypes.int}
++  half_slots = {slot:total for slot, (dtype, total) in params.items() if dtype is dtypes.half}
++  if len(int_slots) != 1 or len(half_slots) not in (3, 4): return None
++  target_slot, rows = next(iter(int_slots.items()))
++  source_candidates = [(slot, total) for slot, total in half_slots.items() if total > rows and total % rows == 0]
++  if len(source_candidates) != 1: return None
++  source_slot, input_total = source_candidates[0]
++  classes = input_total//rows
++  if rows <= 0 or not 2 <= classes <= 64 or input_total > 16384: return None
++
++  target_indexes = [u for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and
++                    u.src[0].buf_uop.arg.slot == target_slot]
++  source_indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and
++                    u.src[0].op is Ops.PARAM and u.src[0].buf_uop.arg.slot == source_slot and
++                    _unwrap(u.src[1]).op is Ops.WHERE]
++  if not target_indexes or len(source_indexes) != 1: return None
++  source_index = source_indexes[0]
++  source_address = _unwrap(source_index.src[1])
++  assert source_address.op is Ops.WHERE
++
++  def target_coefficient(u:UOp) -> int:
++    u = _unwrap(u)
++    if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].buf_uop.arg.slot == target_slot: return 1
++    if u.op is Ops.ADD: return sum(target_coefficient(x) for x in u.src)
++    if u.op is Ops.MUL:
++      const = next((x for x in u.src if x.op is Ops.CONST), None)
++      other = next((x for x in u.src if x is not const), None)
++      return int(const.arg)*target_coefficient(other) if const is not None and other is not None else 0
++    return 0
++
++  class_stride = target_coefficient(source_address.src[1])
++  if class_stride <= 0 or rows % class_stride: return None
++
++  # The completed log-probability ADD is the smallest source-containing
++  # expression with the source plus both scheduled normalization buffers.
++  log_slot_sets:list[set[int]] = []
++  for u in nodes:
++    if u.op is not Ops.ADD or u.dtype is not dtypes.half or source_index not in u.toposort(): continue
++    slots = {x.src[0].buf_uop.arg.slot for x in u.toposort()
++             if x.op is Ops.INDEX and x.dtype is dtypes.half and x.src[0].op is Ops.PARAM}
++    if len(slots) == 3: log_slot_sets.append(slots)
++  if len({frozenset(x) for x in log_slot_sets}) != 1: return None
++  log_slots = log_slot_sets[0]
++  if source_slot not in log_slots or any(half_slots[slot] != rows for slot in log_slots-{source_slot}): return None
++  weight_slots = set(half_slots)-log_slots
++  if len(weight_slots) > 1: return None
++  weight_slot = next(iter(weight_slots), -1)
++  weight_total = 0 if weight_slot < 0 else half_slots[weight_slot]
++  weight_kind = 0 if weight_slot < 0 else 1 if weight_total == classes else 2 if weight_total == rows else -1
++  if weight_kind < 0: return None
++
++  ignore_values:set[int] = set()
++  for compare in (u for u in nodes if u.op is Ops.CMPNE):
++    for target, constant in ((compare.src[0], compare.src[1]), (compare.src[1], compare.src[0])):
++      target = _unwrap(target)
++      if target.op is Ops.INDEX and target.src[0].op is Ops.PARAM and \
++         target.src[0].buf_uop.arg.slot == target_slot and constant.op is Ops.CONST and \
++         constant.dtype in (dtypes.int, dtypes.weakint):
++        ignore_values.add(int(constant.arg))
++  if len(ignore_values) > 1: return None
++  ignore_present = int(bool(ignore_values))
++  ignore_value = next(iter(ignore_values), 0)
++
++  output_total = prod(_shape_of_store(sink))
++  if output_total == rows:
++    if reductions: return None
++    reduction_code = 0
++  elif output_total == 1 and 1 <= len(reductions) <= 2:
++    mean_scale = any(u.op is Ops.CONST and u.dtype is dtypes.half and
++                     math.isclose(float(u.arg), 1.0/rows, rel_tol=0.0, abs_tol=2e-5) for u in nodes)
++    reduction_code = 2 if mean_scale or any(u.op in (Ops.RECIPROCAL, Ops.FDIV) for u in nodes) else 1
++  else: return None
++
++  out_slot = ProgramInfo.from_sink(sink).outs[0]
++  layout = (output_total, _HOST_NLL_LAYOUT, reduction_code, rows, classes, class_stride,
++            ignore_present, ignore_value, weight_kind)
++  reloc_slots = (out_slot, source_slot, target_slot) if weight_slot < 0 else (out_slot, source_slot, target_slot, weight_slot)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in reloc_slots)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++
+ def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
+   store = _store_node(sink)
+@@ -14300,6 +14407,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, logsoftmax_norm_tasks)
+   if (cross_entropy_tasks := _try_cross_entropy_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, cross_entropy_tasks)
++  if (nll_loss_tasks := _try_nll_loss_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, nll_loss_tasks)
+   if (cross_entropy_loss_tasks := _try_cross_entropy_loss_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, cross_entropy_loss_tasks)
+   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
+-- 
+2.34.1
+
