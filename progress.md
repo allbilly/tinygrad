@@ -10248,3 +10248,73 @@ continues to emit its expected two CMAC stages.
 No runtime ABI, LUT, or two-level LUT changed. Mypy remains at the exact
 12-error baseline and Ruff remains at the nine pre-existing touched-file
 findings. Next forward group: `TestOps.test_nll_loss`.
+
+## 2026-07-31 — negative-log-likelihood milestone
+
+All six unchanged NLL methods pass together in **12.48s** on RK3588 with
+`DEV=ROCKCHIP`, `FORWARD_ONLY=1`, `DEFAULT_FLOAT=HALF`, `-n12`, and the
+Rockchip pytest plugin:
+
+| Method | Coverage |
+|---|---|
+| `test_nll_loss` | contiguous `(32,10)` logits and class indices |
+| `test_nll_loss_3d` | strided class axis in `(32,10,3,3,3)` |
+| `test_nll_loss_reductions` | `mean`, `sum`, `none`, and invalid mode |
+| `test_nll_loss_weight` | class weights under every reduction |
+| `test_nll_loss_3d_weight` | weighted strided-class 3-D loss |
+| `test_nll_loss_ignore_index` | ignored target and valid-count mean |
+
+The hardware-free Rockchip contract is now **147/147 in 8.73s**. It is run
+with `DEV=NULL` and the suite's natural dtypes; globally forcing
+`DEFAULT_FLOAT=HALF` on this hardware-free file changes tests intentionally
+constructed with the default fp32 dtype and is not the contract command.
+
+### Diagnostic path and rejected expansion
+
+The first NLL experiment broadened the sparse class-index fallback to admit
+zero reductions, five inputs, `WHERE`, and `CMPLT`. This made a small base
+case compile, but it was rejected for two concrete reasons:
+
+- `reduction="none"` retained the decomposed EXP2/LOG2 log-softmax precision
+  drift and missed the unchanged PyTorch tolerance;
+- the `(32,10,3,3,3)` case would expand to roughly **290,000 serialized
+  integers**, rather than a bounded operator description.
+
+That rejected condition remains commented beside the restored narrow sparse
+matcher. The active `_HOST_NLL_LAYOUT` recognizes only the final NLL
+fingerprint: exactly one int32 target buffer, original fp16 logits, two
+scheduled log-softmax auxiliaries, two class-bound comparisons, one bounds
+`AND`, zero through two ADD reductions, and at most one optional weight.
+The class coefficient in the guarded gather address recovers stride `1` for
+contiguous logits and stride `27` for the official 3-D layout. Optional
+weights are classified as either a `classes`-element vector or a
+pre-gathered `rows`-element vector.
+
+The compact task relocates only output, original logits, targets, and an
+optional weight. It recomputes log-softmax with the already-proven
+framework boundaries: contiguous classes round exponent sum and logarithm
+through fp16, while strided classes retain fp32 normalization before the
+fp16 log-probability result.
+
+### Exact reduced NLL order
+
+Ordinary NumPy half summation was still not a safe model for weighted NLL.
+The PyTorch 2.9.1 `LossNLL.cpp` source showed an eight-level `scalar_t`
+cascade. The runtime now mirrors it directly:
+
+1. add each valid row's fp16 loss (and weight when present) into level zero;
+2. use four-bit row-index groups to merge completed blocks upward through
+   seven levels;
+3. accumulate the eight partials in fp16;
+4. divide the fp16 loss sum by either the valid count or cascaded fp16 total
+   weight for `mean`.
+
+Ignored rows skip both accumulation and cascade merging, matching the source
+loop. This order reproduced the diagnostic weighted values bit-for-bit and
+made all 2-D/3-D weighted reductions pass. The Rockchip pytest plugin is
+required for these tests because it makes explicit test weights fp16 and
+keeps the reference configuration consistent with the backend.
+
+No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline;
+Ruff on the touched files remains at the exact nine pre-existing findings.
+Next ordered forward group: `TestOps.test_one_hot`.

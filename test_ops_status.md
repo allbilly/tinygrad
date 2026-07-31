@@ -2429,3 +2429,31 @@ official combined graph expands 240 class terms and 12 valid-count terms into
 one serialized typed task. The matcher still requires the `CMPNE` class-index
 fingerprint, so unrelated reductions remain excluded. No LUT changed.
 Contract: **146/146**. Next forward group: `TestOps.test_nll_loss`.
+
+### Negative log likelihood
+
+All six NLL methods pass together in **12.48s** with the required HALF
+forward-only Rockchip configuration and
+`-p test.rockchip.conftest_rockchip`:
+
+- base contiguous and `(32,10,3,3,3)` strided-class loss;
+- `mean`, `sum`, and `none`;
+- 2-D and 3-D class weights under all reductions;
+- `ignore_index` and its valid-count denominator;
+- the unchanged invalid-reduction exception.
+
+A strict `_HOST_NLL_LAYOUT` replaces the rejected generic graph-expansion
+experiment. It derives rows/classes/class stride from the guarded gather,
+distinguishes original class weights from scheduled per-position weights,
+and relocates only logits, int32 targets, and the optional weight. The
+runtime reproduces the established contiguous/strided fp16 log-softmax
+precision split and PyTorch's eight-level fp16 `LossNLL.cpp` reduction
+cascade. This removes both the `none` numerical drift and the approximately
+290k-integer 3-D serialized expansion.
+
+The full hardware-free Rockchip contract is **147/147 in 8.73s** under
+`DEV=NULL` with its natural dtypes. The forced-HALF setting belongs to
+`test/backend/test_ops.py`; applying it globally to `test_pr1.py` changes
+default-fp32 classifier fixtures. Mypy remains at 12 pre-existing errors and
+touched-file Ruff remains at nine pre-existing findings. No LUT or two-level
+LUT changed. Next ordered forward group: `TestOps.test_one_hot`.

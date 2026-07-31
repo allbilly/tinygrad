@@ -208,6 +208,7 @@ _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reductio
 _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
 _HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
 _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cross entropy
+_HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -9887,6 +9888,11 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
   nodes = store.src[1].toposort()
   reductions = [u for u in nodes if u.op is Ops.REDUCE]
   inputs = {u.src[0].buf_uop.arg.slot for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+  # Rejected NLL WIP: accepting zero reductions, five inputs, and WHERE/CMPLT
+  # here made reduction="none" inherit decomposed log-softmax drift and made
+  # the 3-D case expand to roughly 290k serialized integers. NLL now has the
+  # strict compact matcher below.
+  # if len(reductions) > 4 or not 3 <= len(inputs) <= 5: ...
   if not 1 <= len(reductions) <= 4 or len(inputs) not in (3, 4) or \
      any(u.arg[0] is not Ops.ADD or u.dtype not in (dtypes.float, dtypes.int) for u in reductions) or \
      sum(u.dtype is dtypes.int for u in reductions) > 1: return None
@@ -9899,6 +9905,7 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
                            if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}.values())
     if len(reductions) != 1 or prod(_shape_of_store(sink)) != 1 or len(input_totals) != 3 or \
        input_totals[0] != 1 or input_totals[1] != input_totals[2]: return None
+  # Rejected NLL WIP also added Ops.WHERE and Ops.CMPLT to this set.
   allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.AND, Ops.CAST, Ops.ADD, Ops.MUL,
              Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
   if any(u.op not in allowed for u in nodes): return None
@@ -9925,6 +9932,106 @@ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|Non
 
   expanded_store = store.replace(src=(store.src[0], expand(store.src[1])))
   return _try_elementwise_host_subtasks(sink.substitute({store:expanded_store}), allow_plain=True)
+
+def _try_nll_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Recognize the final bounded class-index NLL over a scheduled fp16 log-softmax.
+
+  The two log-softmax auxiliaries are deliberately not relocated: the exact
+  runner starts from the original logits and reproduces PyTorch's normalization
+  and reduced NLL precision boundaries in one compact operator boundary.
+  """
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  nodes = store.src[1].toposort()
+  allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.WHERE, Ops.CMPLT, Ops.CMPNE,
+             Ops.AND, Ops.CAST, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes) or sum(u.op is Ops.WHERE for u in nodes) < 1 or \
+     sum(u.op is Ops.CMPLT for u in nodes) != 2 or sum(u.op is Ops.AND for u in nodes) != 1: return None
+
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  if len(reductions) > 2 or any(u.arg[0] is not Ops.ADD or u.dtype not in (dtypes.float, dtypes.int)
+                               for u in reductions) or sum(u.dtype is dtypes.int for u in reductions) > 1: return None
+  params = {u.arg.slot:(u.dtype, int(u.src[0].arg)) for u in nodes if u.op is Ops.PARAM}
+  int_slots = {slot:total for slot, (dtype, total) in params.items() if dtype is dtypes.int}
+  half_slots = {slot:total for slot, (dtype, total) in params.items() if dtype is dtypes.half}
+  if len(int_slots) != 1 or len(half_slots) not in (3, 4): return None
+  target_slot, rows = next(iter(int_slots.items()))
+  source_candidates = [(slot, total) for slot, total in half_slots.items() if total > rows and total % rows == 0]
+  if len(source_candidates) != 1: return None
+  source_slot, input_total = source_candidates[0]
+  classes = input_total//rows
+  if rows <= 0 or not 2 <= classes <= 64 or input_total > 16384: return None
+
+  target_indexes = [u for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and
+                    u.src[0].buf_uop.arg.slot == target_slot]
+  source_indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and
+                    u.src[0].op is Ops.PARAM and u.src[0].buf_uop.arg.slot == source_slot and
+                    _unwrap(u.src[1]).op is Ops.WHERE]
+  if not target_indexes or len(source_indexes) != 1: return None
+  source_index = source_indexes[0]
+  source_address = _unwrap(source_index.src[1])
+  assert source_address.op is Ops.WHERE
+
+  def target_coefficient(u:UOp) -> int:
+    u = _unwrap(u)
+    if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].buf_uop.arg.slot == target_slot: return 1
+    if u.op is Ops.ADD: return sum(target_coefficient(x) for x in u.src)
+    if u.op is Ops.MUL:
+      const = next((x for x in u.src if x.op is Ops.CONST), None)
+      other = next((x for x in u.src if x is not const), None)
+      return int(const.arg)*target_coefficient(other) if const is not None and other is not None else 0
+    return 0
+
+  class_stride = target_coefficient(source_address.src[1])
+  if class_stride <= 0 or rows % class_stride: return None
+
+  # The completed log-probability ADD is the smallest source-containing
+  # expression with the source plus both scheduled normalization buffers.
+  log_slot_sets:list[set[int]] = []
+  for u in nodes:
+    if u.op is not Ops.ADD or u.dtype is not dtypes.half or source_index not in u.toposort(): continue
+    slots = {x.src[0].buf_uop.arg.slot for x in u.toposort()
+             if x.op is Ops.INDEX and x.dtype is dtypes.half and x.src[0].op is Ops.PARAM}
+    if len(slots) == 3: log_slot_sets.append(slots)
+  if len({frozenset(x) for x in log_slot_sets}) != 1: return None
+  log_slots = log_slot_sets[0]
+  if source_slot not in log_slots or any(half_slots[slot] != rows for slot in log_slots-{source_slot}): return None
+  weight_slots = set(half_slots)-log_slots
+  if len(weight_slots) > 1: return None
+  weight_slot = next(iter(weight_slots), -1)
+  weight_total = 0 if weight_slot < 0 else half_slots[weight_slot]
+  weight_kind = 0 if weight_slot < 0 else 1 if weight_total == classes else 2 if weight_total == rows else -1
+  if weight_kind < 0: return None
+
+  ignore_values:set[int] = set()
+  for compare in (u for u in nodes if u.op is Ops.CMPNE):
+    for target, constant in ((compare.src[0], compare.src[1]), (compare.src[1], compare.src[0])):
+      target = _unwrap(target)
+      if target.op is Ops.INDEX and target.src[0].op is Ops.PARAM and \
+         target.src[0].buf_uop.arg.slot == target_slot and constant.op is Ops.CONST and \
+         constant.dtype in (dtypes.int, dtypes.weakint):
+        ignore_values.add(int(constant.arg))
+  if len(ignore_values) > 1: return None
+  ignore_present = int(bool(ignore_values))
+  ignore_value = next(iter(ignore_values), 0)
+
+  output_total = prod(_shape_of_store(sink))
+  if output_total == rows:
+    if reductions: return None
+    reduction_code = 0
+  elif output_total == 1 and 1 <= len(reductions) <= 2:
+    mean_scale = any(u.op is Ops.CONST and u.dtype is dtypes.half and
+                     math.isclose(float(u.arg), 1.0/rows, rel_tol=0.0, abs_tol=2e-5) for u in nodes)
+    reduction_code = 2 if mean_scale or any(u.op in (Ops.RECIPROCAL, Ops.FDIV) for u in nodes) else 1
+  else: return None
+
+  out_slot = ProgramInfo.from_sink(sink).outs[0]
+  layout = (output_total, _HOST_NLL_LAYOUT, reduction_code, rows, classes, class_stride,
+            ignore_present, ignore_value, weight_kind)
+  reloc_slots = (out_slot, source_slot, target_slot) if weight_slot < 0 else (out_slot, source_slot, target_slot, weight_slot)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in reloc_slots)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
 
 def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
@@ -14300,6 +14407,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, logsoftmax_norm_tasks)
   if (cross_entropy_tasks := _try_cross_entropy_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, cross_entropy_tasks)
+  if (nll_loss_tasks := _try_nll_loss_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, nll_loss_tasks)
   if (cross_entropy_loss_tasks := _try_cross_entropy_loss_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, cross_entropy_loss_tasks)
   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)

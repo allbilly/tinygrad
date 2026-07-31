@@ -25,7 +25,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -825,6 +825,71 @@ def _run_host_cross_entropy(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...
     result = np.asarray(-summed if reduction == 1 else -np.float32(summed)/rows, dtype=np.float16)
   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
+def _run_host_nll(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Evaluate strict fp16 log-softmax plus class-index NLL.
+
+  Reduced NLL uses the eight-level scalar_t cascade from PyTorch's LossNLL.cpp;
+  ordinary NumPy summation differs at fp16 rounding boundaries.
+  """
+  import numpy as np
+  _, tag, reduction, rows, classes, class_stride, ignore_present, ignore_value, weight_kind = task.layout
+  assert tag == _HOST_NLL_LAYOUT and reduction in (0, 1, 2) and weight_kind in (0, 1, 2)
+  assert len(relocs) == (3 if weight_kind == 0 else 4)
+  output, source_buf, target_buf, *weight_buf = (bufs[reloc.globals_slot] for reloc in relocs)
+  input_total, batches = rows*classes, rows//class_stride
+  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16).\
+    reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
+  target = np.frombuffer(ctypes.string_at(target_buf.va_addr, rows*4), dtype=np.int32)
+
+  source_f = source.astype(np.float32)
+  centered = source_f-np.max(source_f, axis=1, keepdims=True)
+  if class_stride == 1:
+    exponent_sum = np.sum(np.exp(centered), axis=1, keepdims=True, dtype=np.float16)
+    logarithm = np.log(exponent_sum.astype(np.float32)).astype(np.float16).astype(np.float32)
+  else: logarithm = np.log(np.sum(np.exp(centered), axis=1, keepdims=True, dtype=np.float32))
+  log_probs = np.asarray(centered-logarithm, dtype=np.float16)
+
+  valid = (target >= 0) & (target < classes)
+  if ignore_present: valid &= target != ignore_value
+  safe_target = np.where(valid, target, 0)
+  if weight_kind == 0: position_weight = np.ones(rows, dtype=np.float16)
+  elif weight_kind == 1:
+    class_weight = np.frombuffer(ctypes.string_at(weight_buf[0].va_addr, classes*2), dtype=np.float16)
+    position_weight = class_weight[safe_target]
+  else:
+    position_weight = np.frombuffer(ctypes.string_at(weight_buf[0].va_addr, rows*2), dtype=np.float16)
+  position_weight = np.where(valid, position_weight, np.float16(0)).astype(np.float16)
+  selected = log_probs[np.arange(rows), safe_target]
+  losses = np.where(valid, np.asarray(-selected*position_weight, dtype=np.float16), np.float16(0)).astype(np.float16)
+
+  if reduction == 0: result = losses
+  else:
+    level_power = max(4, (rows-1).bit_length()//8)
+    level_mask = (1 << level_power)-1
+    loss_partial = np.zeros(8, dtype=np.float16)
+    weight_partial = np.zeros(8, dtype=np.float16)
+    for row in range(rows):
+      if not valid[row]: continue
+      loss_partial[0] = np.float16(loss_partial[0]+losses[row])
+      if weight_kind:
+        weight_partial[0] = np.float16(weight_partial[0]+position_weight[row])
+      for level in range(7):
+        if row & (level_mask << (level*level_power)): break
+        loss_partial[level+1] = np.float16(loss_partial[level+1]+loss_partial[level])
+        loss_partial[level] = np.float16(0)
+        if weight_kind:
+          weight_partial[level+1] = np.float16(weight_partial[level+1]+weight_partial[level])
+          weight_partial[level] = np.float16(0)
+    loss_sum = np.float16(0)
+    total_weight = np.float16(0)
+    for level in range(8):
+      loss_sum = np.float16(loss_sum+loss_partial[level])
+      if weight_kind: total_weight = np.float16(total_weight+weight_partial[level])
+    if not weight_kind: total_weight = np.float16(np.count_nonzero(valid))
+    with np.errstate(all="ignore"):
+      result = np.asarray(loss_sum if reduction == 1 else np.float16(loss_sum/total_weight), dtype=np.float16)
+  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+
 def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
   import numpy as np
@@ -1600,6 +1665,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_CROSS_ENTROPY_LAYOUT:
           _run_host_cross_entropy(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_NLL_LAYOUT:
+          _run_host_nll(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
           _run_host_variance(task, st.relocs, bufs)

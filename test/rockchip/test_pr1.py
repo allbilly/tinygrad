@@ -12,7 +12,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
                                                _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
-                                               _HOST_CROSS_ENTROPY_LAYOUT)
+                                               _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -751,6 +751,31 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
     self.assertEqual(len(subtasks[0].relocs), 5)
+
+  def test_nll_uses_exact_bounded_task(self):
+    source_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+    target_2d = Tensor.empty(32, dtype=dtypes.int, device="ROCKCHIP")
+    source_3d = Tensor.empty(2,10,3,3,3, dtype=dtypes.half, device="ROCKCHIP")
+    target_3d = Tensor.empty(2,3,3,3, dtype=dtypes.int, device="ROCKCHIP")
+    weight = Tensor.empty(10, dtype=dtypes.half, device="ROCKCHIP")
+    expressions = (
+      (source_2d.log_softmax(axis=1).nll_loss(target_2d),
+       (1, _HOST_NLL_LAYOUT, 2, 32, 10, 1, 0, 0, 0)),
+      (source_2d.log_softmax(axis=1).nll_loss(target_2d, reduction="none"),
+       (32, _HOST_NLL_LAYOUT, 0, 32, 10, 1, 0, 0, 0)),
+      (source_2d.log_softmax(axis=1).nll_loss(target_2d, weight, reduction="sum"),
+       (1, _HOST_NLL_LAYOUT, 1, 32, 10, 1, 0, 0, 1)),
+      (source_2d.log_softmax(axis=1).nll_loss(target_2d, ignore_index=3),
+       (1, _HOST_NLL_LAYOUT, 2, 32, 10, 1, 1, 3, 0)),
+      (source_3d.log_softmax(axis=1).nll_loss(target_3d),
+       (1, _HOST_NLL_LAYOUT, 2, 54, 10, 27, 0, 0, 0)))
+    for expression, expected_layout in expressions:
+      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+      program = build_native_program(sinks[-1])
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout, expected_layout)
 
   def test_fp32_factorized_zero_stride_sum_stays_native(self):
     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
