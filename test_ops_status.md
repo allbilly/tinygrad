@@ -3155,3 +3155,22 @@ at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
 Methods 301–325 now produce **24 passes and one failure in 200.58s**; the
 remaining failure is `test_simple_cumsum`, whose prefix output is shifted
 from element 1 onward. Next: fix cumsum, rerun this block, then method 326.
+
+### Cumulative-sum scans
+
+`test_simple_cumsum` passes in **12.03s**, completing ordered methods
+301–325 at **25/25 in 198.46s**. Commit `d3a3501b2`; saved patch
+`0120-rockchip-pass-cumulative-sum-scans.patch`.
+
+The direct 512-lane scan had a native prefix-addressing error (510/512
+mismatches). Direct, padded-block, block-prefix, and final-merge cumsum
+graphs now use one strict typed task per stage for fp16 or fp32.
+
+After that backend fix, forced-HALF length 1022 still differed 33/1022
+elements because tinygrad's blocked scan stores fp16 intermediates. The
+same mismatch occurs on CPU. Only this method restores normal fp32
+construction, whose strict Rockchip path passes without approximation.
+
+Contract advances to **171/171 in 10.80s**. Mypy and touched-file Ruff stay
+at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
+Next: ordered methods 326–350.

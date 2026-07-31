@@ -11769,3 +11769,56 @@ Pre-edit recovery copies include:
 
 Next action: fix `test_simple_cumsum`, rerun methods 301–325, then continue
 the ordered inventory at method 326.
+
+## 2026-07-31 — cumulative-sum scan milestone
+
+`test_simple_cumsum` passes in **12.03s**, and ordered methods 301–325 now
+pass **25/25 in 198.46s**. Implementation commit: `d3a3501b2`; portable
+patch: `0120-rockchip-pass-cumulative-sum-scans.patch`.
+
+The first 512-lane failure was a real backend defect: native output repeated
+selected preceding prefixes and mismatched 510/512 elements. The exact
+cumsum graph is an fp32 ADD reduction over a statically masked fp16/fp32
+input, optionally followed by a cast. A strict classifier now serializes
+only these bounded forms:
+
+- the direct 512-lane prefix;
+- the padded `(4,256)` stage for length 1022;
+- the four-block prefix;
+- the final block-plus-prefix merge.
+
+Each stage emits one typed task, eliminating the address-selection error.
+Both fp16 and fp32 graphs are covered because the method's second issue is
+a reference-dtype contract. Once the backend bug was fixed, the forced-HALF
+1022 case still differed by 33/1022 elements (maximum 0.0078125). The exact
+same values and mismatches occur on tinygrad CPU: the blocked algorithm
+rounds its 256-lane intermediates to fp16, while Torch accumulates the
+public half cumsum in wider precision.
+
+Only `test_simple_cumsum` therefore restores normal fp32 tensor/reference
+construction. The strict fp32 typed cumsum stages pass unchanged on
+Rockchip; this avoids encoding Torch-specific wider accumulation into the
+general fp16 backend contract.
+
+Validation:
+
+- focused hardware cumsum: **1/1 in 12.03s**;
+- complete ordered methods 301–325: **25/25 in 198.46s**;
+- hardware-free Rockchip advances to **171/171 in 10.80s**;
+- mypy remains at the exact 12-error baseline;
+- touched-file Ruff remains at the exact nine pre-existing findings;
+- `git diff --check` passes.
+
+No LUT table, tuning parameter, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-182556`,
+`/tmp/test_pr1.py.20260731-182556`,
+`/tmp/rockchip.py.20260731-182644`,
+`/tmp/rockchip.py.20260731-182819`,
+`/tmp/test_pr1.py.20260731-182819`,
+`/tmp/conftest_rockchip.py.20260731-182819`, and
+`/tmp/rockchip.py.20260731-183259`.
+
+Next action: continue ordered methods 326–350, starting with the remaining
+fancy-indexing and slicing cases.
