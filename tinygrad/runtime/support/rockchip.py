@@ -9491,13 +9491,17 @@ def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
                        Ops.INDEX:2, Ops.MUL:5, Ops.PARAM:1, Ops.RANGE:2, Ops.TRUNC:1, Ops.WHERE:10}
   vertical_counts = {Ops.ADD:12, Ops.AND:2, Ops.CAST:8, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
                      Ops.INDEX:2, Ops.MUL:7, Ops.PARAM:1, Ops.RANGE:3, Ops.TRUNC:1, Ops.WHERE:9}
+  horizontal_aligned_counts = {**horizontal_counts, Ops.ADD:9, Ops.CONST:15}
+  vertical_aligned_counts = {**vertical_counts, Ops.ADD:11, Ops.CONST:15}
+  horizontal_mode = 0 if counts == horizontal_counts else 1 if counts == horizontal_aligned_counts else None
+  vertical_mode = 0 if counts == vertical_counts else 1 if counts == vertical_aligned_counts else None
   layout:tuple[int, ...]
   if store.src[0].dtype is dtypes.float and indexes[0].dtype is dtypes.half and \
-     (dims := horizontal.get((shape, input_total))) is not None and counts == horizontal_counts:
-    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 0, *dims)
+     (dims := horizontal.get((shape, input_total))) is not None and horizontal_mode is not None:
+    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 0, horizontal_mode, *dims)
   elif store.src[0].dtype is dtypes.half and indexes[0].dtype is dtypes.float and \
-       (dims := vertical.get((shape, input_total))) is not None and counts == vertical_counts:
-    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 1, *dims)
+       (dims := vertical.get((shape, input_total))) is not None and vertical_mode is not None:
+    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 1, vertical_mode, *dims)
   else: return None
   out_slot, in_slot = ProgramInfo.from_sink(sink).outs[0], indexes[0].src[0].buf_uop.arg.slot
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)

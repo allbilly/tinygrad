@@ -998,15 +998,17 @@ class TestClassifier(unittest.TestCase):
 
   def test_bilinear_interpolate_uses_two_typed_host_stages(self):
     for input_size, output_size in (((12,20),(9,31)), ((12,9),(31,20)), ((9,31),(20,12))):
-      expression = Tensor.empty(2,3,*input_size, dtype=dtypes.half, device="ROCKCHIP").interpolate(size=output_size, mode="linear")
-      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
-      programs = [build_native_program(sink) for sink in sinks]
-      self.assertEqual(len(programs), 2)
-      for program in programs:
-        self.assertIsNotNone(program)
-        subtasks = program.src[1].src[0].arg
-        self.assertEqual(len(subtasks), 1)
-        self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
+      for align_corners in (False, True):
+        expression = Tensor.empty(2,3,*input_size, dtype=dtypes.half, device="ROCKCHIP").interpolate(
+          size=output_size, mode="linear", align_corners=align_corners)
+        sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+        programs = [build_native_program(sink) for sink in sinks]
+        self.assertEqual(len(programs), 2)
+        for program in programs:
+          self.assertIsNotNone(program)
+          subtasks = program.src[1].src[0].arg
+          self.assertEqual(len(subtasks), 1)
+          self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
 
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")

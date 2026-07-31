@@ -564,14 +564,15 @@ def _run_host_large_einsum(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...]
 def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Evaluate one exact separable bilinear stage with float32 coordinates and arithmetic."""
   import numpy as np
-  total, tag, stage, *dims = task.layout
+  total, tag, stage, align_corners, *dims = task.layout
   assert tag == _HOST_BILINEAR_LAYOUT and len(relocs) == 2
   output, source = (bufs[r.globals_slot] for r in relocs)
   if stage == 0:
     rows, input_width, output_width = dims
     horizontal_values = np.frombuffer(ctypes.string_at(source.va_addr, rows*input_width*2),
                                       dtype=np.float16).reshape(rows, input_width)
-    coordinate = (np.arange(output_width, dtype=np.float32)+np.float32(0.5))*np.float32(input_width/output_width)-np.float32(0.5)
+    coordinate = np.arange(output_width, dtype=np.float32)*np.float32((input_width-1)/(output_width-1)) if align_corners else \
+      (np.arange(output_width, dtype=np.float32)+np.float32(0.5))*np.float32(input_width/output_width)-np.float32(0.5)
     lower = np.floor(coordinate).astype(np.int32).clip(0, input_width-1)
     upper, weight = (lower+1).clip(0, input_width-1), (coordinate-lower).clip(0, 1).astype(np.float32)
     result = horizontal_values[:,lower].astype(np.float32)*(np.float32(1)-weight) + \
@@ -582,7 +583,8 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     planes, input_height, output_height, width = dims
     vertical_values = np.frombuffer(ctypes.string_at(source.va_addr, planes*input_height*width*4),
                                     dtype=np.float32).reshape(planes, input_height, width)
-    coordinate = (np.arange(output_height, dtype=np.float32)+np.float32(0.5))*np.float32(input_height/output_height)-np.float32(0.5)
+    coordinate = np.arange(output_height, dtype=np.float32)*np.float32((input_height-1)/(output_height-1)) if align_corners else \
+      (np.arange(output_height, dtype=np.float32)+np.float32(0.5))*np.float32(input_height/output_height)-np.float32(0.5)
     lower = np.floor(coordinate).astype(np.int32).clip(0, input_height-1)
     upper, weight = (lower+1).clip(0, input_height-1), (coordinate-lower).clip(0, 1).astype(np.float32)
     result = vertical_values[:,lower,:]*(np.float32(1)-weight[None,:,None]) + vertical_values[:,upper,:]*weight[None,:,None]
