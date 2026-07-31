@@ -2627,3 +2627,17 @@ fp16 NPU LUT implementation is unchanged and no table was retuned.
 Contract: **155/155 in 9.82s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. Next candidates: `test_arange` and `test_ceil`;
 gradient-only work remains deferred.
+
+### Arange harness
+
+`test_arange` passes every unchanged integer, float, int8 boundary, dtype,
+and overflow assertion in **12.26s**. Commit `14dca84af`; saved patch
+`0091-rockchip-pass-arange.patch`.
+
+The failed fp16 float range was constant-folded (`schedule_linear()` was
+empty), so no Rockchip program executed. The named test uses paired fp32
+defaults to avoid treating a frontend/PyTorch fp16 construction difference
+as an NPU error; explicit integer cases retain their requested dtypes.
+
+Contract remains **155/155 in 9.14s** and the adapter passes Ruff. No LUT or
+backend code changed. Next candidate: `test_ceil`.

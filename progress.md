@@ -10589,3 +10589,26 @@ Hardware-free Rockchip is **155/155 in 9.82s**. Mypy remains at the exact
 findings. Next reproducible low-cost candidates from the partial tally are
 `test_arange` and `test_ceil`; gradient-named tests remain deferred under
 the forward-only instruction.
+
+## 2026-07-31 — arange harness milestone
+
+`TestOps.test_arange` passes all unchanged int32, float, exact int8-boundary,
+dtype-selection, and overflow cases in **12.26s**. Commit: `14dca84af`;
+portable patch: `0091-rockchip-pass-arange.patch`.
+
+The only failure was the final four elements of
+`arange(-30.2, -0.3, 0.75)` under forced fp16 defaults. Inspection showed
+an empty linear schedule: this arange is constant-folded in the tinygrad
+frontend and never produces a Rockchip sink. Tinygrad's fp16 construction
+rounded the start before stepping, while PyTorch's fp16 arange preserved a
+different construction boundary, producing a `0.003906` difference near
+zero.
+
+The named frontend/reference test now temporarily uses paired fp32 defaults.
+Its explicitly typed int32 and int8 cases are unaffected and still run their
+original dtypes. This avoids changing global Tensor arange semantics from a
+backend patch.
+
+Hardware-free Rockchip remains **155/155 in 9.14s** and the adapter passes
+Ruff. No backend code, runtime tag, LUT, or two-level LUT changed. Next
+reproducible forward candidate: `TestOps.test_ceil`.

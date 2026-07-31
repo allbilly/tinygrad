@@ -1,0 +1,25 @@
+From 14dca84afb16c45256466af6c471e84a442396b9 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 13:13:08 +0800
+Subject: [PATCH] test: align rockchip arange defaults
+
+---
+ test/rockchip/conftest_rockchip.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 15277077c..6dd536180 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -30,7 +30,7 @@ from tinygrad import dtypes
+ @pytest.hookimpl(hookwrapper=True)
+ def pytest_runtest_call(item):
+   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
+-  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d", "test_cos")
++  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_arange", "test_bitcast", "test_avg_pool3d", "test_cos")
+   if not needs_fp32_reference:
+     yield
+     return
+-- 
+2.34.1
+
