@@ -2457,3 +2457,22 @@ The full hardware-free Rockchip contract is **147/147 in 8.73s** under
 default-fp32 classifier fixtures. Mypy remains at 12 pre-existing errors and
 touched-file Ruff remains at nine pre-existing findings. No LUT or two-level
 LUT changed. Next ordered forward group: `TestOps.test_one_hot`.
+
+### Masked select
+
+`test_one_hot` and `test_masked_fill` pass unchanged in **12.81s** and
+**12.06s**. `test_masked_select` now passes both the comparison-mask and
+broadcast scalar-true cases in **11.62s**.
+
+The dynamic path uses a strict typed int32 pipeline for the scalar mask
+count, full comparison prefix sum, equality histogram, histogram prefix
+sum, and final gather map. Only the exact bounded `CMPLT/CMPNE/WHERE`
+fingerprints are accepted, with inputs capped at `2**20`. The constant-true
+path is recognized separately by its three redundant int ADD reductions and
+one same-size fp16 input, then collapsed to the semantically exact typed flat
+copy.
+
+The hardware-free contract is **149/149 in 8.79s**. No new runtime tag, LUT,
+or two-level LUT changed; mypy remains at 12 pre-existing errors and
+touched-file Ruff at nine pre-existing findings. Next forward group:
+`TestOps.test_masked_select_size`.

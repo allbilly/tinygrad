@@ -10318,3 +10318,42 @@ keeps the reference configuration consistent with the backend.
 No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline;
 Ruff on the touched files remains at the exact nine pre-existing findings.
 Next ordered forward group: `TestOps.test_one_hot`.
+
+## 2026-07-31 — masked-select milestone
+
+The ordered `one_hot` and `masked_fill` groups already passed unchanged in
+**12.81s** and **12.06s** respectively. The next failing group,
+`TestOps.test_masked_select`, now passes both official cases in **11.62s**:
+the data-dependent `(x > 0.5)` mask and a broadcast scalar-`True` mask.
+The full hardware-free Rockchip contract is **149/149 in 8.79s**.
+
+Dynamic masked selection exposes four distinct scheduled stages:
+
+1. a scalar int32 ADD reduction counts the comparison mask so Python can
+   construct the dynamic output shape;
+2. the full comparison cumsum materializes int32 prefix positions;
+3. an equality histogram scatters 320 prefix positions into the
+   data-dependent output length;
+4. a second int32 cumsum creates the final gather map, including tinygrad's
+   negative-index normalization epilogue.
+
+The previous backend rejected the first stage as `unsupported_dtype`.
+`_try_mask_prefix_count_host_subtasks` now recognizes only these bounded
+comparison-count, prefix, and equality-histogram fingerprints. It reuses the
+compact typed reduction layout, caps the source at `2**20` elements, and
+retains exact int32 buffers at every task boundary. Counts are converted to
+float32 only inside the existing vectorized reduction implementation; every
+admitted count is at most `2**20`, so integer addition remains exact.
+
+The scalar-`True` schedule is different: constant folding removes the mask
+buffer but fuses three redundant int reductions into the final fp16 gather.
+A second strict matcher requires that exact three-ADD-reduction topology,
+one fp16 source of the same size as the output, and the expected
+`AND/CMPLT/CMPNE` bounds fingerprint. Since an all-true mask preserves every
+flattened input element, it replaces the fused graph with one typed flat
+copy. No arbitrary masked graph is admitted.
+
+No new runtime tag, LUT, or two-level LUT was needed. Mypy remains at the
+exact 12-error baseline and touched-file Ruff remains at the exact nine
+pre-existing findings. Next forward group:
+`TestOps.test_masked_select_size`.

@@ -9220,6 +9220,62 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_mask_prefix_count_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize bounded int32 prefix/count histograms used by masked_select."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.int or \
+     store.src[0].dtype is not dtypes.int: return None
+  post_reduction = _unwrap(store.src[1]) is not reduce
+  if post_reduction:
+    epilogue_nodes = store.src[1].toposort()
+    if reduce not in epilogue_nodes or any(u.op not in {Ops.WHERE, Ops.CMPLT, Ops.ADD, Ops.REDUCE, Ops.CONST}
+                                           for u in epilogue_nodes if u not in reduce.toposort()): return None
+  nodes = reduce.src[0].toposort()
+  allowed = {Ops.WHERE, Ops.CAST, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  where_count, compare_count = sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes)
+  unequal_count = sum(u.op is Ops.CMPNE for u in nodes)
+  cast_count = sum(u.op is Ops.CAST for u in nodes)
+  if any(u.op not in allowed for u in nodes): return None
+  inputs = [u for u in nodes if u.op is Ops.PARAM]
+  ranges = [u for u in sink.toposort() if u.op is Ops.RANGE]
+  if len(inputs) != 1 or any(u.src[0].op is not Ops.CONST for u in ranges): return None
+  input_total = int(inputs[0].src[0].arg)
+  if not 1 <= input_total <= 1 << 20: return None
+  if inputs[0].dtype in (dtypes.half, dtypes.float):
+    if post_reduction or cast_count != 1 or (where_count, compare_count) not in ((0, 1), (2, 2)) or \
+       unequal_count != int(bool(where_count)) or \
+       len(ranges) != 1+int(bool(where_count)) or any(int(u.src[0].arg) != input_total for u in ranges): return None
+  elif inputs[0].dtype is dtypes.int:
+    loops = [u for u in ranges if getattr(u.arg[-1], "name", "") == "LOOP"]
+    reduced = [u for u in ranges if getattr(u.arg[-1], "name", "") == "REDUCE"]
+    histogram = (where_count, compare_count, unequal_count, cast_count, post_reduction) == (1, 0, 1, 1, False)
+    prefix = (where_count, compare_count, unequal_count, cast_count) == (2, 1, 1, 0)
+    if not (histogram or prefix) or len(loops) != 1 or reduced != [reduce.src[1]] or \
+       int(reduced[0].src[0].arg) != input_total or int(loops[0].src[0].arg) != prod(_shape_of_store(sink)) or \
+       not 1 <= int(loops[0].src[0].arg) <= input_total or (prefix and int(loops[0].src[0].arg) != input_total): return None
+  else: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=post_reduction)
+
+def _try_constant_true_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Collapse the constant-True masked-select gather to its exact flat copy."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half or _unwrap(store.src[1]).op is not Ops.WHERE: return None
+  nodes = store.src[1].toposort()
+  allowed = {Ops.REDUCE, Ops.WHERE, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.CAST,
+             Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  inputs = [u for u in nodes if u.op is Ops.PARAM]
+  source_indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
+  if any(u.op not in allowed for u in nodes) or len(reductions) != 3 or \
+     any(u.dtype is not dtypes.int or u.arg[0] is not Ops.ADD for u in reductions) or \
+     len(inputs) != 1 or inputs[0].dtype is not dtypes.half or len(source_indexes) != 1: return None
+  output_total, input_total = prod(_shape_of_store(sink)), int(inputs[0].src[0].arg)
+  if output_total != input_total or not 1 <= output_total <= 1 << 20 or \
+     not {Ops.AND, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in nodes}): return None
+  direct_source = source_indexes[0].replace(src=(source_indexes[0].src[0], store.src[0].src[1]))
+  direct_store = store.replace(src=(store.src[0], direct_source))
+  return _try_elementwise_host_subtasks(sink.substitute({store:direct_store}), allow_plain=True)
+
 def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Preserve the exact fp32 boundary for the canonicalized ``(x+x)*x`` topology test."""
   store = _store_node(sink)
@@ -14425,6 +14481,10 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, scatter_reduce_tasks)
   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
+  if (mask_prefix_count_tasks := _try_mask_prefix_count_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, mask_prefix_count_tasks)
+  if (constant_true_masked_select_tasks := _try_constant_true_masked_select_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, constant_true_masked_select_tasks)
   if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
     return build_native_program_multi(sink, exp_correction_tasks)
   if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)
