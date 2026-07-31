@@ -8,6 +8,7 @@
 # multi-task are explicitly rejected via RKPLAN_REJECT.
 # All compute (including copy) executes on the NPU — no host-side tensor arithmetic.
 import ctypes, mmap, os, struct
+from collections.abc import Callable
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import getenv, mv_address, to_mv, Target
 from tinygrad.device import Compiled, Program, BufferSpec, TinyELF
@@ -1354,6 +1355,52 @@ def _run_host_avg_pool(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     result[output] = np.float32(accumulator * np.float32(scales[output]))
   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
+_HostRunner = Callable[[RKTask, list[RKReloc]|tuple[RKReloc, ...], tuple], None]
+_HOST_TASK_RUNNERS:dict[int, _HostRunner] = {
+  _HOST_MOVEMENT_LAYOUT: _run_host_movement, _HOST_STATIC_HALF_LAYOUT: _run_host_static_half,
+  _HOST_STATIC_INT_LAYOUT: _run_host_static_int, _HOST_GATHER_MAP_LAYOUT: _pack_static_gather,
+  _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather, _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk,
+  _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk, _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk,
+  _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk, _HOST_COMPACT_NATIVE_HALF_LAYOUT: _compact_native_half,
+  _HOST_ASSEMBLE_INT_BYTES_LAYOUT: _assemble_int_bytes, _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits,
+  _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits, _HOST_BOOL_HALF_LAYOUT: _run_host_bool_half,
+  _HOST_HALF_FP32_LAYOUT: _run_host_half_fp32, _HOST_STATIC_SELECT_HALF_LAYOUT: _run_host_static_select_half,
+  _HOST_STATIC_SELECT_INT_LAYOUT: _run_host_static_select_int, _HOST_HALF_INT_LAYOUT: _run_host_half_int,
+  _HOST_FP32_COMBINE_LAYOUT: _run_host_fp32_combine, _HOST_SCATTER_LAYOUT: _run_host_scatter,
+  _HOST_ARGMAX_LAYOUT: _run_host_argmax, _HOST_AVG_POOL_LAYOUT: _run_host_avg_pool, _HOST_BITWISE_LAYOUT: _run_host_bitwise,
+  _HOST_TRUNC_LAYOUT: _run_host_trunc, _HOST_COPYSIGN_LAYOUT: _run_host_copysign,
+  _HOST_ELEMENTWISE_LAYOUT: _run_host_elementwise, _HOST_ELEMENTWISE_REDUCE_LAYOUT: _run_host_elementwise,
+  _HOST_EINSUM_LAYOUT: _run_host_elementwise, _HOST_BILINEAR_LAYOUT: _run_host_elementwise, _HOST_TAN_LAYOUT: _run_host_elementwise,
+  _HOST_BCE_LAYOUT: _run_host_bce, _HOST_CROSS_ENTROPY_LAYOUT: _run_host_cross_entropy, _HOST_NLL_LAYOUT: _run_host_nll,
+  _HOST_VARIANCE_LAYOUT: _run_host_variance, _HOST_SOFTMAX_ARGMAX_LAYOUT: _run_host_softmax_argmax,
+}
+_HOST_ALL_LAYOUTS = tuple(tag for tag in _HOST_TASK_RUNNERS if tag != _HOST_FP32_COMBINE_LAYOUT)
+_HOST_CMAC_LAYOUTS = (_HOST_MOVEMENT_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_GATHER_MAP_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT, _HOST_FP32_HALF_LAYOUT,
+  _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+  _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT)
+_HOST_ORDERED_COPY_LAYOUTS = (_HOST_MOVEMENT_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_STATIC_INT_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT, _HOST_FP32_HALF_LAYOUT,
+  _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
+  _HOST_PLANE_GATHER_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT,
+  _HOST_UNPACK_HALF_CHUNK_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT)
+_HOST_COPY_DPU_LAYOUTS = (_HOST_MOVEMENT_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_STATIC_INT_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
+  _HOST_PLANE_GATHER_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT,
+  _HOST_UNPACK_HALF_CHUNK_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT, _HOST_STATIC_SELECT_HALF_LAYOUT,
+  _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT, _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT,
+  _HOST_BITWISE_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT, _HOST_ELEMENTWISE_LAYOUT,
+  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT)
+
+def _run_typed_host_task(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple, allowed:tuple[int, ...]) -> bool:
+  if len(task.layout) <= 1 or task.layout[1] not in allowed: return False
+  tag = task.layout[1]
+  if tag in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
+    _run_host_fp32_view(task, relocs, bufs, tag == _HOST_FP32_RESIDUAL_LAYOUT)
+  else: _HOST_TASK_RUNNERS[tag](task, relocs, bufs)
+  return True
+
 class RockchipProgram(Program['RockchipDevice']):
   cmds: list[int]
   task: RKTask
@@ -1684,98 +1731,7 @@ class RockchipProgram(Program['RockchipDevice']):
     if all(st.task.is_copy or st.task.is_fill for st in subtasks):
       for st in subtasks:
         task = st.task
-        if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
-          _run_host_movement(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
-          _run_host_static_half(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
-          _run_host_static_int(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
-          _pack_static_gather(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
-          _pack_plane_gather(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
-          _pack_fp16_chunk(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
-          _unpack_int32_chunk(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
-          _pack_int32_chunk(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
-          _unpack_fp16_chunk(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
-          _compact_native_half(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
-          _assemble_int_bytes(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
-          _pack_half_bits(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
-          _unpack_half_bits(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
-          _run_host_bool_half(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
-          _run_host_half_fp32(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
-          _run_host_static_select_half(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
-          _run_host_static_select_int(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
-          _run_host_half_int(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
-          _run_host_scatter(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_ARGMAX_LAYOUT:
-          _run_host_argmax(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_AVG_POOL_LAYOUT:
-          _run_host_avg_pool(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
-          _run_host_bitwise(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
-          _run_host_trunc(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
-          _run_host_copysign(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and \
-           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT,
-                              _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
-          _run_host_elementwise(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
-          _run_host_bce(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_CROSS_ENTROPY_LAYOUT:
-          _run_host_cross_entropy(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_NLL_LAYOUT:
-          _run_host_nll(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
-          _run_host_variance(task, st.relocs, bufs)
-          continue
-        if len(task.layout) > 1 and task.layout[1] == _HOST_SOFTMAX_ARGMAX_LAYOUT:
-          _run_host_softmax_argmax(task, st.relocs, bufs)
-          continue
+        if _run_typed_host_task(task, st.relocs, bufs, _HOST_ALL_LAYOUTS): continue
         if task.is_fill:
           total = task.layout[0]
           out_slot = st.relocs[0].globals_slot
@@ -1880,65 +1836,13 @@ class RockchipProgram(Program['RockchipDevice']):
               self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
               self.subtasks = None
               self(*tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
-              _run_host_movement(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
-              _run_host_static_half(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
-              _pack_static_gather(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
-              _run_host_bool_half(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
-              _run_host_static_select_half(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
-              _run_host_static_select_int(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
-              _run_host_half_int(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
-              _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
-              _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
-            elif st.task.is_copy and len(st.task.layout) > 1 and \
-                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
-                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
-              _run_host_elementwise(st.task, st.relocs, tuple(ext))
+            elif st.task.is_copy and _run_typed_host_task(st.task, st.relocs, tuple(ext), _HOST_CMAC_LAYOUTS): pass
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
           flush_mixed_dpu()
           return
         for st in subtasks:
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
-            _run_host_movement(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
-            _run_host_static_half(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
-            _pack_static_gather(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
-            _run_host_bool_half(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
-            _run_host_static_select_half(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
-            _run_host_static_select_int(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
-            _run_host_half_int(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
-            _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
-            _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
-            continue
-          if st.task.is_copy and len(st.task.layout) > 1 and \
-             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
-                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
-            _run_host_elementwise(st.task, st.relocs, tuple(ext))
-            continue
+          if st.task.is_copy and _run_typed_host_task(st.task, st.relocs, tuple(ext), _HOST_CMAC_LAYOUTS): continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
           # stages also stay single-task for reset stability, with the typed
@@ -2038,33 +1942,8 @@ class RockchipProgram(Program['RockchipDevice']):
                               if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, p.task.out_slot)}
             pending_outputs = {p.task.out_slot for p in pending}
             if copy_inputs & pending_outputs or task.out_slot in pending_inputs or task.out_slot in pending_outputs: flush_pending()
-            if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT: _run_host_static_int(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT: _run_host_bool_half(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
-              _run_host_static_select_half(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
-              _run_host_static_select_int(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
-              _run_host_half_int(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
-              _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
-              _run_host_fp32_combine(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
-              _run_host_half_fp32(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT: _compact_native_half(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT: _assemble_int_bytes(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits(task, st.relocs, tuple(ext))
-            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits(task, st.relocs, tuple(ext))
-            else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
+            if not _run_typed_host_task(task, st.relocs, tuple(ext), _HOST_ORDERED_COPY_LAYOUTS):
+              raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
             continue
           if task.fp32_residual_input:
             # The preceding high-half conversion and this residual conversion
@@ -2127,73 +2006,7 @@ class RockchipProgram(Program['RockchipDevice']):
         # Handle copy tasks host-side
         for st in copy_tasks:
           task = st.task
-          if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
-            _run_host_movement(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
-            _run_host_static_half(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
-            _run_host_static_int(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
-            _pack_static_gather(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
-            _pack_plane_gather(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
-            _pack_fp16_chunk(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
-            _unpack_int32_chunk(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
-            _pack_int32_chunk(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
-            _unpack_fp16_chunk(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
-            _compact_native_half(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
-            _assemble_int_bytes(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
-            _pack_half_bits(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
-            _unpack_half_bits(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
-            _run_host_bool_half(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
-            _run_host_static_select_half(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
-            _run_host_static_select_int(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
-            _run_host_half_int(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
-            _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
-            _run_host_bitwise(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
-            _run_host_trunc(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
-            _run_host_copysign(task, st.relocs, tuple(ext))
-            continue
-          if len(task.layout) > 1 and \
-             task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
-            _run_host_elementwise(task, st.relocs, tuple(ext))
-            continue
+          if _run_typed_host_task(task, st.relocs, tuple(ext), _HOST_COPY_DPU_LAYOUTS): continue
           ct = task.layout[0]
           in_slot = st.relocs[1].globals_slot
           out_slot = st.relocs[0].globals_slot
