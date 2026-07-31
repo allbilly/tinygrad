@@ -1,0 +1,200 @@
+From fae952bb1de284bf65076cbf8a8dbcada2dc1267 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 01:53:10 +0800
+Subject: [PATCH] rockchip: share inverse activation graph setup
+
+---
+ tinygrad/runtime/support/rockchip.py | 100 ++++++---------------------
+ 1 file changed, 23 insertions(+), 77 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index c6c068bed..bc312a3a4 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4223,23 +4223,9 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT atan after reciprocal folding maps every finite magnitude into [0,1]."""
+   store = _store_node(sink)
+   if store is None or (source := _try_atan(store.src[1])) is None: return None
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1)+1
+-  tasks:list[RKSubTask] = []
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot+1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    idx = store.src[0]
+-    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
+-  def add_lut(arg:str, source_slot:int, out_slot:int) -> bool:
+-    value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(source_slot),), arg=arg)
+-    plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(out_slot), value))}))
+-    if isinstance(plan, str) or plan.kind != "dpu_lut": return False
+-    cmds, task, relocs = emit_rk(plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-    return True
++  graph = _TaskGraph(sink, store, source)
++  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
++  add_lut = graph.emit_named_lut
+ 
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+   neg_source, abs_source = alloc(), alloc()
+@@ -4305,7 +4291,7 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, negative_magnitude, zero, (magnitude, 0), Ops.SUB),
+                 _emit_where_stage(total, positive_selected, (magnitude, 0), (nonnegative, 0), Ops.MUL),
+                 _emit_where_stage(total, negative_selected, (negative_magnitude, 0), (negative, 0), Ops.MUL),
+-                _emit_where_stage(total, info.outs[0], (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
++                _emit_where_stage(total, out, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+   return tuple(tasks)
+ 
+ def _try_fp32_atanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -4319,23 +4305,9 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT atanh with explicit ±1 infinity and out-of-domain NaN handling."""
+   store = _store_node(sink)
+   if store is None or (source := _try_atanh(store.src[1])) is None: return None
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1)+1
+-  tasks:list[RKSubTask] = []
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot+1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    idx = store.src[0]
+-    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
+-  def add_lut(arg:str, source_slot:int, out_slot:int) -> bool:
+-    value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(source_slot),), arg=arg)
+-    plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(out_slot), value))}))
+-    if isinstance(plan, str) or plan.kind != "dpu_lut": return False
+-    cmds, task, relocs = emit_rk(plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-    return True
++  graph = _TaskGraph(sink, store, source)
++  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
++  add_lut = graph.emit_named_lut
+ 
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+   neg_source, abs_source, neg_abs, neg_clamped, bounded = (alloc() for _ in range(5))
+@@ -4415,7 +4387,7 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, valid, one, (invalid, 0), Ops.SUB),
+                 _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
+                 _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
+-                _emit_where_stage(total, info.outs[0], (signed, 0), (factor, 0), Ops.MUL)))
++                _emit_where_stage(total, out, (signed, 0), (factor, 0), Ops.MUL)))
+   return tuple(tasks)
+ 
+ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -4423,23 +4395,9 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (match := _try_asinh_acosh(store.src[1])) is None: return None
+   source, is_acosh = match
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1)+1
+-  tasks:list[RKSubTask] = []
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot+1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    idx = store.src[0]
+-    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
+-  def add_lut(arg:str, source_slot:int, out_slot:int) -> bool:
+-    value = UOp(Ops.CUSTOM, dtypes.half, (temp_index(source_slot),), arg=arg)
+-    plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(out_slot), value))}))
+-    if isinstance(plan, str) or plan.kind != "dpu_lut": return False
+-    cmds, task, relocs = emit_rk(plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-    return True
++  graph = _TaskGraph(sink, store, source)
++  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
++  add_lut = graph.emit_named_lut
+ 
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+   # Rejected WIP: a 1.5*fp32 residual nudge for small ASINH inputs only
+@@ -4565,7 +4523,7 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     with_near = alloc()
+     tasks.append(_emit_where_stage(total, with_near, (magnitude_result, 0), (near_selected, 0), Ops.ADD))
+     negative_result, positive_selected, negative_selected = (alloc() for _ in range(3))
+-    signed_result = info.outs[0] if source_residual < 0 or not apply_small_residual else alloc()
++    signed_result = out if source_residual < 0 or not apply_small_residual else alloc()
+     tasks.extend((_emit_where_stage(total, negative_result, zero, (with_near, 0), Ops.SUB),
+                   _emit_where_stage(total, positive_selected, (with_near, 0), (nonnegative, 0), Ops.MUL),
+                   _emit_where_stage(total, negative_selected, (negative_result, 0), (negative, 0), Ops.MUL),
+@@ -4579,7 +4537,7 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                     _emit_where_stage(total, correction_inside, one, (correction_outside, 0), Ops.SUB),
+                     _emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1.5/256), Ops.MUL),
+                     _emit_where_stage(total, selected_correction, (scaled_residual, 0), (correction_inside, 0), Ops.MUL),
+-                    _emit_where_stage(total, info.outs[0], (signed_result, 0), (selected_correction, 0), Ops.ADD)))
++                    _emit_where_stage(total, out, (signed_result, 0), (selected_correction, 0), Ops.ADD)))
+   else:
+     exact_zeroed = alloc()
+     tasks.append(_emit_where_stage(total, exact_zeroed, (magnitude_result, 0), (nonexact, 0), Ops.MUL))
+@@ -4588,7 +4546,7 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                   _emit_where_stage(total, valid, one, (invalid, 0), Ops.SUB),
+                   _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
+                   _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
+-                  _emit_where_stage(total, info.outs[0], (exact_zeroed, 0), (factor, 0), Ops.MUL)))
++                  _emit_where_stage(total, out, (exact_zeroed, 0), (factor, 0), Ops.MUL)))
+   tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+   return _finalize_fp32_output(tasks, store)
+ 
+@@ -4606,16 +4564,8 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if store is None or (match := _try_sinh_cosh(store.src[1])) is None: return None
+   source, is_cosh = match
+   if source.dtype is not dtypes.half: return None
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1)+1
+-  tasks:list[RKSubTask] = []
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot+1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    idx = store.src[0]
+-    return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
++  graph = _TaskGraph(sink, store, source)
++  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+ 
+   low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
+@@ -4624,19 +4574,11 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, neg_clamped, (neg_low, 0), _float_arg(-2), Ops.MAX),
+                 _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)))
+   lut_slot = alloc()
+-  lut_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(bounded),), arg="rk_cosh" if is_cosh else "rk_sinh")
+-  lut_plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(lut_slot), lut_val))}))
+-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(lut_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
++  if not graph.emit_named_lut("rk_cosh" if is_cosh else "rk_sinh", bounded, lut_slot): return None
+   local_slot = -1
+   if not is_cosh:
+     local_slot = alloc()
+-    local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(bounded),), arg="rk_sinh_local")
+-    local_plan = plan_rk(sink.substitute({store:store.replace(src=(temp_index(local_slot), local_val))}))
+-    if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+-    cmds, task, relocs = emit_rk(local_plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
++    if not graph.emit_named_lut("rk_sinh_local", bounded, local_slot): return None
+ 
+   neg_source, abs_source = alloc(), alloc()
+   tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+@@ -4670,7 +4612,7 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, denom_scratch, one, (large, 0), Ops.SUB),
+                 _emit_where_stage(total, denom, one, (large, 0), Ops.SUB),
+                 _emit_where_stage(total, result_scratch, (selected, 0), (denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, info.outs[0], (selected, 0), (denom, 0), Ops.FDIV)))
++                _emit_where_stage(total, out, (selected, 0), (denom, 0), Ops.FDIV)))
+   return tuple(tasks)
+ 
+ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+@@ -6239,6 +6181,10 @@ class _TaskGraph:
+     self.tasks.append(RKSubTask(cmds, task, relocs))
+     return out_slot, 0
+ 
++  def emit_named_lut(self, name:object, input_slot:int, out_slot:int) -> bool:
++    value = UOp(Ops.CUSTOM, dtypes.half, (self.temp_index(input_slot),), arg=name)
++    return self.emit_lut(value, out_slot)
++
+ def _try_exp2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Preserve IEEE EXP2 results for infinities and NaN around the bounded LUT."""
+   store = _store_node(sink)

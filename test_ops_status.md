@@ -3351,3 +3351,13 @@ PR1 passes **173/173**. Focused hardware passes 3/3 negative/zero-base, 1/1
 fractional boundaries, and 2/2 tensor/zero-tensor cases. The complete affected
 forward-only `TestOps` power group passes **6/6 in 205.32s**. Mypy remains at
 12 known errors and touched-file Ruff at eight known findings.
+
+### Inverse activation graph setup
+
+Commit `fae952bb1`; saved patch
+`0139-rockchip-share-inverse-activation-graph-setup.patch`.
+
+ATAN, ATANH, ASINH, ACOSH, SINH, and COSH share graph allocation and named-LUT
+emission. PR1 passes **173/173** and all six affected hardware methods pass
+**6/6 in 53.87s**. Support size is **12,256 counted lines**; static baselines
+remain unchanged.

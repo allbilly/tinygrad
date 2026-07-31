@@ -12257,3 +12257,16 @@ Validation:
 - complete touched forward-only power method group: **6/6 in 205.32s**;
 - mypy and touched-file Ruff remain at the exact 12- and 8-finding baselines;
   Python compilation and `git diff --check` pass.
+
+### Shared inverse-activation graph setup
+
+Commit `fae952bb1`; patch
+`0139-rockchip-share-inverse-activation-graph-setup.patch`.
+
+ATAN, ATANH, ASINH/ACOSH, and SINH/COSH now share `_TaskGraph` ownership and
+one named-LUT emitter. Their numerical stage lists are unchanged. This removes
+55 counted lines, reaching **12,256** in `support/rockchip.py`.
+
+PR1 passes **173/173 in 13.00s** and the six affected forward-only RK3588
+methods pass **6/6 in 53.87s**. Mypy/Ruff remain at 12/8 and compilation plus
+`git diff --check` pass.
