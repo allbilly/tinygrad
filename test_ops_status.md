@@ -2903,3 +2903,18 @@ Other interpolation modes/geometries remain unchanged.
 Contract: **166/166 in 9.08s**. Mypy is back at the exact 12-error baseline
 and touched-file Ruff remains at the exact nine pre-existing findings. No
 LUT or two-level LUT changed. Next: remaining interpolation methods.
+
+### Aligned bilinear interpolation
+
+`test_interpolate_bilinear_corners_aligned` passes in **12.08s**; both
+bilinear methods pass **2/2 in 13.12s**. Commit `c174563a7`; saved patch
+`0106-rockchip-pass-aligned-bilinear-interpolation.patch`.
+
+The exact two-stage task now distinguishes half-pixel and aligned-corner
+graph fingerprints and carries a coordinate-mode bit. Aligned mode computes
+`out_index*(in-1)/(out-1)` with float32 weights. The prior first shape missed
+83/1,674 outputs by up to one fp16 ULP.
+
+Contract remains **166/166 in 10.02s**. Mypy stays at the exact 12-error
+baseline and touched-file Ruff at nine pre-existing findings. No LUT or
+two-level LUT changed. Next: remaining interpolation methods.

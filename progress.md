@@ -11177,3 +11177,37 @@ Pre-edit recovery copies:
 
 Next action: inventory aligned-corner, linear, nearest, and trilinear
 interpolation methods, then fix the next separate failure as milestone 106.
+
+## 2026-07-31 — aligned bilinear-interpolation milestone
+
+The complete unchanged `TestOps.test_interpolate_bilinear_corners_aligned`
+passes in **12.08s**. It and the half-pixel bilinear method pass **2/2 in
+13.12s**. Implementation commit: `c174563a7`; portable patch:
+`0106-rockchip-pass-aligned-bilinear-interpolation.patch`.
+
+Aligned-corner scheduling uses the same two-stage fp16→fp32→fp16 ABI and
+official geometries as milestone 105, but its graph fingerprints have one
+fewer ADD and two fewer constants per stage. The previous serialized path
+missed 83/1,674 first-shape outputs by up to one fp16 ULP.
+
+The exact bilinear task now carries an explicit coordinate-mode bit.
+Half-pixel mode retains `(out+0.5)*in/out-0.5`; aligned mode uses
+`out_index*(in-1)/(out-1)`. Separate exact op-count fingerprints select the
+mode, and the vectorized runtime retains float32 weights and intermediate
+storage. Independent comparisons for all three aligned geometries were
+within the unchanged tolerance.
+
+Validation: hardware-free Rockchip remains **166/166**, now in 10.02s;
+mypy remains at the exact 12-error baseline; touched-file Ruff remains at
+the exact nine pre-existing findings; `git diff --check` passes. No LUT,
+LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-153207`,
+`/tmp/ops_rockchip.py.20260731-153207`,
+`/tmp/test_pr1.py.20260731-153207`,
+`/tmp/progress.md.20260731-153425`, and
+`/tmp/test_ops_status.md.20260731-153425`.
+
+Next action: continue with 1-D linear, nearest, and trilinear interpolation
+methods as milestone 107.
