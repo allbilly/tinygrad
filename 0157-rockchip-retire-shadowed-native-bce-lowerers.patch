@@ -1,0 +1,392 @@
+From 5b324acfbaf244d18e267b4e1f4ebfac92c3b007 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 03:35:20 +0800
+Subject: [PATCH] rockchip: retire shadowed native bce lowerers
+
+---
+ tinygrad/runtime/support/rockchip.py | 348 +++++++++++++--------------
+ 1 file changed, 173 insertions(+), 175 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 4fda1fc38..5ee08bad5 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -5942,81 +5942,81 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+       if need: tasks[i] = RKSubTask(st.cmds, replace(st.task, fp32_inputs=tuple(set(st.task.fp32_inputs+need))), st.relocs)
+   return _finalize_fp32_output(tasks, store)
+ 
+-def _try_bce_logits_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Lower BCE-with-logits as (1-y)*x + softplus(-x) with a fitted LUT."""
+-  store = _store_node(sink)
+-  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
+-  value = _unwrap(store.src[1])
+-  if value.op is not Ops.ADD: return None
+-  nodes = value.toposort()
+-  if sum(u.op is Ops.LOG2 for u in nodes) != 2 or sum(u.op is Ops.EXP2 for u in nodes) != 4 or \
+-     any(u.op is Ops.RECIPROCAL for u in nodes): return None
+-  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
+-  source = next((u for u in indexes if any(v.op is Ops.MAX and any(w is u for w in v.toposort()) for v in nodes)), None)
+-  if source is None: return None
+-  source_slot = source.src[0].buf_uop.arg.slot
+-  other_slots = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot}
+-  if len(other_slots) != 1: return None
+-  target_slot = next(iter(other_slots))
+-  target_candidates = [u for u in nodes if u.op is Ops.WHERE and
+-                       any(v.op is Ops.INDEX and v.src[0].buf_uop.arg.slot == target_slot for v in u.toposort()) and
+-                       {float(v.arg) for v in u.toposort() if v.op is Ops.CONST and isinstance(v.arg, (float, np.floating))} >= {0.0, 1.0}]
+-  if not target_candidates: return None
+-  target = max(target_candidates, key=lambda u:len(u.toposort()))
+-
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+-  tasks:list[RKSubTask] = []
+-  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+-  three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
+-
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot + 1
+-    return ret
+-
+-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+-    out_idx = store.src[0]
+-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+-
+-  def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
+-
+-  def extend(stage_tasks:tuple[RKSubTask, ...]) -> None:
+-    nonlocal next_slot
+-    tasks.extend(stage_tasks)
+-    used = [st.task.out_slot for st in stage_tasks] + \
+-      [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+-    next_slot = max(next_slot, max(used, default=-1) + 1)
+-
+-  clipped_target = alloc()
+-  if (target_tasks := _try_where_subtasks(stage_sink(target, clipped_target))) is None: return None
+-  target_used = [st.task.out_slot for st in target_tasks] + \
+-    [r.globals_slot for st in target_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+-  next_slot = max(next_slot, max(target_used, default=-1) + 1)
+-  first, warm_slot = target_tasks[0], alloc()
+-  warm_relocs = tuple(replace(r, globals_slot=warm_slot) if r.globals_slot == first.task.out_slot else r for r in first.relocs)
+-  warm_task = RKSubTask(first.cmds, replace(first.task, out_slot=warm_slot), warm_relocs)
+-  extend((warm_task, *target_tasks))
+-
+-  lut_slot = alloc()
+-  lut_value = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_bce_logits")
+-  lut_plan = plan_rk(stage_sink(lut_value, lut_slot))
+-  if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(lut_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  negative_diff, negative_mask = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (source_slot, 0), Ops.SUB),
+-                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True)))
+-  scaled_negative, scale, loss, inverse_target, weighted_source = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, scaled_negative, (negative_mask, 0), three, Ops.MUL),
+-                _emit_where_stage(total, scale, one, (scaled_negative, 0), Ops.ADD),
+-                _emit_where_stage(total, loss, (lut_slot, 0), (scale, 0), Ops.MUL),
+-                _emit_where_stage(total, inverse_target, one, (clipped_target, 0), Ops.SUB),
+-                _emit_where_stage(total, weighted_source, (inverse_target, 0), (source_slot, 0), Ops.MUL),
+-                _emit_where_stage(total, out, (weighted_source, 0), (loss, 0), Ops.ADD)))
+-  return tuple(tasks)
++# def _try_bce_logits_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++#   """Lower BCE-with-logits as (1-y)*x + softplus(-x) with a fitted LUT."""
++#   store = _store_node(sink)
++#   if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
++#   value = _unwrap(store.src[1])
++#   if value.op is not Ops.ADD: return None
++#   nodes = value.toposort()
++#   if sum(u.op is Ops.LOG2 for u in nodes) != 2 or sum(u.op is Ops.EXP2 for u in nodes) != 4 or \
++#      any(u.op is Ops.RECIPROCAL for u in nodes): return None
++#   indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
++#   source = next((u for u in indexes if any(v.op is Ops.MAX and any(w is u for w in v.toposort()) for v in nodes)), None)
++#   if source is None: return None
++#   source_slot = source.src[0].buf_uop.arg.slot
++#   other_slots = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot}
++#   if len(other_slots) != 1: return None
++#   target_slot = next(iter(other_slots))
++#   target_candidates = [u for u in nodes if u.op is Ops.WHERE and
++#                        any(v.op is Ops.INDEX and v.src[0].buf_uop.arg.slot == target_slot for v in u.toposort()) and
++#                        {float(v.arg) for v in u.toposort() if v.op is Ops.CONST and isinstance(v.arg, (float, np.floating))} >= {0.0, 1.0}]
++#   if not target_candidates: return None
++#   target = max(target_candidates, key=lambda u:len(u.toposort()))
++#
++#   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++#   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
++#   tasks:list[RKSubTask] = []
++#   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++#   three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
++#
++#   def alloc() -> int:
++#     nonlocal next_slot
++#     ret, next_slot = next_slot, next_slot + 1
++#     return ret
++#
++#   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
++#     out_idx = store.src[0]
++#     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
++#
++#   def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
++#     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
++#
++#   def extend(stage_tasks:tuple[RKSubTask, ...]) -> None:
++#     nonlocal next_slot
++#     tasks.extend(stage_tasks)
++#     used = [st.task.out_slot for st in stage_tasks] + \
++#       [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++#     next_slot = max(next_slot, max(used, default=-1) + 1)
++#
++#   clipped_target = alloc()
++#   if (target_tasks := _try_where_subtasks(stage_sink(target, clipped_target))) is None: return None
++#   target_used = [st.task.out_slot for st in target_tasks] + \
++#     [r.globals_slot for st in target_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++#   next_slot = max(next_slot, max(target_used, default=-1) + 1)
++#   first, warm_slot = target_tasks[0], alloc()
++#   warm_relocs = tuple(replace(r, globals_slot=warm_slot) if r.globals_slot == first.task.out_slot else r for r in first.relocs)
++#   warm_task = RKSubTask(first.cmds, replace(first.task, out_slot=warm_slot), warm_relocs)
++#   extend((warm_task, *target_tasks))
++#
++#   lut_slot = alloc()
++#   lut_value = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_bce_logits")
++#   lut_plan = plan_rk(stage_sink(lut_value, lut_slot))
++#   if isinstance(lut_plan, str) or lut_plan.kind != "dpu_lut": return None
++#   cmds, task, relocs = emit_rk(lut_plan)
++#   tasks.append(RKSubTask(cmds, task, relocs))
++#
++#   negative_diff, negative_mask = alloc(), alloc()
++#   tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (source_slot, 0), Ops.SUB),
++#                 _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True)))
++#   scaled_negative, scale, loss, inverse_target, weighted_source = (alloc() for _ in range(5))
++#   tasks.extend((_emit_where_stage(total, scaled_negative, (negative_mask, 0), three, Ops.MUL),
++#                 _emit_where_stage(total, scale, one, (scaled_negative, 0), Ops.ADD),
++#                 _emit_where_stage(total, loss, (lut_slot, 0), (scale, 0), Ops.MUL),
++#                 _emit_where_stage(total, inverse_target, one, (clipped_target, 0), Ops.SUB),
++#                 _emit_where_stage(total, weighted_source, (inverse_target, 0), (source_slot, 0), Ops.MUL),
++#                 _emit_where_stage(total, out, (weighted_source, 0), (loss, 0), Ops.ADD)))
++#   return tuple(tasks)
+ 
+ def _try_bce_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Serialize the bounded official BCE graphs without the unstable 27/33-stage mixed chain."""
+@@ -6072,102 +6072,102 @@ def _try_bce_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, target_slot, *pos_slots))
+   return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+ 
+-def _try_bce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Lower unreduced BCE(sigmoid(x), clip(y, 0, 1)) through endpoint-loss LUTs.
+-
+-  Reconstructing BCE as (1-y)*BCE(x,0) + y*BCE(x,1) retains PyTorch's fp16
+-  rounding boundary while every data-dependent operation remains an NPU task.
+-  """
+-  store = _store_node(sink)
+-  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
+-  value = _unwrap(store.src[1])
+-  if value.op is not Ops.ADD: return None
+-  nodes = value.toposort()
+-  if sum(u.op is Ops.LOG2 for u in nodes) != 2 or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
+-     sum(u.op is Ops.RECIPROCAL for u in nodes) != 1: return None
+-  sigmoid = next((u for u in nodes if u.op is Ops.RECIPROCAL and _try_sigmoid(u) is not None), None)
+-  if sigmoid is None or (source_slot := _try_sigmoid(sigmoid)) is None: return None
+-  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
+-  source = next((u for u in indexes if u.src[0].buf_uop.arg.slot == source_slot), None)
+-  other_slots = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot}
+-  if source is None or len(other_slots) != 1: return None
+-  target_slot = next(iter(other_slots))
+-  target_candidates = [u for u in nodes if u.op is Ops.WHERE and
+-                       any(v.op is Ops.INDEX and v.src[0].buf_uop.arg.slot == target_slot for v in u.toposort()) and
+-                       {float(v.arg) for v in u.toposort() if v.op is Ops.CONST and isinstance(v.arg, (float, np.floating))} >= {0.0, 1.0}]
+-  if not target_candidates: return None
+-  target = max(target_candidates, key=lambda u:len(u.toposort()))
+-
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
+-  tasks:list[RKSubTask] = []
+-  one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
+-  three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
+-
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot + 1
+-    return ret
+-
+-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+-    out_idx = store.src[0]
+-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+-
+-  def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
+-    return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
+-
+-  def extend(stage_tasks:tuple[RKSubTask, ...]) -> None:
+-    nonlocal next_slot
+-    tasks.extend(stage_tasks)
+-    used = [st.task.out_slot for st in stage_tasks] + \
+-      [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+-    next_slot = max(next_slot, max(used, default=-1) + 1)
+-
+-  # Materialize the exact nested clamp graph before consuming the target in
+-  # the endpoint weighting products.
+-  clipped_target = alloc()
+-  if (target_tasks := _try_where_subtasks(stage_sink(target, clipped_target))) is None: return None
+-  # A comparison immediately following four CMAC-ended reduction programs can
+-  # wedge even though one cold DPU difference completed. Repeat BCE's first
+-  # difference stage before its reset-separated comparison without perturbing
+-  # the generic WHERE lowering used by logits.
+-  target_used = [st.task.out_slot for st in target_tasks] + \
+-    [r.globals_slot for st in target_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+-  next_slot = max(next_slot, max(target_used, default=-1) + 1)
+-  first, warm_slot = target_tasks[0], alloc()
+-  warm_relocs = tuple(replace(r, globals_slot=warm_slot) if r.globals_slot == first.task.out_slot else r for r in first.relocs)
+-  warm_task = RKSubTask(first.cmds, replace(first.task, out_slot=warm_slot), warm_relocs)
+-  extend((warm_task, *target_tasks))
+-
+-  endpoint_zero, endpoint_one = alloc(), alloc()
+-  for endpoint_slot, marker in ((endpoint_zero, "rk_bce_zero"), (endpoint_one, "rk_bce_one")):
+-    endpoint_value = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=marker)
+-    endpoint_plan = plan_rk(stage_sink(endpoint_value, endpoint_slot))
+-    if isinstance(endpoint_plan, str) or endpoint_plan.kind != "dpu_lut": return None
+-    cmds, task, relocs = emit_rk(endpoint_plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  # The large-loss half of each LUT is stored at one-quarter magnitude so it
+-  # can keep Q15 precision. Restore it with complementary x<0 / x>=0 masks.
+-  negative_diff, negative_mask = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (source_slot, 0), Ops.SUB),
+-                _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True)))
+-  nonnegative_mask, scaled_negative, scale_zero, scaled_positive, scale_one = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, nonnegative_mask, one, (negative_mask, 0), Ops.SUB),
+-                _emit_where_stage(total, scaled_positive, (nonnegative_mask, 0), three, Ops.MUL),
+-                _emit_where_stage(total, scale_zero, one, (scaled_positive, 0), Ops.ADD),
+-                _emit_where_stage(total, scaled_negative, (negative_mask, 0), three, Ops.MUL),
+-                _emit_where_stage(total, scale_one, one, (scaled_negative, 0), Ops.ADD)))
+-  loss_zero, loss_one = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, loss_zero, (endpoint_zero, 0), (scale_zero, 0), Ops.MUL),
+-                _emit_where_stage(total, loss_one, (endpoint_one, 0), (scale_one, 0), Ops.MUL)))
+-
+-  inverse_target, term_zero, term_one = alloc(), alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, inverse_target, one, (clipped_target, 0), Ops.SUB),
+-                _emit_where_stage(total, term_zero, (inverse_target, 0), (loss_zero, 0), Ops.MUL),
+-                _emit_where_stage(total, term_one, (clipped_target, 0), (loss_one, 0), Ops.MUL),
+-                _emit_where_stage(total, out, (term_zero, 0), (term_one, 0), Ops.ADD)))
+-  return tuple(tasks)
++# def _try_bce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++#   """Lower unreduced BCE(sigmoid(x), clip(y, 0, 1)) through endpoint-loss LUTs.
++#
++#   Reconstructing BCE as (1-y)*BCE(x,0) + y*BCE(x,1) retains PyTorch's fp16
++#   rounding boundary while every data-dependent operation remains an NPU task.
++#   """
++#   store = _store_node(sink)
++#   if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half: return None
++#   value = _unwrap(store.src[1])
++#   if value.op is not Ops.ADD: return None
++#   nodes = value.toposort()
++#   if sum(u.op is Ops.LOG2 for u in nodes) != 2 or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
++#      sum(u.op is Ops.RECIPROCAL for u in nodes) != 1: return None
++#   sigmoid = next((u for u in nodes if u.op is Ops.RECIPROCAL and _try_sigmoid(u) is not None), None)
++#   if sigmoid is None or (source_slot := _try_sigmoid(sigmoid)) is None: return None
++#   indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half]
++#   source = next((u for u in indexes if u.src[0].buf_uop.arg.slot == source_slot), None)
++#   other_slots = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot}
++#   if source is None or len(other_slots) != 1: return None
++#   target_slot = next(iter(other_slots))
++#   target_candidates = [u for u in nodes if u.op is Ops.WHERE and
++#                        any(v.op is Ops.INDEX and v.src[0].buf_uop.arg.slot == target_slot for v in u.toposort()) and
++#                        {float(v.arg) for v in u.toposort() if v.op is Ops.CONST and isinstance(v.arg, (float, np.floating))} >= {0.0, 1.0}]
++#   if not target_candidates: return None
++#   target = max(target_candidates, key=lambda u:len(u.toposort()))
++#
++#   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
++#   out, next_slot = info.outs[0], max(info.globals, default=-1) + 1
++#   tasks:list[RKSubTask] = []
++#   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
++#   three = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 3.0))[0])
++#
++#   def alloc() -> int:
++#     nonlocal next_slot
++#     ret, next_slot = next_slot, next_slot + 1
++#     return ret
++#
++#   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
++#     out_idx = store.src[0]
++#     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
++#
++#   def stage_sink(stage_value:UOp, out_slot:int, dtype=dtypes.half) -> UOp:
++#     return sink.substitute({store:store.replace(src=(temp_index(out_slot, dtype), stage_value))})
++#
++#   def extend(stage_tasks:tuple[RKSubTask, ...]) -> None:
++#     nonlocal next_slot
++#     tasks.extend(stage_tasks)
++#     used = [st.task.out_slot for st in stage_tasks] + \
++#       [r.globals_slot for st in stage_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++#     next_slot = max(next_slot, max(used, default=-1) + 1)
++#
++#   # Materialize the exact nested clamp graph before consuming the target in
++#   # the endpoint weighting products.
++#   clipped_target = alloc()
++#   if (target_tasks := _try_where_subtasks(stage_sink(target, clipped_target))) is None: return None
++#   # A comparison immediately following four CMAC-ended reduction programs can
++#   # wedge even though one cold DPU difference completed. Repeat BCE's first
++#   # difference stage before its reset-separated comparison without perturbing
++#   # the generic WHERE lowering used by logits.
++#   target_used = [st.task.out_slot for st in target_tasks] + \
++#     [r.globals_slot for st in target_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
++#   next_slot = max(next_slot, max(target_used, default=-1) + 1)
++#   first, warm_slot = target_tasks[0], alloc()
++#   warm_relocs = tuple(replace(r, globals_slot=warm_slot) if r.globals_slot == first.task.out_slot else r for r in first.relocs)
++#   warm_task = RKSubTask(first.cmds, replace(first.task, out_slot=warm_slot), warm_relocs)
++#   extend((warm_task, *target_tasks))
++#
++#   endpoint_zero, endpoint_one = alloc(), alloc()
++#   for endpoint_slot, marker in ((endpoint_zero, "rk_bce_zero"), (endpoint_one, "rk_bce_one")):
++#     endpoint_value = UOp(Ops.CUSTOM, dtypes.half, (source,), arg=marker)
++#     endpoint_plan = plan_rk(stage_sink(endpoint_value, endpoint_slot))
++#     if isinstance(endpoint_plan, str) or endpoint_plan.kind != "dpu_lut": return None
++#     cmds, task, relocs = emit_rk(endpoint_plan)
++#     tasks.append(RKSubTask(cmds, task, relocs))
++#
++#   # The large-loss half of each LUT is stored at one-quarter magnitude so it
++#   # can keep Q15 precision. Restore it with complementary x<0 / x>=0 masks.
++#   negative_diff, negative_mask = alloc(), alloc()
++#   tasks.extend((_emit_where_stage(total, negative_diff, (_ZERO_SLOT, 0), (source_slot, 0), Ops.SUB),
++#                 _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True)))
++#   nonnegative_mask, scaled_negative, scale_zero, scaled_positive, scale_one = (alloc() for _ in range(5))
++#   tasks.extend((_emit_where_stage(total, nonnegative_mask, one, (negative_mask, 0), Ops.SUB),
++#                 _emit_where_stage(total, scaled_positive, (nonnegative_mask, 0), three, Ops.MUL),
++#                 _emit_where_stage(total, scale_zero, one, (scaled_positive, 0), Ops.ADD),
++#                 _emit_where_stage(total, scaled_negative, (negative_mask, 0), three, Ops.MUL),
++#                 _emit_where_stage(total, scale_one, one, (scaled_negative, 0), Ops.ADD)))
++#   loss_zero, loss_one = alloc(), alloc()
++#   tasks.extend((_emit_where_stage(total, loss_zero, (endpoint_zero, 0), (scale_zero, 0), Ops.MUL),
++#                 _emit_where_stage(total, loss_one, (endpoint_one, 0), (scale_one, 0), Ops.MUL)))
++#
++#   inverse_target, term_zero, term_one = alloc(), alloc(), alloc()
++#   tasks.extend((_emit_where_stage(total, inverse_target, one, (clipped_target, 0), Ops.SUB),
++#                 _emit_where_stage(total, term_zero, (inverse_target, 0), (loss_zero, 0), Ops.MUL),
++#                 _emit_where_stage(total, term_one, (clipped_target, 0), (loss_one, 0), Ops.MUL),
++#                 _emit_where_stage(total, out, (term_zero, 0), (term_one, 0), Ops.ADD)))
++#   return tuple(tasks)
+ 
+ def _try_elementwise_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Split a nested fp16 elementwise expression into independently classifiable DPU stages."""
+@@ -10885,9 +10885,7 @@ def _try_elementwise_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   # The reduction body is deliberately lowered as an ordinary elementwise graph:
+   # every arithmetic operation remains an NPU DPU/LUT task and only the static
+   # address calculation above is performed while constructing the command chain.
+-  elementwise_tasks = _try_bce_logits_subtasks(stage_sink)
+-  if elementwise_tasks is None: elementwise_tasks = _try_bce_subtasks(stage_sink)
+-  if elementwise_tasks is None: elementwise_tasks = _try_elementwise_subtasks(stage_sink)
++  elementwise_tasks = _try_elementwise_subtasks(stage_sink)
+   if elementwise_tasks is None:
+     if getenv("ROCKCHIP_DEBUG_ELEMENTWISE_SUM"): print("RK_ELEMENTWISE_SUM_BODY_REJECT", stage_sink)
+     return None
+@@ -13086,7 +13084,7 @@ def _try_cmac_shared_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
+ # Ordered active dispatch tables: order is semantic because the first strict classifier wins.
+ # The native two-LUT tangent remains after the exact fp16 host tangent, as in the expanded dispatcher.
+ _SUBTASK_CLASSIFIERS = (
+-  _try_bce_host_subtasks, _try_bce_logits_subtasks, _try_bce_subtasks,
++  _try_bce_host_subtasks,
+   _try_movement_host_subtasks, _try_trunc_host_subtasks, _try_floor_ceil_host_subtasks,
+   _try_copysign_host_subtasks, _try_bitwise_host_subtasks, _try_cast_subtasks,
+   _try_bitcast_host_subtasks, _try_typed_fill_subtasks, _try_round_subtasks,
+-- 
+2.34.1
+

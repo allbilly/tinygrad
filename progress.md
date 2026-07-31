@@ -12521,3 +12521,19 @@ reaching **10,993** in `support/rockchip.py`.
 PR1 passes **173/173 in 13.43s** and six representative RK3588 WHERE/maximum/
 minimum/clip/infinity groups pass **6/6 in 15.47s**. Static baselines remain
 nine mypy errors and eight Ruff findings.
+
+### Retired shadowed BCE lowerers
+
+Commit `5b324acfb`; saved patch
+`0157-rockchip-retire-shadowed-native-bce-lowerers.patch`.
+
+The ordered dispatcher and PR1 contract require `_try_bce_host_subtasks` to
+accept BCE before the two older native elementwise implementations. A call
+audit showed their only remaining fallback caller was itself reached after the
+same host classifier. Both superseded implementations remain verbatim as
+comments, while dispatch and the unreachable fallback references are removed.
+
+This removes **142 counted lines**, reaching **10,851** in
+`support/rockchip.py`. PR1 passes **173/173 in 13.35s** and all BCE method
+groups—including reductions and positive weights—pass **3/3 in 2.10s** on
+RK3588. Static baselines remain nine mypy errors and eight Ruff findings.

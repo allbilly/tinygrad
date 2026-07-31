@@ -3529,3 +3529,14 @@ Representative forward-only RK3588 WHERE coverage passes **6/6 in 15.47s**:
 plain/permuted WHERE, maximum, minimum, clip, and infinity arms. PR1 passes
 **173/173 in 13.43s**; static baselines remain nine mypy errors and eight Ruff
 findings. The support file is now **10,993 counted lines**.
+
+### Typed-host BCE consolidation
+
+Commit `5b324acfb`; saved patch
+`0157-rockchip-retire-shadowed-native-bce-lowerers.patch`.
+
+The required single `_HOST_BCE_LAYOUT` implementation now owns every BCE path;
+the two shadowed native lowerers remain as comments. Binary cross-entropy,
+none/sum/mean reductions, and logits positive weights pass **3/3 in 2.10s**.
+PR1 passes **173/173 in 13.35s**; static baselines remain 9/8. The support file
+is now **10,851 counted lines**.
