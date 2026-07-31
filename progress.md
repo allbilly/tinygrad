@@ -10561,3 +10561,31 @@ reported 76 method passes, 83 subtest passes, two skips, and 16 failures.
 The two uint8 `EINVAL` failures are state artifacts: `TestOpsUint8` passes
 6/6 alone. Reproduce each remaining node alone before classifying it.
 Next low-cost candidate: the scalar dtype boundary in `TestOps.test_cos`.
+
+## 2026-07-31 — fp32 cosine milestone
+
+`TestOps.test_cos` passes its unchanged random `(45,65)`, constant scalar,
+random scalar, NaN/Inf, and large-magnitude cases in **12.40s**.
+Implementation commit: `1a78f22e9`; portable patch:
+`0090-rockchip-pass-fp32-cosine.patch`.
+
+The HALF adapter exposed two coupled issues. Its `torch.tensor(2.0)`
+constant became fp16, while tinygrad's integer `Tensor(2).cos()` correctly
+promoted to fp32. Aligning both defaults to fp32 for this named test fixed
+that artificial dtype mismatch, but then revealed that direct fp32 cosine
+was using the fp16 Rockchip LUT pipeline and widening its result. The random
+case missed normal fp32 tolerance on 681/2925 values, with maximum absolute
+error about `7.76e-4`.
+
+A strict fp32 sin/cos classifier now accepts only one direct, same-size fp32
+input, no reduction, static output bounded by `2**20`, and the canonical
+sin/cos graph. It reuses the typed serialized evaluator, whose cosine phase
+is evaluated by NumPy's fp32 `sin`; this preserves normal fp32 accuracy and
+handles special/large values without expanding the general host fallback.
+The existing fp16 LUT and all LUT tuning remain unchanged.
+
+Hardware-free Rockchip is **155/155 in 9.82s**. Mypy remains at the exact
+12-error baseline and touched-file Ruff at the exact nine pre-existing
+findings. Next reproducible low-cost candidates from the partial tally are
+`test_arange` and `test_ceil`; gradient-named tests remain deferred under
+the forward-only instruction.

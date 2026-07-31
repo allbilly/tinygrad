@@ -2608,3 +2608,22 @@ The serialized full retally was stopped after **891.84s at 17%** due to an
 uninterruptible driver wait. Partial outcome: 76 passes, 83 subtest passes,
 two skips, 16 failures. Standalone uint8 remains 6/6, so its two `EINVAL`
 entries are not operator regressions. Next candidate: `TestOps.test_cos`.
+
+### FP32 cosine
+
+`test_cos` passes all unchanged tensor, scalar, special-value, and
+large-magnitude cases in **12.40s**. Commit `1a78f22e9`; saved patch
+`0090-rockchip-pass-fp32-cosine.patch`.
+
+The named test runs both framework defaults as fp32 because its Torch side
+uses a default-float constant while the tinygrad side uses an integer
+constant that promotes for transcendental math. This exposed a real backend
+precision issue: direct fp32 cosine previously widened the fp16 LUT result,
+missing tolerance on 681/2925 random outputs.
+
+Normal fp32 direct sin/cos now uses one strict bounded typed host task. The
+fp16 NPU LUT implementation is unchanged and no table was retuned.
+
+Contract: **155/155 in 9.82s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. Next candidates: `test_arange` and `test_ceil`;
+gradient-only work remains deferred.

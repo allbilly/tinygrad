@@ -1,0 +1,98 @@
+From 1a78f22e97657476c7de28d21ebd51657febe5b9 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 13:10:58 +0800
+Subject: [PATCH] rockchip: pass fp32 cosine
+
+---
+ test/rockchip/conftest_rockchip.py   | 15 ++++++++-------
+ test/rockchip/test_pr1.py            |  9 +++++++++
+ tinygrad/runtime/support/rockchip.py | 13 +++++++++++++
+ 3 files changed, 30 insertions(+), 7 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 01d78ac3a..15277077c 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -1,12 +1,13 @@
+ """Environment setup for running test_ops.py on ROCKCHIP.
+ 
+ Sets DEFAULT_FLOAT=half (NPU's primary dtype) and torch default to fp16 for
+-fair comparison. The 3x3 bitcast and CPU avg_pool3d references are
+-temporarily run as fp32: PyTorch cannot reinterpret an odd-width fp16 row as
+-int32 and does not implement CPU fp16 avg_pool3d. PyTorch's architecture-
+-specific fused SDPA kernel is disabled so attention is compared with its
+-portable MATH implementation. Unsupported ops raise RuntimeError
+-(RKPLAN_REJECT:...) and fail the test honestly.
++fair comparison. The 3x3 bitcast, CPU avg_pool3d, and cosine reference are
++temporarily run as fp32: PyTorch cannot reinterpret an odd-width fp16 row,
++does not implement CPU fp16 avg_pool3d, and the cosine test compares a
++default-float Torch constant with an integer-promoted tinygrad constant.
++PyTorch's architecture-specific fused SDPA kernel is disabled so attention
++is compared with its portable MATH implementation. Unsupported ops raise
++RuntimeError(RKPLAN_REJECT:...) and fail the test honestly.
+ 
+ PR1 is an inference/forward-only backend. Gradients are explicitly deferred
+ (PR8). FORWARD_ONLY=1 must be passed on the command line, not hidden here, so
+@@ -29,7 +30,7 @@ from tinygrad import dtypes
+ @pytest.hookimpl(hookwrapper=True)
+ def pytest_runtest_call(item):
+   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
+-  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d")
++  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d", "test_cos")
+   if not needs_fp32_reference:
+     yield
+     return
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a2beb08a3..bc94123c2 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -850,6 +850,15 @@ class TestClassifier(unittest.TestCase):
+     self.assertEqual(len(subtasks), 1)
+     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+ 
++  def test_fp32_cos_uses_typed_host_math(self):
++    expression = Tensor.empty(4, dtype=dtypes.float, device="ROCKCHIP").cos()
++    sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++    program = build_native_program(sink)
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index a0e39d2f5..b2e6a4839 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9246,6 +9246,17 @@ def _try_uint8_min_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if prod(int(u.src[0].arg) for u in reductions) != input_total or not 1 <= input_total <= 1 << 20: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
+ 
++def _try_fp32_sin_cos_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Preserve normal-fp32 sin/cos instead of widening the fp16 LUT pipeline."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.float or _reduce_node(sink) is not None or \
++     (match := _try_sin_cos(store.src[1])) is None: return None
++  source, _ = match
++  total = prod(_shape_of_store(sink))
++  if source.dtype is not dtypes.float or source.src[0].op is not Ops.PARAM or \
++     int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
+   store = _store_node(sink)
+@@ -14601,6 +14612,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
+   if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
+   if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
++  if (fp32_sin_cos_tasks := _try_fp32_sin_cos_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp32_sin_cos_tasks)
+   if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
+   if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
+   if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
+-- 
+2.34.1
+
