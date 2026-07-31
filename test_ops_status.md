@@ -3468,3 +3468,13 @@ Focused forward-only RK3588 status is **2/2 PASS in 12.01s** for
 `TestOps::test_log` and `TestOps::test_log2`. PR1 passes **173/173 in 13.17s**;
 static baselines remain exactly 12 mypy errors and eight touched-file Ruff
 findings. The support file is now **11,553 counted lines**.
+
+### TANH task-graph compaction
+
+Commit `b84613631`; saved patch
+`0151-rockchip-compose-tanh-saturation-task-graph.patch`.
+
+Focused forward-only RK3588 status is **2/2 PASS** for `TestOps::test_tanh`
+and `TestOps::test_tanh_extreme` (4.10s and 7.54s). PR1 passes **173/173 in
+13.42s**; static baselines remain exactly 12 mypy errors and eight touched-file
+Ruff findings. The support file is now **11,472 counted lines**.

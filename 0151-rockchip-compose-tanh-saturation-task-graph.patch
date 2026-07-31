@@ -1,0 +1,170 @@
+From b84613631d43f57b4bde550698968b1a038a1bb6 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 02:40:26 +0800
+Subject: [PATCH] rockchip: compose tanh saturation task graph
+
+---
+ tinygrad/runtime/support/rockchip.py | 144 ++++++---------------------
+ 1 file changed, 31 insertions(+), 113 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index da1618feb..ddc1b3ecf 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -2848,122 +2848,40 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Use direct Q15 tanh in [-4,4], exact sign tails, and restore NaN."""
+   store = _store_node(sink)
+   if store is None or (source := _try_tanh(store.src[1])) is None: return None
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1) + 1
+-  tasks:list[RKSubTask] = []
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot + 1
+-    return ret
+-  def temp_index(slot:int, dtype=dtypes.half) -> UOp:
+-    out_idx = store.src[0]
+-    return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
+-
+-  base_slot = alloc()
++  graph = _TaskGraph(sink, store, source)
++  base_slot = graph.alloc()
+   direct_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_tanh")
+-  direct_store = store.replace(src=(temp_index(base_slot), direct_val))
+-  direct_plan = plan_rk(sink.substitute({store:direct_store}))
+-  if isinstance(direct_plan, str) or direct_plan.kind != "dpu_lut":
++  if not graph.emit_lut(direct_val, base_slot):
+     # Preserve the older staged sigmoid interior as a fallback for scheduler changes.
+-    base_store = store.replace(src=(temp_index(base_slot), store.src[1]))
+-    base_tasks = _try_elementwise_subtasks(sink.substitute({store:base_store}))
+-    if base_tasks is None: return None
+-    tasks.extend(base_tasks)
+-    used_slots = [st.task.out_slot for st in base_tasks] + \
+-      [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
+-    next_slot = max(next_slot, max(used_slots, default=-1)+1)
+-  else:
+-    cmds, task, relocs = emit_rk(direct_plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
++    if not graph.extend(_try_elementwise_subtasks(graph.stage_sink(store.src[1], base_slot))): return None
+ 
+-  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), _float_arg(1.0)
+-  scaled = alloc()
+-  tasks.append(_emit_where_stage(total, scaled, source_arg, _float_arg(16.0), Ops.MUL))
+-  local_slot = alloc()
+-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_tanh_local")
+-  local_store = store.replace(src=(temp_index(local_slot), local_val))
+-  local_plan = plan_rk(sink.substitute({store:local_store}))
+-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(local_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-  local_scaled_scratch, local_scaled = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(0.25), Ops.MUL),
+-                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(0.25), Ops.MUL)))
+-  local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
+-  local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, local_low_diff, _float_arg(-0.25), source_arg, Ops.SUB),
+-                _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_high_diff, source_arg, _float_arg(0.25), Ops.SUB),
+-                _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
+-                _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
+-                _emit_where_stage(total, local_inside_scratch, one, (local_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB)))
+-  near_low_diff, near_low, near_high_diff, near_high = (alloc() for _ in range(4))
+-  near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
+-  local_mask_scratch, local_mask = alloc(), alloc()
+-  clamp_low, negated, negated_clamped, identity = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, near_low_diff, _float_arg(-0.04), source_arg, Ops.SUB),
+-                _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_high_diff, source_arg, _float_arg(0.04), Ops.SUB),
+-                _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
+-                _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
+-                _emit_where_stage(total, near_inside_scratch, one, (near_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                _emit_where_stage(total, clamp_low, source_arg, _float_arg(-0.04), Ops.MAX),
+-                _emit_where_stage(total, negated, (_ZERO_SLOT, 0), (clamp_low, 0), Ops.SUB),
+-                _emit_where_stage(total, negated_clamped, (negated, 0), _float_arg(-0.04), Ops.MAX),
+-                _emit_where_stage(total, identity, (_ZERO_SLOT, 0), (negated_clamped, 0), Ops.SUB)))
+-  broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
+-  identity_selected_scratch, identity_selected, lut_sum_scratch, lut_sum, interior_slot = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, broad_selected_scratch, (base_slot, 0), (local_outside, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (base_slot, 0), (local_outside, 0), Ops.MUL),
+-                _emit_where_stage(total, local_selected_scratch, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, identity_selected_scratch, (identity, 0), (near_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, identity_selected, (identity, 0), (near_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, alloc(), (lut_sum, 0), (identity_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, interior_slot, (lut_sum, 0), (identity_selected, 0), Ops.ADD)))
+-  low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, low_diff, _float_arg(-4.0), source_arg, Ops.SUB),
+-                _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, high_diff, source_arg, _float_arg(4.0), Ops.SUB),
+-                _emit_where_stage(total, high_mask, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True)))
+-  sign_scratch, sign, outside_scratch, outside, inside_scratch, inside = (alloc() for _ in range(6))
+-  tasks.extend((_emit_where_stage(total, sign_scratch, (high_mask, 0), (low_mask, 0), Ops.SUB),
+-                _emit_where_stage(total, sign, (high_mask, 0), (low_mask, 0), Ops.SUB),
+-                _emit_where_stage(total, outside_scratch, (high_mask, 0), (low_mask, 0), Ops.MAX),
+-                _emit_where_stage(total, outside, (high_mask, 0), (low_mask, 0), Ops.MAX),
+-                _emit_where_stage(total, inside_scratch, one, (outside, 0), Ops.SUB),
+-                _emit_where_stage(total, inside, one, (outside, 0), Ops.SUB)))
+-  base_selected_scratch, base_selected, sign_selected_scratch, sign_selected, finite = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, base_selected_scratch, (interior_slot, 0), (inside, 0), Ops.MUL),
+-                _emit_where_stage(total, base_selected, (interior_slot, 0), (inside, 0), Ops.MUL),
+-                _emit_where_stage(total, sign_selected_scratch, (sign, 0), (outside, 0), Ops.MUL),
+-                _emit_where_stage(total, sign_selected, (sign, 0), (outside, 0), Ops.MUL),
+-                _emit_where_stage(total, alloc(), (base_selected, 0), (sign_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, finite, (base_selected, 0), (sign_selected, 0), Ops.ADD)))
+-  not_number = alloc()
+-  comparison = UOp(Ops.CMPNE, dtypes.bool, (source, source))
+-  comparison_store = store.replace(src=(temp_index(not_number, dtypes.bool), comparison))
+-  comparison_tasks = _try_comparison_subtasks(sink.substitute({store:comparison_store}))
+-  if comparison_tasks is None: return None
+-  last = comparison_tasks[-1]
+-  comparison_tasks = (*comparison_tasks[:-1], RKSubTask(last.cmds, replace(last.task, bool_output=False), last.relocs))
+-  tasks.extend(comparison_tasks)
+-  nan_denom_scratch, nan_denom, nan_numerator_scratch, nan_numerator = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, nan_denom_scratch, one, (not_number, 0), Ops.SUB),
+-                _emit_where_stage(total, nan_denom, one, (not_number, 0), Ops.SUB),
+-                _emit_where_stage(total, nan_numerator_scratch, (finite, 0), (nan_denom, 0), Ops.MUL),
+-                _emit_where_stage(total, nan_numerator, (finite, 0), (nan_denom, 0), Ops.MUL),
+-                _emit_where_stage(total, alloc(), (nan_numerator, 0), (nan_denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, info.outs[0], (nan_numerator, 0), (nan_denom, 0), Ops.FDIV)))
+-  return tuple(tasks)
++  source_arg, one = (source.src[0].buf_uop.arg.slot,0), _float_arg(1.0)
++  scaled = graph.op(source_arg, _float_arg(16.0), Ops.MUL, repeat=False)
++  local_slot = graph.alloc()
++  if not graph.emit_named_lut("rk_tanh_local", scaled[0], local_slot): return None
++  local_scaled = graph.op((local_slot,0), _float_arg(0.25), Ops.MUL)
++  local_outside, local_inside = graph.interval_mask(source_arg, -0.25, 0.25)
++  _, near_inside = graph.interval_mask(source_arg, -0.04, 0.04)
++  local_mask = graph.op(local_inside, near_inside, Ops.SUB)
++  identity = graph.clamp_symmetric(source_arg, 0.04)
++  broad_selected = graph.op((base_slot,0), local_outside, Ops.MUL)
++  local_selected = graph.op(local_scaled, local_mask, Ops.MUL)
++  identity_selected = graph.op(identity, near_inside, Ops.MUL)
++  interior = graph.op(graph.op(broad_selected, local_selected, Ops.ADD), identity_selected, Ops.ADD)
++  low_mask = graph.positive_mask(_float_arg(-4.0), source_arg)
++  high_mask = graph.positive_mask(source_arg, _float_arg(4.0))
++  sign = graph.op(high_mask, low_mask, Ops.SUB)
++  outside = graph.op(high_mask, low_mask, Ops.MAX)
++  inside = graph.op(one, outside, Ops.SUB)
++  base_selected = graph.op(interior, inside, Ops.MUL)
++  sign_selected = graph.op(sign, outside, Ops.MUL)
++  finite = graph.op(base_selected, sign_selected, Ops.ADD)
++  not_number = graph.comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
++  if not_number is None: return None
++  nan_denom = graph.op(one, not_number, Ops.SUB)
++  nan_numerator = graph.op(finite, nan_denom, Ops.MUL)
++  graph.op(nan_numerator, nan_denom, Ops.FDIV, out_slot=graph.out)
++  return tuple(graph.tasks)
+ 
+ def _try_fp32_tanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Keep exact normal-fp32 tanh out of the half-buffer two-LUT implementation."""
+-- 
+2.34.1
+

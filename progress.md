@@ -12347,6 +12347,20 @@ PR1 passes **173/173 in 13.00s** and the six affected forward-only RK3588
 methods pass **6/6 in 53.87s**. Mypy/Ruff remain at 12/8 and compilation plus
 `git diff --check` pass.
 
+### TANH saturation graph
+
+Commit `b84613631`; saved patch
+`0151-rockchip-compose-tanh-saturation-task-graph.patch`.
+
+TANH now shares LUT emission/fallback extension, interval masks, symmetric
+clamping, regional selection, exact sign tails, and NaN restoration through
+`_TaskGraph`. This removes **81 counted lines**, reaching **11,472** in
+`support/rockchip.py`.
+
+PR1 passes **173/173 in 13.42s**. Normal and extreme TANH pass **2/2** on
+serialized RK3588 (4.10s and 7.54s); mypy/Ruff remain exactly 12/8 and the
+compile/diff gates pass.
+
 ### Declarative GELU/ELU graphs
 
 Commit `1e4c75025`; patch
