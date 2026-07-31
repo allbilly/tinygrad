@@ -206,6 +206,7 @@ _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reductio
 _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
 _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
 _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
+_HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -7754,6 +7755,60 @@ def _try_bce_logits_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, out, (weighted_source, 0), (loss, 0), Ops.ADD)))
   return tuple(tasks)
 
+def _try_bce_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize the bounded official BCE graphs without the unstable 27/33-stage mixed chain."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  nodes = store.src[1].toposort()
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
+  input_slots = {u.src[0].buf_uop.arg.slot for u in indexes}
+  if len(input_slots) not in (2, 3): return None
+  counts = (sum(u.op is Ops.LOG2 for u in nodes), sum(u.op is Ops.EXP2 for u in nodes),
+            sum(u.op is Ops.RECIPROCAL for u in nodes), sum(u.op is Ops.MAX for u in nodes),
+            sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes))
+  if counts not in ((2,1,1,0,2,2), (2,4,0,2,2,2)): return None
+  allowed = {Ops.REDUCE, Ops.LOG2, Ops.EXP2, Ops.RECIPROCAL, Ops.MAX, Ops.WHERE, Ops.CMPLT,
+             Ops.CAST, Ops.ADD, Ops.MUL, Ops.FDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  if len(reductions) > 1 or reductions and (reductions[0].arg[0] is not Ops.ADD or reductions[0].dtype is not dtypes.float or
+     any(axis.src[0].op is not Ops.CONST for axis in reductions[0].src[1:])): return None
+  ranges = [u for u in nodes if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
+  range_extents = {u.arg[0]:int(u.src[0].arg) for u in ranges}
+  input_total = max(prod(_shape_of_store(sink)), prod(range_extents.values()))
+  if not 1 <= input_total <= 4096: return None
+
+  if counts == (2,1,1,0,2,2):
+    sigmoid = next((u for u in nodes if u.op is Ops.RECIPROCAL and _try_sigmoid(u) is not None), None)
+    if sigmoid is None or (source_slot := _try_sigmoid(sigmoid)) is None: return None
+    variant = 0
+  else:
+    source = next((u for u in indexes if any(v.op is Ops.MAX and u in v.toposort() for v in nodes)), None)
+    if source is None: return None
+    source_slot, variant = source.src[0].buf_uop.arg.slot, 1
+  clipped_targets = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot and
+                     any(v.op is Ops.WHERE and u in v.toposort() for v in nodes)}
+  target_slots = clipped_targets if len(input_slots) == 3 else input_slots-{source_slot}
+  if len(target_slots) != 1: return None
+  target_slot = next(iter(target_slots))
+  pos_slots = input_slots-{source_slot, target_slot}
+  if len(pos_slots) > 1: return None
+  pos_total = 0
+  if pos_slots:
+    variant = 2
+    pos_slot = next(iter(pos_slots))
+    pos_index = next((u for u in indexes if u.src[0].buf_uop.arg.slot == pos_slot), None)
+    aff = None if pos_index is None else _affine_index(pos_index.src[1])
+    if aff is None or any(axis not in range_extents for axis in aff[0]): return None
+    pos_total = aff[1]+sum((range_extents[axis]-1)*stride for axis, stride in aff[0].items())+1
+    if not 1 <= pos_total <= input_total or input_total % pos_total: return None
+  reduction_code = 0 if not reductions else 1 if _unwrap(store.src[1]) is reductions[0] else 2
+  out_slot = ProgramInfo.from_sink(sink).outs[0]
+  layout = (prod(_shape_of_store(sink)), _HOST_BCE_LAYOUT, variant, reduction_code, input_total, pos_total)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, target_slot, *pos_slots))
+  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+
 def _try_bce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower unreduced BCE(sigmoid(x), clip(y, 0, 1)) through endpoint-loss LUTs.
 
@@ -14034,6 +14089,7 @@ def build_native_program(sink: UOp) -> UOp|None:
   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
+  if (bce_host_tasks := _try_bce_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_host_tasks)
   if (bce_logits_tasks := _try_bce_logits_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_logits_tasks)
   if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)

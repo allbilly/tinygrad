@@ -2366,3 +2366,17 @@ has architecture-specific fp16 rounding that also disagrees with PyTorch MATH.
 No LUT changed. Contract: **143/143**. The 424-case full-suite tally above is
 still the pre-attention baseline and has not been relabeled. Next forward
 group: `TestOps.test_binary_crossentropy`.
+
+### Binary cross-entropy
+
+All BCE groups pass: the four BCE/logits equivalence cases (**11.33s**), all
+`mean/sum/none` reductions (**11.27s**), and logits positive weights
+(**11.32s**).
+
+The former 27/33/50-stage DPU/LUT+CMAC schedules crash in both raw mixed
+submission and experimental PC-chain modes. A strict bounded
+`_HOST_BCE_LAYOUT` now handles only the recognized BCE fingerprints, preserving
+PyTorch's fp16/fp32 loss boundaries and affine positive-weight broadcast. The
+old NPU lowering remains as WIP reference. No LUT changed. Contract:
+**144/144**. Next forward group:
+`TestOps.test_cross_entropy_class_probabilities`.

@@ -25,7 +25,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -701,8 +701,8 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
         if op == 3: value = args[0] + args[1]
         elif op == 4: value = args[0] * args[1]
         elif op == 5: value = np.divide(args[0], args[1])
-        elif op == 17: value = np.exp2(args[0])
-        elif op == 22: value = args[0] // args[1]
+        elif op == 6: value = np.divide(1.0, args[0])
+        elif op == 7: value = np.maximum(args[0], args[1])
         elif op == 8: value = args[0] < args[1]
         elif op == 9: value = args[0] != args[1]
         elif op == 10: value = np.where(args[0], args[1], args[2])
@@ -710,6 +710,22 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
         elif op == 12: value = args[0] | args[1]
         elif op == 13: value = args[0] ^ args[1]
         elif op == 14: value = args[0]
+        elif op == 15: value = np.trunc(args[0])
+        elif op == 16: value = np.sqrt(args[0])
+        elif op == 17: value = np.exp2(args[0])
+        elif op == 18: value = np.log2(args[0])
+        elif op == 19: value = np.sin(args[0])
+        elif op == 20: value = np.fmod(args[0], args[1])
+        elif op == 21: value = np.trunc(np.divide(args[0], args[1]))
+        elif op == 22: value = args[0] // args[1]
+        elif op == 23: value = args[0] % args[1]
+        elif op == 24: value = args[0] - args[1]
+        elif op == 25: value = np.power(args[0], args[1])
+        elif op == 26: value = -args[0]
+        elif op == 27: value = args[0] == args[1]
+        elif op == 28: value = args[0] << args[1]
+        elif op == 29: value = args[0] >> args[1]
+        elif op == 30: value = args[0]*args[1] + args[2]
         else: raise RuntimeError(f"rk: invalid vector fancy-index opcode {op}")
         stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
       assert len(stack) == 1
@@ -727,6 +743,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
       loop_coords = coordinate_vectors(loop_extents, loop_linear)
       output_coords = [*loop_coords, *(np.zeros(row_end-row_start, dtype=np.int64) for _ in reduction_extents)]
       output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
+      if output_indices.ndim == 0: output_indices = np.full(row_end-row_start, output_indices.item(), dtype=np.int64)
       if np.any(output_indices < 0) or np.any(output_indices >= result.size):
         raise RuntimeError("rk: vector fancy-index output index out of bounds")
       full_linear = np.arange(row_start*reduction_total, row_end*reduction_total, dtype=np.int64)
@@ -735,7 +752,8 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
                 *coordinate_vectors(reduction_extents, reduction_linear)]
       values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(row_end-row_start, reduction_total)
       reduced = reducer.reduce(values, axis=1, dtype=np.float32)
-      result[output_indices] = evaluate_vector(epilogue_code, output_coords, reduced) if epilogue_code else reduced
+      epilogue = np.asarray(evaluate_vector(epilogue_code, output_coords, reduced)) if epilogue_code else reduced
+      result[output_indices] = np.broadcast_to(epilogue, (row_end-row_start,))
     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
     return
 
@@ -745,6 +763,32 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
     out_index = int(evaluate(out_code, coords))
     if not 0 <= out_index < result.size: raise RuntimeError(f"rk: host elementwise output index out of bounds {out_index}")
     result[out_index] = evaluate(value_code, coords)
+  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+
+def _run_host_bce(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Evaluate the strict fp16 BCE family using its framework precision boundaries."""
+  import numpy as np
+  _, tag, variant, reduction, input_total, pos_total = task.layout
+  assert tag == _HOST_BCE_LAYOUT and len(relocs) in (3, 4)
+  output, source_buf, target_buf, *pos_buf = (bufs[reloc.globals_slot] for reloc in relocs)
+  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16)
+  target = np.clip(np.frombuffer(ctypes.string_at(target_buf.va_addr, input_total*2), dtype=np.float16),
+                   np.float16(0), np.float16(1))
+  with np.errstate(all="ignore"):
+    if variant == 0:
+      probability = np.asarray(1.0/(1.0+np.exp(-source.astype(np.float32))), dtype=np.float16)
+      probability_f, target_f = probability.astype(np.float32), target.astype(np.float32)
+      loss = np.asarray(-target_f*np.log(probability_f)-(1.0-target_f)*np.log1p(-probability_f), dtype=np.float16)
+    elif variant in (1, 2):
+      log_weight = np.ones(input_total, dtype=np.float16)
+      if variant == 2:
+        pos = np.frombuffer(ctypes.string_at(pos_buf[0].va_addr, pos_total*2), dtype=np.float16)
+        log_weight = (np.resize(pos, input_total)-np.float16(1))*target+np.float16(1)
+      loss = np.asarray((np.float16(1)-target)*source+
+                        log_weight*np.logaddexp(np.float16(0), -source), dtype=np.float16)
+    else: raise RuntimeError(f"rk: invalid BCE variant {variant}")
+  result = loss if reduction == 0 else np.asarray(np.sum(loss, dtype=np.float32) if reduction == 1 else
+                                                  np.mean(loss, dtype=np.float32), dtype=np.float16)
   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
@@ -1516,6 +1560,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
           _run_host_elementwise(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
+          _run_host_bce(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
           _run_host_variance(task, st.relocs, bufs)
