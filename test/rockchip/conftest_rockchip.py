@@ -27,6 +27,14 @@ torch.backends.cuda.enable_flash_sdp(False)
 import pytest
 from tinygrad import dtypes
 
+def pytest_collection_modifyitems(items):
+  """Exclude the two manual backward-only methods from the forward contract."""
+  if os.environ.get("FORWARD_ONLY") != "1": return
+  backward_only = {"test_cmp_ne_backwards", "test_cmp_lt_backwards"}
+  for item in items:
+    if item.path.name == "test_ops.py" and item.name in backward_only:
+      item.add_marker(pytest.mark.skip(reason="ROCKCHIP forward-only contract excludes manual gradient tests"))
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
