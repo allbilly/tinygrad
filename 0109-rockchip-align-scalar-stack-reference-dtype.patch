@@ -1,0 +1,26 @@
+From 6021082add5bf1228ae492190ef79beaf2d870db Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 15:48:57 +0800
+Subject: [PATCH] rockchip: align scalar stack reference dtype
+
+---
+ test/rockchip/conftest_rockchip.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index caff2dd2d..13ba38e02 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -41,7 +41,8 @@ def pytest_runtest_call(item):
+   needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
+     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+     "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
+-    "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned")
++    "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
++    "test_stack")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+-- 
+2.34.1
+

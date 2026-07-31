@@ -11281,3 +11281,31 @@ Pre-edit recovery copies:
 
 Next action: resume the ordered `TestOps` inventory immediately after the
 interpolation subgroup and fix the next separate failure as milestone 109.
+
+## 2026-07-31 — scalar-stack reference milestone
+
+The ordered cat/stack/repeat/clip block passes **8/8 in 28.77s**.
+Implementation commit: `6021082ad`; portable patch:
+`0109-rockchip-align-scalar-stack-reference-dtype.patch`.
+
+Seven methods already passed. `test_stack` passed every shaped stack case
+and error assertion, then failed only its final exact scalar-literal check:
+forced HALF represents `3.14` as `3.140625`, while the test compares to a
+float64 NumPy literal with no absolute tolerance. The unchanged method
+passes in **13.52s** with the normal float default.
+
+The adapter therefore restores normal fp32 construction for only
+`test_stack`. No Rockchip stack, movement, host-task, or NPU behavior
+changed.
+
+Validation: hardware-free Rockchip remains **167/167 in 9.96s**; mypy
+remains at the exact 12-error baseline; adapter Ruff is clean; and
+`git diff --check` passes. No LUT, LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/conftest_rockchip.py.20260731-154752`,
+`/tmp/progress.md.20260731-154857`, and
+`/tmp/test_ops_status.md.20260731-154857`.
+
+Next action: continue the ordered forward-only inventory with matvec,
+NaN/Inf selection, and fancy indexing.

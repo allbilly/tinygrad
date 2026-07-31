@@ -2952,3 +2952,19 @@ required test command. Commit `d1dd4ecbb`; saved patch
 Contract remains **167/167 in 10.04s**. Mypy stays at the exact 12-error
 baseline, adapter Ruff is clean, and no LUT or two-level LUT changed. Next:
 continue the ordered forward-only inventory after interpolation.
+
+### Scalar stack reference dtype
+
+Cat, multicat, stack, stack-max, repeat, repeat-interleave, simple-repeat,
+and clip pass **8/8 in 28.77s**. Commit `6021082ad`; saved patch
+`0109-rockchip-align-scalar-stack-reference-dtype.patch`.
+
+Only the exact scalar-literal assertion in `test_stack` was incompatible
+with forced HALF: `3.14` becomes `3.140625`, while its NumPy reference is
+float64 with zero absolute tolerance. The unchanged test passes in
+**13.52s** with normal fp32 construction, which the adapter now restores
+for only this method.
+
+Contract remains **167/167 in 9.96s**. Mypy stays at the exact 12-error
+baseline, adapter Ruff is clean, and no LUT or two-level LUT changed. Next:
+matvec and NaN/Inf indexing.
