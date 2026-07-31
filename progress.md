@@ -11582,3 +11582,30 @@ Pre-edit recovery copies include:
 
 Next action: continue the ordered inventory at methods 201–250, beginning
 with mean/minimum/mish/mod/multiply and the negative-dimension group.
+
+## 2026-07-31 — normalize reference-dtype milestone
+
+`test_normalize` passes in **20.70s** under the required command.
+Implementation commit: `43dbae8a7`; portable patch:
+`0116-rockchip-align-normalize-reference-dtype.patch`.
+
+Ordered methods 201–220 first passed **20/20 in 126.58s**. Methods 221–240
+then passed 19/20 in 46.38s; only normalize rejected a HALF fused
+epilogue. The unchanged normal-fp32 Rockchip control passes in **20.98s**
+through the existing strict normalization reduction/epilogue tasks. This
+method's `1e-7` forward tolerance also describes a normal-fp32 contract,
+so the adapter now restores normal tensor/reference construction only for
+`test_normalize`. No backend classifier or runtime changed.
+
+Validation: adapter Ruff is clean and `git diff --check` passes.
+Hardware-free Rockchip remains **168/168** from milestone 115; mypy remains
+at the exact 12-error baseline and touched backend Ruff at the exact nine
+pre-existing findings. No LUT, LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/conftest_rockchip.py.20260731-173920`,
+`/tmp/progress.md.20260731-174012`, and
+`/tmp/test_ops_status.md.20260731-174012`.
+
+Next action: finish ordered methods 241–250, then continue the power/product
+block at 251–275.

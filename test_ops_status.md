@@ -3086,3 +3086,17 @@ buffers. Returned indices, unpool, infinity/NaN unpool, and `maximum` pass
 **4/4 in 58.27s**. Contract remains **168/168 in 10.39s**; mypy and
 touched-file Ruff remain at their 12- and 9-finding baselines. No LUT or
 two-level LUT changed. Next: ordered methods 201–250.
+
+### Normalize reference dtype
+
+Methods 201–220 pass **20/20 in 126.58s**; methods 221–240 pass 19/20
+before this fix. `test_normalize` now passes in **20.70s**. Commit
+`43dbae8a7`; saved patch
+`0116-rockchip-align-normalize-reference-dtype.patch`.
+
+Forced HALF rejected its fused epilogue, while unchanged normal-fp32
+Rockchip passes in **20.98s** through the existing strict normalization
+tasks and matches the method's `1e-7` contract. Only this named method
+restores normal construction. Backend code and the **168/168** PR1
+contract are unchanged; adapter Ruff is clean. No LUT or two-level LUT
+changed. Next: methods 241–250, then the power/product block.

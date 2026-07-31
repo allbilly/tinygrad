@@ -1,0 +1,26 @@
+From 43dbae8a71fe0c0a5710c46c4ce724fecf27b960 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 17:40:01 +0800
+Subject: [PATCH] rockchip: align normalize reference dtype
+
+---
+ test/rockchip/conftest_rockchip.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 31b3ce1fa..3fb499323 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -44,7 +44,8 @@ def pytest_runtest_call(item):
+     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
+     "test_isclose", "test_linspace", "test_log", "test_log_softmax", "test_log_softmax_other_axis",
+     "test_logaddexp", "test_logcumsumexp", "test_logcumsumexp_numerical", "test_logsumexp",
+-    "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors", "test_scatter_reduce_prod_zeros", "test_stack")
++    "test_normalize", "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
++    "test_scatter_reduce_prod_zeros", "test_stack")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+-- 
+2.34.1
+
