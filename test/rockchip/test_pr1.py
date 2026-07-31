@@ -349,9 +349,24 @@ class TestClassifier(unittest.TestCase):
       index_subtasks = index_program.src[1].src[0].arg
       self.assertEqual(len(index_subtasks), 1)
       self.assertEqual(index_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
-      self.assertEqual(index_subtasks[0].task.layout[4] == 10, kind == "min")
-      mapping_offset = 5 if kind == "min" else 4
-      self.assertEqual(index_subtasks[0].task.layout[mapping_offset+20:mapping_offset+25], (4, 3, 2, 1, 0))
+      self.assertEqual(index_subtasks[0].task.layout[4], 18 if kind == "min" else 14)
+      encoded = index_subtasks[0].task.layout[5+20:5+25]
+      self.assertEqual(tuple(value // 5 for value in encoded), (4, 3, 2, 1, 0))
+      self.assertEqual(tuple(value % 5 for value in encoded), (4, 3, 2, 1, 0))
+
+      matrix_source = Tensor.empty(5,6, dtype=dtypes.half, device="ROCKCHIP")
+      matrix_indices = (matrix_source.cummax(0) if kind == "max" else matrix_source.cummin(0))[1]
+      matrix_sinks = [early_simplify(call.src[0]) for call in matrix_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+      matrix_program = build_native_program(matrix_sinks[-1])
+      self.assertIsNotNone(matrix_program)
+      matrix_subtasks = matrix_program.src[1].src[0].arg
+      self.assertEqual(len(matrix_subtasks), 1)
+      self.assertEqual(matrix_subtasks[0].task.layout[4], 18 if kind == "min" else 14)
+      encoded = matrix_subtasks[0].task.layout[5+120:5+125]
+      self.assertEqual(tuple(value // 30 for value in encoded), (4, 3, 2, 1, 0))
+      addresses = tuple(value % 30 for value in encoded)
+      self.assertEqual(tuple(addresses[i]-addresses[i+1] for i in range(4)), (6, 6, 6, 6))
+      self.assertEqual(len({address % 6 for address in addresses}), 1)
 
       long_source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
       long_indices = (long_source.cummax(0) if kind == "max" else long_source.cummin(0))[1]

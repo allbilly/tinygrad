@@ -11935,7 +11935,10 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
         # candidates beyond the current reduction-axis coordinate.
         # if source_index is not Invalid: mapping[out_index*window+reduce_linear] = int(source_index)
         if source_index is not Invalid and (not cumulative_index or reduce_linear <= out_index % window):
-          mapping[out_index*window+reduce_linear] = int(source_index)
+          address = int(source_index)
+          # Cumulative extrema return the reduction-axis coordinate, not the
+          # flattened source address. Pack both into one signed-layout word.
+          mapping[out_index*window+reduce_linear] = reduce_linear*input_total+address if cumulative_index else address
   except (TypeError, ValueError, OverflowError, ZeroDivisionError): return None
 
   info = ProgramInfo.from_sink(sink)
@@ -11950,9 +11953,10 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     host_mapping = [
       address for output in range(total)
       for address in sorted(mapping[output*window:(output+1)*window],
-                            key=lambda value: (value < 0, -(value % input_spatial) if cumulative_index and value >= 0
+                            key=lambda value: (value < 0, -(value // input_total) if cumulative_index and value >= 0
                                                else value % input_spatial if value >= 0 else 0))]
-    dtype_marker = (10,) if negated_data and data.dtype is dtypes.half else (8,) if data.dtype is dtypes.int else ()
+    dtype_marker = (18,) if cumulative_index and negated_data else (14,) if cumulative_index else \
+      (10,) if negated_data and data.dtype is dtypes.half else (8,) if data.dtype is dtypes.int else ()
     layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *dtype_marker, *host_mapping)
     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))

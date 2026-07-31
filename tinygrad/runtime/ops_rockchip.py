@@ -1288,7 +1288,8 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
   total, tag, window, input_spatial, *payload = task.layout
   dtype_marker = payload[0] if len(payload) == total*window+1 else 2
   itemsize = 4 if dtype_marker in (4, 8) else 2
-  negated = dtype_marker == 10
+  negated = dtype_marker in (10, 18)
+  cumulative = dtype_marker in (14, 18)
   if window == 0:
     assert tag == _HOST_ARGMAX_LAYOUT and total == input_spatial and dtype_marker in (2, 10) and len(relocs) == 2
     output_buf, data_buf = (bufs[r.globals_slot] for r in relocs)
@@ -1314,19 +1315,22 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
     if itemsize == 4:
       selected_value = None
       for candidate in candidates:
-        if candidate < 0 or candidate >= data.size: continue
-        value = data[candidate]
+        address = candidate % data.size if cumulative and candidate >= 0 else candidate
+        if address < 0 or address >= data.size: continue
+        value = data[address]
         if np.isnan(value):
-          selected = candidate % input_spatial
+          selected = candidate // data.size if cumulative else address % input_spatial
           break
         if selected_value is None or value > selected_value:
-          selected_value, selected = value, candidate % input_spatial
+          selected_value = value
+          selected = candidate // data.size if cumulative else address % input_spatial
     else:
       for candidate in candidates:
-        if candidate < 0 or candidate >= data.size: continue
-        value = -data[candidate] if negated else data[candidate]
+        address = candidate % data.size if cumulative and candidate >= 0 else candidate
+        if address < 0 or address >= data.size: continue
+        value = -data[address] if negated else data[address]
         if value == maximum[out_index] or (np.isnan(value) and np.isnan(maximum[out_index])):
-          selected = candidate % input_spatial
+          selected = candidate // data.size if cumulative else address % input_spatial
           break
     output[out_index] = selected
   ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
