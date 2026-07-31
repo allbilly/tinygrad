@@ -10667,3 +10667,24 @@ Hardware-free Rockchip is **157/157 in 9.84s**. Mypy remains at the exact
 findings. No LUT or two-level LUT changed. Next: skip/defer the two explicitly
 gradient-only `*_backwards` methods under `FORWARD_ONLY=1`, then retally the
 remaining forward failures.
+
+## 2026-07-31 — explicit forward-only gradient boundary
+
+Under `FORWARD_ONLY=1`, the Rockchip test adapter now skips exactly
+`test_cmp_ne_backwards` and `test_cmp_lt_backwards`. Both methods manually
+invoke `.backward()` and contain no forward assertion; their previous
+`Ops.WHERE` rejects therefore were not forward backend failures. Commit:
+`e4f139b98`; portable patch:
+`0094-rockchip-forward-only-gradient-skip.patch`.
+
+The audit found one other gradient-named method,
+`test_round_quantization_gradient`, but it uses the shared helper: with
+`FORWARD_ONLY=1` the helper still checks its forward result and suppresses
+only backward execution. It is deliberately not skipped and currently
+reveals the next genuine forward gap,
+`RKPLAN_REJECT:unsupported_op:non_index_operand`.
+
+The exact three-node audit reports two skips and one active failure.
+Hardware-free Rockchip remains **157/157 in 9.09s** and the adapter passes
+Ruff. No backend or LUT changed. Next group:
+`TestOps.test_round_quantization_gradient`.

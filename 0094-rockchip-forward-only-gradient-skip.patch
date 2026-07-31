@@ -1,0 +1,31 @@
+From e4f139b9855f484111fbdfe0f78c6dd04af81ace Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 13:35:22 +0800
+Subject: [PATCH] test: exclude gradients from rockchip forward suite
+
+---
+ test/rockchip/conftest_rockchip.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 6dd536180..d65015ef2 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -27,6 +27,14 @@ torch.backends.cuda.enable_flash_sdp(False)
+ import pytest
+ from tinygrad import dtypes
+ 
++def pytest_collection_modifyitems(items):
++  """Exclude the two manual backward-only methods from the forward contract."""
++  if os.environ.get("FORWARD_ONLY") != "1": return
++  backward_only = {"test_cmp_ne_backwards", "test_cmp_lt_backwards"}
++  for item in items:
++    if item.path.name == "test_ops.py" and item.name in backward_only:
++      item.add_marker(pytest.mark.skip(reason="ROCKCHIP forward-only contract excludes manual gradient tests"))
++
+ @pytest.hookimpl(hookwrapper=True)
+ def pytest_runtest_call(item):
+   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
+-- 
+2.34.1
+

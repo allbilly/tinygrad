@@ -2672,3 +2672,17 @@ typed task.
 Contract: **157/157 in 9.84s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. No LUT changed. Gradient-only backwards tests
 remain deferred under `FORWARD_ONLY=1`; next action is a forward retally.
+
+### Forward-only gradient boundary
+
+The two methods that contain only manual `.backward()` calls,
+`test_cmp_ne_backwards` and `test_cmp_lt_backwards`, are now explicitly
+skipped only when `FORWARD_ONLY=1`. Commit `e4f139b98`; saved patch
+`0094-rockchip-forward-only-gradient-skip.patch`.
+
+`test_round_quantization_gradient` is not skipped: its helper retains a real
+forward assertion and only suppresses gradient execution. It currently
+fails forward with `non_index_operand` and is the next group.
+
+Contract remains **157/157 in 9.09s** and adapter Ruff passes. No LUT or
+backend code changed.
