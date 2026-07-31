@@ -3519,3 +3519,13 @@ QuickGELU normal/extreme pass **8/8 in 20.34s** on forward-only RK3588. PR1
 passes **173/173 in 12.90s**. Mypy improves from 12 to **9 known errors**;
 Ruff remains at eight findings. The support file is now **11,007 counted
 lines**.
+
+### Generic WHERE selector
+
+Commit `a065fb40a`; saved patch
+`0156-rockchip-share-where-arm-selection-lowering.patch`.
+
+Representative forward-only RK3588 WHERE coverage passes **6/6 in 15.47s**:
+plain/permuted WHERE, maximum, minimum, clip, and infinity arms. PR1 passes
+**173/173 in 13.43s**; static baselines remain nine mypy errors and eight Ruff
+findings. The support file is now **10,993 counted lines**.

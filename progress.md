@@ -12506,3 +12506,18 @@ This removes **56 counted lines**, reaching **11,553** in
 natural LOG pass **2/2 in 12.01s** on serialized RK3588. Static baselines remain
 exactly 12 mypy errors and eight touched-file Ruff findings; compilation and
 `git diff --check` pass.
+
+### Shared WHERE arm selector
+
+Commit `a065fb40a`; saved patch
+`0156-rockchip-share-where-arm-selection-lowering.patch`.
+
+CMPLT, CMPNE, and two-comparison OR conditions now reuse one generic arm
+selector that preserves duplicate true/false reads, inverse-mask
+materialization, broadcast metadata, and typed final output. Infinity-safe and
+finite-minimum branches remain specialized. This removes **14 counted lines**,
+reaching **10,993** in `support/rockchip.py`.
+
+PR1 passes **173/173 in 13.43s** and six representative RK3588 WHERE/maximum/
+minimum/clip/infinity groups pass **6/6 in 15.47s**. Static baselines remain
+nine mypy errors and eight Ruff findings.
