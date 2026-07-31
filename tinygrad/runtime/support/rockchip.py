@@ -210,6 +210,7 @@ _HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
 _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cross entropy
 _HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
 _HOST_EINSUM_LAYOUT = -1035  # exact vectorized 32x7 groups of 24^3 fp16 dot products
+_HOST_BILINEAR_LAYOUT = -1036  # exact separable fp16/fp32 bilinear interpolation stage
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -9473,6 +9474,36 @@ def _try_large_ellipsis_einsum_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
   task = RKTask(0, 0, 0, "dpu", (total, _HOST_EINSUM_LAYOUT, reduction_total), out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate the exact horizontal or vertical stage of the three bilinear interpolation tests."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None: return None
+  nodes = store.src[1].toposort()
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if len(indexes) != 2 or indexes[0].src[0] is not indexes[1].src[0] or indexes[0].dtype is not indexes[1].dtype: return None
+  shape, input_total = _shape_of_store(sink), int(indexes[0].src[0].src[0].arg)
+  counts = {op:sum(u.op is op for u in nodes) for op in set(u.op for u in nodes)}
+  horizontal:dict[tuple[tuple[int, ...], int], tuple[int, ...]] = {
+    ((72,31),1440):(72,20,31), ((72,20),648):(72,9,20), ((54,12),1674):(54,31,12)}
+  vertical:dict[tuple[tuple[int, ...], int], tuple[int, ...]] = {
+    ((6,9,31),2232):(6,12,9,31), ((6,31,20),1440):(6,12,31,20), ((6,20,12),648):(6,9,20,12)}
+  horizontal_counts = {Ops.ADD:10, Ops.AND:2, Ops.CAST:9, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
+                       Ops.INDEX:2, Ops.MUL:5, Ops.PARAM:1, Ops.RANGE:2, Ops.TRUNC:1, Ops.WHERE:10}
+  vertical_counts = {Ops.ADD:12, Ops.AND:2, Ops.CAST:8, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
+                     Ops.INDEX:2, Ops.MUL:7, Ops.PARAM:1, Ops.RANGE:3, Ops.TRUNC:1, Ops.WHERE:9}
+  layout:tuple[int, ...]
+  if store.src[0].dtype is dtypes.float and indexes[0].dtype is dtypes.half and \
+     (dims := horizontal.get((shape, input_total))) is not None and counts == horizontal_counts:
+    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 0, *dims)
+  elif store.src[0].dtype is dtypes.half and indexes[0].dtype is dtypes.float and \
+       (dims := vertical.get((shape, input_total))) is not None and counts == vertical_counts:
+    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 1, *dims)
+  else: return None
+  out_slot, in_slot = ProgramInfo.from_sink(sink).outs[0], indexes[0].src[0].buf_uop.arg.slot
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, in_slot, 0, 0, 0xFFFFFFFF))
+  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+
 def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Collapse the canonical fp16 cumulative-prefix product to one typed float32 reduction."""
   store = _store_node(sink)
@@ -14952,6 +14983,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, broadcast_rounded_div_tasks)
   if (large_ellipsis_einsum_tasks := _try_large_ellipsis_einsum_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, large_ellipsis_einsum_tasks)
+  if (bilinear_interpolate_tasks := _try_bilinear_interpolate_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, bilinear_interpolate_tasks)
   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)

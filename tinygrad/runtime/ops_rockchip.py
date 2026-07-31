@@ -26,7 +26,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
   _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
-  _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_BILINEAR_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -561,9 +561,38 @@ def _run_host_large_einsum(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...]
   result = np.einsum("ij,ij->i", lhs_values, rhs_values)
   ctypes.memmove(output.va_addr, result.tobytes(), total*2)
 
+def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Evaluate one exact separable bilinear stage with float32 coordinates and arithmetic."""
+  import numpy as np
+  total, tag, stage, *dims = task.layout
+  assert tag == _HOST_BILINEAR_LAYOUT and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  if stage == 0:
+    rows, input_width, output_width = dims
+    horizontal_values = np.frombuffer(ctypes.string_at(source.va_addr, rows*input_width*2),
+                                      dtype=np.float16).reshape(rows, input_width)
+    coordinate = (np.arange(output_width, dtype=np.float32)+np.float32(0.5))*np.float32(input_width/output_width)-np.float32(0.5)
+    lower = np.floor(coordinate).astype(np.int32).clip(0, input_width-1)
+    upper, weight = (lower+1).clip(0, input_width-1), (coordinate-lower).clip(0, 1).astype(np.float32)
+    result = horizontal_values[:,lower].astype(np.float32)*(np.float32(1)-weight) + \
+             horizontal_values[:,upper].astype(np.float32)*weight
+    assert result.size == total
+    ctypes.memmove(output.va_addr, result.tobytes(), total*4)
+  else:
+    planes, input_height, output_height, width = dims
+    vertical_values = np.frombuffer(ctypes.string_at(source.va_addr, planes*input_height*width*4),
+                                    dtype=np.float32).reshape(planes, input_height, width)
+    coordinate = (np.arange(output_height, dtype=np.float32)+np.float32(0.5))*np.float32(input_height/output_height)-np.float32(0.5)
+    lower = np.floor(coordinate).astype(np.int32).clip(0, input_height-1)
+    upper, weight = (lower+1).clip(0, input_height-1), (coordinate-lower).clip(0, 1).astype(np.float32)
+    result = vertical_values[:,lower,:]*(np.float32(1)-weight[None,:,None]) + vertical_values[:,upper,:]*weight[None,:,None]
+    assert result.size == total
+    ctypes.memmove(output.va_addr, result.astype(np.float16).tobytes(), total*2)
+
 def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
   if task.layout[1] == _HOST_EINSUM_LAYOUT: return _run_host_large_einsum(task, relocs, bufs)
+  if task.layout[1] == _HOST_BILINEAR_LAYOUT: return _run_host_bilinear(task, relocs, bufs)
   import numpy as np
   total, tag, out_dtype_code, *layout = task.layout
   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
@@ -1678,7 +1707,8 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
           _run_host_copysign(task, st.relocs, bufs)
           continue
-        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+        if len(task.layout) > 1 and \
+           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
           _run_host_elementwise(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
@@ -1819,7 +1849,8 @@ class RockchipProgram(Program['RockchipDevice']):
             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             elif st.task.is_copy and len(st.task.layout) > 1 and \
-                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
               _run_host_elementwise(st.task, st.relocs, tuple(ext))
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
@@ -1854,7 +1885,8 @@ class RockchipProgram(Program['RockchipDevice']):
             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             continue
           if st.task.is_copy and len(st.task.layout) > 1 and \
-             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
             _run_host_elementwise(st.task, st.relocs, tuple(ext))
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
@@ -2108,7 +2140,8 @@ class RockchipProgram(Program['RockchipDevice']):
           if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
             _run_host_copysign(task, st.relocs, tuple(ext))
             continue
-          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
+          if len(task.layout) > 1 and \
+             task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
             _run_host_elementwise(task, st.relocs, tuple(ext))
             continue
           ct = task.layout[0]
