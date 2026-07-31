@@ -1,0 +1,268 @@
+From f55e39c3bbd496a4ed4458ae3bfdbeda78a7f917 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 02:19:30 +0800
+Subject: [PATCH] rockchip: compose atan detail task graphs
+
+---
+ tinygrad/runtime/support/rockchip.py | 239 ++++++++++-----------------
+ 1 file changed, 89 insertions(+), 150 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 8d815074d..7d0580e18 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -3903,75 +3903,51 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (source := _try_atan(store.src[1])) is None: return None
+   graph = _TaskGraph(sink, store, source)
+-  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
+-  add_lut = graph.emit_named_lut
+-
++  out = graph.out
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+-  neg_source, abs_source = alloc(), alloc()
+-  negative_diff, negative_scratch, negative, nonnegative = (alloc() for _ in range(4))
+-  large_diff, large_scratch, large, small = (alloc() for _ in range(4))
+-  safe_denominator, inverse, small_input, large_input, transformed = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
+-                _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, nonnegative, one, (negative, 0), Ops.SUB),
+-                _emit_where_stage(total, large_diff, (abs_source, 0), one, Ops.SUB),
+-                _emit_where_stage(total, large_scratch, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, large, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, small, one, (large, 0), Ops.SUB),
+-                # Adding one only to the unused |x|<=1 denominator avoids 1/0
+-                # and therefore avoids contaminating the selected identity lane.
+-                _emit_where_stage(total, safe_denominator, (abs_source, 0), (small, 0), Ops.ADD),
+-                _emit_where_stage(total, inverse, one, (safe_denominator, 0), Ops.FDIV),
+-                _emit_where_stage(total, small_input, (abs_source, 0), (small, 0), Ops.MUL),
+-                _emit_where_stage(total, large_input, (inverse, 0), (large, 0), Ops.MUL),
+-                _emit_where_stage(total, transformed, (small_input, 0), (large_input, 0), Ops.ADD)))
+-
+-  near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
+-  local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, near_diff, (transformed, 0), _float_arg(.04), Ops.SUB),
+-                _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_diff, (transformed, 0), _float_arg(.125), Ops.SUB),
+-                _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB)))
+-
+-  negative_transformed, amplified_negative, local_small, local_coordinate = (alloc() for _ in range(4))
+-  large_coordinate, detail_input = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, negative_transformed, zero, (transformed, 0), Ops.SUB),
+-                _emit_where_stage(total, amplified_negative, (negative_transformed, 0), _float_arg(4), Ops.MUL),
+-                _emit_where_stage(total, local_small, (local_inside, 0), (small, 0), Ops.MUL),
+-                _emit_where_stage(total, local_coordinate, (amplified_negative, 0), (local_small, 0), Ops.MUL),
+-                _emit_where_stage(total, large_coordinate, (transformed, 0), (large, 0), Ops.MUL),
+-                _emit_where_stage(total, detail_input, (local_coordinate, 0), (large_coordinate, 0), Ops.ADD)))
+-  broad_slot, local_slot = alloc(), alloc()
+-  if not add_lut("rk_atan", transformed, broad_slot) or not add_lut("rk_atan_local", detail_input, local_slot): return None
+-  broad_region, local_region, near_region = alloc(), alloc(), alloc()
+-  broad_selected, local_scaled, local_selected, near_selected = (alloc() for _ in range(4))
+-  large_scaled, large_selected, partial, base_partial, magnitude = (alloc() for _ in range(5))
+-  negative_magnitude, positive_selected, negative_selected = (alloc() for _ in range(3))
+-  tasks.extend((_emit_where_stage(total, broad_region, (local_outside, 0), (small, 0), Ops.MUL),
+-                _emit_where_stage(total, local_region, (local_mask, 0), (small, 0), Ops.MUL),
+-                _emit_where_stage(total, near_region, (near_inside, 0), (small, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (broad_slot, 0), (broad_region, 0), Ops.MUL),
+-                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(.25), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_region, 0), Ops.MUL),
+-                _emit_where_stage(total, near_selected, (transformed, 0), (near_region, 0), Ops.MUL),
+-                _emit_where_stage(total, large_scaled, (local_slot, 0), _float_arg(2), Ops.MUL),
+-                _emit_where_stage(total, large_selected, (large_scaled, 0), (large, 0), Ops.MUL),
+-                _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, base_partial, (partial, 0), (near_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, magnitude, (base_partial, 0), (large_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, negative_magnitude, zero, (magnitude, 0), Ops.SUB),
+-                _emit_where_stage(total, positive_selected, (magnitude, 0), (nonnegative, 0), Ops.MUL),
+-                _emit_where_stage(total, negative_selected, (negative_magnitude, 0), (negative, 0), Ops.MUL),
+-                _emit_where_stage(total, out, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
+-  return tuple(tasks)
++  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
++  negative = graph.positive_mask(zero, source_arg, repeat=True)
++  nonnegative = graph.op(one, negative, Ops.SUB, repeat=False)
++  large = graph.positive_mask(abs_source, one, repeat=True)
++  small = graph.op(one, large, Ops.SUB, repeat=False)
++  # Adding one only to the unused |x|<=1 denominator avoids 1/0.
++  safe_denominator = graph.op(abs_source, small, Ops.ADD, repeat=False)
++  inverse = graph.op(one, safe_denominator, Ops.FDIV, repeat=False)
++  small_input = graph.op(abs_source, small, Ops.MUL, repeat=False)
++  large_input = graph.op(inverse, large, Ops.MUL, repeat=False)
++  transformed = graph.op(small_input, large_input, Ops.ADD, repeat=False)
++
++  near_outside = graph.positive_mask(transformed, _float_arg(.04), repeat=True)
++  near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++  local_outside = graph.positive_mask(transformed, _float_arg(.125), repeat=True)
++  local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++  local_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++  negative_transformed = graph.op(zero, transformed, Ops.SUB, repeat=False)
++  amplified_negative = graph.op(negative_transformed, _float_arg(4), Ops.MUL, repeat=False)
++  local_small = graph.op(local_inside, small, Ops.MUL, repeat=False)
++  local_coordinate = graph.op(amplified_negative, local_small, Ops.MUL, repeat=False)
++  large_coordinate = graph.op(transformed, large, Ops.MUL, repeat=False)
++  detail_input = graph.op(local_coordinate, large_coordinate, Ops.ADD, repeat=False)
++  broad_slot, local_slot = graph.alloc(), graph.alloc()
++  if not graph.emit_named_lut("rk_atan", transformed[0], broad_slot) or \
++     not graph.emit_named_lut("rk_atan_local", detail_input[0], local_slot): return None
++  broad_region = graph.op(local_outside, small, Ops.MUL, repeat=False)
++  local_region = graph.op(local_mask, small, Ops.MUL, repeat=False)
++  near_region = graph.op(near_inside, small, Ops.MUL, repeat=False)
++  broad_selected = graph.op((broad_slot,0), broad_region, Ops.MUL, repeat=False)
++  local_scaled = graph.op((local_slot,0), _float_arg(.25), Ops.MUL, repeat=False)
++  local_selected = graph.op(local_scaled, local_region, Ops.MUL, repeat=False)
++  near_selected = graph.op(transformed, near_region, Ops.MUL, repeat=False)
++  large_scaled = graph.op((local_slot,0), _float_arg(2), Ops.MUL, repeat=False)
++  large_selected = graph.op(large_scaled, large, Ops.MUL, repeat=False)
++  magnitude = graph.op(graph.op(graph.op(broad_selected, local_selected, Ops.ADD, repeat=False), near_selected, Ops.ADD, repeat=False),
++                       large_selected, Ops.ADD, repeat=False)
++  negative_magnitude = graph.op(zero, magnitude, Ops.SUB, repeat=False)
++  positive_selected = graph.op(magnitude, nonnegative, Ops.MUL, repeat=False)
++  negative_selected = graph.op(negative_magnitude, negative, Ops.MUL, repeat=False)
++  graph.op(positive_selected, negative_selected, Ops.ADD, out_slot=out, repeat=False)
++  return tuple(graph.tasks)
+ 
+ def _try_fp32_atanh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Keep exact normal-fp32 atanh out of the half-buffer two-LUT implementation."""
+@@ -3985,89 +3961,52 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (source := _try_atanh(store.src[1])) is None: return None
+   graph = _TaskGraph(sink, store, source)
+-  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
+-  add_lut = graph.emit_named_lut
+-
++  out = graph.out
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+-  neg_source, abs_source, neg_abs, neg_clamped, bounded = (alloc() for _ in range(5))
+-  negative_diff, negative_scratch, negative, nonnegative = (alloc() for _ in range(4))
+-  invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(3))
+-  tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
+-                _emit_where_stage(total, neg_abs, zero, (abs_source, 0), Ops.SUB),
+-                _emit_where_stage(total, neg_clamped, (neg_abs, 0), _float_arg(-1), Ops.MAX),
+-                _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB),
+-                _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, nonnegative, one, (negative, 0), Ops.SUB),
+-                _emit_where_stage(total, invalid_diff, (abs_source, 0), one, Ops.SUB),
+-                _emit_where_stage(total, invalid_scratch, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, invalid, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True)))
+-
+-  endpoint_diff, endpoint_scratch, endpoint = (alloc() for _ in range(3))
+-  endpoint_distance = alloc()
+-  exact_diff, exact_scratch, exact = (alloc() for _ in range(3))
+-  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), _float_arg(.875), Ops.SUB),
+-                _emit_where_stage(total, endpoint_scratch, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, endpoint, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, endpoint_distance, one, (bounded, 0), Ops.SUB),
+-                _emit_where_stage(total, exact_diff, (bounded, 0), _float_arg(.99975), Ops.SUB),
+-                _emit_where_stage(total, exact_scratch, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, exact, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True)))
+-
+-  near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
+-  local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
+-  broad_mask = alloc()
+-  neg_bounded, local_coordinate, endpoint_coordinate, detail_input = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, near_diff, (bounded, 0), _float_arg(.04), Ops.SUB),
+-                _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_diff, (bounded, 0), _float_arg(.125), Ops.SUB),
+-                _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                _emit_where_stage(total, broad_mask, (local_outside, 0), (endpoint, 0), Ops.SUB),
+-                _emit_where_stage(total, neg_bounded, zero, (bounded, 0), Ops.SUB),
+-                _emit_where_stage(total, local_coordinate, (neg_bounded, 0), (local_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, endpoint_coordinate, (endpoint_distance, 0), (endpoint, 0), Ops.MUL),
+-                _emit_where_stage(total, detail_input, (local_coordinate, 0), (endpoint_coordinate, 0), Ops.ADD)))
+-
+-  broad_slot, detail_slot = alloc(), alloc()
+-  if not add_lut("rk_atanh", bounded, broad_slot) or not add_lut("rk_atanh_detail", detail_input, detail_slot): return None
+-  broad_scaled, broad_selected, local_scaled, local_selected = (alloc() for _ in range(4))
+-  endpoint_scaled, endpoint_selected, near_selected = (alloc() for _ in range(3))
+-  partial, finite_partial, magnitude = alloc(), alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), _float_arg(4), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, local_scaled, (detail_slot, 0), _float_arg(.25), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, endpoint_scaled, (detail_slot, 0), _float_arg(8), Ops.MUL),
+-                _emit_where_stage(total, endpoint_selected, (endpoint_scaled, 0), (endpoint, 0), Ops.MUL),
+-                _emit_where_stage(total, near_selected, (bounded, 0), (near_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, finite_partial, (partial, 0), (endpoint_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, magnitude, (finite_partial, 0), (near_selected, 0), Ops.ADD)))
+-
+-  negative_magnitude, positive_selected, negative_selected, signed_finite = (alloc() for _ in range(4))
+-  finite_denom_scratch, finite_denom, infinite_scratch, signed = (alloc() for _ in range(4))
+-  valid_scratch, valid, factor_scratch, factor = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, negative_magnitude, zero, (magnitude, 0), Ops.SUB),
+-                _emit_where_stage(total, positive_selected, (magnitude, 0), (nonnegative, 0), Ops.MUL),
+-                _emit_where_stage(total, negative_selected, (negative_magnitude, 0), (negative, 0), Ops.MUL),
+-                _emit_where_stage(total, signed_finite, (positive_selected, 0), (negative_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, finite_denom_scratch, one, (exact, 0), Ops.SUB),
+-                _emit_where_stage(total, finite_denom, one, (exact, 0), Ops.SUB),
+-                _emit_where_stage(total, infinite_scratch, (signed_finite, 0), (finite_denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, signed, (signed_finite, 0), (finite_denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, valid_scratch, one, (invalid, 0), Ops.SUB),
+-                _emit_where_stage(total, valid, one, (invalid, 0), Ops.SUB),
+-                _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
+-                _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
+-                _emit_where_stage(total, out, (signed, 0), (factor, 0), Ops.MUL)))
+-  return tuple(tasks)
++  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
++  neg_abs = graph.op(zero, abs_source, Ops.SUB, repeat=False)
++  neg_clamped = graph.op(neg_abs, _float_arg(-1), Ops.MAX, repeat=False)
++  bounded = graph.op(zero, neg_clamped, Ops.SUB, repeat=False)
++  negative = graph.positive_mask(zero, source_arg, repeat=True)
++  nonnegative = graph.op(one, negative, Ops.SUB, repeat=False)
++  invalid = graph.positive_mask(abs_source, one, repeat=True)
++  endpoint = graph.positive_mask(bounded, _float_arg(.875), repeat=True)
++  endpoint_distance = graph.op(one, bounded, Ops.SUB, repeat=False)
++  exact = graph.positive_mask(bounded, _float_arg(.99975), repeat=True)
++  near_outside = graph.positive_mask(bounded, _float_arg(.04), repeat=True)
++  near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++  local_outside = graph.positive_mask(bounded, _float_arg(.125), repeat=True)
++  local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++  local_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++  broad_mask = graph.op(local_outside, endpoint, Ops.SUB, repeat=False)
++  neg_bounded = graph.op(zero, bounded, Ops.SUB, repeat=False)
++  local_coordinate = graph.op(neg_bounded, local_inside, Ops.MUL, repeat=False)
++  endpoint_coordinate = graph.op(endpoint_distance, endpoint, Ops.MUL, repeat=False)
++  detail_input = graph.op(local_coordinate, endpoint_coordinate, Ops.ADD, repeat=False)
++
++  broad_slot, detail_slot = graph.alloc(), graph.alloc()
++  if not graph.emit_named_lut("rk_atanh", bounded[0], broad_slot) or \
++     not graph.emit_named_lut("rk_atanh_detail", detail_input[0], detail_slot): return None
++  broad_scaled = graph.op((broad_slot,0), _float_arg(4), Ops.MUL, repeat=False)
++  broad_selected = graph.op(broad_scaled, broad_mask, Ops.MUL, repeat=False)
++  local_scaled = graph.op((detail_slot,0), _float_arg(.25), Ops.MUL, repeat=False)
++  local_selected = graph.op(local_scaled, local_mask, Ops.MUL, repeat=False)
++  endpoint_scaled = graph.op((detail_slot,0), _float_arg(8), Ops.MUL, repeat=False)
++  endpoint_selected = graph.op(endpoint_scaled, endpoint, Ops.MUL, repeat=False)
++  near_selected = graph.op(bounded, near_inside, Ops.MUL, repeat=False)
++  magnitude = graph.op(graph.op(graph.op(broad_selected, local_selected, Ops.ADD, repeat=False), endpoint_selected, Ops.ADD, repeat=False),
++                       near_selected, Ops.ADD, repeat=False)
++  negative_magnitude = graph.op(zero, magnitude, Ops.SUB, repeat=False)
++  positive_selected = graph.op(magnitude, nonnegative, Ops.MUL, repeat=False)
++  negative_selected = graph.op(negative_magnitude, negative, Ops.MUL, repeat=False)
++  signed_finite = graph.op(positive_selected, negative_selected, Ops.ADD, repeat=False)
++  finite_denom = graph.op(one, exact, Ops.SUB)
++  signed = graph.op(signed_finite, finite_denom, Ops.FDIV)
++  valid = graph.op(one, invalid, Ops.SUB)
++  factor = graph.op(valid, valid, Ops.FDIV)
++  graph.op(signed, factor, Ops.MUL, out_slot=out, repeat=False)
++  return tuple(graph.tasks)
+ 
+ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two physical-table tasks cover core/detail, middle, and finite large ranges."""

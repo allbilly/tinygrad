@@ -7774,6 +7774,18 @@ removes **74 counted lines**, reaching **11,938**.
 PR1 passes **173/173 in 13.28s** and ERF passes **1/1 in 10.23s** on RK3588.
 Mypy/Ruff remain at 12/8.
 
+### Declarative ATAN/ATANH detail graphs
+
+Commit `f55e39c3b`; patch
+`0146-rockchip-compose-atan-detail-task-graphs.patch`.
+
+ATAN reciprocal folding and ATANH endpoint/detail handling now use named graph
+operations with explicit repeated masks and IEEE validity factors. This removes
+**54 counted lines**, reaching **11,758**.
+
+PR1 passes **173/173 in 12.99s** and ATAN/ATANH pass **2/2 in 22.05s** on
+RK3588. Mypy/Ruff remain at 12/8.
+
 ### Declarative periodic sin/cos graphs
 
 Commit `18923eeb3`; patch

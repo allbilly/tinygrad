@@ -3416,3 +3416,12 @@ Commit `18923eeb3`; saved patch
 SIN/COS use the shared graph for reduction and regional selection; tangent WIP
 is untouched. Support size is **11,812**. PR1 is **173/173**, and both hardware
 methods pass in 9.24s with static baselines unchanged.
+
+### ATAN/ATANH detail graphs
+
+Commit `f55e39c3b`; saved patch
+`0146-rockchip-compose-atan-detail-task-graphs.patch`.
+
+ATAN and ATANH now express folding, detail regions, and validity restoration
+through `_TaskGraph`. Support size is **11,758**. PR1 is **173/173**, and both
+hardware methods pass in 22.05s with static baselines unchanged.
