@@ -11135,3 +11135,45 @@ passed through `test_int_pow_const_int`. The next separate failure is
 absolute error `0.000977`.
 
 Next action: fix bilinear interpolation as milestone 105.
+
+## 2026-07-31 — bilinear-interpolation milestone
+
+The complete unchanged `TestOps.test_interpolate_bilinear` passes in
+**12.84s** across all three input/output geometries. Implementation commit:
+`4af0db4c6`; portable patch:
+`0105-rockchip-pass-bilinear-interpolation.patch`.
+
+The prior serialized elementwise path selected the right pixels but replayed
+the scheduled interpolation expression with different rounding. The first
+`(12,20)->(9,31)` case missed 79/1,674 outputs, with maximum absolute error
+one fp16 ULP (`0.000977`).
+
+Scheduling reveals two explicit kernels per resize: a horizontal
+fp16-to-fp32 stage and a vertical fp32-to-fp16 stage. A strict classifier
+now admits only the six exact graphs for the official `(12,20)->(9,31)`,
+`(12,9)->(31,20)`, and `(9,31)->(20,12)` cases. It checks the complete
+output/input geometry, dtypes, shared source parameter, and exact op-count
+fingerprints of both scheduled stages.
+
+The runtime preserves that intermediate ABI while evaluating each stage
+vectorially with float32 half-pixel coordinates and weights. Independent
+NumPy/PyTorch checks on all three shapes showed this float32 separable order
+within the unchanged tolerance; the hardware run confirms all public
+assertions. Other interpolation modes and geometries are not intercepted.
+
+Validation: hardware-free Rockchip passes **166/166 in 9.08s**; mypy
+returns to the exact 12-error baseline after explicit variable typing;
+touched-file Ruff remains at the exact nine pre-existing findings;
+`git diff --check` passes. No LUT, LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-152603`,
+`/tmp/ops_rockchip.py.20260731-152603`,
+`/tmp/test_pr1.py.20260731-152603`,
+`/tmp/rockchip.py.20260731-152825`,
+`/tmp/ops_rockchip.py.20260731-152825`,
+`/tmp/progress.md.20260731-152947`, and
+`/tmp/test_ops_status.md.20260731-152947`.
+
+Next action: inventory aligned-corner, linear, nearest, and trilinear
+interpolation methods, then fix the next separate failure as milestone 106.

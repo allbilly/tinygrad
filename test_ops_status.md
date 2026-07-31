@@ -2886,3 +2886,20 @@ two-level LUT changed.
 
 Next failure: `test_interpolate_bilinear`, with 79/1,674 first-shape
 mismatches and maximum absolute error `0.000977`.
+
+### Bilinear interpolation
+
+`test_interpolate_bilinear` passes in **12.84s** for all three geometries.
+Commit `4af0db4c6`; saved patch
+`0105-rockchip-pass-bilinear-interpolation.patch`.
+
+The original two-stage scheduled form had a horizontal fp16→fp32 kernel and
+a vertical fp32→fp16 kernel, but serialized expression replay missed
+79/1,674 first-shape outputs by up to one fp16 ULP. Exact classifiers now
+recognize only the six official stage graphs and preserve their intermediate
+ABI while using vectorized float32 half-pixel coordinates and arithmetic.
+Other interpolation modes/geometries remain unchanged.
+
+Contract: **166/166 in 9.08s**. Mypy is back at the exact 12-error baseline
+and touched-file Ruff remains at the exact nine pre-existing findings. No
+LUT or two-level LUT changed. Next: remaining interpolation methods.
