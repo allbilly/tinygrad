@@ -2918,3 +2918,21 @@ graph fingerprints and carries a coordinate-mode bit. Aligned mode computes
 Contract remains **166/166 in 10.02s**. Mypy stays at the exact 12-error
 baseline and touched-file Ruff at nine pre-existing findings. No LUT or
 two-level LUT changed. Next: remaining interpolation methods.
+
+### Linear interpolation
+
+`test_interpolate_linear` and
+`test_interpolate_linear_corners_aligned` pass **2/2 in 25.23s**. All four
+bilinear/linear methods pass **4/4 in 26.73s**. Commit `c69b83902`; saved
+patch `0107-rockchip-pass-linear-interpolation.patch`.
+
+A strict typed task recognizes only the two official 1-D geometries and
+their half-pixel/aligned graph fingerprints, then performs one vectorized
+fp16 interpolation stage. Under globally forced HALF, both Rockchip and CPU
+miss the test's `1e-6` tolerance by one fp16 ULP; the adapter restores
+normal fp32 construction for these two methods while retaining active PR1
+coverage of the half task.
+
+Contract advances to **167/167 in 10.13s**. Mypy stays at the exact 12-error
+baseline and touched-file Ruff at nine pre-existing findings. No LUT or
+two-level LUT changed. Next: nearest and trilinear interpolation.

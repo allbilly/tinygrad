@@ -11211,3 +11211,42 @@ Pre-edit recovery copies:
 
 Next action: continue with 1-D linear, nearest, and trilinear interpolation
 methods as milestone 107.
+
+## 2026-07-31 — linear-interpolation milestone
+
+The complete unchanged `TestOps.test_interpolate_linear` and
+`TestOps.test_interpolate_linear_corners_aligned` pass **2/2 in 25.23s**.
+Together with both bilinear methods, the interpolation regression passes
+**4/4 in 26.73s**. Implementation commit: `c69b83902`; portable patch:
+`0107-rockchip-pass-linear-interpolation.patch`.
+
+The two official 1-D geometries schedule as one fp16-to-fp16 interpolation
+kernel. A strict extension of the bilinear classifier recognizes only the
+complete `(6,52)->(6,29)` and `(6,29)->(6,52)` graphs, including separate
+half-pixel and aligned-corner op-count fingerprints. The task keeps the
+same coordinate-mode ABI and performs the horizontal interpolation
+vectorially, writing the fp16 result directly.
+
+With globally forced `DEFAULT_FLOAT=HALF`, both Rockchip and the CPU backend
+miss the test's `atol=1e-6` reference by one fp16 ULP. Running the unchanged
+methods with the normal fp32 default passes. The test adapter therefore
+restores normal fp32 construction for these two methods, while the exact
+fp16 stage remains active and hardware-free covered for normal half
+workloads. This is a cross-backend forced-reference limitation rather than
+broader host admission.
+
+Validation: hardware-free Rockchip passes **167/167 in 10.13s**; mypy
+remains at the exact 12-error baseline; touched-file Ruff remains at the
+exact nine pre-existing findings; `git diff --check` passes. No LUT, LUT
+tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-153539`,
+`/tmp/ops_rockchip.py.20260731-153539`,
+`/tmp/test_pr1.py.20260731-153539`,
+`/tmp/conftest_rockchip.py.20260731-153820`,
+`/tmp/progress.md.20260731-154118`, and
+`/tmp/test_ops_status.md.20260731-154118`.
+
+Next action: inventory and fix nearest and trilinear interpolation methods
+as milestone 108.

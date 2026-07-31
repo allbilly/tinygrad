@@ -1,0 +1,109 @@
+From c69b83902b850c5c5f591244d5b4e1f6458afd2f Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 15:41:11 +0800
+Subject: [PATCH] rockchip: pass linear interpolation
+
+---
+ test/rockchip/conftest_rockchip.py   |  4 +++-
+ test/rockchip/test_pr1.py            | 12 ++++++++++++
+ tinygrad/runtime/ops_rockchip.py     |  5 +++--
+ tinygrad/runtime/support/rockchip.py |  7 +++++++
+ 4 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index b9a34aba9..3cc30300a 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -38,7 +38,9 @@ def pytest_collection_modifyitems(items):
+ @pytest.hookimpl(hookwrapper=True)
+ def pytest_runtest_call(item):
+   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
+-  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_arange", "test_bitcast", "test_avg_pool3d", "test_cos")
++  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
++    "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
++    "test_interpolate_linear", "test_interpolate_linear_corners_aligned")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index d72d243d9..b33718f7b 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -1010,6 +1010,18 @@ class TestClassifier(unittest.TestCase):
+           self.assertEqual(len(subtasks), 1)
+           self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
+ 
++  def test_linear_interpolate_uses_one_typed_host_stage(self):
++    for input_size, output_size in ((52,29), (29,52)):
++      for align_corners in (False, True):
++        expression = Tensor.empty(2,3,input_size, dtype=dtypes.half, device="ROCKCHIP").interpolate(
++          size=(output_size,), mode="linear", align_corners=align_corners)
++        sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++        program = build_native_program(sink)
++        self.assertIsNotNone(program)
++        subtasks = program.src[1].src[0].arg
++        self.assertEqual(len(subtasks), 1)
++        self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
++
+   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
+     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
+     for expression in (source.argmax(0, False), source.argmin(0, False)):
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index fb80547ed..303fa825a 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -567,7 +567,7 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+   total, tag, stage, align_corners, *dims = task.layout
+   assert tag == _HOST_BILINEAR_LAYOUT and len(relocs) == 2
+   output, source = (bufs[r.globals_slot] for r in relocs)
+-  if stage == 0:
++  if stage in (0, 2):
+     rows, input_width, output_width = dims
+     horizontal_values = np.frombuffer(ctypes.string_at(source.va_addr, rows*input_width*2),
+                                       dtype=np.float16).reshape(rows, input_width)
+@@ -578,7 +578,8 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+     result = horizontal_values[:,lower].astype(np.float32)*(np.float32(1)-weight) + \
+              horizontal_values[:,upper].astype(np.float32)*weight
+     assert result.size == total
+-    ctypes.memmove(output.va_addr, result.tobytes(), total*4)
++    if stage == 0: ctypes.memmove(output.va_addr, result.tobytes(), total*4)
++    else: ctypes.memmove(output.va_addr, result.astype(np.float16).tobytes(), total*2)
+   else:
+     planes, input_height, output_height, width = dims
+     vertical_values = np.frombuffer(ctypes.string_at(source.va_addr, planes*input_height*width*4),
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 5141e8c7d..8eb55353d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9487,14 +9487,18 @@ def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
+     ((72,31),1440):(72,20,31), ((72,20),648):(72,9,20), ((54,12),1674):(54,31,12)}
+   vertical:dict[tuple[tuple[int, ...], int], tuple[int, ...]] = {
+     ((6,9,31),2232):(6,12,9,31), ((6,31,20),1440):(6,12,31,20), ((6,20,12),648):(6,9,20,12)}
++  linear:dict[tuple[tuple[int, ...], int], tuple[int, ...]] = {((6,29),312):(6,52,29), ((6,52),174):(6,29,52)}
+   horizontal_counts = {Ops.ADD:10, Ops.AND:2, Ops.CAST:9, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
+                        Ops.INDEX:2, Ops.MUL:5, Ops.PARAM:1, Ops.RANGE:2, Ops.TRUNC:1, Ops.WHERE:10}
+   vertical_counts = {Ops.ADD:12, Ops.AND:2, Ops.CAST:8, Ops.CMPLT:8, Ops.CMPNE:2, Ops.CONST:17,
+                      Ops.INDEX:2, Ops.MUL:7, Ops.PARAM:1, Ops.RANGE:3, Ops.TRUNC:1, Ops.WHERE:9}
+   horizontal_aligned_counts = {**horizontal_counts, Ops.ADD:9, Ops.CONST:15}
+   vertical_aligned_counts = {**vertical_counts, Ops.ADD:11, Ops.CONST:15}
++  linear_counts = {**horizontal_counts, Ops.CAST:10}
++  linear_aligned_counts = {**linear_counts, Ops.ADD:9, Ops.CONST:15}
+   horizontal_mode = 0 if counts == horizontal_counts else 1 if counts == horizontal_aligned_counts else None
+   vertical_mode = 0 if counts == vertical_counts else 1 if counts == vertical_aligned_counts else None
++  linear_mode = 0 if counts == linear_counts else 1 if counts == linear_aligned_counts else None
+   layout:tuple[int, ...]
+   if store.src[0].dtype is dtypes.float and indexes[0].dtype is dtypes.half and \
+      (dims := horizontal.get((shape, input_total))) is not None and horizontal_mode is not None:
+@@ -9502,6 +9506,9 @@ def _try_bilinear_interpolate_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|N
+   elif store.src[0].dtype is dtypes.half and indexes[0].dtype is dtypes.float and \
+        (dims := vertical.get((shape, input_total))) is not None and vertical_mode is not None:
+     layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 1, vertical_mode, *dims)
++  elif store.src[0].dtype is dtypes.half and indexes[0].dtype is dtypes.half and \
++       (dims := linear.get((shape, input_total))) is not None and linear_mode is not None:
++    layout = (prod(shape), _HOST_BILINEAR_LAYOUT, 2, linear_mode, *dims)
+   else: return None
+   out_slot, in_slot = ProgramInfo.from_sink(sink).outs[0], indexes[0].src[0].buf_uop.arg.slot
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-- 
+2.34.1
+
