@@ -10477,3 +10477,32 @@ milestone validation while retaining `-n12`.
 No new runtime tag, LUT, or two-level LUT changed. Mypy remains at the exact
 12-error baseline and touched-file Ruff at the exact nine pre-existing
 findings. Next forward group: `TestOps.test_cast`.
+
+## 2026-07-31 — bitcast milestone
+
+`TestOps.test_cast` and `TestOps.test_int_or` pass unchanged. The previously
+blocked `TestOps.test_bitcast` passes byte-for-byte in **12.55s**. All three
+methods pass together in **18.84s** with `-n12 --dist loadscope`; the
+hardware-free Rockchip contract is **153/153 in 15.83s**. Implementation
+commit: `d853bafe1`; saved patch: `0087-rockchip-pass-bitcast.patch`.
+
+The required HALF suite exposed a reference-harness issue before backend
+execution: PyTorch cannot reinterpret a `(3,3)` fp16 tensor as int32 because
+its last dimension is not divisible by two. The Rockchip pytest plugin now
+temporarily sets both PyTorch's default dtype and tinygrad's
+`dtypes.default_float` to fp32 only while this canonical equal-width bitcast
+test runs, then restores fp16 in a `finally` block. This keeps both sides on
+the same input dtype and does not skip or weaken the assertion.
+
+The backend then honestly rejected `Ops.BITCAST`. A strict classifier now
+accepts only direct, same-shape fp32-to-int32 reinterpretation with matching
+element counts capped at `2**20`. Typed opcode 32 records both source and
+destination dtype codes. The scalar and vector evaluators reconstruct the
+source-width NumPy value and use `.view(destination_dtype)`, preserving the
+four input bytes exactly; it is not a numerical cast. A CPU-to-Rockchip
+hardware-free fixture forces the same materializing sink seen by the backend
+test.
+
+No new layout tag, LUT, or two-level LUT changed. Mypy remains at the exact
+12-error baseline and touched-file Ruff remains at nine pre-existing
+findings. Next ordered forward group: `TestOpsUint8.test_cast`.

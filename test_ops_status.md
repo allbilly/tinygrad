@@ -2546,3 +2546,24 @@ rather than an operator failure.
 Contract: **152/152 in 17.00s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. No LUT or two-level LUT changed. Next forward
 group: `TestOps.test_cast`.
+
+### Bitcast
+
+`test_cast` and `test_int_or` pass unchanged. `test_bitcast` passes in
+**12.55s**, and the three-method group passes in **18.84s** under
+`-n12 --dist loadscope`. Commit `d853bafe1`; saved patch
+`0087-rockchip-pass-bitcast.patch`.
+
+Under the HALF suite, PyTorch cannot construct the unchanged `(3,3)`
+half-to-int32 view because an odd last dimension cannot be paired into
+32-bit words. The Rockchip plugin therefore aligns both frameworks to fp32
+only for this test and restores fp16 afterward.
+
+The active matcher accepts only equal-count fp32-to-int32 bitcasts. Typed
+opcode 32 carries the source dtype and uses NumPy byte views in both scalar
+and vector execution, so the result is a true reinterpretation rather than
+a cast.
+
+Contract: **153/153 in 15.83s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. No LUT or two-level LUT changed. Next forward
+group: `TestOpsUint8.test_cast`.
