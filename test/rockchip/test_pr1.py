@@ -458,6 +458,13 @@ class TestClassifier(unittest.TestCase):
     injected_program = build_native_program(injected_sink)
     self.assertIsNotNone(injected_program)
     self.assertEqual(injected_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+    x_half = Tensor.empty(2,5,6,5,3,4, dtype=dtypes.half, device="ROCKCHIP")
+    for expression in (x_half[indices[0], ..., indices[-1]],
+                       x_half[indices[0], indices[1], None, indices[3], indices[4]]):
+      half_sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+      half_program = build_native_program(half_sink)
+      self.assertIsNotNone(half_program)
+      self.assertEqual(half_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 
   def test_scatter_uses_typed_update_selection(self):
     for shape in ((4,5,6), (3,4,5)):

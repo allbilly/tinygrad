@@ -9860,15 +9860,15 @@ def _try_fancy_index_reduction_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
   """Unroll only bounded masked ADD reductions fused into multi-index gathers."""
   store = _store_node(sink)
   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if store is None or store.src[0].dtype is not dtypes.float or len(reductions) != 1: return None
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or len(reductions) != 1: return None
   reduce = reductions[0]
-  if reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or not reduce.src[1:] or \
+  if reduce.dtype is not store.src[0].dtype or reduce.arg[0] is not Ops.ADD or not reduce.src[1:] or \
      any(axis.src[0].op is not Ops.CONST for axis in reduce.src[1:]): return None
   extents = [int(axis.src[0].arg) for axis in reduce.src[1:]]
   if prod(extents) > 512: return None
   inputs = [u for u in reduce.src[0].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   input_dtypes = {u.dtype for u in inputs}
-  if dtypes.float not in input_dtypes or dtypes.int not in input_dtypes or \
+  if store.src[0].dtype not in input_dtypes or dtypes.int not in input_dtypes or \
      len({u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}) < 2: return None
   if not {Ops.WHERE, Ops.CMPLT, Ops.CMPNE}.issubset({u.op for u in reduce.src[0].toposort()}): return None
 
