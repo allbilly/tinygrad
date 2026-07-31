@@ -1,0 +1,137 @@
+From ae5a4a6f61e0baf182c22cebc8db31d4226bb69c Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 12:24:19 +0800
+Subject: [PATCH] rockchip: pass nonzero
+
+---
+ test/rockchip/test_pr1.py            | 10 ++++
+ tinygrad/runtime/support/rockchip.py | 85 ++++++++++++++++++++++++++++
+ 2 files changed, 95 insertions(+)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 07b1fc828..99395f059 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -792,6 +792,16 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+ 
++  def test_nonzero_expanded_prefix_uses_bounded_typed_reduction(self):
++    source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
++    mask = source > 0.5
++    expression = mask.unsqueeze(-1).expand(*mask.shape, mask.ndim).flatten().cumsum()[-1]
++    sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
++    programs = [build_native_program(sink) for sink in sinks]
++    self.assertTrue(all(program is not None for program in programs))
++    layouts = [program.src[1].src[0].arg[0].task.layout[1] for program in programs]
++    self.assertEqual(layouts[:2], [_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT])
++
+   def test_constant_true_masked_select_uses_typed_copy(self):
+     source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+     expression = source.masked_select(Tensor(True, device="ROCKCHIP"))
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 55c2599cd..e484b0977 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9259,6 +9259,85 @@ def _try_mask_prefix_count_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None
+   else: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=post_reduction)
+ 
++def _try_nonzero_expanded_prefix_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize the two reduction stages of nonzero's blocked coordinate-mask prefix scan."""
++  reduce, store = _reduce_node(sink), _store_node(sink)
++  if reduce is None or store is None or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.int or \
++     store.src[0].dtype is not dtypes.int: return None
++  post_reduction = _unwrap(store.src[1]) is not reduce
++  nodes = reduce.src[0].toposort()
++  allowed = {Ops.REDUCE, Ops.WHERE, Ops.OR, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.CAST, Ops.ADD, Ops.MUL,
++             Ops.FLOORDIV, Ops.FLOORMOD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  ops = {u.op for u in nodes}
++  required = {Ops.WHERE, Ops.OR, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.CAST, Ops.MUL,
++              Ops.FLOORDIV, Ops.FLOORMOD, Ops.INDEX}
++  inputs = [u for u in nodes if u.op is Ops.PARAM]
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if any(u.op not in allowed for u in nodes) or reductions != [reduce] or len(inputs) != 1 or \
++     any(u.src[0].op is not Ops.CONST for u in (*loops, *reduce.src[1:])): return None
++  input_total, output_total = int(inputs[0].src[0].arg), prod(_shape_of_store(sink))
++  reduction_total = prod(int(u.src[0].arg) for u in reduce.src[1:])
++  expanded_mask_stage = not post_reduction and inputs[0].dtype is dtypes.half and len(loops) >= 2 and required.issubset(ops) and \
++    1 <= input_total <= 1 << 20 and input_total < output_total <= input_total*8+2048 and \
++    reduction_total == 256 and output_total % reduction_total == 0
++  direct_expanded_count_stage = not post_reduction and inputs[0].dtype is dtypes.half and not loops and output_total == 1 and \
++    ops == {Ops.CAST, Ops.CMPLT, Ops.FLOORDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} and \
++    1 <= input_total <= 1 << 20 and 2 <= reduction_total//input_total <= 8 and reduction_total % input_total == 0
++  direct_expanded_prefix_stage = not post_reduction and inputs[0].dtype is dtypes.half and len(loops) == 1 and \
++    ops == {Ops.WHERE, Ops.CAST, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.FLOORDIV,
++            Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} and \
++    output_total == reduction_total == int(loops[0].src[0].arg) and 1 <= input_total <= 1 << 20 and \
++    2 <= reduction_total//input_total <= 8 and reduction_total % input_total == 0
++  block_offset_stage = not post_reduction and inputs[0].dtype is dtypes.int and len(loops) == 1 and \
++    ops == {Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} and \
++    1 <= output_total <= 4096 and input_total == output_total*256 and reduction_total == output_total
++  tail_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u not in nodes]
++  scalar_total_stage = post_reduction and inputs[0].dtype is dtypes.int and not loops and \
++    ops == {Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} and \
++    output_total == 1 and input_total % 256 == 0 and reduction_total == input_total//256 and \
++    _unwrap(store.src[1]).op is Ops.ADD and len(tail_indexes) == 1 and tail_indexes[0].src[0] is inputs[0] and \
++    tail_indexes[0].src[1].op is Ops.CONST and int(tail_indexes[0].src[1].arg) == input_total-1
++  if not (expanded_mask_stage or direct_expanded_count_stage or direct_expanded_prefix_stage or
++          block_offset_stage or scalar_total_stage): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=post_reduction)
++
++def _try_nonzero_coordinate_gather_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize nonzero's dynamic coordinate gather from its padded prefix buffers."""
++  reduce, store = _reduce_node(sink), _store_node(sink)
++  if reduce is None or store is None or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.int or \
++     store.src[0].dtype is not dtypes.int or _unwrap(store.src[1]) is not reduce: return None
++  nodes = reduce.src[0].toposort()
++  ops = {u.op for u in nodes}
++  if ops != {Ops.WHERE, Ops.CAST, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.FLOORDIV,
++             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}: return None
++  inputs = [u for u in nodes if u.op is Ops.PARAM]
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if len(inputs) != 2 or any(u.dtype is not dtypes.int for u in inputs) or len(loops) != 1 or \
++     loops[0].src[0].op is not Ops.CONST or any(u.src[0].op is not Ops.CONST for u in reduce.src[1:]): return None
++  output_total, reduction_total = prod(_shape_of_store(sink)), prod(int(u.src[0].arg) for u in reduce.src[1:])
++  blocks, padded = (reduction_total+255)//256, ((reduction_total+255)//256)*256
++  if int(loops[0].src[0].arg) != output_total or not 1 <= output_total <= reduction_total <= 1 << 20 or \
++     sorted(int(u.src[0].arg) for u in inputs) != [blocks, padded]: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
++
++def _try_nonzero_coordinate_interleave_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize nonzero's bounds-masked coordinate reshape."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.int or \
++     _unwrap(store.src[1]).op is not Ops.WHERE: return None
++  nodes = store.src[1].toposort()
++  ops = {u.op for u in nodes}
++  rank1_ops = {Ops.WHERE, Ops.AND, Ops.CAST, Ops.CMPLT, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  ranked_ops = {*rank1_ops, Ops.FLOORDIV, Ops.FLOORMOD}
++  if ops not in (rank1_ops, ranked_ops): return None
++  inputs = [u for u in nodes if u.op is Ops.PARAM]
++  loops = [u for u in nodes if u.op is Ops.RANGE]
++  output_total = prod(_shape_of_store(sink))
++  if len(inputs) != 1 or inputs[0].dtype is not dtypes.int or int(inputs[0].src[0].arg) != output_total or \
++     len(loops) != 1 or loops[0].src[0].op is not Ops.CONST or int(loops[0].src[0].arg) != output_total: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_constant_true_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Collapse the constant-True masked-select gather to its exact flat copy."""
+   store = _store_node(sink)
+@@ -14511,6 +14590,12 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, scatter_reduce_tasks)
+   if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
++  if (nonzero_expanded_prefix_tasks := _try_nonzero_expanded_prefix_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, nonzero_expanded_prefix_tasks)
++  if (nonzero_coordinate_gather_tasks := _try_nonzero_coordinate_gather_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, nonzero_coordinate_gather_tasks)
++  if (nonzero_coordinate_interleave_tasks := _try_nonzero_coordinate_interleave_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, nonzero_coordinate_interleave_tasks)
+   if (mask_prefix_count_tasks := _try_mask_prefix_count_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, mask_prefix_count_tasks)
+   if (constant_true_masked_select_tasks := _try_constant_true_masked_select_host_subtasks(sink)) is not None:
+-- 
+2.34.1
+

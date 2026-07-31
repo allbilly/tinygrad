@@ -10391,3 +10391,42 @@ No LUT or two-level LUT changed. Mypy is back at the exact 12-error baseline
 after removing one newly introduced type-narrowing ambiguity; touched-file
 Ruff remains at nine pre-existing findings. Next forward group:
 `TestOps.test_nonzero`.
+
+## 2026-07-31 — nonzero milestone
+
+`TestOps.test_nonzero` passes all unchanged 2-D, 1-D, 3-D, and scalar cases
+in **14.76s** on RK3588. The full hardware-free Rockchip contract is now
+**151/151 in 10.14s**. Implementation commit: `ae5a4a6f6`; portable patch:
+`0085-rockchip-pass-nonzero.patch`.
+
+`Tensor.nonzero` lowers through dynamic `masked_select`, but repeats every
+predicate once for each coordinate dimension. This produces several
+scheduler-dependent forms rather than one generic `nonzero` kernel:
+
+- the `(32,10)` rank-two case expands 320 predicates to 640 entries and
+  schedules a padded `3 x 256` local scan, block-offset reduction, scalar
+  tail-plus-offset count, full prefix reconstruction, dynamic coordinate
+  gathers, and a final bounds-masked reshape;
+- the length-20 rank-one case uses the simpler direct count/prefix path and
+  a rank-one reshape with div/mod operations optimized away;
+- the `(10,5,3)` rank-three case expands 150 predicates to 450 entries.
+  Since this is below the blocked threshold chosen by the scheduler, its
+  scalar count and full prefix directly read `source[index // 3]`;
+- scalar inputs continue through already-supported constant/small paths.
+
+Three narrow classifiers reuse `_HOST_ELEMENTWISE_REDUCE_LAYOUT` and
+`_HOST_ELEMENTWISE_LAYOUT`. They recognize only the exact expanded-mask
+count/prefix, padded 256-wide scan and block-offset fingerprints, the
+prefix-equality coordinate reductions, and the final one-input coordinate
+reshape. Required dtype/shape relationships include rank factors 2 through
+8, 256-element block geometry, paired padded-prefix/block buffers, matching
+loop/output lengths, and a `2**20` logical bound. The live `.item()` path
+also has a strict post-reduction epilogue check requiring the last padded
+prefix element plus its block offset. No broad `run_host` fallback is
+enabled.
+
+All admitted integer counts remain exactly representable in the typed
+reducer's float32 accumulator. No new runtime tag, LUT, or two-level LUT was
+needed. Mypy remains at the exact 12-error baseline and touched-file Ruff at
+the exact nine pre-existing findings. Next forward group:
+`TestOps.test_nonzero_size`.

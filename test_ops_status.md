@@ -2493,3 +2493,28 @@ the exact bounds fingerprint, capped at `2**20` mask elements.
 Contract: **150/150 in 9.46s**. No new runtime tag, LUT, or two-level LUT
 changed. Mypy remains at 12 and touched-file Ruff at nine pre-existing
 findings. Next forward group: `TestOps.test_nonzero`.
+
+### Nonzero
+
+`test_nonzero` passes its 2-D, 1-D, 3-D, and scalar cases in **14.76s**.
+Commit `ae5a4a6f6`; saved patch `0085-rockchip-pass-nonzero.patch`.
+
+The dynamic coordinate mask repeats each predicate by tensor rank. Strict
+typed-task matchers now cover both scheduled scan strategies:
+
+- rank two: 640 logical entries lowered as padded `3 x 256` local prefixes,
+  block offsets, and the live scalar tail-plus-offset count;
+- rank three: direct 450-wide count/prefix reductions reading the 150-entry
+  source with `index // 3`;
+- rank one: the already-simple direct prefix form;
+- all ranks: bounded equality coordinate gathers and the final
+  bounds-masked coordinate reshape.
+
+The classifiers require exact int32/half dtypes, rank-repeat and
+256-block-size relationships, matching buffer/loop sizes, and the known
+`CMPLT/CMPNE/WHERE/FLOORDIV/FLOORMOD` fingerprints. Work is capped at
+`2**20`; no general host-op switch is used.
+
+The hardware-free contract is **151/151 in 10.14s**. Mypy remains at 12 and
+touched-file Ruff at nine pre-existing findings. No new runtime tag, LUT, or
+two-level LUT changed. Next forward group: `TestOps.test_nonzero_size`.
