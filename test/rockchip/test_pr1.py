@@ -481,6 +481,13 @@ class TestClassifier(unittest.TestCase):
     scalar_program = build_native_program(_get_sink(x.scatter(dim=1, index=indices, src=3)))
     self.assertIsNotNone(scalar_program)
     self.assertEqual(scalar_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    x_half = Tensor.empty(4,5,6, dtype=dtypes.half, device="ROCKCHIP")
+    src_half = Tensor.empty(4,5,6, dtype=dtypes.half, device="ROCKCHIP")
+    for expression in (x_half.scatter(dim=1, index=indices, src=src_half),
+                       x_half.scatter(dim=1, index=indices, src=3)):
+      half_program = build_native_program(_get_sink(expression))
+      self.assertIsNotNone(half_program)
+      self.assertEqual(half_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
   def test_scatter_scalar_reductions_use_typed_stages(self):
     x = Tensor.empty(4,5,6, dtype=dtypes.float, device="ROCKCHIP")
@@ -492,6 +499,14 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 2)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
       self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    x_half = Tensor.empty(4,5,6, dtype=dtypes.half, device="ROCKCHIP")
+    for mode, value in (("add", float("inf")), ("multiply", float("nan"))):
+      half_program = build_native_program(_get_sink(x_half.scatter(dim=1, index=indices, src=value, reduce=mode)))
+      self.assertIsNotNone(half_program)
+      half_subtasks = half_program.src[1].src[0].arg
+      self.assertEqual(len(half_subtasks), 2)
+      self.assertEqual(half_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+      self.assertEqual(half_subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
   def test_scatter_reduce_tensor_uses_bounded_typed_boundary(self):
     x = Tensor.empty(3,4,5, dtype=dtypes.float, device="ROCKCHIP")
