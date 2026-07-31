@@ -308,6 +308,55 @@ class TestClassifier(unittest.TestCase):
     self.assertTrue(all(isinstance(task, RKSubTask) for task in subtasks))
     self.assertLess(len(subtasks), 600)
 
+  def test_fp16_cumulative_extrema_use_typed_reductions_and_indices(self):
+    for kind in ("max", "min"):
+      source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
+      values = (source.cummax(0) if kind == "max" else source.cummin(0))[0]
+      value_sinks = [early_simplify(call.src[0]) for call in values.schedule_linear().src if call.src[0].op is Ops.SINK]
+      self.assertEqual(len(value_sinks), 3)
+      for program in (build_native_program(sink) for sink in value_sinks[:2]):
+        self.assertIsNotNone(program)
+        subtasks = program.src[1].src[0].arg
+        self.assertEqual(len(subtasks), 1)
+        self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+      if kind == "min":
+        final_program = build_native_program(value_sinks[2])
+        self.assertIsNotNone(final_program)
+        final_subtasks = final_program.src[1].src[0].arg
+        self.assertEqual(len(final_subtasks), 1)
+        self.assertEqual(final_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
+      index_source = Tensor.empty(5, dtype=dtypes.half, device="ROCKCHIP")
+      indices = (index_source.cummax(0) if kind == "max" else index_source.cummin(0))[1]
+      index_sinks = [early_simplify(call.src[0]) for call in indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+      index_program = build_native_program(index_sinks[-1])
+      self.assertIsNotNone(index_program)
+      index_subtasks = index_program.src[1].src[0].arg
+      self.assertEqual(len(index_subtasks), 1)
+      self.assertEqual(index_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
+      self.assertEqual(index_subtasks[0].task.layout[4] == 10, kind == "min")
+      mapping_offset = 5 if kind == "min" else 4
+      self.assertEqual(index_subtasks[0].task.layout[mapping_offset+20:mapping_offset+25], (4, 3, 2, 1, 0))
+
+      long_source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
+      long_indices = (long_source.cummax(0) if kind == "max" else long_source.cummin(0))[1]
+      long_sinks = [early_simplify(call.src[0]) for call in long_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+      long_program = build_native_program(long_sinks[-1])
+      self.assertIsNotNone(long_program)
+      long_subtasks = long_program.src[1].src[0].arg
+      self.assertEqual(len(long_subtasks), 1)
+      self.assertEqual(long_subtasks[0].task.layout, (1022, _HOST_ARGMAX_LAYOUT, 0, 1022, 10 if kind == "min" else 2))
+
+      if kind == "min":
+        short_source = Tensor.empty(512, dtype=dtypes.half, device="ROCKCHIP")
+        short_indices = short_source.cummin(0)[1]
+        short_sinks = [early_simplify(call.src[0]) for call in short_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+        short_program = build_native_program(short_sinks[0])
+        self.assertIsNotNone(short_program)
+        short_subtasks = short_program.src[1].src[0].arg
+        self.assertEqual(len(short_subtasks), 1)
+        self.assertEqual(short_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+
   def test_fp32_sum_uses_typed_cmac_boundary(self):
     sink = _get_sink(Tensor.empty(3,3, dtype=dtypes.float, device="ROCKCHIP").sum())
     program = build_native_program(sink)

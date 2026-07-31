@@ -1256,11 +1256,24 @@ def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
   ctypes.memmove(output.va_addr, result.ctypes.data, total*itemsize)  # type: ignore[arg-type]
 
 def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
-  """Choose the first valid maximum from a static fp16/fp32/int32 candidate map."""
+  """Choose extrema indices from a static candidate map or compact cumulative scan."""
   import numpy as np
   total, tag, window, input_spatial, *payload = task.layout
   dtype_marker = payload[0] if len(payload) == total*window+1 else 2
   itemsize = 4 if dtype_marker in (4, 8) else 2
+  negated = dtype_marker == 10
+  if window == 0:
+    assert tag == _HOST_ARGMAX_LAYOUT and total == input_spatial and dtype_marker in (2, 10) and len(relocs) == 2
+    output_buf, data_buf = (bufs[r.globals_slot] for r in relocs)
+    data = np.frombuffer(ctypes.string_at(data_buf.va_addr, total*2), dtype=np.float16)
+    output = np.empty(total, dtype=np.int32)
+    best, selected = data[0], 0
+    for index, value in enumerate(data):
+      if np.isnan(value) or (not np.isnan(best) and (value <= best if negated else value >= best)):
+        best, selected = value, index
+      output[index] = selected
+    ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
+    return
   mapping = payload[1:] if len(payload) == total*window+1 else payload
   assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
   output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
@@ -1284,7 +1297,8 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
     else:
       for candidate in candidates:
         if candidate < 0 or candidate >= data.size: continue
-        if data[candidate] == maximum[out_index] or (np.isnan(data[candidate]) and np.isnan(maximum[out_index])):
+        value = -data[candidate] if negated else data[candidate]
+        if value == maximum[out_index] or (np.isnan(value) and np.isnan(maximum[out_index])):
           selected = candidate % input_spatial
           break
     output[out_index] = selected
