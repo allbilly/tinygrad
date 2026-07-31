@@ -11656,3 +11656,39 @@ Pre-edit recovery copies:
 
 Next action: continue ordered methods 276–300, including scalar arithmetic,
 attention, scatter, and shape/reduction cases.
+
+## 2026-07-31 — explicit forward-only sigmoid milestone
+
+The two embedded-gradient sigmoid methods are now intentionally skipped
+under the requested forward contract: **2 skipped in 11.05s**.
+Implementation commit: `136d8b881`; portable patch:
+`0118-rockchip-exclude-manual-sigmoid-gradients-forward-only.patch`.
+
+The first methods 276–300 run completed 23 passes and one existing skip;
+`test_sigmoid_extreme` alone failed after both positive and negative
+±300–400 forward tensors had already passed. Its next line unconditionally
+called `.gradient()` and compared the result. A source audit found the only
+direct gradient calls outside the common helper in:
+
+- `test_pow_const_direct`, already excluded by milestone 117;
+- `test_sigmoid_extreme`;
+- `test_sigmoid_alt_extreme`.
+
+The two sigmoid methods mix valid forward probes with mandatory manual
+backward assertions, so both are consistently excluded when
+`FORWARD_ONLY=1`. Their extreme forward behavior remains covered by the
+dedicated Rockchip sigmoid regressions and prior hardware milestones. No
+gradient implementation, backend classifier, or runtime changed.
+
+Validation: adapter Ruff is clean and `git diff --check` passes.
+Hardware-free Rockchip remains **169/169** from milestone 117; mypy and
+touched backend Ruff remain at their exact 12- and 9-finding baselines. No
+LUT or two-level LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/conftest_rockchip.py.20260731-175413`,
+`/tmp/progress.md.20260731-175458`, and
+`/tmp/test_ops_status.md.20260731-175458`.
+
+Next action: continue ordered methods 301–325, beginning with remaining
+convolutions, cumulative extrema, slicing, and softmax/softplus.

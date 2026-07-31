@@ -3118,3 +3118,16 @@ excluded when `FORWARD_ONLY=1`.
 Contract advances to **169/169 in 10.51s**. Mypy and touched-file Ruff stay
 at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
 Next: methods 276–300.
+
+### Explicit forward-only sigmoid methods
+
+Methods 276–300 initially produced 23 passes, one skip, and one failure.
+Both ±300–400 forward sigmoid tensors passed; the failure was the method's
+unconditional manual `.gradient()` assertion. Both sigmoid-extreme methods
+contain direct gradients and are now excluded with `FORWARD_ONLY=1`, giving
+**2 skipped in 11.05s**. Commit `136d8b881`; saved patch
+`0118-rockchip-exclude-manual-sigmoid-gradients-forward-only.patch`.
+
+Extreme forward behavior remains covered by Rockchip regressions. Backend
+code and the **169/169** PR1 contract are unchanged; adapter Ruff is clean.
+No LUT or two-level LUT changed. Next: methods 301–325.
