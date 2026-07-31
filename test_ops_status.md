@@ -3389,3 +3389,12 @@ Commit `283c27de1`; saved patch
 LogSigmoid and Softplus use the shared graph, including Softplus beta<1 and
 materialization paths. Support size is **12,012**. PR1 is **173/173** and both
 focused hardware methods pass in 7.33s; static baselines are unchanged.
+
+### ERF regional graph
+
+Commit `afc93601e`; saved patch
+`0143-rockchip-compose-erf-regional-task-graph.patch`.
+
+ERF uses the shared clamp/interval graph and reaches **11,938 support lines**.
+PR1 passes **173/173** and ERF passes its focused hardware method in 10.23s;
+static baselines are unchanged.

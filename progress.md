@@ -7762,6 +7762,18 @@ lines**, reaching **12,012**.
 PR1 passes **173/173 in 13.73s**; LogSigmoid and Softplus pass **2/2 in 7.33s**
 on hardware. Mypy/Ruff remain at 12/8.
 
+### Declarative ERF graph
+
+Commit `afc93601e`; patch
+`0143-rockchip-compose-erf-regional-task-graph.patch`.
+
+ERF's broad/local/identity/tail graph now composes shared clamps and interval
+masks while retaining its exact sign tail and `2/sqrt(pi)` center slope. This
+removes **74 counted lines**, reaching **11,938**.
+
+PR1 passes **173/173 in 13.28s** and ERF passes **1/1 in 10.23s** on RK3588.
+Mypy/Ruff remain at 12/8.
+
 ### Declarative CELU/Mish graphs
 
 Commit `ca3f8725e`; patch
