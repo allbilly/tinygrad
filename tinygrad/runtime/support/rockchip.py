@@ -5554,21 +5554,28 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_pow_base07_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Evaluate 0.7**x over [-2,3] with a shifted Q13 LUT."""
+  """Evaluate half 0.7**x by shifted Q13 LUT or exact typed integer-exponent pow."""
   store = _store_node(sink)
   if store is None or store.src[0].dtype is not dtypes.half: return None
   value = _unwrap(store.src[1])
   if value.op is not Ops.EXP2 or len(value.src) != 1: return None
   product = _unwrap(value.src[0])
   if product.op is not Ops.MUL or len(product.src) != 2: return None
-  source, scale = None, None
+  source = source_operand = scale = None
   for lhs, rhs in (product.src, product.src[::-1]):
     if (candidate := _unwrap(lhs)).op is Ops.INDEX and rhs.op is Ops.CONST:
-      source, scale = candidate, float(rhs.arg)
+      source, source_operand, scale = candidate, lhs, float(rhs.arg)
       break
-  if source is None or scale is None or source.dtype is not dtypes.half or abs(scale-math.log2(0.7)) > 1e-3: return None
+  if source is None or source_operand is None or scale is None or abs(scale-math.log2(0.7)) > 1e-3: return None
   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
-  if int(source.src[0].src[0].arg) != total: return None
+  if int(source.src[0].src[0].arg) != total or _affine_index(source.src[1]) != _affine_index(store.src[0].src[1]): return None
+  if source.dtype is dtypes.int:
+    if source_operand.op is not Ops.CAST or source_operand.dtype is not dtypes.half or source_operand.src != (source,): return None
+    base = UOp.const(dtypes.half, float(np.float16(0.7)))
+    semantic = UOp(Ops.POW, dtypes.half, (base, source))
+    semantic_sink = sink.substitute({store:store.replace(src=(store.src[0], semantic))})
+    return _try_elementwise_host_subtasks(semantic_sink, allow_plain=True)
+  if source.dtype is not dtypes.half: return None
   out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
   next_slot = max(info.globals, default=-1)+1
   tasks:list[RKSubTask] = []

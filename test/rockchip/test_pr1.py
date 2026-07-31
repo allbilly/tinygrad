@@ -403,6 +403,20 @@ class TestClassifier(unittest.TestCase):
       self.assertTrue(subtasks[0].task.is_copy)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp16_constant_base_integer_pow_uses_exact_host_boundary(self):
+    default_float = dtypes.default_float
+    try:
+      dtypes.default_float = dtypes.half
+      sink = _get_sink(0.7**Tensor.empty(6, dtype=dtypes.int, device="ROCKCHIP"))
+    finally:
+      dtypes.default_float = default_float
+    program = build_native_program(sink)
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertTrue(subtasks[0].task.is_copy)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_padded_add_uses_exact_host_boundary(self):
     a = Tensor.empty(64,64, dtype=dtypes.float, device="ROCKCHIP")
     b = Tensor.empty(60,60, dtype=dtypes.float, device="ROCKCHIP")
