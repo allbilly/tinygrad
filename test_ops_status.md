@@ -2401,3 +2401,17 @@ from being captured as cross entropy; its two-CMAC hardware-free regression
 passes again. No LUT changed. Contract: **145/145**. The 424-case tally above
 remains the pre-milestone full-suite baseline. Next forward group:
 `TestOps.test_cross_entropy_smoothing`.
+
+### Cross-entropy label smoothing
+
+`test_cross_entropy_smoothing` passes all eight probability/index cases at
+`0`, `0.3`, `0.7`, and `1` in **14.76s**. All four cross-entropy methods pass
+together in **13.39s**.
+
+The exact probability-target task now carries the raw fp16 target-scale and
+uniform-weight constants. This reproduces tinygrad/PyTorch's half affine
+target before the class product and supports smoothing `1` after scheduling
+removes the target buffer. Smoothed class-index one-hot graphs continue
+through the strict typed `CMPNE` path. No LUT changed. Contract remains
+**145/145** with expanded ABI coverage. Next forward group:
+`TestOps.test_sparse_categorical_crossentropy`.

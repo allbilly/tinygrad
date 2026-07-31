@@ -795,15 +795,20 @@ def _run_host_bce(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tu
 def _run_host_cross_entropy(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Evaluate exact bounded fp16 probability-target cross entropy."""
   import numpy as np
-  _, tag, reduction, rows, classes, class_stride = task.layout
-  assert tag == _HOST_CROSS_ENTROPY_LAYOUT and reduction in (0, 1, 2) and len(relocs) == 3
-  output, source_buf, target_buf = (bufs[reloc.globals_slot] for reloc in relocs)
+  _, tag, reduction, rows, classes, class_stride, scale_bits, uniform_bits = task.layout
+  assert tag == _HOST_CROSS_ENTROPY_LAYOUT and reduction in (0, 1, 2) and len(relocs) in (2, 3)
+  output, source_buf, *target_buf = (bufs[reloc.globals_slot] for reloc in relocs)
   input_total = rows*classes
   batches = rows//class_stride
   source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16).\
     reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
-  target = np.frombuffer(ctypes.string_at(target_buf.va_addr, input_total*2), dtype=np.float16).\
-    reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
+  target_scale = np.float16(struct.unpack('<e', struct.pack('<H', scale_bits))[0])
+  uniform_weight = np.float16(struct.unpack('<e', struct.pack('<H', uniform_bits))[0])
+  if target_buf:
+    target = np.frombuffer(ctypes.string_at(target_buf[0].va_addr, input_total*2), dtype=np.float16).\
+      reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
+    target = np.asarray(target_scale*target+uniform_weight, dtype=np.float16)
+  else: target = np.full((rows, classes), uniform_weight, dtype=np.float16)
   source_f = source.astype(np.float32)
   centered = source_f-np.max(source_f, axis=1, keepdims=True)
   # PyTorch's contiguous-class kernel rounds sum/log to fp16, while its

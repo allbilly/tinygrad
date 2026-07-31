@@ -10188,3 +10188,31 @@ the exact 12-error baseline. Ruff on the three touched files remains at the
 same nine pre-existing findings (the repository-wide command reports the
 existing 2559-error baseline). Next forward group:
 `TestOps.test_cross_entropy_smoothing`.
+
+## 2026-07-31 — cross-entropy label-smoothing milestone
+
+`TestOps.test_cross_entropy_smoothing` passes all eight unchanged cases in
+**14.76s** with `FORWARD_ONLY=1`, `DEFAULT_FLOAT=HALF`, `DEV=ROCKCHIP`, and
+`-n12`. Probability and class-index targets each pass at smoothing values
+`0`, `0.3`, `0.7`, and `1`. The complete four-method cross-entropy block
+passes together in **13.39s**. The hardware-free contract remains
+**145/145 in 8.56s**, with expanded ABI checks for smoothing.
+
+Tinygrad lowers probability smoothing into the fp16 affine target
+`(1-smoothing)*target + smoothing/classes`. The exact cross-entropy task now
+serializes both half constants as raw fp16 bits and applies them before the
+class-term product. At smoothing `1`, scheduling eliminates the target
+buffer entirely; the same task admits the strict two-relocation form and
+constructs only the serialized uniform class weight. Smoothing `0` retains
+the earlier direct target form.
+
+Class-index smoothing values `0.3` and `0.7` continue through the bounded
+typed `CMPNE` one-hot evaluator, while the target-independent smoothing `1`
+form naturally shares the probability task. Diagnostics against PyTorch
+confirmed that half affine target construction plus the established
+contiguous-class log-softmax and flattened fp16 reduction boundaries is
+bit-exact for all probability cases and for the nonzero smoothed index cases.
+
+No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline,
+and Ruff on the touched files remains at the same nine pre-existing findings.
+Next forward group: `TestOps.test_sparse_categorical_crossentropy`.

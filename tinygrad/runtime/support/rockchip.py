@@ -9806,39 +9806,62 @@ def _try_cross_entropy_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
   slot_totals = {u.src[0].buf_uop.arg.slot:int(u.src[0].src[0].arg) for u in indexes}
-  if len(slot_totals) != 4: return None
+  if len(slot_totals) not in (3, 4): return None
   totals = sorted(slot_totals.values())
-  if totals[0] != totals[1] or totals[2] != totals[3] or totals[0] <= 0 or \
-     totals[2] % totals[0] or totals[2] > 4096: return None
-  rows, input_total = totals[0], totals[2]
+  rows, input_total = totals[0], totals[-1]
+  if totals.count(rows) != 2 or totals.count(input_total) != len(totals)-2 or rows <= 0 or \
+     input_total == rows or input_total % rows or input_total > 4096: return None
   classes = input_total//rows
   if not 2 <= classes <= 64: return None
 
-  # The target is the full-size direct INDEX operand of the class-term MUL;
-  # the other full-size slot, nested in the log-probability ADD, is the logits.
+  def parse_weight(weight:UOp) -> tuple[int, float, float]|None:
+    weight = _unwrap(weight)
+    if weight.op is Ops.INDEX and weight.dtype is dtypes.half and weight.src[0].op is Ops.PARAM and \
+       slot_totals.get(weight.src[0].buf_uop.arg.slot) == input_total:
+      return weight.src[0].buf_uop.arg.slot, 1.0, 0.0
+    if weight.op is Ops.CONST and weight.dtype is dtypes.half:
+      return -1, 0.0, float(weight.arg)
+    if weight.op is not Ops.ADD or weight.dtype is not dtypes.half or len(weight.src) != 2: return None
+    uniform_node = next((_unwrap(x) for x in weight.src if _unwrap(x).op is Ops.CONST and _unwrap(x).dtype is dtypes.half), None)
+    scaled = next((_unwrap(x) for x in weight.src if _unwrap(x).op is Ops.MUL), None)
+    if uniform_node is None or scaled is None or len(scaled.src) != 2: return None
+    scale_node = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST and _unwrap(x).dtype is dtypes.half), None)
+    target = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.half and
+                   _unwrap(x).src[0].op is Ops.PARAM), None)
+    if scale_node is None or target is None or slot_totals.get(target.src[0].buf_uop.arg.slot) != input_total: return None
+    return target.src[0].buf_uop.arg.slot, float(scale_node.arg), float(uniform_node.arg)
+
+  # The class-term MUL separates the three-input log-probability subtree from
+  # either a probability target, its affine label-smoothing form, or the
+  # target-independent uniform weight used at smoothing=1.
   class_terms = [u for u in nodes if u.op is Ops.MUL and u.dtype is dtypes.half]
-  candidates:list[tuple[int, int, int]] = []
+  candidates:list[tuple[int, int, int, int, int]] = []
   for term in class_terms:
     class_reductions = [u for u in reductions if term in u.src[0].toposort()]
     if not class_reductions: continue
     class_reduce = min(class_reductions, key=lambda u:len(u.toposort()))
     if len(class_reduce.src) != 2 or class_reduce.src[1].op is not Ops.RANGE: continue
     class_axis = int(class_reduce.src[1].arg[0])
-    for target_index in term.src:
-      target = _unwrap(target_index)
-      if target.op is not Ops.INDEX or target.src[0].op is not Ops.PARAM or \
-         slot_totals.get(target.src[0].buf_uop.arg.slot) != input_total: continue
-      target_affine = _affine_index(target.src[1])
-      if target_affine is None or target_affine[1] != 0 or \
-         (class_stride := target_affine[0].get(class_axis, 0)) <= 0: continue
-      other = _unwrap(term.src[0] if term.src[1] is target_index else term.src[1])
-      other_slots = {u.src[0].buf_uop.arg.slot for u in other.toposort()
+    for log_index in range(2):
+      logarithm, weight = _unwrap(term.src[log_index]), term.src[1-log_index]
+      log_slots = {u.src[0].buf_uop.arg.slot for u in logarithm.toposort()
                      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
-      full_other = [slot for slot in other_slots if slot_totals.get(slot) == input_total]
-      if len(full_other) == 1 and len(other_slots) == 3:
-        candidates.append((full_other[0], target.src[0].buf_uop.arg.slot, class_stride))
+      source_indexes = [u for u in logarithm.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.half and
+                        u.src[0].op is Ops.PARAM and slot_totals.get(u.src[0].buf_uop.arg.slot) == input_total]
+      parsed_weight = parse_weight(weight)
+      if len(log_slots) != 3 or len(source_indexes) != 1 or parsed_weight is None: continue
+      source = source_indexes[0]
+      source_affine = _affine_index(source.src[1])
+      if source_affine is None or source_affine[1] != 0 or \
+         (class_stride := source_affine[0].get(class_axis, 0)) <= 0: continue
+      target_slot, target_scale, uniform_weight = parsed_weight
+      if target_slot == source.src[0].buf_uop.arg.slot or \
+         not math.isclose(target_scale+uniform_weight*classes, 1.0, rel_tol=0.0, abs_tol=0.005): continue
+      scale_bits = struct.unpack('<H', struct.pack('<e', target_scale))[0]
+      uniform_bits = struct.unpack('<H', struct.pack('<e', uniform_weight))[0]
+      candidates.append((source.src[0].buf_uop.arg.slot, target_slot, class_stride, scale_bits, uniform_bits))
   if len(set(candidates)) != 1: return None
-  source_slot, target_slot, class_stride = candidates[0]
+  source_slot, target_slot, class_stride, scale_bits, uniform_bits = candidates[0]
   if source_slot == target_slot or rows % class_stride: return None
 
   output_total = prod(_shape_of_store(sink))
@@ -9851,9 +9874,10 @@ def _try_cross_entropy_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                    math.isclose(float(u.arg), 1.0/rows, rel_tol=1e-12)]
     reduction_code = 2 if mean_scales else 1
   out_slot = ProgramInfo.from_sink(sink).outs[0]
-  layout = (output_total, _HOST_CROSS_ENTROPY_LAYOUT, reduction_code, rows, classes, class_stride)
+  layout = (output_total, _HOST_CROSS_ENTROPY_LAYOUT, reduction_code, rows, classes, class_stride, scale_bits, uniform_bits)
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
-  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, target_slot))
+  input_slots = (source_slot,) if target_slot < 0 else (source_slot, target_slot)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
   return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
 
 def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:

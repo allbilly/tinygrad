@@ -717,13 +717,21 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(subtasks[0].task.layout[1], _HOST_BCE_LAYOUT)
 
   def test_probability_cross_entropy_uses_exact_bounded_task(self):
+    def half_bits(value:float) -> int: return struct.unpack("<H", struct.pack("<e", value))[0]
     source_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
     target_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
     source_4d = Tensor.empty(32,4,4,4, dtype=dtypes.half, device="ROCKCHIP")
     target_4d = Tensor.empty(32,4,4,4, dtype=dtypes.half, device="ROCKCHIP")
-    expressions = ((source_2d.cross_entropy(target_2d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1)),
-                   (source_2d.cross_entropy(target_2d, reduction="none"), (32, _HOST_CROSS_ENTROPY_LAYOUT, 0, 32, 10, 1)),
-                   (source_4d.cross_entropy(target_4d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 512, 4, 16)))
+    expressions = (
+      (source_2d.cross_entropy(target_2d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1, half_bits(1), half_bits(0))),
+      (source_2d.cross_entropy(target_2d, reduction="none"),
+       (32, _HOST_CROSS_ENTROPY_LAYOUT, 0, 32, 10, 1, half_bits(1), half_bits(0))),
+      (source_2d.cross_entropy(target_2d, label_smoothing=.3),
+       (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1, half_bits(.7), half_bits(.03))),
+      (source_2d.cross_entropy(target_2d, label_smoothing=1),
+       (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1, half_bits(0), half_bits(.1))),
+      (source_4d.cross_entropy(target_4d),
+       (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 512, 4, 16, half_bits(1), half_bits(0))))
     for expression, expected_layout in expressions:
       sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
       program = build_native_program(sinks[-1])
