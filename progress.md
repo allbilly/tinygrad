@@ -12390,6 +12390,23 @@ reaching **11,381** in `support/rockchip.py`.
 PR1 passes **173/173 in 12.87s** and focused RK3588 TAN passes **1/1 in 1.66s**.
 Static baselines remain exactly 12 mypy errors and eight Ruff findings.
 
+### Inactive lowering source archive
+
+Commit `ec1852f2c`; saved patch
+`0154-rockchip-archive-inactive-lowering-experiments.patch`.
+
+An AST load/reference audit proved six top-level experiments are absent from
+all active dispatch and calls: rejected QuickGELU and TAN alternatives, an
+fp32 sum-output attempt, two disabled long-cumprod helpers, and native small
+integer power WIP. Their **complete 332 physical lines remain verbatim** as
+line comments, satisfying the repository rule to preserve Rockchip WIP while
+excluding inactive implementation from `sz.py`.
+
+This removes **309 counted lines**, reaching **11,072** in
+`support/rockchip.py`, without deleting source or changing an active symbol.
+PR1 passes **173/173 in 12.94s**; mypy/Ruff remain exactly 12/8 and compile/diff
+checks pass.
+
 ### Declarative GELU/ELU graphs
 
 Commit `1e4c75025`; patch

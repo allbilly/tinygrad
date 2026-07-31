@@ -3498,3 +3498,13 @@ Focused forward-only RK3588 status is **1/1 PASS in 1.66s** for
 `TestOps::test_tan`. PR1 passes **173/173 in 12.87s**; static baselines remain
 exactly 12 mypy errors and eight touched-file Ruff findings. The support file
 is now **11,381 counted lines**.
+
+### Inactive WIP archive
+
+Commit `ec1852f2c`; saved patch
+`0154-rockchip-archive-inactive-lowering-experiments.patch`.
+
+Six unreferenced experiments were preserved verbatim as comments; no active
+classifier or runtime path changed. PR1 passes **173/173 in 12.94s**, static
+baselines remain exactly 12 mypy errors and eight Ruff findings, and the
+support file is now **11,072 counted lines**.
