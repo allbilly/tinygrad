@@ -9228,6 +9228,33 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_fp32_log_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Replay the exact bounded fp32 log and stable logaddexp scheduled graphs."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].op is not Ops.INDEX or \
+     store.src[0].dtype is not dtypes.float or store.src[1].dtype is not dtypes.float: return None
+  value, nodes = store.src[1], store.src[1].toposort()
+  allowed = {Ops.ADD, Ops.MUL, Ops.MAX, Ops.EXP2, Ops.LOG2, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+  indexes = [u for u in nodes if u.op is Ops.INDEX]
+  if len(indexes) not in (1, 2) or any(u.dtype is not dtypes.float or u.src[0].op is not Ops.PARAM for u in indexes): return None
+  out_affine = _affine_index(store.src[0].src[1])
+  total = prod(_shape_of_store(sink))
+  if out_affine is None or not 1 <= total <= 1 << 20: return None
+  direct = [u for u in indexes if _affine_index(u.src[1]) == out_affine and int(u.src[0].src[0].arg) == total]
+  broadcast = [u for u in indexes if u.src[1].op is Ops.CONST and int(u.src[1].arg) == 0 and int(u.src[0].src[0].arg) == 1]
+  if len(direct) + len(broadcast) != len(indexes) or len(direct) < 1: return None
+  counts = {op:sum(u.op is op for u in nodes) for op in (Ops.ADD, Ops.MUL, Ops.MAX, Ops.EXP2, Ops.LOG2)}
+  float_constants = sorted(float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float)
+  is_log = value.op is Ops.MUL and counts == {Ops.ADD:0, Ops.MUL:1, Ops.MAX:0, Ops.EXP2:0, Ops.LOG2:1} and \
+    len(float_constants) == 1 and math.isclose(float_constants[0], math.log(2.0), rel_tol=0.0, abs_tol=1e-12)
+  expected = (-1.0, math.log(2.0), math.log2(math.e))
+  is_logaddexp = value.op is Ops.ADD and counts == {Ops.ADD:4, Ops.MUL:4, Ops.MAX:1, Ops.EXP2:2, Ops.LOG2:1} and \
+    len(indexes) == 2 and len(float_constants) == 3 and all(math.isclose(x, y, rel_tol=0.0, abs_tol=1e-12)
+                                                            for x, y in zip(float_constants, sorted(expected)))
+  if not (is_log or is_logaddexp): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _try_uint8_min_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Evaluate tinygrad's exact uint8 MIN-as-XOR(MAX(XOR(x, 255)), 255) graph."""
   reduce, store = _reduce_node(sink), _store_node(sink)
@@ -15052,6 +15079,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
   if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, logcumsumexp_tasks)
+  if (fp32_log_tasks := _try_fp32_log_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp32_log_tasks)
   if (fancy_index_tasks := _try_fancy_index_preprocess_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fancy_index_tasks)
   if (fancy_index_reduce_tasks := _try_fancy_index_reduction_host_subtasks(sink)) is not None:

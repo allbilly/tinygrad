@@ -624,6 +624,18 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
 
+  def test_fp32_log_and_logaddexp_use_strict_serialized_tasks(self):
+    lhs = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
+    rhs = Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP")
+    scalar = Tensor.empty(1, dtype=dtypes.float, device="ROCKCHIP")
+    vector = Tensor.empty(3, dtype=dtypes.float, device="ROCKCHIP")
+    for expression in (lhs.log(), lhs.logaddexp(rhs), scalar.logaddexp(vector)):
+      program = build_native_program(_get_sink(expression))
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_sinh_cosh_avoid_generic_dpu_splitter(self):
     for expression in (Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").sinh(),
                        Tensor.empty(45,65, dtype=dtypes.float, device="ROCKCHIP").cosh()):
