@@ -5821,6 +5821,15 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     t0, mask, scratch, selected_false = range(first, first+4)
     int_out = final and w.dtype is dtypes.int
     uint8_out = final and w.dtype is dtypes.uint8
+    def select(mask_arg:tuple[int,int]) -> bool:
+      tasks.extend((_emit_where_stage(total, scratch, true, mask_arg, Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, t0, true, mask_arg, Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, scratch, one, mask_arg, Ops.SUB),
+                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
+                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
+                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
+      return True
     if cond.op is Ops.CMPLT:
       lhs, rhs = (lower_arg(x) for x in cond.src)
       if lhs is None or rhs is None: return False
@@ -5889,15 +5898,7 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                                         int32_output=int_out, uint8_output=uint8_out)))
         return True
 
-      tasks.extend((
-                    _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
-                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
-                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
-      return True
+      return select((mask,0))
     if cond.op is Ops.CMPNE:
       lhs, rhs = (lower_arg(x) for x in cond.src)
       if lhs is None or rhs is None: return False
@@ -5908,15 +5909,7 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                     _emit_where_stage(total, neg, (t0,0), neg_one, Ops.MUL),
                     _emit_where_stage(total, neg_mask, (neg,0), (neg,0), Ops.MAX, compare=True),
                     _emit_where_stage(total, mask, (pos_mask,0), (neg_mask,0), Ops.MAX)))
-      tasks.extend((
-                    _emit_where_stage(total, scratch, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, t0, true, (mask,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, scratch, one, (mask,0), Ops.SUB),
-                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
-                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
-      return True
+      return select((mask,0))
     if cond.op is Ops.OR and all(_unwrap(x).op is Ops.CMPLT for x in cond.src):
       masks = []
       for cmp in cond.src:
@@ -5928,15 +5921,8 @@ def _try_where_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                       _emit_where_stage(total, cmp_mask, (diff,0), (diff,0), Ops.MAX, compare=True)))
         masks.append((cmp_mask, 0))
       combined = alloc()
-      tasks.extend((_emit_where_stage(total, combined, masks[0], masks[1], Ops.MAX),
-                    _emit_where_stage(total, scratch, true, (combined,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, t0, true, (combined,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, scratch, one, (combined,0), Ops.SUB),
-                    _emit_where_stage(total, mask, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, selected_false, false, (scratch,0), Ops.MUL, broadcast_inputs=broadcasts),
-                    _emit_where_stage(total, out_slot, (t0,0), (selected_false,0), Ops.ADD,
-                                      broadcast_inputs=broadcasts, int32_output=int_out, uint8_output=uint8_out)))
-      return True
+      tasks.append(_emit_where_stage(total, combined, masks[0], masks[1], Ops.MAX))
+      return select((combined,0))
     if cond.op is Ops.INDEX and (mask_arg := _where_arg(cond)) is not None:
       bool_slots = (mask_arg[0],)
       tasks.extend((_emit_where_stage(total, t0, true, mask_arg, Ops.MUL, bool_inputs=bool_slots, broadcast_inputs=broadcasts),
