@@ -1,0 +1,76 @@
+From 7a5f0b5cbdb88a2574e7f840e4d1498fb8d3d431 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 13:38:23 +0800
+Subject: [PATCH] rockchip: pass round quantization forward
+
+---
+ test/rockchip/test_pr1.py            | 10 ++++++++++
+ tinygrad/runtime/support/rockchip.py | 24 ++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index a1a37e915..9ece892b0 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -869,6 +869,16 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(len(subtasks), 1)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_round_quantization_uses_one_typed_host_task(self):
++    source = Tensor.empty(6, dtype=dtypes.half, device="ROCKCHIP")
++    expression = source + 0.125*(source.round()-source)
++    sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++    program = build_native_program(sink)
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
+     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
+     for expression in (source.argmax(0, False), source.argmin(0, False)):
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 79c4cbcb1..3043869e0 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9275,6 +9275,28 @@ def _try_floor_ceil_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+      int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
++def _try_round_quantization_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate x + 0.125*(round(x)-x) without splitting round's non-index operands."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half or _reduce_node(sink) is not None: return None
++  value = _unwrap(store.src[1])
++  indexes = list(dict.fromkeys(u for u in value.toposort() if u.op is Ops.INDEX))
++  if value.op is not Ops.ADD or len(indexes) != 1: return None
++  source = indexes[0]
++  if source.dtype is not dtypes.half or source.src[0].op is not Ops.PARAM or source not in value.src: return None
++  scaled = next((u for u in value.src if u is not source), None)
++  if scaled is None or scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
++  scale = next((u for u in scaled.src if u.op is Ops.CONST and float(u.arg) == 0.125), None)
++  difference = next((u for u in scaled.src if u is not scale), None)
++  if scale is None or difference is None or difference.op is not Ops.ADD or len(difference.src) != 2: return None
++  rounded = next((u for u in difference.src if u.op is Ops.WHERE and _try_round(u) is source), None)
++  negative = next((u for u in difference.src if u is not rounded), None)
++  if rounded is None or negative is None or negative.op is not Ops.MUL or source not in negative.src or \
++     not any(u.op is Ops.CONST and float(u.arg) == -1.0 for u in negative.src): return None
++  total = prod(_shape_of_store(sink))
++  if int(source.src[0].src[0].arg) != total or not 1 <= total <= 1 << 20: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_axis_arg_extrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Preserve argmax/argmin's public axis coordinate instead of its flattened source address."""
+   store = _store_node(sink)
+@@ -14645,6 +14667,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (bitcast_tasks := _try_bitcast_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitcast_tasks)
+   if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
+   if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
++  if (round_quantization_tasks := _try_round_quantization_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, round_quantization_tasks)
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
+-- 
+2.34.1
+

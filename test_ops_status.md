@@ -2686,3 +2686,17 @@ fails forward with `non_index_operand` and is the next group.
 
 Contract remains **157/157 in 9.09s** and adapter Ruff passes. No LUT or
 backend code changed.
+
+### Round quantization forward
+
+`test_round_quantization_gradient` passes its unchanged forward assertion in
+**11.03s** under `FORWARD_ONLY=1`. Commit `7a5f0b5cb`; saved patch
+`0095-rockchip-pass-round-quantization-forward.patch`.
+
+The exact `x + 0.125*(round(x)-x)` fp16 graph now uses one bounded typed
+task. The matcher requires the canonical round-even tree and exact outer
+constants; it does not broaden generic host execution. Backward remains
+deferred.
+
+Contract: **158/158 in 9.99s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. No LUT changed. Next: refreshed forward retally.

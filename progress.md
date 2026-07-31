@@ -10688,3 +10688,24 @@ The exact three-node audit reports two skips and one active failure.
 Hardware-free Rockchip remains **157/157 in 9.09s** and the adapter passes
 Ruff. No backend or LUT changed. Next group:
 `TestOps.test_round_quantization_gradient`.
+
+## 2026-07-31 — round-quantization forward milestone
+
+The forward assertion in `TestOps.test_round_quantization_gradient` passes
+unchanged in **11.03s** under `FORWARD_ONLY=1`. Implementation commit:
+`7a5f0b5cb`; portable patch:
+`0095-rockchip-pass-round-quantization-forward.patch`.
+
+The fused expression `x + 0.125*(round(x)-x)` was rejected as
+`non_index_operand`: the standalone round matcher accepts only a root round
+graph, while generic DPU splitting could not lower its nested WHERE tree.
+A strict matcher now requires one direct same-size fp16 input, the exact
+round-to-nearest-even expansion already recognized by `_try_round`, outer
+scale exactly `0.125`, subtraction represented by an exact `-1` multiply,
+no reduction, and a `2**20` bound. The full expression executes as one typed
+task. Backward remains intentionally suppressed.
+
+Hardware-free Rockchip is **158/158 in 9.99s**. Mypy remains at the exact
+12-error baseline and touched-file Ruff at the exact nine pre-existing
+findings. No LUT or two-level LUT changed. Next action: refreshed parallel
+forward retally, with every candidate reproduced alone before fixing.
