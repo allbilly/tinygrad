@@ -3371,3 +3371,12 @@ GELU and ELU/SELU now compose shared interval-mask and symmetric-clamp graph
 primitives. Support size reaches **12,157 counted lines**. PR1 is **173/173**;
 GELU, GELU-extreme, ELU, and SELU pass **4/4 in 27.47s** on hardware, with
 static baselines unchanged.
+
+### CELU and Mish task graphs
+
+Commit `ca3f8725e`; saved patch
+`0141-rockchip-compose-celu-and-mish-task-graphs.patch`.
+
+CELU and Mish now use the shared regional activation graph. Support size is
+**12,061 counted lines**. PR1 passes **173/173**; focused CELU and Mish hardware
+methods both pass, with static baselines unchanged.

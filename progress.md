@@ -7749,6 +7749,20 @@ range, and identity cases passed before the explicit-half boundary, and the
 final 64x64, 256x256, empty-shape, broadcast-dot, and multidot groups also
 pass.
 
+### Declarative CELU/Mish graphs
+
+Commit `ca3f8725e`; patch
+`0141-rockchip-compose-celu-and-mish-task-graphs.patch`.
+
+CELU's fallback/broad/local/positive selection and Mish's broad/local/
+near-zero/wide selection now compose `_TaskGraph` primitives. Nested fallback
+relocation tracking in CELU is handled by `extend`. This removes **96 counted
+lines**, reaching **12,061**.
+
+PR1 passes **173/173**. CELU passes **1/1 in 17.49s** and Mish passes **1/1 in
+4.45s** on RK3588. Mypy/Ruff remain at 12/8; compilation and diff checking
+pass.
+
 ### Padded fp32 CMAC operands
 
 The 9→16 padded GEMM exposed source operands as
