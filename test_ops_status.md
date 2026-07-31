@@ -3425,3 +3425,16 @@ Commit `f55e39c3b`; saved patch
 ATAN and ATANH now express folding, detail regions, and validity restoration
 through `_TaskGraph`. Support size is **11,758**. PR1 is **173/173**, and both
 hardware methods pass in 22.05s with static baselines unchanged.
+
+### ASINH/ACOSH task-graph compaction
+
+Commit `39983f66a`; saved patch
+`0147-rockchip-compose-asinh-acosh-task-graphs.patch`.
+
+The ASINH/ACOSH forward lowerers now use `_TaskGraph` end to end, including the
+active ACOSH fp32 endpoint residual and preserved disabled ASINH residual WIP.
+Focused forward-only hardware status is **2/2 PASS in 22.13s**:
+`TestOps::test_asinh` and `TestOps::test_acosh`. Hardware-free PR1 is
+**173/173 PASS in 13.34s** when run in its normal environment. Static baselines
+are unchanged at 12 mypy errors and eight touched-file Ruff findings. The
+support file is now **11,704 counted lines**.

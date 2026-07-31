@@ -12361,3 +12361,25 @@ explicit through the graph API. This removes **99 counted lines**, reaching
 PR1 passes **173/173 in 13.37s**. GELU, GELU-extreme, ELU, and SELU pass **4/4
 in 27.47s** on RK3588. Mypy/Ruff remain at 12/8; compilation and diff checking
 pass.
+
+### ASINH/ACOSH regional graphs
+
+Commit `39983f66a`; saved patch
+`0147-rockchip-compose-asinh-acosh-task-graphs.patch`.
+
+ASINH and ACOSH now compose their sign/domain masks, local/broad/middle/huge
+coordinates, two named LUT tasks, regional decode, sign restoration, and ACOSH
+validity factor through `_TaskGraph`. The disabled fp32 ASINH residual experiment
+remains executable reference code, while ACOSH keeps its active fp32 endpoint
+residual path. Explicit `repeat=False` calls preserve single-consumption stages;
+the comparison and division dependencies retain their duplicated visibility
+writes.
+
+This batch removes **54 counted lines**, taking `support/rockchip.py` from
+11,758 to **11,704 counted lines**. PR1 passes **173/173 in 13.34s**, and
+focused serialized RK3588 ASINH/ACOSH testing passes **2/2 in 22.13s**. Mypy
+remains at the exact 12-error baseline and touched-file Ruff at the exact
+eight-finding baseline; compilation and `git diff --check` pass. PR1 must run
+without an externally forced `DEFAULT_FLOAT=HALF`, because its fp32 normalize
+classifier intentionally verifies the default scheduler shape; hardware
+TestOps continues to use `DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.

@@ -1,0 +1,249 @@
+From 39983f66a4f2931cd50b11c6e61c3671e9bf1eb0 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 02:25:22 +0800
+Subject: [PATCH] rockchip: compose asinh acosh task graphs
+
+---
+ tinygrad/runtime/support/rockchip.py | 202 ++++++++++-----------------
+ 1 file changed, 74 insertions(+), 128 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 7d0580e18..09f8bc5a7 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4014,158 +4014,104 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if store is None or (match := _try_asinh_acosh(store.src[1])) is None: return None
+   source, is_acosh = match
+   graph = _TaskGraph(sink, store, source)
+-  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
+-  add_lut = graph.emit_named_lut
++  total, out, tasks = graph.total, graph.out, graph.tasks
+ 
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+   # Rejected WIP: a 1.5*fp32 residual nudge for small ASINH inputs only
+   # moved which samples landed in the wrong fp16 output bin. Keep the path
+   # disabled for reference; ACOSH still needs the residual for its endpoint.
+   apply_small_residual = False
+-  source_residual = alloc() if source.dtype is dtypes.float and (is_acosh or apply_small_residual) else -1
++  source_residual = graph.alloc() if source.dtype is dtypes.float and (is_acosh or apply_small_residual) else -1
+   if source_residual >= 0:
+     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     relocs = (RKReloc(0, source_residual, 0, 0, 0xFFFFFFFF), RKReloc(0, source_arg[0], 0, 0, 0xFFFFFFFF))
+     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, _HOST_FP32_RESIDUAL_LAYOUT), source_residual, is_copy=True), relocs))
+   invalid = -1
+   if is_acosh:
+-    below_diff, below_scratch, invalid, magnitude = (alloc() for _ in range(4))
+-    tasks.extend((_emit_where_stage(total, below_diff, one, source_arg, Ops.SUB),
+-                  _emit_where_stage(total, below_scratch, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, invalid, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, magnitude, source_arg, one, Ops.MAX)))
++    invalid = graph.positive_mask(one, source_arg, repeat=True)[0]
++    magnitude = graph.op(source_arg, one, Ops.MAX, repeat=False)[0]
+     negative, nonnegative = -1, -1
+   else:
+-    neg_source, magnitude = alloc(), alloc()
+-    negative_diff, negative_scratch, negative, nonnegative = (alloc() for _ in range(4))
+-    tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+-                  _emit_where_stage(total, magnitude, source_arg, (neg_source, 0), Ops.MAX),
+-                  _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
+-                  _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, nonnegative, one, (negative, 0), Ops.SUB)))
+-
+-  small_diff, small_scratch, small_outside, small = (alloc() for _ in range(4))
+-  huge_diff, huge_scratch, huge, mid_region = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, small_diff, (magnitude, 0), _float_arg(2), Ops.SUB),
+-                _emit_where_stage(total, small_scratch, (small_diff, 0), (small_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, small_outside, (small_diff, 0), (small_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, small, one, (small_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, huge_diff, (magnitude, 0), _float_arg(16), Ops.SUB),
+-                _emit_where_stage(total, huge_scratch, (huge_diff, 0), (huge_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, huge, (huge_diff, 0), (huge_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, mid_region, (small_outside, 0), (huge, 0), Ops.SUB)))
+-
+-  local_inside, local_mask, broad_region = -1, -1, -1
+-  near_inside = -1
++    neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++    magnitude = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)[0]
++    negative = graph.positive_mask(zero, source_arg, repeat=True)[0]
++    nonnegative = graph.op(one, (negative,0), Ops.SUB, repeat=False)[0]
++
++  small_outside = graph.positive_mask((magnitude,0), _float_arg(2), repeat=True)[0]
++  small = graph.op(one, (small_outside,0), Ops.SUB, repeat=False)[0]
++  huge = graph.positive_mask((magnitude,0), _float_arg(16), repeat=True)[0]
++  mid_region = graph.op((small_outside,0), (huge,0), Ops.SUB, repeat=False)[0]
++
+   if is_acosh:
+-    distance, local_diff, local_scratch, local_outside = (alloc() for _ in range(4))
+-    local_inside, broad_region = alloc(), alloc()
+-    nonexact_diff, nonexact_scratch, nonexact = (alloc() for _ in range(3))
+-    tasks.append(_emit_where_stage(total, distance, source_arg if source_residual >= 0 else (magnitude, 0), one, Ops.SUB))
+-    coordinate_source = distance
++    coordinate_source = graph.op(source_arg if source_residual >= 0 else (magnitude,0), one, Ops.SUB, repeat=False)
+     if source_residual >= 0:
+-      scaled_residual, coordinate_source = alloc(), alloc()
+-      refined_below_diff, refined_below_scratch, invalid = alloc(), alloc(), alloc()
+-      tasks.extend((_emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1/256), Ops.MUL),
+-                    _emit_where_stage(total, coordinate_source, (distance, 0), (scaled_residual, 0), Ops.ADD),
+-                    _emit_where_stage(total, refined_below_diff, zero, (coordinate_source, 0), Ops.SUB),
+-                    _emit_where_stage(total, refined_below_scratch, (refined_below_diff, 0), (refined_below_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, invalid, (refined_below_diff, 0), (refined_below_diff, 0), Ops.MAX, compare=True)))
+-    tasks.extend((_emit_where_stage(total, local_diff, (coordinate_source, 0), _float_arg(.04), Ops.SUB),
+-                  _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, broad_region, (small, 0), (local_inside, 0), Ops.SUB),
+-                  _emit_where_stage(total, nonexact_diff, (coordinate_source, 0), _float_arg(.0005), Ops.SUB),
+-                  _emit_where_stage(total, nonexact_scratch, (nonexact_diff, 0), (nonexact_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, nonexact, (nonexact_diff, 0), (nonexact_diff, 0), Ops.MAX, compare=True)))
++      scaled_residual = graph.op((source_residual,0), _float_arg(1/256), Ops.MUL, repeat=False)
++      coordinate_source = graph.op(coordinate_source, scaled_residual, Ops.ADD, repeat=False)
++      invalid = graph.positive_mask(zero, coordinate_source, repeat=True)[0]
++    local_outside = graph.positive_mask(coordinate_source, _float_arg(.04), repeat=True)
++    local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++    broad_region = graph.op((small,0), local_inside, Ops.SUB, repeat=False)
++    nonexact = graph.positive_mask(coordinate_source, _float_arg(.0005), repeat=True)
+   else:
+-    near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
+-    local_diff, local_scratch, local_outside, local_inside = (alloc() for _ in range(4))
+-    local_mask, broad_region = alloc(), alloc()
+-    tasks.extend((_emit_where_stage(total, near_diff, (magnitude, 0), _float_arg(.04), Ops.SUB),
+-                  _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_diff, (magnitude, 0), _float_arg(.25), Ops.SUB),
+-                  _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                  _emit_where_stage(total, broad_region, (small, 0), (local_inside, 0), Ops.SUB)))
+-    coordinate_source, nonexact = magnitude, -1
++    near_outside = graph.positive_mask((magnitude,0), _float_arg(.04), repeat=True)
++    near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++    local_outside = graph.positive_mask((magnitude,0), _float_arg(.25), repeat=True)
++    local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++    local_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++    broad_region = graph.op((small,0), local_inside, Ops.SUB, repeat=False)
++    coordinate_source = (magnitude,0)
+ 
+-  neg_coordinate, amplified_coordinate, local_coordinate = (alloc() for _ in range(3))
+-  broad_raw, broad_coordinate, core_input = alloc(), alloc(), alloc()
+   local_gain, broad_gain = (48 if is_acosh else 8), (2 if is_acosh else 1)
+-  tasks.extend((_emit_where_stage(total, neg_coordinate, zero, (coordinate_source, 0), Ops.SUB),
+-                _emit_where_stage(total, amplified_coordinate, (neg_coordinate, 0), _float_arg(local_gain), Ops.MUL),
+-                _emit_where_stage(total, local_coordinate, (amplified_coordinate, 0), (local_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_raw, (coordinate_source, 0), _float_arg(broad_gain), Ops.MUL),
+-                _emit_where_stage(total, broad_coordinate, (broad_raw, 0), (broad_region, 0), Ops.MUL),
+-                _emit_where_stage(total, core_input, (local_coordinate, 0), (broad_coordinate, 0), Ops.ADD)))
+-
+-  middle_delta, negative_middle, middle_coordinate = (alloc() for _ in range(3))
+-  huge_scaled, huge_coordinate, range_input = (alloc() for _ in range(3))
+-  tasks.extend((_emit_where_stage(total, middle_delta, (magnitude, 0), _float_arg(2), Ops.SUB),
+-                _emit_where_stage(total, negative_middle, zero, (middle_delta, 0), Ops.SUB),
+-                _emit_where_stage(total, middle_coordinate, (negative_middle, 0), (mid_region, 0), Ops.MUL),
+-                _emit_where_stage(total, huge_scaled, (magnitude, 0), _float_arg(1/19), Ops.MUL),
+-                _emit_where_stage(total, huge_coordinate, (huge_scaled, 0), (huge, 0), Ops.MUL),
+-                _emit_where_stage(total, range_input, (middle_coordinate, 0), (huge_coordinate, 0), Ops.ADD)))
+-
+-  core_slot, range_slot = alloc(), alloc()
++  neg_coordinate = graph.op(zero, coordinate_source, Ops.SUB, repeat=False)
++  amplified_coordinate = graph.op(neg_coordinate, _float_arg(local_gain), Ops.MUL, repeat=False)
++  local_coordinate = graph.op(amplified_coordinate, local_inside, Ops.MUL, repeat=False)
++  broad_raw = graph.op(coordinate_source, _float_arg(broad_gain), Ops.MUL, repeat=False)
++  broad_coordinate = graph.op(broad_raw, broad_region, Ops.MUL, repeat=False)
++  core_input = graph.op(local_coordinate, broad_coordinate, Ops.ADD, repeat=False)
++
++  middle_delta = graph.op((magnitude,0), _float_arg(2), Ops.SUB, repeat=False)
++  negative_middle = graph.op(zero, middle_delta, Ops.SUB, repeat=False)
++  middle_coordinate = graph.op(negative_middle, (mid_region,0), Ops.MUL, repeat=False)
++  huge_scaled = graph.op((magnitude,0), _float_arg(1/19), Ops.MUL, repeat=False)
++  huge_coordinate = graph.op(huge_scaled, (huge,0), Ops.MUL, repeat=False)
++  range_input = graph.op(middle_coordinate, huge_coordinate, Ops.ADD, repeat=False)
++
++  core_slot, range_slot = graph.alloc(), graph.alloc()
+   prefix = "acosh" if is_acosh else "asinh"
+-  if not add_lut(f"rk_{prefix}_core", core_input, core_slot) or not add_lut(f"rk_{prefix}_range", range_input, range_slot): return None
+-  local_scaled, local_selected, broad_scaled, broad_selected = (alloc() for _ in range(4))
+-  middle_scaled, middle_selected, huge_scaled_output, huge_selected = (alloc() for _ in range(4))
+-  near_selected = alloc() if not is_acosh else -1
+-  first, second, magnitude_result = alloc(), alloc(), alloc()
++  if not graph.emit_named_lut(f"rk_{prefix}_core", core_input[0], core_slot) or \
++     not graph.emit_named_lut(f"rk_{prefix}_range", range_input[0], range_slot): return None
+   local_scale = .5 if is_acosh else .25
+-  tasks.extend((_emit_where_stage(total, local_scaled, (core_slot, 0), _float_arg(local_scale), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_scaled, 0),
+-                                  (local_inside if is_acosh else local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_scaled, (core_slot, 0), _float_arg(2), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_region, 0), Ops.MUL),
+-                _emit_where_stage(total, middle_scaled, (range_slot, 0), _float_arg(4), Ops.MUL),
+-                _emit_where_stage(total, middle_selected, (middle_scaled, 0), (mid_region, 0), Ops.MUL),
+-                _emit_where_stage(total, huge_scaled_output, (range_slot, 0), _float_arg(8), Ops.MUL),
+-                _emit_where_stage(total, huge_selected, (huge_scaled_output, 0), (huge, 0), Ops.MUL)))
++  local_scaled = graph.op((core_slot,0), _float_arg(local_scale), Ops.MUL, repeat=False)
++  local_selected = graph.op(local_scaled, local_inside if is_acosh else local_mask, Ops.MUL, repeat=False)
++  broad_scaled = graph.op((core_slot,0), _float_arg(2), Ops.MUL, repeat=False)
++  broad_selected = graph.op(broad_scaled, broad_region, Ops.MUL, repeat=False)
++  middle_scaled = graph.op((range_slot,0), _float_arg(4), Ops.MUL, repeat=False)
++  middle_selected = graph.op(middle_scaled, (mid_region,0), Ops.MUL, repeat=False)
++  huge_scaled_output = graph.op((range_slot,0), _float_arg(8), Ops.MUL, repeat=False)
++  huge_selected = graph.op(huge_scaled_output, (huge,0), Ops.MUL, repeat=False)
++  first = graph.op(local_selected, broad_selected, Ops.ADD, repeat=False)
++  second = graph.op(middle_selected, huge_selected, Ops.ADD, repeat=False)
++  magnitude_result = graph.op(first, second, Ops.ADD, repeat=False)
+   if not is_acosh:
+-    tasks.append(_emit_where_stage(total, near_selected, (magnitude, 0), (near_inside, 0), Ops.MUL))
+-  tasks.extend((_emit_where_stage(total, first, (local_selected, 0), (broad_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, second, (middle_selected, 0), (huge_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, magnitude_result, (first, 0), (second, 0), Ops.ADD)))
+-  if not is_acosh:
+-    with_near = alloc()
+-    tasks.append(_emit_where_stage(total, with_near, (magnitude_result, 0), (near_selected, 0), Ops.ADD))
+-    negative_result, positive_selected, negative_selected = (alloc() for _ in range(3))
+-    signed_result = out if source_residual < 0 or not apply_small_residual else alloc()
+-    tasks.extend((_emit_where_stage(total, negative_result, zero, (with_near, 0), Ops.SUB),
+-                  _emit_where_stage(total, positive_selected, (with_near, 0), (nonnegative, 0), Ops.MUL),
+-                  _emit_where_stage(total, negative_selected, (negative_result, 0), (negative, 0), Ops.MUL),
+-                  _emit_where_stage(total, signed_result, (positive_selected, 0), (negative_selected, 0), Ops.ADD)))
++    near_selected = graph.op((magnitude,0), near_inside, Ops.MUL, repeat=False)
++    with_near = graph.op(magnitude_result, near_selected, Ops.ADD, repeat=False)
++    negative_result = graph.op(zero, with_near, Ops.SUB, repeat=False)
++    positive_selected = graph.op(with_near, (nonnegative,0), Ops.MUL, repeat=False)
++    negative_selected = graph.op(negative_result, (negative,0), Ops.MUL, repeat=False)
++    signed_result = graph.op(positive_selected, negative_selected, Ops.ADD,
++                             out_slot=out if source_residual < 0 or not apply_small_residual else None, repeat=False)
+     if apply_small_residual and source_residual >= 0:
+-      correction_diff, correction_scratch, correction_outside, correction_inside = (alloc() for _ in range(4))
+-      scaled_residual, selected_correction = alloc(), alloc()
+-      tasks.extend((_emit_where_stage(total, correction_diff, (magnitude, 0), _float_arg(.25), Ops.SUB),
+-                    _emit_where_stage(total, correction_scratch, (correction_diff, 0), (correction_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, correction_outside, (correction_diff, 0), (correction_diff, 0), Ops.MAX, compare=True),
+-                    _emit_where_stage(total, correction_inside, one, (correction_outside, 0), Ops.SUB),
+-                    _emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1.5/256), Ops.MUL),
+-                    _emit_where_stage(total, selected_correction, (scaled_residual, 0), (correction_inside, 0), Ops.MUL),
+-                    _emit_where_stage(total, out, (signed_result, 0), (selected_correction, 0), Ops.ADD)))
++      correction_outside = graph.positive_mask((magnitude,0), _float_arg(.25), repeat=True)
++      correction_inside = graph.op(one, correction_outside, Ops.SUB, repeat=False)
++      scaled_residual = graph.op((source_residual,0), _float_arg(1.5/256), Ops.MUL, repeat=False)
++      selected_correction = graph.op(scaled_residual, correction_inside, Ops.MUL, repeat=False)
++      graph.op(signed_result, selected_correction, Ops.ADD, out_slot=out, repeat=False)
+   else:
+-    exact_zeroed = alloc()
+-    tasks.append(_emit_where_stage(total, exact_zeroed, (magnitude_result, 0), (nonexact, 0), Ops.MUL))
+-    valid_scratch, valid, factor_scratch, factor = (alloc() for _ in range(4))
+-    tasks.extend((_emit_where_stage(total, valid_scratch, one, (invalid, 0), Ops.SUB),
+-                  _emit_where_stage(total, valid, one, (invalid, 0), Ops.SUB),
+-                  _emit_where_stage(total, factor_scratch, (valid, 0), (valid, 0), Ops.FDIV),
+-                  _emit_where_stage(total, factor, (valid, 0), (valid, 0), Ops.FDIV),
+-                  _emit_where_stage(total, out, (exact_zeroed, 0), (factor, 0), Ops.MUL)))
+-  tasks = list(_fix_cmp_fp32(tuple(tasks), source))
++    exact_zeroed = graph.op(magnitude_result, nonexact, Ops.MUL, repeat=False)
++    valid = graph.op(one, (invalid,0), Ops.SUB)
++    factor = graph.op(valid, valid, Ops.FDIV)
++    graph.op(exact_zeroed, factor, Ops.MUL, out_slot=out, repeat=False)
++  tasks = list(_fix_cmp_fp32(tuple(graph.tasks), source))
+   return _finalize_fp32_output(tasks, store)
+ 
+ def _try_fp32_sinh_cosh_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-- 
+2.34.1
+
