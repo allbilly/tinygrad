@@ -932,10 +932,18 @@ class TestClassifier(unittest.TestCase):
     default_float = dtypes.default_float
     try:
       dtypes.default_float = dtypes.half
-      lhs = Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")
-      rhs = Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")
+      cases = [(dtypes.int, dtypes.int, 7, None), (dtypes.int, dtypes.int, 7, "floor"),
+               (dtypes.int, dtypes.int, 7, "trunc"), (dtypes.int, dtypes.int, 1, None),
+               (dtypes.int, dtypes.int, 1, "floor"), (dtypes.int, dtypes.int, 1, "trunc")]
+      cases += [(lhs_dtype, rhs_dtype, 1, mode)
+                for lhs_dtype, rhs_dtype in ((dtypes.half, dtypes.int), (dtypes.int, dtypes.half), (dtypes.half, dtypes.half))
+                for mode in (None, "trunc", "floor")]
+      expressions = [Tensor.empty(7, dtype=lhs_dtype, device="ROCKCHIP").div(
+        Tensor.empty(rhs_size, dtype=rhs_dtype, device="ROCKCHIP"), rounding_mode=mode)
+                     for lhs_dtype, rhs_dtype, rhs_size, mode in cases]
+      expressions.append(Tensor.empty(7, dtype=dtypes.int, device="ROCKCHIP")//2)
       sinks = [next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
-               for expression in (lhs/rhs, lhs//rhs, lhs//2, lhs.div(rhs, rounding_mode="trunc"))]
+               for expression in expressions]
     finally:
       dtypes.default_float = default_float
     for sink in sinks:
