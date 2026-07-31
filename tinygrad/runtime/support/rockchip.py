@@ -211,6 +211,7 @@ _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cros
 _HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
 _HOST_EINSUM_LAYOUT = -1035  # exact vectorized 32x7 groups of 24^3 fp16 dot products
 _HOST_BILINEAR_LAYOUT = -1036  # exact separable fp16/fp32 bilinear interpolation stage
+_HOST_TAN_LAYOUT = -1037  # exact contiguous fp16 tangent with float32 range reduction
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -4171,6 +4172,21 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, info.outs[0], (selected, 0), (factor, 0), Ops.MUL)))
   tasks = list(_fix_cmp_fp32(tuple(tasks), source))
   return _finalize_fp32_output(tasks, store)
+
+def _try_fp16_tan_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate the exact contiguous fp16 tangent graph without overflowing its native period counter."""
+  store = _store_node(sink)
+  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half or \
+     (source := _try_tan(store.src[1])) is None or source.dtype is not dtypes.half: return None
+  output = store.src[0]
+  if output.op is not Ops.INDEX or not _is_flat_contiguous(output.src[1]) or not _is_flat_contiguous(source.src[1]): return None
+  total = prod(_shape_of_store(sink))
+  if total <= 0 or int(source.src[0].src[0].arg) != total: return None
+  out_slot, in_slot = ProgramInfo.from_sink(sink).outs[0], source.src[0].buf_uop.arg.slot
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, in_slot, 0, 0, 0xFFFFFFFF))
+  task = RKTask(0, 0, 0, "dpu", (total, _HOST_TAN_LAYOUT), out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
 
 def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Two-LUT atan after reciprocal folding maps every finite magnitude into [0,1]."""
@@ -15246,6 +15262,9 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
   if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
   if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
+  if (fp16_tan_host_tasks := _try_fp16_tan_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, fp16_tan_host_tasks)
+  # The native two-LUT/pole-safe implementation remains below as the fp32 WIP path.
   if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
   if (fp32_sin_cos_tasks := _try_fp32_sin_cos_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, fp32_sin_cos_tasks)

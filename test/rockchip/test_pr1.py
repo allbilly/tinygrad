@@ -13,7 +13,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
                                                _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
                                                _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
-                                               _HOST_BILINEAR_LAYOUT)
+                                               _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -1162,6 +1162,13 @@ class TestClassifier(unittest.TestCase):
         subtasks = program.src[1].src[0].arg
         self.assertEqual(len(subtasks), 1)
         self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
+
+  def test_fp16_tan_uses_one_typed_host_task(self):
+    program = build_native_program(_get_sink(Tensor.empty(17, dtype=dtypes.half, device="ROCKCHIP").tan()))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout, (17, _HOST_TAN_LAYOUT))
 
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")

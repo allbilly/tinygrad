@@ -26,7 +26,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
   _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
-  _HOST_BILINEAR_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -592,10 +592,22 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     assert result.size == total
     ctypes.memmove(output.va_addr, result.astype(np.float16).tobytes(), total*2)
 
+def _run_host_tan(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Match PyTorch fp16 tangent using float32 range reduction and one final fp16 rounding."""
+  import numpy as np
+  total, tag = task.layout
+  assert tag == _HOST_TAN_LAYOUT and len(relocs) == 2
+  output, source = (bufs[r.globals_slot] for r in relocs)
+  values = np.frombuffer(ctypes.string_at(source.va_addr, total*2), dtype=np.float16)
+  with np.errstate(invalid="ignore", over="ignore"):
+    result = np.tan(values.astype(np.float32)).astype(np.float16)
+  ctypes.memmove(output.va_addr, result.tobytes(), total*2)
+
 def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
   if task.layout[1] == _HOST_EINSUM_LAYOUT: return _run_host_large_einsum(task, relocs, bufs)
   if task.layout[1] == _HOST_BILINEAR_LAYOUT: return _run_host_bilinear(task, relocs, bufs)
+  if task.layout[1] == _HOST_TAN_LAYOUT: return _run_host_tan(task, relocs, bufs)
   import numpy as np
   total, tag, out_dtype_code, *layout = task.layout
   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
@@ -1741,7 +1753,8 @@ class RockchipProgram(Program['RockchipDevice']):
           _run_host_copysign(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and \
-           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
+           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT,
+                              _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
           _run_host_elementwise(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
@@ -1883,7 +1896,7 @@ class RockchipProgram(Program['RockchipDevice']):
               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             elif st.task.is_copy and len(st.task.layout) > 1 and \
                  st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
-                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
+                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
               _run_host_elementwise(st.task, st.relocs, tuple(ext))
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
@@ -1919,7 +1932,7 @@ class RockchipProgram(Program['RockchipDevice']):
             continue
           if st.task.is_copy and len(st.task.layout) > 1 and \
              st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
-                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
+                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
             _run_host_elementwise(st.task, st.relocs, tuple(ext))
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
