@@ -3540,3 +3540,13 @@ the two shadowed native lowerers remain as comments. Binary cross-entropy,
 none/sum/mean reductions, and logits positive weights pass **3/3 in 2.10s**.
 PR1 passes **173/173 in 13.35s**; static baselines remain 9/8. The support file
 is now **10,851 counted lines**.
+
+### Consolidated TAN host path
+
+Commit `1841722dd`; saved patch
+`0158-rockchip-consolidate-tangent-host-lowering.patch`.
+
+The required contiguous fp16 TAN path passes **1/1 in 1.70s**; an explicit
+fp32 probe also passes through the generic serializer. PR1 is **173/173 in
+12.83s**, static baselines remain 9/8, and the support file is now **10,770
+counted lines**.

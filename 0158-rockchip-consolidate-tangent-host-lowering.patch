@@ -1,0 +1,228 @@
+From 1841722dda006edcba0c2d0d56fab992c9403c80 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 03:37:58 +0800
+Subject: [PATCH] rockchip: consolidate tangent host lowering
+
+---
+ tinygrad/runtime/support/rockchip.py | 191 ++++++++++++++-------------
+ 1 file changed, 99 insertions(+), 92 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 5ee08bad5..90f6a383c 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -3348,97 +3348,97 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ #              if source_slot in st.task.fp32_inputs else st for st in tasks]
+ #   return _finalize_fp32_output(tasks, store)
+ 
+-def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Piecewise tangent using direct local/wide LUTs and a pole-safe trig quotient."""
+-  store = _store_node(sink)
+-  if store is None or (source := _try_tan(store.src[1])) is None: return None
+-  graph = _TaskGraph(sink, store, source)
+-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+-  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
+-  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
+-  invalid = graph.positive_mask(abs_source, _float_arg(20000), repeat=True) if source.src[0].dtype is dtypes.float else None
+-  bounded = graph.op(source_arg, zero, Ops.ADD, repeat=False)
+-  quotient = graph.op(bounded, _float_arg(1/math.pi), Ops.MUL, repeat=False)
+-  neg_quotient = graph.op(zero, quotient, Ops.SUB, repeat=False)
+-  abs_quotient = graph.op(quotient, neg_quotient, Ops.MAX, repeat=False)
+-  # fp16 1/pi can round values just below every odd pi/2 to an exact .5 tie.
+-  # Bias toward the lower magnitude period; no fp16 input is exactly pi/2.
+-  corrected = graph.op(abs_quotient, _float_arg(.0005), Ops.SUB, repeat=False)
+-  biased = graph.op(corrected, _float_arg(.5), Ops.ADD, repeat=False)
+-  rounded_abs = graph.alloc()
+-  graph.tasks.append(_emit_trunc_stage(graph.total, rounded_abs, biased))
+-  positive = graph.positive_mask(quotient, zero)
+-  negative = graph.op(one, positive, Ops.SUB, repeat=False)
+-  positive_n = graph.op((rounded_abs,0), positive, Ops.MUL, repeat=False)
+-  negative_n = graph.op((rounded_abs,0), negative, Ops.MUL, repeat=False)
+-  rounded = graph.op(positive_n, graph.op(zero, negative_n, Ops.SUB, repeat=False), Ops.ADD, repeat=False)
+-  reduced = bounded
+-  for coefficient in (3.140625, math.pi-3.140625):
+-    product = graph.op(rounded, _float_arg(coefficient), Ops.MUL, repeat=False)
+-    reduced = graph.op(reduced, product, Ops.SUB, repeat=False)
+-  local, sine, wide, cos_local = (graph.alloc() for _ in range(4))
+-  if not graph.emit_named_lut("rk_tan_local", reduced[0], local) or \
+-     not graph.emit_lut(UOp(Ops.SIN, dtypes.half, (graph.temp_index(reduced[0]),)), sine) or \
+-     not graph.emit_named_lut("rk_tan_wide", reduced[0], wide) or \
+-     not graph.emit_named_lut("rk_cos_local", reduced[0], cos_local): return None
+-  neg_reduced = graph.op(zero, reduced, Ops.SUB, repeat=False)
+-  abs_reduced = graph.op(reduced, neg_reduced, Ops.MAX, repeat=False)
+-  outside = graph.positive_mask(abs_reduced, _float_arg(.45))
+-  inside = graph.op(one, outside, Ops.SUB, repeat=False)
+-  tan_near_outside = graph.positive_mask(abs_reduced, _float_arg(.04))
+-  tan_near_inside = graph.op(one, tan_near_outside, Ops.SUB, repeat=False)
+-  tan_local_mask = graph.op(inside, tan_near_inside, Ops.SUB, repeat=False)
+-  quotient_outside = graph.positive_mask(abs_reduced, _float_arg(1.05))
+-  pole_group = graph.positive_mask(abs_source, _float_arg(3.0))
+-  base_extra = graph.op(pole_group, _float_arg(3.0), Ops.MUL, repeat=False)
+-  pole_base = graph.op(_float_arg(1.5), base_extra, Ops.ADD, repeat=False)
+-  pole_distance = graph.op(pole_base, abs_source, Ops.SUB, repeat=False)
+-  remainder = graph.op(_float_arg(.0703125), graph.op(pole_group, _float_arg(.140625), Ops.MUL, repeat=False), Ops.ADD, repeat=False)
+-  center_hi = graph.op(pole_distance, remainder, Ops.ADD, repeat=False)
+-  center = graph.op(_float_arg(math.pi/2-1.5703125),
+-                    graph.op(pole_group, _float_arg(math.pi-3.140625), Ops.MUL, repeat=False), Ops.ADD, repeat=False)
+-  source_center = graph.op(center_hi, center, Ops.ADD, repeat=False)
+-  neg_center = graph.op(zero, source_center, Ops.SUB, repeat=False)
+-  abs_center = graph.op(source_center, neg_center, Ops.MAX, repeat=False)
+-  center_outside = graph.positive_mask(abs_center, _float_arg(.05))
+-  center_inside = graph.op(one, center_outside, Ops.SUB, repeat=False)
+-  center_mask = graph.op(quotient_outside, center_inside, Ops.SUB, repeat=False)
+-  cos_scaled = graph.op((cos_local,0), _float_arg(.5), Ops.MUL, repeat=False)
+-  # In the closest pole band, cot(d) ~= 1/d. Cancelling the sine LUT magnitude
+-  # avoids amplifying its Q15 quantization in the quotient.
+-  neg_sine = graph.op(zero, (sine,0), Ops.SUB, repeat=False)
+-  abs_sine = graph.op((sine,0), neg_sine, Ops.MAX, repeat=False)
+-  center_sq = graph.op(abs_center, abs_center, Ops.MUL, repeat=False)
+-  center_term = graph.op(center_sq, _float_arg(1/3), Ops.MUL, repeat=False)
+-  center_factor = graph.op(one, center_term, Ops.SUB, repeat=False)
+-  center_cos = graph.op(abs_center, abs_sine, Ops.MUL, repeat=False)
+-  center_selected = graph.op(center_cos, center_inside, Ops.MUL, repeat=False)
+-  local_cos_selected = graph.op(cos_scaled, center_mask, Ops.MUL, repeat=False)
+-  cosine_partial = graph.op(center_selected, local_cos_selected, Ops.ADD, repeat=False)
+-  safe_cos = graph.op(one, quotient_outside, Ops.SUB, repeat=False)
+-  cosine = graph.op(cosine_partial, safe_cos, Ops.ADD, repeat=False)
+-  tangent = graph.op((sine,0), cosine, Ops.FDIV, repeat=False)
+-  center_quotient = graph.op(graph.op(tangent, center_factor, Ops.MUL, repeat=False), center_inside, Ops.MUL, repeat=False)
+-  middle_quotient = graph.op(tangent, center_mask, Ops.MUL, repeat=False)
+-  quotient_selected = graph.op(center_quotient, middle_quotient, Ops.ADD, repeat=False)
+-  middle_mask = graph.op(outside, quotient_outside, Ops.SUB, repeat=False)
+-  wide_selected = graph.op(graph.op((wide,0), _float_arg(2.0), Ops.MUL, repeat=False), middle_mask, Ops.MUL, repeat=False)
+-  local_selected = graph.op((local,0), tan_local_mask, Ops.MUL, repeat=False)
+-  near_selected = graph.op(reduced, tan_near_inside, Ops.MUL, repeat=False)
+-  selected = graph.op(graph.op(graph.op(quotient_selected, wide_selected, Ops.ADD, repeat=False),
+-                                local_selected, Ops.ADD, repeat=False), near_selected, Ops.ADD, repeat=False)
+-  if source.src[0].dtype is dtypes.half:
+-    graph.op(selected, one, Ops.MUL, out_slot=graph.out, repeat=False)
+-  else:
+-    assert invalid is not None
+-    valid = graph.op(one, invalid, Ops.SUB)
+-    factor = graph.op(valid, valid, Ops.FDIV)
+-    graph.op(selected, factor, Ops.MUL, out_slot=graph.out, repeat=False)
+-  tasks=list(_fix_cmp_fp32(tuple(graph.tasks),source))
+-  if source.src[0].dtype is dtypes.float:
+-    slot=source.src[0].arg.slot
+-    tasks=[RKSubTask(st.cmds,replace(st.task,periodic_input=True),st.relocs) if slot in st.task.fp32_inputs else st for st in tasks]
+-  return _finalize_fp32_output(tasks,store)
++# def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++#   """Piecewise tangent using direct local/wide LUTs and a pole-safe trig quotient."""
++#   store = _store_node(sink)
++#   if store is None or (source := _try_tan(store.src[1])) is None: return None
++#   graph = _TaskGraph(sink, store, source)
++#   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
++#   neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++#   abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
++#   invalid = graph.positive_mask(abs_source, _float_arg(20000), repeat=True) if source.src[0].dtype is dtypes.float else None
++#   bounded = graph.op(source_arg, zero, Ops.ADD, repeat=False)
++#   quotient = graph.op(bounded, _float_arg(1/math.pi), Ops.MUL, repeat=False)
++#   neg_quotient = graph.op(zero, quotient, Ops.SUB, repeat=False)
++#   abs_quotient = graph.op(quotient, neg_quotient, Ops.MAX, repeat=False)
++#   # fp16 1/pi can round values just below every odd pi/2 to an exact .5 tie.
++#   # Bias toward the lower magnitude period; no fp16 input is exactly pi/2.
++#   corrected = graph.op(abs_quotient, _float_arg(.0005), Ops.SUB, repeat=False)
++#   biased = graph.op(corrected, _float_arg(.5), Ops.ADD, repeat=False)
++#   rounded_abs = graph.alloc()
++#   graph.tasks.append(_emit_trunc_stage(graph.total, rounded_abs, biased))
++#   positive = graph.positive_mask(quotient, zero)
++#   negative = graph.op(one, positive, Ops.SUB, repeat=False)
++#   positive_n = graph.op((rounded_abs,0), positive, Ops.MUL, repeat=False)
++#   negative_n = graph.op((rounded_abs,0), negative, Ops.MUL, repeat=False)
++#   rounded = graph.op(positive_n, graph.op(zero, negative_n, Ops.SUB, repeat=False), Ops.ADD, repeat=False)
++#   reduced = bounded
++#   for coefficient in (3.140625, math.pi-3.140625):
++#     product = graph.op(rounded, _float_arg(coefficient), Ops.MUL, repeat=False)
++#     reduced = graph.op(reduced, product, Ops.SUB, repeat=False)
++#   local, sine, wide, cos_local = (graph.alloc() for _ in range(4))
++#   if not graph.emit_named_lut("rk_tan_local", reduced[0], local) or \
++#      not graph.emit_lut(UOp(Ops.SIN, dtypes.half, (graph.temp_index(reduced[0]),)), sine) or \
++#      not graph.emit_named_lut("rk_tan_wide", reduced[0], wide) or \
++#      not graph.emit_named_lut("rk_cos_local", reduced[0], cos_local): return None
++#   neg_reduced = graph.op(zero, reduced, Ops.SUB, repeat=False)
++#   abs_reduced = graph.op(reduced, neg_reduced, Ops.MAX, repeat=False)
++#   outside = graph.positive_mask(abs_reduced, _float_arg(.45))
++#   inside = graph.op(one, outside, Ops.SUB, repeat=False)
++#   tan_near_outside = graph.positive_mask(abs_reduced, _float_arg(.04))
++#   tan_near_inside = graph.op(one, tan_near_outside, Ops.SUB, repeat=False)
++#   tan_local_mask = graph.op(inside, tan_near_inside, Ops.SUB, repeat=False)
++#   quotient_outside = graph.positive_mask(abs_reduced, _float_arg(1.05))
++#   pole_group = graph.positive_mask(abs_source, _float_arg(3.0))
++#   base_extra = graph.op(pole_group, _float_arg(3.0), Ops.MUL, repeat=False)
++#   pole_base = graph.op(_float_arg(1.5), base_extra, Ops.ADD, repeat=False)
++#   pole_distance = graph.op(pole_base, abs_source, Ops.SUB, repeat=False)
++#   remainder = graph.op(_float_arg(.0703125), graph.op(pole_group, _float_arg(.140625), Ops.MUL, repeat=False), Ops.ADD, repeat=False)
++#   center_hi = graph.op(pole_distance, remainder, Ops.ADD, repeat=False)
++#   center = graph.op(_float_arg(math.pi/2-1.5703125),
++#                     graph.op(pole_group, _float_arg(math.pi-3.140625), Ops.MUL, repeat=False), Ops.ADD, repeat=False)
++#   source_center = graph.op(center_hi, center, Ops.ADD, repeat=False)
++#   neg_center = graph.op(zero, source_center, Ops.SUB, repeat=False)
++#   abs_center = graph.op(source_center, neg_center, Ops.MAX, repeat=False)
++#   center_outside = graph.positive_mask(abs_center, _float_arg(.05))
++#   center_inside = graph.op(one, center_outside, Ops.SUB, repeat=False)
++#   center_mask = graph.op(quotient_outside, center_inside, Ops.SUB, repeat=False)
++#   cos_scaled = graph.op((cos_local,0), _float_arg(.5), Ops.MUL, repeat=False)
++#   # In the closest pole band, cot(d) ~= 1/d. Cancelling the sine LUT magnitude
++#   # avoids amplifying its Q15 quantization in the quotient.
++#   neg_sine = graph.op(zero, (sine,0), Ops.SUB, repeat=False)
++#   abs_sine = graph.op((sine,0), neg_sine, Ops.MAX, repeat=False)
++#   center_sq = graph.op(abs_center, abs_center, Ops.MUL, repeat=False)
++#   center_term = graph.op(center_sq, _float_arg(1/3), Ops.MUL, repeat=False)
++#   center_factor = graph.op(one, center_term, Ops.SUB, repeat=False)
++#   center_cos = graph.op(abs_center, abs_sine, Ops.MUL, repeat=False)
++#   center_selected = graph.op(center_cos, center_inside, Ops.MUL, repeat=False)
++#   local_cos_selected = graph.op(cos_scaled, center_mask, Ops.MUL, repeat=False)
++#   cosine_partial = graph.op(center_selected, local_cos_selected, Ops.ADD, repeat=False)
++#   safe_cos = graph.op(one, quotient_outside, Ops.SUB, repeat=False)
++#   cosine = graph.op(cosine_partial, safe_cos, Ops.ADD, repeat=False)
++#   tangent = graph.op((sine,0), cosine, Ops.FDIV, repeat=False)
++#   center_quotient = graph.op(graph.op(tangent, center_factor, Ops.MUL, repeat=False), center_inside, Ops.MUL, repeat=False)
++#   middle_quotient = graph.op(tangent, center_mask, Ops.MUL, repeat=False)
++#   quotient_selected = graph.op(center_quotient, middle_quotient, Ops.ADD, repeat=False)
++#   middle_mask = graph.op(outside, quotient_outside, Ops.SUB, repeat=False)
++#   wide_selected = graph.op(graph.op((wide,0), _float_arg(2.0), Ops.MUL, repeat=False), middle_mask, Ops.MUL, repeat=False)
++#   local_selected = graph.op((local,0), tan_local_mask, Ops.MUL, repeat=False)
++#   near_selected = graph.op(reduced, tan_near_inside, Ops.MUL, repeat=False)
++#   selected = graph.op(graph.op(graph.op(quotient_selected, wide_selected, Ops.ADD, repeat=False),
++#                                 local_selected, Ops.ADD, repeat=False), near_selected, Ops.ADD, repeat=False)
++#   if source.src[0].dtype is dtypes.half:
++#     graph.op(selected, one, Ops.MUL, out_slot=graph.out, repeat=False)
++#   else:
++#     assert invalid is not None
++#     valid = graph.op(one, invalid, Ops.SUB)
++#     factor = graph.op(valid, valid, Ops.FDIV)
++#     graph.op(selected, factor, Ops.MUL, out_slot=graph.out, repeat=False)
++#   tasks=list(_fix_cmp_fp32(tuple(graph.tasks),source))
++#   if source.src[0].dtype is dtypes.float:
++#     slot=source.src[0].arg.slot
++#     tasks=[RKSubTask(st.cmds,replace(st.task,periodic_input=True),st.relocs) if slot in st.task.fp32_inputs else st for st in tasks]
++#   return _finalize_fp32_output(tasks,store)
+ 
+ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT asin/acos with separate precision for the smooth center and singular endpoint."""
+@@ -3575,6 +3575,13 @@ def _try_fp16_tan_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   task = RKTask(0, 0, 0, "dpu", (total, _HOST_TAN_LAYOUT), out_slot, is_copy=True)
+   return (RKSubTask(cmds, task, relocs),)
+ 
++def _try_tan_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Prefer exact contiguous fp16 tangent, then serialize remaining TAN graphs."""
++  if (tasks := _try_fp16_tan_host_subtasks(sink)) is not None: return tasks
++  store = _store_node(sink)
++  if store is None or _try_tan(store.src[1]) is None: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT atan after reciprocal folding maps every finite magnitude into [0,1]."""
+   store = _store_node(sink)
+@@ -13095,7 +13102,7 @@ _SUBTASK_CLASSIFIERS = (
+   _try_sign_subtasks, _try_inf_div_subtasks, _try_hardsigmoid_subtasks,
+   _try_hardswish_subtasks, _try_fp32_tanh_host_subtasks, _try_tanh_saturation_subtasks,
+   _try_quick_gelu_two_lut_subtasks, _try_logsigmoid_subtasks, _try_softplus_subtasks,
+-  _try_mish_subtasks, _try_fp16_tan_host_subtasks, _try_tan_subtasks,
++  _try_mish_subtasks, _try_tan_host_subtasks,
+   _try_fp32_sin_cos_host_subtasks, _try_sin_cos_subtasks, _try_asin_acos_subtasks,
+   _try_atan_subtasks, _try_fp32_atanh_host_subtasks, _try_atanh_subtasks,
+   _try_asinh_acosh_subtasks, _try_fp32_sinh_cosh_host_subtasks, _try_sinh_cosh_subtasks,
+-- 
+2.34.1
+

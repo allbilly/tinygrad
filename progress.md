@@ -12537,3 +12537,20 @@ This removes **142 counted lines**, reaching **10,851** in
 `support/rockchip.py`. PR1 passes **173/173 in 13.35s** and all BCE method
 groups—including reductions and positive weights—pass **3/3 in 2.10s** on
 RK3588. Static baselines remain nine mypy errors and eight Ruff findings.
+
+### Consolidated TAN host lowering and clean-rewrite pivot
+
+Commit `1841722dd`; saved patch
+`0158-rockchip-consolidate-tangent-host-lowering.patch`.
+
+The exact contiguous fp16 `_HOST_TAN_LAYOUT` required by PR1 remains first;
+remaining TAN shapes/dtypes use the existing generic serializer. The shadowed
+native graph remains verbatim as comments. This removes **81 counted lines**,
+reaching **10,770** in `support/rockchip.py`. PR1 passes **173/173 in 12.83s**,
+fp16 TAN passes in 1.70s, and an explicit fp32 seven-value probe matches NumPy.
+Static baselines remain 9/8.
+
+`plan_cleanrewrite.md` is now the architectural authority: future milestones
+replace the operator catalog and semantic host ABI with typed UOp-free plans,
+generic DPU/contraction/conv lowering, machine-only RKImage, and generated LUT
+artifacts. Incremental compaction remains only for clean oracle checkpoints.
