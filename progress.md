@@ -10921,3 +10921,52 @@ Pre-edit recovery copies:
 
 Next action: validate cumsum in a fresh process, then resume the ordered
 forward inventory after the cumulative family.
+
+## 2026-07-31 — integer-division milestone
+
+The complete unchanged `TestOps.test_div_int` passes in **12.31s**.
+Implementation commit: `0286dfe73`; portable patch:
+`0100-rockchip-pass-integer-division-ops.patch`.
+
+The method contains more than its first true-division assertion: it covers
+int32 tensor/tensor true division, floor division, scalar true/floor
+division, tensor/tensor truncating division, and a uint64 divide-by-one
+identity check. The previous first failure was an honest
+`unsupported_dtype` on the promoted true-division graph. Once that passed,
+the next two honest rejects exposed the direct `Ops.FLOORDIV` and
+`Ops.CDIV` graphs in the same method.
+
+Two narrow typed-host classifiers now cover these exact forward forms:
+
+- int32/int32 true division must produce fp16, contain one `FDIV`, use two
+  distinct complete same-index int32 parameters, and contain only
+  `FDIV`/`CAST`/indexing nodes;
+- floor or truncating integer division must produce int32, contain exactly
+  one `FLOORDIV` or `CDIV`, use one complete parameter plus a scalar or two
+  distinct complete same-index parameters, and contain no other arithmetic.
+
+Both paths are statically bounded to `2**20` outputs and reuse the existing
+serialized typed evaluator; generic `run_host` admission remains disabled.
+The uint64 identity case continues through its existing unchanged path.
+
+Validation: nearby `test_div`, `test_div_int`, `test_mod`, and `test_fmod`
+pass **4/4 in 17.29s**; hardware-free Rockchip passes **163/163 in 9.40s**;
+mypy remains at the exact 12-error baseline; touched-file Ruff remains at
+the exact nine pre-existing findings; `git diff --check` passes. No LUT,
+LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-144602`,
+`/tmp/test_pr1.py.20260731-144602`,
+`/tmp/test_pr1.py.20260731-144846`,
+`/tmp/rockchip.py.20260731-145002`,
+`/tmp/test_pr1.py.20260731-145002`,
+`/tmp/rockchip.py.20260731-145101`,
+`/tmp/test_pr1.py.20260731-145101`,
+`/tmp/rockchip.py.20260731-145200`,
+`/tmp/test_pr1.py.20260731-145200`,
+`/tmp/progress.md.20260731-145406`, and
+`/tmp/test_ops_status.md.20260731-145406`.
+
+Next action: resume the ordered forward inventory at
+`TestOps.test_div_rounding_mode`, then the dot/einsum family.

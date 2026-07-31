@@ -2784,3 +2784,24 @@ regression.
 Contract: **162/162 in 9.22s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. Next: fresh cumsum validation, then ordered inventory.
+
+### Integer division
+
+The complete unchanged `test_div_int` passes in **12.31s**. Commit
+`0286dfe73`; saved patch
+`0100-rockchip-pass-integer-division-ops.patch`.
+
+The new admission is restricted to direct int32 division graphs. Promoted
+true division requires an fp16 `FDIV` over two distinct, complete,
+same-index int32 parameters. Rounded division requires a single int32
+`FLOORDIV` or `CDIV` over either two such parameters or one parameter and a
+scalar. Both use the existing bounded typed evaluator with at most `2**20`
+outputs; generic host fallback remains disabled.
+
+All tensor/tensor, tensor/scalar, floor, truncating, and uint64 identity
+subcases in the method pass. The nearby division/remainder family passes
+**4/4 in 17.29s**.
+
+Contract: **163/163 in 9.40s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. Next: `test_div_rounding_mode`, then dot/einsum.
