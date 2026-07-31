@@ -12413,3 +12413,21 @@ This removes **74 counted lines**, reaching **11,609** in
 `support/rockchip.py`. PR1 passes **173/173 in 12.94s** and focused serialized
 RK3588 ASIN/ACOS passes **2/2 in 20.38s**. Mypy/Ruff remain exactly 12/8;
 compilation and `git diff --check` pass.
+
+### LOG2 special-value graph
+
+Commit `7eec38ee3`; saved patch
+`0150-rockchip-compose-log2-special-task-graph.patch`.
+
+The LOG2 lowering now expresses four power-of-four normalization bands,
+balanced factor/count composition, bounded mantissa LUTs, local polynomial
+selection, natural-log direct refinement, and IEEE special-value restoration
+through `_TaskGraph`. Source-fp32 annotations remain explicit on the two stages
+that consume the ABI input directly; nested comparison tasks still advance the
+graph allocator through relocation slots.
+
+This removes **56 counted lines**, reaching **11,553** in
+`support/rockchip.py`. PR1 passes **173/173 in 13.17s**, while direct LOG2 and
+natural LOG pass **2/2 in 12.01s** on serialized RK3588. Static baselines remain
+exactly 12 mypy errors and eight touched-file Ruff findings; compilation and
+`git diff --check` pass.

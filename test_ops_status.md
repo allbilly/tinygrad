@@ -3458,3 +3458,13 @@ Focused forward-only RK3588 status is **2/2 PASS in 20.38s** for
 `TestOps::test_asin` and `TestOps::test_acos`. PR1 passes **173/173 in 12.94s**;
 static baselines remain exactly 12 mypy errors and eight touched-file Ruff
 findings. The support file is now **11,609 counted lines**.
+
+### LOG/LOG2 task-graph compaction
+
+Commit `7eec38ee3`; saved patch
+`0150-rockchip-compose-log2-special-task-graph.patch`.
+
+Focused forward-only RK3588 status is **2/2 PASS in 12.01s** for
+`TestOps::test_log` and `TestOps::test_log2`. PR1 passes **173/173 in 13.17s**;
+static baselines remain exactly 12 mypy errors and eight touched-file Ruff
+findings. The support file is now **11,553 counted lines**.
