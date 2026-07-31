@@ -3335,3 +3335,19 @@ RK3588 testing passes **4/4 in 12.48s**: base 5.5, four-region base 8, shifted
 base 0.7, and negative-base-2 parity (which exercises the shared positive
 base-2 magnitude graph). Mypy and touched-file Ruff remain at the exact 12-
 and 8-finding baselines; compilation and `git diff --check` pass.
+
+### Shared power graph primitives
+
+Commit `4c69f21bf`; saved patch
+`0138-rockchip-share-power-graph-lowering-primitives.patch`.
+
+Negative constant-base parity, zero-base semantics, fractional power, and
+tensor power now use the shared task graph. Tensor/negative powers also share
+the exact-mask and roundoff/truncation subgraphs. Numerical correction tables,
+range reduction, special-value rules, and recognizers are unchanged. The
+support file reaches **12,311 counted lines**, 154 fewer in this batch.
+
+PR1 passes **173/173**. Focused hardware passes 3/3 negative/zero-base, 1/1
+fractional boundaries, and 2/2 tensor/zero-tensor cases. The complete affected
+forward-only `TestOps` power group passes **6/6 in 205.32s**. Mypy remains at
+12 known errors and touched-file Ruff at eight known findings.

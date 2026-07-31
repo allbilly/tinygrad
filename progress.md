@@ -12229,3 +12229,31 @@ Next lowering targets are negative constant-base parity, zero-base power, and
 fractional/tensor power graphs, followed by activation families. The `<5000`
 goal requires migrating whole graph families; allocator cleanup alone is not
 large enough.
+
+### Shared power semantics and roundoff graph
+
+Commit `4c69f21bf`; patch
+`0138-rockchip-share-power-graph-lowering-primitives.patch`.
+
+`_TaskGraph` now owns exact-value masks and the native fp16 truncation graph:
+absolute value, roundoff LUT, overshoot removal, and sign restoration. Negative
+constant-base parity and tensor power share that implementation. Zero-base,
+fractional, and tensor powers also share allocation, nested-stage relocation
+tracking, comparison materialization, and duplicate visibility writes. Their
+recognizers, range reduction, correction tables, IEEE selections, and WIP
+reference comments remain intact.
+
+This batch removes **154 counted lines** and 184 physical lines, taking
+`support/rockchip.py` from 12,465 to **12,311**. The reusable graph pass is now
+457 lines below its 12,768 starting point; the two-file Rockchip runtime is
+1,300 counted lines below the original 15,698 audit baseline.
+
+Validation:
+
+- hardware-free PR1: **173/173 in 13.46s**;
+- focused negative/zero constant-base hardware: **3/3 in 12.66s**;
+- fractional-power boundaries: **1/1 in 14.83s**;
+- tensor and zero-tensor power: **2/2 in 123.33s**;
+- complete touched forward-only power method group: **6/6 in 205.32s**;
+- mypy and touched-file Ruff remain at the exact 12- and 8-finding baselines;
+  Python compilation and `git diff --check` pass.
