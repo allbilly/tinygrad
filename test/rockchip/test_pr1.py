@@ -1544,17 +1544,39 @@ class TestPipeline(unittest.TestCase):
     self.assertEqual(subtasks[0].task.layout[4], 4)
     self.assertIn(7, subtasks[0].task.layout[5:])
 
-  def test_fp32_max_unpool_uses_typed_scatter_boundary(self):
-    x = Tensor.empty(1,1,4,4, dtype=dtypes.float, device="ROCKCHIP")
-    values, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
-    output = values.max_unpool2d(indices, kernel_size=(2,2))
-    sinks = [early_simplify(call.src[0]) for call in output.schedule_linear().src if call.src[0].op is Ops.SINK]
-    prg = build_native_program(sinks[-1])
-    self.assertIsNotNone(prg)
-    subtasks = prg.src[1].src[0].arg
-    self.assertEqual(len(subtasks), 1)
-    self.assertEqual(subtasks[0].task.layout[1], _HOST_SCATTER_LAYOUT)
-    self.assertEqual(subtasks[0].task.layout[-1], 4)
+    large = Tensor.empty(8,3,50,50, dtype=dtypes.half, device="ROCKCHIP")
+    _, large_indices = large.max_pool2d(kernel_size=(5,5), stride=(6,5), return_indices=True)
+    large_sinks = [early_simplify(call.src[0]) for call in large_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+    large_prg = build_native_program(large_sinks[-1])
+    self.assertIsNotNone(large_prg)
+    large_subtasks = large_prg.src[1].src[0].arg
+    self.assertEqual(len(large_subtasks), 1)
+    self.assertEqual(large_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
+    self.assertEqual(large_subtasks[0].task.layout[2:4], (25, 2500))
+
+    overlap = Tensor.empty(1,1,6,6, dtype=dtypes.int, device="ROCKCHIP")
+    _, overlap_indices = overlap.max_pool2d(kernel_size=(2,2), stride=1, return_indices=True)
+    overlap_sinks = [early_simplify(call.src[0]) for call in overlap_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
+    overlap_prg = build_native_program(overlap_sinks[-1])
+    self.assertIsNotNone(overlap_prg)
+    overlap_subtasks = overlap_prg.src[1].src[0].arg
+    self.assertEqual(len(overlap_subtasks), 1)
+    self.assertEqual(overlap_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
+    self.assertEqual(overlap_subtasks[0].task.layout[4], 8)
+    self.assertEqual(overlap_subtasks[0].task.layout[5:9], (0, 1, 6, 7))
+
+  def test_max_unpool_uses_typed_scatter_boundary(self):
+    for dtype, itemsize in ((dtypes.half, 2), (dtypes.float, 4)):
+      x = Tensor.empty(1,1,4,4, dtype=dtype, device="ROCKCHIP")
+      values, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
+      output = values.max_unpool2d(indices, kernel_size=(2,2))
+      sinks = [early_simplify(call.src[0]) for call in output.schedule_linear().src if call.src[0].op is Ops.SINK]
+      prg = build_native_program(sinks[-1])
+      self.assertIsNotNone(prg)
+      subtasks = prg.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_SCATTER_LAYOUT)
+      self.assertEqual(subtasks[0].task.layout[-1], itemsize)
 
   def test_single_output_fp32_max_pool_keeps_spatial_index_boundary(self):
     x = Tensor.empty(1,1,2,3, dtype=dtypes.float, device="ROCKCHIP")

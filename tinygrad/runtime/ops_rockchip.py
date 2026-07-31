@@ -1256,14 +1256,15 @@ def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
   ctypes.memmove(output.va_addr, result.ctypes.data, total*itemsize)  # type: ignore[arg-type]
 
 def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
-  """Choose the first valid maximum from a static fp16/fp32 candidate map."""
+  """Choose the first valid maximum from a static fp16/fp32/int32 candidate map."""
   import numpy as np
   total, tag, window, input_spatial, *payload = task.layout
-  itemsize = payload[0] if len(payload) == total*window+1 else 2
+  dtype_marker = payload[0] if len(payload) == total*window+1 else 2
+  itemsize = 4 if dtype_marker in (4, 8) else 2
   mapping = payload[1:] if len(payload) == total*window+1 else payload
   assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
   output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
-  data_dtype = np.float32 if itemsize == 4 else np.float16
+  data_dtype = np.int32 if dtype_marker == 8 else np.float32 if dtype_marker == 4 else np.float16
   data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=data_dtype)
   maximum = np.frombuffer(ctypes.string_at(maximum_buf.va_addr, total*itemsize), dtype=data_dtype)
   output = np.empty(total, dtype=np.int32)

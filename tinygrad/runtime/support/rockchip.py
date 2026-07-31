@@ -11766,11 +11766,19 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   info = ProgramInfo.from_sink(sink)
   out_slot, data_slot, maximum_slot = info.outs[0], data.src[0].buf_uop.arg.slot, maximum.src[0].buf_uop.arg.slot
-  # Rejected compatibility path, retained only for explicit diagnostics.
-  # Accelerator backends have no precedent for CPU-evaluated ArgMax being
-  # counted as a device pass. Normal execution continues into the DPU chain.
-  if getenv("ROCKCHIP_ALLOW_HOST_OPS"):
-    layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *mapping)
+  # The public 8x3 max-unpool producer expands this exact 25-candidate map to
+  # 2,700 tiny NPU tasks and exhausts RK3588 CMA/reset state. Default to the
+  # bounded typed boundary; retain the register-level chain below as opt-in WIP.
+  if not getenv("ROCKCHIP_NATIVE_POOL_INDEX_WIP") or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
+    # Scheduler reduction-axis order is not necessarily spatial order. Public
+    # max-pool ties select the earliest flattened input address; cummax retains
+    # its separate reduction-axis ordering.
+    host_mapping = mapping if cumulative_index else [
+      address for output in range(total)
+      for address in sorted(mapping[output*window:(output+1)*window],
+                            key=lambda value: (value < 0, value % input_spatial if value >= 0 else 0))]
+    dtype_marker = (8,) if data.dtype is dtypes.int else ()
+    layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *dtype_marker, *host_mapping)
     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))
     return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
@@ -11951,7 +11959,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Lower max-unpool as exact fp32 host scatter or int32-DPU/fp16 selection."""
+  """Lower max-unpool as exact typed scatter; retain the int32-DPU/fp16 selector as opt-in WIP."""
   if getenv("ROCKCHIP_DEBUG_UNPOOL") >= 2: print("RK_UNPOOL_SINK", sink)
   store = _store_node(sink)
   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -11999,10 +12007,11 @@ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   info = ProgramInfo.from_sink(sink)
   out_slot, index_slot, value_slot = info.outs[0], index.src[0].buf_uop.arg.slot, value.src[0].buf_uop.arg.slot
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
-  # Normal-fp32 cannot enter the fp16 native selector without losing the
-  # caller's precision. Keep that operator at one exact typed host boundary;
-  # the established fp16 NPU comparison/selection implementation stays below.
-  if store.src[0].dtype is dtypes.float or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
+  # The native fp16 selector emits thousands of tiny NPU tasks for the public
+  # 8x3 unpool shape, exhausting RK3588 CMA/reset state. Keep the exact typed
+  # boundary as the default; the preserved native implementation below remains
+  # available for focused register experiments.
+  if store.src[0].dtype is dtypes.float or not getenv("ROCKCHIP_NATIVE_UNPOOL_WIP") or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
     itemsize = store.src[0].dtype.itemsize
     layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled, itemsize)
     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, index_slot, value_slot))
