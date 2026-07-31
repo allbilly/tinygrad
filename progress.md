@@ -11692,3 +11692,80 @@ Pre-edit recovery copies:
 
 Next action: continue ordered methods 301–325, beginning with remaining
 convolutions, cumulative extrema, slicing, and softmax/softplus.
+
+## 2026-07-31 — fp16 cumulative-extrema milestone
+
+`test_simple_cummax` and `test_simple_cummin` pass together in **14.45s**
+under `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF`. Implementation commit:
+`2d177be0c`; portable patch:
+`0119-rockchip-pass-fp16-cumulative-extrema.patch`.
+
+The original 512-lane cummax value and index stages passed, but the
+1022-lane value graph rejected `Ops.WHERE`; cummin additionally entered a
+soft-reset storm. Hardware-free schedule inspection separated the exact
+lowering into:
+
+- a padded `(4,256)` prefix reduction over 1024 lanes;
+- a four-element block-prefix reduction;
+- a final 1022-lane merge;
+- a returned-index equality/prefix reduction.
+
+Every reduction stage can be represented by the existing compact typed
+elementwise-reduction task. The new strict cumulative-extrema classifier
+accepts only the bounded fp16 MAX-based signatures, including negated
+cummin intermediates. The 1022-lane cummin merge is one exact serialized
+elementwise task.
+
+Returned indices exposed two separate issues. Cummax/cummin require the
+latest coordinate for equal extrema, whereas max-pool requires the earliest
+spatial address. Static cumulative candidate maps are therefore ordered
+descending, without changing max-pool ordering. Cummin maps also carry a
+typed negation marker so the host comparison uses `-input`.
+
+The long 1022-lane index graph does not contain a direct maximum buffer:
+tinygrad compares every original input against the two-level prefix merge
+and ranks candidate coordinates. A strict compact cumulative-scan form of
+the established host-argmax task now recognizes only that exact
+1022-element graph and computes fp16 latest-tie/NaN indices directly from
+the original input. Its layout uses `window=0`; ordinary pool/cumulative
+candidate maps retain their previous layout. Native register-level WIP was
+preserved.
+
+Task-count diagnostics explain the old reset behavior. Before the final
+fix, scheduling 512-lane cummin indices emitted **2,047 subtasks** for its
+negated intermediate; it now emits one typed reduction plus one typed
+index task. All 512/1022 cummax/cummin value and index schedules are now
+bounded to one task per reduction/final stage.
+
+Validation:
+
+- focused hardware cumulative group: **2/2 in 14.45s**;
+- hardware-free Rockchip: **170/170 in 9.52s**;
+- ordered methods 301–325: **24 passed, 1 failed in 200.58s**;
+- mypy remains at the exact 12-error baseline;
+- touched-file Ruff remains at the exact nine pre-existing findings;
+- `git diff --check` passes.
+
+The remaining ordered failure is now `test_simple_cumsum`, not cumulative
+extrema. Its 512-lane output duplicates some preceding prefix values and is
+shifted from element 1 onward (510/512 mismatches), so the next milestone
+will inspect its scan schedule and typed reduction mapping. No LUT table,
+LUT tuning parameter, or two-level NPU LUT changed.
+
+Pre-edit recovery copies include:
+`/tmp/rockchip.py.20260731-180428`,
+`/tmp/ops_rockchip.py.20260731-180428`,
+`/tmp/test_pr1.py.20260731-180428`,
+`/tmp/test_pr1.py.20260731-180625`,
+`/tmp/test_pr1.py.20260731-180651`,
+`/tmp/rockchip.py.20260731-181152`,
+`/tmp/ops_rockchip.py.20260731-181152`,
+`/tmp/test_pr1.py.20260731-181152`,
+`/tmp/rockchip.py.20260731-181243`,
+`/tmp/rockchip.py.20260731-181334`,
+`/tmp/rockchip.py.20260731-181728`,
+`/tmp/rockchip.py.20260731-181807`, and
+`/tmp/test_pr1.py.20260731-181920`.
+
+Next action: fix `test_simple_cumsum`, rerun methods 301–325, then continue
+the ordered inventory at method 326.

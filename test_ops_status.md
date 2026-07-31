@@ -3131,3 +3131,27 @@ contain direct gradients and are now excluded with `FORWARD_ONLY=1`, giving
 Extreme forward behavior remains covered by Rockchip regressions. Backend
 code and the **169/169** PR1 contract are unchanged; adapter Ruff is clean.
 No LUT or two-level LUT changed. Next: methods 301–325.
+
+### FP16 cumulative extrema
+
+Cummax and cummin now pass all 512/1022 value and returned-index subcases
+together in **14.45s**. Commit `2d177be0c`; saved patch
+`0119-rockchip-pass-fp16-cumulative-extrema.patch`.
+
+The two-level 1022 scan is lowered as padded 256-lane blocks, a four-block
+prefix, and a final merge. Strict typed reduction/final tasks replace the
+previous unbounded chains. The worst missed form was the 512-lane negated
+cummin intermediate used by returned indices: it scheduled **2,047
+subtasks** and caused repeated RKNPU soft resets; it now uses one task.
+
+Cumulative candidate maps use descending addresses for latest-tie
+semantics, while max-pool retains earliest-address ordering. Cummin carries
+an explicit negation marker. The exact long index graph uses a compact
+1022-lane typed cumulative scan over the original fp16 input, including
+latest NaN behavior.
+
+Contract advances to **170/170 in 9.52s**. Mypy and touched-file Ruff stay
+at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
+Methods 301–325 now produce **24 passes and one failure in 200.58s**; the
+remaining failure is `test_simple_cumsum`, whose prefix output is shifted
+from element 1 onward. Next: fix cumsum, rerun this block, then method 326.

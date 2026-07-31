@@ -1,0 +1,277 @@
+From 2d177be0cacfc2d2455bccbbb15e61c5ee24e0f0 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 18:24:09 +0800
+Subject: [PATCH] rockchip: pass fp16 cumulative extrema
+
+---
+ test/rockchip/test_pr1.py            |  49 +++++++++++
+ tinygrad/runtime/ops_rockchip.py     |  18 +++-
+ tinygrad/runtime/support/rockchip.py | 122 +++++++++++++++++++++++++--
+ 3 files changed, 181 insertions(+), 8 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 127b92e18..1c994d668 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -308,6 +308,55 @@ class TestClassifier(unittest.TestCase):
+     self.assertTrue(all(isinstance(task, RKSubTask) for task in subtasks))
+     self.assertLess(len(subtasks), 600)
+ 
++  def test_fp16_cumulative_extrema_use_typed_reductions_and_indices(self):
++    for kind in ("max", "min"):
++      source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
++      values = (source.cummax(0) if kind == "max" else source.cummin(0))[0]
++      value_sinks = [early_simplify(call.src[0]) for call in values.schedule_linear().src if call.src[0].op is Ops.SINK]
++      self.assertEqual(len(value_sinks), 3)
++      for program in (build_native_program(sink) for sink in value_sinks[:2]):
++        self.assertIsNotNone(program)
++        subtasks = program.src[1].src[0].arg
++        self.assertEqual(len(subtasks), 1)
++        self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++      if kind == "min":
++        final_program = build_native_program(value_sinks[2])
++        self.assertIsNotNone(final_program)
++        final_subtasks = final_program.src[1].src[0].arg
++        self.assertEqual(len(final_subtasks), 1)
++        self.assertEqual(final_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
++      index_source = Tensor.empty(5, dtype=dtypes.half, device="ROCKCHIP")
++      indices = (index_source.cummax(0) if kind == "max" else index_source.cummin(0))[1]
++      index_sinks = [early_simplify(call.src[0]) for call in indices.schedule_linear().src if call.src[0].op is Ops.SINK]
++      index_program = build_native_program(index_sinks[-1])
++      self.assertIsNotNone(index_program)
++      index_subtasks = index_program.src[1].src[0].arg
++      self.assertEqual(len(index_subtasks), 1)
++      self.assertEqual(index_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
++      self.assertEqual(index_subtasks[0].task.layout[4] == 10, kind == "min")
++      mapping_offset = 5 if kind == "min" else 4
++      self.assertEqual(index_subtasks[0].task.layout[mapping_offset+20:mapping_offset+25], (4, 3, 2, 1, 0))
++
++      long_source = Tensor.empty(1022, dtype=dtypes.half, device="ROCKCHIP")
++      long_indices = (long_source.cummax(0) if kind == "max" else long_source.cummin(0))[1]
++      long_sinks = [early_simplify(call.src[0]) for call in long_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
++      long_program = build_native_program(long_sinks[-1])
++      self.assertIsNotNone(long_program)
++      long_subtasks = long_program.src[1].src[0].arg
++      self.assertEqual(len(long_subtasks), 1)
++      self.assertEqual(long_subtasks[0].task.layout, (1022, _HOST_ARGMAX_LAYOUT, 0, 1022, 10 if kind == "min" else 2))
++
++      if kind == "min":
++        short_source = Tensor.empty(512, dtype=dtypes.half, device="ROCKCHIP")
++        short_indices = short_source.cummin(0)[1]
++        short_sinks = [early_simplify(call.src[0]) for call in short_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
++        short_program = build_native_program(short_sinks[0])
++        self.assertIsNotNone(short_program)
++        short_subtasks = short_program.src[1].src[0].arg
++        self.assertEqual(len(short_subtasks), 1)
++        self.assertEqual(short_subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++
+   def test_fp32_sum_uses_typed_cmac_boundary(self):
+     sink = _get_sink(Tensor.empty(3,3, dtype=dtypes.float, device="ROCKCHIP").sum())
+     program = build_native_program(sink)
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 46ee4e7ea..a36abf6fe 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -1256,11 +1256,24 @@ def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
+   ctypes.memmove(output.va_addr, result.ctypes.data, total*itemsize)  # type: ignore[arg-type]
+ 
+ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+-  """Choose the first valid maximum from a static fp16/fp32/int32 candidate map."""
++  """Choose extrema indices from a static candidate map or compact cumulative scan."""
+   import numpy as np
+   total, tag, window, input_spatial, *payload = task.layout
+   dtype_marker = payload[0] if len(payload) == total*window+1 else 2
+   itemsize = 4 if dtype_marker in (4, 8) else 2
++  negated = dtype_marker == 10
++  if window == 0:
++    assert tag == _HOST_ARGMAX_LAYOUT and total == input_spatial and dtype_marker in (2, 10) and len(relocs) == 2
++    output_buf, data_buf = (bufs[r.globals_slot] for r in relocs)
++    data = np.frombuffer(ctypes.string_at(data_buf.va_addr, total*2), dtype=np.float16)
++    output = np.empty(total, dtype=np.int32)
++    best, selected = data[0], 0
++    for index, value in enumerate(data):
++      if np.isnan(value) or (not np.isnan(best) and (value <= best if negated else value >= best)):
++        best, selected = value, index
++      output[index] = selected
++    ctypes.memmove(output_buf.va_addr, output.ctypes.data, total*4)  # type: ignore[arg-type]
++    return
+   mapping = payload[1:] if len(payload) == total*window+1 else payload
+   assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
+   output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
+@@ -1284,7 +1297,8 @@ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs
+     else:
+       for candidate in candidates:
+         if candidate < 0 or candidate >= data.size: continue
+-        if data[candidate] == maximum[out_index] or (np.isnan(data[candidate]) and np.isnan(maximum[out_index])):
++        value = -data[candidate] if negated else data[candidate]
++        if value == maximum[out_index] or (np.isnan(value) and np.isnan(maximum[out_index])):
+           selected = candidate % input_spatial
+           break
+     output[out_index] = selected
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index eb262e9b3..b9cb3aca5 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9597,6 +9597,75 @@ def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+      prefix_loops[0].src[0].op is not Ops.CONST or int(prefix_loops[0].src[0].arg) != window: return None
+   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+ 
++def _try_cumextrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Collapse bounded fp16 cumulative max/min prefix stages to one typed reduction."""
++  store = _store_node(sink)
++  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
++  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) != 1: return None
++  reduce = reductions[0]
++  if reduce.dtype is not dtypes.half or reduce.arg[0] is not Ops.MAX or len(reduce.src) != 2 or \
++     reduce.src[1].src[0].op is not Ops.CONST: return None
++  body, value_nodes = reduce.src[0], store.src[1].toposort()
++  body_nodes = body.toposort()
++  indexes = [u for u in body_nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
++  if body.op is not Ops.WHERE or len(indexes) != 1: return None
++  source, window = indexes[0], int(reduce.src[1].src[0].arg)
++  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if any(u.src[0].op is not Ops.CONST for u in loops): return None
++  total, input_total = prod(_shape_of_store(sink)), int(source.src[0].src[0].arg)
++  loop_extents = [int(u.src[0].arg) for u in loops]
++  if prod(loop_extents) != total or not 2 <= window <= 1024 or not 1 <= total*window <= 1 << 22: return None
++  allowed = {Ops.REDUCE, Ops.WHERE, Ops.AND, Ops.CMPLT, Ops.CMPNE,
++             Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in value_nodes): return None
++  where_count = sum(u.op is Ops.WHERE for u in body_nodes)
++  lt_count = sum(u.op is Ops.CMPLT for u in body_nodes)
++  ne_count = sum(u.op is Ops.CMPNE for u in body_nodes)
++  and_count = sum(u.op is Ops.AND for u in body_nodes)
++  mul_count = sum(u.op is Ops.MUL for u in body_nodes)
++
++  padded_blocks = store.src[1] is reduce and total == 1024 and input_total == 1022 and window == 256 and \
++    sorted(loop_extents) == [4, 256] and (where_count, lt_count, ne_count, and_count) == (5, 2, 2, 1) and \
++    mul_count in (1, 2)
++  block_prefix = store.src[1].op is Ops.WHERE and reduce in value_nodes and total == 4 and input_total == 1024 and \
++    window == 4 and loop_extents == [4] and \
++    (sum(u.op is Ops.WHERE for u in value_nodes), sum(u.op is Ops.CMPLT for u in value_nodes),
++     sum(u.op is Ops.CMPNE for u in value_nodes), sum(u.op is Ops.AND for u in value_nodes)) == (6, 2, 2, 1) and \
++    mul_count == 2
++  if padded_blocks or block_prefix:
++    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=block_prefix)
++
++  plain_max = store.src[1] is reduce and mul_count == 0
++  negated_min_intermediate = store.src[1] is reduce and mul_count == 1 and \
++    sum(u.op is Ops.MUL for u in value_nodes) == 1
++  plain_min = store.src[1].op is Ops.MUL and reduce in value_nodes and mul_count == 1 and \
++    sum(u.op is Ops.MUL for u in value_nodes) == 2
++  if not (plain_max or plain_min or negated_min_intermediate) or input_total != total or loop_extents != [window] or \
++     (where_count, lt_count, ne_count, and_count) != (3, 1, 1, 0): return None
++  condition = next(u for u in body_nodes if u.op is Ops.CMPLT)
++  if condition.src[0].op is not Ops.ADD or condition.src[1].op is not Ops.CONST or int(condition.src[1].arg) != window-1 or \
++     body.src[0] is not condition or body.src[1].op is not Ops.CONST or float(body.src[1].arg) != -math.inf: return None
++  condition_ranges = [u for u in condition.toposort() if u.op is Ops.RANGE]
++  prefix_loops = [u for u in condition_ranges if getattr(u.arg[-1], "name", "") == "LOOP"]
++  if reduce.src[1] not in condition_ranges or len(prefix_loops) != 1 or \
++     prefix_loops[0].src[0].op is not Ops.CONST or int(prefix_loops[0].src[0].arg) != window: return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=plain_min)
++
++def _try_long_cummin_finalize_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Merge and restore the exact two-level 1022-lane cummin value graph."""
++  store = _store_node(sink)
++  if store is None or _shape_of_store(sink) != (1022,) or store.src[0].dtype is not dtypes.half or \
++     store.src[1].op is not Ops.MUL: return None
++  nodes = sink.toposort()
++  loops = [u for u in nodes if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
++  if len(loops) != 1 or loops[0].src[0].op is not Ops.CONST or int(loops[0].src[0].arg) != 1022 or \
++     sorted(int(u.src[0].src[0].arg) for u in indexes) != [4, 1022, 1024]: return None
++  counts = {op:sum(u.op is op for u in nodes) for op in (Ops.INDEX, Ops.MAX, Ops.MUL, Ops.FLOORDIV, Ops.ADD, Ops.REDUCE)}
++  if counts != {Ops.INDEX:3, Ops.MAX:1, Ops.MUL:1, Ops.FLOORDIV:1, Ops.ADD:1, Ops.REDUCE:0}: return None
++  if not any(u.op is Ops.CONST and u.dtype is dtypes.half and float(u.arg) == -1.0 for u in store.src[1].src): return None
++  return _try_elementwise_host_subtasks(sink, allow_plain=True)
++
+ def _try_axis_arg_extrema_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Preserve argmax/argmin's public axis coordinate instead of its flattened source address."""
+   store = _store_node(sink)
+@@ -11690,6 +11759,40 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     tasks.append(RKSubTask(host_cmds, RKTask(0, 0, 0, "dpu", assemble_layout, out_slot, is_copy=True), assemble_relocs))
+   return tuple(tasks)
+ 
++def _try_long_cumextrema_index_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Collapse the exact 1022-lane cummax/cummin index graph to a bounded typed scan."""
++  store = _store_node(sink)
++  if store is None or _shape_of_store(sink) != (1022,) or store.src[0].dtype is not dtypes.int or \
++     store.src[1].op is not Ops.CAST or store.src[1].dtype is not dtypes.int: return None
++  nodes = sink.toposort()
++  reductions = [u for u in nodes if u.op is Ops.REDUCE]
++  loops = [u for u in nodes if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
++  if len(reductions) != 1 or len(loops) != 1: return None
++  reduce, loop = reductions[0], loops[0]
++  reduce_axes = list(reduce.src[1:])
++  if reduce.dtype not in (dtypes.half, dtypes.float) or reduce.arg[0] is not Ops.MAX or len(reduce_axes) != 1 or \
++     reduce_axes[0].src[0].op is not Ops.CONST or int(reduce_axes[0].src[0].arg) != 1022 or \
++     loop.src[0].op is not Ops.CONST or int(loop.src[0].arg) != 1022: return None
++  half_indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
++  sizes = sorted(int(u.src[0].src[0].arg) for u in half_indexes)
++  if sizes != [4, 1022, 1024]: return None
++  data = next((u for u in half_indexes if int(u.src[0].src[0].arg) == 1022 and u.src[1] is reduce_axes[0]), None)
++  if data is None: return None
++  counts = {op:sum(u.op is op for u in nodes) for op in
++            (Ops.INDEX, Ops.REDUCE, Ops.MAX, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CAST, Ops.FLOORDIV, Ops.MUL)}
++  is_min = any(u.op is Ops.MUL and u.dtype is dtypes.half and data in u.src and
++               any(x.op is Ops.CONST and float(x.arg) == -1.0 for x in u.src) for u in nodes)
++  expected = {Ops.INDEX:4, Ops.REDUCE:1, Ops.MAX:1, Ops.WHERE:1, Ops.CMPLT:1,
++              Ops.CMPNE:2, Ops.CAST:5, Ops.FLOORDIV:1, Ops.MUL:5 if is_min else 4}
++  if counts != expected: return None
++  info = ProgramInfo.from_sink(sink)
++  out_slot, data_slot = info.outs[0], data.src[0].buf_uop.arg.slot
++  # window=0 is the compact cumulative-scan form of _HOST_ARGMAX_LAYOUT.
++  layout = (1022, _HOST_ARGMAX_LAYOUT, 0, 1022, 10 if is_min else 2)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot))
++  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++
+ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Compile max-pool's static candidate addresses without unrolling its argmax expression."""
+   store = _store_node(sink)
+@@ -11777,14 +11880,15 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   # 2,700 tiny NPU tasks and exhausts RK3588 CMA/reset state. Default to the
+   # bounded typed boundary; retain the register-level chain below as opt-in WIP.
+   if not getenv("ROCKCHIP_NATIVE_POOL_INDEX_WIP") or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
+-    # Scheduler reduction-axis order is not necessarily spatial order. Public
+-    # max-pool ties select the earliest flattened input address; cummax retains
+-    # its separate reduction-axis ordering.
+-    host_mapping = mapping if cumulative_index else [
++    # Scheduler reduction-axis order is not necessarily public tie order.
++    # Cumulative extrema choose the latest coordinate; max-pool chooses the
++    # earliest flattened spatial address.
++    host_mapping = [
+       address for output in range(total)
+       for address in sorted(mapping[output*window:(output+1)*window],
+-                            key=lambda value: (value < 0, value % input_spatial if value >= 0 else 0))]
+-    dtype_marker = (8,) if data.dtype is dtypes.int else ()
++                            key=lambda value: (value < 0, -(value % input_spatial) if cumulative_index and value >= 0
++                                               else value % input_spatial if value >= 0 else 0))]
++    dtype_marker = (10,) if negated_data and data.dtype is dtypes.half else (8,) if data.dtype is dtypes.int else ()
+     layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *dtype_marker, *host_mapping)
+     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))
+@@ -15048,6 +15152,10 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (bilinear_interpolate_tasks := _try_bilinear_interpolate_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, bilinear_interpolate_tasks)
+   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
++  if (cumextrema_tasks := _try_cumextrema_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, cumextrema_tasks)
++  if (cummin_finalize_tasks := _try_long_cummin_finalize_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, cummin_finalize_tasks)
+   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
+   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
+   if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
+@@ -15188,6 +15296,8 @@ def build_native_program(sink: UOp) -> UOp|None:
+     return build_native_program_multi(sink, axis_arg_extrema_tasks)
+   if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, arg_extrema_tasks)
++  if (long_cumextrema_index_tasks := _try_long_cumextrema_index_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, long_cumextrema_index_tasks)
+   if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
+   if (int_max_pool_tasks := _try_int_max_pool_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, int_max_pool_tasks)
+-- 
+2.34.1
+
