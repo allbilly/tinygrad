@@ -12383,3 +12383,17 @@ eight-finding baseline; compilation and `git diff --check` pass. PR1 must run
 without an externally forced `DEFAULT_FLOAT=HALF`, because its fp32 normalize
 classifier intentionally verifies the default scheduler shape; hardware
 TestOps continues to use `DEFAULT_FLOAT=HALF FORWARD_ONLY=1`.
+
+### SINH/COSH task graphs
+
+Commit `d8508a925`; saved patch
+`0148-rockchip-compose-sinh-cosh-task-graphs.patch`.
+
+The fp16 SINH/COSH lowerer now shares symmetric clamping, positive masks,
+regional composition, and duplicated overflow-denominator visibility through
+`_TaskGraph`. Its separate normal-fp32 host path is unchanged. This removes
+**21 counted lines**, reaching **11,683** in `support/rockchip.py`.
+
+PR1 passes **173/173 in 12.90s** and focused serialized RK3588 SINH/COSH passes
+**2/2 in 11.34s**. Mypy/Ruff remain at the exact 12/8 baselines; compilation
+and `git diff --check` pass.

@@ -3438,3 +3438,13 @@ Focused forward-only hardware status is **2/2 PASS in 22.13s**:
 **173/173 PASS in 13.34s** when run in its normal environment. Static baselines
 are unchanged at 12 mypy errors and eight touched-file Ruff findings. The
 support file is now **11,704 counted lines**.
+
+### SINH/COSH task-graph compaction
+
+Commit `d8508a925`; saved patch
+`0148-rockchip-compose-sinh-cosh-task-graphs.patch`.
+
+Focused forward-only RK3588 status is **2/2 PASS in 11.34s** for
+`TestOps::test_sinh` and `TestOps::test_cosh`. PR1 passes **173/173 in 12.90s**;
+static baselines remain 12 mypy errors and eight touched-file Ruff findings.
+The support file is now **11,683 counted lines**.

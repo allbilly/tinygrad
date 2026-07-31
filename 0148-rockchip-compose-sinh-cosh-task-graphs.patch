@@ -1,0 +1,95 @@
+From d8508a9256856beb015636482457f0318c781f19 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 02:27:56 +0800
+Subject: [PATCH] rockchip: compose sinh cosh task graphs
+
+---
+ tinygrad/runtime/support/rockchip.py | 67 ++++++++++------------------
+ 1 file changed, 23 insertions(+), 44 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 09f8bc5a7..e33d6560b 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4129,55 +4129,34 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   source, is_cosh = match
+   if source.dtype is not dtypes.half: return None
+   graph = _TaskGraph(sink, store, source)
+-  total, out, tasks, alloc = graph.total, graph.out, graph.tasks, graph.alloc
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
+ 
+-  low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, low, source_arg, _float_arg(-2), Ops.MAX),
+-                _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
+-                _emit_where_stage(total, neg_clamped, (neg_low, 0), _float_arg(-2), Ops.MAX),
+-                _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)))
+-  lut_slot = alloc()
+-  if not graph.emit_named_lut("rk_cosh" if is_cosh else "rk_sinh", bounded, lut_slot): return None
+-  local_slot = -1
++  bounded = graph.clamp_symmetric(source_arg, 2.0)
++  lut_slot = graph.alloc()
++  if not graph.emit_named_lut("rk_cosh" if is_cosh else "rk_sinh", bounded[0], lut_slot): return None
++  selected = (lut_slot,0)
+   if not is_cosh:
+-    local_slot = alloc()
+-    if not graph.emit_named_lut("rk_sinh_local", bounded, local_slot): return None
++    local_slot = graph.alloc()
++    if not graph.emit_named_lut("rk_sinh_local", bounded[0], local_slot): return None
+ 
+-  neg_source, abs_source = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX)))
+-  selected = lut_slot
++  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
+   if not is_cosh:
+-    near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
+-    local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
+-    broad, local_scaled, local, near, partial, selected = (alloc() for _ in range(6))
+-    tasks.extend((_emit_where_stage(total, near_diff, (abs_source, 0), _float_arg(.04), Ops.SUB),
+-                  _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_diff, (abs_source, 0), _float_arg(.125), Ops.SUB),
+-                  _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                  _emit_where_stage(total, broad, (lut_slot, 0), (local_outside, 0), Ops.MUL),
+-                  _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(.25), Ops.MUL),
+-                  _emit_where_stage(total, local, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                  _emit_where_stage(total, near, source_arg, (near_inside, 0), Ops.MUL),
+-                  _emit_where_stage(total, partial, (broad, 0), (local, 0), Ops.ADD),
+-                  _emit_where_stage(total, selected, (partial, 0), (near, 0), Ops.ADD)))
+-
+-  large_diff, large_scratch, large, denom_scratch, denom = (alloc() for _ in range(5))
+-  result_scratch = alloc()
+-  tasks.extend((_emit_where_stage(total, large_diff, (abs_source, 0), _float_arg(10), Ops.SUB),
+-                _emit_where_stage(total, large_scratch, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, large, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, denom_scratch, one, (large, 0), Ops.SUB),
+-                _emit_where_stage(total, denom, one, (large, 0), Ops.SUB),
+-                _emit_where_stage(total, result_scratch, (selected, 0), (denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, out, (selected, 0), (denom, 0), Ops.FDIV)))
+-  return tuple(tasks)
++    near_outside = graph.positive_mask(abs_source, _float_arg(.04), repeat=True)
++    near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++    local_outside = graph.positive_mask(abs_source, _float_arg(.125), repeat=True)
++    local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++    local_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++    broad = graph.op((lut_slot,0), local_outside, Ops.MUL, repeat=False)
++    local_scaled = graph.op((local_slot,0), _float_arg(.25), Ops.MUL, repeat=False)
++    local = graph.op(local_scaled, local_mask, Ops.MUL, repeat=False)
++    near = graph.op(source_arg, near_inside, Ops.MUL, repeat=False)
++    selected = graph.op(graph.op(broad, local, Ops.ADD, repeat=False), near, Ops.ADD, repeat=False)
++
++  large = graph.positive_mask(abs_source, _float_arg(10), repeat=True)
++  denom = graph.op(one, large, Ops.SUB)
++  graph.op(selected, denom, Ops.FDIV, out_slot=graph.out)
++  return tuple(graph.tasks)
+ 
+ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Evaluate either GELU form with broad/local LUTs and a near-zero series."""
+-- 
+2.34.1
+
