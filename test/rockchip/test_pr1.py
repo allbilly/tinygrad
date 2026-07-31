@@ -985,6 +985,16 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertEqual(subtasks[0].task.layout, (224, _HOST_EINSUM_LAYOUT, 13824))
 
+  def test_int_power_uses_one_typed_host_task(self):
+    for exponent in (2, 7, 29):
+      expression = Tensor.empty(3, dtype=dtypes.int, device="ROCKCHIP")**exponent
+      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+      program = build_native_program(sink)
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
     for expression in (source.argmax(0, False), source.argmin(0, False)):

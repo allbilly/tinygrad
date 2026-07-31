@@ -14075,6 +14075,26 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", identity_layout, info.outs[0], is_copy=True), identity_relocs))
   return tuple(tasks)
 
+def _try_int_power_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate a bounded repeated int32 MUL tree as one typed task."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.int or _reduce_node(sink) is not None: return None
+  value = _unwrap(store.src[1])
+  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.int]
+  if len(indexes) != 1 or (source := indexes[0]).src[0].op is not Ops.PARAM: return None
+  def exponent(u:UOp) -> int|None:
+    u = _unwrap(u)
+    if u is source: return 1
+    if u.op is not Ops.MUL or len(u.src) != 2: return None
+    lhs, rhs = exponent(u.src[0]), exponent(u.src[1])
+    return None if lhs is None or rhs is None else lhs+rhs
+  power = exponent(value)
+  if power is None or not 2 <= power <= 32: return None
+  total = prod(_shape_of_store(sink))
+  if not 1 <= total <= 1 << 20 or int(source.src[0].src[0].arg) != total or source.src[1] is not store.src[0].src[1] or \
+     any(u.op not in {Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in value.toposort()): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True)
+
 def _wip_try_native_small_int_power_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Lower a repeated int32 MUL tree through packed native DPU atoms."""
   store = _store_node(sink)
@@ -15083,6 +15103,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   #   return build_native_program_multi(sink, neutral_block_tasks)
   if (product_tasks := _try_local_product_subtasks(sink)) is not None:
     return build_native_program_multi(sink, product_tasks)
+  if (int_power_tasks := _try_int_power_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, int_power_tasks)
   # WIP: small official values pass, but native MUL corrupts the high word of
   # 46340**2. Keep disabled until byte-limb multiplication is exact.
   # if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
