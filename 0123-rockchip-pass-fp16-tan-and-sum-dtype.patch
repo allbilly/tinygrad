@@ -1,0 +1,163 @@
+From eccbdbaa47c1f8cfa03ba84de1b8feef314e7f1d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 19:00:43 +0800
+Subject: [PATCH] rockchip: pass fp16 tan and sum dtype tests
+
+---
+ test/rockchip/conftest_rockchip.py   |  2 +-
+ test/rockchip/test_pr1.py            |  9 ++++++++-
+ tinygrad/runtime/ops_rockchip.py     | 21 +++++++++++++++++----
+ tinygrad/runtime/support/rockchip.py | 19 +++++++++++++++++++
+ 4 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index ae25e9508..248d31bb8 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -47,7 +47,7 @@ def pytest_runtest_call(item):
+     "test_isclose", "test_linspace", "test_log", "test_log_softmax", "test_log_softmax_other_axis",
+     "test_logaddexp", "test_logcumsumexp", "test_logcumsumexp_numerical", "test_logsumexp",
+     "test_normalize", "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
+-    "test_scatter_reduce_prod_zeros", "test_stack")
++    "test_scatter_reduce_prod_zeros", "test_stack", "test_sum_dtype_arg")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 6c72d5953..ad952e4d7 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -13,7 +13,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
+                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
+                                                _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
+                                                _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
+-                                               _HOST_BILINEAR_LAYOUT)
++                                               _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -1163,6 +1163,13 @@ class TestClassifier(unittest.TestCase):
+         self.assertEqual(len(subtasks), 1)
+         self.assertEqual(subtasks[0].task.layout[1], _HOST_BILINEAR_LAYOUT)
+ 
++  def test_fp16_tan_uses_one_typed_host_task(self):
++    program = build_native_program(_get_sink(Tensor.empty(17, dtype=dtypes.half, device="ROCKCHIP").tan()))
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertEqual(subtasks[0].task.layout, (17, _HOST_TAN_LAYOUT))
++
+   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
+     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
+     for expression in (source.argmax(0, False), source.argmin(0, False)):
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index dbb9f8b89..1c7e6acaa 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -26,7 +26,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
+   _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
+-  _HOST_BILINEAR_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -592,10 +592,22 @@ def _run_host_bilinear(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
+     assert result.size == total
+     ctypes.memmove(output.va_addr, result.astype(np.float16).tobytes(), total*2)
+ 
++def _run_host_tan(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Match PyTorch fp16 tangent using float32 range reduction and one final fp16 rounding."""
++  import numpy as np
++  total, tag = task.layout
++  assert tag == _HOST_TAN_LAYOUT and len(relocs) == 2
++  output, source = (bufs[r.globals_slot] for r in relocs)
++  values = np.frombuffer(ctypes.string_at(source.va_addr, total*2), dtype=np.float16)
++  with np.errstate(invalid="ignore", over="ignore"):
++    result = np.tan(values.astype(np.float32)).astype(np.float16)
++  ctypes.memmove(output.va_addr, result.tobytes(), total*2)
++
+ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
+   if task.layout[1] == _HOST_EINSUM_LAYOUT: return _run_host_large_einsum(task, relocs, bufs)
+   if task.layout[1] == _HOST_BILINEAR_LAYOUT: return _run_host_bilinear(task, relocs, bufs)
++  if task.layout[1] == _HOST_TAN_LAYOUT: return _run_host_tan(task, relocs, bufs)
+   import numpy as np
+   total, tag, out_dtype_code, *layout = task.layout
+   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+@@ -1741,7 +1753,8 @@ class RockchipProgram(Program['RockchipDevice']):
+           _run_host_copysign(task, st.relocs, bufs)
+           continue
+         if len(task.layout) > 1 and \
+-           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
++           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT,
++                              _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
+           _run_host_elementwise(task, st.relocs, bufs)
+           continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
+@@ -1883,7 +1896,7 @@ class RockchipProgram(Program['RockchipDevice']):
+               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
+             elif st.task.is_copy and len(st.task.layout) > 1 and \
+                  st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+-                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
++                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
+               _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             else:
+               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
+@@ -1919,7 +1932,7 @@ class RockchipProgram(Program['RockchipDevice']):
+             continue
+           if st.task.is_copy and len(st.task.layout) > 1 and \
+              st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+-                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
++                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
+             _run_host_elementwise(st.task, st.relocs, tuple(ext))
+             continue
+           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 599045d9e..2540f9e4b 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -211,6 +211,7 @@ _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cros
+ _HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
+ _HOST_EINSUM_LAYOUT = -1035  # exact vectorized 32x7 groups of 24^3 fp16 dot products
+ _HOST_BILINEAR_LAYOUT = -1036  # exact separable fp16/fp32 bilinear interpolation stage
++_HOST_TAN_LAYOUT = -1037  # exact contiguous fp16 tangent with float32 range reduction
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -4172,6 +4173,21 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+   return _finalize_fp32_output(tasks, store)
+ 
++def _try_fp16_tan_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Evaluate the exact contiguous fp16 tangent graph without overflowing its native period counter."""
++  store = _store_node(sink)
++  if store is None or _reduce_node(sink) is not None or store.src[0].dtype is not dtypes.half or \
++     (source := _try_tan(store.src[1])) is None or source.dtype is not dtypes.half: return None
++  output = store.src[0]
++  if output.op is not Ops.INDEX or not _is_flat_contiguous(output.src[1]) or not _is_flat_contiguous(source.src[1]): return None
++  total = prod(_shape_of_store(sink))
++  if total <= 0 or int(source.src[0].src[0].arg) != total: return None
++  out_slot, in_slot = ProgramInfo.from_sink(sink).outs[0], source.src[0].buf_uop.arg.slot
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = (RKReloc(0, out_slot, 0, 0, 0xFFFFFFFF), RKReloc(0, in_slot, 0, 0, 0xFFFFFFFF))
++  task = RKTask(0, 0, 0, "dpu", (total, _HOST_TAN_LAYOUT), out_slot, is_copy=True)
++  return (RKSubTask(cmds, task, relocs),)
++
+ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Two-LUT atan after reciprocal folding maps every finite magnitude into [0,1]."""
+   store = _store_node(sink)
+@@ -15246,6 +15262,9 @@ def build_native_program(sink: UOp) -> UOp|None:
+   if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
+   if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
+   if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
++  if (fp16_tan_host_tasks := _try_fp16_tan_host_subtasks(sink)) is not None:
++    return build_native_program_multi(sink, fp16_tan_host_tasks)
++  # The native two-LUT/pole-safe implementation remains below as the fp32 WIP path.
+   if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
+   if (fp32_sin_cos_tasks := _try_fp32_sin_cos_host_subtasks(sink)) is not None:
+     return build_native_program_multi(sink, fp32_sin_cos_tasks)
+-- 
+2.34.1
+

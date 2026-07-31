@@ -3208,3 +3208,23 @@ one bounded typed reduction. Focused std-mean passes in **13.15s**.
 Contract advances to **172/172 in 10.95s**. Mypy and touched-file Ruff stay
 at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
 Next: methods 376–400.
+
+### FP16 tangent and explicit sum dtype
+
+Ordered methods 376–400 pass **24 runnable methods plus one intentional
+skip in 58.39s**. Commit `eccbdbaa4`; saved patch
+`0123-rockchip-pass-fp16-tan-and-sum-dtype.patch`.
+
+The explicit-fp32 sum method now uses a matching normal-fp32 reference.
+The tangent failure was backend-specific: its native fp16 period counter
+made finite ±1,000 and ±10,000 become NaN. A strict one-task contiguous
+fp16 tangent boundary uses float32 range reduction and one fp16 rounding,
+matching PyTorch exactly over the explicit cases and three 100,000-sample
+random controls. The existing native two-LUT tangent remains preserved as
+WIP.
+
+Contract advances to **173/173 in 9.75s**. Mypy and touched-file Ruff stay
+at their 12- and 9-finding baselines; `git diff --check` passes. Full-tree
+Ruff additionally scans the intentionally untracked `ref/` clones and is
+not a clean baseline. No LUT or two-level LUT changed. Next: ordered
+methods 401–424, followed by the full forward-only inventory.

@@ -11907,3 +11907,48 @@ Pre-edit recovery copies:
 `/tmp/ops_rockchip.py.20260731-185254`.
 
 Next action: continue ordered methods 376–400.
+
+## 2026-07-31 — fp16 tangent and explicit sum dtype milestone
+
+Ordered methods 376–400 pass **24/24 runnable methods with one intentional
+skip in 58.39s**. The focused `test_sum_dtype_arg` and `test_tan` run passes
+**2/2 in 12.39s**. Implementation commit: `eccbdbaa4`; portable patch:
+`0123-rockchip-pass-fp16-tan-and-sum-dtype.patch`.
+
+`test_sum_dtype_arg` was a reference-construction mismatch. The test asks
+tinygrad for an explicit fp32 sum while the forced-HALF Torch lambda kept a
+half result. Only this method now restores normal fp32 construction.
+
+The native tangent graph passed its ordinary ranges but returned NaN for
+finite fp16 ±1,000 and ±10,000 because its fp16 period counter overflowed
+the useful range. A strict typed host task now recognizes only the direct,
+contiguous fp16 `sin(x)/cos(x)` tangent lowering. It computes the semantic
+tangent with float32 range reduction and performs one final fp16 rounding.
+This exactly matched PyTorch on all explicit values and on 100,000 random
+fp16 samples in each of `[-1.5,1.5]`, `[-5,5]`, and `[-10000,10000]`.
+Nonfinite inputs remain NaN. The existing native two-LUT/pole-safe
+implementation is preserved below it as the fp32 WIP path.
+
+Validation:
+
+- focused hardware sum/tangent group: **2/2 in 12.39s**;
+- complete ordered methods 376–400: **24 passed, 1 skipped in 58.39s**;
+- hardware-free Rockchip advances to **173/173 in 9.75s**;
+- mypy remains at the exact 12-error baseline;
+- touched-file Ruff remains at the exact nine pre-existing findings;
+- full-tree Ruff is polluted by the intentionally untracked `ref/` clones
+  and generated bindings, and reported 2,559 unrelated findings;
+- `git diff --check` passes.
+
+No LUT table, LUT tuning parameter, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-185729`,
+`/tmp/ops_rockchip.py.20260731-185729`,
+`/tmp/conftest_rockchip.py.20260731-185729`,
+`/tmp/test_pr1.py.20260731-185729`,
+`/tmp/progress.md.20260731-190110`, and
+`/tmp/test_ops_status.md.20260731-190110`.
+
+Next action: complete ordered methods 401–424, then run the full forward-only
+`TestOps` inventory and fix every remaining failure group.
