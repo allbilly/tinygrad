@@ -1,0 +1,176 @@
+From 963a3a7c0d6814c46ca210ed675f37d82e9ce91e Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 00:25:51 +0800
+Subject: [PATCH] rockchip: share static index graph evaluator
+
+---
+ tinygrad/runtime/support/rockchip.py | 118 +++++++--------------------
+ 1 file changed, 28 insertions(+), 90 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index f95b088c5..c805fbf05 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -10496,6 +10496,29 @@ def _try_int_max_pool_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+      not any(u.op is Ops.CONST and u.dtype is dtypes.int and int(u.arg) == -(1 << 31) for u in nodes): return None
+   return _try_static_index_reduction_subtasks(sink)
+ 
++def _eval_static_index(u:UOp, coords:dict[UOp,int], allow_where:bool=False, lazy_where:bool=False, allow_neg:bool=False):
++  """Evaluate the bounded index-expression subset used by static graph lowerers."""
++  while u.op is Ops.CAST: u = u.src[0]
++  if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
++  if u.op is Ops.RANGE and u in coords: return coords[u]
++  if u.op is Ops.WHERE and allow_where and lazy_where:
++    return _eval_static_index(u.src[1] if _eval_static_index(u.src[0], coords, allow_where, lazy_where, allow_neg) else u.src[2],
++                              coords, allow_where, lazy_where, allow_neg)
++  values = [_eval_static_index(x, coords, allow_where, lazy_where, allow_neg) for x in u.src]
++  if any(x is Invalid for x in values): return Invalid
++  if u.op is Ops.ADD: return values[0]+values[1]
++  if u.op is Ops.MUL: return values[0]*values[1]
++  if u.op is Ops.SUB: return values[0]-values[1]
++  if u.op is Ops.FLOORDIV: return values[0]//values[1]
++  if u.op is Ops.FLOORMOD: return values[0]%values[1]
++  if u.op is Ops.CMPLT: return values[0] < values[1]
++  if u.op is Ops.CMPNE: return values[0] != values[1]
++  if u.op is Ops.AND: return all(bool(x) for x in values)
++  if u.op is Ops.OR: return any(bool(x) for x in values)
++  if u.op is Ops.WHERE and allow_where: return values[1] if values[0] else values[2]
++  if u.op is Ops.NEG and allow_neg: return -values[0]
++  raise ValueError(u.op)
++
+ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower bitonic sort's static MAX/MIN lane choice without host value comparisons."""
+   store = _store_node(sink)
+@@ -10535,22 +10558,7 @@ def _try_sort_compare_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if prod(loop_extents) != total: return None
+   if getenv("ROCKCHIP_DEBUG_ARGSORT"): print("RK_ARGSORT_COMPARE", total)
+ 
+-  def evaluate(u:UOp, coords:dict[UOp,int]):
+-    while u.op is Ops.CAST: u = u.src[0]
+-    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+-    if u.op is Ops.RANGE and u in coords: return coords[u]
+-    values = [evaluate(x, coords) for x in u.src]
+-    if any(x is Invalid for x in values): return Invalid
+-    if u.op is Ops.ADD: return values[0]+values[1]
+-    if u.op is Ops.MUL: return values[0]*values[1]
+-    if u.op is Ops.SUB: return values[0]-values[1]
+-    if u.op is Ops.FLOORDIV: return values[0]//values[1]
+-    if u.op is Ops.FLOORMOD: return values[0]%values[1]
+-    if u.op is Ops.CMPLT: return values[0] < values[1]
+-    if u.op is Ops.CMPNE: return values[0] != values[1]
+-    if u.op is Ops.AND: return all(bool(x) for x in values)
+-    if u.op is Ops.OR: return any(bool(x) for x in values)
+-    raise ValueError(u.op)
++  def evaluate(u:UOp, coords:dict[UOp,int]): return _eval_static_index(u, coords)
+ 
+   mappings = ([-1]*total, [-1]*total)
+   choose_max = [False]*total
+@@ -10757,23 +10765,7 @@ def _try_argsort_selected_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if any(u.op is Ops.INDEX for u in static_body.toposort()): return None
+   if getenv("ROCKCHIP_DEBUG_ARGSORT"): print("RK_ARGSORT_SELECTED", total, window)
+ 
+-  def evaluate(u:UOp, coords:dict[UOp,int]):
+-    while u.op is Ops.CAST: u = u.src[0]
+-    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+-    if u.op is Ops.RANGE and u in coords: return coords[u]
+-    values = [evaluate(x, coords) for x in u.src]
+-    if any(x is Invalid for x in values): return Invalid
+-    if u.op is Ops.ADD: return values[0]+values[1]
+-    if u.op is Ops.MUL: return values[0]*values[1]
+-    if u.op is Ops.SUB: return values[0]-values[1]
+-    if u.op is Ops.FLOORDIV: return values[0]//values[1]
+-    if u.op is Ops.FLOORMOD: return values[0]%values[1]
+-    if u.op is Ops.CMPLT: return values[0] < values[1]
+-    if u.op is Ops.CMPNE: return values[0] != values[1]
+-    if u.op is Ops.AND: return all(bool(x) for x in values)
+-    if u.op is Ops.OR: return any(bool(x) for x in values)
+-    if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
+-    raise ValueError(u.op)
++  def evaluate(u:UOp, coords:dict[UOp,int]): return _eval_static_index(u, coords, allow_where=True)
+ 
+   flat_indexes = tuple(index for _, pair in equality_pairs for index in pair)
+   source_totals = tuple(int(x.src[0].src[0].arg) for x in flat_indexes)
+@@ -10992,23 +10984,7 @@ def _try_argsort_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if any(u.op is Ops.INDEX for u in static_body.toposort()): return None
+   if getenv("ROCKCHIP_DEBUG_ARGSORT"): print("RK_ARGSORT_INDEX", total, window)
+ 
+-  def evaluate(u:UOp, coords:dict[UOp,int]):
+-    while u.op is Ops.CAST: u = u.src[0]
+-    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+-    if u.op is Ops.RANGE and u in coords: return coords[u]
+-    values = [evaluate(x, coords) for x in u.src]
+-    if any(x is Invalid for x in values): return Invalid
+-    if u.op is Ops.ADD: return values[0]+values[1]
+-    if u.op is Ops.MUL: return values[0]*values[1]
+-    if u.op is Ops.SUB: return values[0]-values[1]
+-    if u.op is Ops.FLOORDIV: return values[0]//values[1]
+-    if u.op is Ops.FLOORMOD: return values[0]%values[1]
+-    if u.op is Ops.CMPLT: return values[0] < values[1]
+-    if u.op is Ops.CMPNE: return values[0] != values[1]
+-    if u.op is Ops.AND: return all(bool(x) for x in values)
+-    if u.op is Ops.OR: return any(bool(x) for x in values)
+-    if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
+-    raise ValueError(u.op)
++  def evaluate(u:UOp, coords:dict[UOp,int]): return _eval_static_index(u, coords, allow_where=True)
+ 
+   mappings:list[tuple[tuple[int,...],tuple[int,...],tuple[bool,...]]] = []
+   source_totals = tuple(int(x.src[0].src[0].arg) for x in indexes)
+@@ -11201,26 +11177,7 @@ def _try_arg_extrema_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   if getenv("ROCKCHIP_DEBUG_ARG_EXTREMA"):
+     print("RK_ARG_EXTREMA", "selected" if extrema_source is not None else ("min" if is_min else "max"), source.dtype, total, window)
+ 
+-  def evaluate(u:UOp, coords:dict[UOp,int]):
+-    while u.op is Ops.CAST: u = u.src[0]
+-    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+-    if u.op is Ops.RANGE and u in coords: return coords[u]
+-    if u.op is Ops.WHERE:
+-      condition = evaluate(u.src[0], coords)
+-      return evaluate(u.src[1] if condition else u.src[2], coords)
+-    values = [evaluate(x, coords) for x in u.src]
+-    if any(x is Invalid for x in values): return Invalid
+-    if u.op is Ops.ADD: return values[0]+values[1]
+-    if u.op is Ops.MUL: return values[0]*values[1]
+-    if u.op is Ops.SUB: return values[0]-values[1]
+-    if u.op is Ops.FLOORDIV: return values[0]//values[1]
+-    if u.op is Ops.FLOORMOD: return values[0]%values[1]
+-    if u.op is Ops.CMPLT: return values[0] < values[1]
+-    if u.op is Ops.CMPNE: return values[0] != values[1]
+-    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
+-    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
+-    if u.op is Ops.NEG: return -values[0]
+-    raise ValueError(u.op)
++  def evaluate(u:UOp, coords:dict[UOp,int]): return _eval_static_index(u, coords, allow_where=True, lazy_where=True, allow_neg=True)
+ 
+   scheduled_index = None
+   if selected_reduce is not None:
+@@ -11499,26 +11456,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+     store.src[1].src[0].dtype in (dtypes.half, dtypes.float)
+   relative_index = cumulative_index
+ 
+-  def evaluate(u:UOp, coords:dict[UOp, int]):
+-    while u.op is Ops.CAST: u = u.src[0]
+-    if u.op is Ops.CONST: return Invalid if u.arg is Invalid else u.arg
+-    if u.op is Ops.RANGE and u in coords: return coords[u]
+-    if u.op is Ops.WHERE:
+-      condition = evaluate(u.src[0], coords)
+-      return evaluate(u.src[1] if condition else u.src[2], coords)
+-    values = [evaluate(x, coords) for x in u.src]
+-    if any(x is Invalid for x in values): return Invalid
+-    if u.op is Ops.ADD: return values[0] + values[1]
+-    if u.op is Ops.MUL: return values[0] * values[1]
+-    if u.op is Ops.SUB: return values[0] - values[1]
+-    if u.op is Ops.FLOORDIV: return values[0] // values[1]
+-    if u.op is Ops.FLOORMOD: return values[0] % values[1]
+-    if u.op is Ops.CMPLT: return values[0] < values[1]
+-    if u.op is Ops.CMPNE: return values[0] != values[1]
+-    if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
+-    if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
+-    if u.op is Ops.NEG: return -values[0]
+-    raise ValueError(u.op)
++  def evaluate(u:UOp, coords:dict[UOp,int]): return _eval_static_index(u, coords, allow_where=True, lazy_where=True, allow_neg=True)
+ 
+   mapping = [-1] * (total*window)
+   loop_extents = [int(u.src[0].arg) for u in loops]
+-- 
+2.34.1
+
