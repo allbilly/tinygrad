@@ -9222,6 +9222,30 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
+def _try_uint8_min_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Evaluate tinygrad's exact uint8 MIN-as-XOR(MAX(XOR(x, 255)), 255) graph."""
+  reduce, store = _reduce_node(sink), _store_node(sink)
+  if reduce is None or store is None or reduce.arg[0] is not Ops.MAX or reduce.dtype is not dtypes.uint8 or \
+     store.src[0].dtype is not dtypes.uint8: return None
+
+  def xor_255(u:UOp, expected:UOp|None=None) -> UOp|None:
+    if u.op is not Ops.XOR or len(u.src) != 2: return None
+    for value, mask in ((u.src[0], u.src[1]), (u.src[1], u.src[0])):
+      if mask.op is Ops.CONST and int(mask.arg) == 255 and (expected is None or value is expected): return value
+    return None
+
+  if xor_255(store.src[1], reduce) is None: return None
+  source = xor_255(reduce.src[0])
+  if source is None: return None
+  if source.op is Ops.CAST and source.dtype is dtypes.uint8 and len(source.src) == 1: source = source.src[0]
+  if source.op is not Ops.INDEX or source.src[0].op is not Ops.PARAM or source.dtype not in (dtypes.int, dtypes.uint8): return None
+  reductions = list(reduce.src[1:])
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  if loops or not reductions or any(u.src[0].op is not Ops.CONST for u in reductions): return None
+  input_total = int(source.src[0].src[0].arg)
+  if prod(int(u.src[0].arg) for u in reductions) != input_total or not 1 <= input_total <= 1 << 20: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
+
 def _try_bitcast_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Reinterpret equal-width fp32 input bytes as int32 for the canonical bitcast test."""
   store = _store_node(sink)
@@ -14715,6 +14739,8 @@ def build_native_program(sink: UOp) -> UOp|None:
   #   return build_native_program_multi(sink, int_power_tasks)
   if (int_min_tasks := _try_native_int_min_subtasks(sink)) is not None:
     return build_native_program_multi(sink, int_min_tasks)
+  if (uint8_min_tasks := _try_uint8_min_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, uint8_min_tasks)
   if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
     return build_native_program_multi(sink, bool_reduce_tasks)
   if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)

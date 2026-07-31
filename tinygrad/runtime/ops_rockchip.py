@@ -582,9 +582,14 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   out_dtype = np_dtypes[out_dtype_code]
   result = np.zeros(output.size // np.dtype(out_dtype).itemsize, dtype=out_dtype)
 
+  def array_cast(value, dtype_code):
+    target = np_dtypes[dtype_code]
+    if np.issubdtype(target, np.integer): return np.asarray(value).astype(target, casting="unsafe")
+    return np.asarray(value, dtype=target)
+
   def cast(value, dtype_code):
     with np.errstate(all="ignore"):
-      return np.asarray(value, dtype=np_dtypes[dtype_code]).item()
+      return array_cast(value, dtype_code).item()
 
   def evaluate(code, coords):
     stack:list = []
@@ -681,10 +686,10 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
             bits &= (1 << width)-1
             if np.issubdtype(np_dtypes[dtype_code], np.signedinteger) and bits & (1 << (width-1)): bits -= 1 << width
             value = bits
-          stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
+          stack.append(array_cast(value, dtype_code))
           continue
         if op == 1:
-          stack.append(np.asarray(coords[arg0], dtype=np_dtypes[dtype_code]))
+          stack.append(array_cast(coords[arg0], dtype_code))
           continue
         if op == 2:
           indices = np.asarray(stack.pop(), dtype=np.int64)
@@ -696,7 +701,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
           continue
         if op == 31:
           if reduced is None: raise RuntimeError("rk: typed reduction epilogue used without reduced value")
-          stack.append(np.asarray(reduced, dtype=np_dtypes[dtype_code]))
+          stack.append(array_cast(reduced, dtype_code))
           continue
         args = stack[-arg0:] if arg0 else []
         if arg0: del stack[-arg0:]
@@ -730,7 +735,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
         elif op == 30: value = args[0]*args[1] + args[2]
         elif op == 32: value = np.asarray(args[0], dtype=np_dtypes[arg1]).view(np_dtypes[dtype_code])
         else: raise RuntimeError(f"rk: invalid vector fancy-index opcode {op}")
-        stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
+        stack.append(array_cast(value, dtype_code))
       assert len(stack) == 1
       return stack[0]
 
