@@ -1,0 +1,47 @@
+From 4cc01c6ec6f665df2bed54c1bcceee606239025a Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 13:07:20 +0800
+Subject: [PATCH] test: run rockchip avg pool3d reference in fp32
+
+---
+ test/rockchip/conftest_rockchip.py | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 2f122d340..01d78ac3a 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -1,11 +1,12 @@
+ """Environment setup for running test_ops.py on ROCKCHIP.
+ 
+ Sets DEFAULT_FLOAT=half (NPU's primary dtype) and torch default to fp16 for
+-fair comparison. The one 3x3 bitcast reference is temporarily run as fp32:
+-PyTorch cannot reinterpret an odd-width fp16 row as int32. PyTorch's
+-architecture-specific fused SDPA kernel is disabled so attention is compared
+-with its portable MATH implementation. Unsupported ops raise
+-RuntimeError(RKPLAN_REJECT:...) and fail the test honestly.
++fair comparison. The 3x3 bitcast and CPU avg_pool3d references are
++temporarily run as fp32: PyTorch cannot reinterpret an odd-width fp16 row as
++int32 and does not implement CPU fp16 avg_pool3d. PyTorch's architecture-
++specific fused SDPA kernel is disabled so attention is compared with its
++portable MATH implementation. Unsupported ops raise RuntimeError
++(RKPLAN_REJECT:...) and fail the test honestly.
+ 
+ PR1 is an inference/forward-only backend. Gradients are explicitly deferred
+ (PR8). FORWARD_ONLY=1 must be passed on the command line, not hidden here, so
+@@ -27,9 +28,9 @@ from tinygrad import dtypes
+ 
+ @pytest.hookimpl(hookwrapper=True)
+ def pytest_runtest_call(item):
+-  """Keep the canonical equal-width bitcast test constructible under the HALF suite."""
+-  is_bitcast = item.name == "test_bitcast" and item.path.name == "test_ops.py"
+-  if not is_bitcast:
++  """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
++  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d")
++  if not needs_fp32_reference:
+     yield
+     return
+   torch_dtype, tinygrad_dtype = torch.get_default_dtype(), dtypes.default_float
+-- 
+2.34.1
+

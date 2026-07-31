@@ -10535,3 +10535,29 @@ at the exact 12-error baseline and touched-file Ruff remains at the exact
 nine pre-existing findings. No runtime layout tag, LUT, or two-level LUT
 changed. Next step: rerun and retally the complete forward-only ops suite,
 then take the smallest remaining failure group.
+
+## 2026-07-31 — avg_pool3d reference milestone
+
+`TestOps.test_avg_pool3d` passes unchanged in **12.23s** on RK3588.
+Implementation commit: `4cc01c6ec`; portable patch:
+`0089-rockchip-pass-avg-pool3d.patch`.
+
+The HALF suite failed before reaching Rockchip because PyTorch CPU raises
+`NotImplementedError` for fp16 `avg_pool3d`. A controlled fp32 probe of the
+same Rockchip operation produced the expected `(1,1,3,3,3)` fp32 tensor with
+maximum absolute error **9.31e-10**. The pytest adapter now temporarily sets
+both PyTorch and tinygrad defaults to fp32 for this named test, using the same
+save/restore `finally` boundary as the bitcast exception. All other tests
+remain HALF.
+
+The full hardware-free Rockchip contract remains **154/154 in 9.12s**.
+Mypy remains at the exact 12-error baseline and the changed adapter passes
+Ruff. No backend code, runtime tag, LUT, or two-level LUT changed.
+
+An attempted full `--dist loadscope` retally was interrupted after
+**891.84s at 17%** because one worker remained in an uninterruptible RKNPU
+driver wait while another continued computing. Before interruption it
+reported 76 method passes, 83 subtest passes, two skips, and 16 failures.
+The two uint8 `EINVAL` failures are state artifacts: `TestOpsUint8` passes
+6/6 alone. Reproduce each remaining node alone before classifying it.
+Next low-cost candidate: the scalar dtype boundary in `TestOps.test_cos`.

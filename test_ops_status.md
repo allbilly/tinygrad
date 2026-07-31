@@ -2589,3 +2589,22 @@ Contract: **154/154 in 10.12s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. No LUT or two-level LUT changed. Next action:
 retally the complete forward-only ops suite and select the smallest remaining
 failure group.
+
+### Avg pool 3-D reference
+
+`test_avg_pool3d` passes unchanged in **12.23s**. Commit `4cc01c6ec`; saved
+patch `0089-rockchip-pass-avg-pool3d.patch`.
+
+PyTorch CPU does not implement fp16 `avg_pool3d`, so the HALF run previously
+failed before backend execution. The Rockchip fp32 path was checked directly
+against PyTorch and matched with maximum absolute error **9.31e-10**. The
+adapter temporarily aligns both frameworks to fp32 only for this named test
+and restores their defaults afterward.
+
+Contract remains **154/154 in 9.12s**; mypy remains at 12 baseline errors;
+the changed adapter passes Ruff. No backend layout or LUT changed.
+
+The serialized full retally was stopped after **891.84s at 17%** due to an
+uninterruptible driver wait. Partial outcome: 76 passes, 83 subtest passes,
+two skips, 16 failures. Standalone uint8 remains 6/6, so its two `EINVAL`
+entries are not operator regressions. Next candidate: `TestOps.test_cos`.
