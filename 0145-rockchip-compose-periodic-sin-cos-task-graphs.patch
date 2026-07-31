@@ -1,0 +1,252 @@
+From 18923eeb3834793df3ae7c6e34a5d9530c10faf3 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 02:15:04 +0800
+Subject: [PATCH] rockchip: compose periodic sin cos task graphs
+
+---
+ tinygrad/runtime/support/rockchip.py | 208 +++++++++------------------
+ 1 file changed, 67 insertions(+), 141 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index b920ba57e..8d815074d 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -3316,31 +3316,15 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (match := _try_sin_cos(store.src[1])) is None: return None
+   source, is_cos = match
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1) + 1
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot + 1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    out_idx = store.src[0]
+-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
+-
++  graph = _TaskGraph(sink, store, source)
++  total, tasks = graph.total, graph.tasks
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
+-  neg_source, abs_source, invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(5))
++  neg_source = graph.op(zero, source_arg, Ops.SUB, repeat=False)
++  abs_source = graph.op(source_arg, neg_source, Ops.MAX, repeat=False)
++  invalid = graph.positive_mask(abs_source, _float_arg(20000.0), repeat=True)
+   # Bound infinities before the host-assisted truncation stage. The final x*0
+   # term restores NaN for both infinities and NaN without perturbing finite x.
+-  low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
+-  tasks:list[RKSubTask] = [
+-    _emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
+-    _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
+-    _emit_where_stage(total, invalid_diff, (abs_source, 0), _float_arg(20000.0), Ops.SUB),
+-    _emit_where_stage(total, invalid_scratch, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
+-    _emit_where_stage(total, invalid, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
+-    _emit_where_stage(total, low, source_arg, _float_arg(-10000.0), Ops.MAX),
+-    _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
+-    _emit_where_stage(total, neg_clamped, (neg_low, 0), _float_arg(-10000.0), Ops.MAX),
+-    _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
++  bounded = graph.clamp_symmetric(source_arg, 10000.0)
+   phase = bounded
+   # The first cosine implementation used this literal lowering:
+   # if is_cos:
+@@ -3351,85 +3335,53 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   # n=round(phase/(2*pi)).  Restoring the sign after trunc(abs(q)+0.5)
+   # avoids a full lowering of tinygrad's general round-to-even expression.
+-  quotient, neg_quotient, abs_quotient, biased, rounded_abs = (alloc() for _ in range(5))
+-  positive_diff, positive, negative, positive_n = (alloc() for _ in range(4))
+-  negative_n, signed_negative_n, rounded = (alloc() for _ in range(3))
+-  tasks.extend((_emit_where_stage(total, quotient, (phase, 0), _float_arg(1/(2*math.pi)), Ops.MUL),
+-                _emit_where_stage(total, neg_quotient, zero, (quotient, 0), Ops.SUB),
+-                _emit_where_stage(total, abs_quotient, (quotient, 0), (neg_quotient, 0), Ops.MAX),
+-                _emit_where_stage(total, biased, (abs_quotient, 0), _float_arg(0.5), Ops.ADD),
+-                _emit_trunc_stage(total, rounded_abs, (biased, 0)),
+-                _emit_where_stage(total, positive_diff, (quotient, 0), zero, Ops.SUB),
+-                _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, negative, one, (positive, 0), Ops.SUB),
+-                _emit_where_stage(total, positive_n, (rounded_abs, 0), (positive, 0), Ops.MUL),
+-                _emit_where_stage(total, negative_n, (rounded_abs, 0), (negative, 0), Ops.MUL),
+-                _emit_where_stage(total, signed_negative_n, zero, (negative_n, 0), Ops.SUB),
+-                _emit_where_stage(total, rounded, (positive_n, 0), (signed_negative_n, 0), Ops.ADD)))
++  quotient = graph.op(phase, _float_arg(1/(2*math.pi)), Ops.MUL, repeat=False)
++  neg_quotient = graph.op(zero, quotient, Ops.SUB, repeat=False)
++  abs_quotient = graph.op(quotient, neg_quotient, Ops.MAX, repeat=False)
++  biased = graph.op(abs_quotient, _float_arg(0.5), Ops.ADD, repeat=False)
++  rounded_abs = graph.alloc()
++  tasks.append(_emit_trunc_stage(total, rounded_abs, biased))
++  positive = graph.positive_mask(quotient, zero)
++  negative = graph.op(one, positive, Ops.SUB, repeat=False)
++  positive_n = graph.op((rounded_abs,0), positive, Ops.MUL, repeat=False)
++  negative_n = graph.op((rounded_abs,0), negative, Ops.MUL, repeat=False)
++  signed_negative_n = graph.op(zero, negative_n, Ops.SUB, repeat=False)
++  rounded = graph.op(positive_n, signed_negative_n, Ops.ADD, repeat=False)
+ 
+   # Cody-Waite-style split subtraction is essential for fp16 scratch values:
+   # a single n*(2*pi) rounds to a multiple of eight around x=10000.
+   reduced = phase
+   for coefficient in (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125):
+-    product_slot, next_reduced = alloc(), alloc()
+-    tasks.extend((_emit_where_stage(total, product_slot, (rounded, 0), _float_arg(coefficient), Ops.MUL),
+-                  _emit_where_stage(total, next_reduced, (reduced, 0), (product_slot, 0), Ops.SUB)))
+-    reduced = next_reduced
++    product_slot = graph.op(rounded, _float_arg(coefficient), Ops.MUL, repeat=False)
++    reduced = graph.op(reduced, product_slot, Ops.SUB, repeat=False)
+ 
+   if is_cos:
+-    broad, local = alloc(), alloc()
+-    broad_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(reduced),), arg="rk_cos")
+-    broad_store = store.replace(src=(temp_index(broad), broad_val))
+-    broad_plan = plan_rk(sink.substitute({store:broad_store}))
+-    if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+-    cmds, task, relocs = emit_rk(broad_plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-    local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(reduced),), arg="rk_cos_local")
+-    local_store = store.replace(src=(temp_index(local), local_val))
+-    local_plan = plan_rk(sink.substitute({store:local_store}))
+-    if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+-    cmds, task, relocs = emit_rk(local_plan)
+-    tasks.append(RKSubTask(cmds, task, relocs))
+-
+-    neg_broad, abs_broad, local_diff = alloc(), alloc(), alloc()
+-    local_outside, local_inside = alloc(), alloc()
+-    near_diff, near_outside, near_inside, middle_mask = alloc(), alloc(), alloc(), alloc()
+-    selected_sum, broad_mask = alloc(), alloc()
+-    neg_reduced_cos, abs_reduced_cos = alloc(), alloc()
+-    center_hi, near_scaled, middle_scaled = alloc(), alloc(), alloc()
+-    broad_selected, near_selected, middle_selected = alloc(), alloc(), alloc()
+-    local_sum, normal = alloc(), alloc()
+-    denom_scratch, valid_denom, factor_scratch, valid_factor, out_scratch = (alloc() for _ in range(5))
+-    tasks.extend((_emit_where_stage(total, neg_broad, zero, (broad, 0), Ops.SUB),
+-                  _emit_where_stage(total, abs_broad, (broad, 0), (neg_broad, 0), Ops.MAX),
+-                  _emit_where_stage(total, local_diff, (abs_broad, 0), _float_arg(0.5), Ops.SUB),
+-                  _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                  _emit_where_stage(total, near_diff, (abs_broad, 0), _float_arg(0.01), Ops.SUB),
+-                  _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                  _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                  # Earlier piecewise-gain tuning used separate 0.096/0.104 masks
+-                  # around a discontinuous local LUT. The continuous 2*cos table
+-                  # only needs the local-minus-center mask.
+-                  _emit_where_stage(total, middle_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
+-                  _emit_where_stage(total, selected_sum, (near_inside, 0), (middle_mask, 0), Ops.ADD),
+-                  _emit_where_stage(total, broad_mask, one, (selected_sum, 0), Ops.SUB),
+-                  _emit_where_stage(total, neg_reduced_cos, zero, (reduced, 0), Ops.SUB),
+-                  _emit_where_stage(total, abs_reduced_cos, (reduced, 0), (neg_reduced_cos, 0), Ops.MAX),
+-                  _emit_where_stage(total, center_hi, _float_arg(1.5703125), (abs_reduced_cos, 0), Ops.SUB),
+-                  _emit_where_stage(total, near_scaled, (center_hi, 0), _float_arg(math.pi/2-1.5703125), Ops.ADD),
+-                  _emit_where_stage(total, middle_scaled, (local, 0), _float_arg(0.5), Ops.MUL),
+-                  _emit_where_stage(total, broad_selected, (broad, 0), (broad_mask, 0), Ops.MUL),
+-                  _emit_where_stage(total, near_selected, (near_scaled, 0), (near_inside, 0), Ops.MUL),
+-                  _emit_where_stage(total, middle_selected, (middle_scaled, 0), (middle_mask, 0), Ops.MUL),
+-                  _emit_where_stage(total, local_sum, (near_selected, 0), (middle_selected, 0), Ops.ADD),
+-                  _emit_where_stage(total, normal, (broad_selected, 0), (local_sum, 0), Ops.ADD),
+-                  _emit_where_stage(total, denom_scratch, one, (invalid, 0), Ops.SUB),
+-                  _emit_where_stage(total, valid_denom, one, (invalid, 0), Ops.SUB),
+-                  _emit_where_stage(total, factor_scratch, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+-                  _emit_where_stage(total, valid_factor, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+-                  _emit_where_stage(total, out_scratch, (normal, 0), (valid_factor, 0), Ops.MUL),
+-                  _emit_where_stage(total, info.outs[0], (normal, 0), (valid_factor, 0), Ops.MUL)))
++    broad, local = graph.alloc(), graph.alloc()
++    if not graph.emit_named_lut("rk_cos", reduced[0], broad) or not graph.emit_named_lut("rk_cos_local", reduced[0], local): return None
++    neg_broad = graph.op(zero, (broad,0), Ops.SUB, repeat=False)
++    abs_broad = graph.op((broad,0), neg_broad, Ops.MAX, repeat=False)
++    local_outside = graph.positive_mask(abs_broad, _float_arg(0.5))
++    local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++    near_outside = graph.positive_mask(abs_broad, _float_arg(0.01))
++    near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++    # Earlier piecewise-gain tuning used separate 0.096/0.104 masks around a
++    # discontinuous local LUT. The continuous 2*cos table only needs this mask.
++    middle_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++    selected_sum = graph.op(near_inside, middle_mask, Ops.ADD, repeat=False)
++    broad_mask = graph.op(one, selected_sum, Ops.SUB, repeat=False)
++    neg_reduced = graph.op(zero, reduced, Ops.SUB, repeat=False)
++    abs_reduced = graph.op(reduced, neg_reduced, Ops.MAX, repeat=False)
++    center_hi = graph.op(_float_arg(1.5703125), abs_reduced, Ops.SUB, repeat=False)
++    near_scaled = graph.op(center_hi, _float_arg(math.pi/2-1.5703125), Ops.ADD, repeat=False)
++    middle_scaled = graph.op((local,0), _float_arg(0.5), Ops.MUL, repeat=False)
++    broad_selected = graph.op((broad,0), broad_mask, Ops.MUL, repeat=False)
++    near_selected = graph.op(near_scaled, near_inside, Ops.MUL, repeat=False)
++    middle_selected = graph.op(middle_scaled, middle_mask, Ops.MUL, repeat=False)
++    local_sum = graph.op(near_selected, middle_selected, Ops.ADD, repeat=False)
++    normal = graph.op(broad_selected, local_sum, Ops.ADD, repeat=False)
++    valid_denom = graph.op(one, invalid, Ops.SUB)
++    valid_factor = graph.op(valid_denom, valid_denom, Ops.FDIV)
++    graph.op(normal, valid_factor, Ops.MUL, out_slot=graph.out)
+     tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+     if source.src[0].dtype is dtypes.float:
+       source_slot = source.src[0].arg.slot
+@@ -3437,53 +3389,27 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                if source_slot in st.task.fp32_inputs else st for st in tasks]
+     return _finalize_fp32_output(tasks, store)
+ 
+-  broad = alloc()
+-  broad_val = UOp(Ops.SIN, dtypes.half, (temp_index(reduced),))
+-  broad_store = store.replace(src=(temp_index(broad), broad_val))
+-  broad_plan = plan_rk(sink.substitute({store:broad_store}))
+-  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(broad_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  zoomed, local = alloc(), alloc()
+-  tasks.append(_emit_where_stage(total, zoomed, (reduced, 0), _float_arg(16.0), Ops.MUL))
+-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_sin_local")
+-  local_store = store.replace(src=(temp_index(local), local_val))
+-  local_plan = plan_rk(sink.substitute({store:local_store}))
+-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(local_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  neg_reduced, abs_reduced = alloc(), alloc()
+-  local_diff, local_outside, local_inside = alloc(), alloc(), alloc()
+-  near_diff, near_outside, near_inside = alloc(), alloc(), alloc()
+-  broad_mask, local_mask = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, neg_reduced, zero, (reduced, 0), Ops.SUB),
+-                _emit_where_stage(total, abs_reduced, (reduced, 0), (neg_reduced, 0), Ops.MAX),
+-                _emit_where_stage(total, local_diff, (abs_reduced, 0), _float_arg(0.125), Ops.SUB),
+-                _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, near_diff, (abs_reduced, 0), _float_arg(0.04), Ops.SUB),
+-                _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, broad_mask, one, (local_inside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB)))
+-
+-  local_scaled, broad_selected, local_selected = alloc(), alloc(), alloc()
+-  near_selected, lut_sum, normal = alloc(), alloc(), alloc()
+-  denom_scratch, valid_denom, factor_scratch, valid_factor, out_scratch = (alloc() for _ in range(5))
+-  tasks.extend((_emit_where_stage(total, local_scaled, (local, 0), _float_arg(0.125), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (broad, 0), (broad_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, near_selected, (reduced, 0), (near_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, normal, (lut_sum, 0), (near_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, denom_scratch, one, (invalid, 0), Ops.SUB),
+-                _emit_where_stage(total, valid_denom, one, (invalid, 0), Ops.SUB),
+-                _emit_where_stage(total, factor_scratch, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, valid_factor, (valid_denom, 0), (valid_denom, 0), Ops.FDIV),
+-                _emit_where_stage(total, out_scratch, (normal, 0), (valid_factor, 0), Ops.MUL),
+-                _emit_where_stage(total, info.outs[0], (normal, 0), (valid_factor, 0), Ops.MUL)))
++  broad = graph.alloc()
++  if not graph.emit_lut(UOp(Ops.SIN, dtypes.half, (graph.temp_index(reduced[0]),)), broad): return None
++  zoomed = graph.op(reduced, _float_arg(16.0), Ops.MUL, repeat=False)
++  local = graph.alloc()
++  if not graph.emit_named_lut("rk_sin_local", zoomed[0], local): return None
++  neg_reduced = graph.op(zero, reduced, Ops.SUB, repeat=False)
++  abs_reduced = graph.op(reduced, neg_reduced, Ops.MAX, repeat=False)
++  local_outside = graph.positive_mask(abs_reduced, _float_arg(0.125))
++  local_inside = graph.op(one, local_outside, Ops.SUB, repeat=False)
++  near_outside = graph.positive_mask(abs_reduced, _float_arg(0.04))
++  near_inside = graph.op(one, near_outside, Ops.SUB, repeat=False)
++  broad_mask = graph.op(one, local_inside, Ops.SUB, repeat=False)
++  local_mask = graph.op(local_inside, near_inside, Ops.SUB, repeat=False)
++  local_scaled = graph.op((local,0), _float_arg(0.125), Ops.MUL, repeat=False)
++  broad_selected = graph.op((broad,0), broad_mask, Ops.MUL, repeat=False)
++  local_selected = graph.op(local_scaled, local_mask, Ops.MUL, repeat=False)
++  near_selected = graph.op(reduced, near_inside, Ops.MUL, repeat=False)
++  normal = graph.op(graph.op(broad_selected, local_selected, Ops.ADD, repeat=False), near_selected, Ops.ADD, repeat=False)
++  valid_denom = graph.op(one, invalid, Ops.SUB)
++  valid_factor = graph.op(valid_denom, valid_denom, Ops.FDIV)
++  graph.op(normal, valid_factor, Ops.MUL, out_slot=graph.out)
+   tasks = list(_fix_cmp_fp32(tuple(tasks), source))
+   if source.src[0].dtype is dtypes.float:
+     source_slot = source.src[0].arg.slot

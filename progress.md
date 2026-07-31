@@ -7774,6 +7774,19 @@ removes **74 counted lines**, reaching **11,938**.
 PR1 passes **173/173 in 13.28s** and ERF passes **1/1 in 10.23s** on RK3588.
 Mypy/Ruff remain at 12/8.
 
+### Declarative periodic sin/cos graphs
+
+Commit `18923eeb3`; patch
+`0145-rockchip-compose-periodic-sin-cos-task-graphs.patch`.
+
+SIN/COS now share graph-built invalid masking, symmetric bounding, signed
+round reduction, Cody-Waite subtraction, regional LUT selection, and final
+validity restoration. Periodic fp32 flags and the tangent WIP reference remain
+unchanged. This removes **68 counted lines**, reaching **11,812**.
+
+PR1 passes **173/173 in 12.85s** and SIN/COS pass **2/2 in 9.24s** on RK3588.
+Mypy/Ruff remain at 12/8.
+
 ### Declarative QuickGELU graph
 
 Commit `4fe27953c`; patch

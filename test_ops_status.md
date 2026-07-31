@@ -3407,3 +3407,12 @@ Commit `4fe27953c`; saved patch
 The active QuickGELU graph uses shared regional primitives; its WIP alternative
 is retained. Support size is **11,880**. PR1 is **173/173**, and normal/extreme
 QuickGELU pass **2/2 in 11.56s** on hardware.
+
+### Periodic SIN/COS graphs
+
+Commit `18923eeb3`; saved patch
+`0145-rockchip-compose-periodic-sin-cos-task-graphs.patch`.
+
+SIN/COS use the shared graph for reduction and regional selection; tangent WIP
+is untouched. Support size is **11,812**. PR1 is **173/173**, and both hardware
+methods pass in 9.24s with static baselines unchanged.
