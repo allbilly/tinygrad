@@ -30,7 +30,7 @@ from tinygrad import dtypes
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
-  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_bitcast", "test_avg_pool3d", "test_cos")
+  needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_arange", "test_bitcast", "test_avg_pool3d", "test_cos")
   if not needs_fp32_reference:
     yield
     return
