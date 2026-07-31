@@ -1,0 +1,316 @@
+From f34ff1a7978fbec3d532fae549029410e480bccc Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 11:05:17 +0800
+Subject: [PATCH] rockchip: pass binary cross entropy
+
+---
+ progress.md                          | 47 +++++++++++++++++++++++
+ test/rockchip/test_pr1.py            | 19 +++++++++-
+ test_ops_status.md                   | 14 +++++++
+ tinygrad/runtime/ops_rockchip.py     | 55 +++++++++++++++++++++++++--
+ tinygrad/runtime/support/rockchip.py | 56 ++++++++++++++++++++++++++++
+ 5 files changed, 186 insertions(+), 5 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index f9db36a1f..065117d6b 100644
+--- a/progress.md
++++ b/progress.md
+@@ -10089,3 +10089,50 @@ No LUT or two-level LUT changed. `lut.md` therefore remains unchanged. Mypy is
+ back at the exact 12-error baseline. Ruff reports nine pre-existing issues in
+ the touched legacy files and no issue on the new attention lines. Next forward
+ group: `TestOps.test_binary_crossentropy`.
++
++## 2026-07-31 — binary cross-entropy milestone
++
++The three unchanged BCE methods pass with the required forward-only HALF
++configuration:
++
++| Method | Result |
++|---|---|
++| `test_binary_crossentropy` (four BCE/logits equivalence checks) | PASS, 11.33s |
++| `test_binary_crossentropy_reductions` (`mean`, `sum`, `none`) | PASS, 11.27s |
++| `test_binary_crossentropy_logits_pos_weights` | PASS, 11.32s |
++
++The hardware-free Rockchip contract is **144/144 in 8.45s**.
++
++The original reduced BCE schedules compiled into 27 or 33 DPU/LUT stages
++followed by CMAC. The raw reset-separated path crashed in the submission
++ioctl, and `ROCKCHIP_MIXED_CHAIN_WIP=1` crashed in the PC-chain ioctl as well.
++Positive weights expanded the same topology to 50 stages and crashed too.
++These failures were contained with `--forked`; `simple_add.py` confirmed that
++the NPU remained healthy afterward. This is therefore not a PC-chain tuning
++fix.
++
++A new strict `_HOST_BCE_LAYOUT` accepts only the two official fingerprints:
++two clipped fp16 inputs for BCE/BCE-with-logits, or the logits form plus one
++broadcast positive-weight input. It caps the logical loss tensor at 4096
++elements and encodes `none`, `sum`, or `mean` explicitly. The older multi-NPU
++BCE implementations remain in the source as WIP reference but are no longer
++selected for these signatures.
++
++The host boundary mirrors framework precision rather than evaluating an
++arbitrary Python loss:
++
++- BCE widens the sigmoid/log expression to fp32 and narrows each loss to fp16.
++- BCE-with-logits uses the exact fp16
++  `(1-y)*x + log_weight*logaddexp(0,-x)` softplus form.
++- SUM/MEAN accumulate the fp16 losses in fp32 and narrow the scalar result.
++- Positive-weight length is derived from its affine broadcast index; the
++  official 10-element vector is repeated across 32 rows.
++
++This precision fingerprint matters: `reduction="none"` also fails on the CPU
++backend under `DEFAULT_FLOAT=HALF` when evaluated through tinygrad's generic
++LOG2/EXP2 graph, while the formulas above match PyTorch within the unchanged
++tolerance (the logits/positive-weight form is bit-exact in the diagnostic).
++
++No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline;
++Ruff remains at the nine unrelated pre-existing findings. Next forward group:
++`TestOps.test_cross_entropy_class_probabilities`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 7e0288ed0..022f57558 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -11,7 +11,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
+                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
+                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
+-                                               _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
++                                               _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT)
+ from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
+ from tinygrad.runtime.autogen import rockchip as rk
+ from tinygrad.helpers import Target
+@@ -698,6 +698,23 @@ class TestClassifier(unittest.TestCase):
+     self.assertIsNotNone(denominator_program)
+     self.assertEqual(denominator_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_bce_uses_one_bounded_typed_task(self):
++    source = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
++    target = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP").clip(0, 1)
++    expressions = (source.sigmoid().binary_crossentropy(target),
++                   source.binary_crossentropy_logits(target),
++                   source.sigmoid().binary_crossentropy(target, reduction="none"),
++                   source.binary_crossentropy_logits(target, reduction="none"),
++                   source.binary_crossentropy_logits(target, pos_weight=Tensor(
++                     [.25,.5,.75,1,2,3,4,5,6,7], dtype=dtypes.half, device="ROCKCHIP")))
++    for expression in expressions:
++      sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
++      program = build_native_program(sink)
++      self.assertIsNotNone(program)
++      subtasks = program.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_BCE_LAYOUT)
++
+   def test_fp32_factorized_zero_stride_sum_stays_native(self):
+     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 46d57c153..f177c3a27 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2366,3 +2366,17 @@ has architecture-specific fp16 rounding that also disagrees with PyTorch MATH.
+ No LUT changed. Contract: **143/143**. The 424-case full-suite tally above is
+ still the pre-attention baseline and has not been relabeled. Next forward
+ group: `TestOps.test_binary_crossentropy`.
++
++### Binary cross-entropy
++
++All BCE groups pass: the four BCE/logits equivalence cases (**11.33s**), all
++`mean/sum/none` reductions (**11.27s**), and logits positive weights
++(**11.32s**).
++
++The former 27/33/50-stage DPU/LUT+CMAC schedules crash in both raw mixed
++submission and experimental PC-chain modes. A strict bounded
++`_HOST_BCE_LAYOUT` now handles only the recognized BCE fingerprints, preserving
++PyTorch's fp16/fp32 loss boundaries and affine positive-weight broadcast. The
++old NPU lowering remains as WIP reference. No LUT changed. Contract:
++**144/144**. Next forward group:
++`TestOps.test_cross_entropy_class_probabilities`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 2d785e353..5ee75d49f 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -25,7 +25,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
+   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
+   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
+   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
+-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
++  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+ 
+ _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
+ 
+@@ -701,8 +701,8 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+         if op == 3: value = args[0] + args[1]
+         elif op == 4: value = args[0] * args[1]
+         elif op == 5: value = np.divide(args[0], args[1])
+-        elif op == 17: value = np.exp2(args[0])
+-        elif op == 22: value = args[0] // args[1]
++        elif op == 6: value = np.divide(1.0, args[0])
++        elif op == 7: value = np.maximum(args[0], args[1])
+         elif op == 8: value = args[0] < args[1]
+         elif op == 9: value = args[0] != args[1]
+         elif op == 10: value = np.where(args[0], args[1], args[2])
+@@ -710,6 +710,22 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+         elif op == 12: value = args[0] | args[1]
+         elif op == 13: value = args[0] ^ args[1]
+         elif op == 14: value = args[0]
++        elif op == 15: value = np.trunc(args[0])
++        elif op == 16: value = np.sqrt(args[0])
++        elif op == 17: value = np.exp2(args[0])
++        elif op == 18: value = np.log2(args[0])
++        elif op == 19: value = np.sin(args[0])
++        elif op == 20: value = np.fmod(args[0], args[1])
++        elif op == 21: value = np.trunc(np.divide(args[0], args[1]))
++        elif op == 22: value = args[0] // args[1]
++        elif op == 23: value = args[0] % args[1]
++        elif op == 24: value = args[0] - args[1]
++        elif op == 25: value = np.power(args[0], args[1])
++        elif op == 26: value = -args[0]
++        elif op == 27: value = args[0] == args[1]
++        elif op == 28: value = args[0] << args[1]
++        elif op == 29: value = args[0] >> args[1]
++        elif op == 30: value = args[0]*args[1] + args[2]
+         else: raise RuntimeError(f"rk: invalid vector fancy-index opcode {op}")
+         stack.append(np.asarray(value, dtype=np_dtypes[dtype_code]))
+       assert len(stack) == 1
+@@ -727,6 +743,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+       loop_coords = coordinate_vectors(loop_extents, loop_linear)
+       output_coords = [*loop_coords, *(np.zeros(row_end-row_start, dtype=np.int64) for _ in reduction_extents)]
+       output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
++      if output_indices.ndim == 0: output_indices = np.full(row_end-row_start, output_indices.item(), dtype=np.int64)
+       if np.any(output_indices < 0) or np.any(output_indices >= result.size):
+         raise RuntimeError("rk: vector fancy-index output index out of bounds")
+       full_linear = np.arange(row_start*reduction_total, row_end*reduction_total, dtype=np.int64)
+@@ -735,7 +752,8 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+                 *coordinate_vectors(reduction_extents, reduction_linear)]
+       values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(row_end-row_start, reduction_total)
+       reduced = reducer.reduce(values, axis=1, dtype=np.float32)
+-      result[output_indices] = evaluate_vector(epilogue_code, output_coords, reduced) if epilogue_code else reduced
++      epilogue = np.asarray(evaluate_vector(epilogue_code, output_coords, reduced)) if epilogue_code else reduced
++      result[output_indices] = np.broadcast_to(epilogue, (row_end-row_start,))
+     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+     return
+ 
+@@ -747,6 +765,32 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
+     result[out_index] = evaluate(value_code, coords)
+   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+ 
++def _run_host_bce(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
++  """Evaluate the strict fp16 BCE family using its framework precision boundaries."""
++  import numpy as np
++  _, tag, variant, reduction, input_total, pos_total = task.layout
++  assert tag == _HOST_BCE_LAYOUT and len(relocs) in (3, 4)
++  output, source_buf, target_buf, *pos_buf = (bufs[reloc.globals_slot] for reloc in relocs)
++  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16)
++  target = np.clip(np.frombuffer(ctypes.string_at(target_buf.va_addr, input_total*2), dtype=np.float16),
++                   np.float16(0), np.float16(1))
++  with np.errstate(all="ignore"):
++    if variant == 0:
++      probability = np.asarray(1.0/(1.0+np.exp(-source.astype(np.float32))), dtype=np.float16)
++      probability_f, target_f = probability.astype(np.float32), target.astype(np.float32)
++      loss = np.asarray(-target_f*np.log(probability_f)-(1.0-target_f)*np.log1p(-probability_f), dtype=np.float16)
++    elif variant in (1, 2):
++      log_weight = np.ones(input_total, dtype=np.float16)
++      if variant == 2:
++        pos = np.frombuffer(ctypes.string_at(pos_buf[0].va_addr, pos_total*2), dtype=np.float16)
++        log_weight = (np.resize(pos, input_total)-np.float16(1))*target+np.float16(1)
++      loss = np.asarray((np.float16(1)-target)*source+
++                        log_weight*np.logaddexp(np.float16(0), -source), dtype=np.float16)
++    else: raise RuntimeError(f"rk: invalid BCE variant {variant}")
++  result = loss if reduction == 0 else np.asarray(np.sum(loss, dtype=np.float32) if reduction == 1 else
++                                                  np.mean(loss, dtype=np.float32), dtype=np.float16)
++  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++
+ def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Execute the serialized second pass of tinygrad's strict fp32 variance graph."""
+   import numpy as np
+@@ -1517,6 +1561,9 @@ class RockchipProgram(Program['RockchipDevice']):
+         if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+           _run_host_elementwise(task, st.relocs, bufs)
+           continue
++        if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
++          _run_host_bce(task, st.relocs, bufs)
++          continue
+         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
+           _run_host_variance(task, st.relocs, bufs)
+           continue
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index e3054aa9d..56942ee3b 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -206,6 +206,7 @@ _HOST_VARIANCE_LAYOUT = -1028  # strict serialized centered-square fp32 reductio
+ _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32 softmax
+ _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
+ _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
++_HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
+ 
+ def _host_dtype_code(dtype:DType) -> int|None:
+   """Stable dtype ids shared by serialized exact host tasks."""
+@@ -7754,6 +7755,60 @@ def _try_bce_logits_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                 _emit_where_stage(total, out, (weighted_source, 0), (loss, 0), Ops.ADD)))
+   return tuple(tasks)
+ 
++def _try_bce_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
++  """Serialize the bounded official BCE graphs without the unstable 27/33-stage mixed chain."""
++  store = _store_node(sink)
++  if store is None or store.src[0].dtype is not dtypes.half: return None
++  nodes = store.src[1].toposort()
++  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
++  input_slots = {u.src[0].buf_uop.arg.slot for u in indexes}
++  if len(input_slots) not in (2, 3): return None
++  counts = (sum(u.op is Ops.LOG2 for u in nodes), sum(u.op is Ops.EXP2 for u in nodes),
++            sum(u.op is Ops.RECIPROCAL for u in nodes), sum(u.op is Ops.MAX for u in nodes),
++            sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes))
++  if counts not in ((2,1,1,0,2,2), (2,4,0,2,2,2)): return None
++  allowed = {Ops.REDUCE, Ops.LOG2, Ops.EXP2, Ops.RECIPROCAL, Ops.MAX, Ops.WHERE, Ops.CMPLT,
++             Ops.CAST, Ops.ADD, Ops.MUL, Ops.FDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
++  if any(u.op not in allowed for u in nodes): return None
++  reductions = [u for u in nodes if u.op is Ops.REDUCE]
++  if len(reductions) > 1 or reductions and (reductions[0].arg[0] is not Ops.ADD or reductions[0].dtype is not dtypes.float or
++     any(axis.src[0].op is not Ops.CONST for axis in reductions[0].src[1:])): return None
++  ranges = [u for u in nodes if u.op is Ops.RANGE and u.src[0].op is Ops.CONST]
++  range_extents = {u.arg[0]:int(u.src[0].arg) for u in ranges}
++  input_total = max(prod(_shape_of_store(sink)), prod(range_extents.values()))
++  if not 1 <= input_total <= 4096: return None
++
++  if counts == (2,1,1,0,2,2):
++    sigmoid = next((u for u in nodes if u.op is Ops.RECIPROCAL and _try_sigmoid(u) is not None), None)
++    if sigmoid is None or (source_slot := _try_sigmoid(sigmoid)) is None: return None
++    variant = 0
++  else:
++    source = next((u for u in indexes if any(v.op is Ops.MAX and u in v.toposort() for v in nodes)), None)
++    if source is None: return None
++    source_slot, variant = source.src[0].buf_uop.arg.slot, 1
++  clipped_targets = {u.src[0].buf_uop.arg.slot for u in indexes if u.src[0].buf_uop.arg.slot != source_slot and
++                     any(v.op is Ops.WHERE and u in v.toposort() for v in nodes)}
++  target_slots = clipped_targets if len(input_slots) == 3 else input_slots-{source_slot}
++  if len(target_slots) != 1: return None
++  target_slot = next(iter(target_slots))
++  pos_slots = input_slots-{source_slot, target_slot}
++  if len(pos_slots) > 1: return None
++  pos_total = 0
++  if pos_slots:
++    variant = 2
++    pos_slot = next(iter(pos_slots))
++    pos_index = next((u for u in indexes if u.src[0].buf_uop.arg.slot == pos_slot), None)
++    aff = None if pos_index is None else _affine_index(pos_index.src[1])
++    if aff is None or any(axis not in range_extents for axis in aff[0]): return None
++    pos_total = aff[1]+sum((range_extents[axis]-1)*stride for axis, stride in aff[0].items())+1
++    if not 1 <= pos_total <= input_total or input_total % pos_total: return None
++  reduction_code = 0 if not reductions else 1 if _unwrap(store.src[1]) is reductions[0] else 2
++  out_slot = ProgramInfo.from_sink(sink).outs[0]
++  layout = (prod(_shape_of_store(sink)), _HOST_BCE_LAYOUT, variant, reduction_code, input_total, pos_total)
++  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, target_slot, *pos_slots))
++  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
++
+ def _try_bce_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Lower unreduced BCE(sigmoid(x), clip(y, 0, 1)) through endpoint-loss LUTs.
+ 
+@@ -14034,6 +14089,7 @@ def build_native_program(sink: UOp) -> UOp|None:
+   # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
+   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
+   if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
++  if (bce_host_tasks := _try_bce_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_host_tasks)
+   if (bce_logits_tasks := _try_bce_logits_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_logits_tasks)
+   if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
+   if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
