@@ -2518,3 +2518,31 @@ The classifiers require exact int32/half dtypes, rank-repeat and
 The hardware-free contract is **151/151 in 10.14s**. Mypy remains at 12 and
 touched-file Ruff at nine pre-existing findings. No new runtime tag, LUT, or
 two-level LUT changed. Next forward group: `TestOps.test_nonzero_size`.
+
+### Fixed-size nonzero
+
+`test_nonzero_size` passes exact, padded/fill, rank-two, rank-zero, empty,
+and dtype-preservation cases in **12.40s**. Dynamic plus fixed nonzero pass
+in **16.59s** with `-n12 --dist loadscope`. Commit `add791a62`; saved patch
+`0086-rockchip-pass-fixed-nonzero.patch`.
+
+The typed path now recognizes:
+
+- full cumsums of inline int32 `source != 0` predicates;
+- rank-expanded prefix lengths from one through eight coordinates;
+- the fixed masked-select post-reduction gather with either an explicit bool
+  mask or the exact computed int32 predicate;
+- reduced-count-dependent STORE validity indices.
+
+For the last item, the typed runtime computes the row reduction before
+evaluating STORE indices and the epilogue. This resolves the rank-two opcode
+31 ordering failure without adding a new layout tag.
+
+A concurrent two-worker run produced one transient RKNPU submit `EINVAL` on
+the empty constant-fill case. Each method passes alone, and load-scope passes
+both together, identifying existing device concurrency/state pollution
+rather than an operator failure.
+
+Contract: **152/152 in 17.00s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. No LUT or two-level LUT changed. Next forward
+group: `TestOps.test_cast`.

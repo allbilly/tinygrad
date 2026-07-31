@@ -10430,3 +10430,50 @@ reducer's float32 accumulator. No new runtime tag, LUT, or two-level LUT was
 needed. Mypy remains at the exact 12-error baseline and touched-file Ruff at
 the exact nine pre-existing findings. Next forward group:
 `TestOps.test_nonzero_size`.
+
+## 2026-07-31 — fixed-size nonzero milestone
+
+`TestOps.test_nonzero_size` passes all unchanged exact-size, padded/fill,
+rank-two, rank-zero, empty-input, and dtype-preservation cases in **12.40s**.
+Dynamic and fixed nonzero pass together in **16.59s** under
+`-n12 --dist loadscope`. The hardware-free Rockchip contract is
+**152/152 in 17.00s**. Implementation commit: `add791a62`; saved patch:
+`0086-rockchip-pass-fixed-nonzero.patch`.
+
+Fixed-size nonzero never calls `.item()`. It materializes a full int32 prefix
+from an inline `source != 0` predicate, then keeps the predicate count inside
+the final guarded coordinate gather. The prefix matcher now distinguishes
+this from ordinary int histograms by requiring the exact
+`CAST(CMPNE(INDEX(int32), 0))` plus cumsum topology. Rank-one uses equal
+source/reduction lengths; rank-two divides the expanded coordinate index by
+two and requires `reduction_length == source_length * rank`, with rank
+bounded to 1 through 8.
+
+The existing fixed masked-select matcher now has a second strict mask form:
+an inline int32 not-equal-zero predicate. It requires exactly two int32 input
+buffers (source-sized predicate data and output-sized coordinate data), the
+known one-ADD-reduction plus guarded post-reduction epilogue, and matching
+rank-expanded reduction geometry. `FLOORDIV/FLOORMOD` are permitted only for
+this computed-mask branch; the original explicit-bool matcher remains
+unchanged in scope.
+
+The rank-two scheduler also places a reduced-count validity condition in the
+STORE index. The typed runtime previously evaluated output indices before
+the row reduction, causing opcode 31 to raise “epilogue used without reduced
+value.” It now evaluates the reduction first, then evaluates both STORE
+indices and the value epilogue with the reduced vector. This preserves
+ordinary output indices and enables the valid post-reduction form.
+
+### RK driver concurrency diagnostic
+
+Running `test_nonzero` and `test_nonzero_size` as separate concurrent xdist
+workers produced one transient `DRM_IOCTL_RKNPU_SUBMIT` `EINVAL` on the
+empty-input constant-fill case. Both methods pass alone, and both pass
+together when xdist uses `--dist loadscope`, keeping the `TestOps` class on
+one worker. This is the existing device state-pollution/concurrent-submit
+class, not a classifier or numerical failure. Use load-scope for grouped NPU
+milestone validation while retaining `-n12`.
+
+No new runtime tag, LUT, or two-level LUT changed. Mypy remains at the exact
+12-error baseline and touched-file Ruff at the exact nine pre-existing
+findings. Next forward group: `TestOps.test_cast`.
