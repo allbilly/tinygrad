@@ -207,6 +207,7 @@ _HOST_SOFTMAX_ARGMAX_LAYOUT = -1029  # exact global argmax over a scheduled fp32
 _HOST_AVG_POOL_LAYOUT = -1030  # exact bounded normal-fp32 average-pool reduction
 _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus static reduction axes
 _HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
+_HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cross entropy
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -9701,13 +9702,17 @@ def _try_bounded_attention_max_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
   """
   store, reduce = _store_node(sink), _reduce_node(sink)
   shape = _shape_of_store(sink)
+  minimum_total = 1 if store is not None and store.src[0].dtype is dtypes.half else 256
   if store is None or reduce is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or \
-     _unwrap(store.src[1]) is not reduce or reduce.arg[0] is not Ops.MAX or reduce.dtype is not store.src[0].dtype or \
+     reduce.arg[0] is not Ops.MAX or reduce.dtype is not store.src[0].dtype or \
      len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or \
-     not 1 <= int(reduce.src[1].src[0].arg) <= 64 or not 256 <= prod(shape) <= 1 << 20: return None
+     not 1 <= int(reduce.src[1].src[0].arg) <= 64 or not minimum_total <= prod(shape) <= 1 << 20: return None
   body = _unwrap(reduce.src[0])
   if body.op is not Ops.INDEX or body.dtype is not reduce.dtype or body.src[0].op is not Ops.PARAM: return None
-  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+  post_reduction = _unwrap(store.src[1]) is not reduce
+  if post_reduction and (reduce not in store.src[1].toposort() or
+     any(u.op not in {Ops.REDUCE, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} for u in store.src[1].toposort())): return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=post_reduction)
 
 def _try_attention_value_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Stage the exact fused softmax-value contraction through a bounded typed reduction."""
@@ -9762,6 +9767,138 @@ def _try_attention_value_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:scratch_index})))
   epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
   return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
+
+def _try_logsoftmax_norm_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize the bounded log-sum-exp normalization used by cross entropy."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  nodes = store.src[1].toposort()
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  inputs = {u.src[0].buf_uop.arg.slot for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+  if len(reductions) != 1 or len(inputs) not in (1, 2) or sum(u.op is Ops.EXP2 for u in nodes) != 1 or \
+     sum(u.op is Ops.LOG2 for u in nodes) != 1: return None
+  reduce = reductions[0]
+  if reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or len(reduce.src) != 2 or \
+     reduce.src[1].src[0].op is not Ops.CONST or not 1 <= int(reduce.src[1].src[0].arg) <= 64: return None
+  allowed = {Ops.REDUCE, Ops.EXP2, Ops.LOG2, Ops.CAST, Ops.ADD, Ops.MUL,
+             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+  tasks = _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
+  if tasks is None: return None
+  # PyTorch's fp16 log_softmax rounds the exponent sum before LOG2.
+  task = tasks[0]
+  layout = (*task.task.layout[:5], 3, *task.task.layout[6:])
+  return (RKSubTask(task.cmds, replace(task.task, layout=layout), task.relocs),)
+
+def _try_cross_entropy_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Serialize exact bounded probability-target cross entropy.
+
+  PyTorch reduces the flattened fp16 class terms directly for SUM/MEAN. The
+  generic scheduled graph first rounds each row, which is observably different.
+  """
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  nodes = store.src[1].toposort()
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  if len(reductions) not in (1, 2) or any(u.arg[0] is not Ops.ADD or u.dtype is not dtypes.float for u in reductions): return None
+  allowed = {Ops.REDUCE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+
+  indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
+  slot_totals = {u.src[0].buf_uop.arg.slot:int(u.src[0].src[0].arg) for u in indexes}
+  if len(slot_totals) != 4: return None
+  totals = sorted(slot_totals.values())
+  if totals[0] != totals[1] or totals[2] != totals[3] or totals[0] <= 0 or \
+     totals[2] % totals[0] or totals[2] > 4096: return None
+  rows, input_total = totals[0], totals[2]
+  classes = input_total//rows
+  if not 2 <= classes <= 64: return None
+
+  # The target is the full-size direct INDEX operand of the class-term MUL;
+  # the other full-size slot, nested in the log-probability ADD, is the logits.
+  class_terms = [u for u in nodes if u.op is Ops.MUL and u.dtype is dtypes.half]
+  candidates:list[tuple[int, int, int]] = []
+  for term in class_terms:
+    class_reductions = [u for u in reductions if term in u.src[0].toposort()]
+    if not class_reductions: continue
+    class_reduce = min(class_reductions, key=lambda u:len(u.toposort()))
+    if len(class_reduce.src) != 2 or class_reduce.src[1].op is not Ops.RANGE: continue
+    class_axis = int(class_reduce.src[1].arg[0])
+    for target_index in term.src:
+      target = _unwrap(target_index)
+      if target.op is not Ops.INDEX or target.src[0].op is not Ops.PARAM or \
+         slot_totals.get(target.src[0].buf_uop.arg.slot) != input_total: continue
+      target_affine = _affine_index(target.src[1])
+      if target_affine is None or target_affine[1] != 0 or \
+         (class_stride := target_affine[0].get(class_axis, 0)) <= 0: continue
+      other = _unwrap(term.src[0] if term.src[1] is target_index else term.src[1])
+      other_slots = {u.src[0].buf_uop.arg.slot for u in other.toposort()
+                     if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+      full_other = [slot for slot in other_slots if slot_totals.get(slot) == input_total]
+      if len(full_other) == 1 and len(other_slots) == 3:
+        candidates.append((full_other[0], target.src[0].buf_uop.arg.slot, class_stride))
+  if len(set(candidates)) != 1: return None
+  source_slot, target_slot, class_stride = candidates[0]
+  if source_slot == target_slot or rows % class_stride: return None
+
+  output_total = prod(_shape_of_store(sink))
+  if len(reductions) == 1:
+    if output_total != rows: return None
+    reduction_code = 0
+  else:
+    if output_total != 1: return None
+    mean_scales = [u for u in nodes if u.op is Ops.CONST and u.dtype is dtypes.float and
+                   math.isclose(float(u.arg), 1.0/rows, rel_tol=1e-12)]
+    reduction_code = 2 if mean_scales else 1
+  out_slot = ProgramInfo.from_sink(sink).outs[0]
+  layout = (output_total, _HOST_CROSS_ENTROPY_LAYOUT, reduction_code, rows, classes, class_stride)
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, target_slot))
+  return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+
+def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Expand only the bounded final weighted reductions of class-probability cross entropy."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype is not dtypes.half: return None
+  nodes = store.src[1].toposort()
+  reductions = [u for u in nodes if u.op is Ops.REDUCE]
+  inputs = {u.src[0].buf_uop.arg.slot for u in nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+  if len(reductions) not in (1, 2) or len(inputs) not in (3, 4) or \
+     any(u.arg[0] is not Ops.ADD or u.dtype is not dtypes.float for u in reductions): return None
+  # Probability-target 2-D/N-D kernels use the dedicated exact matcher above.
+  # The remaining three-input probability form is only the scalar 1-D case;
+  # this prevents arbitrary three-factor reductions (for example einsum) from
+  # being mistaken for cross entropy. CMPNE identifies class-index weighting.
+  if not any(u.op is Ops.CMPNE for u in nodes):
+    input_totals = sorted({u.src[0].buf_uop.arg.slot:int(u.src[0].src[0].arg) for u in nodes
+                           if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}.values())
+    if len(reductions) != 1 or prod(_shape_of_store(sink)) != 1 or len(input_totals) != 3 or \
+       input_totals[0] != 1 or input_totals[1] != input_totals[2]: return None
+  allowed = {Ops.REDUCE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+  budget = prod(int(axis.src[0].arg) for reduce in reductions for axis in reduce.src[1:]
+                if axis.src[0].op is Ops.CONST)
+  if not 1 <= budget <= 4096: return None
+
+  def expand(u:UOp) -> UOp:
+    if u.op is Ops.REDUCE:
+      ranges = u.src[1:]
+      extents = [int(axis.src[0].arg) for axis in ranges]
+      terms:list[UOp] = []
+      for linear in range(prod(extents)):
+        rem, fixed = linear, {}
+        for axis in range(len(ranges)-1, -1, -1):
+          rem, coordinate = divmod(rem, extents[axis])
+          fixed[ranges[axis]] = UOp.const(ranges[axis].dtype, coordinate)
+        terms.append(expand(u.src[0].substitute(fixed)))
+      result = terms[0]
+      for term in terms[1:]: result = UOp(Ops.ADD, u.dtype, (result, term))
+      return result
+    new_src = tuple(expand(x) for x in u.src)
+    return u if new_src == u.src else u.replace(src=new_src)
+
+  expanded_store = store.replace(src=(store.src[0], expand(store.src[1])))
+  return _try_elementwise_host_subtasks(sink.substitute({store:expanded_store}), allow_plain=True)
 
 def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
@@ -14133,6 +14270,12 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, attention_score_tasks)
   if (attention_value_tasks := _try_attention_value_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, attention_value_tasks)
+  if (logsoftmax_norm_tasks := _try_logsoftmax_norm_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, logsoftmax_norm_tasks)
+  if (cross_entropy_tasks := _try_cross_entropy_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, cross_entropy_tasks)
+  if (cross_entropy_loss_tasks := _try_cross_entropy_loss_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, cross_entropy_loss_tasks)
   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
   if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, logcumsumexp_tasks)

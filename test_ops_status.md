@@ -2380,3 +2380,24 @@ PyTorch's fp16/fp32 loss boundaries and affine positive-weight broadcast. The
 old NPU lowering remains as WIP reference. No LUT changed. Contract:
 **144/144**. Next forward group:
 `TestOps.test_cross_entropy_class_probabilities`.
+
+### Cross entropy
+
+The three probability/index/reduction groups pass together in **12.69s**
+under the required HALF forward-only configuration. This covers probability
+targets in `(32,)`, `(32,10)`, and `(32,4,4,4)`, int32 class targets,
+`mean/sum/none`, and both expected API errors.
+
+A strict bounded `_HOST_CROSS_ENTROPY_LAYOUT` preserves PyTorch's two
+probability-target precision paths: fp16 sum/log normalization for a
+contiguous class axis and fp32 normalization for a strided NCHW class axis.
+It also reduces flattened fp16 class terms directly for `sum/mean`, avoiding
+the incorrect per-position rounding introduced by the decomposed schedule.
+The serialized affine class stride distinguishes the 2-D and NCHW layouts.
+
+The generic fallback is restricted to the exact scalar 1-D probability form
+or the `CMPNE` class-index fingerprint. This prevents a three-factor einsum
+from being captured as cross entropy; its two-CMAC hardware-free regression
+passes again. No LUT changed. Contract: **145/145**. The 424-case tally above
+remains the pre-milestone full-suite baseline. Next forward group:
+`TestOps.test_cross_entropy_smoothing`.

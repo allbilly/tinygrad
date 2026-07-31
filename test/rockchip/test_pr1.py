@@ -11,7 +11,8 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
-                                               _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT)
+                                               _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
+                                               _HOST_CROSS_ENTROPY_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -714,6 +715,22 @@ class TestClassifier(unittest.TestCase):
       subtasks = program.src[1].src[0].arg
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_BCE_LAYOUT)
+
+  def test_probability_cross_entropy_uses_exact_bounded_task(self):
+    source_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+    target_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+    source_4d = Tensor.empty(32,4,4,4, dtype=dtypes.half, device="ROCKCHIP")
+    target_4d = Tensor.empty(32,4,4,4, dtype=dtypes.half, device="ROCKCHIP")
+    expressions = ((source_2d.cross_entropy(target_2d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1)),
+                   (source_2d.cross_entropy(target_2d, reduction="none"), (32, _HOST_CROSS_ENTROPY_LAYOUT, 0, 32, 10, 1)),
+                   (source_4d.cross_entropy(target_4d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 512, 4, 16)))
+    for expression, expected_layout in expressions:
+      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+      program = build_native_program(sinks[-1])
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), 1)
+      self.assertEqual(subtasks[0].task.layout, expected_layout)
 
   def test_fp32_factorized_zero_stride_sum_stays_native(self):
     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)

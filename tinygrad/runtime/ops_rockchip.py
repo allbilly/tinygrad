@@ -25,7 +25,7 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -731,7 +731,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
       assert len(stack) == 1
       return stack[0]
 
-    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else np.maximum if reduction_op == 2 else None
+    reducer = np.add if reduction_op in (0, 3) else np.multiply if reduction_op == 1 else np.maximum if reduction_op == 2 else None
     if reducer is None: raise RuntimeError(f"rk: invalid typed reduction opcode {reduction_op}")
     # Bound coordinate/value grids to four million candidates. GQA attention
     # reaches 16M candidates per contraction; one giant grid spends minutes in
@@ -751,7 +751,8 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
       coords = [*coordinate_vectors(loop_extents, full_loop_linear),
                 *coordinate_vectors(reduction_extents, reduction_linear)]
       values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(row_end-row_start, reduction_total)
-      reduced = reducer.reduce(values, axis=1, dtype=np.float32)
+      reduced = reducer.reduce(values.astype(np.float16), axis=1, dtype=np.float16).astype(np.float32) if reduction_op == 3 else \
+        reducer.reduce(values, axis=1, dtype=np.float32)
       epilogue = np.asarray(evaluate_vector(epilogue_code, output_coords, reduced)) if epilogue_code else reduced
       result[output_indices] = np.broadcast_to(epilogue, (row_end-row_start,))
     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
@@ -789,6 +790,34 @@ def _run_host_bce(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tu
     else: raise RuntimeError(f"rk: invalid BCE variant {variant}")
   result = loss if reduction == 0 else np.asarray(np.sum(loss, dtype=np.float32) if reduction == 1 else
                                                   np.mean(loss, dtype=np.float32), dtype=np.float16)
+  ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
+
+def _run_host_cross_entropy(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Evaluate exact bounded fp16 probability-target cross entropy."""
+  import numpy as np
+  _, tag, reduction, rows, classes, class_stride = task.layout
+  assert tag == _HOST_CROSS_ENTROPY_LAYOUT and reduction in (0, 1, 2) and len(relocs) == 3
+  output, source_buf, target_buf = (bufs[reloc.globals_slot] for reloc in relocs)
+  input_total = rows*classes
+  batches = rows//class_stride
+  source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16).\
+    reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
+  target = np.frombuffer(ctypes.string_at(target_buf.va_addr, input_total*2), dtype=np.float16).\
+    reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
+  source_f = source.astype(np.float32)
+  centered = source_f-np.max(source_f, axis=1, keepdims=True)
+  # PyTorch's contiguous-class kernel rounds sum/log to fp16, while its
+  # strided NCHW class-axis kernel retains the normalization in fp32.
+  if class_stride == 1:
+    exponent_sum = np.sum(np.exp(centered), axis=1, keepdims=True, dtype=np.float16)
+    logarithm = np.log(exponent_sum.astype(np.float32)).astype(np.float16).astype(np.float32)
+  else: logarithm = np.log(np.sum(np.exp(centered), axis=1, keepdims=True, dtype=np.float32))
+  log_probs = np.asarray(centered-logarithm, dtype=np.float16)
+  terms = np.asarray(log_probs*target, dtype=np.float16)
+  if reduction == 0: result = np.asarray(-np.sum(terms, axis=1, dtype=np.float16), dtype=np.float16)
+  else:
+    summed = np.sum(terms, dtype=np.float16)
+    result = np.asarray(-summed if reduction == 1 else -np.float32(summed)/rows, dtype=np.float16)
   ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
 
 def _run_host_variance(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
@@ -1563,6 +1592,9 @@ class RockchipProgram(Program['RockchipDevice']):
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
           _run_host_bce(task, st.relocs, bufs)
+          continue
+        if len(task.layout) > 1 and task.layout[1] == _HOST_CROSS_ENTROPY_LAYOUT:
+          _run_host_cross_entropy(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
           _run_host_variance(task, st.relocs, bufs)

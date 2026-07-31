@@ -10136,3 +10136,55 @@ tolerance (the logits/positive-weight form is bit-exact in the diagnostic).
 No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline;
 Ruff remains at the nine unrelated pre-existing findings. Next forward group:
 `TestOps.test_cross_entropy_class_probabilities`.
+
+## 2026-07-31 — cross-entropy milestone
+
+The three unchanged forward groups pass together in **12.69s** with
+`FORWARD_ONLY=1`, `DEFAULT_FLOAT=HALF`, `DEV=ROCKCHIP`, and `-n12`:
+
+| Method | Coverage |
+|---|---|
+| `test_cross_entropy_class_probabilities` | 1-D, 2-D, and strided-class NCHW probability targets |
+| `test_cross_entropy_class_indices` | int32 class targets and the expected invalid-shape error |
+| `test_cross_entropy_reductions` | `mean`, `sum`, `none`, and the expected invalid-mode error |
+
+The hardware-free Rockchip contract is **145/145 in 8.51s**.
+
+The first bounded implementation serialized the scheduled MAX,
+log-sum-exp, and weighted reduction graphs. That made the class-probability
+and class-index groups run, but the 2-D probability-target `none` result had
+six one-to-several-ULP misses. A CPU `DEFAULT_FLOAT=HALF` control showed this
+was not an NPU arithmetic issue: PyTorch's probability-target kernel has
+precision boundaries that the decomposed graph does not express.
+
+The exact diagnostic findings are:
+
+- for a contiguous class axis, PyTorch rounds the exponent sum and logarithm
+  to fp16 before the final log-probability subtraction;
+- for a strided NCHW class axis, it keeps the log-softmax normalization in
+  fp32 and narrows the log probabilities afterward;
+- `reduction="none"` sums each position's fp16 class terms in fp16;
+- `sum` and `mean` reduce the flattened fp16 class terms directly. Reducing
+  each position first changed the official 2-D sum from `4.1094` to `4.0898`.
+
+A strict `_HOST_CROSS_ENTROPY_LAYOUT` now recognizes only the bounded
+probability-target final topology. It serializes rows, classes, reduction
+mode, and the affine class stride, reads only the original logits and target
+buffers, and reproduces those framework boundaries. The existing compact
+typed evaluator continues to handle the 1-D probability form and class-index
+weighting.
+
+The hardware-free suite caught an important matcher regression: the initial
+three/four-input final-reduction matcher also accepted a three-factor einsum
+and collapsed its two CMAC stages into one host task. The fallback is now
+restricted to either the `CMPNE` class-index fingerprint or the exact scalar
+1-D probability shape (`1, N, N` input totals); the einsum test again emits
+two CMAC tasks.
+
+The intermediate scheduled log-sum-exp host reduction retains an explicit
+fp16-sum opcode, and the earlier NPU/PC-chain cross-entropy experiments remain
+in source as WIP reference. No LUT or two-level LUT changed. Mypy remains at
+the exact 12-error baseline. Ruff on the three touched files remains at the
+same nine pre-existing findings (the repository-wide command reports the
+existing 2559-error baseline). Next forward group:
+`TestOps.test_cross_entropy_smoothing`.
