@@ -39,12 +39,13 @@ def pytest_collection_modifyitems(items):
 def pytest_runtest_call(item):
   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
   needs_fp32_reference = item.path.name == "test_ops.py" and item.name in ("test_arange", "test_bitcast", "test_avg_pool3d", "test_cos")
-  if not needs_fp32_reference:
+  torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+  if not needs_fp32_reference and not torch_only_fp32_reference:
     yield
     return
   torch_dtype, tinygrad_dtype = torch.get_default_dtype(), dtypes.default_float
   torch.set_default_dtype(torch.float32)
-  dtypes.default_float = dtypes.float32
+  if needs_fp32_reference: dtypes.default_float = dtypes.float32
   try:
     yield
   finally:
