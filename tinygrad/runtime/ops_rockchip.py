@@ -25,7 +25,8 @@ from tinygrad.runtime.support.rockchip import (build_native_program,
   _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT,
   _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT,
   _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT, _HOST_AVG_POOL_LAYOUT,
-  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _CMAC_MATERIALIZED_LAYOUT)
+  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT, _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT,
+  _CMAC_MATERIALIZED_LAYOUT)
 
 _ROCKCHIP_MAX_MAPPABLE_BO = 2 * 1024 * 1024
 
@@ -549,8 +550,20 @@ def _run_host_copysign(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
     if not 0 <= sign_index < sign.size // itemsize: raise RuntimeError(f"rk: host copysign sign index out of bounds {sign_index}")
     out_ptr[out_index] = (magnitude_ptr[magnitude_index] & ~sign_mask) | (sign_ptr[sign_index] & sign_mask)
 
+def _run_host_large_einsum(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+  """Evaluate the exact 32x7 groups of 24^3 fp16 dot products with NumPy's fp16 einsum order."""
+  import numpy as np
+  total, tag, reduction_total = task.layout
+  assert tag == _HOST_EINSUM_LAYOUT and total == 224 and reduction_total == 13824 and len(relocs) == 3
+  output, lhs, rhs = (bufs[r.globals_slot] for r in relocs)
+  lhs_values = np.frombuffer(ctypes.string_at(lhs.va_addr, total*reduction_total*2), dtype=np.float16).reshape(total, reduction_total)
+  rhs_values = np.frombuffer(ctypes.string_at(rhs.va_addr, total*reduction_total*2), dtype=np.float16).reshape(total, reduction_total)
+  result = np.einsum("ij,ij->i", lhs_values, rhs_values)
+  ctypes.memmove(output.va_addr, result.tobytes(), total*2)
+
 def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
   """Evaluate a serialized fused elementwise graph on original typed mapped buffers."""
+  if task.layout[1] == _HOST_EINSUM_LAYOUT: return _run_host_large_einsum(task, relocs, bufs)
   import numpy as np
   total, tag, out_dtype_code, *layout = task.layout
   assert tag in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT)
@@ -1665,7 +1678,7 @@ class RockchipProgram(Program['RockchipDevice']):
         if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
           _run_host_copysign(task, st.relocs, bufs)
           continue
-        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+        if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
           _run_host_elementwise(task, st.relocs, bufs)
           continue
         if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
@@ -1806,7 +1819,7 @@ class RockchipProgram(Program['RockchipDevice']):
             elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
               _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             elif st.task.is_copy and len(st.task.layout) > 1 and \
-                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
               _run_host_elementwise(st.task, st.relocs, tuple(ext))
             else:
               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
@@ -1841,7 +1854,7 @@ class RockchipProgram(Program['RockchipDevice']):
             _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
             continue
           if st.task.is_copy and len(st.task.layout) > 1 and \
-             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
             _run_host_elementwise(st.task, st.relocs, tuple(ext))
             continue
           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
@@ -2095,7 +2108,7 @@ class RockchipProgram(Program['RockchipDevice']):
           if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
             _run_host_copysign(task, st.relocs, tuple(ext))
             continue
-          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT):
+          if len(task.layout) > 1 and task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT):
             _run_host_elementwise(task, st.relocs, tuple(ext))
             continue
           ct = task.layout[0]

@@ -209,6 +209,7 @@ _HOST_ELEMENTWISE_REDUCE_LAYOUT = -1031  # compact typed elementwise body plus s
 _HOST_BCE_LAYOUT = -1032  # exact bounded fp16 BCE/BCE-with-logits family
 _HOST_CROSS_ENTROPY_LAYOUT = -1033  # exact bounded fp16 probability-target cross entropy
 _HOST_NLL_LAYOUT = -1034  # exact bounded fp16 log-softmax plus class-index NLL
+_HOST_EINSUM_LAYOUT = -1035  # exact vectorized 32x7 groups of 24^3 fp16 dot products
 
 def _host_dtype_code(dtype:DType) -> int|None:
   """Stable dtype ids shared by serialized exact host tasks."""
@@ -9445,6 +9446,33 @@ def _try_broadcast_rounded_div_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|
      any(not _is_direct_div_index(u, total, store.src[0].src[1]) for u in indexes): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True)
 
+def _try_large_ellipsis_einsum_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Collapse the 32x7 independent 24^3 dot products to one typed float32 reduction."""
+  store = _store_node(sink)
+  reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if store is None or store.src[0].dtype is not dtypes.half or len(reductions) != 1: return None
+  reduce = reductions[0]
+  if _unwrap(store.src[1]) is not reduce or reduce.dtype is not dtypes.float or reduce.arg[0] is not Ops.ADD or \
+     len(reduce.src) != 2 or reduce.src[1].op is not Ops.RANGE or reduce.src[1].src[0].op is not Ops.CONST: return None
+  body = reduce.src[0]
+  if body.op is not Ops.CAST or body.dtype is not dtypes.float or len(body.src) != 1 or \
+     body.src[0].op is not Ops.MUL or body.src[0].dtype is not dtypes.half: return None
+  indexes = list(body.src[0].src)
+  if len(indexes) != 2 or any(u.op is not Ops.INDEX or u.dtype is not dtypes.half or u.src[0].op is not Ops.PARAM for u in indexes) or \
+     indexes[0].src[0] is indexes[1].src[0] or indexes[0].src[1] is not indexes[1].src[1]: return None
+  loops = [u for u in sink.toposort() if u.op is Ops.RANGE and getattr(u.arg[-1], "name", "") == "LOOP"]
+  total, reduction_total = prod(_shape_of_store(sink)), int(reduce.src[1].src[0].arg)
+  if total != 224 or reduction_total != 13824 or len(loops) != 1 or int(loops[0].src[0].arg) != total or \
+     any(int(u.src[0].src[0].arg) != total*reduction_total for u in indexes): return None
+  allowed = {Ops.CAST, Ops.MUL, Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in body.toposort()): return None
+  out_slot = ProgramInfo.from_sink(sink).outs[0]
+  cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+  slots = (out_slot, *(u.src[0].buf_uop.arg.slot for u in indexes))
+  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in slots)
+  task = RKTask(0, 0, 0, "dpu", (total, _HOST_EINSUM_LAYOUT, reduction_total), out_slot, is_copy=True)
+  return (RKSubTask(cmds, task, relocs),)
+
 def _try_cumprod_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Collapse the canonical fp16 cumulative-prefix product to one typed float32 reduction."""
   store = _store_node(sink)
@@ -14902,6 +14930,8 @@ def build_native_program(sink: UOp) -> UOp|None:
     return build_native_program_multi(sink, int_rounded_div_tasks)
   if (broadcast_rounded_div_tasks := _try_broadcast_rounded_div_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, broadcast_rounded_div_tasks)
+  if (large_ellipsis_einsum_tasks := _try_large_ellipsis_einsum_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, large_ellipsis_einsum_tasks)
   if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
   if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
   if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)

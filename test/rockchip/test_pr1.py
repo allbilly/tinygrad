@@ -12,7 +12,7 @@ from tinygrad.runtime.support.rockchip import (plan_rk, emit_rk, encode_rk, deco
                                                _HOST_ELEMENTWISE_LAYOUT, _HOST_VARIANCE_LAYOUT, _HOST_SOFTMAX_ARGMAX_LAYOUT,
                                                _HOST_STATIC_HALF_LAYOUT, _HOST_SCATTER_LAYOUT, _HOST_ARGMAX_LAYOUT,
                                                _HOST_AVG_POOL_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_BCE_LAYOUT,
-                                               _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT)
+                                               _HOST_CROSS_ENTROPY_LAYOUT, _HOST_NLL_LAYOUT, _HOST_EINSUM_LAYOUT)
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipRenderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.helpers import Target
@@ -973,6 +973,17 @@ class TestClassifier(unittest.TestCase):
       self.assertEqual(len(subtasks), 1)
       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
       self.assertEqual(subtasks[0].task.layout[5], 1)
+
+  def test_large_ellipsis_einsum_uses_one_typed_float32_reduction(self):
+    lhs = Tensor.empty(32, 7, 24, 24, 24, dtype=dtypes.half, device="ROCKCHIP")
+    rhs = Tensor.empty(32, 7, 24, 24, 24, dtype=dtypes.half, device="ROCKCHIP")
+    expression = Tensor.einsum("ij...,ij...->ij", lhs, rhs)
+    sink = next(early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK)
+    program = build_native_program(sink)
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 1)
+    self.assertEqual(subtasks[0].task.layout, (224, _HOST_EINSUM_LAYOUT, 13824))
 
   def test_fp16_axis_arg_extrema_use_typed_coordinate_reduction(self):
     source = Tensor.empty(10,20, dtype=dtypes.half, device="ROCKCHIP")
