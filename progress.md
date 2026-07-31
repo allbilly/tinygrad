@@ -12407,6 +12407,21 @@ This removes **309 counted lines**, reaching **11,072** in
 PR1 passes **173/173 in 12.94s**; mypy/Ruff remain exactly 12/8 and compile/diff
 checks pass.
 
+### Shared small elementwise graphs
+
+Commit `20b29a512`; saved patch
+`0155-rockchip-share-small-elementwise-task-graphs.patch`.
+
+Round, sign, signed infinity division, hardsigmoid, and the QuickGELU
+saturation wrapper now share `_TaskGraph` allocation and dependency semantics.
+Direct fp32 input annotations are explicit typed tuples; this removes the
+three old mypy errors caused by local `**kwargs` dictionaries.
+
+This removes **65 counted lines**, reaching **11,007** in
+`support/rockchip.py`. PR1 passes **173/173 in 12.90s** and the eight focused
+RK3588 methods pass **8/8 in 20.34s**. Mypy improves from 12 to **9 known
+errors**; Ruff remains at eight findings. Compilation and diff checking pass.
+
 ### Declarative GELU/ELU graphs
 
 Commit `1e4c75025`; patch

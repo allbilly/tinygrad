@@ -3508,3 +3508,14 @@ Six unreferenced experiments were preserved verbatim as comments; no active
 classifier or runtime path changed. PR1 passes **173/173 in 12.94s**, static
 baselines remain exactly 12 mypy errors and eight Ruff findings, and the
 support file is now **11,072 counted lines**.
+
+### Small elementwise graph batch
+
+Commit `20b29a512`; saved patch
+`0155-rockchip-share-small-elementwise-task-graphs.patch`.
+
+Round, sign/sign-exact, infinity division, hardsigmoid normal/extreme, and
+QuickGELU normal/extreme pass **8/8 in 20.34s** on forward-only RK3588. PR1
+passes **173/173 in 12.90s**. Mypy improves from 12 to **9 known errors**;
+Ruff remains at eight findings. The support file is now **11,007 counted
+lines**.
