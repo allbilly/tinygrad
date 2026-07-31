@@ -15212,239 +15212,83 @@ def _try_cmac_shared_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
   return tuple(tasks)
 
 # ---- the native_program hook ----
+# Ordered active dispatch tables: order is semantic because the first strict classifier wins.
+# The native two-LUT tangent remains after the exact fp16 host tangent, as in the expanded dispatcher.
+_SUBTASK_CLASSIFIERS = (
+  _try_bce_host_subtasks, _try_bce_logits_subtasks, _try_bce_subtasks,
+  _try_movement_host_subtasks, _try_trunc_host_subtasks, _try_floor_ceil_host_subtasks,
+  _try_copysign_host_subtasks, _try_bitwise_host_subtasks, _try_cast_subtasks,
+  _try_bitcast_host_subtasks, _try_typed_fill_subtasks, _try_round_subtasks,
+  _try_round_quantization_host_subtasks, _try_mod_host_subtasks, _try_fmod_host_subtasks,
+  _try_int_true_div_host_subtasks, _try_int_rounded_div_host_subtasks, _try_broadcast_rounded_div_host_subtasks,
+  _try_large_ellipsis_einsum_host_subtasks, _try_bilinear_interpolate_host_subtasks, _try_cumsum_host_subtasks,
+  _try_cumprod_host_subtasks, _try_cumextrema_host_subtasks, _try_long_cummin_finalize_host_subtasks,
+  _try_sign_subtasks, _try_inf_div_subtasks, _try_hardsigmoid_subtasks,
+  _try_hardswish_subtasks, _try_fp32_tanh_host_subtasks, _try_tanh_saturation_subtasks,
+  _try_quick_gelu_two_lut_subtasks, _try_logsigmoid_subtasks, _try_softplus_subtasks,
+  _try_mish_subtasks, _try_fp16_tan_host_subtasks, _try_tan_subtasks,
+  _try_fp32_sin_cos_host_subtasks, _try_sin_cos_subtasks, _try_asin_acos_subtasks,
+  _try_atan_subtasks, _try_fp32_atanh_host_subtasks, _try_atanh_subtasks,
+  _try_asinh_acosh_subtasks, _try_fp32_sinh_cosh_host_subtasks, _try_sinh_cosh_subtasks,
+  _try_erf_subtasks, _try_gelu_subtasks, _try_elu_subtasks,
+  _try_celu_subtasks, _try_isclose_host_subtasks, _try_softmax_host_subtasks,
+  _try_bounded_attention_max_host_subtasks, _try_attention_score_host_subtasks, _try_attention_value_host_subtasks,
+  _try_logsoftmax_norm_host_subtasks, _try_cross_entropy_host_subtasks, _try_nll_loss_host_subtasks,
+  _try_cross_entropy_loss_host_subtasks, _try_normalize_norm_host_subtasks, _try_logcumsumexp_host_subtasks,
+  _try_fp32_log_host_subtasks, _try_fancy_index_preprocess_host_subtasks, _try_fancy_index_reduction_host_subtasks,
+  _try_scatter_host_subtasks, _try_scatter_reduce_tensor_host_subtasks, _try_scatter_reduction_host_subtasks,
+  _try_comparison_subtasks, _try_nonzero_expanded_prefix_host_subtasks, _try_nonzero_coordinate_gather_host_subtasks,
+  _try_nonzero_coordinate_interleave_host_subtasks, _try_mask_prefix_count_host_subtasks, _try_constant_true_masked_select_host_subtasks,
+  _try_fixed_masked_select_host_subtasks, _try_exp_correction_subtasks, _try_sigmoid_special_subtasks,
+  _try_exp2_special_subtasks, _try_log2_special_subtasks, _try_rsqrt_special_subtasks,
+  _try_sqrt_special_subtasks, _try_pow8_lut_subtasks, _try_pow55_lut_subtasks,
+  _try_pow_neg55_lut_subtasks, _try_pow_base55_lut_subtasks, _try_pow_base8_lut_subtasks,
+  _try_pow_base07_lut_subtasks, _try_pow_neg_base55_subtasks, _try_zero_base_pow_subtasks,
+  _try_tensor_pow_subtasks, _try_fp16_broadcast_pow_host_subtasks, _try_fractional_pow_subtasks,
+  _try_abs_subtasks, _try_softsign_subtasks, _try_lerp_subtasks,
+  _try_one_hot_subtasks, _try_cat_subtasks, _try_pad_subtasks,
+  _try_conditional_movement_host_subtasks, _try_fp32_broadcast_host_subtasks, _try_fp32_topology_host_subtasks,
+  _try_fp32_add_subtasks, _try_fp32_mul_subtasks, _try_half_to_fp32_sum_host_subtasks,
+  _try_variance_host_subtasks, _try_fp32_avg_pool_host_subtasks, _try_fp32_factorized_sum_subtasks,
+  _try_broadcast_subtasks, _try_unpool_scatter_subtasks, _try_sort_compare_subtasks,
+  _try_argsort_selected_subtasks, _try_argsort_index_subtasks, _try_softmax_argmax_host_subtasks,
+  _try_axis_arg_extrema_host_subtasks, _try_arg_extrema_subtasks, _try_long_cumextrema_index_host_subtasks,
+  _try_pool_index_subtasks, _try_int_max_pool_host_subtasks,
+)
+
+# Rejected CPU operator fallbacks remain opt-in diagnostics only; static index reduction stays separately gated.
+_POST_INDEX_SUBTASK_CLASSIFIERS = (
+  _try_long_cumprod_subtasks, _try_local_product_subtasks, _try_int_power_host_subtasks,
+  _try_native_int_min_subtasks, _try_uint8_min_host_subtasks, _try_bool_reduce_subtasks,
+  _try_local_max_subtasks, _try_cmac_variable_scale_subtasks, _try_movement_sum_subtasks,
+  _try_elementwise_sum_subtasks, _try_small_fp32_cmac_subtasks, _try_fp32_sum_subtasks,
+  _try_relu_sum_subtasks, _try_nested_sum_subtasks, _try_cmac_multifactor_subtasks,
+)
+
+# Preserved disabled WIP dispatches (implementations remain above):
+# if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
+#   return build_native_program_multi(sink, long_cumprod_copy_tasks)
+# if (neutral_block_tasks := _try_long_cumprod_neutral_block_subtasks(sink)) is not None:
+#   return build_native_program_multi(sink, neutral_block_tasks)
+# if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
+#   return build_native_program_multi(sink, int_power_tasks)
+
+def _first_subtasks(sink:UOp, classifiers) -> tuple[RKSubTask, ...]|None:
+  for classifier in classifiers:
+    if (tasks := classifier(sink)) is not None: return tasks
+  return None
+
 def build_native_program(sink: UOp) -> UOp|None:
   """Classify and build a PROGRAM(SINK, LINEAR(INS...)). Raises RKPLAN_REJECT:<reason>
   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
-  # The generic reciprocal-to-FDIV rewrite obscures the strict x**-5.5 graph,
-  # so recognize this special case while its exponent structure is intact.
-  if (pow_neg55_tasks := _try_pow_neg55_lut_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, pow_neg55_tasks)
-  # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
+  # The reciprocal-to-FDIV rewrite obscures strict x**-5.5, so classify it first.
+  if (tasks := _try_pow_neg55_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, tasks)
   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
   if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
-  if (bce_host_tasks := _try_bce_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_host_tasks)
-  if (bce_logits_tasks := _try_bce_logits_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_logits_tasks)
-  if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
-  if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
-  if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
-  if (floor_ceil_tasks := _try_floor_ceil_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, floor_ceil_tasks)
-  if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
-  if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
-  if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
-  if (bitcast_tasks := _try_bitcast_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitcast_tasks)
-  if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
-  if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
-  if (round_quantization_tasks := _try_round_quantization_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, round_quantization_tasks)
-  if (mod_tasks := _try_mod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, mod_tasks)
-  if (fmod_tasks := _try_fmod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, fmod_tasks)
-  if (int_true_div_tasks := _try_int_true_div_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, int_true_div_tasks)
-  if (int_rounded_div_tasks := _try_int_rounded_div_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, int_rounded_div_tasks)
-  if (broadcast_rounded_div_tasks := _try_broadcast_rounded_div_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, broadcast_rounded_div_tasks)
-  if (large_ellipsis_einsum_tasks := _try_large_ellipsis_einsum_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, large_ellipsis_einsum_tasks)
-  if (bilinear_interpolate_tasks := _try_bilinear_interpolate_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, bilinear_interpolate_tasks)
-  if (cumsum_tasks := _try_cumsum_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumsum_tasks)
-  if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
-  if (cumextrema_tasks := _try_cumextrema_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, cumextrema_tasks)
-  if (cummin_finalize_tasks := _try_long_cummin_finalize_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, cummin_finalize_tasks)
-  if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
-  if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
-  if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
-  if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
-  if (fp32_tanh_tasks := _try_fp32_tanh_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_tanh_tasks)
-  if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)
-  if (quick_gelu_tasks := _try_quick_gelu_two_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
-  if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
-  if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
-  if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
-  if (fp16_tan_host_tasks := _try_fp16_tan_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp16_tan_host_tasks)
-  # The native two-LUT/pole-safe implementation remains below as the fp32 WIP path.
-  if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
-  if (fp32_sin_cos_tasks := _try_fp32_sin_cos_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_sin_cos_tasks)
-  if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
-  if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
-  if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
-  if (fp32_atanh_tasks := _try_fp32_atanh_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_atanh_tasks)
-  if (atanh_tasks := _try_atanh_subtasks(sink)) is not None: return build_native_program_multi(sink, atanh_tasks)
-  if (asinh_acosh_tasks := _try_asinh_acosh_subtasks(sink)) is not None: return build_native_program_multi(sink, asinh_acosh_tasks)
-  if (fp32_sinh_cosh_tasks := _try_fp32_sinh_cosh_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_sinh_cosh_tasks)
-  if (sinh_cosh_tasks := _try_sinh_cosh_subtasks(sink)) is not None: return build_native_program_multi(sink, sinh_cosh_tasks)
-  if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
-  if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)
-  if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)
-  if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
-  if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
-  if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
-  if (bounded_attention_max_tasks := _try_bounded_attention_max_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, bounded_attention_max_tasks)
-  if (attention_score_tasks := _try_attention_score_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, attention_score_tasks)
-  if (attention_value_tasks := _try_attention_value_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, attention_value_tasks)
-  if (logsoftmax_norm_tasks := _try_logsoftmax_norm_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, logsoftmax_norm_tasks)
-  if (cross_entropy_tasks := _try_cross_entropy_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, cross_entropy_tasks)
-  if (nll_loss_tasks := _try_nll_loss_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, nll_loss_tasks)
-  if (cross_entropy_loss_tasks := _try_cross_entropy_loss_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, cross_entropy_loss_tasks)
-  if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
-  if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, logcumsumexp_tasks)
-  if (fp32_log_tasks := _try_fp32_log_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_log_tasks)
-  if (fancy_index_tasks := _try_fancy_index_preprocess_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fancy_index_tasks)
-  if (fancy_index_reduce_tasks := _try_fancy_index_reduction_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fancy_index_reduce_tasks)
-  if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, scatter_tasks)
-  if (scatter_reduce_tensor_tasks := _try_scatter_reduce_tensor_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, scatter_reduce_tensor_tasks)
-  if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, scatter_reduce_tasks)
-  if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
-  if (nonzero_expanded_prefix_tasks := _try_nonzero_expanded_prefix_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, nonzero_expanded_prefix_tasks)
-  if (nonzero_coordinate_gather_tasks := _try_nonzero_coordinate_gather_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, nonzero_coordinate_gather_tasks)
-  if (nonzero_coordinate_interleave_tasks := _try_nonzero_coordinate_interleave_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, nonzero_coordinate_interleave_tasks)
-  if (mask_prefix_count_tasks := _try_mask_prefix_count_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, mask_prefix_count_tasks)
-  if (constant_true_masked_select_tasks := _try_constant_true_masked_select_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, constant_true_masked_select_tasks)
-  if (fixed_masked_select_tasks := _try_fixed_masked_select_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fixed_masked_select_tasks)
-  if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, exp_correction_tasks)
-  if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)
-  if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
-  if (log2_tasks := _try_log2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, log2_tasks)
-  if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
-  if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
-  if (pow8_tasks := _try_pow8_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, pow8_tasks)
-  if (pow55_tasks := _try_pow55_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, pow55_tasks)
-  if (pow_neg55_tasks := _try_pow_neg55_lut_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, pow_neg55_tasks)
-  if (pow_base55_tasks := _try_pow_base55_lut_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, pow_base55_tasks)
-  if (pow_base8_tasks := _try_pow_base8_lut_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, pow_base8_tasks)
-  if (pow_base07_tasks := _try_pow_base07_lut_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, pow_base07_tasks)
-  if (pow_neg_base55_tasks := _try_pow_neg_base55_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, pow_neg_base55_tasks)
-  if (zero_base_pow_tasks := _try_zero_base_pow_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, zero_base_pow_tasks)
-  if (tensor_pow_tasks := _try_tensor_pow_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, tensor_pow_tasks)
-  if (fp16_broadcast_pow_tasks := _try_fp16_broadcast_pow_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp16_broadcast_pow_tasks)
-  if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fractional_pow_tasks)
-  if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
-  if (softsign_tasks := _try_softsign_subtasks(sink)) is not None: return build_native_program_multi(sink, softsign_tasks)
-  if (lerp_tasks := _try_lerp_subtasks(sink)) is not None: return build_native_program_multi(sink, lerp_tasks)
-  if (one_hot_tasks := _try_one_hot_subtasks(sink)) is not None: return build_native_program_multi(sink, one_hot_tasks)
-  if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
-  if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
-  if (conditional_movement_tasks := _try_conditional_movement_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, conditional_movement_tasks)
-  # WIP: only valid when the producer was the fused one-dimensional long
-  # scan; multidimensional cumprod uses the same physical helper shape.
-  # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
-  #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
-  if (fp32_broadcast_tasks := _try_fp32_broadcast_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_broadcast_tasks)
-  if (fp32_topology_tasks := _try_fp32_topology_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_topology_tasks)
-  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_add_tasks)
-  if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_mul_tasks)
-  if (half_fp32_sum_tasks := _try_half_to_fp32_sum_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, half_fp32_sum_tasks)
-  if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, variance_tasks)
-  if (fp32_avg_pool_tasks := _try_fp32_avg_pool_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_avg_pool_tasks)
-  if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_factorized_sum_tasks)
-  if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
-  # Rejected CPU operator fallbacks remain opt-in diagnostics only.
-  if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
-  if (sort_compare_tasks := _try_sort_compare_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, sort_compare_tasks)
-  if (argsort_selected_tasks := _try_argsort_selected_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, argsort_selected_tasks)
-  if (argsort_tasks := _try_argsort_index_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, argsort_tasks)
-  if (softmax_argmax_tasks := _try_softmax_argmax_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, softmax_argmax_tasks)
-  if (axis_arg_extrema_tasks := _try_axis_arg_extrema_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, axis_arg_extrema_tasks)
-  if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, arg_extrema_tasks)
-  if (long_cumextrema_index_tasks := _try_long_cumextrema_index_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, long_cumextrema_index_tasks)
-  if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
-  if (int_max_pool_tasks := _try_int_max_pool_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, int_max_pool_tasks)
+  if (tasks := _first_subtasks(sink, _SUBTASK_CLASSIFIERS)) is not None: return build_native_program_multi(sink, tasks)
   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
-     (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
-  if (long_cumprod_tasks := _try_long_cumprod_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, long_cumprod_tasks)
-  # WIP companion to _try_long_cumprod_final_copy_subtasks; see note above.
-  # if (neutral_block_tasks := _try_long_cumprod_neutral_block_subtasks(sink)) is not None:
-  #   return build_native_program_multi(sink, neutral_block_tasks)
-  if (product_tasks := _try_local_product_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, product_tasks)
-  if (int_power_tasks := _try_int_power_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, int_power_tasks)
-  # WIP: small official values pass, but native MUL corrupts the high word of
-  # 46340**2. Keep disabled until byte-limb multiplication is exact.
-  # if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
-  #   return build_native_program_multi(sink, int_power_tasks)
-  if (int_min_tasks := _try_native_int_min_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, int_min_tasks)
-  if (uint8_min_tasks := _try_uint8_min_host_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, uint8_min_tasks)
-  if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, bool_reduce_tasks)
-  if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
-  if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, variable_scale_tasks)
-  if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, movement_sum_tasks)
-  if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, elementwise_sum_tasks)
-  if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_cmac_tasks)
-  # Retain the half-input WIP above for reference. The active path is narrower:
-  # it requires a direct fp32 INDEX and preserves the explicitly fp32 output.
-  if (fp32_sum_tasks := _try_fp32_sum_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, fp32_sum_tasks)
-  if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, relu_sum_tasks)
-  if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, nested_sum_tasks)
-  if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
-    return build_native_program_multi(sink, multifactor_tasks)
+     (tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, tasks)
+  if (tasks := _first_subtasks(sink, _POST_INDEX_SUBTASK_CLASSIFIERS)) is not None: return build_native_program_multi(sink, tasks)
   plan = plan_rk(sink)
   if isinstance(plan, str):
     # Nested elementwise lowering can materialize an indexed WHERE operand before
