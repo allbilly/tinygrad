@@ -2852,3 +2852,19 @@ unchanged.
 Contract: **164/164 in 9.18s**. Mypy remains at the exact 12-error baseline
 and touched-file Ruff at the exact nine pre-existing findings. No LUT or
 two-level LUT changed. Next: continue the ordered forward inventory.
+
+### Integer exp reference dtype
+
+`test_exp` passes in **15.33s**, and exp/exp2/expand/eye passes **5/5 in
+26.58s**. Commit `b922f77de`; saved patch
+`0103-rockchip-align-integer-exp-reference-dtype.patch`.
+
+Only the no-input scalar reference was failing: tinygrad intentionally
+promotes integer exp to fp32, while the Rockchip adapter made
+`torch.tensor(2.0)` fp16. For this method only, the adapter now restores
+PyTorch's fp32 scalar default while leaving tinygrad and all shaped inputs
+at fp16. Backend and core semantics are unchanged.
+
+Adapter Ruff and `git diff --check` pass. Hardware-free remains **164/164**
+from milestone 102; no LUT or two-level LUT changed. Next:
+`test_fancy_conv2d`.

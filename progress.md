@@ -11065,3 +11065,35 @@ Pre-edit recovery copies:
 
 Next action: resume the ordered forward inventory after the dot/einsum
 family and fix the next genuine failure as milestone 103.
+
+## 2026-07-31 — integer-exp reference-dtype milestone
+
+The complete unchanged `TestOps.test_exp` passes in **15.33s**, and the
+neighboring exp/exp2/expand/eye block passes **5/5 in 26.58s**.
+Implementation commit: `b922f77de`; portable patch:
+`0103-rockchip-align-integer-exp-reference-dtype.patch`.
+
+The NPU tensor exp assertion already passed. The failure was the no-input
+scalar assertion: tinygrad intentionally promotes `Tensor(2).exp()` to
+fp32 (`Elementwise.exp` explicitly casts non-floating input to
+`dtypes.float`), while the Rockchip adapter globally sets PyTorch's default
+scalar dtype to fp16. This produced a dtype-only mismatch, fp32 versus fp16.
+
+The adapter now temporarily sets only PyTorch's default dtype to fp32 for
+`test_exp`; tinygrad remains `DEFAULT_FLOAT=HALF`, and shaped test inputs
+continue to be created from fp16 NumPy data. Thus the scalar reference
+matches tinygrad's intentional promotion without moving the tensor tests to
+fp32 or changing backend/core semantics.
+
+Validation: adapter Ruff passes cleanly and `git diff --check` passes. The
+hardware-free contract remains **164/164** from milestone 102; mypy and the
+touched backend Ruff baseline are unchanged because no backend/core file
+changed. No LUT, LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/conftest_rockchip.py.20260731-151628`,
+`/tmp/progress.md.20260731-151759`, and
+`/tmp/test_ops_status.md.20260731-151759`.
+
+Next action: resume at `test_fancy_conv2d` and continue the ordered forward
+inventory as milestone 104.
