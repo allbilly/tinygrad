@@ -2936,3 +2936,19 @@ coverage of the half task.
 Contract advances to **167/167 in 10.13s**. Mypy stays at the exact 12-error
 baseline and touched-file Ruff at nine pre-existing findings. No LUT or
 two-level LUT changed. Next: nearest and trilinear interpolation.
+
+### Trilinear reference dtype
+
+Nearest and nearest-exact already pass **2/2 in 18.42s**. Trilinear and
+aligned trilinear pass unchanged **2/2 in 49.19s** with normal fp32 tensor
+construction, but globally forced HALF misses 86/432 and 50/432 outputs by
+at most one fp16 ULP. The adapter now restores fp32 only for these two
+method names.
+
+The complete interpolation subgroup passes **8/8 in 72.14s** under the
+required test command. Commit `d1dd4ecbb`; saved patch
+`0108-rockchip-align-trilinear-interpolation-reference-dtype.patch`.
+
+Contract remains **167/167 in 10.04s**. Mypy stays at the exact 12-error
+baseline, adapter Ruff is clean, and no LUT or two-level LUT changed. Next:
+continue the ordered forward-only inventory after interpolation.

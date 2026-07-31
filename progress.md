@@ -11250,3 +11250,34 @@ Pre-edit recovery copies:
 
 Next action: inventory and fix nearest and trilinear interpolation methods
 as milestone 108.
+
+## 2026-07-31 — trilinear reference milestone
+
+The full interpolation subgroup now passes **8/8 in 72.14s**, including
+bilinear, aligned bilinear, linear, aligned linear, nearest, nearest-exact,
+trilinear, and aligned trilinear. Implementation commit: `d1dd4ecbb`;
+portable patch:
+`0108-rockchip-align-trilinear-interpolation-reference-dtype.patch`.
+
+Nearest and nearest-exact already passed **2/2 in 18.42s** and required no
+change. Under globally forced `DEFAULT_FLOAT=HALF`, the two trilinear
+methods completed correctly but missed 86/432 and 50/432 reference outputs,
+respectively, by at most one fp16 ULP (`0.000977`). Both methods pass
+unchanged **2/2 in 49.19s** with the normal fp32 default.
+
+As with the 1-D linear case, the adapter now restores normal fp32 tensor
+construction for only these two named methods. This keeps the required HALF
+environment for every other case and does not broaden Rockchip host
+execution or alter backend arithmetic.
+
+Validation: hardware-free Rockchip remains **167/167 in 10.04s**; mypy
+remains at the exact 12-error baseline; the adapter passes Ruff; and
+`git diff --check` passes. No LUT, LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/conftest_rockchip.py.20260731-154423`,
+`/tmp/progress.md.20260731-154616`, and
+`/tmp/test_ops_status.md.20260731-154616`.
+
+Next action: resume the ordered `TestOps` inventory immediately after the
+interpolation subgroup and fix the next separate failure as milestone 109.

@@ -1,0 +1,26 @@
+From d1dd4ecbbd5b57ee4683905952f359b12e0df91d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 15:46:11 +0800
+Subject: [PATCH] rockchip: align trilinear interpolation reference dtype
+
+---
+ test/rockchip/conftest_rockchip.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 3cc30300a..caff2dd2d 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -40,7 +40,8 @@ def pytest_runtest_call(item):
+   """Keep CPU reference gaps constructible while preserving HALF everywhere else."""
+   needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
+     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+-    "test_interpolate_linear", "test_interpolate_linear_corners_aligned")
++    "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
++    "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+-- 
+2.34.1
+
