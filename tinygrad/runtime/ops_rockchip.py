@@ -742,10 +742,6 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
       loop_linear = np.arange(row_start, row_end, dtype=np.int64)
       loop_coords = coordinate_vectors(loop_extents, loop_linear)
       output_coords = [*loop_coords, *(np.zeros(row_end-row_start, dtype=np.int64) for _ in reduction_extents)]
-      output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
-      if output_indices.ndim == 0: output_indices = np.full(row_end-row_start, output_indices.item(), dtype=np.int64)
-      if np.any(output_indices < 0) or np.any(output_indices >= result.size):
-        raise RuntimeError("rk: vector fancy-index output index out of bounds")
       full_linear = np.arange(row_start*reduction_total, row_end*reduction_total, dtype=np.int64)
       full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
       coords = [*coordinate_vectors(loop_extents, full_loop_linear),
@@ -753,6 +749,10 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
       values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(row_end-row_start, reduction_total)
       reduced = reducer.reduce(values.astype(np.float16), axis=1, dtype=np.float16).astype(np.float32) if reduction_op == 3 else \
         reducer.reduce(values, axis=1, dtype=np.float32)
+      output_indices = np.asarray(evaluate_vector(out_code, output_coords, reduced), dtype=np.int64)
+      if output_indices.ndim == 0: output_indices = np.full(row_end-row_start, output_indices.item(), dtype=np.int64)
+      if np.any(output_indices < 0) or np.any(output_indices >= result.size):
+        raise RuntimeError("rk: vector fancy-index output index out of bounds")
       epilogue = np.asarray(evaluate_vector(epilogue_code, output_coords, reduced)) if epilogue_code else reduced
       result[output_indices] = np.broadcast_to(epilogue, (row_end-row_start,))
     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]

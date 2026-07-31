@@ -9289,6 +9289,11 @@ def _try_nonzero_expanded_prefix_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...
             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} and \
     output_total == reduction_total == int(loops[0].src[0].arg) and 1 <= input_total <= 1 << 20 and \
     2 <= reduction_total//input_total <= 8 and reduction_total % input_total == 0
+  int_prefix_ops = {Ops.WHERE, Ops.CAST, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  direct_int_nonzero_prefix_stage = not post_reduction and inputs[0].dtype is dtypes.int and len(loops) == 1 and \
+    ops in (int_prefix_ops, {*int_prefix_ops, Ops.FLOORDIV}) and \
+    output_total == reduction_total == int(loops[0].src[0].arg) and 1 <= input_total <= 1 << 20 and \
+    1 <= reduction_total//input_total <= 8 and reduction_total % input_total == 0
   block_offset_stage = not post_reduction and inputs[0].dtype is dtypes.int and len(loops) == 1 and \
     ops == {Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.ADD, Ops.MUL, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST} and \
     1 <= output_total <= 4096 and input_total == output_total*256 and reduction_total == output_total
@@ -9298,7 +9303,7 @@ def _try_nonzero_expanded_prefix_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...
     output_total == 1 and input_total % 256 == 0 and reduction_total == input_total//256 and \
     _unwrap(store.src[1]).op is Ops.ADD and len(tail_indexes) == 1 and tail_indexes[0].src[0] is inputs[0] and \
     tail_indexes[0].src[1].op is Ops.CONST and int(tail_indexes[0].src[1].arg) == input_total-1
-  if not (expanded_mask_stage or direct_expanded_count_stage or direct_expanded_prefix_stage or
+  if not (expanded_mask_stage or direct_expanded_count_stage or direct_expanded_prefix_stage or direct_int_nonzero_prefix_stage or
           block_offset_stage or scalar_total_stage): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=post_reduction)
 
@@ -9359,30 +9364,41 @@ def _try_constant_true_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask,
   return _try_elementwise_host_subtasks(sink.substitute({store:direct_store}), allow_plain=True)
 
 def _try_fixed_masked_select_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
-  """Serialize fixed-size masked-select's bool count and typed final gather."""
+  """Serialize fixed-size masked-select's explicit/computed mask count and typed final gather."""
   store = _store_node(sink)
   if store is None or store.src[0].dtype not in (dtypes.half, dtypes.int) or _unwrap(store.src[1]).op is not Ops.WHERE: return None
   nodes = store.src[1].toposort()
   reductions = [u for u in nodes if u.op is Ops.REDUCE]
   allowed = {Ops.REDUCE, Ops.WHERE, Ops.AND, Ops.CMPLT, Ops.CMPNE, Ops.CAST,
-             Ops.ADD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+             Ops.ADD, Ops.FLOORDIV, Ops.FLOORMOD, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
   if len(reductions) != 1 or any(u.op not in allowed for u in nodes): return None
   reduce = reductions[0]
   body = _unwrap(reduce.src[0])
-  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.ADD or \
-     reduce.src[0].op is not Ops.CAST or body.op is not Ops.INDEX: return None
-  mask_index = body
-  if mask_index.op is not Ops.INDEX or mask_index.dtype is not dtypes.bool or mask_index.src[0].op is not Ops.PARAM: return None
+  if reduce.dtype is not dtypes.int or reduce.arg[0] is not Ops.ADD or reduce.src[0].op is not Ops.CAST: return None
+  if body.op is Ops.INDEX and body.dtype is dtypes.bool and body.src[0].op is Ops.PARAM:
+    mask_index, explicit_bool = body, True
+  elif body.op is Ops.CMPNE:
+    mask_indexes = [u for u in body.src if u.op is Ops.INDEX and u.dtype is dtypes.int and u.src[0].op is Ops.PARAM]
+    zeros = [u for u in body.src if u.op is Ops.CONST and int(u.arg) == 0]
+    if len(mask_indexes) != 1 or len(zeros) != 1: return None
+    mask_index, explicit_bool = mask_indexes[0], False
+  else: return None
   output_total, mask_total = prod(_shape_of_store(sink)), int(mask_index.src[0].src[0].arg)
+  reduction_total = prod(int(u.src[0].arg) for u in reduce.src[1:])
   params = {u.arg.slot:(u.dtype, int(u.src[0].arg)) for u in nodes if u.op is Ops.PARAM}
   bool_inputs = [(slot, total) for slot, (dtype, total) in params.items() if dtype is dtypes.bool]
   value_inputs = [(slot, total) for slot, (dtype, total) in params.items() if dtype is store.src[0].dtype]
-  if bool_inputs != [(mask_index.src[0].buf_uop.arg.slot, mask_total)] or len(value_inputs) != 2 or \
+  expected_bool = [(mask_index.src[0].buf_uop.arg.slot, mask_total)] if explicit_bool else []
+  if bool_inputs != expected_bool or len(value_inputs) != 2 or \
      sorted(total for _, total in value_inputs) != sorted((output_total, mask_total)) or \
-     not 1 <= output_total <= mask_total <= 1 << 20: return None
+     (not explicit_bool and (mask_index.src[0].buf_uop.arg.slot, mask_total) not in value_inputs) or \
+     not 1 <= mask_total <= 1 << 20: return None
+  if explicit_bool:
+    if output_total > mask_total or reduction_total != mask_total or any(u.op in (Ops.FLOORDIV, Ops.FLOORMOD) for u in nodes): return None
+  elif output_total > reduction_total or not mask_total <= reduction_total <= mask_total*8 or reduction_total % mask_total: return None
   dynamic_gathers = [u for u in nodes if u.op is Ops.INDEX and u.dtype is store.src[0].dtype and
                      u.src[0].op is Ops.PARAM and any(x.op is Ops.INDEX for x in u.src[1].toposort())]
-  if len(dynamic_gathers) != 1: return None
+  if (explicit_bool and len(dynamic_gathers) != 1) or (not explicit_bool and dynamic_gathers): return None
   return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
 
 def _try_fp32_topology_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:

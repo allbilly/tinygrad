@@ -823,6 +823,15 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(len(subtasks), 1)
     self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
 
+  def test_fixed_nonzero_uses_bounded_typed_reduction(self):
+    expressions = (Tensor.empty(5, dtype=dtypes.int, device="ROCKCHIP").nonzero(size=3),
+                   Tensor.empty(2,2, dtype=dtypes.int, device="ROCKCHIP").nonzero(size=2))
+    for expression in expressions:
+      sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+      programs = [build_native_program(sink) for sink in sinks]
+      self.assertTrue(all(program is not None for program in programs))
+      self.assertEqual(programs[-1].src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+
   def test_fp32_factorized_zero_stride_sum_stays_native(self):
     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
