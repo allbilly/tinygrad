@@ -134,3 +134,41 @@ two-level task composition. The repeated builder-selection portion of
 Every milestone must retain `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF`, pass PR1,
 preserve mypy/Ruff baselines, pass `git diff --check`, and finish with the
 complete forward-only Rockchip TestOps inventory.
+
+## Task/graph lowering follow-up
+
+The first lowering-focused pass validates three reusable boundaries that are
+smaller without weakening graph recognition:
+
+1. `_SpecialStages` centralizes construction state, not operation matching.
+   Its `next_slot` is advanced past comparison output and relocation slots;
+   its dependency method preserves the duplicate-write workaround required
+   after reset-separated comparison and LUT tasks. EXP2, EXP, sigmoid, LOG2,
+   sqrt, and rsqrt retain separate recognizers and arithmetic sequences.
+2. `_eval_static_index` centralizes the compile-time interpreter used to turn
+   RANGE-driven UOp address graphs into finite layout maps. Its flags are part
+   of the contract: sort compare has no WHERE/NEG, argsort permits eager WHERE,
+   and extrema/pool permit lazy WHERE plus NEG. This avoids the tempting but
+   incorrect superset interpreter that would silently accept new graph forms.
+3. `_float_arg` is the single constant-buffer ABI boundary: Python float to
+   IEEE fp32 bytes to the unsigned 32-bit relocation payload. The prior 37
+   local helpers were identical but allowed future drift.
+
+This pass removes **263 counted lines** from `support/rockchip.py`:
+
+| State | support | ops | Rockchip total | Repository total |
+|---|---:|---:|---:|---:|
+| Before lowering pass | 13,031 | 2,087 | 15,118 | 39,427 |
+| After lowering pass | 12,768 | 2,087 | 14,855 | 39,164 |
+| Change | -263 | 0 | -263 | -263 |
+
+Across the original size-audit baseline, Rockchip runtime has fallen from
+15,698 to 14,855 counted lines (**-843**) and physical source from 18,059 to
+17,187 lines (**-872**). No implementation was moved into `autogen` or another
+`sz.py`-excluded path.
+
+The complete post-refactor forward-only inventory passes **411 methods, 13
+expected skips, and 126 subtests in 2449.18s**. The next high-yield mechanical
+boundary is the 51 repeated scratch-slot allocators. They must be split into
+simple monotonic allocators and nested-stage allocators that also reserve every
+output/relocation slot; merging those two semantics would risk slot aliasing.

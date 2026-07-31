@@ -3280,6 +3280,32 @@ whose assertions pass. Worktree is clean except intentional `ref/` clones.
 
 **Final status: all runnable forward-only Rockchip TestOps cases pass.**
 
+### Reusable lowering refactor remains fully green
+
+The 2026-08-01 lowering cleanup commits `939f4e7b1`, `963a3a7c0`, and
+`2f8aa2cb0` remove another **263 counted lines** by sharing special-value stage
+construction, bounded static index-expression evaluation, and scalar operand
+encoding. Saved patches are `0131`, `0132`, and `0133`.
+
+The authoritative post-refactor serial command is:
+
+```sh
+. .venv/bin/activate
+CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  python -m pytest test/backend/test_ops.py \
+  -p test.rockchip.conftest_rockchip --tb=no -q -rN
+```
+
+Result: **411 passed, 13 expected skips, one known warning, and 126 passing
+subtests in 2449.18s (40:49)**. PR1 remains **173/173**. Mypy and touched-file
+Ruff remain at the exact 12- and 8-finding baselines.
+
+Do not add `--forked` to the current runtime command: forked children inherit
+the mapped NPU state and can SIGSEGV before assertions. Do not use multiple
+xdist workers for hardware classes sharing this NPU. A failed exploratory
+forked run was followed by a passing reference `simple_add.py` health check
+and the complete clean serial result above.
+
 ### Size compaction remains fully green
 
 Commits `fc69aeff3`, `927996958`, and `6cb4310f6` reduce Rockchip runtime code

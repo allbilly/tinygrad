@@ -12138,3 +12138,57 @@ Pre-edit recovery copies:
 
 Next size step: implement the versioned external compiler for the 42 static
 LUT builders, then validate generated tables byte-for-byte and on hardware.
+
+## 2026-08-01 — reusable task/graph lowering milestone
+
+Three algorithm-level refactors reduce `support/rockchip.py` by another **263
+`sz.py` lines**, from 13,031 to 12,768, while preserving the recognizers and
+task order that define the native contract:
+
+- `939f4e7b1`, patch `0131-rockchip-share-special-value-stage-lowering.patch`:
+  one `_SpecialStages` builder now owns scratch allocation, typed temporary
+  indexes, comparison-mask materialization, stale-lane dependency writes, and
+  ordinary LUT emission for EXP2, EXP, sigmoid, LOG2, sqrt, and rsqrt. The six
+  operation-specific graph recognizers and numerical pipelines remain separate.
+- `963a3a7c0`, patch `0132-rockchip-share-static-index-graph-evaluator.patch`:
+  sort compare, argsort selection/count, general arg-extrema, and pool-index
+  lowering share one bounded static UOp evaluator. Explicit flags preserve
+  eager argsort WHERE evaluation, lazy extrema/pool WHERE evaluation, and the
+  latter pair's NEG allowlist; unsupported graph operators still reject.
+- `2f8aa2cb0`, patch `0133-rockchip-centralize-scalar-operand-encoding.patch`:
+  37 local implementations and 369 call sites now use one `_float_arg` helper
+  for the constant-buffer fp32 bit ABI.
+
+Current `sz.py` totals are 12,768 lines in `support/rockchip.py`, 2,087 in
+`ops_rockchip.py`, 14,855 across the Rockchip runtime, and 39,164 repository
+lines. Combined with the preceding compaction work, Rockchip runtime is down
+**843 counted lines** from 15,698 without moving code into excluded directories.
+Physical Rockchip source is 17,187 lines, down from 18,059.
+
+Validation:
+
+- hardware-free PR1 contract: **173/173**;
+- affected IEEE/LUT hardware methods: **7/7**;
+- representative activation/power methods after scalar centralization:
+  **12/12**;
+- complete uninterrupted forward-only TestOps replay: **411 passed, 13
+  skipped, 126 subtests passed in 2449.18s (40:49)**;
+- mypy remains at the exact 12-error baseline and touched-file Ruff at the
+  exact eight-finding baseline; `git diff --check` passes.
+
+An exploratory replay with the obsolete `--forked` option was invalid: forked
+children inherited mapped NPU state and crashed with SIGSEGV before assertions.
+The reference `simple_add.py` health probe passed immediately afterward. The
+authoritative serial replay above then completed with no crash, timeout, worker
+loss, or numerical mismatch. Its only warning is the already-known NumPy cast
+of nonfinite fp16 input in `test_exp`.
+
+Pre-edit recovery copies include `/tmp/rockchip.py.20260801-001401` through
+`/tmp/rockchip.py.20260801-002928`, plus
+`/tmp/progress.md.20260801-011316`,
+`/tmp/test_ops_status.md.20260801-011316`, and
+`/tmp/rockchip_size.md.20260801-011316`.
+
+Next lowering target: replace the 51 hand-written monotonic scratch-slot
+allocators in safe batches, keeping the nested-stage allocators that advance
+past relocation slots explicit until their task-list invariants are captured.
