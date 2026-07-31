@@ -174,6 +174,11 @@ def _try_sub(val: UOp) -> tuple[int, int]|None:
   return None
 _CONST_SLOT = 0xFFFF  # sentinel globals_slot for scalar constant buffer
 _ZERO_SLOT = 0xFFFD  # sentinel globals_slot for zero-filled input buffer (fill)
+
+def _float_arg(value:float) -> tuple[int,int]:
+  """Encode a scalar fp32 DPU operand in the constant-buffer ABI."""
+  return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
+
 _HOST_BITWISE_LAYOUT = -1000  # is_copy task layout tag for exact host-side 32-bit/bool bitwise operations
 _HOST_MOVEMENT_LAYOUT = -1001  # is_copy task layout tag for exact integer-indexed host movement
 _HOST_TRUNC_LAYOUT = -1002  # is_copy task layout tag for exact root fp16/fp32 truncation
@@ -2736,13 +2741,11 @@ def _try_hardsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
   scaled, shifted, positive, negative, clamped = (alloc() for _ in range(5))
-  source, zero, negative_one = (input_slot, 0), (_ZERO_SLOT, 0), scalar(-1.0)
-  return (_emit_where_stage(total, scaled, source, scalar(alpha), Ops.MUL),
-          _emit_where_stage(total, shifted, (scaled, 0), scalar(beta), Ops.ADD),
+  source, zero, negative_one = (input_slot, 0), (_ZERO_SLOT, 0), _float_arg(-1.0)
+  return (_emit_where_stage(total, scaled, source, _float_arg(alpha), Ops.MUL),
+          _emit_where_stage(total, shifted, (scaled, 0), _float_arg(beta), Ops.ADD),
           _emit_where_stage(total, positive, (shifted, 0), zero, Ops.MAX),
           _emit_where_stage(total, negative, (positive, 0), negative_one, Ops.MUL),
           _emit_where_stage(total, clamped, (negative, 0), negative_one, Ops.MAX),
@@ -2759,8 +2762,6 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
@@ -2773,19 +2774,19 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(lut_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   plus, positive, negative, clamped_negative, relu6, product, fallback = (alloc() for _ in range(7))
-  tasks.extend((_emit_where_stage(total, plus, source_arg, scalar(3.0), Ops.ADD),
+  tasks.extend((_emit_where_stage(total, plus, source_arg, _float_arg(3.0), Ops.ADD),
                 _emit_where_stage(total, positive, (plus, 0), zero, Ops.MAX),
-                _emit_where_stage(total, negative, (positive, 0), scalar(-1.0), Ops.MUL),
-                _emit_where_stage(total, clamped_negative, (negative, 0), scalar(-6.0), Ops.MAX),
-                _emit_where_stage(total, relu6, (clamped_negative, 0), scalar(-1.0), Ops.MUL),
+                _emit_where_stage(total, negative, (positive, 0), _float_arg(-1.0), Ops.MUL),
+                _emit_where_stage(total, clamped_negative, (negative, 0), _float_arg(-6.0), Ops.MAX),
+                _emit_where_stage(total, relu6, (clamped_negative, 0), _float_arg(-1.0), Ops.MUL),
                 _emit_where_stage(total, product, source_arg, (relu6, 0), Ops.MUL),
-                _emit_where_stage(total, fallback, (product, 0), scalar(1/6), Ops.MUL)))
+                _emit_where_stage(total, fallback, (product, 0), _float_arg(1/6), Ops.MUL)))
   wide_negative_diff, wide_negative_mask, wide_positive_diff, wide_positive_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, wide_negative_diff, scalar(-2.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, wide_negative_diff, _float_arg(-2.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, wide_negative_mask, (wide_negative_diff, 0), (wide_negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, wide_positive_diff, source_arg, scalar(2.0), Ops.SUB),
+                _emit_where_stage(total, wide_positive_diff, source_arg, _float_arg(2.0), Ops.SUB),
                 _emit_where_stage(total, wide_positive_mask, (wide_positive_diff, 0), (wide_positive_diff, 0), Ops.MAX, compare=True)))
   wide_outside_scratch, wide_outside, wide_inside_scratch, wide_inside = alloc(), alloc(), alloc(), alloc()
   tasks.extend((_emit_where_stage(total, wide_outside_scratch, (wide_negative_mask, 0), (wide_positive_mask, 0), Ops.MAX),
@@ -2801,7 +2802,7 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, wide, (base_inner, 0), (fallback_outer, 0), Ops.ADD)))
 
   scaled = alloc()
-  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(16.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, scaled, source_arg, _float_arg(16.0), Ops.MUL))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_hardswish_correction")
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -2811,12 +2812,12 @@ def _try_hardswish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(RKSubTask(cmds, task, relocs))
 
   local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(1/16), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(1/16), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(1/16), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(1/16), Ops.MUL)))
   negative_diff, negative_mask, positive_diff, positive_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, negative_diff, scalar(-0.125), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, negative_diff, _float_arg(-0.125), source_arg, Ops.SUB),
                 _emit_where_stage(total, negative_mask, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_diff, source_arg, scalar(15/128), Ops.SUB),
+                _emit_where_stage(total, positive_diff, source_arg, _float_arg(15/128), Ops.SUB),
                 _emit_where_stage(total, positive_mask, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True)))
   outside_scratch, outside, inside_scratch, inside = alloc(), alloc(), alloc(), alloc()
   tasks.extend((_emit_where_stage(total, outside_scratch, (negative_mask, 0), (positive_mask, 0), Ops.MAX),
@@ -2854,8 +2855,6 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int, dtype=dtypes.half) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtype, src=(out_idx.src[0].param_like(slot).replace(dtype=dtype), *out_idx.src[1:]))
@@ -2877,9 +2876,9 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     cmds, task, relocs = emit_rk(direct_plan)
     tasks.append(RKSubTask(cmds, task, relocs))
 
-  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), _float_arg(1.0)
   scaled = alloc()
-  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(16.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, scaled, source_arg, _float_arg(16.0), Ops.MUL))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_tanh_local")
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -2888,13 +2887,13 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(local_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
   local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.25), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.25), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(0.25), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(0.25), Ops.MUL)))
   local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
   local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, local_low_diff, scalar(-0.25), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, local_low_diff, _float_arg(-0.25), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, source_arg, scalar(0.25), Ops.SUB),
+                _emit_where_stage(total, local_high_diff, source_arg, _float_arg(0.25), Ops.SUB),
                 _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
                 _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
@@ -2904,9 +2903,9 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
   local_mask_scratch, local_mask = alloc(), alloc()
   clamp_low, negated, negated_clamped, identity = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, near_low_diff, scalar(-0.04), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, near_low_diff, _float_arg(-0.04), source_arg, Ops.SUB),
                 _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_high_diff, source_arg, scalar(0.04), Ops.SUB),
+                _emit_where_stage(total, near_high_diff, source_arg, _float_arg(0.04), Ops.SUB),
                 _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
                 _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
@@ -2914,9 +2913,9 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
                 _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
                 _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
-                _emit_where_stage(total, clamp_low, source_arg, scalar(-0.04), Ops.MAX),
+                _emit_where_stage(total, clamp_low, source_arg, _float_arg(-0.04), Ops.MAX),
                 _emit_where_stage(total, negated, (_ZERO_SLOT, 0), (clamp_low, 0), Ops.SUB),
-                _emit_where_stage(total, negated_clamped, (negated, 0), scalar(-0.04), Ops.MAX),
+                _emit_where_stage(total, negated_clamped, (negated, 0), _float_arg(-0.04), Ops.MAX),
                 _emit_where_stage(total, identity, (_ZERO_SLOT, 0), (negated_clamped, 0), Ops.SUB)))
   broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
   identity_selected_scratch, identity_selected, lut_sum_scratch, lut_sum, interior_slot = (alloc() for _ in range(5))
@@ -2931,9 +2930,9 @@ def _try_tanh_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, alloc(), (lut_sum, 0), (identity_selected, 0), Ops.ADD),
                 _emit_where_stage(total, interior_slot, (lut_sum, 0), (identity_selected, 0), Ops.ADD)))
   low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, low_diff, scalar(-4.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, low_diff, _float_arg(-4.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, high_diff, source_arg, scalar(4.0), Ops.SUB),
+                _emit_where_stage(total, high_diff, source_arg, _float_arg(4.0), Ops.SUB),
                 _emit_where_stage(total, high_mask, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True)))
   sign_scratch, sign, outside_scratch, outside, inside_scratch, inside = (alloc() for _ in range(6))
   tasks.extend((_emit_where_stage(total, sign_scratch, (high_mask, 0), (low_mask, 0), Ops.SUB),
@@ -2984,8 +2983,6 @@ def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
@@ -2999,11 +2996,11 @@ def _try_quick_gelu_saturation_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     [r.globals_slot for st in base_tasks for r in st.relocs if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
   next_slot = max(next_slot, max(used_slots, default=-1)+1)
 
-  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), _float_arg(1.0)
   low_diff, low_mask, high_diff, high_mask = alloc(), alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, low_diff, scalar(-10.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, low_diff, _float_arg(-10.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, low_mask, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, high_diff, source_arg, scalar(5.0), Ops.SUB),
+                _emit_where_stage(total, high_diff, source_arg, _float_arg(5.0), Ops.SUB),
                 _emit_where_stage(total, high_mask, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True)))
   outside_scratch, outside, inside_scratch, inside = alloc(), alloc(), alloc(), alloc()
   tasks.extend((_emit_where_stage(total, outside_scratch, (high_mask, 0), (low_mask, 0), Ops.MAX),
@@ -3030,8 +3027,6 @@ def _try_quick_gelu_direct_two_lut_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
@@ -3053,9 +3048,9 @@ def _try_quick_gelu_direct_two_lut_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(broad_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
-  source_arg, one, zero = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0), (_ZERO_SLOT, 0)
+  source_arg, one, zero = (source.src[0].buf_uop.arg.slot, 0), _float_arg(1.0), (_ZERO_SLOT, 0)
   scaled = alloc()
-  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(14.25), Ops.MUL))
+  tasks.append(_emit_where_stage(total, scaled, source_arg, _float_arg(14.25), Ops.MUL))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_quick_gelu_local")
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -3064,19 +3059,19 @@ def _try_quick_gelu_direct_two_lut_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(local_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
   local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.0625), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.0625), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(0.0625), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(0.0625), Ops.MUL)))
 
   below_diff, below, above_diff, above = (alloc() for _ in range(4))
   local_below_diff, local_below, local_above_diff, local_above = (alloc() for _ in range(4))
   negative_diff, negative, positive_diff, positive = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, below_diff, scalar(-2.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, below_diff, _float_arg(-2.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, below, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, above_diff, source_arg, scalar(2.0), Ops.SUB),
+                _emit_where_stage(total, above_diff, source_arg, _float_arg(2.0), Ops.SUB),
                 _emit_where_stage(total, above, (above_diff, 0), (above_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_below_diff, scalar(-0.14), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_below_diff, _float_arg(-0.14), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_below, (local_below_diff, 0), (local_below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_above_diff, source_arg, scalar(0.11), Ops.SUB),
+                _emit_where_stage(total, local_above_diff, source_arg, _float_arg(0.11), Ops.SUB),
                 _emit_where_stage(total, local_above, (local_above_diff, 0), (local_above_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
@@ -3128,8 +3123,6 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
@@ -3151,10 +3144,10 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(broad_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
-  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), _float_arg(1.0)
   shifted, scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, shifted, source_arg, scalar(1.5), Ops.ADD),
-                _emit_where_stage(total, scaled, (shifted, 0), scalar(4.0), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, shifted, source_arg, _float_arg(1.5), Ops.ADD),
+                _emit_where_stage(total, scaled, (shifted, 0), _float_arg(4.0), Ops.MUL)))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg="rk_quick_gelu_local")
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -3166,15 +3159,15 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   below_diff, below, above_diff, above = (alloc() for _ in range(4))
   local_above_diff, local_above = alloc(), alloc()
   poly_below_diff, poly_below, poly_above_diff, poly_above = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, below_diff, scalar(-2.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, below_diff, _float_arg(-2.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, below, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, above_diff, source_arg, scalar(2.0), Ops.SUB),
+                _emit_where_stage(total, above_diff, source_arg, _float_arg(2.0), Ops.SUB),
                 _emit_where_stage(total, above, (above_diff, 0), (above_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_above_diff, source_arg, scalar(-1.0), Ops.SUB),
+                _emit_where_stage(total, local_above_diff, source_arg, _float_arg(-1.0), Ops.SUB),
                 _emit_where_stage(total, local_above, (local_above_diff, 0), (local_above_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, poly_below_diff, scalar(-0.16), source_arg, Ops.SUB),
+                _emit_where_stage(total, poly_below_diff, _float_arg(-0.16), source_arg, Ops.SUB),
                 _emit_where_stage(total, poly_below, (poly_below_diff, 0), (poly_below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, poly_above_diff, source_arg, scalar(0.16), Ops.SUB),
+                _emit_where_stage(total, poly_above_diff, source_arg, _float_arg(0.16), Ops.SUB),
                 _emit_where_stage(total, poly_above, (poly_above_diff, 0), (poly_above_diff, 0), Ops.MAX, compare=True)))
 
   outside_scratch, outside, inside_scratch, inside = (alloc() for _ in range(4))
@@ -3201,9 +3194,9 @@ def _try_quick_gelu_two_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   poly_x_scratch, poly_x, half_x, square, quadratic, polynomial = (alloc() for _ in range(6))
   tasks.extend((_emit_where_stage(total, poly_x_scratch, source_arg, (poly_inside, 0), Ops.MUL),
                 _emit_where_stage(total, poly_x, source_arg, (poly_inside, 0), Ops.MUL),
-                _emit_where_stage(total, half_x, (poly_x, 0), scalar(0.5), Ops.MUL),
+                _emit_where_stage(total, half_x, (poly_x, 0), _float_arg(0.5), Ops.MUL),
                 _emit_where_stage(total, square, (poly_x, 0), (poly_x, 0), Ops.MUL),
-                _emit_where_stage(total, quadratic, (square, 0), scalar(0.4253), Ops.MUL),
+                _emit_where_stage(total, quadratic, (square, 0), _float_arg(0.4253), Ops.MUL),
                 _emit_where_stage(total, polynomial, (half_x, 0), (quadratic, 0), Ops.ADD)))
 
   base_selected_scratch, base_selected, broad_selected_scratch, broad_selected = (alloc() for _ in range(4))
@@ -3242,8 +3235,6 @@ def _try_logsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
   correction = alloc()
   lut_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_logsigmoid_correction")
@@ -3261,23 +3252,23 @@ def _try_logsigmoid_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(tail_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   positive, minimum, tail_diff, tail_mask, broad_mask = (alloc() for _ in range(5))
   broad_selected, tail_scaled, tail_selected, selected_correction = (alloc() for _ in range(4))
   raw_output, negated_output, clamped_output = alloc(), alloc(), alloc()
   tasks.extend((_emit_where_stage(total, positive, source_arg, zero, Ops.MAX),
                 _emit_where_stage(total, minimum, source_arg, (positive, 0), Ops.SUB),
-                _emit_where_stage(total, tail_diff, source_arg, scalar(3.5), Ops.SUB),
+                _emit_where_stage(total, tail_diff, source_arg, _float_arg(3.5), Ops.SUB),
                 _emit_where_stage(total, tail_mask, (tail_diff, 0), (tail_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, broad_mask, one, (tail_mask, 0), Ops.SUB),
                 _emit_where_stage(total, broad_selected, (correction, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, tail_scaled, (tail, 0), scalar(1/32), Ops.MUL),
+                _emit_where_stage(total, tail_scaled, (tail, 0), _float_arg(1/32), Ops.MUL),
                 _emit_where_stage(total, tail_selected, (tail_scaled, 0), (tail_mask, 0), Ops.MUL),
                 _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
                 _emit_where_stage(total, raw_output, (minimum, 0), (selected_correction, 0), Ops.ADD),
-                _emit_where_stage(total, negated_output, (raw_output, 0), scalar(-1.0), Ops.MUL),
+                _emit_where_stage(total, negated_output, (raw_output, 0), _float_arg(-1.0), Ops.MUL),
                 _emit_where_stage(total, clamped_output, (negated_output, 0), zero, Ops.MAX),
-                _emit_where_stage(total, info.outs[0], (clamped_output, 0), scalar(-1.0), Ops.MUL)))
+                _emit_where_stage(total, info.outs[0], (clamped_output, 0), _float_arg(-1.0), Ops.MUL)))
   return tuple(tasks)
 
 def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
@@ -3300,8 +3291,6 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
   tasks:list[RKSubTask] = []
   if source.op is not Ops.INDEX or not _is_flat_contiguous(source.src[1]):
@@ -3326,9 +3315,9 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return (*tasks, RKSubTask(cmds, task, relocs),
             _emit_where_stage(total, positive, source_arg, (_ZERO_SLOT, 0), Ops.MAX),
             _emit_where_stage(total, raw_output, (positive, 0), (correction, 0), Ops.SUB),
-            _emit_where_stage(total, far_diff, scalar(-100.0), source_arg, Ops.SUB),
+            _emit_where_stage(total, far_diff, _float_arg(-100.0), source_arg, Ops.SUB),
             _emit_where_stage(total, far_mask, (far_diff, 0), (far_diff, 0), Ops.MAX, compare=True),
-            _emit_where_stage(total, finite_mask, scalar(1.0), (far_mask, 0), Ops.SUB),
+            _emit_where_stage(total, finite_mask, _float_arg(1.0), (far_mask, 0), Ops.SUB),
             _emit_where_stage(total, finite_output, (raw_output, 0), (finite_mask, 0), Ops.MUL),
             _emit_where_stage(total, info.outs[0], (finite_output, 0), (_ZERO_SLOT, 0), Ops.MAX))
 
@@ -3352,15 +3341,15 @@ def _try_softplus_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(tail_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
-  zero, one = (_ZERO_SLOT, 0), scalar(1.0)
+  zero, one = (_ZERO_SLOT, 0), _float_arg(1.0)
   positive, tail_diff, tail_mask, broad_mask = (alloc() for _ in range(4))
   broad_selected, tail_scaled, tail_selected, selected_correction, raw_output = (alloc() for _ in range(5))
   tasks.extend((_emit_where_stage(total, positive, source_arg, zero, Ops.MAX),
-                _emit_where_stage(total, tail_diff, scalar(-3.05/beta), source_arg, Ops.SUB),
+                _emit_where_stage(total, tail_diff, _float_arg(-3.05/beta), source_arg, Ops.SUB),
                 _emit_where_stage(total, tail_mask, (tail_diff, 0), (tail_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, broad_mask, one, (tail_mask, 0), Ops.SUB),
                 _emit_where_stage(total, broad_selected, (correction, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, tail_scaled, (tail, 0), scalar(1/21), Ops.MUL),
+                _emit_where_stage(total, tail_scaled, (tail, 0), _float_arg(1/21), Ops.MUL),
                 _emit_where_stage(total, tail_selected, (tail_scaled, 0), (tail_mask, 0), Ops.MUL),
                 _emit_where_stage(total, selected_correction, (broad_selected, 0), (tail_selected, 0), Ops.ADD),
                 _emit_where_stage(total, raw_output, (positive, 0), (selected_correction, 0), Ops.SUB),
@@ -3380,8 +3369,6 @@ def _try_mish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
   broad = alloc()
   broad_val = UOp(Ops.CUSTOM, dtypes.half, (source,), arg="rk_mish")
@@ -3391,9 +3378,9 @@ def _try_mish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(broad_plan)
   tasks = [RKSubTask(cmds, task, relocs)]
 
-  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), scalar(1.0)
+  source_arg, one = (source.src[0].buf_uop.arg.slot, 0), _float_arg(1.0)
   zoomed = alloc()
-  tasks.append(_emit_where_stage(total, zoomed, source_arg, scalar(2.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, zoomed, source_arg, _float_arg(2.0), Ops.MUL))
   local = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_mish_local")
   local_store = store.replace(src=(temp_index(local), local_val))
@@ -3408,21 +3395,21 @@ def _try_mish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_outside, local_inside, poly_low_diff, poly_low = (alloc() for _ in range(4))
   poly_high_diff, poly_high, poly_outside, poly_inside = (alloc() for _ in range(4))
   local_mask, broad_mask = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, range_low_diff, scalar(-8.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, range_low_diff, _float_arg(-8.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, range_low, (range_low_diff, 0), (range_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, range_high_diff, source_arg, scalar(8.0), Ops.SUB),
+                _emit_where_stage(total, range_high_diff, source_arg, _float_arg(8.0), Ops.SUB),
                 _emit_where_stage(total, range_high, (range_high_diff, 0), (range_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, range_outside, (range_low, 0), (range_high, 0), Ops.MAX),
                 _emit_where_stage(total, range_inside, one, (range_outside, 0), Ops.SUB),
-                _emit_where_stage(total, local_low_diff, scalar(-1.0), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_low_diff, _float_arg(-1.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, source_arg, scalar(1.0), Ops.SUB),
+                _emit_where_stage(total, local_high_diff, source_arg, _float_arg(1.0), Ops.SUB),
                 _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
-                _emit_where_stage(total, poly_low_diff, scalar(-0.08), source_arg, Ops.SUB),
+                _emit_where_stage(total, poly_low_diff, _float_arg(-0.08), source_arg, Ops.SUB),
                 _emit_where_stage(total, poly_low, (poly_low_diff, 0), (poly_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, poly_high_diff, source_arg, scalar(0.08), Ops.SUB),
+                _emit_where_stage(total, poly_high_diff, source_arg, _float_arg(0.08), Ops.SUB),
                 _emit_where_stage(total, poly_high, (poly_high_diff, 0), (poly_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, poly_outside, (poly_low, 0), (poly_high, 0), Ops.MAX),
                 _emit_where_stage(total, poly_inside, one, (poly_outside, 0), Ops.SUB),
@@ -3434,18 +3421,18 @@ def _try_mish_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   positive_diff, positive, positive_extra, broad_scale, broad_scaled = (alloc() for _ in range(5))
   broad_selected, local_scaled, local_selected, lut_sum = (alloc() for _ in range(4))
   fallback, fallback_selected, inner = alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, bounded_low, source_arg, scalar(-0.08), Ops.MAX),
+  tasks.extend((_emit_where_stage(total, bounded_low, source_arg, _float_arg(-0.08), Ops.MAX),
                 _emit_where_stage(total, neg_bounded_low, (_ZERO_SLOT, 0), (bounded_low, 0), Ops.SUB),
-                _emit_where_stage(total, neg_clamped, (neg_bounded_low, 0), scalar(-0.08), Ops.MAX),
+                _emit_where_stage(total, neg_clamped, (neg_bounded_low, 0), _float_arg(-0.08), Ops.MAX),
                 _emit_where_stage(total, bounded, (_ZERO_SLOT, 0), (neg_clamped, 0), Ops.SUB),
                 _emit_where_stage(total, poly_source, (bounded, 0), (poly_inside, 0), Ops.MUL),
-                _emit_where_stage(total, linear, (poly_source, 0), scalar(0.6), Ops.MUL),
+                _emit_where_stage(total, linear, (poly_source, 0), _float_arg(0.6), Ops.MUL),
                 _emit_where_stage(total, square, (poly_source, 0), (poly_source, 0), Ops.MUL),
-                _emit_where_stage(total, quadratic, (square, 0), scalar(0.32), Ops.MUL),
+                _emit_where_stage(total, quadratic, (square, 0), _float_arg(0.32), Ops.MUL),
                 _emit_where_stage(total, polynomial, (linear, 0), (quadratic, 0), Ops.ADD),
                 _emit_where_stage(total, positive_diff, source_arg, (_ZERO_SLOT, 0), Ops.SUB),
                 _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_extra, (positive, 0), scalar(7.0), Ops.MUL),
+                _emit_where_stage(total, positive_extra, (positive, 0), _float_arg(7.0), Ops.MUL),
                 _emit_where_stage(total, broad_scale, one, (positive_extra, 0), Ops.ADD),
                 _emit_where_stage(total, broad_scaled, (broad, 0), (broad_scale, 0), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_mask, 0), Ops.MUL),
@@ -3471,17 +3458,15 @@ def _try_erf_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def clamp_symmetric(limit:float) -> tuple[int,list[RKSubTask]]:
     low, neg, neg_clamped, bounded = (alloc() for _ in range(4))
-    stages = [_emit_where_stage(total, low, source_arg, scalar(-limit), Ops.MAX),
+    stages = [_emit_where_stage(total, low, source_arg, _float_arg(-limit), Ops.MAX),
               _emit_where_stage(total, neg, zero, (low, 0), Ops.SUB),
-              _emit_where_stage(total, neg_clamped, (neg, 0), scalar(-limit), Ops.MAX),
+              _emit_where_stage(total, neg_clamped, (neg, 0), _float_arg(-limit), Ops.MAX),
               _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
     return bounded, stages
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   broad_input, tasks = clamp_symmetric(4.0)
   broad_slot = alloc()
   broad_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(broad_input),), arg="rk_erf")
@@ -3494,7 +3479,7 @@ def _try_erf_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_input, local_stages = clamp_symmetric(0.25)
   tasks.extend(local_stages)
   zoomed = alloc()
-  tasks.append(_emit_where_stage(total, zoomed, (local_input, 0), scalar(16.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, zoomed, (local_input, 0), _float_arg(16.0), Ops.MUL))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_erf_local")
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -3506,17 +3491,17 @@ def _try_erf_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   low_diff, low, high_diff, high = (alloc() for _ in range(4))
   local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
   near_low_diff, near_low, near_high_diff, near_high = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, low_diff, scalar(-4.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, low_diff, _float_arg(-4.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, low, (low_diff, 0), (low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, high_diff, source_arg, scalar(4.0), Ops.SUB),
+                _emit_where_stage(total, high_diff, source_arg, _float_arg(4.0), Ops.SUB),
                 _emit_where_stage(total, high, (high_diff, 0), (high_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_low_diff, scalar(-0.25), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_low_diff, _float_arg(-0.25), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, source_arg, scalar(0.25), Ops.SUB),
+                _emit_where_stage(total, local_high_diff, source_arg, _float_arg(0.25), Ops.SUB),
                 _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_low_diff, scalar(-0.04), source_arg, Ops.SUB),
+                _emit_where_stage(total, near_low_diff, _float_arg(-0.04), source_arg, Ops.SUB),
                 _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_high_diff, source_arg, scalar(0.04), Ops.SUB),
+                _emit_where_stage(total, near_high_diff, source_arg, _float_arg(0.04), Ops.SUB),
                 _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True)))
 
   outside_scratch, outside, inside_scratch, inside = (alloc() for _ in range(4))
@@ -3543,10 +3528,10 @@ def _try_erf_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   near_input, near_stages = clamp_symmetric(0.04)
   tasks.extend(near_stages)
   identity = alloc()
-  tasks.append(_emit_where_stage(total, identity, (near_input, 0), scalar(2/math.sqrt(math.pi)), Ops.MUL))
+  tasks.append(_emit_where_stage(total, identity, (near_input, 0), _float_arg(2/math.sqrt(math.pi)), Ops.MUL))
   local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(1/3), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(1/3), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(1/3), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(1/3), Ops.MUL)))
 
   broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
   identity_selected_scratch, identity_selected = alloc(), alloc()
@@ -3587,10 +3572,8 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   neg_source, abs_source, invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(5))
   # Bound infinities before the host-assisted truncation stage. The final x*0
   # term restores NaN for both infinities and NaN without perturbing finite x.
@@ -3598,18 +3581,18 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks:list[RKSubTask] = [
     _emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
     _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
-    _emit_where_stage(total, invalid_diff, (abs_source, 0), scalar(20000.0), Ops.SUB),
+    _emit_where_stage(total, invalid_diff, (abs_source, 0), _float_arg(20000.0), Ops.SUB),
     _emit_where_stage(total, invalid_scratch, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
     _emit_where_stage(total, invalid, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
-    _emit_where_stage(total, low, source_arg, scalar(-10000.0), Ops.MAX),
+    _emit_where_stage(total, low, source_arg, _float_arg(-10000.0), Ops.MAX),
     _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
-    _emit_where_stage(total, neg_clamped, (neg_low, 0), scalar(-10000.0), Ops.MAX),
+    _emit_where_stage(total, neg_clamped, (neg_low, 0), _float_arg(-10000.0), Ops.MAX),
     _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
   phase = bounded
   # The first cosine implementation used this literal lowering:
   # if is_cos:
   #   phase = alloc()
-  #   tasks.append(_emit_where_stage(total, phase, scalar(math.pi/2), (bounded, 0), Ops.SUB))
+  #   tasks.append(_emit_where_stage(total, phase, _float_arg(math.pi/2), (bounded, 0), Ops.SUB))
   # It is kept as tuning reference, but materializing the float32 phase as fp16
   # caused up to 0.0021 error. Direct cosine LUTs below use x as the phase.
 
@@ -3618,10 +3601,10 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   quotient, neg_quotient, abs_quotient, biased, rounded_abs = (alloc() for _ in range(5))
   positive_diff, positive, negative, positive_n = (alloc() for _ in range(4))
   negative_n, signed_negative_n, rounded = (alloc() for _ in range(3))
-  tasks.extend((_emit_where_stage(total, quotient, (phase, 0), scalar(1/(2*math.pi)), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, quotient, (phase, 0), _float_arg(1/(2*math.pi)), Ops.MUL),
                 _emit_where_stage(total, neg_quotient, zero, (quotient, 0), Ops.SUB),
                 _emit_where_stage(total, abs_quotient, (quotient, 0), (neg_quotient, 0), Ops.MAX),
-                _emit_where_stage(total, biased, (abs_quotient, 0), scalar(0.5), Ops.ADD),
+                _emit_where_stage(total, biased, (abs_quotient, 0), _float_arg(0.5), Ops.ADD),
                 _emit_trunc_stage(total, rounded_abs, (biased, 0)),
                 _emit_where_stage(total, positive_diff, (quotient, 0), zero, Ops.SUB),
                 _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
@@ -3636,7 +3619,7 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   reduced = phase
   for coefficient in (4.0, 2.0, 0.25, 0.03125, 2*math.pi-6.28125):
     product_slot, next_reduced = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, product_slot, (rounded, 0), scalar(coefficient), Ops.MUL),
+    tasks.extend((_emit_where_stage(total, product_slot, (rounded, 0), _float_arg(coefficient), Ops.MUL),
                   _emit_where_stage(total, next_reduced, (reduced, 0), (product_slot, 0), Ops.SUB)))
     reduced = next_reduced
 
@@ -3666,10 +3649,10 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     denom_scratch, valid_denom, factor_scratch, valid_factor, out_scratch = (alloc() for _ in range(5))
     tasks.extend((_emit_where_stage(total, neg_broad, zero, (broad, 0), Ops.SUB),
                   _emit_where_stage(total, abs_broad, (broad, 0), (neg_broad, 0), Ops.MAX),
-                  _emit_where_stage(total, local_diff, (abs_broad, 0), scalar(0.5), Ops.SUB),
+                  _emit_where_stage(total, local_diff, (abs_broad, 0), _float_arg(0.5), Ops.SUB),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
-                  _emit_where_stage(total, near_diff, (abs_broad, 0), scalar(0.01), Ops.SUB),
+                  _emit_where_stage(total, near_diff, (abs_broad, 0), _float_arg(0.01), Ops.SUB),
                   _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
                   # Earlier piecewise-gain tuning used separate 0.096/0.104 masks
@@ -3680,9 +3663,9 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   _emit_where_stage(total, broad_mask, one, (selected_sum, 0), Ops.SUB),
                   _emit_where_stage(total, neg_reduced_cos, zero, (reduced, 0), Ops.SUB),
                   _emit_where_stage(total, abs_reduced_cos, (reduced, 0), (neg_reduced_cos, 0), Ops.MAX),
-                  _emit_where_stage(total, center_hi, scalar(1.5703125), (abs_reduced_cos, 0), Ops.SUB),
-                  _emit_where_stage(total, near_scaled, (center_hi, 0), scalar(math.pi/2-1.5703125), Ops.ADD),
-                  _emit_where_stage(total, middle_scaled, (local, 0), scalar(0.5), Ops.MUL),
+                  _emit_where_stage(total, center_hi, _float_arg(1.5703125), (abs_reduced_cos, 0), Ops.SUB),
+                  _emit_where_stage(total, near_scaled, (center_hi, 0), _float_arg(math.pi/2-1.5703125), Ops.ADD),
+                  _emit_where_stage(total, middle_scaled, (local, 0), _float_arg(0.5), Ops.MUL),
                   _emit_where_stage(total, broad_selected, (broad, 0), (broad_mask, 0), Ops.MUL),
                   _emit_where_stage(total, near_selected, (near_scaled, 0), (near_inside, 0), Ops.MUL),
                   _emit_where_stage(total, middle_selected, (middle_scaled, 0), (middle_mask, 0), Ops.MUL),
@@ -3710,7 +3693,7 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(RKSubTask(cmds, task, relocs))
 
   zoomed, local = alloc(), alloc()
-  tasks.append(_emit_where_stage(total, zoomed, (reduced, 0), scalar(16.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, zoomed, (reduced, 0), _float_arg(16.0), Ops.MUL))
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg="rk_sin_local")
   local_store = store.replace(src=(temp_index(local), local_val))
   local_plan = plan_rk(sink.substitute({store:local_store}))
@@ -3724,10 +3707,10 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   broad_mask, local_mask = alloc(), alloc()
   tasks.extend((_emit_where_stage(total, neg_reduced, zero, (reduced, 0), Ops.SUB),
                 _emit_where_stage(total, abs_reduced, (reduced, 0), (neg_reduced, 0), Ops.MAX),
-                _emit_where_stage(total, local_diff, (abs_reduced, 0), scalar(0.125), Ops.SUB),
+                _emit_where_stage(total, local_diff, (abs_reduced, 0), _float_arg(0.125), Ops.SUB),
                 _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
-                _emit_where_stage(total, near_diff, (abs_reduced, 0), scalar(0.04), Ops.SUB),
+                _emit_where_stage(total, near_diff, (abs_reduced, 0), _float_arg(0.04), Ops.SUB),
                 _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
                 _emit_where_stage(total, broad_mask, one, (local_inside, 0), Ops.SUB),
@@ -3736,7 +3719,7 @@ def _try_sin_cos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_scaled, broad_selected, local_selected = alloc(), alloc(), alloc()
   near_selected, lut_sum, normal = alloc(), alloc(), alloc()
   denom_scratch, valid_denom, factor_scratch, valid_factor, out_scratch = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, local_scaled, (local, 0), scalar(0.125), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, local_scaled, (local, 0), _float_arg(0.125), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad, 0), (broad_mask, 0), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
                 _emit_where_stage(total, near_selected, (reduced, 0), (near_inside, 0), Ops.MUL),
@@ -3768,30 +3751,28 @@ def _try_tan_trig_quotient_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   neg_source, abs_source, invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(5))
   low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
   tasks:list[RKSubTask] = [
     _emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
     _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
-    _emit_where_stage(total, invalid_diff, (abs_source, 0), scalar(20000.0), Ops.SUB),
+    _emit_where_stage(total, invalid_diff, (abs_source, 0), _float_arg(20000.0), Ops.SUB),
     _emit_where_stage(total, invalid_scratch, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
     _emit_where_stage(total, invalid, (invalid_diff, 0), (invalid_diff, 0), Ops.MAX, compare=True),
-    _emit_where_stage(total, low, source_arg, scalar(-10000.0), Ops.MAX),
+    _emit_where_stage(total, low, source_arg, _float_arg(-10000.0), Ops.MAX),
     _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
-    _emit_where_stage(total, neg_clamped, (neg_low, 0), scalar(-10000.0), Ops.MAX),
+    _emit_where_stage(total, neg_clamped, (neg_low, 0), _float_arg(-10000.0), Ops.MAX),
     _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
 
   quotient, neg_quotient, abs_quotient, biased, rounded_abs = (alloc() for _ in range(5))
   positive_diff, positive, negative, positive_n = (alloc() for _ in range(4))
   negative_n, signed_negative_n, rounded = (alloc() for _ in range(3))
-  tasks.extend((_emit_where_stage(total, quotient, (bounded, 0), scalar(1/math.pi), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, quotient, (bounded, 0), _float_arg(1/math.pi), Ops.MUL),
                 _emit_where_stage(total, neg_quotient, zero, (quotient, 0), Ops.SUB),
                 _emit_where_stage(total, abs_quotient, (quotient, 0), (neg_quotient, 0), Ops.MAX),
-                _emit_where_stage(total, biased, (abs_quotient, 0), scalar(0.5), Ops.ADD),
+                _emit_where_stage(total, biased, (abs_quotient, 0), _float_arg(0.5), Ops.ADD),
                 _emit_trunc_stage(total, rounded_abs, (biased, 0)),
                 _emit_where_stage(total, positive_diff, (quotient, 0), zero, Ops.SUB),
                 _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
@@ -3803,7 +3784,7 @@ def _try_tan_trig_quotient_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   reduced = bounded
   for coefficient in (3.0, 0.140625, math.pi-3.140625):
     product_slot, next_reduced = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, product_slot, (rounded, 0), scalar(coefficient), Ops.MUL),
+    tasks.extend((_emit_where_stage(total, product_slot, (rounded, 0), _float_arg(coefficient), Ops.MUL),
                   _emit_where_stage(total, next_reduced, (reduced, 0), (product_slot, 0), Ops.SUB)))
     reduced = next_reduced
 
@@ -3829,18 +3810,18 @@ def _try_tan_trig_quotient_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_scaled, broad_selected, near_selected, middle_selected, cosine_partial, cosine = (alloc() for _ in range(6))
   _old_cosine_tasks = (_emit_where_stage(total, neg_cos, zero, (cos_broad, 0), Ops.SUB),
                 _emit_where_stage(total, abs_cos, (cos_broad, 0), (neg_cos, 0), Ops.MAX),
-                _emit_where_stage(total, local_diff, (abs_cos, 0), scalar(0.5), Ops.SUB),
+                _emit_where_stage(total, local_diff, (abs_cos, 0), _float_arg(0.5), Ops.SUB),
                 _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
-                _emit_where_stage(total, near_diff, (abs_cos, 0), scalar(0.01), Ops.SUB),
+                _emit_where_stage(total, near_diff, (abs_cos, 0), _float_arg(0.01), Ops.SUB),
                 _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
                 _emit_where_stage(total, middle_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
                 _emit_where_stage(total, neg_reduced, zero, (reduced, 0), Ops.SUB),
                 _emit_where_stage(total, abs_reduced, (reduced, 0), (neg_reduced, 0), Ops.MAX),
-                _emit_where_stage(total, center_hi, scalar(1.5703125), (abs_reduced, 0), Ops.SUB),
-                _emit_where_stage(total, center, (center_hi, 0), scalar(math.pi/2-1.5703125), Ops.ADD),
-                _emit_where_stage(total, local_scaled, (cos_local, 0), scalar(0.5), Ops.MUL),
+                _emit_where_stage(total, center_hi, _float_arg(1.5703125), (abs_reduced, 0), Ops.SUB),
+                _emit_where_stage(total, center, (center_hi, 0), _float_arg(math.pi/2-1.5703125), Ops.ADD),
+                _emit_where_stage(total, local_scaled, (cos_local, 0), _float_arg(0.5), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (cos_broad, 0), (local_outside, 0), Ops.MUL),
                 _emit_where_stage(total, near_selected, (center, 0), (near_inside, 0), Ops.MUL),
                 _emit_where_stage(total, middle_selected, (local_scaled, 0), (middle_mask, 0), Ops.MUL),
@@ -3851,15 +3832,15 @@ def _try_tan_trig_quotient_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   center_near_outside, center_near_inside, center_local_mask = alloc(), alloc(), alloc()
   tasks.extend((_emit_where_stage(total, neg_reduced, zero, (reduced, 0), Ops.SUB),
                 _emit_where_stage(total, abs_reduced, (reduced, 0), (neg_reduced, 0), Ops.MAX),
-                _emit_where_stage(total, center_hi, scalar(1.5703125), (abs_reduced, 0), Ops.SUB),
-                _emit_where_stage(total, center, (center_hi, 0), scalar(math.pi/2-1.5703125), Ops.ADD),
+                _emit_where_stage(total, center_hi, _float_arg(1.5703125), (abs_reduced, 0), Ops.SUB),
+                _emit_where_stage(total, center, (center_hi, 0), _float_arg(math.pi/2-1.5703125), Ops.ADD),
                 _emit_where_stage(total, neg_center, zero, (center, 0), Ops.SUB),
                 _emit_where_stage(total, abs_center, (center, 0), (neg_center, 0), Ops.MAX),
-                _emit_where_stage(total, center_near_diff, (abs_center, 0), scalar(0.01), Ops.SUB),
+                _emit_where_stage(total, center_near_diff, (abs_center, 0), _float_arg(0.01), Ops.SUB),
                 _emit_where_stage(total, center_near_outside, (center_near_diff, 0), (center_near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, center_near_inside, one, (center_near_outside, 0), Ops.SUB),
                 _emit_where_stage(total, center_local_mask, one, (center_near_inside, 0), Ops.SUB),
-                _emit_where_stage(total, local_scaled, (cos_local, 0), scalar(0.5), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (cos_local, 0), _float_arg(0.5), Ops.MUL),
                 _emit_where_stage(total, near_selected, (center, 0), (center_near_inside, 0), Ops.MUL),
                 _emit_where_stage(total, middle_selected, (local_scaled, 0), (center_local_mask, 0), Ops.MUL),
                 _emit_where_stage(total, cosine, (near_selected, 0), (middle_selected, 0), Ops.ADD)))
@@ -3872,17 +3853,17 @@ def _try_tan_trig_quotient_wip(sink:UOp) -> tuple[RKSubTask, ...]|None:
   direct_sum, selected = alloc(), alloc()
   denom_scratch, valid_denom, factor_scratch, valid_factor = (alloc() for _ in range(4))
   tasks.extend((_emit_where_stage(total, tangent, (sine, 0), (cosine, 0), Ops.FDIV),
-                _emit_where_stage(total, direct_diff, (abs_reduced, 0), scalar(0.5), Ops.SUB),
+                _emit_where_stage(total, direct_diff, (abs_reduced, 0), _float_arg(0.5), Ops.SUB),
                 _emit_where_stage(total, direct_outside, (direct_diff, 0), (direct_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, direct_inside, one, (direct_outside, 0), Ops.SUB),
-                _emit_where_stage(total, wide_end_diff, (abs_reduced, 0), scalar(1.0), Ops.SUB),
+                _emit_where_stage(total, wide_end_diff, (abs_reduced, 0), _float_arg(1.0), Ops.SUB),
                 _emit_where_stage(total, wide_outside, (wide_end_diff, 0), (wide_end_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, wide_inside, one, (wide_outside, 0), Ops.SUB),
-                _emit_where_stage(total, wide_start_diff, (abs_reduced, 0), scalar(0.55), Ops.SUB),
+                _emit_where_stage(total, wide_start_diff, (abs_reduced, 0), _float_arg(0.55), Ops.SUB),
                 _emit_where_stage(total, wide_start, (wide_start_diff, 0), (wide_start_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, wide_mask, (wide_inside, 0), (wide_start, 0), Ops.MUL),
                 _emit_where_stage(total, quotient_mask, (direct_outside, 0), (wide_mask, 0), Ops.SUB),
-                _emit_where_stage(total, wide_scaled, (tan_local, 0), scalar(2.0), Ops.MUL),
+                _emit_where_stage(total, wide_scaled, (tan_local, 0), _float_arg(2.0), Ops.MUL),
                 _emit_where_stage(total, divided_selected, (tangent, 0), (quotient_mask, 0), Ops.MUL),
                 _emit_where_stage(total, direct_selected, (tan_local, 0), (direct_inside, 0), Ops.MUL),
                 _emit_where_stage(total, wide_selected, (wide_scaled, 0), (wide_mask, 0), Ops.MUL),
@@ -3909,15 +3890,14 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
   def temp_index(slot:int) -> UOp:
     idx = store.src[0]
     return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
   ns, ab, idiff, isc, invalid, low, nl, nc, bounded = (alloc() for _ in range(9))
   tasks = [_emit_where_stage(total, ns, zero, source_arg, Ops.SUB),
            _emit_where_stage(total, ab, source_arg, (ns,0), Ops.MAX),
-           _emit_where_stage(total, idiff, (ab,0), scalar(20000), Ops.SUB),
+           _emit_where_stage(total, idiff, (ab,0), _float_arg(20000), Ops.SUB),
            _emit_where_stage(total, isc, (idiff,0), (idiff,0), Ops.MAX, compare=True),
            _emit_where_stage(total, invalid, (idiff,0), (idiff,0), Ops.MAX, compare=True),
            _emit_where_stage(total, bounded, source_arg, zero, Ops.ADD)]
@@ -3926,12 +3906,12 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
              _emit_where_stage(total, ab, source_arg, (ns,0), Ops.MAX),
              _emit_where_stage(total, bounded, source_arg, zero, Ops.ADD)]
   q,nq,aq,aq_corrected,bias,nabs,pd,pos,neg,pn,nn,snn,n = (alloc() for _ in range(13))
-  tasks += [_emit_where_stage(total,q,(bounded,0),scalar(1/math.pi),Ops.MUL),
+  tasks += [_emit_where_stage(total,q,(bounded,0),_float_arg(1/math.pi),Ops.MUL),
             _emit_where_stage(total,nq,zero,(q,0),Ops.SUB), _emit_where_stage(total,aq,(q,0),(nq,0),Ops.MAX),
             # fp16 1/pi can round values just below every odd pi/2 to an exact .5 tie.
             # Bias toward the lower magnitude period; no fp16 input is exactly pi/2.
-            _emit_where_stage(total,aq_corrected,(aq,0),scalar(.0005),Ops.SUB),
-            _emit_where_stage(total,bias,(aq_corrected,0),scalar(.5),Ops.ADD), _emit_trunc_stage(total,nabs,(bias,0)),
+            _emit_where_stage(total,aq_corrected,(aq,0),_float_arg(.0005),Ops.SUB),
+            _emit_where_stage(total,bias,(aq_corrected,0),_float_arg(.5),Ops.ADD), _emit_trunc_stage(total,nabs,(bias,0)),
             _emit_where_stage(total,pd,(q,0),zero,Ops.SUB), _emit_where_stage(total,pos,(pd,0),(pd,0),Ops.MAX,compare=True),
             _emit_where_stage(total,neg,one,(pos,0),Ops.SUB), _emit_where_stage(total,pn,(nabs,0),(pos,0),Ops.MUL),
             _emit_where_stage(total,nn,(nabs,0),(neg,0),Ops.MUL), _emit_where_stage(total,snn,zero,(nn,0),Ops.SUB),
@@ -3939,7 +3919,7 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   reduced = bounded
   for coefficient in (3.140625, math.pi-3.140625):
     product_slot, next_reduced = alloc(), alloc()
-    tasks += [_emit_where_stage(total,product_slot,(n,0),scalar(coefficient),Ops.MUL),
+    tasks += [_emit_where_stage(total,product_slot,(n,0),_float_arg(coefficient),Ops.MUL),
               _emit_where_stage(total,next_reduced,(reduced,0),(product_slot,0),Ops.SUB)]
     reduced = next_reduced
   def add_value(val:UOp, out:int) -> bool:
@@ -3962,39 +3942,39 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   quotient_adjusted,quotient_center,quotient_middle = alloc(),alloc(),alloc()
   local_scaled,wide_scaled,qs,ws,ls,near_sel,tmp_sel,tmp2,selected = (alloc() for _ in range(9))
   tasks += [_emit_where_stage(total,nr,zero,(reduced,0),Ops.SUB), _emit_where_stage(total,ar,(reduced,0),(nr,0),Ops.MAX),
-            _emit_where_stage(total,diff,(ar,0),scalar(.45),Ops.SUB),
+            _emit_where_stage(total,diff,(ar,0),_float_arg(.45),Ops.SUB),
             _emit_where_stage(total,outside,(diff,0),(diff,0),Ops.MAX,compare=True),
             _emit_where_stage(total,inside,one,(outside,0),Ops.SUB),
-            _emit_where_stage(total,tan_near_diff,(ar,0),scalar(.04),Ops.SUB),
+            _emit_where_stage(total,tan_near_diff,(ar,0),_float_arg(.04),Ops.SUB),
             _emit_where_stage(total,tan_near_outside,(tan_near_diff,0),(tan_near_diff,0),Ops.MAX,compare=True),
             _emit_where_stage(total,tan_near_inside,one,(tan_near_outside,0),Ops.SUB),
             _emit_where_stage(total,tan_local_mask,(inside,0),(tan_near_inside,0),Ops.SUB),
-            _emit_where_stage(total,qdiff,(ar,0),scalar(1.05),Ops.SUB),
+            _emit_where_stage(total,qdiff,(ar,0),_float_arg(1.05),Ops.SUB),
             _emit_where_stage(total,qoutside,(qdiff,0),(qdiff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,pole_diff,(ab,0),scalar(3.0),Ops.SUB),
+            _emit_where_stage(total,pole_diff,(ab,0),_float_arg(3.0),Ops.SUB),
             _emit_where_stage(total,pole_group,(pole_diff,0),(pole_diff,0),Ops.MAX,compare=True),
-            _emit_where_stage(total,base_extra,(pole_group,0),scalar(3.0),Ops.MUL),
-            _emit_where_stage(total,pole_base,scalar(1.5),(base_extra,0),Ops.ADD),
+            _emit_where_stage(total,base_extra,(pole_group,0),_float_arg(3.0),Ops.MUL),
+            _emit_where_stage(total,pole_base,_float_arg(1.5),(base_extra,0),Ops.ADD),
             _emit_where_stage(total,pole_dist,(pole_base,0),(ab,0),Ops.SUB),
-            _emit_where_stage(total,rem_extra,(pole_group,0),scalar(.140625),Ops.MUL),
-            _emit_where_stage(total,pole_rem,scalar(.0703125),(rem_extra,0),Ops.ADD),
+            _emit_where_stage(total,rem_extra,(pole_group,0),_float_arg(.140625),Ops.MUL),
+            _emit_where_stage(total,pole_rem,_float_arg(.0703125),(rem_extra,0),Ops.ADD),
             _emit_where_stage(total,center_hi,(pole_dist,0),(pole_rem,0),Ops.ADD),
-            _emit_where_stage(total,local_scaled,(pole_group,0),scalar(math.pi-3.140625),Ops.MUL),
-            _emit_where_stage(total,center,scalar(math.pi/2-1.5703125),(local_scaled,0),Ops.ADD),
+            _emit_where_stage(total,local_scaled,(pole_group,0),_float_arg(math.pi-3.140625),Ops.MUL),
+            _emit_where_stage(total,center,_float_arg(math.pi/2-1.5703125),(local_scaled,0),Ops.ADD),
             _emit_where_stage(total,source_center,(center_hi,0),(center,0),Ops.ADD),
             _emit_where_stage(total,ncenter,zero,(source_center,0),Ops.SUB),
             _emit_where_stage(total,acenter,(source_center,0),(ncenter,0),Ops.MAX),
-            _emit_where_stage(total,cdiff,(acenter,0),scalar(.05),Ops.SUB),
+            _emit_where_stage(total,cdiff,(acenter,0),_float_arg(.05),Ops.SUB),
             _emit_where_stage(total,coutside,(cdiff,0),(cdiff,0),Ops.MAX,compare=True),
             _emit_where_stage(total,cinside,one,(coutside,0),Ops.SUB),
             _emit_where_stage(total,cmask,(qoutside,0),(cinside,0),Ops.SUB),
-            _emit_where_stage(total,cos_scaled,(cos_local,0),scalar(.5),Ops.MUL),
+            _emit_where_stage(total,cos_scaled,(cos_local,0),_float_arg(.5),Ops.MUL),
             # In the closest pole band, cot(d) ~= 1/d. Cancelling the sine LUT
             # magnitude avoids amplifying its Q15 quantization in the quotient.
             _emit_where_stage(total,neg_sine,zero,(sine,0),Ops.SUB),
             _emit_where_stage(total,abs_sine,(sine,0),(neg_sine,0),Ops.MAX),
             _emit_where_stage(total,center_sq,(acenter,0),(acenter,0),Ops.MUL),
-            _emit_where_stage(total,center_term,(center_sq,0),scalar(1/3),Ops.MUL),
+            _emit_where_stage(total,center_term,(center_sq,0),_float_arg(1/3),Ops.MUL),
             _emit_where_stage(total,center_factor,one,(center_term,0),Ops.SUB),
             _emit_where_stage(total,center_cos,(acenter,0),(abs_sine,0),Ops.MUL),
             _emit_where_stage(total,cos_center_sel,(center_cos,0),(cinside,0),Ops.MUL),
@@ -4008,7 +3988,7 @@ def _try_tan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
             _emit_where_stage(total,quotient_middle,(quotient,0),(cmask,0),Ops.MUL),
             _emit_where_stage(total,qs,(quotient_center,0),(quotient_middle,0),Ops.ADD),
             _emit_where_stage(total,middle_mask,(outside,0),(qoutside,0),Ops.SUB),
-            _emit_where_stage(total,wide_scaled,(wide,0),scalar(2.0),Ops.MUL),
+            _emit_where_stage(total,wide_scaled,(wide,0),_float_arg(2.0),Ops.MUL),
             _emit_where_stage(total,ws,(wide_scaled,0),(middle_mask,0),Ops.MUL),
             _emit_where_stage(total,ls,(local,0),(tan_local_mask,0),Ops.MUL),
             _emit_where_stage(total,near_sel,(reduced,0),(tan_near_inside,0),Ops.MUL),
@@ -4040,7 +4020,6 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
   def temp_index(slot:int) -> UOp:
     idx = store.src[0]
     return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
@@ -4052,7 +4031,7 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
     return True
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
   source_residual = alloc() if source.dtype is dtypes.float else -1
   if source_residual >= 0:
     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
@@ -4064,7 +4043,7 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
                 _emit_where_stage(total, neg_abs, zero, (abs_source, 0), Ops.SUB),
-                _emit_where_stage(total, neg_clamped, (neg_abs, 0), scalar(-1), Ops.MAX),
+                _emit_where_stage(total, neg_clamped, (neg_abs, 0), _float_arg(-1), Ops.MAX),
                 _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB),
                 _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
@@ -4076,7 +4055,7 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   endpoint_diff, endpoint_scratch, endpoint = (alloc() for _ in range(3))
   endpoint_distance = alloc()
-  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), scalar(.85 if is_acos else .875), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), _float_arg(.85 if is_acos else .875), Ops.SUB),
                 _emit_where_stage(total, endpoint_scratch, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, endpoint, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, endpoint_distance, one, (bounded, 0), Ops.SUB)))
@@ -4088,7 +4067,7 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   _emit_where_stage(total, positive_residual, (source_residual, 0), (positive, 0), Ops.MUL),
                   _emit_where_stage(total, selected_negative_residual, (negative_residual, 0), (negative, 0), Ops.MUL),
                   _emit_where_stage(total, absolute_residual, (positive_residual, 0), (selected_negative_residual, 0), Ops.ADD),
-                  _emit_where_stage(total, scaled_residual, (absolute_residual, 0), scalar(1/256), Ops.MUL),
+                  _emit_where_stage(total, scaled_residual, (absolute_residual, 0), _float_arg(1/256), Ops.MUL),
                   _emit_where_stage(total, endpoint_input, (endpoint_distance, 0), (scaled_residual, 0), Ops.SUB)))
 
   broad_slot = alloc()
@@ -4104,12 +4083,12 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     decoded_endpoint_slot = endpoint_slot
     if source_residual >= 0:
       fine_input, fine_slot, decoded_fine_slot = alloc(), alloc(), alloc()
-      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), scalar(64), Ops.MUL))
+      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), _float_arg(64), Ops.MUL))
       if not add_lut("rk_acos_fine_endpoint", fine_input, fine_slot): return None
-      tasks.append(_emit_where_stage(total, decoded_fine_slot, (fine_slot, 0), scalar(1/8), Ops.MUL))
+      tasks.append(_emit_where_stage(total, decoded_fine_slot, (fine_slot, 0), _float_arg(1/8), Ops.MUL))
       fine_diff, fine_scratch, coarse_mask, fine_mask = (alloc() for _ in range(4))
       coarse_selected, fine_selected, decoded_endpoint_slot = (alloc() for _ in range(3))
-      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), scalar(.003), Ops.SUB),
+      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), _float_arg(.003), Ops.SUB),
                     _emit_where_stage(total, fine_scratch, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, coarse_mask, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, fine_mask, one, (coarse_mask, 0), Ops.SUB),
@@ -4122,8 +4101,8 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     endpoint_nonzero, positive_endpoint, negative_endpoint = (alloc() for _ in range(3))
     positive_endpoint_selected, negative_endpoint_selected, endpoint_decoded, endpoint_selected, selected = (alloc() for _ in range(5))
     tasks.extend((_emit_where_stage(total, broad_mask, one, (endpoint, 0), Ops.SUB),
-                  _emit_where_stage(total, broad_positive, (broad_slot, 0), scalar(2), Ops.MUL),
-                  _emit_where_stage(total, broad_negative, (broad_slot, 0), scalar(4), Ops.MUL),
+                  _emit_where_stage(total, broad_positive, (broad_slot, 0), _float_arg(2), Ops.MUL),
+                  _emit_where_stage(total, broad_negative, (broad_slot, 0), _float_arg(4), Ops.MUL),
                   _emit_where_stage(total, broad_positive_selected, (broad_positive, 0), (positive, 0), Ops.MUL),
                   _emit_where_stage(total, broad_negative_selected, (broad_negative, 0), (negative, 0), Ops.MUL),
                   _emit_where_stage(total, broad_decoded, (broad_positive_selected, 0), (broad_negative_selected, 0), Ops.ADD),
@@ -4131,14 +4110,14 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                   # The hardware cannot safely emit a literal zero LUT entry.
                   # Only fp16 x=1 exceeds this threshold, so mask its one-count substitute.
                   _emit_where_stage(total, exact_diff, (endpoint_input, 0) if source_residual >= 0 else (bounded, 0),
-                                    zero if source_residual >= 0 else scalar(.99975), Ops.SUB),
+                                    zero if source_residual >= 0 else _float_arg(.99975), Ops.SUB),
                   _emit_where_stage(total, exact_scratch, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, exact_one, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, not_exact, (exact_one, 0) if source_residual >= 0 else one,
                                     zero if source_residual >= 0 else (exact_one, 0), Ops.SUB),
                   _emit_where_stage(total, endpoint_nonzero, (decoded_endpoint_slot, 0), (not_exact, 0), Ops.MUL),
                   _emit_where_stage(total, positive_endpoint, (endpoint_nonzero, 0), (positive, 0), Ops.MUL),
-                  _emit_where_stage(total, negative_endpoint, scalar(math.pi), (endpoint_nonzero, 0), Ops.SUB),
+                  _emit_where_stage(total, negative_endpoint, _float_arg(math.pi), (endpoint_nonzero, 0), Ops.SUB),
                   _emit_where_stage(total, positive_endpoint_selected, (positive_endpoint, 0), (positive, 0), Ops.MUL),
                   _emit_where_stage(total, negative_endpoint_selected, (negative_endpoint, 0), (negative, 0), Ops.MUL),
                   _emit_where_stage(total, endpoint_decoded, (positive_endpoint_selected, 0), (negative_endpoint_selected, 0), Ops.ADD),
@@ -4149,12 +4128,12 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     local_diff, local_scratch, local_outside, local_inside = (alloc() for _ in range(4))
     local_mask, middle_mask = alloc(), alloc()
     neg_bounded, local_coordinate, endpoint_coordinate, detail_input = (alloc() for _ in range(4))
-    tasks.extend((_emit_where_stage(total, near_diff, (bounded, 0), scalar(.04), Ops.SUB),
+    tasks.extend((_emit_where_stage(total, near_diff, (bounded, 0), _float_arg(.04), Ops.SUB),
                   _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
                   _emit_where_stage(total, local_diff, (bounded, 0),
-                                    scalar(.24 if source_residual >= 0 else .125), Ops.SUB),
+                                    _float_arg(.24 if source_residual >= 0 else .125), Ops.SUB),
                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
@@ -4172,31 +4151,31 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       if not add_lut("rk_asin_derivative", bounded, derivative_slot): return None
       coarse_acos, fine_input, fine_acos, decoded_fine_acos = alloc(), alloc(), alloc(), alloc()
       if not add_lut("rk_acos_endpoint", endpoint_input, coarse_acos): return None
-      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), scalar(64), Ops.MUL))
+      tasks.append(_emit_where_stage(total, fine_input, (endpoint_input, 0), _float_arg(64), Ops.MUL))
       if not add_lut("rk_acos_fine_endpoint", fine_input, fine_acos): return None
-      tasks.append(_emit_where_stage(total, decoded_fine_acos, (fine_acos, 0), scalar(1/8), Ops.MUL))
+      tasks.append(_emit_where_stage(total, decoded_fine_acos, (fine_acos, 0), _float_arg(1/8), Ops.MUL))
       fine_diff, fine_scratch, coarse_mask, fine_mask = (alloc() for _ in range(4))
       coarse_selected_acos, fine_selected_acos, decoded_acos, fp32_endpoint_asin = (alloc() for _ in range(4))
-      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), scalar(.003), Ops.SUB),
+      tasks.extend((_emit_where_stage(total, fine_diff, (endpoint_input, 0), _float_arg(.003), Ops.SUB),
                     _emit_where_stage(total, fine_scratch, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, coarse_mask, (fine_diff, 0), (fine_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, fine_mask, one, (coarse_mask, 0), Ops.SUB),
                     _emit_where_stage(total, coarse_selected_acos, (coarse_acos, 0), (coarse_mask, 0), Ops.MUL),
                     _emit_where_stage(total, fine_selected_acos, (decoded_fine_acos, 0), (fine_mask, 0), Ops.MUL),
                     _emit_where_stage(total, decoded_acos, (coarse_selected_acos, 0), (fine_selected_acos, 0), Ops.ADD),
-                    _emit_where_stage(total, fp32_endpoint_asin, scalar(math.pi/2), (decoded_acos, 0), Ops.SUB)))
+                    _emit_where_stage(total, fp32_endpoint_asin, _float_arg(math.pi/2), (decoded_acos, 0), Ops.SUB)))
     broad_scaled, broad_selected = alloc(), alloc()
     local_scaled, local_selected = alloc(), alloc()
     endpoint_scaled, endpoint_selected = alloc(), alloc()
     near_selected, partial, absolute_partial, absolute_asin = alloc(), alloc(), alloc(), alloc()
     negative_asin, positive_selected, negative_selected, base_selected = (alloc() for _ in range(4))
-    tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), scalar(2), Ops.MUL),
+    tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), _float_arg(2), Ops.MUL),
                   _emit_where_stage(total, broad_selected, (broad_scaled, 0), (middle_mask, 0), Ops.MUL),
-                  _emit_where_stage(total, local_scaled, (detail_slot, 0), scalar(.25), Ops.MUL),
+                  _emit_where_stage(total, local_scaled, (detail_slot, 0), _float_arg(.25), Ops.MUL),
                   _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
                   _emit_where_stage(total, endpoint_scaled,
                                     (fp32_endpoint_asin, 0) if fp32_endpoint_asin >= 0 else (detail_slot, 0),
-                                    one if fp32_endpoint_asin >= 0 else scalar(2), Ops.MUL),
+                                    one if fp32_endpoint_asin >= 0 else _float_arg(2), Ops.MUL),
                   _emit_where_stage(total, endpoint_selected, (endpoint_scaled, 0), (endpoint, 0), Ops.MUL),
                   _emit_where_stage(total, near_selected, (bounded, 0), (near_inside, 0), Ops.MUL),
                   _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
@@ -4209,8 +4188,8 @@ def _try_asin_acos_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     selected = base_selected
     if source_residual >= 0:
       derivative, scaled_residual, residual_correction, nonendpoint_mask, nonendpoint_correction, selected = (alloc() for _ in range(6))
-      tasks.extend((_emit_where_stage(total, derivative, (derivative_slot, 0), scalar(2), Ops.MUL),
-                    _emit_where_stage(total, scaled_residual, (source_residual, 0), scalar(1/256), Ops.MUL),
+      tasks.extend((_emit_where_stage(total, derivative, (derivative_slot, 0), _float_arg(2), Ops.MUL),
+                    _emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1/256), Ops.MUL),
                     _emit_where_stage(total, residual_correction, (derivative, 0), (scaled_residual, 0), Ops.MUL),
                     _emit_where_stage(total, nonendpoint_mask, one, (endpoint, 0), Ops.SUB),
                     _emit_where_stage(total, nonendpoint_correction, (residual_correction, 0), (nonendpoint_mask, 0), Ops.MUL),
@@ -4251,7 +4230,6 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
   def temp_index(slot:int) -> UOp:
     idx = store.src[0]
     return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
@@ -4263,7 +4241,7 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
     return True
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
   neg_source, abs_source = alloc(), alloc()
   negative_diff, negative_scratch, negative, nonnegative = (alloc() for _ in range(4))
   large_diff, large_scratch, large, small = (alloc() for _ in range(4))
@@ -4288,11 +4266,11 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
   local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
-  tasks.extend((_emit_where_stage(total, near_diff, (transformed, 0), scalar(.04), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, near_diff, (transformed, 0), _float_arg(.04), Ops.SUB),
                 _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
-                _emit_where_stage(total, local_diff, (transformed, 0), scalar(.125), Ops.SUB),
+                _emit_where_stage(total, local_diff, (transformed, 0), _float_arg(.125), Ops.SUB),
                 _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
@@ -4301,7 +4279,7 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   negative_transformed, amplified_negative, local_small, local_coordinate = (alloc() for _ in range(4))
   large_coordinate, detail_input = alloc(), alloc()
   tasks.extend((_emit_where_stage(total, negative_transformed, zero, (transformed, 0), Ops.SUB),
-                _emit_where_stage(total, amplified_negative, (negative_transformed, 0), scalar(4), Ops.MUL),
+                _emit_where_stage(total, amplified_negative, (negative_transformed, 0), _float_arg(4), Ops.MUL),
                 _emit_where_stage(total, local_small, (local_inside, 0), (small, 0), Ops.MUL),
                 _emit_where_stage(total, local_coordinate, (amplified_negative, 0), (local_small, 0), Ops.MUL),
                 _emit_where_stage(total, large_coordinate, (transformed, 0), (large, 0), Ops.MUL),
@@ -4316,10 +4294,10 @@ def _try_atan_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, local_region, (local_mask, 0), (small, 0), Ops.MUL),
                 _emit_where_stage(total, near_region, (near_inside, 0), (small, 0), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad_slot, 0), (broad_region, 0), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(.25), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(.25), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0), (local_region, 0), Ops.MUL),
                 _emit_where_stage(total, near_selected, (transformed, 0), (near_region, 0), Ops.MUL),
-                _emit_where_stage(total, large_scaled, (local_slot, 0), scalar(2), Ops.MUL),
+                _emit_where_stage(total, large_scaled, (local_slot, 0), _float_arg(2), Ops.MUL),
                 _emit_where_stage(total, large_selected, (large_scaled, 0), (large, 0), Ops.MUL),
                 _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
                 _emit_where_stage(total, base_partial, (partial, 0), (near_selected, 0), Ops.ADD),
@@ -4348,7 +4326,6 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
   def temp_index(slot:int) -> UOp:
     idx = store.src[0]
     return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
@@ -4360,14 +4337,14 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
     return True
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
   neg_source, abs_source, neg_abs, neg_clamped, bounded = (alloc() for _ in range(5))
   negative_diff, negative_scratch, negative, nonnegative = (alloc() for _ in range(4))
   invalid_diff, invalid_scratch, invalid = (alloc() for _ in range(3))
   tasks.extend((_emit_where_stage(total, neg_source, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, abs_source, source_arg, (neg_source, 0), Ops.MAX),
                 _emit_where_stage(total, neg_abs, zero, (abs_source, 0), Ops.SUB),
-                _emit_where_stage(total, neg_clamped, (neg_abs, 0), scalar(-1), Ops.MAX),
+                _emit_where_stage(total, neg_clamped, (neg_abs, 0), _float_arg(-1), Ops.MAX),
                 _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB),
                 _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, negative_scratch, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
@@ -4380,11 +4357,11 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   endpoint_diff, endpoint_scratch, endpoint = (alloc() for _ in range(3))
   endpoint_distance = alloc()
   exact_diff, exact_scratch, exact = (alloc() for _ in range(3))
-  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), scalar(.875), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, endpoint_diff, (bounded, 0), _float_arg(.875), Ops.SUB),
                 _emit_where_stage(total, endpoint_scratch, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, endpoint, (endpoint_diff, 0), (endpoint_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, endpoint_distance, one, (bounded, 0), Ops.SUB),
-                _emit_where_stage(total, exact_diff, (bounded, 0), scalar(.99975), Ops.SUB),
+                _emit_where_stage(total, exact_diff, (bounded, 0), _float_arg(.99975), Ops.SUB),
                 _emit_where_stage(total, exact_scratch, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, exact, (exact_diff, 0), (exact_diff, 0), Ops.MAX, compare=True)))
 
@@ -4392,11 +4369,11 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
   broad_mask = alloc()
   neg_bounded, local_coordinate, endpoint_coordinate, detail_input = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, near_diff, (bounded, 0), scalar(.04), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, near_diff, (bounded, 0), _float_arg(.04), Ops.SUB),
                 _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
-                _emit_where_stage(total, local_diff, (bounded, 0), scalar(.125), Ops.SUB),
+                _emit_where_stage(total, local_diff, (bounded, 0), _float_arg(.125), Ops.SUB),
                 _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
@@ -4412,11 +4389,11 @@ def _try_atanh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   broad_scaled, broad_selected, local_scaled, local_selected = (alloc() for _ in range(4))
   endpoint_scaled, endpoint_selected, near_selected = (alloc() for _ in range(3))
   partial, finite_partial, magnitude = alloc(), alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), scalar(4), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, broad_scaled, (broad_slot, 0), _float_arg(4), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (detail_slot, 0), scalar(.25), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (detail_slot, 0), _float_arg(.25), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
-                _emit_where_stage(total, endpoint_scaled, (detail_slot, 0), scalar(8), Ops.MUL),
+                _emit_where_stage(total, endpoint_scaled, (detail_slot, 0), _float_arg(8), Ops.MUL),
                 _emit_where_stage(total, endpoint_selected, (endpoint_scaled, 0), (endpoint, 0), Ops.MUL),
                 _emit_where_stage(total, near_selected, (bounded, 0), (near_inside, 0), Ops.MUL),
                 _emit_where_stage(total, partial, (broad_selected, 0), (local_selected, 0), Ops.ADD),
@@ -4453,7 +4430,6 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
   def temp_index(slot:int) -> UOp:
     idx = store.src[0]
     return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
@@ -4465,7 +4441,7 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
     return True
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
   # Rejected WIP: a 1.5*fp32 residual nudge for small ASINH inputs only
   # moved which samples landed in the wrong fp16 output bin. Keep the path
   # disabled for reference; ACOSH still needs the residual for its endpoint.
@@ -4495,11 +4471,11 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   small_diff, small_scratch, small_outside, small = (alloc() for _ in range(4))
   huge_diff, huge_scratch, huge, mid_region = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, small_diff, (magnitude, 0), scalar(2), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, small_diff, (magnitude, 0), _float_arg(2), Ops.SUB),
                 _emit_where_stage(total, small_scratch, (small_diff, 0), (small_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, small_outside, (small_diff, 0), (small_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, small, one, (small_outside, 0), Ops.SUB),
-                _emit_where_stage(total, huge_diff, (magnitude, 0), scalar(16), Ops.SUB),
+                _emit_where_stage(total, huge_diff, (magnitude, 0), _float_arg(16), Ops.SUB),
                 _emit_where_stage(total, huge_scratch, (huge_diff, 0), (huge_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, huge, (huge_diff, 0), (huge_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, mid_region, (small_outside, 0), (huge, 0), Ops.SUB)))
@@ -4515,28 +4491,28 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if source_residual >= 0:
       scaled_residual, coordinate_source = alloc(), alloc()
       refined_below_diff, refined_below_scratch, invalid = alloc(), alloc(), alloc()
-      tasks.extend((_emit_where_stage(total, scaled_residual, (source_residual, 0), scalar(1/256), Ops.MUL),
+      tasks.extend((_emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1/256), Ops.MUL),
                     _emit_where_stage(total, coordinate_source, (distance, 0), (scaled_residual, 0), Ops.ADD),
                     _emit_where_stage(total, refined_below_diff, zero, (coordinate_source, 0), Ops.SUB),
                     _emit_where_stage(total, refined_below_scratch, (refined_below_diff, 0), (refined_below_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, invalid, (refined_below_diff, 0), (refined_below_diff, 0), Ops.MAX, compare=True)))
-    tasks.extend((_emit_where_stage(total, local_diff, (coordinate_source, 0), scalar(.04), Ops.SUB),
+    tasks.extend((_emit_where_stage(total, local_diff, (coordinate_source, 0), _float_arg(.04), Ops.SUB),
                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
                   _emit_where_stage(total, broad_region, (small, 0), (local_inside, 0), Ops.SUB),
-                  _emit_where_stage(total, nonexact_diff, (coordinate_source, 0), scalar(.0005), Ops.SUB),
+                  _emit_where_stage(total, nonexact_diff, (coordinate_source, 0), _float_arg(.0005), Ops.SUB),
                   _emit_where_stage(total, nonexact_scratch, (nonexact_diff, 0), (nonexact_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, nonexact, (nonexact_diff, 0), (nonexact_diff, 0), Ops.MAX, compare=True)))
   else:
     near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
     local_diff, local_scratch, local_outside, local_inside = (alloc() for _ in range(4))
     local_mask, broad_region = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, near_diff, (magnitude, 0), scalar(.04), Ops.SUB),
+    tasks.extend((_emit_where_stage(total, near_diff, (magnitude, 0), _float_arg(.04), Ops.SUB),
                   _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
-                  _emit_where_stage(total, local_diff, (magnitude, 0), scalar(.25), Ops.SUB),
+                  _emit_where_stage(total, local_diff, (magnitude, 0), _float_arg(.25), Ops.SUB),
                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
@@ -4548,18 +4524,18 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   broad_raw, broad_coordinate, core_input = alloc(), alloc(), alloc()
   local_gain, broad_gain = (48 if is_acosh else 8), (2 if is_acosh else 1)
   tasks.extend((_emit_where_stage(total, neg_coordinate, zero, (coordinate_source, 0), Ops.SUB),
-                _emit_where_stage(total, amplified_coordinate, (neg_coordinate, 0), scalar(local_gain), Ops.MUL),
+                _emit_where_stage(total, amplified_coordinate, (neg_coordinate, 0), _float_arg(local_gain), Ops.MUL),
                 _emit_where_stage(total, local_coordinate, (amplified_coordinate, 0), (local_inside, 0), Ops.MUL),
-                _emit_where_stage(total, broad_raw, (coordinate_source, 0), scalar(broad_gain), Ops.MUL),
+                _emit_where_stage(total, broad_raw, (coordinate_source, 0), _float_arg(broad_gain), Ops.MUL),
                 _emit_where_stage(total, broad_coordinate, (broad_raw, 0), (broad_region, 0), Ops.MUL),
                 _emit_where_stage(total, core_input, (local_coordinate, 0), (broad_coordinate, 0), Ops.ADD)))
 
   middle_delta, negative_middle, middle_coordinate = (alloc() for _ in range(3))
   huge_scaled, huge_coordinate, range_input = (alloc() for _ in range(3))
-  tasks.extend((_emit_where_stage(total, middle_delta, (magnitude, 0), scalar(2), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, middle_delta, (magnitude, 0), _float_arg(2), Ops.SUB),
                 _emit_where_stage(total, negative_middle, zero, (middle_delta, 0), Ops.SUB),
                 _emit_where_stage(total, middle_coordinate, (negative_middle, 0), (mid_region, 0), Ops.MUL),
-                _emit_where_stage(total, huge_scaled, (magnitude, 0), scalar(1/19), Ops.MUL),
+                _emit_where_stage(total, huge_scaled, (magnitude, 0), _float_arg(1/19), Ops.MUL),
                 _emit_where_stage(total, huge_coordinate, (huge_scaled, 0), (huge, 0), Ops.MUL),
                 _emit_where_stage(total, range_input, (middle_coordinate, 0), (huge_coordinate, 0), Ops.ADD)))
 
@@ -4571,14 +4547,14 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   near_selected = alloc() if not is_acosh else -1
   first, second, magnitude_result = alloc(), alloc(), alloc()
   local_scale = .5 if is_acosh else .25
-  tasks.extend((_emit_where_stage(total, local_scaled, (core_slot, 0), scalar(local_scale), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, local_scaled, (core_slot, 0), _float_arg(local_scale), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0),
                                   (local_inside if is_acosh else local_mask, 0), Ops.MUL),
-                _emit_where_stage(total, broad_scaled, (core_slot, 0), scalar(2), Ops.MUL),
+                _emit_where_stage(total, broad_scaled, (core_slot, 0), _float_arg(2), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_region, 0), Ops.MUL),
-                _emit_where_stage(total, middle_scaled, (range_slot, 0), scalar(4), Ops.MUL),
+                _emit_where_stage(total, middle_scaled, (range_slot, 0), _float_arg(4), Ops.MUL),
                 _emit_where_stage(total, middle_selected, (middle_scaled, 0), (mid_region, 0), Ops.MUL),
-                _emit_where_stage(total, huge_scaled_output, (range_slot, 0), scalar(8), Ops.MUL),
+                _emit_where_stage(total, huge_scaled_output, (range_slot, 0), _float_arg(8), Ops.MUL),
                 _emit_where_stage(total, huge_selected, (huge_scaled_output, 0), (huge, 0), Ops.MUL)))
   if not is_acosh:
     tasks.append(_emit_where_stage(total, near_selected, (magnitude, 0), (near_inside, 0), Ops.MUL))
@@ -4597,11 +4573,11 @@ def _try_asinh_acosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if apply_small_residual and source_residual >= 0:
       correction_diff, correction_scratch, correction_outside, correction_inside = (alloc() for _ in range(4))
       scaled_residual, selected_correction = alloc(), alloc()
-      tasks.extend((_emit_where_stage(total, correction_diff, (magnitude, 0), scalar(.25), Ops.SUB),
+      tasks.extend((_emit_where_stage(total, correction_diff, (magnitude, 0), _float_arg(.25), Ops.SUB),
                     _emit_where_stage(total, correction_scratch, (correction_diff, 0), (correction_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, correction_outside, (correction_diff, 0), (correction_diff, 0), Ops.MAX, compare=True),
                     _emit_where_stage(total, correction_inside, one, (correction_outside, 0), Ops.SUB),
-                    _emit_where_stage(total, scaled_residual, (source_residual, 0), scalar(1.5/256), Ops.MUL),
+                    _emit_where_stage(total, scaled_residual, (source_residual, 0), _float_arg(1.5/256), Ops.MUL),
                     _emit_where_stage(total, selected_correction, (scaled_residual, 0), (correction_inside, 0), Ops.MUL),
                     _emit_where_stage(total, info.outs[0], (signed_result, 0), (selected_correction, 0), Ops.ADD)))
   else:
@@ -4637,16 +4613,15 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(x:float) -> tuple[int,int]: return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', x))[0]
   def temp_index(slot:int) -> UOp:
     idx = store.src[0]
     return idx.replace(dtype=dtypes.half, src=(idx.src[0].param_like(slot).replace(dtype=dtypes.half), *idx.src[1:]))
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1)
 
   low, neg_low, neg_clamped, bounded = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, low, source_arg, scalar(-2), Ops.MAX),
+  tasks.extend((_emit_where_stage(total, low, source_arg, _float_arg(-2), Ops.MAX),
                 _emit_where_stage(total, neg_low, zero, (low, 0), Ops.SUB),
-                _emit_where_stage(total, neg_clamped, (neg_low, 0), scalar(-2), Ops.MAX),
+                _emit_where_stage(total, neg_clamped, (neg_low, 0), _float_arg(-2), Ops.MAX),
                 _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)))
   lut_slot = alloc()
   lut_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(bounded),), arg="rk_cosh" if is_cosh else "rk_sinh")
@@ -4671,17 +4646,17 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     near_diff, near_scratch, near_outside, near_inside = (alloc() for _ in range(4))
     local_diff, local_scratch, local_outside, local_inside, local_mask = (alloc() for _ in range(5))
     broad, local_scaled, local, near, partial, selected = (alloc() for _ in range(6))
-    tasks.extend((_emit_where_stage(total, near_diff, (abs_source, 0), scalar(.04), Ops.SUB),
+    tasks.extend((_emit_where_stage(total, near_diff, (abs_source, 0), _float_arg(.04), Ops.SUB),
                   _emit_where_stage(total, near_scratch, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_outside, (near_diff, 0), (near_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, near_inside, one, (near_outside, 0), Ops.SUB),
-                  _emit_where_stage(total, local_diff, (abs_source, 0), scalar(.125), Ops.SUB),
+                  _emit_where_stage(total, local_diff, (abs_source, 0), _float_arg(.125), Ops.SUB),
                   _emit_where_stage(total, local_scratch, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_outside, (local_diff, 0), (local_diff, 0), Ops.MAX, compare=True),
                   _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
                   _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
                   _emit_where_stage(total, broad, (lut_slot, 0), (local_outside, 0), Ops.MUL),
-                  _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(.25), Ops.MUL),
+                  _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(.25), Ops.MUL),
                   _emit_where_stage(total, local, (local_scaled, 0), (local_mask, 0), Ops.MUL),
                   _emit_where_stage(total, near, source_arg, (near_inside, 0), Ops.MUL),
                   _emit_where_stage(total, partial, (broad, 0), (local, 0), Ops.ADD),
@@ -4689,7 +4664,7 @@ def _try_sinh_cosh_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   large_diff, large_scratch, large, denom_scratch, denom = (alloc() for _ in range(5))
   result_scratch = alloc()
-  tasks.extend((_emit_where_stage(total, large_diff, (abs_source, 0), scalar(10), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, large_diff, (abs_source, 0), _float_arg(10), Ops.SUB),
                 _emit_where_stage(total, large_scratch, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, large, (large_diff, 0), (large_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, denom_scratch, one, (large, 0), Ops.SUB),
@@ -4712,16 +4687,14 @@ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def clamp_symmetric(limit:float) -> tuple[int,list[RKSubTask]]:
     low, neg, neg_clamped, bounded = (alloc() for _ in range(4))
-    return bounded, [_emit_where_stage(total, low, source_arg, scalar(-limit), Ops.MAX),
+    return bounded, [_emit_where_stage(total, low, source_arg, _float_arg(-limit), Ops.MAX),
                      _emit_where_stage(total, neg, zero, (low, 0), Ops.SUB),
-                     _emit_where_stage(total, neg_clamped, (neg, 0), scalar(-limit), Ops.MAX),
+                     _emit_where_stage(total, neg_clamped, (neg, 0), _float_arg(-limit), Ops.MAX),
                      _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   broad_input, tasks = clamp_symmetric(4.0)
   broad = alloc()
   broad_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(broad_input),), arg=("rk_gelu", approximate_tanh))
@@ -4734,7 +4707,7 @@ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_input, local_stages = clamp_symmetric(0.5)
   tasks.extend(local_stages)
   zoomed = alloc()
-  tasks.append(_emit_where_stage(total, zoomed, (local_input, 0), scalar(8.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, zoomed, (local_input, 0), _float_arg(8.0), Ops.MUL))
   local = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_gelu_local", approximate_tanh))
   local_store = store.replace(src=(temp_index(local), local_val))
@@ -4749,21 +4722,21 @@ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   local_outside, local_inside, poly_low_diff, poly_low = (alloc() for _ in range(4))
   poly_high_diff, poly_high, poly_outside, poly_inside = (alloc() for _ in range(4))
   local_mask, broad_mask = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, range_low_diff, scalar(-4.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, range_low_diff, _float_arg(-4.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, range_low, (range_low_diff, 0), (range_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, range_high_diff, source_arg, scalar(4.0), Ops.SUB),
+                _emit_where_stage(total, range_high_diff, source_arg, _float_arg(4.0), Ops.SUB),
                 _emit_where_stage(total, range_high, (range_high_diff, 0), (range_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, range_outside, (range_low, 0), (range_high, 0), Ops.MAX),
                 _emit_where_stage(total, range_inside, one, (range_outside, 0), Ops.SUB),
-                _emit_where_stage(total, local_low_diff, scalar(-0.5), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_low_diff, _float_arg(-0.5), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, source_arg, scalar(0.5), Ops.SUB),
+                _emit_where_stage(total, local_high_diff, source_arg, _float_arg(0.5), Ops.SUB),
                 _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
                 _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
-                _emit_where_stage(total, poly_low_diff, scalar(-0.04), source_arg, Ops.SUB),
+                _emit_where_stage(total, poly_low_diff, _float_arg(-0.04), source_arg, Ops.SUB),
                 _emit_where_stage(total, poly_low, (poly_low_diff, 0), (poly_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, poly_high_diff, source_arg, scalar(0.04), Ops.SUB),
+                _emit_where_stage(total, poly_high_diff, source_arg, _float_arg(0.04), Ops.SUB),
                 _emit_where_stage(total, poly_high, (poly_high_diff, 0), (poly_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, poly_outside, (poly_low, 0), (poly_high, 0), Ops.MAX),
                 _emit_where_stage(total, poly_inside, one, (poly_outside, 0), Ops.SUB),
@@ -4776,17 +4749,17 @@ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   positive_diff, positive, positive_extra, broad_scale, broad_scaled = (alloc() for _ in range(5))
   broad_selected, local_scaled, local_selected, poly_selected = (alloc() for _ in range(4))
   lut_sum, interior, fallback, fallback_selected = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, linear, (poly_input, 0), scalar(0.5), Ops.MUL),
+  tasks.extend((_emit_where_stage(total, linear, (poly_input, 0), _float_arg(0.5), Ops.MUL),
                 _emit_where_stage(total, square, (poly_input, 0), (poly_input, 0), Ops.MUL),
-                _emit_where_stage(total, quadratic, (square, 0), scalar(1/math.sqrt(2*math.pi)), Ops.MUL),
+                _emit_where_stage(total, quadratic, (square, 0), _float_arg(1/math.sqrt(2*math.pi)), Ops.MUL),
                 _emit_where_stage(total, polynomial, (linear, 0), (quadratic, 0), Ops.ADD),
                 _emit_where_stage(total, positive_diff, source_arg, zero, Ops.SUB),
                 _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, positive_extra, (positive, 0), scalar(3.0), Ops.MUL),
+                _emit_where_stage(total, positive_extra, (positive, 0), _float_arg(3.0), Ops.MUL),
                 _emit_where_stage(total, broad_scale, one, (positive_extra, 0), Ops.ADD),
                 _emit_where_stage(total, broad_scaled, (broad, 0), (broad_scale, 0), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local, 0), scalar(0.5), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local, 0), _float_arg(0.5), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
                 _emit_where_stage(total, poly_selected, (polynomial, 0), (poly_inside, 0), Ops.MUL),
                 _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
@@ -4810,12 +4783,10 @@ def _try_elu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
-  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), scalar(1.0)
+  source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
   broad_low, broad_neg, broad_input = alloc(), alloc(), alloc()
-  tasks = [_emit_where_stage(total, broad_low, source_arg, scalar(-8.0), Ops.MAX),
+  tasks = [_emit_where_stage(total, broad_low, source_arg, _float_arg(-8.0), Ops.MAX),
            _emit_where_stage(total, broad_neg, zero, (broad_low, 0), Ops.SUB),
            _emit_where_stage(total, broad_input, zero, (broad_neg, 0), Ops.SUB)]
   broad_slot = alloc()
@@ -4827,10 +4798,10 @@ def _try_elu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(RKSubTask(cmds, task, relocs))
 
   local_low, local_neg, local_input, zoomed = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, local_low, source_arg, scalar(-0.5), Ops.MAX),
+  tasks.extend((_emit_where_stage(total, local_low, source_arg, _float_arg(-0.5), Ops.MAX),
                 _emit_where_stage(total, local_neg, zero, (local_low, 0), Ops.SUB),
                 _emit_where_stage(total, local_input, zero, (local_neg, 0), Ops.SUB),
-                _emit_where_stage(total, zoomed, (local_input, 0), scalar(4.0), Ops.MUL)))
+                _emit_where_stage(total, zoomed, (local_input, 0), _float_arg(4.0), Ops.MUL)))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_elu_local", negative_scale))
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -4844,11 +4815,11 @@ def _try_elu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   broad_mask_scratch, broad_mask, local_mask_scratch, local_mask = (alloc() for _ in range(4))
   poly_mask_scratch, poly_mask = alloc(), alloc()
   positive_scratch, positive = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, below_diff, scalar(-8.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, below_diff, _float_arg(-8.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, below, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_below_diff, scalar(-0.5), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_below_diff, _float_arg(-0.5), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_below, (local_below_diff, 0), (local_below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, poly_below_diff, scalar(-0.03), source_arg, Ops.SUB),
+                _emit_where_stage(total, poly_below_diff, _float_arg(-0.03), source_arg, Ops.SUB),
                 _emit_where_stage(total, poly_below, (poly_below_diff, 0), (poly_below_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
@@ -4872,27 +4843,27 @@ def _try_elu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   positive_selected_scratch, positive_selected = alloc(), alloc()
   lut_sum_scratch, lut_sum, negative_sum_scratch, negative_sum = (alloc() for _ in range(4))
   all_negative_scratch, all_negative = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, poly_low, source_arg, scalar(-0.03), Ops.MAX),
+  tasks.extend((_emit_where_stage(total, poly_low, source_arg, _float_arg(-0.03), Ops.MAX),
                 _emit_where_stage(total, poly_neg, zero, (poly_low, 0), Ops.SUB),
                 _emit_where_stage(total, poly_input, zero, (poly_neg, 0), Ops.SUB),
-                _emit_where_stage(total, linear, (poly_input, 0), scalar(negative_scale), Ops.MUL),
+                _emit_where_stage(total, linear, (poly_input, 0), _float_arg(negative_scale), Ops.MUL),
                 _emit_where_stage(total, square, (poly_input, 0), (poly_input, 0), Ops.MUL),
-                _emit_where_stage(total, quadratic, (square, 0), scalar(negative_scale/2), Ops.MUL),
+                _emit_where_stage(total, quadratic, (square, 0), _float_arg(negative_scale/2), Ops.MUL),
                 _emit_where_stage(total, polynomial, (linear, 0), (quadratic, 0), Ops.ADD),
                 _emit_where_stage(total, polynomial_selected_scratch, (polynomial, 0), (poly_mask, 0), Ops.MUL),
                 _emit_where_stage(total, polynomial_selected, (polynomial, 0), (poly_mask, 0), Ops.MUL),
-                _emit_where_stage(total, broad_restored_scratch, (broad_slot, 0), scalar(1/broad_gain), Ops.MUL),
-                _emit_where_stage(total, broad_restored, (broad_slot, 0), scalar(1/broad_gain), Ops.MUL),
+                _emit_where_stage(total, broad_restored_scratch, (broad_slot, 0), _float_arg(1/broad_gain), Ops.MUL),
+                _emit_where_stage(total, broad_restored, (broad_slot, 0), _float_arg(1/broad_gain), Ops.MUL),
                 _emit_where_stage(total, broad_selected_scratch, (broad_restored, 0), (broad_mask, 0), Ops.MUL),
                 _emit_where_stage(total, broad_selected, (broad_restored, 0), (broad_mask, 0), Ops.MUL),
-                _emit_where_stage(total, local_restored_scratch, (local_slot, 0), scalar(1/local_gain), Ops.MUL),
-                _emit_where_stage(total, local_restored, (local_slot, 0), scalar(1/local_gain), Ops.MUL),
+                _emit_where_stage(total, local_restored_scratch, (local_slot, 0), _float_arg(1/local_gain), Ops.MUL),
+                _emit_where_stage(total, local_restored, (local_slot, 0), _float_arg(1/local_gain), Ops.MUL),
                 _emit_where_stage(total, local_selected_scratch, (local_restored, 0), (local_mask, 0), Ops.MUL),
                 _emit_where_stage(total, local_selected, (local_restored, 0), (local_mask, 0), Ops.MUL),
-                _emit_where_stage(total, tail_scratch, scalar(-negative_scale), (below, 0), Ops.MUL),
-                _emit_where_stage(total, tail, scalar(-negative_scale), (below, 0), Ops.MUL),
+                _emit_where_stage(total, tail_scratch, _float_arg(-negative_scale), (below, 0), Ops.MUL),
+                _emit_where_stage(total, tail, _float_arg(-negative_scale), (below, 0), Ops.MUL),
                 _emit_where_stage(total, positive_source, source_arg, zero, Ops.MAX),
-                _emit_where_stage(total, positive_scaled, (positive_source, 0), scalar(positive_scale), Ops.MUL),
+                _emit_where_stage(total, positive_scaled, (positive_source, 0), _float_arg(positive_scale), Ops.MUL),
                 _emit_where_stage(total, positive_selected_scratch, (positive_scaled, 0), (positive, 0), Ops.MUL),
                 _emit_where_stage(total, positive_selected, (positive_scaled, 0), (positive, 0), Ops.MUL),
                 _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
@@ -4916,8 +4887,6 @@ def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot + 1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def temp_index(slot:int) -> UOp:
     out_idx = store.src[0]
     return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
@@ -4941,7 +4910,7 @@ def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   source_arg, zero = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0)
   scaled = alloc()
-  tasks.append(_emit_where_stage(total, scaled, source_arg, scalar(16.0), Ops.MUL))
+  tasks.append(_emit_where_stage(total, scaled, source_arg, _float_arg(16.0), Ops.MUL))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(scaled),), arg=("rk_celu_local", alpha))
   local_store = store.replace(src=(temp_index(local_slot), local_val))
@@ -4950,14 +4919,14 @@ def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(local_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
   local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.125), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.125), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(0.125), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(0.125), Ops.MUL)))
 
   below_diff, below, local_below_diff, local_below = (alloc() for _ in range(4))
   negative_diff, negative, positive_diff, positive = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, below_diff, scalar(-2.0), source_arg, Ops.SUB),
+  tasks.extend((_emit_where_stage(total, below_diff, _float_arg(-2.0), source_arg, Ops.SUB),
                 _emit_where_stage(total, below, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_below_diff, scalar(-0.125), source_arg, Ops.SUB),
+                _emit_where_stage(total, local_below_diff, _float_arg(-0.125), source_arg, Ops.SUB),
                 _emit_where_stage(total, local_below, (local_below_diff, 0), (local_below_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
                 _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
@@ -5015,9 +4984,6 @@ def _try_pow8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
-
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
     tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
@@ -5044,16 +5010,16 @@ def _try_pow8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, repeated, (fourth, 0), (fourth, 0), Ops.MUL)))
 
   negative, absolute = alloc(), alloc()
-  dependent(negative, (source_slot, 0), scalar(-1.0), Ops.MUL)
+  dependent(negative, (source_slot, 0), _float_arg(-1.0), Ops.MUL)
   dependent(absolute, (source_slot, 0), (negative, 0), Ops.MAX)
   abs_arg = (absolute, 0)
 
   # Exact power-of-two range reduction maps 0.25 < |x| < 4 to 1 <= u < 2.
-  above_half = positive_mask(abs_arg, scalar(0.5))
-  above_one = positive_mask(abs_arg, scalar(1.0))
-  above_two = positive_mask(abs_arg, scalar(2.0))
+  above_half = positive_mask(abs_arg, _float_arg(0.5))
+  above_one = positive_mask(abs_arg, _float_arg(1.0))
+  above_two = positive_mask(abs_arg, _float_arg(2.0))
   band0, band1, band2 = alloc(), alloc(), alloc()
-  one = scalar(1.0)
+  one = _float_arg(1.0)
   dependent(band0, one, above_half, Ops.SUB)
   dependent(band1, above_half, above_one, Ops.SUB)
   dependent(band2, above_one, above_two, Ops.SUB)
@@ -5061,7 +5027,7 @@ def _try_pow8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def weighted_bands(weights:tuple[float,float,float,float]) -> int:
     weighted = [alloc() for _ in range(4)]
     for slot, band, weight in zip(weighted, ((band0,0), (band1,0), (band2,0), above_two), weights):
-      dependent(slot, band, scalar(weight), Ops.MUL)
+      dependent(slot, band, _float_arg(weight), Ops.MUL)
     low, high, result = alloc(), alloc(), alloc()
     dependent(low, (weighted[0],0), (weighted[1],0), Ops.ADD)
     dependent(high, (weighted[2],0), (weighted[3],0), Ops.ADD)
@@ -5086,9 +5052,9 @@ def _try_pow8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(RKSubTask(cmds, task, relocs))
 
   high_scaled = alloc()
-  high_mask = positive_mask((normalized, 0), scalar(float(np.float16(math.sqrt(2.0)))))
+  high_mask = positive_mask((normalized, 0), _float_arg(float(np.float16(math.sqrt(2.0)))))
   low_mask = alloc()
-  dependent(high_scaled, (high_slot, 0), scalar(256.0), Ops.MUL)
+  dependent(high_scaled, (high_slot, 0), _float_arg(256.0), Ops.MUL)
   dependent(low_mask, one, high_mask, Ops.SUB)
   low_selected, high_selected, corrected, scaled = (alloc() for _ in range(4))
   dependent(low_selected, (base_slot, 0), (low_mask, 0), Ops.MUL)
@@ -5096,17 +5062,17 @@ def _try_pow8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(corrected, (low_selected, 0), (high_selected, 0), Ops.ADD)
   dependent(scaled, (corrected, 0), (factor, 0), Ops.MUL)
   negative_scaled, bounded_negative, bounded = alloc(), alloc(), alloc()
-  dependent(negative_scaled, (scaled, 0), scalar(-1.0), Ops.MUL)
-  dependent(bounded_negative, (negative_scaled, 0), scalar(-65504.0), Ops.MAX)
-  dependent(bounded, (bounded_negative, 0), scalar(-1.0), Ops.MUL)
+  dependent(negative_scaled, (scaled, 0), _float_arg(-1.0), Ops.MUL)
+  dependent(bounded_negative, (negative_scaled, 0), _float_arg(-65504.0), Ops.MAX)
+  dependent(bounded, (bounded_negative, 0), _float_arg(-1.0), Ops.MUL)
   if (debug_stage := getenv("ROCKCHIP_DEBUG_POW8_STAGE")):
     debug_slots = {1:normalized, 2:base_slot, 3:high_slot, 4:high_scaled, 5:corrected, 6:factor, 7:bounded}
     if debug_stage in debug_slots:
       dependent(out, (debug_slots[debug_stage], 0), (_ZERO_SLOT, 0), Ops.ADD)
       return tuple(tasks)
 
-  above_quarter = positive_mask(abs_arg, scalar(0.25))
-  below_four = positive_mask(scalar(4.0), abs_arg)
+  above_quarter = positive_mask(abs_arg, _float_arg(0.25))
+  below_four = positive_mask(_float_arg(4.0), abs_arg)
   valid, selected, inverse, fallback = alloc(), alloc(), alloc(), alloc()
   dependent(valid, above_quarter, below_four, Ops.MUL)
   dependent(selected, (bounded, 0), (valid, 0), Ops.MUL)
@@ -5147,9 +5113,6 @@ def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
-
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
     tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
@@ -5179,16 +5142,16 @@ def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   next_slot = max(next_slot, max(used_slots, default=-1)+1)
 
   base_slot = alloc() if reciprocals else source_slot
-  one = scalar(1.0)
+  one = _float_arg(1.0)
   if reciprocals: dependent(base_slot, one, (source_slot,0), Ops.FDIV)
   negative, absolute = alloc(), alloc()
-  dependent(negative, (base_slot,0), scalar(-1.0), Ops.MUL)
+  dependent(negative, (base_slot,0), _float_arg(-1.0), Ops.MUL)
   dependent(absolute, (base_slot,0), (negative,0), Ops.MAX)
   abs_arg = (absolute,0)
 
-  above_half = positive_mask(abs_arg, scalar(0.5))
-  above_one = positive_mask(abs_arg, scalar(1.0))
-  above_two = positive_mask(abs_arg, scalar(2.0))
+  above_half = positive_mask(abs_arg, _float_arg(0.5))
+  above_one = positive_mask(abs_arg, _float_arg(1.0))
+  above_two = positive_mask(abs_arg, _float_arg(2.0))
   band0, band1, band2 = alloc(), alloc(), alloc()
   dependent(band0, one, above_half, Ops.SUB)
   dependent(band1, above_half, above_one, Ops.SUB)
@@ -5197,7 +5160,7 @@ def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def weighted_bands(weights:tuple[float,float,float,float]) -> int:
     weighted = [alloc() for _ in range(4)]
     for slot, band, weight in zip(weighted, ((band0,0), (band1,0), (band2,0), above_two), weights):
-      dependent(slot, band, scalar(weight), Ops.MUL)
+      dependent(slot, band, _float_arg(weight), Ops.MUL)
     low, high, result = alloc(), alloc(), alloc()
     dependent(low, (weighted[0],0), (weighted[1],0), Ops.ADD)
     dependent(high, (weighted[2],0), (weighted[3],0), Ops.ADD)
@@ -5226,9 +5189,9 @@ def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   high_scaled = alloc()
   # Select high at the fp16 split itself: low Q11 is already at saturation.
   split = np.nextafter(np.float16(16.0**(1.0/5.5)), np.float16(0.0), dtype=np.float16)
-  high_mask = positive_mask((normalized,0), scalar(float(split)))
+  high_mask = positive_mask((normalized,0), _float_arg(float(split)))
   low_mask = alloc()
-  dependent(high_scaled, (high_slot,0), scalar(2.0**5.5), Ops.MUL)
+  dependent(high_scaled, (high_slot,0), _float_arg(2.0**5.5), Ops.MUL)
   dependent(low_mask, one, high_mask, Ops.SUB)
   low_selected, high_selected, normalized_power, scaled = (alloc() for _ in range(4))
   dependent(low_selected, (low_slot,0), (low_mask,0), Ops.MUL)
@@ -5236,17 +5199,17 @@ def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(normalized_power, (low_selected,0), (high_selected,0), Ops.ADD)
   dependent(scaled, (normalized_power,0), (factor,0), Ops.MUL)
   negative_scaled, bounded_negative, bounded = alloc(), alloc(), alloc()
-  dependent(negative_scaled, (scaled,0), scalar(-1.0), Ops.MUL)
-  dependent(bounded_negative, (negative_scaled,0), scalar(-65504.0), Ops.MAX)
-  dependent(bounded, (bounded_negative,0), scalar(-1.0), Ops.MUL)
+  dependent(negative_scaled, (scaled,0), _float_arg(-1.0), Ops.MUL)
+  dependent(bounded_negative, (negative_scaled,0), _float_arg(-65504.0), Ops.MAX)
+  dependent(bounded, (bounded_negative,0), _float_arg(-1.0), Ops.MUL)
   if (debug_stage := getenv("ROCKCHIP_DEBUG_POW55_STAGE")):
     debug_slots = {1:normalized, 2:low_slot, 3:high_slot, 4:high_scaled, 5:normalized_power, 6:factor, 7:bounded}
     if debug_stage in debug_slots:
       dependent(out, (debug_slots[debug_stage],0), (_ZERO_SLOT,0), Ops.ADD)
       return tuple(tasks)
 
-  above_quarter = positive_mask(abs_arg, scalar(0.25))
-  below_four = positive_mask(scalar(4.0), abs_arg)
+  above_quarter = positive_mask(abs_arg, _float_arg(0.25))
+  below_four = positive_mask(_float_arg(4.0), abs_arg)
   valid, selected, inverse, fallback, combined = (alloc() for _ in range(5))
   dependent(valid, above_quarter, below_four, Ops.MUL)
   dependent(selected, (bounded,0), (valid,0), Ops.MUL)
@@ -5255,7 +5218,7 @@ def _try_pow55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent(combined, (selected,0), (fallback,0), Ops.ADD)
 
   negative_mask = positive_mask((_ZERO_SLOT,0), (base_slot,0))
-  negative_inf = positive_mask(scalar(-65472.0), (base_slot,0))
+  negative_inf = positive_mask(_float_arg(-65472.0), (base_slot,0))
   invalid_negative, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
   dependent(invalid_negative, negative_mask, negative_inf, Ops.SUB)
   dependent(invalid_denom, one, (invalid_negative,0), Ops.SUB)
@@ -5295,9 +5258,6 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
-
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
     tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
@@ -5326,16 +5286,16 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
      if reloc.globals_slot not in (_CONST_SLOT, _ZERO_SLOT)]
   next_slot = max(next_slot, max(used_slots, default=-1)+1)
 
-  source_arg, one = (source_slot,0), scalar(1.0)
+  source_arg, one = (source_slot,0), _float_arg(1.0)
   negative, absolute = alloc(), alloc()
-  dependent(negative, source_arg, scalar(-1.0), Ops.MUL)
+  dependent(negative, source_arg, _float_arg(-1.0), Ops.MUL)
   dependent(absolute, source_arg, (negative,0), Ops.MAX)
   abs_arg = (absolute,0)
 
-  above_half = positive_mask(abs_arg, scalar(0.5))
-  above_one = positive_mask(abs_arg, scalar(1.0))
-  above_two = positive_mask(abs_arg, scalar(2.0))
-  above_four = positive_mask(abs_arg, scalar(4.0))
+  above_half = positive_mask(abs_arg, _float_arg(0.5))
+  above_one = positive_mask(abs_arg, _float_arg(1.0))
+  above_two = positive_mask(abs_arg, _float_arg(2.0))
+  above_four = positive_mask(abs_arg, _float_arg(4.0))
   band0, band1, band2, band3 = (alloc() for _ in range(4))
   dependent(band0, one, above_half, Ops.SUB)
   dependent(band1, above_half, above_one, Ops.SUB)
@@ -5345,7 +5305,7 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   def weighted_bands(weights:tuple[float,float,float,float,float]) -> int:
     weighted = [alloc() for _ in range(5)]
     for slot, band, weight in zip(weighted, ((band0,0), (band1,0), (band2,0), (band3,0), above_four), weights):
-      dependent(slot, band, scalar(weight), Ops.MUL)
+      dependent(slot, band, _float_arg(weight), Ops.MUL)
     low, middle, high, result = alloc(), alloc(), alloc(), alloc()
     dependent(low, (weighted[0],0), (weighted[1],0), Ops.ADD)
     dependent(middle, (weighted[2],0), (weighted[3],0), Ops.ADD)
@@ -5381,9 +5341,9 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   scaled = alloc()
   dependent(scaled, (normalized_power,0), (factor,0), Ops.MUL)
   negative_scaled, bounded_negative, bounded = alloc(), alloc(), alloc()
-  dependent(negative_scaled, (scaled,0), scalar(-1.0), Ops.MUL)
-  dependent(bounded_negative, (negative_scaled,0), scalar(-65504.0), Ops.MAX)
-  dependent(bounded, (bounded_negative,0), scalar(-1.0), Ops.MUL)
+  dependent(negative_scaled, (scaled,0), _float_arg(-1.0), Ops.MUL)
+  dependent(bounded_negative, (negative_scaled,0), _float_arg(-65504.0), Ops.MAX)
+  dependent(bounded, (bounded_negative,0), _float_arg(-1.0), Ops.MUL)
   if (debug_stage := getenv("ROCKCHIP_DEBUG_POW_NEG55_STAGE")):
     debug_slots = {1:normalized, 2:low_slot, 3:high_slot, 4:normalized_power, 5:factor, 6:bounded}
     if debug_stage in debug_slots:
@@ -5392,8 +5352,8 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   # The old direct-LUT boundary was 0.125.  Use the last fp16 input whose
   # correctly rounded x**-5.5 overflows instead, and synthesize infinity below.
-  above_finite = positive_mask(abs_arg, scalar(float(np.float16(0.133056640625))))
-  below_eight = positive_mask(scalar(8.0), abs_arg)
+  above_finite = positive_mask(abs_arg, _float_arg(float(np.float16(0.133056640625))))
+  below_eight = positive_mask(_float_arg(8.0), abs_arg)
   valid, selected, inverse = (alloc() for _ in range(3))
   dependent(valid, above_finite, below_eight, Ops.MUL)
   dependent(selected, (bounded,0), (valid,0), Ops.MUL)
@@ -5401,9 +5361,9 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # Clamp the generic fallback before masking so 0*inf cannot contaminate a
   # finite direct-LUT result.  Overflow is restored explicitly just below.
   fallback_negative, fallback_bounded_negative, fallback_bounded, fallback, combined = (alloc() for _ in range(5))
-  dependent(fallback_negative, (fallback_slot,0), scalar(-1.0), Ops.MUL)
-  dependent(fallback_bounded_negative, (fallback_negative,0), scalar(-65504.0), Ops.MAX)
-  dependent(fallback_bounded, (fallback_bounded_negative,0), scalar(-1.0), Ops.MUL)
+  dependent(fallback_negative, (fallback_slot,0), _float_arg(-1.0), Ops.MUL)
+  dependent(fallback_bounded_negative, (fallback_negative,0), _float_arg(-65504.0), Ops.MAX)
+  dependent(fallback_bounded, (fallback_bounded_negative,0), _float_arg(-1.0), Ops.MUL)
   dependent(fallback, (fallback_bounded,0), (inverse,0), Ops.MUL)
   dependent(combined, (selected,0), (fallback,0), Ops.ADD)
   overflow, overflow_numerator, overflow_combined = alloc(), alloc(), alloc()
@@ -5413,16 +5373,16 @@ def _try_pow_neg55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   # 0.1331787 is the first positive fp16 base with a finite result.  It lies
   # immediately after a saturated Q10 knot, so use its correctly rounded half
   # value rather than interpolating across the infinity/finite discontinuity.
-  above_first_finite = positive_mask(abs_arg, scalar(float(np.float16(0.1331787109375))))
+  above_first_finite = positive_mask(abs_arg, _float_arg(float(np.float16(0.1331787109375))))
   first_finite, ordinary_mask, ordinary, boundary, rounded = (alloc() for _ in range(5))
   dependent(first_finite, above_finite, above_first_finite, Ops.SUB)
   dependent(ordinary_mask, one, (first_finite,0), Ops.SUB)
   dependent(ordinary, (overflow_combined,0), (ordinary_mask,0), Ops.MUL)
-  dependent(boundary, (first_finite,0), scalar(65408.0), Ops.MUL)
+  dependent(boundary, (first_finite,0), _float_arg(65408.0), Ops.MUL)
   dependent(rounded, (ordinary,0), (boundary,0), Ops.ADD)
 
   negative_mask = positive_mask((_ZERO_SLOT,0), source_arg)
-  negative_extreme = positive_mask(scalar(-65472.0), source_arg)
+  negative_extreme = positive_mask(_float_arg(-65472.0), source_arg)
   invalid_negative, invalid_denom, invalid_factor = alloc(), alloc(), alloc()
   dependent(invalid_negative, negative_mask, negative_extreme, Ops.SUB)
   dependent(invalid_denom, one, (invalid_negative,0), Ops.SUB)
@@ -5454,9 +5414,6 @@ def _try_pow_base55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
 
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
@@ -5496,9 +5453,9 @@ def _try_pow_base55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(high_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
 
-  one, source_arg = scalar(1.0), (source_slot,0)
+  one, source_arg = _float_arg(1.0), (source_slot,0)
   high_scaled = alloc()
-  dependent(high_scaled, (high_slot,0), scalar(32.0), Ops.MUL)
+  dependent(high_scaled, (high_slot,0), _float_arg(32.0), Ops.MUL)
   positive = positive_mask(source_arg, (_ZERO_SLOT,0))
   nonpositive, low_selected, high_selected, corrected = (alloc() for _ in range(4))
   dependent(nonpositive, one, positive, Ops.SUB)
@@ -5513,8 +5470,8 @@ def _try_pow_base55_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   lower = float(np.nextafter(np.float16(-2.0), np.float16(-np.inf), dtype=np.float16))
   upper = float(np.nextafter(np.float16(2.0), np.float16(np.inf), dtype=np.float16))
-  above_lower = positive_mask(source_arg, scalar(lower))
-  below_upper = positive_mask(scalar(upper), source_arg)
+  above_lower = positive_mask(source_arg, _float_arg(lower))
+  below_upper = positive_mask(_float_arg(upper), source_arg)
   valid, selected, inverse, fallback = (alloc() for _ in range(4))
   dependent(valid, above_lower, below_upper, Ops.MUL)
   dependent(selected, (corrected,0), (valid,0), Ops.MUL)
@@ -5547,9 +5504,6 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
 
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
@@ -5588,8 +5542,8 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
     region_slots.append(slot)
 
-  one, source_arg = scalar(1.0), (source_slot,0)
-  above_negative_one = positive_mask(source_arg, scalar(-1.0))
+  one, source_arg = _float_arg(1.0), (source_slot,0)
+  above_negative_one = positive_mask(source_arg, _float_arg(-1.0))
   above_zero = positive_mask(source_arg, (_ZERO_SLOT,0))
   above_one = positive_mask(source_arg, one)
   masks = [alloc() for _ in range(4)]
@@ -5600,7 +5554,7 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   decoded = [alloc() for _ in range(4)]
   for slot, decoded_slot, factor in zip(region_slots, decoded, (0.125, 1.0, 8.0, 64.0)):
-    dependent(decoded_slot, (slot,0), scalar(factor), Ops.MUL)
+    dependent(decoded_slot, (slot,0), _float_arg(factor), Ops.MUL)
   chosen = [alloc() for _ in range(4)]
   for out_slot, decoded_slot, mask in zip(chosen, decoded, masks):
     dependent(out_slot, (decoded_slot,0), (mask,0), Ops.MUL)
@@ -5611,8 +5565,8 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   lower = float(np.nextafter(np.float16(-2.0), np.float16(-np.inf), dtype=np.float16))
   upper = float(np.nextafter(np.float16(2.0), np.float16(np.inf), dtype=np.float16))
-  above_lower = positive_mask(source_arg, scalar(lower))
-  below_upper = positive_mask(scalar(upper), source_arg)
+  above_lower = positive_mask(source_arg, _float_arg(lower))
+  below_upper = positive_mask(_float_arg(upper), source_arg)
   valid, selected, inverse, fallback = (alloc() for _ in range(4))
   dependent(valid, above_lower, below_upper, Ops.MUL)
   dependent(selected, (corrected,0), (valid,0), Ops.MUL)
@@ -5653,9 +5607,6 @@ def _try_pow_base07_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
-
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
     tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
@@ -5681,7 +5632,7 @@ def _try_pow_base07_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(RKSubTask(cmds, task, relocs))
 
   shifted, corrected = alloc(), alloc()
-  dependent(shifted, (source_slot,0), scalar(-0.5), Ops.ADD)
+  dependent(shifted, (source_slot,0), _float_arg(-0.5), Ops.ADD)
   custom = UOp(Ops.CUSTOM, dtypes.half, (temp_index(shifted),), arg="rk_pow_base07")
   corrected_plan = RKPlan("dpu_lut", stage_sink(custom, corrected), corrected, (shifted,), lut_op=_LUT_POW_BASE07)
   cmds, task, relocs = emit_rk(corrected_plan)
@@ -5689,12 +5640,12 @@ def _try_pow_base07_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   lower = float(np.nextafter(np.float16(-2.0), np.float16(-np.inf), dtype=np.float16))
   upper = float(np.nextafter(np.float16(3.0), np.float16(np.inf), dtype=np.float16))
-  above_lower = positive_mask((source_slot,0), scalar(lower))
-  below_upper = positive_mask(scalar(upper), (source_slot,0))
+  above_lower = positive_mask((source_slot,0), _float_arg(lower))
+  below_upper = positive_mask(_float_arg(upper), (source_slot,0))
   valid, selected, inverse, fallback = (alloc() for _ in range(4))
   dependent(valid, above_lower, below_upper, Ops.MUL)
   dependent(selected, (corrected,0), (valid,0), Ops.MUL)
-  dependent(inverse, scalar(1.0), (valid,0), Ops.SUB)
+  dependent(inverse, _float_arg(1.0), (valid,0), Ops.SUB)
   dependent(fallback, (fallback_slot,0), (inverse,0), Ops.MUL)
   dependent(out, (selected,0), (fallback,0), Ops.ADD)
   return tuple(tasks)
@@ -5716,9 +5667,6 @@ def _try_pow_base2_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
 
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
@@ -5745,7 +5693,7 @@ def _try_pow_base2_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.append(RKSubTask(cmds, task, relocs))
 
   shifted = alloc()
-  dependent(shifted, (source_slot,0), scalar(-0.5), Ops.ADD)
+  dependent(shifted, (source_slot,0), _float_arg(-0.5), Ops.ADD)
   region_slots:list[int] = []
   for name, marker in (("rk_pow_base2_low", _LUT_POW_BASE2_LOW), ("rk_pow_base2_high", _LUT_POW_BASE2_HIGH)):
     slot = alloc()
@@ -5755,9 +5703,9 @@ def _try_pow_base2_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, task, relocs))
     region_slots.append(slot)
 
-  one, source_arg = scalar(1.0), (source_slot,0)
+  one, source_arg = _float_arg(1.0), (source_slot,0)
   high_scaled = alloc()
-  dependent(high_scaled, (region_slots[1],0), scalar(8.0), Ops.MUL)
+  dependent(high_scaled, (region_slots[1],0), _float_arg(8.0), Ops.MUL)
   positive = positive_mask(source_arg, (_ZERO_SLOT,0))
   nonpositive, low_selected, high_selected, corrected = (alloc() for _ in range(4))
   dependent(nonpositive, one, positive, Ops.SUB)
@@ -5767,8 +5715,8 @@ def _try_pow_base2_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   lower = float(np.nextafter(np.float16(-2.0), np.float16(-np.inf), dtype=np.float16))
   upper = float(np.nextafter(np.float16(3.0), np.float16(np.inf), dtype=np.float16))
-  above_lower = positive_mask(source_arg, scalar(lower))
-  below_upper = positive_mask(scalar(upper), source_arg)
+  above_lower = positive_mask(source_arg, _float_arg(lower))
+  below_upper = positive_mask(_float_arg(upper), source_arg)
   valid, selected, inverse, fallback = (alloc() for _ in range(4))
   dependent(valid, above_lower, below_upper, Ops.MUL)
   dependent(selected, (corrected,0), (valid,0), Ops.MUL)
@@ -5808,9 +5756,6 @@ def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
 
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
@@ -5866,25 +5811,25 @@ def _try_pow_neg_base55_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   truncated = trunc_half(source_slot)
   if truncated is None: return None
   half = alloc()
-  dependent(half, (truncated,0), scalar(0.5), Ops.MUL)
+  dependent(half, (truncated,0), _float_arg(0.5), Ops.MUL)
   half_truncated = trunc_half(half)
   if half_truncated is None: return None
 
   doubled, remainder, negative_remainder, odd = (alloc() for _ in range(4))
-  dependent(doubled, (half_truncated,0), scalar(2.0), Ops.MUL)
+  dependent(doubled, (half_truncated,0), _float_arg(2.0), Ops.MUL)
   dependent(remainder, (truncated,0), (doubled,0), Ops.SUB)
   dependent(negative_remainder, (_ZERO_SLOT,0), (remainder,0), Ops.SUB)
   dependent(odd, (remainder,0), (negative_remainder,0), Ops.MAX)
   twice_odd, sign = alloc(), alloc()
-  dependent(twice_odd, (odd,0), scalar(2.0), Ops.MUL)
-  dependent(sign, scalar(1.0), (twice_odd,0), Ops.SUB)
+  dependent(twice_odd, (odd,0), _float_arg(2.0), Ops.MUL)
+  dependent(sign, _float_arg(1.0), (twice_odd,0), Ops.SUB)
 
   source_arg, truncated_arg = (source_slot,0), (truncated,0)
   positive_fraction = positive_mask(source_arg, truncated_arg)
   negative_fraction = positive_mask(truncated_arg, source_arg)
   noninteger, valid_denom, valid_factor, signed = (alloc() for _ in range(4))
   dependent(noninteger, positive_fraction, negative_fraction, Ops.ADD)
-  dependent(valid_denom, scalar(1.0), (noninteger,0), Ops.SUB)
+  dependent(valid_denom, _float_arg(1.0), (noninteger,0), Ops.SUB)
   dependent(valid_factor, (valid_denom,0), (valid_denom,0), Ops.FDIV)
   dependent(signed, (magnitude_slot,0), (sign,0), Ops.MUL)
   dependent(out, (signed,0), (valid_factor,0), Ops.MUL)
@@ -5918,9 +5863,6 @@ def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
-
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops) -> None:
     tasks.append(_emit_where_stage(total, alloc(), lhs, rhs, op))
     tasks.append(_emit_where_stage(total, out_slot, lhs, rhs, op))
@@ -5953,7 +5895,7 @@ def _try_zero_base_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     next_slot = max(next_slot, max(used_slots, default=-1)+1)
     return mask_slot, 0
 
-  source_arg, one = (source_slot,0), scalar(1.0)
+  source_arg, one = (source_slot,0), _float_arg(1.0)
   positive = positive_mask(source_arg, (_ZERO_SLOT,0))
   negative = positive_mask((_ZERO_SLOT,0), source_arg)
   not_number = comparison_mask(UOp(Ops.CMPNE, dtypes.bool, (source, source)))
@@ -6010,9 +5952,6 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     ret, next_slot = next_slot, next_slot+1
     return ret
 
-  def scalar(number:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', number))[0]
-
   def dependent(out_slot:int, lhs:tuple[int,int], rhs:tuple[int,int], op:Ops, **kwargs) -> None:
     # The first write is an fp16 visibility scratch. Typed output conversion
     # belongs only to the logical destination on the second write.
@@ -6027,8 +5966,8 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return mask, 0
 
   def exact_mask(arg:tuple[int,int], number:float) -> tuple[int,int]:
-    lower = positive_mask(arg, scalar(number))
-    upper = positive_mask(scalar(number), arg)
+    lower = positive_mask(arg, _float_arg(number))
+    upper = positive_mask(_float_arg(number), arg)
     different, equal = alloc(), alloc()
     tasks.extend((_emit_where_stage(total, different, lower, upper, Ops.MAX),
                   _emit_where_stage(total, equal, one, (different,0), Ops.SUB)))
@@ -6052,7 +5991,7 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     next_slot = max(next_slot, max(used_slots, default=-1)+1)
     return True
 
-  zero, one = (_ZERO_SLOT,0), scalar(1.0)
+  zero, one = (_ZERO_SLOT,0), _float_arg(1.0)
   base_half = alloc() if base.dtype is dtypes.float else base_slot
   exponent_half = alloc() if exponent.dtype is dtypes.float else exponent_slot
   if base.dtype is dtypes.float:
@@ -6106,7 +6045,7 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       tasks.append(_emit_where_stage(total, combined, group_mask, mask, Ops.MAX))
       group_mask = (combined,0)
     adjustment, next_log = alloc(), alloc()
-    tasks.append(_emit_where_stage(total, adjustment, group_mask, scalar(delta), Ops.MUL))
+    tasks.append(_emit_where_stage(total, adjustment, group_mask, _float_arg(delta), Ops.MUL))
     dependent(next_log, (corrected_log,0), (adjustment,0), Ops.ADD)
     corrected_log = next_log
 
@@ -6151,7 +6090,7 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
               fp32_output=store.src[0].src[0].dtype is dtypes.float)
     return tuple(tasks)
   residual_coordinate = alloc()
-  dependent(residual_coordinate, (residual,0), scalar(2.0), Ops.MUL)
+  dependent(residual_coordinate, (residual,0), _float_arg(2.0), Ops.MUL)
   residual_exp = alloc()
   residual_value = UOp(Ops.EXP2, dtypes.half, (temp_index(residual_coordinate),))
   residual_plan = RKPlan("dpu_lut", stage_sink(residual_value, residual_exp), residual_exp,
@@ -6170,15 +6109,15 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   negative_integer, absolute_integer = alloc(), alloc()
   dependent(negative_integer, zero, (scaled_integer,0), Ops.SUB)
   dependent(absolute_integer, (scaled_integer,0), (negative_integer,0), Ops.MAX)
-  scale_tail = positive_mask((absolute_integer,0), scalar(8.0))
+  scale_tail = positive_mask((absolute_integer,0), _float_arg(8.0))
   scale_head = alloc()
   dependent(scale_head, one, scale_tail, Ops.SUB)
   head_coordinate, head_selected = alloc(), alloc()
-  dependent(head_coordinate, (absolute_integer,0), scalar(0.25), Ops.MUL)
+  dependent(head_coordinate, (absolute_integer,0), _float_arg(0.25), Ops.MUL)
   dependent(head_selected, (head_coordinate,0), (scale_head,0), Ops.MUL)
   tail_delta, tail_coordinate, tail_selected = (alloc() for _ in range(3))
-  dependent(tail_delta, scalar(8.0), (absolute_integer,0), Ops.SUB)
-  dependent(tail_coordinate, (tail_delta,0), scalar(0.125), Ops.MUL)
+  dependent(tail_delta, _float_arg(8.0), (absolute_integer,0), Ops.SUB)
+  dependent(tail_coordinate, (tail_delta,0), _float_arg(0.125), Ops.MUL)
   dependent(tail_selected, (tail_coordinate,0), scale_tail, Ops.MUL)
   scale_input = alloc()
   dependent(scale_input, (head_selected,0), (tail_selected,0), Ops.ADD)
@@ -6190,7 +6129,7 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   cmds, task, relocs = emit_rk(scale_plan)
   tasks.append(RKSubTask(cmds, task, relocs))
   tail_adjustment, scale_divisor, negative_scale = (alloc() for _ in range(3))
-  dependent(tail_adjustment, scale_tail, scalar(255.0), Ops.MUL)
+  dependent(tail_adjustment, scale_tail, _float_arg(255.0), Ops.MUL)
   dependent(scale_divisor, one, (tail_adjustment,0), Ops.ADD)
   dependent(negative_scale, (encoded_scale,0), (scale_divisor,0), Ops.FDIV)
 
@@ -6239,7 +6178,7 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       group_mask = (combined,0)
     signed_group, factor_delta, selected_delta, corrected_magnitude = (alloc() for _ in range(4))
     tasks.extend((_emit_where_stage(total, signed_group, group_mask, exponent_mask, Ops.MUL),
-                  _emit_where_stage(total, factor_delta, (signed_group,0), scalar(factor-1.0), Ops.MUL),
+                  _emit_where_stage(total, factor_delta, (signed_group,0), _float_arg(factor-1.0), Ops.MUL),
                   _emit_where_stage(total, selected_delta, one, (factor_delta,0), Ops.ADD)))
     dependent(corrected_magnitude, (magnitude,0), (selected_delta,0), Ops.MUL)
     magnitude = corrected_magnitude
@@ -6247,16 +6186,16 @@ def _try_tensor_pow_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   truncated = trunc_half(exponent_half)
   if truncated is None: return None
   half = alloc()
-  dependent(half, (truncated,0), scalar(0.5), Ops.MUL)
+  dependent(half, (truncated,0), _float_arg(0.5), Ops.MUL)
   half_truncated = trunc_half(half)
   if half_truncated is None: return None
   doubled, remainder, negative_remainder, odd = (alloc() for _ in range(4))
-  dependent(doubled, (half_truncated,0), scalar(2.0), Ops.MUL)
+  dependent(doubled, (half_truncated,0), _float_arg(2.0), Ops.MUL)
   dependent(remainder, (truncated,0), (doubled,0), Ops.SUB)
   dependent(negative_remainder, zero, (remainder,0), Ops.SUB)
   dependent(odd, (remainder,0), (negative_remainder,0), Ops.MAX)
   twice_odd, parity_sign = alloc(), alloc()
-  dependent(twice_odd, (odd,0), scalar(2.0), Ops.MUL)
+  dependent(twice_odd, (odd,0), _float_arg(2.0), Ops.MUL)
   dependent(parity_sign, one, (twice_odd,0), Ops.SUB)
 
   exponent_above_trunc = positive_mask((exponent_half,0), (truncated,0))
@@ -7014,22 +6953,19 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   dependent, comparison_mask = stages.dependent, stages.comparison_mask
   one = (_CONST_SLOT, struct.unpack('<I', struct.pack('<f', 1.0))[0])
 
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
-
   source_arg = (source.src[0].buf_uop.arg.slot, 0)
   source_fp32 = (source_arg[0],) if source.dtype is dtypes.float else ()
   range_masks:list[tuple[int,int]] = []
   for threshold in (0.25, 0.0625, 0.015625, 0.00390625):
     diff, mask = alloc(), alloc()
-    tasks.extend((_emit_where_stage(total, diff, scalar(threshold), source_arg, Ops.SUB, fp32_inputs=source_fp32),
+    tasks.extend((_emit_where_stage(total, diff, _float_arg(threshold), source_arg, Ops.SUB, fp32_inputs=source_fp32),
                   _emit_where_stage(total, mask, (diff, 0), (diff, 0), Ops.MAX, compare=True)))
     range_masks.append((mask, 0))
 
   weighted:list[tuple[int,int]] = []
   for mask_arg, weight in zip(range_masks, (3.0, 12.0, 48.0, 192.0)):
     slot = alloc()
-    tasks.append(_emit_where_stage(total, slot, mask_arg, scalar(weight), Ops.MUL))
+    tasks.append(_emit_where_stage(total, slot, mask_arg, _float_arg(weight), Ops.MUL))
     weighted.append((slot, 0))
   factor_lo, factor_hi, factor_delta, factor, normalized = (alloc() for _ in range(5))
   tasks.extend((_emit_where_stage(total, factor_lo, weighted[0], weighted[1], Ops.ADD),
@@ -7042,12 +6978,12 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   tasks.extend((_emit_where_stage(total, count_lo, range_masks[0], range_masks[1], Ops.ADD),
                 _emit_where_stage(total, count_hi, range_masks[2], range_masks[3], Ops.ADD),
                 _emit_where_stage(total, count, (count_lo, 0), (count_hi, 0), Ops.ADD),
-                _emit_where_stage(total, offset, (count, 0), scalar(-2.0*output_scale), Ops.MUL)))
+                _emit_where_stage(total, offset, (count, 0), _float_arg(-2.0*output_scale), Ops.MUL)))
 
   bounded_low, negated, negated_bounded, bounded = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, bounded_low, (normalized, 0), scalar(0.25), Ops.MAX),
+  tasks.extend((_emit_where_stage(total, bounded_low, (normalized, 0), _float_arg(0.25), Ops.MAX),
                 _emit_where_stage(total, negated, (_ZERO_SLOT, 0), (bounded_low, 0), Ops.SUB),
-                _emit_where_stage(total, negated_bounded, (negated, 0), scalar(-4.0), Ops.MAX),
+                _emit_where_stage(total, negated_bounded, (negated, 0), _float_arg(-4.0), Ops.MAX),
                 _emit_where_stage(total, bounded, (_ZERO_SLOT, 0), (negated_bounded, 0), Ops.SUB)))
 
   lut_slot = alloc()
@@ -7058,19 +6994,19 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   centered, zoomed = alloc(), alloc()
   tasks.extend((_emit_where_stage(total, centered, (bounded, 0), one, Ops.SUB),
-                _emit_where_stage(total, zoomed, (centered, 0), scalar(12.5), Ops.MUL)))
+                _emit_where_stage(total, zoomed, (centered, 0), _float_arg(12.5), Ops.MUL)))
   local_slot = alloc()
   local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_log2_local", output_scale))
   if not stages.emit_lut(local_val, local_slot): return None
   local_scaled_scratch, local_scaled = alloc(), alloc()
-  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), scalar(0.25), Ops.MUL),
-                _emit_where_stage(total, local_scaled, (local_slot, 0), scalar(0.25), Ops.MUL)))
+  tasks.extend((_emit_where_stage(total, local_scaled_scratch, (local_slot, 0), _float_arg(0.25), Ops.MUL),
+                _emit_where_stage(total, local_scaled, (local_slot, 0), _float_arg(0.25), Ops.MUL)))
 
   local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
   local_outside_scratch, local_outside, local_inside_scratch, local_inside = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, local_low_diff, scalar(0.85), (bounded, 0), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, local_low_diff, _float_arg(0.85), (bounded, 0), Ops.SUB),
                 _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, local_high_diff, (bounded, 0), scalar(1.15), Ops.SUB),
+                _emit_where_stage(total, local_high_diff, (bounded, 0), _float_arg(1.15), Ops.SUB),
                 _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, local_outside_scratch, (local_low, 0), (local_high, 0), Ops.MAX),
                 _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
@@ -7080,9 +7016,9 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   near_outside_scratch, near_outside, near_inside_scratch, near_inside = (alloc() for _ in range(4))
   local_mask_scratch, local_mask = alloc(), alloc()
   square, half_square, adjusted, polynomial = (alloc() for _ in range(4))
-  tasks.extend((_emit_where_stage(total, near_low_diff, scalar(-0.02), (centered, 0), Ops.SUB),
+  tasks.extend((_emit_where_stage(total, near_low_diff, _float_arg(-0.02), (centered, 0), Ops.SUB),
                 _emit_where_stage(total, near_low, (near_low_diff, 0), (near_low_diff, 0), Ops.MAX, compare=True),
-                _emit_where_stage(total, near_high_diff, (centered, 0), scalar(0.02), Ops.SUB),
+                _emit_where_stage(total, near_high_diff, (centered, 0), _float_arg(0.02), Ops.SUB),
                 _emit_where_stage(total, near_high, (near_high_diff, 0), (near_high_diff, 0), Ops.MAX, compare=True),
                 _emit_where_stage(total, near_outside_scratch, (near_low, 0), (near_high, 0), Ops.MAX),
                 _emit_where_stage(total, near_outside, (near_low, 0), (near_high, 0), Ops.MAX),
@@ -7091,9 +7027,9 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
                 _emit_where_stage(total, local_mask_scratch, (local_inside, 0), (near_inside, 0), Ops.SUB),
                 _emit_where_stage(total, local_mask, (local_inside, 0), (near_inside, 0), Ops.SUB),
                 _emit_where_stage(total, square, (centered, 0), (centered, 0), Ops.MUL),
-                _emit_where_stage(total, half_square, (square, 0), scalar(0.5), Ops.MUL),
+                _emit_where_stage(total, half_square, (square, 0), _float_arg(0.5), Ops.MUL),
                 _emit_where_stage(total, adjusted, (centered, 0), (half_square, 0), Ops.SUB),
-                _emit_where_stage(total, polynomial, (adjusted, 0), scalar(output_scale*math.log2(math.e)), Ops.MUL)))
+                _emit_where_stage(total, polynomial, (adjusted, 0), _float_arg(output_scale*math.log2(math.e)), Ops.MUL)))
   broad_selected_scratch, broad_selected, local_selected_scratch, local_selected = (alloc() for _ in range(4))
   linear_selected_scratch, linear_selected, lut_sum_scratch, lut_sum, mantissa = (alloc() for _ in range(5))
   tasks.extend((_emit_where_stage(total, broad_selected_scratch, (lut_slot, 0), (local_outside, 0), Ops.MUL),
@@ -7116,15 +7052,15 @@ def _try_log2_special_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   refined = corrected
   if source.dtype is dtypes.half and math.isclose(output_scale, math.log(2.0), rel_tol=0.0, abs_tol=1e-3):
     low_centered, low_input = alloc(), alloc()
-    dependent(low_centered, (bounded, 0), scalar(0.375), Ops.SUB)
-    dependent(low_input, (low_centered, 0), scalar(16.0), Ops.MUL)
+    dependent(low_centered, (bounded, 0), _float_arg(0.375), Ops.SUB)
+    dependent(low_input, (low_centered, 0), _float_arg(16.0), Ops.MUL)
     low_lut = alloc()
     low_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(low_input),), arg="rk_log_half_low")
     if not stages.emit_lut(low_val, low_lut): return None
 
     high_centered, high_input = alloc(), alloc()
-    dependent(high_centered, (bounded, 0), scalar(0.75), Ops.SUB)
-    dependent(high_input, (high_centered, 0), scalar(8.0), Ops.MUL)
+    dependent(high_centered, (bounded, 0), _float_arg(0.75), Ops.SUB)
+    dependent(high_input, (high_centered, 0), _float_arg(8.0), Ops.MUL)
     high_lut = alloc()
     high_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(high_input),), arg="rk_log_half_high")
     if not stages.emit_lut(high_val, high_lut): return None
@@ -11546,7 +11482,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       out_idx = store.src[0]
       return out_idx.replace(dtype=dtypes.half,
         src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
-    def scalar(value:float) -> tuple[int,int]:
+    def _float_arg(value:float) -> tuple[int,int]:
       return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
 
     zero = (_ZERO_SLOT, 0)
@@ -12396,7 +12332,7 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       nonlocal next_slot
       ret, next_slot = next_slot, next_slot+1
       return ret
-    def scalar(value:float) -> tuple[int,int]:
+    def _float_arg(value:float) -> tuple[int,int]:
       return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
     def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, compare=False) -> int:
       out = alloc()
@@ -12413,7 +12349,7 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     negative_high = stage((_ZERO_SLOT, 0), (high, 0), Ops.SUB)
     high_negative = stage((negative_high, 0), (negative_high, 0), Ops.MAX, compare=True)
     high_nonzero = stage((high_positive, 0), (high_negative, 0), Ops.MAX)
-    high_zero = stage(scalar(1.0), (high_nonzero, 0), Ops.SUB)
+    high_zero = stage(_float_arg(1.0), (high_nonzero, 0), Ops.SUB)
     residual_positive = stage((residual, 0), (residual, 0), Ops.MAX, compare=True)
     residual_only = stage((residual_positive, 0), (high_zero, 0), Ops.MUL)
     positive = stage((high_positive, 0), (residual_only, 0), Ops.MAX)
@@ -12439,7 +12375,7 @@ def _try_relu_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     high_sum, residual_sum = cmac_sum(relu_high), cmac_sum(relu_residual)
     if high_sum is None or residual_sum is None: return None
     correction = alloc()
-    tasks.append(_emit_where_stage(output_total, correction, (residual_sum, 0), scalar(1/256), Ops.MUL))
+    tasks.append(_emit_where_stage(output_total, correction, (residual_sum, 0), _float_arg(1/256), Ops.MUL))
     tasks.append(_emit_where_stage(output_total, info.outs[0], (high_sum, 0), (correction, 0), Ops.ADD, fp32_output=True))
     return tuple(tasks)
 
@@ -12637,8 +12573,6 @@ def _try_long_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
               RKReloc(0, low_slot, 0, 0, 0xFFFFFFFF))
     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (1, _HOST_FP32_COMBINE_LAYOUT),
                                        out_slot, is_copy=True, fp32_output=True), relocs))
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def sum_half(input_slot:int, width:int, out_slot:int|None=None, out_offset=0, raw_fp32=False) -> int|None:
     red = UOp.range(width, 5100, AxisType.REDUCE)
     source_param = UOp.param(input_slot, dtypes.half, (width,), device=device)
@@ -12685,7 +12619,7 @@ def _try_long_fp32_sum_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   high_residual = view(high_raw, _HOST_FP32_RESIDUAL_LAYOUT, 1)
   low_half = view(low_raw, _HOST_FP32_HALF_LAYOUT, 1)
   low_residual = view(low_raw, _HOST_FP32_RESIDUAL_LAYOUT, 1)
-  low_value = stage((low_half, 0), (stage((low_residual, 0), scalar(1/256), Ops.MUL), 0), Ops.ADD)
+  low_value = stage((low_half, 0), (stage((low_residual, 0), _float_arg(1/256), Ops.MUL), 0), Ops.ADD)
   final_residual = stage((high_residual, 0), (low_value, 0), Ops.ADD)
   combine_raw(high_half, final_residual, info.outs[0])
   return tuple(tasks)
@@ -12835,8 +12769,6 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag, *layout), out, is_copy=True), relocs))
     return out
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def stage(a:tuple[int,int], b:tuple[int,int], op:Ops) -> tuple[int,int]:
     out = alloc()
     tasks.append(_emit_where_stage(total, out, a, b, op))
@@ -12846,7 +12778,7 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       original = np.float32(sign*float(source.arg))
       high = np.float16(original)
       value = high if tag == _HOST_FP32_HALF_LAYOUT else np.float16((original-np.float32(high))*256.0)
-      return scalar(float(value))
+      return _float_arg(float(value))
     assert layout is not None
     return view(source.src[0].arg.slot, tag, layout), 0
 
@@ -12855,7 +12787,7 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     high_limb = limb(source, sign, _HOST_FP32_HALF_LAYOUT, layout)
     low_limb = limb(source, sign, _HOST_FP32_RESIDUAL_LAYOUT, layout)
     if sign < 0 and source.op is not Ops.CONST:
-      high_limb, low_limb = stage(scalar(0.0), high_limb, Ops.SUB), stage(scalar(0.0), low_limb, Ops.SUB)
+      high_limb, low_limb = stage(_float_arg(0.0), high_limb, Ops.SUB), stage(_float_arg(0.0), low_limb, Ops.SUB)
     limbs_list.append((high_limb, low_limb))
   limbs = tuple(limbs_list)
   high, low = limbs[0]
@@ -12868,7 +12800,7 @@ def _try_fp32_add_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     error_b = stage(next_high, rounded_b, Ops.SUB)
     high_error = stage(error_a, error_b, Ops.ADD)
     input_low = stage(low, next_low, Ops.ADD)
-    scaled_high_error = stage(high_error, scalar(256.0), Ops.MUL)
+    scaled_high_error = stage(high_error, _float_arg(256.0), Ops.MUL)
     low = stage(input_low, scaled_high_error, Ops.ADD)
 
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
@@ -12927,8 +12859,6 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     relocs = (RKReloc(0, out, 0, 0, 0xFFFFFFFF), RKReloc(0, source_slot, 0, 0, 0xFFFFFFFF))
     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", (total, tag, *layout), out, is_copy=True), relocs))
     return out, 0
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def stage(a:tuple[int,int], b:tuple[int,int], op:Ops) -> tuple[int,int]:
     out = alloc()
     tasks.append(_emit_where_stage(total, out, a, b, op))
@@ -12938,7 +12868,7 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       original = np.float32(float(source.arg))
       high = np.float16(original)
       value = high if tag == _HOST_FP32_HALF_LAYOUT else np.float16((original-np.float32(high))*256.0)
-      return scalar(float(value))
+      return _float_arg(float(value))
     assert layout is not None
     return view(source.src[0].arg.slot, tag, layout)
 
@@ -12949,11 +12879,11 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
 
   # Dekker split with splitter 2**6+1. Product error and input cross terms are
   # accumulated as an x256 residual for the final split-fp32 ABI decode.
-  split_a = stage(a_high, scalar(65.0), Ops.MUL)
+  split_a = stage(a_high, _float_arg(65.0), Ops.MUL)
   big_a = stage(split_a, a_high, Ops.SUB)
   head_a = stage(split_a, big_a, Ops.SUB)
   tail_a = stage(a_high, head_a, Ops.SUB)
-  split_b = stage(b_high, scalar(65.0), Ops.MUL)
+  split_b = stage(b_high, _float_arg(65.0), Ops.MUL)
   big_b = stage(split_b, b_high, Ops.SUB)
   head_b = stage(split_b, big_b, Ops.SUB)
   tail_b = stage(b_high, head_b, Ops.SUB)
@@ -12963,10 +12893,10 @@ def _try_fp32_mul_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   error = stage(error, stage(head_a, tail_b, Ops.MUL), Ops.ADD)
   error = stage(error, stage(tail_a, head_b, Ops.MUL), Ops.ADD)
   error = stage(error, stage(tail_a, tail_b, Ops.MUL), Ops.ADD)
-  error = stage(error, scalar(256.0), Ops.MUL)
+  error = stage(error, _float_arg(256.0), Ops.MUL)
   error = stage(error, stage(a_high, b_low, Ops.MUL), Ops.ADD)
   error = stage(error, stage(a_low, b_high, Ops.MUL), Ops.ADD)
-  low_low = stage(stage(a_low, b_low, Ops.MUL), scalar(1.0/256.0), Ops.MUL)
+  low_low = stage(stage(a_low, b_low, Ops.MUL), _float_arg(1.0/256.0), Ops.MUL)
   residual = stage(error, low_low, Ops.ADD)
 
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
@@ -13572,8 +13502,6 @@ def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     nonlocal next_slot
     ret, next_slot = next_slot, next_slot+1
     return ret
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, **kwargs) -> int:
     out = alloc()
     tasks.append(_emit_where_stage(total, out, a, b, op, **kwargs))
@@ -13613,8 +13541,8 @@ def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     tasks.append(RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out, is_copy=True), relocs))
     return out
 
-  splitter = scalar(65.0)
-  limb_scale, inverse_limb_scale = scalar(256.0), scalar(1/256)
+  splitter = _float_arg(65.0)
+  limb_scale, inverse_limb_scale = _float_arg(256.0), _float_arg(1/256)
   offset = 1
   while offset < segment_width:
     operand, operand_low = shifted(hi, offset, 1.0), shifted(lo, offset, 0.0)
@@ -13622,10 +13550,10 @@ def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     p = stage((hi, 0), (operand, 0), Ops.MUL)
     negative_hi = stage((_ZERO_SLOT, 0), (hi, 0), Ops.SUB)
     magnitude_hi = stage((hi, 0), (negative_hi, 0), Ops.MAX)
-    large_diff = stage((magnitude_hi, 0), scalar(64.0), Ops.SUB)
+    large_diff = stage((magnitude_hi, 0), _float_arg(64.0), Ops.SUB)
     large = stage((large_diff, 0), (large_diff, 0), Ops.MAX, compare=True)
-    weighted_large = stage((large, 0), scalar(255/256), Ops.MUL)
-    normalization = stage(scalar(1.0), (weighted_large, 0), Ops.SUB)
+    weighted_large = stage((large, 0), _float_arg(255/256), Ops.MUL)
+    normalization = stage(_float_arg(1.0), (weighted_large, 0), Ops.SUB)
     normalized_hi = stage((hi, 0), (normalization, 0), Ops.MUL)
 
     c_hi = stage(splitter, (normalized_hi, 0), Ops.MUL)
@@ -13656,7 +13584,7 @@ def _try_long_cumprod_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     restoration_error = stage((restored_product, 0), (large_product, 0), Ops.SUB)
     restoration_error = stage((restoration_error, 0), limb_scale, Ops.MUL)
     large_err = stage((large_err, 0), (restoration_error, 0), Ops.ADD)
-    small = stage(scalar(1.0), (large, 0), Ops.SUB)
+    small = stage(_float_arg(1.0), (large, 0), Ops.SUB)
     small_err = stage((err, 0), (small, 0), Ops.MUL)
     err = stage((small_err, 0), (large_err, 0), Ops.ADD)
     low_product = stage((lo, 0), (operand, 0), Ops.MUL)
@@ -13823,8 +13751,6 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
       accumulator = out_slot
     return tuple(tasks)
 
-  def scalar(value:float) -> tuple[int,int]:
-    return _CONST_SLOT, struct.unpack('<I', struct.pack('<f', value))[0]
   def stage(a:tuple[int,int], b:tuple[int,int], op:Ops, **kwargs) -> int:
     nonlocal next_slot
     out_slot, next_slot = next_slot, next_slot+1
@@ -13832,8 +13758,8 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     return out_slot
 
   hi, lo = gathered_slots[0], gathered_low_slots[0]
-  splitter = scalar(65.0)  # 2**ceil(11/2)+1 for binary16's 11-bit significand.
-  limb_scale, inverse_limb_scale = scalar(256.0), scalar(1/256)
+  splitter = _float_arg(65.0)  # 2**ceil(11/2)+1 for binary16's 11-bit significand.
+  limb_scale, inverse_limb_scale = _float_arg(256.0), _float_arg(1/256)
   for operand, operand_low in zip(gathered_slots[1:], gathered_low_slots[1:]):
     p = stage((hi, 0), (operand, 0), Ops.MUL)
     # Dekker's 65*x split overflows once |x| approaches 1008. Normalize lanes
@@ -13841,10 +13767,10 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     # error below. The actual visible product `p` remains unscaled.
     negative_hi = stage((_ZERO_SLOT, 0), (hi, 0), Ops.SUB)
     magnitude_hi = stage((hi, 0), (negative_hi, 0), Ops.MAX)
-    large_diff = stage((magnitude_hi, 0), scalar(64.0), Ops.SUB)
+    large_diff = stage((magnitude_hi, 0), _float_arg(64.0), Ops.SUB)
     large = stage((large_diff, 0), (large_diff, 0), Ops.MAX, compare=True)
-    weighted_large = stage((large, 0), scalar(255/256), Ops.MUL)
-    normalization = stage(scalar(1.0), (weighted_large, 0), Ops.SUB)
+    weighted_large = stage((large, 0), _float_arg(255/256), Ops.MUL)
+    normalization = stage(_float_arg(1.0), (weighted_large, 0), Ops.SUB)
     normalized_hi = stage((hi, 0), (normalization, 0), Ops.MUL)
 
     # TwoProduct(hi, operand): p is the visible fp16 product and err recovers
@@ -13883,7 +13809,7 @@ def _try_local_product_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     restoration_error = stage((restored_product, 0), (large_product, 0), Ops.SUB)
     restoration_error = stage((restoration_error, 0), limb_scale, Ops.MUL)
     large_err = stage((large_err, 0), (restoration_error, 0), Ops.ADD)
-    small = stage(scalar(1.0), (large, 0), Ops.SUB)
+    small = stage(_float_arg(1.0), (large, 0), Ops.SUB)
     small_err = stage((err, 0), (small, 0), Ops.MUL)
     err = stage((small_err, 0), (large_err, 0), Ops.ADD)
 
