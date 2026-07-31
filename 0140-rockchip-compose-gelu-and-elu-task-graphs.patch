@@ -1,0 +1,314 @@
+From 1e4c750257fd6da8dc3b77e6a9bf43ea1979ffa4 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 01:58:38 +0800
+Subject: [PATCH] rockchip: compose gelu and elu task graphs
+
+---
+ tinygrad/runtime/support/rockchip.py | 275 +++++++++------------------
+ 1 file changed, 88 insertions(+), 187 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index bc312a3a4..562acdf64 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -4620,202 +4620,88 @@ def _try_gelu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   store = _store_node(sink)
+   if store is None or (match := _try_gelu(store.src[1])) is None: return None
+   source, approximate_tanh = match
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1) + 1
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot + 1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    out_idx = store.src[0]
+-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
+-  def clamp_symmetric(limit:float) -> tuple[int,list[RKSubTask]]:
+-    low, neg, neg_clamped, bounded = (alloc() for _ in range(4))
+-    return bounded, [_emit_where_stage(total, low, source_arg, _float_arg(-limit), Ops.MAX),
+-                     _emit_where_stage(total, neg, zero, (low, 0), Ops.SUB),
+-                     _emit_where_stage(total, neg_clamped, (neg, 0), _float_arg(-limit), Ops.MAX),
+-                     _emit_where_stage(total, bounded, zero, (neg_clamped, 0), Ops.SUB)]
+-
++  graph = _TaskGraph(sink, store, source)
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
+-  broad_input, tasks = clamp_symmetric(4.0)
+-  broad = alloc()
+-  broad_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(broad_input),), arg=("rk_gelu", approximate_tanh))
+-  broad_store = store.replace(src=(temp_index(broad), broad_val))
+-  broad_plan = plan_rk(sink.substitute({store:broad_store}))
+-  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(broad_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  local_input, local_stages = clamp_symmetric(0.5)
+-  tasks.extend(local_stages)
+-  zoomed = alloc()
+-  tasks.append(_emit_where_stage(total, zoomed, (local_input, 0), _float_arg(8.0), Ops.MUL))
+-  local = alloc()
+-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_gelu_local", approximate_tanh))
+-  local_store = store.replace(src=(temp_index(local), local_val))
+-  local_plan = plan_rk(sink.substitute({store:local_store}))
+-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(local_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  range_low_diff, range_low, range_high_diff, range_high = (alloc() for _ in range(4))
+-  range_outside, range_inside = alloc(), alloc()
+-  local_low_diff, local_low, local_high_diff, local_high = (alloc() for _ in range(4))
+-  local_outside, local_inside, poly_low_diff, poly_low = (alloc() for _ in range(4))
+-  poly_high_diff, poly_high, poly_outside, poly_inside = (alloc() for _ in range(4))
+-  local_mask, broad_mask = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, range_low_diff, _float_arg(-4.0), source_arg, Ops.SUB),
+-                _emit_where_stage(total, range_low, (range_low_diff, 0), (range_low_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, range_high_diff, source_arg, _float_arg(4.0), Ops.SUB),
+-                _emit_where_stage(total, range_high, (range_high_diff, 0), (range_high_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, range_outside, (range_low, 0), (range_high, 0), Ops.MAX),
+-                _emit_where_stage(total, range_inside, one, (range_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_low_diff, _float_arg(-0.5), source_arg, Ops.SUB),
+-                _emit_where_stage(total, local_low, (local_low_diff, 0), (local_low_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_high_diff, source_arg, _float_arg(0.5), Ops.SUB),
+-                _emit_where_stage(total, local_high, (local_high_diff, 0), (local_high_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_outside, (local_low, 0), (local_high, 0), Ops.MAX),
+-                _emit_where_stage(total, local_inside, one, (local_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, poly_low_diff, _float_arg(-0.04), source_arg, Ops.SUB),
+-                _emit_where_stage(total, poly_low, (poly_low_diff, 0), (poly_low_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, poly_high_diff, source_arg, _float_arg(0.04), Ops.SUB),
+-                _emit_where_stage(total, poly_high, (poly_high_diff, 0), (poly_high_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, poly_outside, (poly_low, 0), (poly_high, 0), Ops.MAX),
+-                _emit_where_stage(total, poly_inside, one, (poly_outside, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask, (local_inside, 0), (poly_inside, 0), Ops.SUB),
+-                _emit_where_stage(total, broad_mask, (range_inside, 0), (local_inside, 0), Ops.SUB)))
+-
+-  poly_input, poly_stages = clamp_symmetric(0.04)
+-  tasks.extend(poly_stages)
+-  linear, square, quadratic, polynomial = (alloc() for _ in range(4))
+-  positive_diff, positive, positive_extra, broad_scale, broad_scaled = (alloc() for _ in range(5))
+-  broad_selected, local_scaled, local_selected, poly_selected = (alloc() for _ in range(4))
+-  lut_sum, interior, fallback, fallback_selected = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, linear, (poly_input, 0), _float_arg(0.5), Ops.MUL),
+-                _emit_where_stage(total, square, (poly_input, 0), (poly_input, 0), Ops.MUL),
+-                _emit_where_stage(total, quadratic, (square, 0), _float_arg(1/math.sqrt(2*math.pi)), Ops.MUL),
+-                _emit_where_stage(total, polynomial, (linear, 0), (quadratic, 0), Ops.ADD),
+-                _emit_where_stage(total, positive_diff, source_arg, zero, Ops.SUB),
+-                _emit_where_stage(total, positive, (positive_diff, 0), (positive_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, positive_extra, (positive, 0), _float_arg(3.0), Ops.MUL),
+-                _emit_where_stage(total, broad_scale, one, (positive_extra, 0), Ops.ADD),
+-                _emit_where_stage(total, broad_scaled, (broad, 0), (broad_scale, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (broad_scaled, 0), (broad_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, local_scaled, (local, 0), _float_arg(0.5), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_scaled, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, poly_selected, (polynomial, 0), (poly_inside, 0), Ops.MUL),
+-                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, interior, (lut_sum, 0), (poly_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, fallback, source_arg, zero, Ops.MAX),
+-                _emit_where_stage(total, fallback_selected, (fallback, 0), (range_outside, 0), Ops.MUL),
+-                _emit_where_stage(total, info.outs[0], (interior, 0), (fallback_selected, 0), Ops.ADD)))
+-  return tuple(tasks)
++  broad_input = graph.clamp_symmetric(source_arg, 4.0)
++  broad = graph.alloc()
++  if not graph.emit_named_lut(("rk_gelu", approximate_tanh), broad_input[0], broad): return None
++  local_input = graph.clamp_symmetric(source_arg, 0.5)
++  zoomed = graph.op(local_input, _float_arg(8.0), Ops.MUL, repeat=False)
++  local = graph.alloc()
++  if not graph.emit_named_lut(("rk_gelu_local", approximate_tanh), zoomed[0], local): return None
++
++  range_outside, range_inside = graph.interval_mask(source_arg, -4.0, 4.0, repeat=False)
++  _, local_inside = graph.interval_mask(source_arg, -0.5, 0.5, repeat=False)
++  _, poly_inside = graph.interval_mask(source_arg, -0.04, 0.04, repeat=False)
++  local_mask = graph.op(local_inside, poly_inside, Ops.SUB, repeat=False)
++  broad_mask = graph.op(range_inside, local_inside, Ops.SUB, repeat=False)
++
++  poly_input = graph.clamp_symmetric(source_arg, 0.04)
++  linear = graph.op(poly_input, _float_arg(0.5), Ops.MUL, repeat=False)
++  square = graph.op(poly_input, poly_input, Ops.MUL, repeat=False)
++  quadratic = graph.op(square, _float_arg(1/math.sqrt(2*math.pi)), Ops.MUL, repeat=False)
++  polynomial = graph.op(linear, quadratic, Ops.ADD, repeat=False)
++  positive = graph.positive_mask(source_arg, zero)
++  positive_extra = graph.op(positive, _float_arg(3.0), Ops.MUL, repeat=False)
++  broad_scale = graph.op(one, positive_extra, Ops.ADD, repeat=False)
++  broad_scaled = graph.op((broad,0), broad_scale, Ops.MUL, repeat=False)
++  broad_selected = graph.op(broad_scaled, broad_mask, Ops.MUL, repeat=False)
++  local_scaled = graph.op((local,0), _float_arg(0.5), Ops.MUL, repeat=False)
++  local_selected = graph.op(local_scaled, local_mask, Ops.MUL, repeat=False)
++  poly_selected = graph.op(polynomial, poly_inside, Ops.MUL, repeat=False)
++  interior = graph.op(graph.op(broad_selected, local_selected, Ops.ADD, repeat=False), poly_selected, Ops.ADD, repeat=False)
++  fallback = graph.op(source_arg, zero, Ops.MAX, repeat=False)
++  fallback_selected = graph.op(fallback, range_outside, Ops.MUL, repeat=False)
++  graph.op(interior, fallback_selected, Ops.ADD, out_slot=graph.out, repeat=False)
++  return tuple(graph.tasks)
+ 
+ def _try_elu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Evaluate ELU/SELU with broad/local negative LUTs and exact asymptotes."""
+   store = _store_node(sink)
+   if store is None or (match := _try_elu(store.src[1])) is None: return None
+   source, negative_scale, positive_scale = match
+-  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  next_slot = max(info.globals, default=-1) + 1
+-  def alloc() -> int:
+-    nonlocal next_slot
+-    ret, next_slot = next_slot, next_slot + 1
+-    return ret
+-  def temp_index(slot:int) -> UOp:
+-    out_idx = store.src[0]
+-    return out_idx.replace(dtype=dtypes.half, src=(out_idx.src[0].param_like(slot).replace(dtype=dtypes.half), *out_idx.src[1:]))
+-
++  graph = _TaskGraph(sink, store, source)
+   source_arg, zero, one = (source.src[0].buf_uop.arg.slot, 0), (_ZERO_SLOT, 0), _float_arg(1.0)
+-  broad_low, broad_neg, broad_input = alloc(), alloc(), alloc()
+-  tasks = [_emit_where_stage(total, broad_low, source_arg, _float_arg(-8.0), Ops.MAX),
+-           _emit_where_stage(total, broad_neg, zero, (broad_low, 0), Ops.SUB),
+-           _emit_where_stage(total, broad_input, zero, (broad_neg, 0), Ops.SUB)]
+-  broad_slot = alloc()
+-  broad_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(broad_input),), arg=("rk_elu", negative_scale))
+-  broad_store = store.replace(src=(temp_index(broad_slot), broad_val))
+-  broad_plan = plan_rk(sink.substitute({store:broad_store}))
+-  if isinstance(broad_plan, str) or broad_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(broad_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  local_low, local_neg, local_input, zoomed = (alloc() for _ in range(4))
+-  tasks.extend((_emit_where_stage(total, local_low, source_arg, _float_arg(-0.5), Ops.MAX),
+-                _emit_where_stage(total, local_neg, zero, (local_low, 0), Ops.SUB),
+-                _emit_where_stage(total, local_input, zero, (local_neg, 0), Ops.SUB),
+-                _emit_where_stage(total, zoomed, (local_input, 0), _float_arg(4.0), Ops.MUL)))
+-  local_slot = alloc()
+-  local_val = UOp(Ops.CUSTOM, dtypes.half, (temp_index(zoomed),), arg=("rk_elu_local", negative_scale))
+-  local_store = store.replace(src=(temp_index(local_slot), local_val))
+-  local_plan = plan_rk(sink.substitute({store:local_store}))
+-  if isinstance(local_plan, str) or local_plan.kind != "dpu_lut": return None
+-  cmds, task, relocs = emit_rk(local_plan)
+-  tasks.append(RKSubTask(cmds, task, relocs))
+-
+-  below_diff, below, local_below_diff, local_below = (alloc() for _ in range(4))
+-  poly_below_diff, poly_below, negative_diff, negative = (alloc() for _ in range(4))
+-  broad_mask_scratch, broad_mask, local_mask_scratch, local_mask = (alloc() for _ in range(4))
+-  poly_mask_scratch, poly_mask = alloc(), alloc()
+-  positive_scratch, positive = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, below_diff, _float_arg(-8.0), source_arg, Ops.SUB),
+-                _emit_where_stage(total, below, (below_diff, 0), (below_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, local_below_diff, _float_arg(-0.5), source_arg, Ops.SUB),
+-                _emit_where_stage(total, local_below, (local_below_diff, 0), (local_below_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, poly_below_diff, _float_arg(-0.03), source_arg, Ops.SUB),
+-                _emit_where_stage(total, poly_below, (poly_below_diff, 0), (poly_below_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, negative_diff, zero, source_arg, Ops.SUB),
+-                _emit_where_stage(total, negative, (negative_diff, 0), (negative_diff, 0), Ops.MAX, compare=True),
+-                _emit_where_stage(total, broad_mask_scratch, (local_below, 0), (below, 0), Ops.SUB),
+-                _emit_where_stage(total, broad_mask, (local_below, 0), (below, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask_scratch, (poly_below, 0), (local_below, 0), Ops.SUB),
+-                _emit_where_stage(total, local_mask, (poly_below, 0), (local_below, 0), Ops.SUB),
+-                _emit_where_stage(total, poly_mask_scratch, (negative, 0), (poly_below, 0), Ops.SUB),
+-                _emit_where_stage(total, poly_mask, (negative, 0), (poly_below, 0), Ops.SUB),
+-                _emit_where_stage(total, positive_scratch, one, (negative, 0), Ops.SUB),
+-                _emit_where_stage(total, positive, one, (negative, 0), Ops.SUB)))
++  broad_low = graph.op(source_arg, _float_arg(-8.0), Ops.MAX, repeat=False)
++  broad_input = graph.op(zero, graph.op(zero, broad_low, Ops.SUB, repeat=False), Ops.SUB, repeat=False)
++  broad_slot = graph.alloc()
++  if not graph.emit_named_lut(("rk_elu", negative_scale), broad_input[0], broad_slot): return None
++  local_low = graph.op(source_arg, _float_arg(-0.5), Ops.MAX, repeat=False)
++  local_input = graph.op(zero, graph.op(zero, local_low, Ops.SUB, repeat=False), Ops.SUB, repeat=False)
++  zoomed = graph.op(local_input, _float_arg(4.0), Ops.MUL, repeat=False)
++  local_slot = graph.alloc()
++  if not graph.emit_named_lut(("rk_elu_local", negative_scale), zoomed[0], local_slot): return None
++
++  below = graph.positive_mask(_float_arg(-8.0), source_arg)
++  local_below = graph.positive_mask(_float_arg(-0.5), source_arg)
++  poly_below = graph.positive_mask(_float_arg(-0.03), source_arg)
++  negative = graph.positive_mask(zero, source_arg)
++  broad_mask = graph.op(local_below, below, Ops.SUB)
++  local_mask = graph.op(poly_below, local_below, Ops.SUB)
++  poly_mask = graph.op(negative, poly_below, Ops.SUB)
++  positive = graph.op(one, negative, Ops.SUB)
+ 
+   broad_gain = 8.0 if negative_scale <= 0.125 else (1.0 if negative_scale <= 1.0 else 0.5)
+   local_gain = 16.0 if negative_scale <= 0.125 else (2.0 if negative_scale <= 1.0 else 1.0)
+-  poly_low, poly_neg, poly_input = alloc(), alloc(), alloc()
+-  linear, square, quadratic, polynomial = (alloc() for _ in range(4))
+-  polynomial_selected_scratch, polynomial_selected = alloc(), alloc()
+-  broad_restored_scratch, broad_restored, broad_selected_scratch, broad_selected = (alloc() for _ in range(4))
+-  local_restored_scratch, local_restored, local_selected_scratch, local_selected = (alloc() for _ in range(4))
+-  tail_scratch, tail, positive_source, positive_scaled = (alloc() for _ in range(4))
+-  positive_selected_scratch, positive_selected = alloc(), alloc()
+-  lut_sum_scratch, lut_sum, negative_sum_scratch, negative_sum = (alloc() for _ in range(4))
+-  all_negative_scratch, all_negative = alloc(), alloc()
+-  tasks.extend((_emit_where_stage(total, poly_low, source_arg, _float_arg(-0.03), Ops.MAX),
+-                _emit_where_stage(total, poly_neg, zero, (poly_low, 0), Ops.SUB),
+-                _emit_where_stage(total, poly_input, zero, (poly_neg, 0), Ops.SUB),
+-                _emit_where_stage(total, linear, (poly_input, 0), _float_arg(negative_scale), Ops.MUL),
+-                _emit_where_stage(total, square, (poly_input, 0), (poly_input, 0), Ops.MUL),
+-                _emit_where_stage(total, quadratic, (square, 0), _float_arg(negative_scale/2), Ops.MUL),
+-                _emit_where_stage(total, polynomial, (linear, 0), (quadratic, 0), Ops.ADD),
+-                _emit_where_stage(total, polynomial_selected_scratch, (polynomial, 0), (poly_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, polynomial_selected, (polynomial, 0), (poly_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_restored_scratch, (broad_slot, 0), _float_arg(1/broad_gain), Ops.MUL),
+-                _emit_where_stage(total, broad_restored, (broad_slot, 0), _float_arg(1/broad_gain), Ops.MUL),
+-                _emit_where_stage(total, broad_selected_scratch, (broad_restored, 0), (broad_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, broad_selected, (broad_restored, 0), (broad_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, local_restored_scratch, (local_slot, 0), _float_arg(1/local_gain), Ops.MUL),
+-                _emit_where_stage(total, local_restored, (local_slot, 0), _float_arg(1/local_gain), Ops.MUL),
+-                _emit_where_stage(total, local_selected_scratch, (local_restored, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, local_selected, (local_restored, 0), (local_mask, 0), Ops.MUL),
+-                _emit_where_stage(total, tail_scratch, _float_arg(-negative_scale), (below, 0), Ops.MUL),
+-                _emit_where_stage(total, tail, _float_arg(-negative_scale), (below, 0), Ops.MUL),
+-                _emit_where_stage(total, positive_source, source_arg, zero, Ops.MAX),
+-                _emit_where_stage(total, positive_scaled, (positive_source, 0), _float_arg(positive_scale), Ops.MUL),
+-                _emit_where_stage(total, positive_selected_scratch, (positive_scaled, 0), (positive, 0), Ops.MUL),
+-                _emit_where_stage(total, positive_selected, (positive_scaled, 0), (positive, 0), Ops.MUL),
+-                _emit_where_stage(total, lut_sum_scratch, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, lut_sum, (broad_selected, 0), (local_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, negative_sum_scratch, (lut_sum, 0), (polynomial_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, negative_sum, (lut_sum, 0), (polynomial_selected, 0), Ops.ADD),
+-                _emit_where_stage(total, all_negative_scratch, (negative_sum, 0), (tail, 0), Ops.ADD),
+-                _emit_where_stage(total, all_negative, (negative_sum, 0), (tail, 0), Ops.ADD),
+-                _emit_where_stage(total, info.outs[0], (all_negative, 0), (positive_selected, 0), Ops.ADD)))
+-  return tuple(tasks)
++  poly_low = graph.op(source_arg, _float_arg(-0.03), Ops.MAX, repeat=False)
++  poly_input = graph.op(zero, graph.op(zero, poly_low, Ops.SUB, repeat=False), Ops.SUB, repeat=False)
++  linear = graph.op(poly_input, _float_arg(negative_scale), Ops.MUL, repeat=False)
++  square = graph.op(poly_input, poly_input, Ops.MUL, repeat=False)
++  quadratic = graph.op(square, _float_arg(negative_scale/2), Ops.MUL, repeat=False)
++  polynomial = graph.op(linear, quadratic, Ops.ADD, repeat=False)
++  polynomial_selected = graph.op(polynomial, poly_mask, Ops.MUL)
++  broad_restored = graph.op((broad_slot,0), _float_arg(1/broad_gain), Ops.MUL)
++  broad_selected = graph.op(broad_restored, broad_mask, Ops.MUL)
++  local_restored = graph.op((local_slot,0), _float_arg(1/local_gain), Ops.MUL)
++  local_selected = graph.op(local_restored, local_mask, Ops.MUL)
++  tail = graph.op(_float_arg(-negative_scale), below, Ops.MUL)
++  positive_source = graph.op(source_arg, zero, Ops.MAX, repeat=False)
++  positive_scaled = graph.op(positive_source, _float_arg(positive_scale), Ops.MUL, repeat=False)
++  positive_selected = graph.op(positive_scaled, positive, Ops.MUL)
++  negative_sum = graph.op(graph.op(broad_selected, local_selected, Ops.ADD), polynomial_selected, Ops.ADD)
++  all_negative = graph.op(negative_sum, tail, Ops.ADD)
++  graph.op(all_negative, positive_selected, Ops.ADD, out_slot=graph.out, repeat=False)
++  return tuple(graph.tasks)
+ 
+ def _try_celu_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   """Use a Q15 LUT on CELU's tested negative interval and preserve wide tails."""
+@@ -6115,9 +6001,24 @@ class _TaskGraph:
+     self.tasks.append(_emit_where_stage(self.total, out_slot, lhs, rhs, op, **kwargs))
+     return out_slot, 0
+ 
+-  def positive_mask(self, lhs:tuple[int,int], rhs:tuple[int,int]) -> tuple[int,int]:
++  def positive_mask(self, lhs:tuple[int,int], rhs:tuple[int,int], repeat:bool=False) -> tuple[int,int]:
+     diff = self.op(lhs, rhs, Ops.SUB, repeat=False)
+-    return self.op(diff, diff, Ops.MAX, repeat=False, compare=True)
++    return self.op(diff, diff, Ops.MAX, repeat=repeat, compare=True)
++
++  def interval_mask(self, arg:tuple[int,int], low:float, high:float, repeat:bool=True,
++                    repeat_compare:bool=False) -> tuple[tuple[int,int],tuple[int,int]]:
++    """Return outside/inside masks for a closed interval."""
++    below = self.positive_mask(_float_arg(low), arg, repeat_compare)
++    above = self.positive_mask(arg, _float_arg(high), repeat_compare)
++    outside = self.op(below, above, Ops.MAX, repeat=repeat)
++    return outside, self.op(_float_arg(1.0), outside, Ops.SUB, repeat=repeat)
++
++  def clamp_symmetric(self, arg:tuple[int,int], limit:float) -> tuple[int,int]:
++    """Clamp an fp16 graph value to [-limit, limit] without MIN."""
++    low = self.op(arg, _float_arg(-limit), Ops.MAX, repeat=False)
++    negated = self.op((_ZERO_SLOT,0), low, Ops.SUB, repeat=False)
++    negated_clamped = self.op(negated, _float_arg(-limit), Ops.MAX, repeat=False)
++    return self.op((_ZERO_SLOT,0), negated_clamped, Ops.SUB, repeat=False)
+ 
+   def sum(self, values:list[tuple[int,int]]) -> tuple[int,int]:
+     while len(values) > 1:

@@ -12270,3 +12270,18 @@ one named-LUT emitter. Their numerical stage lists are unchanged. This removes
 PR1 passes **173/173 in 13.00s** and the six affected forward-only RK3588
 methods pass **6/6 in 53.87s**. Mypy/Ruff remain at 12/8 and compilation plus
 `git diff --check` pass.
+
+### Declarative GELU/ELU graphs
+
+Commit `1e4c75025`; patch
+`0140-rockchip-compose-gelu-and-elu-task-graphs.patch`.
+
+Reusable closed-interval masks and symmetric clamps now express GELU's three
+LUT/polynomial regions and ELU/SELU's tail/local/polynomial/positive regions.
+Single-consumption stages and reset-visibility-dependent stages remain
+explicit through the graph API. This removes **99 counted lines**, reaching
+**12,157** in `support/rockchip.py`.
+
+PR1 passes **173/173 in 13.37s**. GELU, GELU-extreme, ELU, and SELU pass **4/4
+in 27.47s** on RK3588. Mypy/Ruff remain at 12/8; compilation and diff checking
+pass.

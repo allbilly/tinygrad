@@ -3361,3 +3361,13 @@ ATAN, ATANH, ASINH, ACOSH, SINH, and COSH share graph allocation and named-LUT
 emission. PR1 passes **173/173** and all six affected hardware methods pass
 **6/6 in 53.87s**. Support size is **12,256 counted lines**; static baselines
 remain unchanged.
+
+### GELU and ELU task graphs
+
+Commit `1e4c75025`; saved patch
+`0140-rockchip-compose-gelu-and-elu-task-graphs.patch`.
+
+GELU and ELU/SELU now compose shared interval-mask and symmetric-clamp graph
+primitives. Support size reaches **12,157 counted lines**. PR1 is **173/173**;
+GELU, GELU-extreme, ELU, and SELU pass **4/4 in 27.47s** on hardware, with
+static baselines unchanged.
