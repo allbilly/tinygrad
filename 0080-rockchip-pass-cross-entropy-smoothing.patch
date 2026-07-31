@@ -1,0 +1,233 @@
+From c8c773b4e782967087f49ae6a63a63e14365859d Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 11:34:48 +0800
+Subject: [PATCH] rockchip: pass cross entropy smoothing
+
+---
+ progress.md                          | 28 ++++++++++++
+ test/rockchip/test_pr1.py            | 14 ++++--
+ test_ops_status.md                   | 14 ++++++
+ tinygrad/runtime/ops_rockchip.py     | 15 ++++--
+ tinygrad/runtime/support/rockchip.py | 68 +++++++++++++++++++---------
+ 5 files changed, 109 insertions(+), 30 deletions(-)
+
+diff --git a/progress.md b/progress.md
+index e877c44c5..a19415a55 100644
+--- a/progress.md
++++ b/progress.md
+@@ -10188,3 +10188,31 @@ the exact 12-error baseline. Ruff on the three touched files remains at the
+ same nine pre-existing findings (the repository-wide command reports the
+ existing 2559-error baseline). Next forward group:
+ `TestOps.test_cross_entropy_smoothing`.
++
++## 2026-07-31 — cross-entropy label-smoothing milestone
++
++`TestOps.test_cross_entropy_smoothing` passes all eight unchanged cases in
++**14.76s** with `FORWARD_ONLY=1`, `DEFAULT_FLOAT=HALF`, `DEV=ROCKCHIP`, and
++`-n12`. Probability and class-index targets each pass at smoothing values
++`0`, `0.3`, `0.7`, and `1`. The complete four-method cross-entropy block
++passes together in **13.39s**. The hardware-free contract remains
++**145/145 in 8.56s**, with expanded ABI checks for smoothing.
++
++Tinygrad lowers probability smoothing into the fp16 affine target
++`(1-smoothing)*target + smoothing/classes`. The exact cross-entropy task now
++serializes both half constants as raw fp16 bits and applies them before the
++class-term product. At smoothing `1`, scheduling eliminates the target
++buffer entirely; the same task admits the strict two-relocation form and
++constructs only the serialized uniform class weight. Smoothing `0` retains
++the earlier direct target form.
++
++Class-index smoothing values `0.3` and `0.7` continue through the bounded
++typed `CMPNE` one-hot evaluator, while the target-independent smoothing `1`
++form naturally shares the probability task. Diagnostics against PyTorch
++confirmed that half affine target construction plus the established
++contiguous-class log-softmax and flattened fp16 reduction boundaries is
++bit-exact for all probability cases and for the nonzero smoothed index cases.
++
++No LUT or two-level LUT changed. Mypy remains at the exact 12-error baseline,
++and Ruff on the touched files remains at the same nine pre-existing findings.
++Next forward group: `TestOps.test_sparse_categorical_crossentropy`.
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index f3072f20b..6ead93d0b 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -717,13 +717,21 @@ class TestClassifier(unittest.TestCase):
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_BCE_LAYOUT)
+ 
+   def test_probability_cross_entropy_uses_exact_bounded_task(self):
++    def half_bits(value:float) -> int: return struct.unpack("<H", struct.pack("<e", value))[0]
+     source_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+     target_2d = Tensor.empty(32,10, dtype=dtypes.half, device="ROCKCHIP")
+     source_4d = Tensor.empty(32,4,4,4, dtype=dtypes.half, device="ROCKCHIP")
+     target_4d = Tensor.empty(32,4,4,4, dtype=dtypes.half, device="ROCKCHIP")
+-    expressions = ((source_2d.cross_entropy(target_2d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1)),
+-                   (source_2d.cross_entropy(target_2d, reduction="none"), (32, _HOST_CROSS_ENTROPY_LAYOUT, 0, 32, 10, 1)),
+-                   (source_4d.cross_entropy(target_4d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 512, 4, 16)))
++    expressions = (
++      (source_2d.cross_entropy(target_2d), (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1, half_bits(1), half_bits(0))),
++      (source_2d.cross_entropy(target_2d, reduction="none"),
++       (32, _HOST_CROSS_ENTROPY_LAYOUT, 0, 32, 10, 1, half_bits(1), half_bits(0))),
++      (source_2d.cross_entropy(target_2d, label_smoothing=.3),
++       (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1, half_bits(.7), half_bits(.03))),
++      (source_2d.cross_entropy(target_2d, label_smoothing=1),
++       (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 32, 10, 1, half_bits(0), half_bits(.1))),
++      (source_4d.cross_entropy(target_4d),
++       (1, _HOST_CROSS_ENTROPY_LAYOUT, 2, 512, 4, 16, half_bits(1), half_bits(0))))
+     for expression, expected_layout in expressions:
+       sinks = [early_simplify(call.src[0]) for call in expression.schedule_linear().src if call.src[0].op is Ops.SINK]
+       program = build_native_program(sinks[-1])
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 18af7eb4a..ea217bd0e 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -2401,3 +2401,17 @@ from being captured as cross entropy; its two-CMAC hardware-free regression
+ passes again. No LUT changed. Contract: **145/145**. The 424-case tally above
+ remains the pre-milestone full-suite baseline. Next forward group:
+ `TestOps.test_cross_entropy_smoothing`.
++
++### Cross-entropy label smoothing
++
++`test_cross_entropy_smoothing` passes all eight probability/index cases at
++`0`, `0.3`, `0.7`, and `1` in **14.76s**. All four cross-entropy methods pass
++together in **13.39s**.
++
++The exact probability-target task now carries the raw fp16 target-scale and
++uniform-weight constants. This reproduces tinygrad/PyTorch's half affine
++target before the class product and supports smoothing `1` after scheduling
++removes the target buffer. Smoothed class-index one-hot graphs continue
++through the strict typed `CMPNE` path. No LUT changed. Contract remains
++**145/145** with expanded ABI coverage. Next forward group:
++`TestOps.test_sparse_categorical_crossentropy`.
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index ef424b050..5cf26393c 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -795,15 +795,20 @@ def _run_host_bce(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tu
+ def _run_host_cross_entropy(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+   """Evaluate exact bounded fp16 probability-target cross entropy."""
+   import numpy as np
+-  _, tag, reduction, rows, classes, class_stride = task.layout
+-  assert tag == _HOST_CROSS_ENTROPY_LAYOUT and reduction in (0, 1, 2) and len(relocs) == 3
+-  output, source_buf, target_buf = (bufs[reloc.globals_slot] for reloc in relocs)
++  _, tag, reduction, rows, classes, class_stride, scale_bits, uniform_bits = task.layout
++  assert tag == _HOST_CROSS_ENTROPY_LAYOUT and reduction in (0, 1, 2) and len(relocs) in (2, 3)
++  output, source_buf, *target_buf = (bufs[reloc.globals_slot] for reloc in relocs)
+   input_total = rows*classes
+   batches = rows//class_stride
+   source = np.frombuffer(ctypes.string_at(source_buf.va_addr, input_total*2), dtype=np.float16).\
+     reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
+-  target = np.frombuffer(ctypes.string_at(target_buf.va_addr, input_total*2), dtype=np.float16).\
+-    reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
++  target_scale = np.float16(struct.unpack('<e', struct.pack('<H', scale_bits))[0])
++  uniform_weight = np.float16(struct.unpack('<e', struct.pack('<H', uniform_bits))[0])
++  if target_buf:
++    target = np.frombuffer(ctypes.string_at(target_buf[0].va_addr, input_total*2), dtype=np.float16).\
++      reshape(batches, classes, class_stride).transpose(0, 2, 1).reshape(rows, classes)
++    target = np.asarray(target_scale*target+uniform_weight, dtype=np.float16)
++  else: target = np.full((rows, classes), uniform_weight, dtype=np.float16)
+   source_f = source.astype(np.float32)
+   centered = source_f-np.max(source_f, axis=1, keepdims=True)
+   # PyTorch's contiguous-class kernel rounds sum/log to fp16, while its
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index ce82b195a..c8e510a14 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9806,39 +9806,62 @@ def _try_cross_entropy_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   indexes = [u for u in nodes if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM]
+   slot_totals = {u.src[0].buf_uop.arg.slot:int(u.src[0].src[0].arg) for u in indexes}
+-  if len(slot_totals) != 4: return None
++  if len(slot_totals) not in (3, 4): return None
+   totals = sorted(slot_totals.values())
+-  if totals[0] != totals[1] or totals[2] != totals[3] or totals[0] <= 0 or \
+-     totals[2] % totals[0] or totals[2] > 4096: return None
+-  rows, input_total = totals[0], totals[2]
++  rows, input_total = totals[0], totals[-1]
++  if totals.count(rows) != 2 or totals.count(input_total) != len(totals)-2 or rows <= 0 or \
++     input_total == rows or input_total % rows or input_total > 4096: return None
+   classes = input_total//rows
+   if not 2 <= classes <= 64: return None
+ 
+-  # The target is the full-size direct INDEX operand of the class-term MUL;
+-  # the other full-size slot, nested in the log-probability ADD, is the logits.
++  def parse_weight(weight:UOp) -> tuple[int, float, float]|None:
++    weight = _unwrap(weight)
++    if weight.op is Ops.INDEX and weight.dtype is dtypes.half and weight.src[0].op is Ops.PARAM and \
++       slot_totals.get(weight.src[0].buf_uop.arg.slot) == input_total:
++      return weight.src[0].buf_uop.arg.slot, 1.0, 0.0
++    if weight.op is Ops.CONST and weight.dtype is dtypes.half:
++      return -1, 0.0, float(weight.arg)
++    if weight.op is not Ops.ADD or weight.dtype is not dtypes.half or len(weight.src) != 2: return None
++    uniform_node = next((_unwrap(x) for x in weight.src if _unwrap(x).op is Ops.CONST and _unwrap(x).dtype is dtypes.half), None)
++    scaled = next((_unwrap(x) for x in weight.src if _unwrap(x).op is Ops.MUL), None)
++    if uniform_node is None or scaled is None or len(scaled.src) != 2: return None
++    scale_node = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.CONST and _unwrap(x).dtype is dtypes.half), None)
++    target = next((_unwrap(x) for x in scaled.src if _unwrap(x).op is Ops.INDEX and _unwrap(x).dtype is dtypes.half and
++                   _unwrap(x).src[0].op is Ops.PARAM), None)
++    if scale_node is None or target is None or slot_totals.get(target.src[0].buf_uop.arg.slot) != input_total: return None
++    return target.src[0].buf_uop.arg.slot, float(scale_node.arg), float(uniform_node.arg)
++
++  # The class-term MUL separates the three-input log-probability subtree from
++  # either a probability target, its affine label-smoothing form, or the
++  # target-independent uniform weight used at smoothing=1.
+   class_terms = [u for u in nodes if u.op is Ops.MUL and u.dtype is dtypes.half]
+-  candidates:list[tuple[int, int, int]] = []
++  candidates:list[tuple[int, int, int, int, int]] = []
+   for term in class_terms:
+     class_reductions = [u for u in reductions if term in u.src[0].toposort()]
+     if not class_reductions: continue
+     class_reduce = min(class_reductions, key=lambda u:len(u.toposort()))
+     if len(class_reduce.src) != 2 or class_reduce.src[1].op is not Ops.RANGE: continue
+     class_axis = int(class_reduce.src[1].arg[0])
+-    for target_index in term.src:
+-      target = _unwrap(target_index)
+-      if target.op is not Ops.INDEX or target.src[0].op is not Ops.PARAM or \
+-         slot_totals.get(target.src[0].buf_uop.arg.slot) != input_total: continue
+-      target_affine = _affine_index(target.src[1])
+-      if target_affine is None or target_affine[1] != 0 or \
+-         (class_stride := target_affine[0].get(class_axis, 0)) <= 0: continue
+-      other = _unwrap(term.src[0] if term.src[1] is target_index else term.src[1])
+-      other_slots = {u.src[0].buf_uop.arg.slot for u in other.toposort()
++    for log_index in range(2):
++      logarithm, weight = _unwrap(term.src[log_index]), term.src[1-log_index]
++      log_slots = {u.src[0].buf_uop.arg.slot for u in logarithm.toposort()
+                      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM}
+-      full_other = [slot for slot in other_slots if slot_totals.get(slot) == input_total]
+-      if len(full_other) == 1 and len(other_slots) == 3:
+-        candidates.append((full_other[0], target.src[0].buf_uop.arg.slot, class_stride))
++      source_indexes = [u for u in logarithm.toposort() if u.op is Ops.INDEX and u.dtype is dtypes.half and
++                        u.src[0].op is Ops.PARAM and slot_totals.get(u.src[0].buf_uop.arg.slot) == input_total]
++      parsed_weight = parse_weight(weight)
++      if len(log_slots) != 3 or len(source_indexes) != 1 or parsed_weight is None: continue
++      source = source_indexes[0]
++      source_affine = _affine_index(source.src[1])
++      if source_affine is None or source_affine[1] != 0 or \
++         (class_stride := source_affine[0].get(class_axis, 0)) <= 0: continue
++      target_slot, target_scale, uniform_weight = parsed_weight
++      if target_slot == source.src[0].buf_uop.arg.slot or \
++         not math.isclose(target_scale+uniform_weight*classes, 1.0, rel_tol=0.0, abs_tol=0.005): continue
++      scale_bits = struct.unpack('<H', struct.pack('<e', target_scale))[0]
++      uniform_bits = struct.unpack('<H', struct.pack('<e', uniform_weight))[0]
++      candidates.append((source.src[0].buf_uop.arg.slot, target_slot, class_stride, scale_bits, uniform_bits))
+   if len(set(candidates)) != 1: return None
+-  source_slot, target_slot, class_stride = candidates[0]
++  source_slot, target_slot, class_stride, scale_bits, uniform_bits = candidates[0]
+   if source_slot == target_slot or rows % class_stride: return None
+ 
+   output_total = prod(_shape_of_store(sink))
+@@ -9851,9 +9874,10 @@ def _try_cross_entropy_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+                    math.isclose(float(u.arg), 1.0/rows, rel_tol=1e-12)]
+     reduction_code = 2 if mean_scales else 1
+   out_slot = ProgramInfo.from_sink(sink).outs[0]
+-  layout = (output_total, _HOST_CROSS_ENTROPY_LAYOUT, reduction_code, rows, classes, class_stride)
++  layout = (output_total, _HOST_CROSS_ENTROPY_LAYOUT, reduction_code, rows, classes, class_stride, scale_bits, uniform_bits)
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, source_slot, target_slot))
++  input_slots = (source_slot,) if target_slot < 0 else (source_slot, target_slot)
++  relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
+   return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+ 
+ def _try_cross_entropy_loss_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-- 
+2.34.1
+
