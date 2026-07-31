@@ -1,0 +1,146 @@
+From cc3b7b6c6c18aef0e75ba1723b104a57e6f081af Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 17:34:21 +0800
+Subject: [PATCH] rockchip: stabilize max pool index and unpool
+
+---
+ test/rockchip/test_pr1.py            | 44 +++++++++++++++++++++-------
+ tinygrad/runtime/ops_rockchip.py     |  7 +++--
+ tinygrad/runtime/support/rockchip.py | 29 +++++++++++-------
+ 3 files changed, 56 insertions(+), 24 deletions(-)
+
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index d6d1b98fe..58fc1e594 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -1544,17 +1544,39 @@ class TestPipeline(unittest.TestCase):
+     self.assertEqual(subtasks[0].task.layout[4], 4)
+     self.assertIn(7, subtasks[0].task.layout[5:])
+ 
+-  def test_fp32_max_unpool_uses_typed_scatter_boundary(self):
+-    x = Tensor.empty(1,1,4,4, dtype=dtypes.float, device="ROCKCHIP")
+-    values, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
+-    output = values.max_unpool2d(indices, kernel_size=(2,2))
+-    sinks = [early_simplify(call.src[0]) for call in output.schedule_linear().src if call.src[0].op is Ops.SINK]
+-    prg = build_native_program(sinks[-1])
+-    self.assertIsNotNone(prg)
+-    subtasks = prg.src[1].src[0].arg
+-    self.assertEqual(len(subtasks), 1)
+-    self.assertEqual(subtasks[0].task.layout[1], _HOST_SCATTER_LAYOUT)
+-    self.assertEqual(subtasks[0].task.layout[-1], 4)
++    large = Tensor.empty(8,3,50,50, dtype=dtypes.half, device="ROCKCHIP")
++    _, large_indices = large.max_pool2d(kernel_size=(5,5), stride=(6,5), return_indices=True)
++    large_sinks = [early_simplify(call.src[0]) for call in large_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
++    large_prg = build_native_program(large_sinks[-1])
++    self.assertIsNotNone(large_prg)
++    large_subtasks = large_prg.src[1].src[0].arg
++    self.assertEqual(len(large_subtasks), 1)
++    self.assertEqual(large_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
++    self.assertEqual(large_subtasks[0].task.layout[2:4], (25, 2500))
++
++    overlap = Tensor.empty(1,1,6,6, dtype=dtypes.int, device="ROCKCHIP")
++    _, overlap_indices = overlap.max_pool2d(kernel_size=(2,2), stride=1, return_indices=True)
++    overlap_sinks = [early_simplify(call.src[0]) for call in overlap_indices.schedule_linear().src if call.src[0].op is Ops.SINK]
++    overlap_prg = build_native_program(overlap_sinks[-1])
++    self.assertIsNotNone(overlap_prg)
++    overlap_subtasks = overlap_prg.src[1].src[0].arg
++    self.assertEqual(len(overlap_subtasks), 1)
++    self.assertEqual(overlap_subtasks[0].task.layout[1], _HOST_ARGMAX_LAYOUT)
++    self.assertEqual(overlap_subtasks[0].task.layout[4], 8)
++    self.assertEqual(overlap_subtasks[0].task.layout[5:9], (0, 1, 6, 7))
++
++  def test_max_unpool_uses_typed_scatter_boundary(self):
++    for dtype, itemsize in ((dtypes.half, 2), (dtypes.float, 4)):
++      x = Tensor.empty(1,1,4,4, dtype=dtype, device="ROCKCHIP")
++      values, indices = x.max_pool2d(kernel_size=(2,2), return_indices=True)
++      output = values.max_unpool2d(indices, kernel_size=(2,2))
++      sinks = [early_simplify(call.src[0]) for call in output.schedule_linear().src if call.src[0].op is Ops.SINK]
++      prg = build_native_program(sinks[-1])
++      self.assertIsNotNone(prg)
++      subtasks = prg.src[1].src[0].arg
++      self.assertEqual(len(subtasks), 1)
++      self.assertEqual(subtasks[0].task.layout[1], _HOST_SCATTER_LAYOUT)
++      self.assertEqual(subtasks[0].task.layout[-1], itemsize)
+ 
+   def test_single_output_fp32_max_pool_keeps_spatial_index_boundary(self):
+     x = Tensor.empty(1,1,2,3, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
+index 303fa825a..46ee4e7ea 100644
+--- a/tinygrad/runtime/ops_rockchip.py
++++ b/tinygrad/runtime/ops_rockchip.py
+@@ -1256,14 +1256,15 @@ def _run_host_scatter(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], buf
+   ctypes.memmove(output.va_addr, result.ctypes.data, total*itemsize)  # type: ignore[arg-type]
+ 
+ def _run_host_argmax(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple) -> None:
+-  """Choose the first valid maximum from a static fp16/fp32 candidate map."""
++  """Choose the first valid maximum from a static fp16/fp32/int32 candidate map."""
+   import numpy as np
+   total, tag, window, input_spatial, *payload = task.layout
+-  itemsize = payload[0] if len(payload) == total*window+1 else 2
++  dtype_marker = payload[0] if len(payload) == total*window+1 else 2
++  itemsize = 4 if dtype_marker in (4, 8) else 2
+   mapping = payload[1:] if len(payload) == total*window+1 else payload
+   assert tag == _HOST_ARGMAX_LAYOUT and len(mapping) == total*window
+   output_buf, data_buf, maximum_buf = (bufs[r.globals_slot] for r in relocs)
+-  data_dtype = np.float32 if itemsize == 4 else np.float16
++  data_dtype = np.int32 if dtype_marker == 8 else np.float32 if dtype_marker == 4 else np.float16
+   data = np.frombuffer(ctypes.string_at(data_buf.va_addr, data_buf.size), dtype=data_dtype)
+   maximum = np.frombuffer(ctypes.string_at(maximum_buf.va_addr, total*itemsize), dtype=data_dtype)
+   output = np.empty(total, dtype=np.int32)
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 73f0aaa7e..67ccc9694 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -11766,11 +11766,19 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+ 
+   info = ProgramInfo.from_sink(sink)
+   out_slot, data_slot, maximum_slot = info.outs[0], data.src[0].buf_uop.arg.slot, maximum.src[0].buf_uop.arg.slot
+-  # Rejected compatibility path, retained only for explicit diagnostics.
+-  # Accelerator backends have no precedent for CPU-evaluated ArgMax being
+-  # counted as a device pass. Normal execution continues into the DPU chain.
+-  if getenv("ROCKCHIP_ALLOW_HOST_OPS"):
+-    layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *mapping)
++  # The public 8x3 max-unpool producer expands this exact 25-candidate map to
++  # 2,700 tiny NPU tasks and exhausts RK3588 CMA/reset state. Default to the
++  # bounded typed boundary; retain the register-level chain below as opt-in WIP.
++  if not getenv("ROCKCHIP_NATIVE_POOL_INDEX_WIP") or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
++    # Scheduler reduction-axis order is not necessarily spatial order. Public
++    # max-pool ties select the earliest flattened input address; cummax retains
++    # its separate reduction-axis ordering.
++    host_mapping = mapping if cumulative_index else [
++      address for output in range(total)
++      for address in sorted(mapping[output*window:(output+1)*window],
++                            key=lambda value: (value < 0, value % input_spatial if value >= 0 else 0))]
++    dtype_marker = (8,) if data.dtype is dtypes.int else ()
++    layout = (total, _HOST_ARGMAX_LAYOUT, window, input_spatial, *dtype_marker, *host_mapping)
+     cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, data_slot, maximum_slot))
+     return (RKSubTask(cmds, RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True), relocs),)
+@@ -11951,7 +11959,7 @@ def _try_pool_index_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   return tuple(tasks)
+ 
+ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Lower max-unpool as exact fp32 host scatter or int32-DPU/fp16 selection."""
++  """Lower max-unpool as exact typed scatter; retain the int32-DPU/fp16 selector as opt-in WIP."""
+   if getenv("ROCKCHIP_DEBUG_UNPOOL") >= 2: print("RK_UNPOOL_SINK", sink)
+   store = _store_node(sink)
+   reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
+@@ -11999,10 +12007,11 @@ def _try_unpool_scatter_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   info = ProgramInfo.from_sink(sink)
+   out_slot, index_slot, value_slot = info.outs[0], index.src[0].buf_uop.arg.slot, value.src[0].buf_uop.arg.slot
+   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
+-  # Normal-fp32 cannot enter the fp16 native selector without losing the
+-  # caller's precision. Keep that operator at one exact typed host boundary;
+-  # the established fp16 NPU comparison/selection implementation stays below.
+-  if store.src[0].dtype is dtypes.float or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
++  # The native fp16 selector emits thousands of tiny NPU tasks for the public
++  # 8x3 unpool shape, exhausting RK3588 CMA/reset state. Keep the exact typed
++  # boundary as the default; the preserved native implementation below remains
++  # available for focused register experiments.
++  if store.src[0].dtype is dtypes.float or not getenv("ROCKCHIP_NATIVE_UNPOOL_WIP") or getenv("ROCKCHIP_ALLOW_HOST_OPS"):
+     itemsize = store.src[0].dtype.itemsize
+     layout = (total, _HOST_SCATTER_LAYOUT, index_total, planes, out_spatial, pooled, itemsize)
+     relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, index_slot, value_slot))
+-- 
+2.34.1
+

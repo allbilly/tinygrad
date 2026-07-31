@@ -3065,3 +3065,24 @@ Contract advances to **168/168 in 10.37s**. Mypy stays at the exact
 12-error baseline and touched-file Ruff at nine pre-existing findings. No
 LUT or two-level LUT changed. Next: rerun the reset-polluted tail of
 ordered methods 151–200, then continue 201–250.
+
+### Max-pool index and max-unpool stability
+
+The complete tail passes **16 methods plus 33 subtests in 119.75s**.
+Commit `cc3b7b6c6`; saved patch
+`0115-rockchip-stabilize-max-pool-index-and-unpool.patch`.
+
+`test_max_unpool2d` alone reproduced repeated RKNPU resets and CMA failures.
+The first public geometry scheduled 49 pooled-value tasks, 2,700
+returned-index tasks, and the final scatter. Exact bounded typed tasks are
+now the defaults for the static pool-index candidate map and unpool
+scatter. The old register chains remain available through
+`ROCKCHIP_NATIVE_POOL_INDEX_WIP=1` and
+`ROCKCHIP_NATIVE_UNPOOL_WIP=1`.
+
+Pool-index maps are spatially ordered for earliest-address tie behavior,
+and an explicit int32 marker preserves the deterministic integer test
+buffers. Returned indices, unpool, infinity/NaN unpool, and `maximum` pass
+**4/4 in 58.27s**. Contract remains **168/168 in 10.39s**; mypy and
+touched-file Ruff remain at their 12- and 9-finding baselines. No LUT or
+two-level LUT changed. Next: ordered methods 201–250.

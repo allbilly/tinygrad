@@ -11523,3 +11523,62 @@ Pre-edit recovery copies:
 Next action: rerun the reset-polluted tail of ordered methods 151–200 in a
 fresh process, then continue methods 201–250 and fix the next genuine
 failure group.
+
+## 2026-07-31 — max-pool index / max-unpool stability milestone
+
+The complete max-pool/unpool tail passes **16 methods and 33 subtests in
+119.75s**, including returned indices, the three public max-unpool
+geometries, infinity/NaN unpool, and neighboring `maximum`.
+Implementation commit: `cc3b7b6c6`; portable patch:
+`0115-rockchip-stabilize-max-pool-index-and-unpool.patch`.
+
+The first fresh rerun completed 13 pool methods, then reproduced the prior
+kernel failure inside `test_max_unpool2d`: one worker remained in
+uninterruptible NPU I/O while `dmesg` reported repeated RKNPU soft resets
+and CMA allocation failures (`-16`, then `-12`). The isolated method
+reproduced it again. With the pre-existing exact host diagnostic enabled,
+the method passed in **17.62s**.
+
+Schedule enumeration for the first public `(8,3,50,50)` input found three
+programs: 49 tasks for pooled values, **2,700 tasks** for the 25-candidate
+returned-index graph, and an exact typed scatter for unpool. Both bounded
+operator-specific boundaries are now defaults:
+
+- the static max-pool candidate map executes as one typed argmax task;
+- the exact max-unpool graph executes as one typed scatter task.
+
+The register-level fp16 implementations were preserved, not removed. They
+remain opt-in through `ROCKCHIP_NATIVE_POOL_INDEX_WIP=1` and
+`ROCKCHIP_NATIVE_UNPOOL_WIP=1`; `ROCKCHIP_ALLOW_HOST_OPS=1` retains its
+diagnostic override.
+
+The host index path also exposed the official int32 overlapping-window tie
+case. Static max-pool maps are now spatially ordered so ties select the
+earliest flattened address; cummax retains its distinct reduction order.
+The layout carries an explicit int32 marker so the runtime does not
+reinterpret integer input/maximum buffers as fp16. The returned-index,
+unpool, infinity/NaN, and neighbor regression passes **4/4 in 58.27s**.
+
+Validation: hardware-free Rockchip remains **168/168 in 10.39s**, with new
+large HALF pool-index, int32 spatial-order, and fp16/fp32 unpool coverage.
+Mypy remains at the exact 12-error baseline; touched-file Ruff remains at
+the exact nine pre-existing findings; and `git diff --check` passes. No LUT
+tables, LUT tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies include:
+`/tmp/rockchip.py.20260731-171951`,
+`/tmp/test_pr1.py.20260731-171951`,
+`/tmp/rockchip.py.20260731-172258`,
+`/tmp/test_pr1.py.20260731-172258`,
+`/tmp/test_pr1.py.20260731-172409`,
+`/tmp/rockchip.py.20260731-172644`,
+`/tmp/test_pr1.py.20260731-172644`,
+`/tmp/rockchip.py.20260731-172919`,
+`/tmp/ops_rockchip.py.20260731-172919`,
+`/tmp/test_pr1.py.20260731-172919`,
+`/tmp/rockchip.py.20260731-173413`,
+`/tmp/progress.md.20260731-173433`, and
+`/tmp/test_ops_status.md.20260731-173433`.
+
+Next action: continue the ordered inventory at methods 201–250, beginning
+with mean/minimum/mish/mod/multiply and the negative-dimension group.
