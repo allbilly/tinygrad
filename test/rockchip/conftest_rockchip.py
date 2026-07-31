@@ -1,8 +1,10 @@
 """Environment setup for running test_ops.py on ROCKCHIP.
 
 Sets DEFAULT_FLOAT=half (NPU's only supported dtype) and torch default to fp16
-for fair comparison. Unsupported ops raise RuntimeError(RKPLAN_REJECT:...) and
-fail the test honestly — no skip conversion, no monkeypatch.
+for fair comparison. PyTorch's architecture-specific fused SDPA kernel is
+disabled so attention is compared with its portable MATH implementation.
+Unsupported ops raise RuntimeError(RKPLAN_REJECT:...) and fail the test
+honestly — no skip conversion, no monkeypatch.
 
 PR1 is an inference/forward-only backend. Gradients are explicitly deferred
 (PR8). FORWARD_ONLY=1 must be passed on the command line, not hidden here, so
@@ -17,3 +19,4 @@ os.environ.setdefault("DEFAULT_FLOAT", "half")
 
 import torch
 torch.set_default_dtype(torch.float16)
+torch.backends.cuda.enable_flash_sdp(False)

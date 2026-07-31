@@ -566,6 +566,11 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
   cursor += out_n+1
   value_n = meta[cursor]
   value_code = meta[cursor+1:cursor+1+value_n]
+  cursor += value_n+1
+  epilogue_code:list[int] = []
+  if tag == _HOST_ELEMENTWISE_REDUCE_LAYOUT and cursor < len(meta):
+    epilogue_n = meta[cursor]
+    epilogue_code = meta[cursor+1:cursor+1+epilogue_n]
   np_dtypes = (np.bool_, np.int32, np.uint32, np.int64, np.uint64, np.uint8,
                np.float16, np.float32, np.int64, np.int16, np.uint16, np.int8, np.float64)
   inputs:list[dict] = []
@@ -659,7 +664,7 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
         ret.append((linear//stride) % shape[axis])
       return ret
 
-    def evaluate_vector(code, coords):
+    def evaluate_vector(code, coords, reduced=None):
       stack:list = []
       for pos in range(0, len(code), 4):
         op, dtype_code, arg0, arg1 = code[pos:pos+4]
@@ -687,10 +692,17 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
           gathered[valid] = source[indices[valid]]
           stack.append(gathered)
           continue
+        if op == 31:
+          if reduced is None: raise RuntimeError("rk: typed reduction epilogue used without reduced value")
+          stack.append(np.asarray(reduced, dtype=np_dtypes[dtype_code]))
+          continue
         args = stack[-arg0:] if arg0 else []
         if arg0: del stack[-arg0:]
         if op == 3: value = args[0] + args[1]
         elif op == 4: value = args[0] * args[1]
+        elif op == 5: value = np.divide(args[0], args[1])
+        elif op == 17: value = np.exp2(args[0])
+        elif op == 22: value = args[0] // args[1]
         elif op == 8: value = args[0] < args[1]
         elif op == 9: value = args[0] != args[1]
         elif op == 10: value = np.where(args[0], args[1], args[2])
@@ -703,20 +715,27 @@ def _run_host_elementwise(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...],
       assert len(stack) == 1
       return stack[0]
 
-    loop_linear = np.arange(total, dtype=np.int64)
-    loop_coords = coordinate_vectors(loop_extents, loop_linear)
-    output_coords = [*loop_coords, *(np.zeros(total, dtype=np.int64) for _ in reduction_extents)]
-    output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
-    if np.any(output_indices < 0) or np.any(output_indices >= result.size):
-      raise RuntimeError("rk: vector fancy-index output index out of bounds")
-    full_linear = np.arange(total*reduction_total, dtype=np.int64)
-    full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
-    coords = [*coordinate_vectors(loop_extents, full_loop_linear),
-              *coordinate_vectors(reduction_extents, reduction_linear)]
-    values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(total, reduction_total)
-    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else None
+    reducer = np.add if reduction_op == 0 else np.multiply if reduction_op == 1 else np.maximum if reduction_op == 2 else None
     if reducer is None: raise RuntimeError(f"rk: invalid typed reduction opcode {reduction_op}")
-    result[output_indices] = reducer.reduce(values, axis=1, dtype=np.float32)
+    # Bound coordinate/value grids to four million candidates. GQA attention
+    # reaches 16M candidates per contraction; one giant grid spends minutes in
+    # allocation/RCU teardown, while row chunks preserve identical reductions.
+    row_chunk = max(1, (1 << 22) // reduction_total)
+    for row_start in range(0, total, row_chunk):
+      row_end = min(total, row_start+row_chunk)
+      loop_linear = np.arange(row_start, row_end, dtype=np.int64)
+      loop_coords = coordinate_vectors(loop_extents, loop_linear)
+      output_coords = [*loop_coords, *(np.zeros(row_end-row_start, dtype=np.int64) for _ in reduction_extents)]
+      output_indices = np.asarray(evaluate_vector(out_code, output_coords), dtype=np.int64)
+      if np.any(output_indices < 0) or np.any(output_indices >= result.size):
+        raise RuntimeError("rk: vector fancy-index output index out of bounds")
+      full_linear = np.arange(row_start*reduction_total, row_end*reduction_total, dtype=np.int64)
+      full_loop_linear, reduction_linear = np.divmod(full_linear, reduction_total)
+      coords = [*coordinate_vectors(loop_extents, full_loop_linear),
+                *coordinate_vectors(reduction_extents, reduction_linear)]
+      values = np.asarray(evaluate_vector(value_code, coords), dtype=np.float32).reshape(row_end-row_start, reduction_total)
+      reduced = reducer.reduce(values, axis=1, dtype=np.float32)
+      result[output_indices] = evaluate_vector(epilogue_code, output_coords, reduced) if epilogue_code else reduced
     ctypes.memmove(output.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
     return
 
@@ -2271,7 +2290,15 @@ class RockchipDevice(Compiled):
       return HCQBuffer(va_addr=va, size=size)
     mc = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags|rk.RKNPU_MEM_NON_CACHEABLE)
     mm = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mc.handle, offset=0)
-    va = self.fd_ctl.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mm.offset)
+    try: va = self.fd_ctl.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mm.offset)
+    except OSError:
+      # Some RK3588 driver/object-size combinations return an unusable >4 GiB
+      # map offset even below the conservative proactive host-buffer threshold.
+      rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, __payload=rk.struct_rknpu_mem_destroy(
+        handle=mc.handle, reserved=0, obj_addr=mc.obj_addr))
+      va = FileIOInterface.anon_mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE,
+                                     mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS, 0)
+      return HCQBuffer(va_addr=va, size=size)
     mc.flink_name = self.create_flink_name(mc.handle, name)
     return HCQBuffer(va_addr=va, size=size, meta=mc)
 

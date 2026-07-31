@@ -9074,7 +9074,8 @@ def _try_copysign_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
   return (RKSubTask(cmds, task, relocs),)
 
-def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|None=None) -> tuple[RKSubTask, ...]|None:
+def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|None=None,
+                                    post_reduction=False) -> tuple[RKSubTask, ...]|None:
   """Serialize a fixed-shape, no-reduction elementwise graph after native classifiers reject it."""
   store = _store_node(sink)
   if store is None: return None
@@ -9083,10 +9084,12 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
     output, val = store.src
   else:
     reductions = [u for u in sink.toposort() if u.op is Ops.REDUCE]
-    if reductions != [reduction] or _unwrap(store.src[1]) is not reduction or reduction.arg[0] not in (Ops.ADD, Ops.MUL): return None
+    if reductions != [reduction] or reduction.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or \
+       (reduction not in store.src[1].toposort() if post_reduction else _unwrap(store.src[1]) is not reduction): return None
     output, val = store.src[0], reduction.src[0]
   out_dtype = _host_dtype_code(output.dtype)
-  if output.op is not Ops.INDEX or out_dtype is None or val.dtype is not output.dtype: return None
+  if output.op is not Ops.INDEX or out_dtype is None or \
+     (val.dtype is not output.dtype and not (reduction is not None and output.dtype is dtypes.half and val.dtype is dtypes.float)): return None
   # Keep ordinary arithmetic on the existing NPU paths. This fallback is for
   # gather/fancy-index kernels whose data INDEX address loads an index tensor.
   if not allow_plain and not any(u.op is Ops.INDEX and any(x.op is Ops.INDEX for x in u.src[1].toposort()) for u in val.toposort()): return None
@@ -9117,6 +9120,9 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
   def emit(u:UOp, code:list[int]) -> bool:
     dtype_code = _host_dtype_code(u.dtype)
     if dtype_code is None: return False
+    if post_reduction and u is reduction:
+      code.extend((31, dtype_code, 0, 0))
+      return True
     if u.op is Ops.CONST:
       if u.arg is Invalid: bits = 0
       elif dtype_code == 0: bits = int(bool(u.arg))
@@ -9141,14 +9147,17 @@ def _try_elementwise_host_subtasks(sink:UOp, allow_plain=False, reduction:UOp|No
   out_code:list[int] = []
   value_code:list[int] = []
   if not emit(output.src[1], out_code) or not emit(val, value_code): return None
+  epilogue_code:list[int] = []
+  if post_reduction and not emit(store.src[1], epilogue_code): return None
   out_slot = ProgramInfo.from_sink(sink).outs[0]
   if reduction is None:
     layout = (total, _HOST_ELEMENTWISE_LAYOUT, out_dtype, len(extents), *extents,
               len(out_code), *out_code, len(value_code), *value_code)
   else:
+    epilogue_layout = (len(epilogue_code), *epilogue_code) if post_reduction else ()
     layout = (total, _HOST_ELEMENTWISE_REDUCE_LAYOUT, out_dtype, nloops, nreductions,
-              0 if reduction.arg[0] is Ops.ADD else 1, *extents,
-              len(out_code), *out_code, len(value_code), *value_code)
+              {Ops.ADD:0, Ops.MUL:1, Ops.MAX:2}[reduction.arg[0]], *extents,
+              len(out_code), *out_code, len(value_code), *value_code, *epilogue_layout)
   cmds = (RKCmd(_T_PC, rk.REG_PC_OPERATION_ENABLE, 0).pack(),)
   relocs = tuple(RKReloc(0, slot, 0, 0, 0xFFFFFFFF) for slot in (out_slot, *input_slots))
   task = RKTask(0, 0, 0, "dpu", layout, out_slot, is_copy=True)
@@ -9574,6 +9583,130 @@ def _try_normalize_norm_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   except (TypeError, ValueError, OverflowError): return None
   expanded = sink.substitute({store:store.replace(src=(store.src[0], expanded_value))})
   return _try_elementwise_host_subtasks(expanded, allow_plain=True)
+
+def _try_attention_score_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Stage scaled batched attention scores and their optional additive mask."""
+  store = _store_node(sink)
+  shape = _shape_of_store(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or len(shape) not in (2, 3) or \
+     not any(extent <= 64 for extent in shape) or prod(shape) > 1 << 20: return None
+  value = _unwrap(store.src[1])
+  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+  if len(reductions) != 1 or value.op not in (Ops.MUL, Ops.ADD): return None
+  reduce = reductions[0]
+  if reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or len(reduce.src) != 2 or \
+     reduce.src[1].src[0].op is not Ops.CONST: return None
+  width = int(reduce.src[1].src[0].arg)
+  body = _unwrap(reduce.src[0])
+  body_sources = tuple(_unwrap(x) for x in body.src)
+  if not 1 <= width <= 128 or body.op is not Ops.MUL or len(body_sources) != 2 or \
+     any(x.op is not Ops.INDEX or x.dtype not in (dtypes.half, dtypes.float) or x.src[0].op is not Ops.PARAM for x in body_sources) or \
+     len({x.dtype for x in body_sources}) != 1 or \
+     len({x.src[0].buf_uop.arg.slot for x in body_sources}) != 2: return None
+  constants = [float(u.arg) for u in value.toposort() if u.op is Ops.CONST and u.dtype in (dtypes.half, dtypes.float)]
+  if sum(math.isclose(constant, width**-0.5, rel_tol=1e-12) for constant in constants) != 1: return None
+  inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if len({u.src[0].buf_uop.arg.slot for u in inputs}) not in (2, 3): return None
+  nodes = value.toposort()
+  causal = any(u.op is Ops.WHERE for u in nodes)
+  causal_casts = 3 if body_sources[0].dtype is dtypes.half and store.src[0].dtype is dtypes.float else 2
+  if causal and (sum(u.op is Ops.WHERE for u in nodes), sum(u.op is Ops.CMPLT for u in nodes),
+                 sum(u.op is Ops.CAST for u in nodes)) != (1, 1, causal_casts): return None
+  if causal and not (0.0 in constants and -math.inf in constants): return None
+  allowed = {Ops.REDUCE, Ops.ADD, Ops.MUL, Ops.FLOORDIV, Ops.WHERE, Ops.CMPLT, Ops.CAST,
+             Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in nodes): return None
+
+  info, total = ProgramInfo.from_sink(sink), prod(shape)
+  scratch = UOp.param(info.outs[0], store.src[0].dtype, (total,), device=store.src[0].src[0].device)
+  scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
+  # CPU and NPU fp32-accumulating matmul widen fp16 operands before their
+  # product. Preserve that MULACC boundary instead of rounding every product
+  # to fp16 in the generic UOp evaluator.
+  staged_reduce = reduce
+  if body_sources[0].dtype is dtypes.half:
+    widened_sources = tuple(UOp(Ops.CAST, dtypes.float, (x,), arg=dtypes.float) for x in body_sources)
+    staged_reduce = reduce.replace(src=(UOp(Ops.MUL, dtypes.float, widened_sources), *reduce.src[1:]))
+  reduction_store = store.replace(src=(scratch_index, staged_reduce))
+  reduction_tasks = _try_elementwise_host_subtasks(sink.substitute({store:reduction_store}),
+                                                    allow_plain=True, reduction=staged_reduce)
+  if reduction_tasks is None: return None
+  reduction_value = scratch_index if scratch_index.dtype is reduce.dtype else \
+    UOp(Ops.CAST, reduce.dtype, (scratch_index,), arg=reduce.dtype)
+  epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:reduction_value})))
+  epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
+  return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
+
+def _try_bounded_attention_max_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Keep a compact floating-point MAX reduction in one typed task.
+
+  Attention softmax emits this exact boundary between its score and
+  denominator kernels. Serializing it also avoids the 31-stage mixed
+  host/native tree mutating the mapped score input on RK3588.
+  """
+  store, reduce = _store_node(sink), _reduce_node(sink)
+  shape = _shape_of_store(sink)
+  if store is None or reduce is None or store.src[0].dtype not in (dtypes.half, dtypes.float) or \
+     _unwrap(store.src[1]) is not reduce or reduce.arg[0] is not Ops.MAX or reduce.dtype is not store.src[0].dtype or \
+     len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or \
+     not 1 <= int(reduce.src[1].src[0].arg) <= 64 or not 256 <= prod(shape) <= 1 << 20: return None
+  body = _unwrap(reduce.src[0])
+  if body.op is not Ops.INDEX or body.dtype is not reduce.dtype or body.src[0].op is not Ops.PARAM: return None
+  return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+
+def _try_attention_value_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+  """Stage the exact fused softmax-value contraction through a bounded typed reduction."""
+  store = _store_node(sink)
+  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
+  value = _unwrap(store.src[1])
+  reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+  if value.op is Ops.REDUCE:
+    if len(reductions) != 1: return None
+    reduce = reductions[0]
+    if reduce is not value or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or \
+       len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or \
+       not 1 <= int(reduce.src[1].src[0].arg) <= 64: return None
+    body_nodes = reduce.src[0].toposort()
+    body_inputs = [u for u in body_nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+    input_slots = {u.src[0].buf_uop.arg.slot for u in body_inputs}
+    if len(input_slots) not in (2, 4) or any(u.dtype is not dtypes.half for u in body_inputs) or \
+       sum(u.op is Ops.EXP2 for u in body_nodes) != 1: return None
+    shape = _shape_of_store(sink)
+    if (len(input_slots) == 2 and len(shape) != 1) or (len(input_slots) == 4 and len(shape) not in (2, 3)): return None
+    if len(input_slots) == 2 and any(u.op is Ops.FDIV for u in body_nodes): return None
+    if len(input_slots) == 4 and sum(u.op is Ops.FDIV for u in body_nodes) != 1: return None
+    allowed = {Ops.EXP2, Ops.ADD, Ops.MUL, Ops.FDIV, Ops.CAST, Ops.FLOORDIV,
+               Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+    if any(u.op not in allowed for u in body_nodes): return None
+    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce)
+  if len(_shape_of_store(sink)) not in (2, 3): return None
+  if value.op is not Ops.FDIV or len(reductions) != 1: return None
+  reduce = reductions[0]
+  denominator = _unwrap(value.src[1])
+  if _unwrap(value.src[0]) is not reduce or denominator.op is not Ops.INDEX or denominator.dtype is not dtypes.float or \
+     denominator.src[0].op is not Ops.PARAM or reduce.arg[0] is not Ops.ADD or reduce.dtype is not dtypes.float or \
+     len(reduce.src) != 2 or reduce.src[1].src[0].op is not Ops.CONST or not 1 <= int(reduce.src[1].src[0].arg) <= 64: return None
+  body_nodes = reduce.src[0].toposort()
+  body_inputs = [u for u in body_nodes if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if reduce.src[0].op is not Ops.MUL or sum(u.op is Ops.EXP2 for u in body_nodes) != 1 or \
+     len({u.src[0].buf_uop.arg.slot for u in body_inputs}) != 3: return None
+  allowed = {Ops.EXP2, Ops.ADD, Ops.MUL, Ops.CAST, Ops.FLOORDIV, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  if any(u.op not in allowed for u in body_nodes): return None
+  if store.src[0].dtype is dtypes.half:
+    return _try_elementwise_host_subtasks(sink, allow_plain=True, reduction=reduce, post_reduction=True)
+
+  info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+  # Both stages are typed host tasks. Reuse the final output as scratch; the
+  # elementwise runner snapshots every mapped input before writing its result.
+  scratch = UOp.param(info.outs[0], dtypes.float, (total,), device=store.src[0].src[0].device)
+  scratch_index = store.src[0].replace(src=(scratch, *store.src[0].src[1:]))
+  reduction_store = store.replace(src=(scratch_index, reduce))
+  reduction_tasks = _try_elementwise_host_subtasks(sink.substitute({store:reduction_store}),
+                                                    allow_plain=True, reduction=reduce)
+  if reduction_tasks is None: return None
+  epilogue_store = store.replace(src=(store.src[0], store.src[1].substitute({reduce:scratch_index})))
+  epilogue_tasks = _try_elementwise_host_subtasks(sink.substitute({store:epilogue_store}), allow_plain=True)
+  return None if epilogue_tasks is None else (*reduction_tasks, *epilogue_tasks)
 
 def _try_logcumsumexp_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
   """Serialize the exact masked prefix-MAX and prefix-exp-sum stages of logcumsumexp."""
@@ -12660,7 +12793,6 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if isinstance(stage_plan, str) or stage_plan.kind != "cmac": return None
     # Runtime K-tile accumulation is retained as WIP reference, but uses host
     # addition between NPU partials. Keep this forward path NPU-arithmetic-only.
-    if stage_plan.cmac_materialization and stage_plan.cmac_materialization[2] > 4096: return None
     # Shared batch/group axes expand direct materialization into a block-diagonal
     # K. Serialize them like conv_grok's cartesian local tiles: besides avoiding
     # unused cross-batch cells, this keeps multi-row CMAC below the proven
@@ -12668,6 +12800,7 @@ def _try_small_fp32_cmac_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
     if (shared_tasks := _try_cmac_shared_subtasks(stage_plan)) is not None:
       tasks.extend(RKSubTask(st.cmds, replace(st.task, fp32_output=fp32_output), st.relocs) for st in shared_tasks)
     else:
+      if stage_plan.cmac_materialization and stage_plan.cmac_materialization[2] > 4096: return None
       cmds, task, relocs = emit_rk(stage_plan)
       tasks.append(RKSubTask(cmds, replace(task, fp32_output=fp32_output), relocs))
     return out_slot
@@ -13938,6 +14071,12 @@ def build_native_program(sink: UOp) -> UOp|None:
   if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
   if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
   if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
+  if (bounded_attention_max_tasks := _try_bounded_attention_max_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, bounded_attention_max_tasks)
+  if (attention_score_tasks := _try_attention_score_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, attention_score_tasks)
+  if (attention_value_tasks := _try_attention_value_host_subtasks(sink)) is not None:
+    return build_native_program_multi(sink, attention_value_tasks)
   if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
   if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
     return build_native_program_multi(sink, logcumsumexp_tasks)

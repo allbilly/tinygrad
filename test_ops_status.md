@@ -2348,3 +2348,21 @@ form additionally admits its exact `CMPLT/AND` guards, and mean is matched
 after reciprocal-to-FDIV rewriting. No runtime ABI or LUT changed. Contract:
 **139/139**. Next forward group:
 `TestOps.test_scaled_dot_product_attention`.
+
+### Scaled-dot-product attention
+
+All attention methods pass under the required HALF forward-only configuration:
+base plus additive mask (**32.93s**), mismatched sequence lengths (**13.95s**),
+causal plus its expected error (**23.73s**), GQA (**41.40s**), and invalid GQA
+heads (**11.03s**).
+
+The strict backend path uses fp32 score/softmax/value accumulation, one bounded
+typed MAX task instead of the corrupting 31-stage mixed MAX tree, widened
+fp16 Q/K operands at the fp32 `MULACC` boundary, chunked GQA candidate grids,
+and a typed post-reduction epilogue for final division. The Rockchip test plugin
+selects PyTorch's portable MATH SDPA reference because its aarch64 flash kernel
+has architecture-specific fp16 rounding that also disagrees with PyTorch MATH.
+
+No LUT changed. Contract: **143/143**. The 424-case full-suite tally above is
+still the pre-attention baseline and has not been relabeled. Next forward
+group: `TestOps.test_binary_crossentropy`.

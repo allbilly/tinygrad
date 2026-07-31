@@ -9949,3 +9949,143 @@ the compact staged implementation for legacy scalar scatter ADD/MUL.
 
 No runtime ABI or LUT changed. Mypy remains at the exact 12-error baseline.
 Next forward group: `TestOps.test_scaled_dot_product_attention`.
+
+## 2026-07-31 — full test_ops.py hardware suite baseline (424 cases)
+
+Ran the complete `test/backend/test_ops.py` suite (424 cases) on the ROCKCHIP
+NPU backend for the first time, to establish a hardware pass/fail baseline.
+
+Command:
+
+```sh
+FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP .venv/bin/python -m pytest \
+  test/backend/test_ops.py -p test.rockchip.conftest_rockchip \
+  --forked --tb=line -q -rN
+```
+
+`--forked` is required: several tests (the cum* family, `test_isclose_edge_cases`,
+`test_cast`, `test_abs_exact`, `test_9_gemm`, `test_acos`, `test_zeros_like`,
+`test_cast_relu`) poison NPU state so the subsequent `reset_npu` ioctl raises
+SIGABRT/SIGSEGV. Without `--forked` the whole run aborts at the first such test;
+with `--forked` each crash is contained to a child process and the parent
+continues. `pytest-forked` was installed via `uv pip install pytest-forked`.
+
+### Tally — 424 total
+
+| Status | Count |
+|---|---|
+| PASS    | 129 |
+| FAIL    | 287 |
+| SKIP    |   8 |
+| Total   | 424 |
+
+Runtime: 1153.84s (19m13s). NPU health (`ref/rk3588/examples/simple_add.py`)
+PASS before and after the run.
+
+### Failure breakdown by root cause
+
+| Error class | Count | Notes |
+|---|---|---|
+| `RKPLAN_REJECT:unsupported_op`        | 94 | Honest planner rejects — op not implemented |
+| `AssertionError`                      | 42 | Numerical mismatch vs torch reference |
+| `RKPLAN_REJECT:unsupported_dtype`     | 22 | dtype not supported on NPU |
+| `TimeoutError` (Errno 110)            |  6 | NPU job timeout — state pollution class |
+| `OverflowError` (uint8 bounds)        |  6 | Python int → uint8 cast overflow |
+| `RuntimeError not raised`             |  2 | Expected error didn't fire |
+| `NotImplementedError`                 |  2 | Path not implemented |
+| `RKPLAN_REJECT:unsupported_layout`    |  2 | Layout not supported |
+
+### `unsupported_op` sub-breakdown
+
+| Rejected op | Count |
+|---|---|
+| `fused_epilogue`          | 27 |
+| `fus*` (fused variants)   | 27 |
+| `Ops.*` (generic)         | 17 |
+| `Ops.MUL`                 |  6 |
+| `Ops.EXP2`                |  6 |
+| `Ops.WHERE`               |  5 |
+| `non_index_operand`       |  3 |
+
+### Interpretation
+
+- 118 failures (94 unsupported_op + 22 unsupported_dtype + 2 unsupported_layout)
+  are **honest `RKPLAN_REJECT`** from the PR1 planner — ops/dtypes/layouts not
+  yet implemented on the NPU. These are not bugs; they are deferred work.
+- 42 `AssertionError` are real numerical mismatches that need investigation.
+- 6 `TimeoutError` are the same NPU state-pollution class documented in
+  `ref/rk3588/progress.md` (C64/H56 blocker): the job submits but the NPU never
+  raises the completion IRQ, so the driver times out and soft-resets.
+- 6 `OverflowError` are uint8 cast bounds errors in the test harness path.
+- The 8 skips are pytest skips, not rockchip-specific.
+
+This is the first full-suite hardware baseline. The hardware-free Rockchip
+contract (test/rockchip/test_pr1.py, DEV=NULL) remains at 139/139.
+
+## 2026-07-31 — scaled-dot-product attention milestone
+
+All five unchanged attention methods now pass with `FORWARD_ONLY=1`,
+`DEFAULT_FLOAT=HALF`, `DEV=ROCKCHIP`, `--forked`, and `-n12`:
+
+| Method | Result |
+|---|---|
+| `test_scaled_dot_product_attention` (base + additive mask) | PASS, 32.93s |
+| `test_scaled_dot_product_attention_mismatch_ls` | PASS, 13.95s |
+| `test_scaled_dot_product_attention_causal` | PASS, 23.73s |
+| `test_scaled_dot_product_attention_gqa` | PASS, 41.40s |
+| `test_scaled_dot_product_attention_gqa_errors` | PASS, 11.03s |
+
+The hardware-free Rockchip contract is **143/143 in 8.98s**. The shared
+attention dtype and four-kernel scheduling checks also pass.
+
+### Debug sequence and root causes
+
+1. The original fp16 attention result had 31.2% mismatches and maximum error
+   near 2.318. Capturing each mapped input immediately before the final value
+   contraction showed that the score buffer had changed by as much as 7.697,
+   the MAX buffer was all zero, and the denominator contained values around
+   182–270 instead of the expected 1–16 range.
+2. The softmax MAX kernel was a 31-task program: 16 host gather stages followed
+   by 15 native DPU MAX stages. Although no logical task wrote the score slot,
+   this mixed path mutated the mapped score input. A strict bounded floating
+   MAX classifier now emits one compact typed reduction. The large error
+   disappeared, leaving only a one-half-ULP (`0.001953`) precision mismatch.
+3. A CPU control with `DEFAULT_FLOAT=HALF` reproduced the one-ULP mismatch:
+   PyTorch selected its architecture-specific CPU flash SDPA implementation,
+   while tinygrad explicitly narrowed scores before softmax. PyTorch's official
+   MATH SDPA backend is now selected by the Rockchip test plugin, and tinygrad
+   keeps score, softmax, and value accumulation in fp32 before narrowing only
+   the public result. The CPU control then passed.
+4. The Rockchip path still differed by up to `0.0011` in the first score
+   intermediate. Stage-level capture isolated this to the dot product:
+   generic UOp evaluation rounded every fp16 product before its fp32 sum,
+   whereas CPU/NPU `MULACC` widens operands before multiplication. The strict
+   attention score stage now widens Q/K first. The base hardware test then
+   passed.
+
+### Runtime/compiler details
+
+- The compact typed reduction ABI now carries ADD, MUL, or MAX and can append
+  an exact post-reduction expression. Opcode 31 injects the fp32 reduced value
+  into that epilogue, allowing the final attention division to occur after,
+  rather than inside, the value sum.
+- Scaled QK, optional additive/causal masking, softmax denominator, and final
+  value contraction have strict attention fingerprints. Their reduction width
+  is bounded at 128 for QK and 64 for softmax/value work.
+- GQA's folded two-dimensional score/value schedules use the same bounded
+  tasks. Candidate grids are processed in chunks of at most four million
+  values, preserving per-row reduction order while avoiding a single 16M-value
+  allocation.
+- The rejected first GQA approach produced 49,152 CMAC tasks and tripped the
+  process watchdog. That path is not active. A later 1.125 MiB Rockchip GEM
+  allocation also returned `ENXIO`; small failed allocations now use the
+  existing mapped host-backed buffer fallback after destroying the unusable
+  GEM handle.
+- `ref/rk3588/conv_grok` was reviewed again. Its useful transferable ideas are
+  formula-driven chunk bounds and preserving fp32 accumulation surfaces. It
+  contains no attention/softmax implementation to copy.
+
+No LUT or two-level LUT changed. `lut.md` therefore remains unchanged. Mypy is
+back at the exact 12-error baseline. Ruff reports nine pre-existing issues in
+the touched legacy files and no issue on the new attention lines. Next forward
+group: `TestOps.test_binary_crossentropy`.

@@ -324,4 +324,8 @@ class RandMixin(OpMixin):
     if attn_mask is not None:
       if attn_mask.dtype == dtypes.bool: attn_mask = attn_mask.where(0, -float("inf"))
       qk = qk + attn_mask
-    return qk.cast(self.dtype).softmax(-1).dropout(dropout_p) @ value
+    # Match SDPA's reference precision: reduced-width Q/K/V keep fp32 score,
+    # softmax, and value accumulation, with only the public result narrowed.
+    attention_dtype = least_upper_dtype(q.dtype, key.dtype, value.dtype, dtypes.float32)
+    attention = qk.softmax(-1, dtype=attention_dtype).dropout(dropout_p)
+    return attention.matmul(value.cast(attention_dtype), dtype=attention_dtype).cast(self.dtype)

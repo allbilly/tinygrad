@@ -627,6 +627,77 @@ class TestClassifier(unittest.TestCase):
     self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 8)
     self.assertEqual(subtasks[-1].task.layout[1], _HOST_FP32_COMBINE_LAYOUT)
 
+  def test_large_shared_fp32_gemm_serializes_before_k_limit(self):
+    query = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    key = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink((query @ key.transpose(-2,-1)) * 0.25))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    cmac_tasks = [task.task for task in subtasks if task.task.kind == "cmac"]
+    self.assertEqual(len(cmac_tasks), 3*256)
+    self.assertTrue(all(task.layout[:3] == (16,16,64) for task in cmac_tasks))
+    self.assertEqual(sum(task.fp32_output for task in cmac_tasks), 256)
+    self.assertEqual(subtasks[-1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
+  def test_attention_score_gemm_uses_bounded_typed_reduction(self):
+    query = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    key = Tensor.empty(256,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    program = build_native_program(_get_sink((query @ key.transpose(-2,-1)) * 0.125))
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 2)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+    self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    causal_query = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    causal_key = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    causal_value = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    causal_sink = next(early_simplify(call.src[0]) for call in
+                       causal_query.scaled_dot_product_attention(causal_key, causal_value, is_causal=True).schedule_linear().src
+                       if call.src[0].op is Ops.SINK)
+    causal_program = build_native_program(causal_sink)
+    self.assertIsNotNone(causal_program)
+    self.assertEqual([task.task.layout[1] for task in causal_program.src[1].src[0].arg],
+                     [_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_LAYOUT])
+
+  def test_attention_value_gemm_uses_bounded_typed_reduction(self):
+    query = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    key = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    value = Tensor.empty(32,8,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    sinks = [early_simplify(call.src[0]) for call in query.scaled_dot_product_attention(key, value).schedule_linear().src
+             if call.src[0].op is Ops.SINK]
+    program = build_native_program(sinks[-1])
+    self.assertIsNotNone(program)
+    subtasks = program.src[1].src[0].arg
+    self.assertEqual(len(subtasks), 2)
+    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+    self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    gqa_query = Tensor.empty(32,32,16,64, dtype=dtypes.float, device="ROCKCHIP")
+    gqa_sinks = [early_simplify(call.src[0]) for call in
+                 gqa_query.scaled_dot_product_attention(key, value, enable_gqa=True).schedule_linear().src
+                 if call.src[0].op is Ops.SINK]
+    for sink in (gqa_sinks[0], gqa_sinks[-1]):
+      gqa_program = build_native_program(sink)
+      self.assertIsNotNone(gqa_program)
+      self.assertEqual([task.task.layout[1] for task in gqa_program.src[1].src[0].arg],
+                       [_HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_ELEMENTWISE_LAYOUT])
+
+  def test_half_attention_uses_typed_score_and_softmax_reductions(self):
+    query = Tensor.empty(32,8,16,64, dtype=dtypes.half, device="ROCKCHIP")
+    key = Tensor.empty(32,8,16,64, dtype=dtypes.half, device="ROCKCHIP")
+    value = Tensor.empty(32,8,16,64, dtype=dtypes.half, device="ROCKCHIP")
+    sinks = [early_simplify(call.src[0]) for call in query.scaled_dot_product_attention(key, value).schedule_linear().src
+             if call.src[0].op is Ops.SINK]
+    for sink_index, expected_count in ((0, 2), (1, 1), (3, 1)):
+      program = build_native_program(sinks[sink_index])
+      self.assertIsNotNone(program)
+      subtasks = program.src[1].src[0].arg
+      self.assertEqual(len(subtasks), expected_count)
+      self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_REDUCE_LAYOUT)
+      if expected_count == 2: self.assertEqual(subtasks[1].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+    denominator_program = build_native_program(sinks[2])
+    self.assertIsNotNone(denominator_program)
+    self.assertEqual(denominator_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+
   def test_fp32_factorized_zero_stride_sum_stays_native(self):
     a = Tensor.empty(2,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
     b = Tensor.empty(1,4,1, dtype=dtypes.float, device="ROCKCHIP").expand(2,4,3)
