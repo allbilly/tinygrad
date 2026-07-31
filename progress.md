@@ -12073,3 +12073,68 @@ Pre-edit recovery copies:
 `/tmp/test_ops_status.md.20260731-203002`.
 
 Result: the requested forward-only Rockchip `TestOps` goal is complete.
+
+## 2026-07-31 — Rockchip size-compaction milestone
+
+Three table-driven refactors reduce the two Rockchip runtime files by **580
+`sz.py` lines**, from 15,698 to 15,118. Repository size moves from 40,007 to
+39,427 counted lines. Physical Rockchip source moves from 18,059 to 17,479
+lines.
+
+The milestones are:
+
+- `fc69aeff3`, patch `0127-rockchip-compact-classifier-dispatch.patch`:
+  replace the repeated native classifier chain while preserving all 133 active
+  classifiers and their exact order; `support/rockchip.py` saves 153 counted
+  lines.
+- `927996958`, patch `0128-rockchip-centralize-host-dispatch.patch`:
+  centralize typed-host runners with path-specific allowlists;
+  `ops_rockchip.py` saves 189 counted lines.
+- `6cb4310f6`, patch `0129-rockchip-table-drive-lut-builders.patch`:
+  table-drive 74 unique ordinary LUT marker variants while preserving every
+  builder body, roundoff's separate configuration, and the register stream;
+  `support/rockchip.py` saves another 238 counted lines and `_emit_dpu_lut`
+  falls from 388 to 103 counted lines.
+
+`rockchip_size.md` contains the full audit. The dominant source is lowering:
+typed/general plus native/LUT task lowering occupied 10,402 baseline lines,
+77.5% of `support/rockchip.py`. LUT builders were only 742 lines. Of 63 LUT
+builders, 42 static builders occupy 483 counted lines and 21 parameterized
+builders occupy 255.
+
+The recommended external LUT compiler is a generator in `extra/rockchip/`
+with a committed versioned Python artifact in `runtime/autogen/`. It should
+precompile static and finite-variant tables, retain dynamic alpha/beta/scale
+builders, include table metadata and a digest, and have a byte-for-byte
+regeneration check. Merely moving handwritten code into the `sz.py`-excluded
+`autogen` directory is explicitly rejected as metric gaming.
+
+Validation:
+
+- after the first two commits, the complete inventory passed **405 methods,
+  13 skips, and 126 subtests in 2366.21s**;
+- after LUT dispatch, PR1 passed **173/173 in 10.71s** and all LUT tests in the
+  serialized `TestDPU` class passed;
+- the definitive post-LUT inventory passed **405 methods, 13 skips, and 126
+  subtests in 2373.12s (39:33)** with zero failures;
+- mypy remains at the exact 12-error baseline; touched-file Ruff now reports
+  only the eight pre-existing `support/rockchip.py` findings; `git diff
+  --check` passes.
+
+One attempted whole-`test_hw.py` run with `-n12 --dist loadscope` is not a
+valid backend result: xdist assigned separate hardware classes to concurrent
+workers sharing one NPU, producing 48 `EINVAL` submissions and one polluted
+result. Running the LUT-containing class on one worker passed every LUT case;
+the two unrelated argsort/product failures followed the invalid concurrent
+run. The correctly serialized complete TestOps replay above is authoritative.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-215851`,
+`/tmp/ops_rockchip.py.20260731-220353`,
+`/tmp/rockchip.py.20260731-224641`,
+`/tmp/progress.md.20260731-233743`,
+`/tmp/test_ops_status.md.20260731-233743`, and
+`/tmp/rockchip_size.md.20260731-233743`.
+
+Next size step: implement the versioned external compiler for the 42 static
+LUT builders, then validate generated tables byte-for-byte and on hardware.

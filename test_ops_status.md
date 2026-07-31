@@ -3279,3 +3279,17 @@ suite warning is the known nonfinite fp16-to-fp32 NumPy cast in `test_exp`,
 whose assertions pass. Worktree is clean except intentional `ref/` clones.
 
 **Final status: all runnable forward-only Rockchip TestOps cases pass.**
+
+### Size compaction remains fully green
+
+Commits `fc69aeff3`, `927996958`, and `6cb4310f6` reduce Rockchip runtime code
+by **580 `sz.py` lines** without changing the forward-only result. The final
+sizes are 13,031 counted lines in `support/rockchip.py` and 2,087 in
+`ops_rockchip.py`, versus 13,422 and 2,276 before the audit.
+
+The definitive post-refactor inventory passes **405 methods, 13 expected
+skips, and 126 subtests in 2373.12s (39:33)** with zero failures. PR1 remains
+**173/173**; mypy remains at its exact 12-error baseline, and touched-file
+Ruff has only eight pre-existing support-file findings. See
+`rockchip_size.md` for the line-category audit and external LUT compiler
+design. Saved implementation patches are `0127`, `0128`, and `0129`.

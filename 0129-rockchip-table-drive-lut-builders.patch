@@ -1,0 +1,383 @@
+From 6cb4310f6506e6f8bed0237a69de3fd363f115f4 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 22:57:50 +0800
+Subject: [PATCH] rockchip: table-drive LUT builder selection
+
+---
+ tinygrad/runtime/support/rockchip.py | 349 +++++----------------------
+ 1 file changed, 56 insertions(+), 293 deletions(-)
+
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index bdf3c03ef..a162838a6 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -1731,6 +1731,58 @@ def _build_bce_logits_lut() -> tuple[list[int], int, float, float, int]:
+   for knot_index in (23, 24): lut[_LUT_SIZE+knot_index] += 16
+   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
+ 
++_LUTBuild = tuple[list[int], int, float, float, int]
++_LUT_STATIC_BUILDERS:dict[Ops, Callable[[], _LUTBuild]] = {
++  _LUT_EXP_CORRECTION: _build_exp_correction_lut, _LUT_EXP2_SCALE: _build_exp2_scale_lut,
++  _LUT_EXP2_RESIDUAL: _build_exp2_residual_lut, _LUT_HARDSWISH: _build_hardswish_lut,
++  _LUT_HARDSWISH_CORRECTION: _build_hardswish_correction_lut, _LUT_ERF: _build_erf_lut,
++  _LUT_ERF_LOCAL: _build_erf_local_lut, _LUT_QUICK_GELU: _build_quick_gelu_lut,
++  _LUT_QUICK_GELU_LOCAL: _build_quick_gelu_local_lut, _LUT_TANH: _build_tanh_lut,
++  _LUT_TANH_LOCAL: _build_tanh_local_lut, _LUT_MISH: _build_mish_lut, _LUT_MISH_LOCAL: _build_mish_local_lut,
++  Ops.LOG2: _build_log2_lut, Ops.SIN: _build_sin_lut, _LUT_SIN_LOCAL: _build_sin_local_lut,
++  _LUT_COS: _build_cos_lut, _LUT_COS_LOCAL: _build_cos_local_lut, _LUT_ASIN: _build_asin_lut,
++  _LUT_ASIN_DETAIL: _build_asin_detail_lut, _LUT_ASIN_DERIVATIVE: _build_asin_derivative_lut,
++  _LUT_ACOS: _build_acos_lut, _LUT_ACOS_ENDPOINT: _build_acos_endpoint_lut,
++  _LUT_ACOS_FINE_ENDPOINT: _build_acos_fine_endpoint_lut, _LUT_ATAN: _build_atan_lut,
++  _LUT_ATAN_LOCAL: _build_atan_local_lut, _LUT_ATANH: _build_atanh_lut, _LUT_ATANH_DETAIL: _build_atanh_detail_lut,
++  _LUT_POW8: _build_pow8_lut, _LUT_POW8_CORRECTION: _build_pow8_correction_lut, _LUT_POW8_HIGH: _build_pow8_high_lut,
++  _LUT_POW_BASE07: _build_pow_base07_lut, _LUT_TAN_LOCAL: _build_tan_local_lut, _LUT_TAN_WIDE: _build_tan_wide_lut,
++  _LUT_SINH: _build_sinh_lut, _LUT_SINH_LOCAL: _build_sinh_local_lut, _LUT_COSH: _build_cosh_lut,
++  Ops.SQRT: _build_sqrt_lut, Ops.RECIPROCAL: _build_rsqrt_lut, _LUT_SIGMOID: _build_sigmoid_lut,
++  _LUT_SIGMOID_LOCAL: _build_sigmoid_local_lut, _LUT_BCE_LOGITS: _build_bce_logits_lut,
++}
++_LUT_SCALE_BUILDERS:dict[Ops, Callable[[float], _LUTBuild]] = {
++  Ops.EXP2: _build_exp2_lut, _LUT_CELU: _build_celu_lut, _LUT_CELU_LOCAL: _build_celu_local_lut,
++  _LUT_ELU: _build_elu_lut, _LUT_ELU_LOCAL: _build_elu_local_lut, _LUT_LOG2_LOCAL: _build_log2_local_lut,
++  _LUT_LOGSIGMOID_CORRECTION: _build_logsigmoid_correction_lut, _LUT_LOGSIGMOID_TAIL: _build_logsigmoid_tail_lut,
++  _LUT_SOFTPLUS_TAIL: _build_softplus_tail_lut, _LUT_SOFTPLUS_WIDE: _build_softplus_wide_lut,
++}
++_LUT_SCALE_BOOL_BUILDERS:dict[Ops, Callable[[bool], _LUTBuild]] = {
++  _LUT_GELU: _build_gelu_lut, _LUT_GELU_LOCAL: _build_gelu_local_lut,
++}
++_LUT_FIXED_BOOL_BUILDERS:dict[Ops, tuple[Callable[[bool], _LUTBuild], bool]] = {
++  _LUT_LOG_HALF_LOW: (_build_log_half_lut, False), _LUT_LOG_HALF_HIGH: (_build_log_half_lut, True),
++  _LUT_ASINH_CORE: (_build_asinh_acosh_core_lut, False), _LUT_ASINH_RANGE: (_build_asinh_acosh_range_lut, False),
++  _LUT_ACOSH_CORE: (_build_asinh_acosh_core_lut, True), _LUT_ACOSH_RANGE: (_build_asinh_acosh_range_lut, True),
++  _LUT_POW55: (_build_pow55_lut, False), _LUT_POW55_HIGH: (_build_pow55_lut, True),
++  _LUT_POW_NEG55_LOW: (_build_pow_neg55_lut, False), _LUT_POW_NEG55_HIGH: (_build_pow_neg55_lut, True),
++  _LUT_POW_BASE55_LOW: (_build_pow_base55_lut, False), _LUT_POW_BASE55_HIGH: (_build_pow_base55_lut, True),
++  _LUT_POW_BASE2_LOW: (_build_pow_base2_lut, False), _LUT_POW_BASE2_HIGH: (_build_pow_base2_lut, True),
++  _LUT_BCE_ZERO: (_build_bce_endpoint_lut, False), _LUT_BCE_ONE: (_build_bce_endpoint_lut, True),
++}
++_LUT_REGION_BUILDERS = {
++  _LUT_POW_BASE8_LOW: 1, _LUT_POW_BASE8_HIGH: 2, _LUT_POW_BASE8_FAR_LOW: 0, _LUT_POW_BASE8_FAR_HIGH: 3,
++}
++
++def _build_lut_tables(lut_op:Ops, input_scale:float) -> _LUTBuild:
++  if (static_builder := _LUT_STATIC_BUILDERS.get(lut_op)) is not None: return static_builder()
++  if (scale_builder := _LUT_SCALE_BUILDERS.get(lut_op)) is not None: return scale_builder(input_scale)
++  if (scale_bool_builder := _LUT_SCALE_BOOL_BUILDERS.get(lut_op)) is not None: return scale_bool_builder(bool(input_scale))
++  if (fixed_bool_builder := _LUT_FIXED_BOOL_BUILDERS.get(lut_op)) is not None:
++    return fixed_bool_builder[0](fixed_bool_builder[1])
++  if (region := _LUT_REGION_BUILDERS.get(lut_op)) is not None: return _build_pow_base8_lut(region)
++  raise AssertionError(f"dpu_lut: no builder for {lut_op}")
++
+ def _try_sigmoid(val:UOp) -> int|None:
+   """RECIPROCAL(1 + EXP2(INDEX * -log2(e))) → input slot."""
+   if val.op is not Ops.RECIPROCAL or (add := _unwrap(val.src[0])).op is not Ops.ADD: return None
+@@ -8236,303 +8288,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
+   # DST_SURF_STRIDE = (width+1) * (channel+1) * 2 bytes
+   surf_stride = (width + 1) * 8 * 2
+   # --- LUT table fill (513 entries × 2 tables) ---
+-  if lut_op is Ops.EXP2:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_lut(input_scale)
+-    lut_le_start = 0xffffc000  # -16384
+-    lut_lo_end = 0x00004000    # 16384
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
+-  elif lut_op is _LUT_EXP_CORRECTION:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp_correction_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_EXP2_SCALE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_scale_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_EXP2_RESIDUAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_residual_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_HARDSWISH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_HARDSWISH_CORRECTION:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_correction_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_CELU:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_celu_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_CELU_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_celu_local_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ELU:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_elu_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ELU_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_elu_local_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ERF:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_erf_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ERF_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_erf_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_GELU:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_gelu_lut(bool(input_scale))
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_GELU_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_gelu_local_lut(bool(input_scale))
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_QUICK_GELU:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_quick_gelu_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_QUICK_GELU_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_quick_gelu_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_TANH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tanh_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_TANH_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tanh_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_LOG2_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op in (_LUT_LOG_HALF_LOW, _LUT_LOG_HALF_HIGH):
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log_half_lut(lut_op is _LUT_LOG_HALF_HIGH)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_LOGSIGMOID_CORRECTION:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_correction_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_LOGSIGMOID_TAIL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_tail_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_SOFTPLUS_TAIL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_softplus_tail_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_SOFTPLUS_WIDE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_softplus_wide_lut(input_scale)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_MISH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_mish_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_MISH_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_mish_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is Ops.LOG2:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
+-    lut_le_start = 0xffffc000  # -16384
+-    lut_lo_end = 0x00004000    # 16384
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+-  elif lut_op is Ops.SIN:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sin_lut()
+-    lut_le_start = 0xffffc000  # -16384
+-    lut_lo_end = 0x00004000    # 16384
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+-  elif lut_op is _LUT_SIN_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sin_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_COS:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cos_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_COS_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cos_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ASIN:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ASIN_DETAIL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_detail_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ASIN_DERIVATIVE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_derivative_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ACOS:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ACOS_ENDPOINT:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_endpoint_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ACOS_FINE_ENDPOINT:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_fine_endpoint_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ATAN:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ATAN_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ATANH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atanh_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ATANH_DETAIL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atanh_detail_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ASINH_CORE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_core_lut(False)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ASINH_RANGE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_range_lut(False)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ACOSH_CORE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_core_lut(True)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ACOSH_RANGE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_range_lut(True)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW8:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW8_CORRECTION:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_correction_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW8_HIGH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_high_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW55:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow55_lut(False)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW55_HIGH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow55_lut(True)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_NEG55_LOW:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_neg55_lut(False)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_NEG55_HIGH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_neg55_lut(True)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE55_LOW:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base55_lut(False)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE55_HIGH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base55_lut(True)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE8_LOW:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(1)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE8_HIGH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(2)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE8_FAR_LOW:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(0)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE8_FAR_HIGH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(3)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_POW_BASE07:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base07_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op in (_LUT_POW_BASE2_LOW, _LUT_POW_BASE2_HIGH):
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base2_lut(lut_op is _LUT_POW_BASE2_HIGH)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_TAN_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_TAN_WIDE:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_wide_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_SINH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sinh_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_SINH_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sinh_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_COSH:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cosh_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is Ops.SQRT:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sqrt_lut()
+-    lut_le_start = 0xffffc000  # -16384
+-    lut_lo_end = 0x00004000    # 16384
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+-  elif lut_op is Ops.RECIPROCAL:
+-    # RECIPROCAL(SQRT(x)) → RSQRT LUT
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_rsqrt_lut()
+-    lut_le_start = 0xffffc000  # -16384
+-    lut_lo_end = 0x00004000    # 16384
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
+-  elif lut_op is _LUT_SIGMOID:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_SIGMOID_LOCAL:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_local_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op in (_LUT_BCE_ZERO, _LUT_BCE_ONE):
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_bce_endpoint_lut(lut_op is _LUT_BCE_ONE)
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_BCE_LOGITS:
+-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_bce_logits_lut()
+-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+-  elif lut_op is _LUT_ROUNDOFF:
++  if lut_op is _LUT_ROUNDOFF:
+     lut = [0 if i % 2 == 0 else 1 << 14 for i in range(_LUT_SIZE)] * 2
+     bn_mul_operand, minus_exp = 0, 0
+     lut_le_start, lut_lo_end = 0x00000000, 0x44800000
+-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
+   else:
+-    raise AssertionError(f"dpu_lut: no builder for {lut_op}")
++    lut, bn_mul_operand, _, _, minus_exp = _build_lut_tables(lut_op, input_scale)
++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++  lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
+   # Apply output_scale_factor via OUT_CVT_SCALE (Q15 fixed-point) — see below
+   for table_id, base in ((0, 0), (1, _LUT_SIZE)):
+     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_ACCESS_CFG,
+-- 
+2.34.1
+
