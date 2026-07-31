@@ -10506,3 +10506,32 @@ test.
 No new layout tag, LUT, or two-level LUT changed. Mypy remains at the exact
 12-error baseline and touched-file Ruff remains at nine pre-existing
 findings. Next ordered forward group: `TestOpsUint8.test_cast`.
+
+## 2026-07-31 — uint8 milestone
+
+The complete unchanged `TestOpsUint8` class now passes **6/6 in 107.97s**
+on RK3588 with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF` and
+`-n12 --dist loadscope`. This includes cast, ReLU-cast, bilinear,
+nearest, nearest-exact, and both `min()` inputs. Implementation commit:
+`181b51b9f`; portable patch: `0088-rockchip-pass-uint8-ops.patch`.
+
+NumPy 2.x rejects out-of-range Python scalars passed directly through
+`np.asarray(..., dtype=integer)`. The typed host interpreter hit this first
+at `1020 -> uint8`, then at the valid intermediate `253 -> int8` used by the
+bilinear index graph. Its scalar and vector cast boundaries now use explicit
+NumPy unsafe integer conversion, preserving tinygrad's intended truncation
+and fixed-width wrap semantics for every signed and unsigned integer dtype.
+Floating and boolean conversions retain the prior path.
+
+`uint8.min()` lowers as the exact unsigned-order transform
+`XOR(MAX(XOR(x, 255)), 255)`, sometimes with an inline int32-to-uint8 cast.
+A narrow classifier verifies that complete graph, a scalar output, static
+reduction axes covering the entire bounded input, and direct int32/uint8
+storage. It then reuses the typed MAX reduction and post-reduction epilogue;
+no generic host fallback is enabled.
+
+The hardware-free Rockchip contract is **154/154 in 10.12s**. Mypy remains
+at the exact 12-error baseline and touched-file Ruff remains at the exact
+nine pre-existing findings. No runtime layout tag, LUT, or two-level LUT
+changed. Next step: rerun and retally the complete forward-only ops suite,
+then take the smallest remaining failure group.

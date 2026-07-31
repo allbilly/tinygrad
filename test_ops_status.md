@@ -2567,3 +2567,25 @@ a cast.
 Contract: **153/153 in 15.83s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. No LUT or two-level LUT changed. Next forward
 group: `TestOpsUint8.test_cast`.
+
+### Uint8 ops
+
+The full `TestOpsUint8` class passes **6/6 in 107.97s** with
+`-n12 --dist loadscope`: cast, ReLU-cast, bilinear, nearest, nearest-exact,
+and min. Commit `181b51b9f`; saved patch
+`0088-rockchip-pass-uint8-ops.patch`.
+
+Typed scalar/vector integer conversion now explicitly requests NumPy's
+unsafe fixed-width cast semantics. This avoids NumPy 2.x `OverflowError`
+for interpolation intermediates such as `1020 -> uint8` and `253 -> int8`
+while preserving the backend graph's truncation/wrap behavior.
+
+The uint8 minimum graph is separately constrained to
+`XOR(MAX(XOR(x, 255)), 255)` over one complete, static, bounded input. It
+uses the existing typed reduction layout and epilogue instead of broadening
+the general host path.
+
+Contract: **154/154 in 10.12s**. Mypy remains at 12 and touched-file Ruff at
+nine pre-existing findings. No LUT or two-level LUT changed. Next action:
+retally the complete forward-only ops suite and select the smallest remaining
+failure group.
