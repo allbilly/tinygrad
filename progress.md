@@ -12361,6 +12361,20 @@ PR1 passes **173/173 in 13.42s**. Normal and extreme TANH pass **2/2** on
 serialized RK3588 (4.10s and 7.54s); mypy/Ruff remain exactly 12/8 and the
 compile/diff gates pass.
 
+### Hardswish regional graph
+
+Commit `014fe296d`; saved patch
+`0152-rockchip-compose-hardswish-task-graph.patch`.
+
+Hardswish now composes its broad LUT, exact ReLU6 fallback, wide interval,
+local correction LUT, narrow interval, exact nonzero mask, and final selection
+through `_TaskGraph`. This removes **56 counted lines**, reaching **11,416** in
+`support/rockchip.py`.
+
+PR1 passes **173/173 in 12.91s** and focused RK3588 Hardswish passes **1/1 in
+4.20s**. Static baselines remain exactly 12 mypy errors and eight touched-file
+Ruff findings; compilation and diff checking pass.
+
 ### Declarative GELU/ELU graphs
 
 Commit `1e4c75025`; patch
