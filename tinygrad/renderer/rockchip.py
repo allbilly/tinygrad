@@ -91,6 +91,7 @@ class RKView:
   shape: tuple[int, ...]
   strides: tuple[int, ...]
   offset: int = 0
+  kind: RKBufferKind = RKBufferKind.ARG
 
 @dataclass(frozen=True)
 class RKContract:
@@ -273,23 +274,33 @@ def _affine(u:UOp) -> tuple[dict[int, int], int]|None:
   return None
 
 def lower_contract(sink:UOp) -> RKContract|None:
-  """Recognize the directly legal M=1, K=32 affine contraction A @ packed-B.T."""
+  """Recognize directly legal M=1, K=32 affine contractions and row sums."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1: return None
   store, reduce = stores[0], reductions[0]
   if store.src[0].op is not Ops.INDEX or store.src[0].dtype is not dtypes.half or reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2: return None
   body, red = _strip_casts(reduce.src[0]), reduce.src[1]
+  out_param, out_aff = store.src[0].src[0], _affine(store.src[0].src[1])
+  if out_param.op is not Ops.PARAM or out_aff is None or out_aff[1] or len(out_aff[0]) != 1: return None
+  if body.op is Ops.INDEX:
+    inp_aff = _affine(body.src[1])
+    out_axis, red_axis, n = next(iter(out_aff[0])), red.arg[0], int(out_param.src[0].arg)
+    if (body.dtype is not dtypes.half or body.src[0].op is not Ops.PARAM or red.op is not Ops.RANGE or int(red.src[0].arg) != 32 or
+        not 4 <= n <= 16 or out_aff[0] != {out_axis:1} or inp_aff != ({out_axis:32, red_axis:1}, 0) or
+        int(body.src[0].src[0].arg) != n*32): return None
+    ones = RKView(0, (1,32), (32,1), kind=RKBufferKind.CONSTANT)
+    return RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), ones,
+                      RKView(body.src[0].arg.slot, (n,32), (32,1)), (red_axis,))
   if body.op is not Ops.MUL or red.op is not Ops.RANGE or int(red.src[0].arg) != 32: return None
   lhs, rhs = (_strip_casts(x) for x in body.src)
   if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half or x.src[0].op is not Ops.PARAM for x in (lhs, rhs)): return None
-  out_aff, lhs_aff, rhs_aff = _affine(store.src[0].src[1]), _affine(lhs.src[1]), _affine(rhs.src[1])
-  if out_aff is None or lhs_aff is None or rhs_aff is None or any(x[1] for x in (out_aff, lhs_aff, rhs_aff)): return None
+  lhs_aff, rhs_aff = _affine(lhs.src[1]), _affine(rhs.src[1])
+  if lhs_aff is None or rhs_aff is None or any(x[1] for x in (lhs_aff, rhs_aff)): return None
   red_axis = red.arg[0]
   out_axes = tuple(out_aff[0])
   if len(out_axes) != 1 or out_aff[0][out_axes[0]] != 1 or lhs_aff[0] != {red_axis:1}: return None
   n_axis, n = out_axes[0], next(int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.arg[0] == out_axes[0])
   if not 1 <= n <= 16 or rhs_aff[0] != {n_axis:32, red_axis:1}: return None
-  out_param = store.src[0].src[0]
   if out_param.op is not Ops.PARAM or int(out_param.src[0].arg) != n or int(lhs.src[0].src[0].arg) != 32 or int(rhs.src[0].src[0].arg) != n*32:
     return None
   return RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), RKView(lhs.src[0].arg.slot, (1,32), (32,1)),
@@ -433,9 +444,11 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, 0), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
-  relocs = (RKReloc(0, 18, RKBufferKind.ARG, plan.lhs.slot), RKReloc(0, 24, RKBufferKind.ARG, plan.rhs.slot),
-            RKReloc(0, 31, RKBufferKind.ARG, plan.out.slot))
-  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, (plan.lhs.slot, plan.rhs.slot), (plan.out.slot,), flags=RK_STAGE_RESET),))
+  relocs = (RKReloc(0, 18, plan.lhs.kind, plan.lhs.slot), RKReloc(0, 24, plan.rhs.kind, plan.rhs.slot),
+            RKReloc(0, 31, plan.out.kind, plan.out.slot))
+  reads = tuple(x.slot for x in (plan.lhs, plan.rhs) if x.kind is RKBufferKind.ARG)
+  constants = struct.pack("<e", 1.0)*32 if any(x.kind is RKBufferKind.CONSTANT for x in (plan.lhs, plan.rhs)) else b""
+  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, reads, (plan.out.slot,), flags=RK_STAGE_RESET),), constants=constants)
 
 def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")

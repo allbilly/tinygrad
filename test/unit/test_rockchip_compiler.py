@@ -112,6 +112,16 @@ class TestDPUCompiler(unittest.TestCase):
     a, b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(32,8,dtype=dtypes.half)
     self.assertIsNone(lower_contract(sink(a@b)))
 
+  def test_row_sum_is_constant_backed_contract(self):
+    plan = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
+    self.assertIsInstance(plan, RKContract)
+    self.assertFalse(contains_uop(plan))
+    self.assertIs(plan.lhs.kind, RKBufferKind.CONSTANT)
+    image = emit_contract(plan)
+    self.assertEqual(len(image.constants), 64)
+    self.assertEqual(image.stages[0].reads, (plan.rhs.slot,))
+    self.assertEqual(image.stages[0].relocs[0].kind, RKBufferKind.CONSTANT)
+
   def test_global_max_requires_explicit_hwc_layout(self):
     source = Tensor.empty(8,8,dtype=dtypes.half)
     plan = lower_pool(sink(source.max(axis=0)))
