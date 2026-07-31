@@ -3003,3 +3003,24 @@ Contract remains **167/167 in 10.84s**, with new fp16 scatter PR1 coverage.
 Mypy stays at the exact 12-error baseline and touched-file Ruff at nine
 pre-existing findings. No LUT or two-level LUT changed. Next:
 scatter-reduce.
+
+### Bounded scatter-reduce
+
+The four-method scatter-reduce subgroup passes **4/4 in 16.92s**. Commit
+`1ff6ebc9d`; saved patch
+`0112-rockchip-pass-bounded-scatter-reduce.patch`.
+
+The bounded tensor classifier now admits fp16 data/reduction nodes while
+retaining 1–3 static reductions, per-reduction size ≤8, total expansion
+≤24, exactly one int index and two same-dtype data buffers, the
+WHERE/CMPNE signature, and its fixed op whitelist. All ten fp16
+mode/include-self forms are PR1-covered.
+
+Forced-HALF sum differs from PyTorch by one ULP on both Rockchip and CPU;
+normal-fp32 Rockchip passes in **27.15s**. The three public scatter-reduce
+methods therefore restore normal construction, also preserving their
+intended dtype-error checks.
+
+Contract remains **167/167 in 10.88s**. Mypy stays at the exact 12-error
+baseline and touched-file Ruff at nine pre-existing findings. No LUT or
+two-level LUT changed. Next: scaled-dot-product attention.

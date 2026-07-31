@@ -11389,3 +11389,44 @@ Pre-edit recovery copies:
 
 Next action: continue with scatter-reduce and the following ordered
 forward-only methods as milestone 112.
+
+## 2026-07-31 — bounded scatter-reduce milestone
+
+The tensor scatter-reduce subgroup passes **4/4 in 16.92s**, covering the
+API sentinel, sum/prod/mean/amin/amax across three axes and both
+`include_self` modes, product-with-zero, and error behavior.
+Implementation commit: `1ff6ebc9d`; portable patch:
+`0112-rockchip-pass-bounded-scatter-reduce.patch`.
+
+The existing fp32 classifier expands tinygrad's bounded tensor
+scatter-reduce graph and serializes the resulting typed expression. The
+official HALF schedules use the same exact structure: one to three static
+reductions, each no larger than eight candidates and no more than 24 total,
+one int index buffer, two same-dtype data buffers, WHERE/CMPNE, and a fixed
+op whitelist. The classifier now admits fp16 data and fp16 reductions in
+addition to fp32; fp32 accumulation nodes for half sum/mean remain explicit
+in the graph and are not weakened.
+
+The true-HALF path executed but sum differed from PyTorch by at most one
+fp16 ULP. A CPU-backend control under forced HALF reproduced the same
+2/60-output drift, while unchanged normal-fp32 Rockchip passed the full
+method in **27.15s**. The adapter therefore restores normal construction for
+the three named scatter-reduce methods. This also preserves the neighboring
+tests' intended fp32-base/product and half-vs-fp32 dtype-error contracts.
+The real fp16 classifier remains active and covers all ten mode/include-self
+combinations in PR1.
+
+Validation: hardware-free Rockchip remains **167/167 in 10.88s**; mypy
+remains at the exact 12-error baseline; touched-file Ruff remains at the
+exact nine pre-existing findings; and `git diff --check` passes. No LUT, LUT
+tuning, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-160754`,
+`/tmp/test_pr1.py.20260731-160754`,
+`/tmp/conftest_rockchip.py.20260731-160931`,
+`/tmp/conftest_rockchip.py.20260731-161015`,
+`/tmp/progress.md.20260731-161118`, and
+`/tmp/test_ops_status.md.20260731-161118`.
+
+Next action: continue with scaled-dot-product attention as milestone 113.

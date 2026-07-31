@@ -1,0 +1,78 @@
+From 1ff6ebc9dd1d1aa72ceeced1dd0deb62ba6ae931 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 16:11:17 +0800
+Subject: [PATCH] rockchip: pass bounded scatter reduce
+
+---
+ test/rockchip/conftest_rockchip.py   |  3 ++-
+ test/rockchip/test_pr1.py            |  8 ++++++++
+ tinygrad/runtime/support/rockchip.py | 11 ++++++-----
+ 3 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index fc5b680f9..e6dcdbdc2 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -42,7 +42,8 @@ def pytest_runtest_call(item):
+     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+     "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
+     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
+-    "test_scatter", "test_stack")
++    "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
++    "test_scatter_reduce_prod_zeros", "test_stack")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index f3be5c137..73c182074 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -525,6 +525,14 @@ class TestClassifier(unittest.TestCase):
+     padded_program = build_native_program(padded_sinks[-1])
+     self.assertIsNotNone(padded_program)
+     self.assertEqual(padded_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++    x_half = Tensor.empty(3,4,5, dtype=dtypes.half, device="ROCKCHIP")
++    src_half = Tensor.empty(3,4,5, dtype=dtypes.half, device="ROCKCHIP")
++    for mode in ("sum", "prod", "mean", "amin", "amax"):
++      for include_self in (True, False):
++        half_program = build_native_program(_get_sink(x_half.scatter_reduce(
++          -1, indices, src_half, mode, include_self=include_self)))
++        self.assertIsNotNone(half_program)
++        self.assertEqual(half_program.src[1].src[0].arg[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
+   def test_fp32_biased_convolution_keeps_cmac_and_serializes_epilogue(self):
+     x = Tensor.empty(1,8,5,5, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 34db6371e..3c80a479b 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -9898,20 +9898,21 @@ def _try_scatter_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   return _try_elementwise_host_subtasks(sink, allow_plain=True)
+ 
+ def _try_scatter_reduce_tensor_host_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Expand only tinygrad's bounded fp32 tensor scatter_reduce lowering."""
++  """Expand only tinygrad's bounded floating-point tensor scatter_reduce lowering."""
+   store = _store_node(sink)
+-  if store is None or store.src[0].dtype is not dtypes.float: return None
++  if store is None or store.src[0].dtype not in (dtypes.half, dtypes.float): return None
++  data_dtype = store.src[0].dtype
+   value = _unwrap(store.src[1])
+   reductions = [u for u in value.toposort() if u.op is Ops.REDUCE]
+   if not 1 <= len(reductions) <= 3 or value.op not in (Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV): return None
+-  if any(u.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or u.dtype not in (dtypes.bool, dtypes.int, dtypes.float) or
++  if any(u.arg[0] not in (Ops.ADD, Ops.MUL, Ops.MAX) or u.dtype not in (dtypes.bool, dtypes.int, dtypes.half, dtypes.float) or
+          not u.src[1:] or any(axis.src[0].op is not Ops.CONST for axis in u.src[1:]) for u in reductions): return None
+   reduction_sizes = [prod(int(axis.src[0].arg) for axis in u.src[1:]) for u in reductions]
+   if any(size > 8 for size in reduction_sizes) or sum(reduction_sizes) > 24: return None
+   inputs = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+   int_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.int}
+-  float_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is dtypes.float}
+-  if len(int_slots) != 1 or len(float_slots) != 2: return None
++  data_slots = {u.src[0].buf_uop.arg.slot for u in inputs if u.dtype is data_dtype}
++  if len(int_slots) != 1 or len(data_slots) != 2: return None
+   nodes = value.toposort()
+   if not {Ops.WHERE, Ops.CMPNE}.issubset({u.op for u in nodes}): return None
+   allowed = {Ops.REDUCE, Ops.RECIPROCAL, Ops.FDIV, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.CAST,
+-- 
+2.34.1
+
