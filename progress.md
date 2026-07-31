@@ -10709,3 +10709,55 @@ Hardware-free Rockchip is **158/158 in 9.99s**. Mypy remains at the exact
 12-error baseline and touched-file Ruff at the exact nine pre-existing
 findings. No LUT or two-level LUT changed. Next action: refreshed parallel
 forward retally, with every candidate reproduced alone before fixing.
+
+## 2026-07-31 — modulo milestone
+
+The complete unchanged `TestOps.test_mod` passes in **13.36s** with
+`-n12 --dist loadscope`. It covers the two public tensor/tensor entry
+points for every float/int input pairing plus `x % 2`, `x % 3`, `x % 3.5`,
+`100 % x`, and `100.5 % x`. Implementation commit: `ead24405a`; portable
+patch: `0096-rockchip-pass-modulo-ops.patch`.
+
+The reproducible failure was
+`RKPLAN_REJECT:unsupported_op:non_index_operand`. Modulo is expanded into a
+nested truncation/correction graph, so the root is neither a native
+elementwise operation nor a standalone truncation/WHERE form. Debugging
+used hardware-free scheduled-sink inspection before touching the driver:
+enumerate each value graph's op counts, parameter sizes, scalar constants,
+and output dtype both before and after the backend reciprocal-to-FDIV
+rewrite. That exposed three exact representations:
+
+- tensor/tensor float remainder has `TRUNC`, `CMPLT`, `WHERE`, and
+  `RECIPROCAL` or `FDIV`;
+- scalar-divisor float remainder folds the reciprocal and contains a finite
+  reciprocal/negative-divisor constant pair whose product is `-1`;
+- integer remainder remains one `FLOORMOD`, with either two indexed tensors
+  or one indexed tensor and one integer constant.
+
+A strict classifier now admits only those graphs, with one or two complete
+same-size parameters, no reduction, an allowlist of the remainder expansion
+ops, output restricted to fp16/int32, and total size bounded by `2**20`.
+It serializes the whole expression as one typed host task. Arbitrary
+one-input arithmetic and the opt-in generic host fallback remain excluded.
+The hardware-free regression checks four tensor/tensor dtype combinations
+and both scalar operand directions with integer and fractional literals.
+
+Validation: hardware-free Rockchip **159/159 in 8.93s**; mypy remains at the
+exact 12-error baseline; touched-file Ruff remains at the exact nine
+pre-existing findings; `git diff --check` passes. No LUT, LUT tuning, or
+two-level NPU LUT changed.
+
+Pre-edit recovery copies for this milestone:
+`/tmp/rockchip.py.20260731-134504`,
+`/tmp/test_pr1.py.20260731-134504`,
+`/tmp/rockchip.py.20260731-134530`,
+`/tmp/rockchip.py.20260731-134806`,
+`/tmp/test_pr1.py.20260731-134806`,
+`/tmp/rockchip.py.20260731-135036`,
+`/tmp/test_pr1.py.20260731-135036`,
+`/tmp/progress.md.20260731-135225`, and
+`/tmp/test_ops_status.md.20260731-135225`.
+
+Next action: refresh the forward-only failure inventory using serialized
+load-scope groups, reproduce the next candidate alone, and commit the next
+passing group as milestone 97.

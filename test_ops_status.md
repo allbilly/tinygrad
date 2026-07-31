@@ -2700,3 +2700,25 @@ deferred.
 
 Contract: **158/158 in 9.99s**. Mypy remains at 12 and touched-file Ruff at
 nine pre-existing findings. No LUT changed. Next: refreshed forward retally.
+
+### Modulo
+
+The complete unchanged `test_mod` passes in **13.36s** with
+`-n12 --dist loadscope`. Commit `ead24405a`; saved patch
+`0096-rockchip-pass-modulo-ops.patch`.
+
+Coverage includes both tensor/tensor modulo APIs for all float/int pairings,
+integer and fractional scalar divisors, and integer and fractional scalar
+numerators. The former `non_index_operand` reject came from modulo's nested
+truncation and sign-correction graph.
+
+The new typed boundary is restricted to the canonical remainder signatures:
+float `TRUNC`/`CMPLT`/`WHERE` with a ratio operation or a finite reciprocal
+constant pair, or exactly one integer `FLOORMOD`. Inputs must be one or two
+complete same-size parameters, output must be fp16/int32, there is no
+reduction, only the remainder op allowlist is accepted, and the workload is
+bounded by `2**20`. Generic host execution remains opt-in and unchanged.
+
+Contract: **159/159 in 8.93s**. Mypy remains at the exact 12-error baseline
+and touched-file Ruff at the exact nine pre-existing findings. No LUT or
+two-level LUT changed. Next: isolate the next forward-only failure group.
