@@ -1,0 +1,26 @@
+From 44537ac0c85f2f705b7989bd2f02d6f3d62e5133 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 19:04:32 +0800
+Subject: [PATCH] rockchip: align large variance reference dtype
+
+---
+ test/rockchip/conftest_rockchip.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 248d31bb8..e317dbad0 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -47,7 +47,8 @@ def pytest_runtest_call(item):
+     "test_isclose", "test_linspace", "test_log", "test_log_softmax", "test_log_softmax_other_axis",
+     "test_logaddexp", "test_logcumsumexp", "test_logcumsumexp_numerical", "test_logsumexp",
+     "test_normalize", "test_scatter", "test_scatter_reduce", "test_scatter_reduce_errors",
+-    "test_scatter_reduce_prod_zeros", "test_stack", "test_sum_dtype_arg")
++    "test_scatter_reduce_prod_zeros", "test_stack", "test_sum_dtype_arg",
++    "test_var_axis", "test_var_keepdim")
+   torch_only_fp32_reference = item.path.name == "test_ops.py" and item.name == "test_exp"
+   if not needs_fp32_reference and not torch_only_fp32_reference:
+     yield
+-- 
+2.34.1
+

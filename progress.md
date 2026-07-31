@@ -11952,3 +11952,34 @@ Pre-edit recovery copies:
 
 Next action: complete ordered methods 401–424, then run the full forward-only
 `TestOps` inventory and fix every remaining failure group.
+
+## 2026-07-31 — large-axis variance reference milestone
+
+The final ordered tail passes **18/18 in 35.54s**. Implementation commit:
+`44537ac0c`; portable patch:
+`0124-rockchip-align-large-variance-reference-dtype.patch`.
+
+Only `test_var_axis` and the axis-specific subcase of `test_var_keepdim`
+failed under forced HALF. Both reproduce on tinygrad CPU, with at most
+`0.001953` absolute error against Torch's wider half-variance accumulation.
+The unchanged normal-fp32 Rockchip paths pass together **2/2 in 15.52s**,
+so only these two named methods restore normal tensor/reference
+construction. The other variance and standard-deviation methods retain
+true fp16 coverage.
+
+Validation:
+
+- complete final ordered tail: **18/18 in 35.54s**;
+- normal-fp32 Rockchip control: **2/2 in 15.52s**;
+- hardware-free Rockchip remains **173/173 in 10.31s**;
+- adapter Ruff and `git diff --check` pass.
+
+No backend code, LUT table, tuning parameter, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/conftest_rockchip.py.20260731-190308`,
+`/tmp/progress.md.20260731-190439`, and
+`/tmp/test_ops_status.md.20260731-190439`.
+
+Next action: run the complete forward-only `TestOps` inventory in one
+process-wide sweep and fix any remaining cross-group failures.

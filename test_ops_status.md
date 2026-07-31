@@ -3228,3 +3228,18 @@ at their 12- and 9-finding baselines; `git diff --check` passes. Full-tree
 Ruff additionally scans the intentionally untracked `ref/` clones and is
 not a clean baseline. No LUT or two-level LUT changed. Next: ordered
 methods 401–424, followed by the full forward-only inventory.
+
+### Large-axis variance reference dtype
+
+The final ordered tail passes **18/18 in 35.54s**. Commit `44537ac0c`;
+saved patch `0124-rockchip-align-large-variance-reference-dtype.patch`.
+
+`var(axis=0)` and its keepdim form reproduce their fp16 rounding misses on
+tinygrad CPU (maximum absolute difference `0.001953`). Both pass unchanged
+on Rockchip in normal fp32 mode, **2/2 in 15.52s**, so only those two named
+methods use the normal-fp32 adapter. Other variance/std cases continue to
+exercise the fp16 backend.
+
+Contract remains **173/173 in 10.31s**. Adapter Ruff and
+`git diff --check` pass. No backend or LUT changed. Next: one complete
+forward-only inventory sweep.
