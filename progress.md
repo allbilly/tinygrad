@@ -11609,3 +11609,50 @@ Pre-edit recovery copies:
 
 Next action: finish ordered methods 241–250, then continue the power/product
 block at 251–275.
+
+## 2026-07-31 — constant-base integer-power milestone
+
+The focused regression passes: complete `test_pow_const` plus the
+forward-only collection decision produce **1 passed, 1 skipped in 47.72s**.
+Implementation commit: `028dc3e99`; portable patch:
+`0117-rockchip-pass-constant-base-integer-powers.patch`.
+
+Methods 241–250 passed **10/10 in 59.01s**, completing the 201–250 block.
+The first 251–275 run then reported 22 passes, one existing intentional
+skip, and two failures in 228.76s:
+
+- `test_pow_const` reached only its last `0.7 ** int32` subcase and missed
+  one of six outputs by one fp16 ULP;
+- `test_pow_const_direct` explicitly called `.gradient()` for every case
+  despite `FORWARD_ONLY=1`.
+
+The failing forward graph is exactly
+`EXP2(CAST(int32 exponent) * log2(0.7))`. CPU HALF reproduces tinygrad's
+`[2.041, 1.429, 1, 0.7, 0.49, 0.343]`, while Torch HALF expects
+`[2.04, 1.428, 1, 0.7, 0.4902, 0.3433]`. A normal-fp32 adapter is not valid:
+it makes the earlier exponent-eight tensor fail 1,384/2,925 outputs.
+
+The existing base-0.7 classifier now admits one additional exact signature:
+same-index, bounded int32 input cast once to fp16, fp16 output, and the
+base-0.7 logarithmic scale. It replaces only that scheduled decomposition
+with semantic `pow(fp16(0.7), int32)` in the typed mapped-buffer evaluator.
+All other constant powers retain their existing NPU/LUT paths. The manual
+gradient-only method joins the two comparison-backward methods excluded
+from the explicit forward contract.
+
+Validation: hardware-free Rockchip advances to **169/169 in 10.51s**.
+Mypy remains at the exact 12-error baseline; touched-file Ruff remains at
+the exact nine pre-existing findings; and `git diff --check` passes. No LUT
+table, tuning parameter, or two-level NPU LUT changed.
+
+Pre-edit recovery copies:
+`/tmp/rockchip.py.20260731-174744`,
+`/tmp/test_pr1.py.20260731-174744`,
+`/tmp/conftest_rockchip.py.20260731-174744`,
+`/tmp/test_pr1.py.20260731-174845`,
+`/tmp/rockchip.py.20260731-175029`,
+`/tmp/progress.md.20260731-175054`, and
+`/tmp/test_ops_status.md.20260731-175054`.
+
+Next action: continue ordered methods 276–300, including scalar arithmetic,
+attention, scatter, and shape/reduction cases.

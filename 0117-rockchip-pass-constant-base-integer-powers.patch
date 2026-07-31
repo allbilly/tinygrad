@@ -1,0 +1,93 @@
+From 028dc3e9915f7662639044ffe25aae5606528c3b Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 17:50:39 +0800
+Subject: [PATCH] rockchip: pass constant base integer powers
+
+---
+ test/rockchip/conftest_rockchip.py   |  4 ++--
+ test/rockchip/test_pr1.py            | 14 ++++++++++++++
+ tinygrad/runtime/support/rockchip.py | 17 ++++++++++++-----
+ 3 files changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/test/rockchip/conftest_rockchip.py b/test/rockchip/conftest_rockchip.py
+index 3fb499323..0cb0b33ec 100644
+--- a/test/rockchip/conftest_rockchip.py
++++ b/test/rockchip/conftest_rockchip.py
+@@ -28,9 +28,9 @@ import pytest
+ from tinygrad import dtypes
+ 
+ def pytest_collection_modifyitems(items):
+-  """Exclude the two manual backward-only methods from the forward contract."""
++  """Exclude manual backward-only methods from the forward contract."""
+   if os.environ.get("FORWARD_ONLY") != "1": return
+-  backward_only = {"test_cmp_ne_backwards", "test_cmp_lt_backwards"}
++  backward_only = {"test_cmp_ne_backwards", "test_cmp_lt_backwards", "test_pow_const_direct"}
+   for item in items:
+     if item.path.name == "test_ops.py" and item.name in backward_only:
+       item.add_marker(pytest.mark.skip(reason="ROCKCHIP forward-only contract excludes manual gradient tests"))
+diff --git a/test/rockchip/test_pr1.py b/test/rockchip/test_pr1.py
+index 58fc1e594..127b92e18 100644
+--- a/test/rockchip/test_pr1.py
++++ b/test/rockchip/test_pr1.py
+@@ -403,6 +403,20 @@ class TestClassifier(unittest.TestCase):
+       self.assertTrue(subtasks[0].task.is_copy)
+       self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
+ 
++  def test_fp16_constant_base_integer_pow_uses_exact_host_boundary(self):
++    default_float = dtypes.default_float
++    try:
++      dtypes.default_float = dtypes.half
++      sink = _get_sink(0.7**Tensor.empty(6, dtype=dtypes.int, device="ROCKCHIP"))
++    finally:
++      dtypes.default_float = default_float
++    program = build_native_program(sink)
++    self.assertIsNotNone(program)
++    subtasks = program.src[1].src[0].arg
++    self.assertEqual(len(subtasks), 1)
++    self.assertTrue(subtasks[0].task.is_copy)
++    self.assertEqual(subtasks[0].task.layout[1], _HOST_ELEMENTWISE_LAYOUT)
++
+   def test_fp32_padded_add_uses_exact_host_boundary(self):
+     a = Tensor.empty(64,64, dtype=dtypes.float, device="ROCKCHIP")
+     b = Tensor.empty(60,60, dtype=dtypes.float, device="ROCKCHIP")
+diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
+index 67ccc9694..eb262e9b3 100644
+--- a/tinygrad/runtime/support/rockchip.py
++++ b/tinygrad/runtime/support/rockchip.py
+@@ -5554,21 +5554,28 @@ def _try_pow_base8_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+   return tuple(tasks)
+ 
+ def _try_pow_base07_lut_subtasks(sink:UOp) -> tuple[RKSubTask, ...]|None:
+-  """Evaluate 0.7**x over [-2,3] with a shifted Q13 LUT."""
++  """Evaluate half 0.7**x by shifted Q13 LUT or exact typed integer-exponent pow."""
+   store = _store_node(sink)
+   if store is None or store.src[0].dtype is not dtypes.half: return None
+   value = _unwrap(store.src[1])
+   if value.op is not Ops.EXP2 or len(value.src) != 1: return None
+   product = _unwrap(value.src[0])
+   if product.op is not Ops.MUL or len(product.src) != 2: return None
+-  source, scale = None, None
++  source = source_operand = scale = None
+   for lhs, rhs in (product.src, product.src[::-1]):
+     if (candidate := _unwrap(lhs)).op is Ops.INDEX and rhs.op is Ops.CONST:
+-      source, scale = candidate, float(rhs.arg)
++      source, source_operand, scale = candidate, lhs, float(rhs.arg)
+       break
+-  if source is None or scale is None or source.dtype is not dtypes.half or abs(scale-math.log2(0.7)) > 1e-3: return None
++  if source is None or source_operand is None or scale is None or abs(scale-math.log2(0.7)) > 1e-3: return None
+   info, total = ProgramInfo.from_sink(sink), prod(_shape_of_store(sink))
+-  if int(source.src[0].src[0].arg) != total: return None
++  if int(source.src[0].src[0].arg) != total or _affine_index(source.src[1]) != _affine_index(store.src[0].src[1]): return None
++  if source.dtype is dtypes.int:
++    if source_operand.op is not Ops.CAST or source_operand.dtype is not dtypes.half or source_operand.src != (source,): return None
++    base = UOp.const(dtypes.half, float(np.float16(0.7)))
++    semantic = UOp(Ops.POW, dtypes.half, (base, source))
++    semantic_sink = sink.substitute({store:store.replace(src=(store.src[0], semantic))})
++    return _try_elementwise_host_subtasks(semantic_sink, allow_plain=True)
++  if source.dtype is not dtypes.half: return None
+   out, source_slot = info.outs[0], source.src[0].buf_uop.arg.slot
+   next_slot = max(info.globals, default=-1)+1
+   tasks:list[RKSubTask] = []
+-- 
+2.34.1
+

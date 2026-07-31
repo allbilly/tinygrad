@@ -3100,3 +3100,21 @@ tasks and matches the method's `1e-7` contract. Only this named method
 restores normal construction. Backend code and the **168/168** PR1
 contract are unchanged; adapter Ruff is clean. No LUT or two-level LUT
 changed. Next: methods 241–250, then the power/product block.
+
+### Constant-base integer powers
+
+Methods 241–250 pass **10/10 in 59.01s**. The initial 251–275 run produced
+22 passes, one intentional skip, and two failures; the focused rerun after
+the fix is **1 passed, 1 skipped in 47.72s**. Commit `028dc3e99`; saved
+patch `0117-rockchip-pass-constant-base-integer-powers.patch`.
+
+Only the final `0.7 ** int32` subcase failed, by one fp16 ULP. Its exact
+`EXP2(CAST(int32)*log2(0.7))` graph now becomes semantic
+`pow(fp16(0.7), int32)` in one typed mapped-buffer task. The fp32 route was
+rejected because it regresses exponent eight badly. The separate
+`test_pow_const_direct` is entirely manual gradient evaluation and is now
+excluded when `FORWARD_ONLY=1`.
+
+Contract advances to **169/169 in 10.51s**. Mypy and touched-file Ruff stay
+at their 12- and 9-finding baselines. No LUT or two-level LUT changed.
+Next: methods 276–300.
