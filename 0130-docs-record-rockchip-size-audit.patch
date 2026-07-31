@@ -1,0 +1,1342 @@
+From 03968ea043047ceb7b459df6073d45f22aa42f64 Mon Sep 17 00:00:00 2001
+From: allbilly <53866088+allbilly@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 23:38:48 +0800
+Subject: [PATCH] docs: record rockchip size audit
+
+---
+ ...rockchip-compact-classifier-dispatch.patch | 327 +++++++++++++++
+ 0128-rockchip-centralize-host-dispatch.patch  | 356 ++++++++++++++++
+ 0129-rockchip-table-drive-lut-builders.patch  | 383 ++++++++++++++++++
+ progress.md                                   |  65 +++
+ rockchip_size.md                              | 136 +++++++
+ test_ops_status.md                            |  14 +
+ 6 files changed, 1281 insertions(+)
+ create mode 100644 0127-rockchip-compact-classifier-dispatch.patch
+ create mode 100644 0128-rockchip-centralize-host-dispatch.patch
+ create mode 100644 0129-rockchip-table-drive-lut-builders.patch
+ create mode 100644 rockchip_size.md
+
+diff --git a/0127-rockchip-compact-classifier-dispatch.patch b/0127-rockchip-compact-classifier-dispatch.patch
+new file mode 100644
+index 000000000..bb7c2bf10
+--- /dev/null
++++ b/0127-rockchip-compact-classifier-dispatch.patch
+@@ -0,0 +1,327 @@
++From fc69aeff34da46eaabe1040a342755e6d22ebf4b Mon Sep 17 00:00:00 2001
++From: allbilly <53866088+allbilly@users.noreply.github.com>
++Date: Fri, 31 Jul 2026 22:01:23 +0800
++Subject: [PATCH] rockchip: compact ordered classifier dispatch
++
++---
++ tinygrad/runtime/support/rockchip.py | 298 +++++++--------------------
++ 1 file changed, 71 insertions(+), 227 deletions(-)
++
++diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
++index 4b134ab79..bdf3c03ef 100644
++--- a/tinygrad/runtime/support/rockchip.py
+++++ b/tinygrad/runtime/support/rockchip.py
++@@ -15212,239 +15212,83 @@ def _try_cmac_shared_subtasks(plan:RKPlan) -> tuple[RKSubTask, ...]|None:
++   return tuple(tasks)
++ 
++ # ---- the native_program hook ----
+++# Ordered active dispatch tables: order is semantic because the first strict classifier wins.
+++# The native two-LUT tangent remains after the exact fp16 host tangent, as in the expanded dispatcher.
+++_SUBTASK_CLASSIFIERS = (
+++  _try_bce_host_subtasks, _try_bce_logits_subtasks, _try_bce_subtasks,
+++  _try_movement_host_subtasks, _try_trunc_host_subtasks, _try_floor_ceil_host_subtasks,
+++  _try_copysign_host_subtasks, _try_bitwise_host_subtasks, _try_cast_subtasks,
+++  _try_bitcast_host_subtasks, _try_typed_fill_subtasks, _try_round_subtasks,
+++  _try_round_quantization_host_subtasks, _try_mod_host_subtasks, _try_fmod_host_subtasks,
+++  _try_int_true_div_host_subtasks, _try_int_rounded_div_host_subtasks, _try_broadcast_rounded_div_host_subtasks,
+++  _try_large_ellipsis_einsum_host_subtasks, _try_bilinear_interpolate_host_subtasks, _try_cumsum_host_subtasks,
+++  _try_cumprod_host_subtasks, _try_cumextrema_host_subtasks, _try_long_cummin_finalize_host_subtasks,
+++  _try_sign_subtasks, _try_inf_div_subtasks, _try_hardsigmoid_subtasks,
+++  _try_hardswish_subtasks, _try_fp32_tanh_host_subtasks, _try_tanh_saturation_subtasks,
+++  _try_quick_gelu_two_lut_subtasks, _try_logsigmoid_subtasks, _try_softplus_subtasks,
+++  _try_mish_subtasks, _try_fp16_tan_host_subtasks, _try_tan_subtasks,
+++  _try_fp32_sin_cos_host_subtasks, _try_sin_cos_subtasks, _try_asin_acos_subtasks,
+++  _try_atan_subtasks, _try_fp32_atanh_host_subtasks, _try_atanh_subtasks,
+++  _try_asinh_acosh_subtasks, _try_fp32_sinh_cosh_host_subtasks, _try_sinh_cosh_subtasks,
+++  _try_erf_subtasks, _try_gelu_subtasks, _try_elu_subtasks,
+++  _try_celu_subtasks, _try_isclose_host_subtasks, _try_softmax_host_subtasks,
+++  _try_bounded_attention_max_host_subtasks, _try_attention_score_host_subtasks, _try_attention_value_host_subtasks,
+++  _try_logsoftmax_norm_host_subtasks, _try_cross_entropy_host_subtasks, _try_nll_loss_host_subtasks,
+++  _try_cross_entropy_loss_host_subtasks, _try_normalize_norm_host_subtasks, _try_logcumsumexp_host_subtasks,
+++  _try_fp32_log_host_subtasks, _try_fancy_index_preprocess_host_subtasks, _try_fancy_index_reduction_host_subtasks,
+++  _try_scatter_host_subtasks, _try_scatter_reduce_tensor_host_subtasks, _try_scatter_reduction_host_subtasks,
+++  _try_comparison_subtasks, _try_nonzero_expanded_prefix_host_subtasks, _try_nonzero_coordinate_gather_host_subtasks,
+++  _try_nonzero_coordinate_interleave_host_subtasks, _try_mask_prefix_count_host_subtasks, _try_constant_true_masked_select_host_subtasks,
+++  _try_fixed_masked_select_host_subtasks, _try_exp_correction_subtasks, _try_sigmoid_special_subtasks,
+++  _try_exp2_special_subtasks, _try_log2_special_subtasks, _try_rsqrt_special_subtasks,
+++  _try_sqrt_special_subtasks, _try_pow8_lut_subtasks, _try_pow55_lut_subtasks,
+++  _try_pow_neg55_lut_subtasks, _try_pow_base55_lut_subtasks, _try_pow_base8_lut_subtasks,
+++  _try_pow_base07_lut_subtasks, _try_pow_neg_base55_subtasks, _try_zero_base_pow_subtasks,
+++  _try_tensor_pow_subtasks, _try_fp16_broadcast_pow_host_subtasks, _try_fractional_pow_subtasks,
+++  _try_abs_subtasks, _try_softsign_subtasks, _try_lerp_subtasks,
+++  _try_one_hot_subtasks, _try_cat_subtasks, _try_pad_subtasks,
+++  _try_conditional_movement_host_subtasks, _try_fp32_broadcast_host_subtasks, _try_fp32_topology_host_subtasks,
+++  _try_fp32_add_subtasks, _try_fp32_mul_subtasks, _try_half_to_fp32_sum_host_subtasks,
+++  _try_variance_host_subtasks, _try_fp32_avg_pool_host_subtasks, _try_fp32_factorized_sum_subtasks,
+++  _try_broadcast_subtasks, _try_unpool_scatter_subtasks, _try_sort_compare_subtasks,
+++  _try_argsort_selected_subtasks, _try_argsort_index_subtasks, _try_softmax_argmax_host_subtasks,
+++  _try_axis_arg_extrema_host_subtasks, _try_arg_extrema_subtasks, _try_long_cumextrema_index_host_subtasks,
+++  _try_pool_index_subtasks, _try_int_max_pool_host_subtasks,
+++)
+++
+++# Rejected CPU operator fallbacks remain opt-in diagnostics only; static index reduction stays separately gated.
+++_POST_INDEX_SUBTASK_CLASSIFIERS = (
+++  _try_long_cumprod_subtasks, _try_local_product_subtasks, _try_int_power_host_subtasks,
+++  _try_native_int_min_subtasks, _try_uint8_min_host_subtasks, _try_bool_reduce_subtasks,
+++  _try_local_max_subtasks, _try_cmac_variable_scale_subtasks, _try_movement_sum_subtasks,
+++  _try_elementwise_sum_subtasks, _try_small_fp32_cmac_subtasks, _try_fp32_sum_subtasks,
+++  _try_relu_sum_subtasks, _try_nested_sum_subtasks, _try_cmac_multifactor_subtasks,
+++)
+++
+++# Preserved disabled WIP dispatches (implementations remain above):
+++# if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
+++#   return build_native_program_multi(sink, long_cumprod_copy_tasks)
+++# if (neutral_block_tasks := _try_long_cumprod_neutral_block_subtasks(sink)) is not None:
+++#   return build_native_program_multi(sink, neutral_block_tasks)
+++# if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
+++#   return build_native_program_multi(sink, int_power_tasks)
+++
+++def _first_subtasks(sink:UOp, classifiers) -> tuple[RKSubTask, ...]|None:
+++  for classifier in classifiers:
+++    if (tasks := classifier(sink)) is not None: return tasks
+++  return None
+++
++ def build_native_program(sink: UOp) -> UOp|None:
++   """Classify and build a PROGRAM(SINK, LINEAR(INS...)). Raises RKPLAN_REJECT:<reason>
++   if unsupported (no fallback per §15). Raises if a classified kernel fails emission."""
++-  # The generic reciprocal-to-FDIV rewrite obscures the strict x**-5.5 graph,
++-  # so recognize this special case while its exponent structure is intact.
++-  if (pow_neg55_tasks := _try_pow_neg55_lut_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, pow_neg55_tasks)
++-  # Pre-classification rewrite: MUL(a, RECIPROCAL(b)) → FDIV(a, b)
+++  # The reciprocal-to-FDIV rewrite obscures strict x**-5.5, so classify it first.
+++  if (tasks := _try_pow_neg55_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, tasks)
++   sink = graph_rewrite(sink, _pm_fdiv, name="rk fdiv decomp")
++   if getenv("ROCKCHIP_DEBUG_SINK"): print("RK_SINK", sink)
++-  if (bce_host_tasks := _try_bce_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_host_tasks)
++-  if (bce_logits_tasks := _try_bce_logits_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_logits_tasks)
++-  if (bce_tasks := _try_bce_subtasks(sink)) is not None: return build_native_program_multi(sink, bce_tasks)
++-  if (movement_tasks := _try_movement_host_subtasks(sink)) is not None: return build_native_program_multi(sink, movement_tasks)
++-  if (trunc_tasks := _try_trunc_host_subtasks(sink)) is not None: return build_native_program_multi(sink, trunc_tasks)
++-  if (floor_ceil_tasks := _try_floor_ceil_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, floor_ceil_tasks)
++-  if (copysign_tasks := _try_copysign_host_subtasks(sink)) is not None: return build_native_program_multi(sink, copysign_tasks)
++-  if (bitwise_tasks := _try_bitwise_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitwise_tasks)
++-  if (cast_tasks := _try_cast_subtasks(sink)) is not None: return build_native_program_multi(sink, cast_tasks)
++-  if (bitcast_tasks := _try_bitcast_host_subtasks(sink)) is not None: return build_native_program_multi(sink, bitcast_tasks)
++-  if (fill_tasks := _try_typed_fill_subtasks(sink)) is not None: return build_native_program_multi(sink, fill_tasks)
++-  if (round_tasks := _try_round_subtasks(sink)) is not None: return build_native_program_multi(sink, round_tasks)
++-  if (round_quantization_tasks := _try_round_quantization_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, round_quantization_tasks)
++-  if (mod_tasks := _try_mod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, mod_tasks)
++-  if (fmod_tasks := _try_fmod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, fmod_tasks)
++-  if (int_true_div_tasks := _try_int_true_div_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, int_true_div_tasks)
++-  if (int_rounded_div_tasks := _try_int_rounded_div_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, int_rounded_div_tasks)
++-  if (broadcast_rounded_div_tasks := _try_broadcast_rounded_div_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, broadcast_rounded_div_tasks)
++-  if (large_ellipsis_einsum_tasks := _try_large_ellipsis_einsum_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, large_ellipsis_einsum_tasks)
++-  if (bilinear_interpolate_tasks := _try_bilinear_interpolate_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, bilinear_interpolate_tasks)
++-  if (cumsum_tasks := _try_cumsum_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumsum_tasks)
++-  if (cumprod_tasks := _try_cumprod_host_subtasks(sink)) is not None: return build_native_program_multi(sink, cumprod_tasks)
++-  if (cumextrema_tasks := _try_cumextrema_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, cumextrema_tasks)
++-  if (cummin_finalize_tasks := _try_long_cummin_finalize_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, cummin_finalize_tasks)
++-  if (sign_tasks := _try_sign_subtasks(sink)) is not None: return build_native_program_multi(sink, sign_tasks)
++-  if (inf_div_tasks := _try_inf_div_subtasks(sink)) is not None: return build_native_program_multi(sink, inf_div_tasks)
++-  if (hardsigmoid_tasks := _try_hardsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, hardsigmoid_tasks)
++-  if (hardswish_tasks := _try_hardswish_subtasks(sink)) is not None: return build_native_program_multi(sink, hardswish_tasks)
++-  if (fp32_tanh_tasks := _try_fp32_tanh_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_tanh_tasks)
++-  if (tanh_tasks := _try_tanh_saturation_subtasks(sink)) is not None: return build_native_program_multi(sink, tanh_tasks)
++-  if (quick_gelu_tasks := _try_quick_gelu_two_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, quick_gelu_tasks)
++-  if (logsigmoid_tasks := _try_logsigmoid_subtasks(sink)) is not None: return build_native_program_multi(sink, logsigmoid_tasks)
++-  if (softplus_tasks := _try_softplus_subtasks(sink)) is not None: return build_native_program_multi(sink, softplus_tasks)
++-  if (mish_tasks := _try_mish_subtasks(sink)) is not None: return build_native_program_multi(sink, mish_tasks)
++-  if (fp16_tan_host_tasks := _try_fp16_tan_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp16_tan_host_tasks)
++-  # The native two-LUT/pole-safe implementation remains below as the fp32 WIP path.
++-  if (tan_tasks := _try_tan_subtasks(sink)) is not None: return build_native_program_multi(sink, tan_tasks)
++-  if (fp32_sin_cos_tasks := _try_fp32_sin_cos_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_sin_cos_tasks)
++-  if (sin_cos_tasks := _try_sin_cos_subtasks(sink)) is not None: return build_native_program_multi(sink, sin_cos_tasks)
++-  if (asin_acos_tasks := _try_asin_acos_subtasks(sink)) is not None: return build_native_program_multi(sink, asin_acos_tasks)
++-  if (atan_tasks := _try_atan_subtasks(sink)) is not None: return build_native_program_multi(sink, atan_tasks)
++-  if (fp32_atanh_tasks := _try_fp32_atanh_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_atanh_tasks)
++-  if (atanh_tasks := _try_atanh_subtasks(sink)) is not None: return build_native_program_multi(sink, atanh_tasks)
++-  if (asinh_acosh_tasks := _try_asinh_acosh_subtasks(sink)) is not None: return build_native_program_multi(sink, asinh_acosh_tasks)
++-  if (fp32_sinh_cosh_tasks := _try_fp32_sinh_cosh_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_sinh_cosh_tasks)
++-  if (sinh_cosh_tasks := _try_sinh_cosh_subtasks(sink)) is not None: return build_native_program_multi(sink, sinh_cosh_tasks)
++-  if (erf_tasks := _try_erf_subtasks(sink)) is not None: return build_native_program_multi(sink, erf_tasks)
++-  if (gelu_tasks := _try_gelu_subtasks(sink)) is not None: return build_native_program_multi(sink, gelu_tasks)
++-  if (elu_tasks := _try_elu_subtasks(sink)) is not None: return build_native_program_multi(sink, elu_tasks)
++-  if (celu_tasks := _try_celu_subtasks(sink)) is not None: return build_native_program_multi(sink, celu_tasks)
++-  if (isclose_tasks := _try_isclose_host_subtasks(sink)) is not None: return build_native_program_multi(sink, isclose_tasks)
++-  if (softmax_tasks := _try_softmax_host_subtasks(sink)) is not None: return build_native_program_multi(sink, softmax_tasks)
++-  if (bounded_attention_max_tasks := _try_bounded_attention_max_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, bounded_attention_max_tasks)
++-  if (attention_score_tasks := _try_attention_score_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, attention_score_tasks)
++-  if (attention_value_tasks := _try_attention_value_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, attention_value_tasks)
++-  if (logsoftmax_norm_tasks := _try_logsoftmax_norm_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, logsoftmax_norm_tasks)
++-  if (cross_entropy_tasks := _try_cross_entropy_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, cross_entropy_tasks)
++-  if (nll_loss_tasks := _try_nll_loss_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, nll_loss_tasks)
++-  if (cross_entropy_loss_tasks := _try_cross_entropy_loss_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, cross_entropy_loss_tasks)
++-  if (normalize_tasks := _try_normalize_norm_host_subtasks(sink)) is not None: return build_native_program_multi(sink, normalize_tasks)
++-  if (logcumsumexp_tasks := _try_logcumsumexp_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, logcumsumexp_tasks)
++-  if (fp32_log_tasks := _try_fp32_log_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_log_tasks)
++-  if (fancy_index_tasks := _try_fancy_index_preprocess_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fancy_index_tasks)
++-  if (fancy_index_reduce_tasks := _try_fancy_index_reduction_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fancy_index_reduce_tasks)
++-  if (scatter_tasks := _try_scatter_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, scatter_tasks)
++-  if (scatter_reduce_tensor_tasks := _try_scatter_reduce_tensor_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, scatter_reduce_tensor_tasks)
++-  if (scatter_reduce_tasks := _try_scatter_reduction_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, scatter_reduce_tasks)
++-  if (comparison_tasks := _try_comparison_subtasks(sink)) is not None: return build_native_program_multi(sink, comparison_tasks)
++-  if (nonzero_expanded_prefix_tasks := _try_nonzero_expanded_prefix_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, nonzero_expanded_prefix_tasks)
++-  if (nonzero_coordinate_gather_tasks := _try_nonzero_coordinate_gather_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, nonzero_coordinate_gather_tasks)
++-  if (nonzero_coordinate_interleave_tasks := _try_nonzero_coordinate_interleave_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, nonzero_coordinate_interleave_tasks)
++-  if (mask_prefix_count_tasks := _try_mask_prefix_count_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, mask_prefix_count_tasks)
++-  if (constant_true_masked_select_tasks := _try_constant_true_masked_select_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, constant_true_masked_select_tasks)
++-  if (fixed_masked_select_tasks := _try_fixed_masked_select_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fixed_masked_select_tasks)
++-  if (exp_correction_tasks := _try_exp_correction_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, exp_correction_tasks)
++-  if (sigmoid_tasks := _try_sigmoid_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sigmoid_tasks)
++-  if (exp2_tasks := _try_exp2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, exp2_tasks)
++-  if (log2_tasks := _try_log2_special_subtasks(sink)) is not None: return build_native_program_multi(sink, log2_tasks)
++-  if (rsqrt_tasks := _try_rsqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, rsqrt_tasks)
++-  if (sqrt_tasks := _try_sqrt_special_subtasks(sink)) is not None: return build_native_program_multi(sink, sqrt_tasks)
++-  if (pow8_tasks := _try_pow8_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, pow8_tasks)
++-  if (pow55_tasks := _try_pow55_lut_subtasks(sink)) is not None: return build_native_program_multi(sink, pow55_tasks)
++-  if (pow_neg55_tasks := _try_pow_neg55_lut_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, pow_neg55_tasks)
++-  if (pow_base55_tasks := _try_pow_base55_lut_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, pow_base55_tasks)
++-  if (pow_base8_tasks := _try_pow_base8_lut_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, pow_base8_tasks)
++-  if (pow_base07_tasks := _try_pow_base07_lut_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, pow_base07_tasks)
++-  if (pow_neg_base55_tasks := _try_pow_neg_base55_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, pow_neg_base55_tasks)
++-  if (zero_base_pow_tasks := _try_zero_base_pow_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, zero_base_pow_tasks)
++-  if (tensor_pow_tasks := _try_tensor_pow_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, tensor_pow_tasks)
++-  if (fp16_broadcast_pow_tasks := _try_fp16_broadcast_pow_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp16_broadcast_pow_tasks)
++-  if (fractional_pow_tasks := _try_fractional_pow_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fractional_pow_tasks)
++-  if (abs_tasks := _try_abs_subtasks(sink)) is not None: return build_native_program_multi(sink, abs_tasks)
++-  if (softsign_tasks := _try_softsign_subtasks(sink)) is not None: return build_native_program_multi(sink, softsign_tasks)
++-  if (lerp_tasks := _try_lerp_subtasks(sink)) is not None: return build_native_program_multi(sink, lerp_tasks)
++-  if (one_hot_tasks := _try_one_hot_subtasks(sink)) is not None: return build_native_program_multi(sink, one_hot_tasks)
++-  if (cat_tasks := _try_cat_subtasks(sink)) is not None: return build_native_program_multi(sink, cat_tasks)
++-  if (pad_tasks := _try_pad_subtasks(sink)) is not None: return build_native_program_multi(sink, pad_tasks)
++-  if (conditional_movement_tasks := _try_conditional_movement_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, conditional_movement_tasks)
++-  # WIP: only valid when the producer was the fused one-dimensional long
++-  # scan; multidimensional cumprod uses the same physical helper shape.
++-  # if (long_cumprod_copy_tasks := _try_long_cumprod_final_copy_subtasks(sink)) is not None:
++-  #   return build_native_program_multi(sink, long_cumprod_copy_tasks)
++-  if (fp32_broadcast_tasks := _try_fp32_broadcast_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_broadcast_tasks)
++-  if (fp32_topology_tasks := _try_fp32_topology_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_topology_tasks)
++-  if (fp32_add_tasks := _try_fp32_add_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_add_tasks)
++-  if (fp32_mul_tasks := _try_fp32_mul_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_mul_tasks)
++-  if (half_fp32_sum_tasks := _try_half_to_fp32_sum_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, half_fp32_sum_tasks)
++-  if (variance_tasks := _try_variance_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, variance_tasks)
++-  if (fp32_avg_pool_tasks := _try_fp32_avg_pool_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_avg_pool_tasks)
++-  if (fp32_factorized_sum_tasks := _try_fp32_factorized_sum_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_factorized_sum_tasks)
++-  if (broadcast_tasks := _try_broadcast_subtasks(sink)) is not None: return build_native_program_multi(sink, broadcast_tasks)
++-  # Rejected CPU operator fallbacks remain opt-in diagnostics only.
++-  if (scatter_tasks := _try_unpool_scatter_subtasks(sink)) is not None: return build_native_program_multi(sink, scatter_tasks)
++-  if (sort_compare_tasks := _try_sort_compare_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, sort_compare_tasks)
++-  if (argsort_selected_tasks := _try_argsort_selected_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, argsort_selected_tasks)
++-  if (argsort_tasks := _try_argsort_index_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, argsort_tasks)
++-  if (softmax_argmax_tasks := _try_softmax_argmax_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, softmax_argmax_tasks)
++-  if (axis_arg_extrema_tasks := _try_axis_arg_extrema_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, axis_arg_extrema_tasks)
++-  if (arg_extrema_tasks := _try_arg_extrema_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, arg_extrema_tasks)
++-  if (long_cumextrema_index_tasks := _try_long_cumextrema_index_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, long_cumextrema_index_tasks)
++-  if (pool_index_tasks := _try_pool_index_subtasks(sink)) is not None: return build_native_program_multi(sink, pool_index_tasks)
++-  if (int_max_pool_tasks := _try_int_max_pool_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, int_max_pool_tasks)
+++  if (tasks := _first_subtasks(sink, _SUBTASK_CLASSIFIERS)) is not None: return build_native_program_multi(sink, tasks)
++   if getenv("ROCKCHIP_ALLOW_HOST_OPS") and \
++-     (index_tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, index_tasks)
++-  if (long_cumprod_tasks := _try_long_cumprod_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, long_cumprod_tasks)
++-  # WIP companion to _try_long_cumprod_final_copy_subtasks; see note above.
++-  # if (neutral_block_tasks := _try_long_cumprod_neutral_block_subtasks(sink)) is not None:
++-  #   return build_native_program_multi(sink, neutral_block_tasks)
++-  if (product_tasks := _try_local_product_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, product_tasks)
++-  if (int_power_tasks := _try_int_power_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, int_power_tasks)
++-  # WIP: small official values pass, but native MUL corrupts the high word of
++-  # 46340**2. Keep disabled until byte-limb multiplication is exact.
++-  # if (int_power_tasks := _wip_try_native_small_int_power_subtasks(sink)) is not None:
++-  #   return build_native_program_multi(sink, int_power_tasks)
++-  if (int_min_tasks := _try_native_int_min_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, int_min_tasks)
++-  if (uint8_min_tasks := _try_uint8_min_host_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, uint8_min_tasks)
++-  if (bool_reduce_tasks := _try_bool_reduce_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, bool_reduce_tasks)
++-  if (local_max_tasks := _try_local_max_subtasks(sink)) is not None: return build_native_program_multi(sink, local_max_tasks)
++-  if (variable_scale_tasks := _try_cmac_variable_scale_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, variable_scale_tasks)
++-  if (movement_sum_tasks := _try_movement_sum_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, movement_sum_tasks)
++-  if (elementwise_sum_tasks := _try_elementwise_sum_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, elementwise_sum_tasks)
++-  if (fp32_cmac_tasks := _try_small_fp32_cmac_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_cmac_tasks)
++-  # Retain the half-input WIP above for reference. The active path is narrower:
++-  # it requires a direct fp32 INDEX and preserves the explicitly fp32 output.
++-  if (fp32_sum_tasks := _try_fp32_sum_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, fp32_sum_tasks)
++-  if (relu_sum_tasks := _try_relu_sum_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, relu_sum_tasks)
++-  if (nested_sum_tasks := _try_nested_sum_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, nested_sum_tasks)
++-  if (multifactor_tasks := _try_cmac_multifactor_subtasks(sink)) is not None:
++-    return build_native_program_multi(sink, multifactor_tasks)
+++     (tasks := _try_static_index_reduction_subtasks(sink)) is not None: return build_native_program_multi(sink, tasks)
+++  if (tasks := _first_subtasks(sink, _POST_INDEX_SUBTASK_CLASSIFIERS)) is not None: return build_native_program_multi(sink, tasks)
++   plan = plan_rk(sink)
++   if isinstance(plan, str):
++     # Nested elementwise lowering can materialize an indexed WHERE operand before
++-- 
++2.34.1
++
+diff --git a/0128-rockchip-centralize-host-dispatch.patch b/0128-rockchip-centralize-host-dispatch.patch
+new file mode 100644
+index 000000000..efe21e55f
+--- /dev/null
++++ b/0128-rockchip-centralize-host-dispatch.patch
+@@ -0,0 +1,356 @@
++From 9279969589b3631007cfa0686a69caf0710a6d25 Mon Sep 17 00:00:00 2001
++From: allbilly <53866088+allbilly@users.noreply.github.com>
++Date: Fri, 31 Jul 2026 22:06:41 +0800
++Subject: [PATCH] rockchip: centralize typed host task dispatch
++
++---
++ tinygrad/runtime/ops_rockchip.py | 293 ++++++-------------------------
++ 1 file changed, 53 insertions(+), 240 deletions(-)
++
++diff --git a/tinygrad/runtime/ops_rockchip.py b/tinygrad/runtime/ops_rockchip.py
++index 9ef64eec2..95874184e 100644
++--- a/tinygrad/runtime/ops_rockchip.py
+++++ b/tinygrad/runtime/ops_rockchip.py
++@@ -8,6 +8,7 @@
++ # multi-task are explicitly rejected via RKPLAN_REJECT.
++ # All compute (including copy) executes on the NPU — no host-side tensor arithmetic.
++ import ctypes, mmap, os, struct
+++from collections.abc import Callable
++ from tinygrad.dtype import dtypes, DType
++ from tinygrad.helpers import getenv, mv_address, to_mv, Target
++ from tinygrad.device import Compiled, Program, BufferSpec, TinyELF
++@@ -1354,6 +1355,52 @@ def _run_host_avg_pool(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bu
++     result[output] = np.float32(accumulator * np.float32(scales[output]))
++   ctypes.memmove(output_buf.va_addr, result.ctypes.data, result.nbytes)  # type: ignore[arg-type]
++ 
+++_HostRunner = Callable[[RKTask, list[RKReloc]|tuple[RKReloc, ...], tuple], None]
+++_HOST_TASK_RUNNERS:dict[int, _HostRunner] = {
+++  _HOST_MOVEMENT_LAYOUT: _run_host_movement, _HOST_STATIC_HALF_LAYOUT: _run_host_static_half,
+++  _HOST_STATIC_INT_LAYOUT: _run_host_static_int, _HOST_GATHER_MAP_LAYOUT: _pack_static_gather,
+++  _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather, _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk,
+++  _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk, _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk,
+++  _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk, _HOST_COMPACT_NATIVE_HALF_LAYOUT: _compact_native_half,
+++  _HOST_ASSEMBLE_INT_BYTES_LAYOUT: _assemble_int_bytes, _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits,
+++  _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits, _HOST_BOOL_HALF_LAYOUT: _run_host_bool_half,
+++  _HOST_HALF_FP32_LAYOUT: _run_host_half_fp32, _HOST_STATIC_SELECT_HALF_LAYOUT: _run_host_static_select_half,
+++  _HOST_STATIC_SELECT_INT_LAYOUT: _run_host_static_select_int, _HOST_HALF_INT_LAYOUT: _run_host_half_int,
+++  _HOST_FP32_COMBINE_LAYOUT: _run_host_fp32_combine, _HOST_SCATTER_LAYOUT: _run_host_scatter,
+++  _HOST_ARGMAX_LAYOUT: _run_host_argmax, _HOST_AVG_POOL_LAYOUT: _run_host_avg_pool, _HOST_BITWISE_LAYOUT: _run_host_bitwise,
+++  _HOST_TRUNC_LAYOUT: _run_host_trunc, _HOST_COPYSIGN_LAYOUT: _run_host_copysign,
+++  _HOST_ELEMENTWISE_LAYOUT: _run_host_elementwise, _HOST_ELEMENTWISE_REDUCE_LAYOUT: _run_host_elementwise,
+++  _HOST_EINSUM_LAYOUT: _run_host_elementwise, _HOST_BILINEAR_LAYOUT: _run_host_elementwise, _HOST_TAN_LAYOUT: _run_host_elementwise,
+++  _HOST_BCE_LAYOUT: _run_host_bce, _HOST_CROSS_ENTROPY_LAYOUT: _run_host_cross_entropy, _HOST_NLL_LAYOUT: _run_host_nll,
+++  _HOST_VARIANCE_LAYOUT: _run_host_variance, _HOST_SOFTMAX_ARGMAX_LAYOUT: _run_host_softmax_argmax,
+++}
+++_HOST_ALL_LAYOUTS = tuple(tag for tag in _HOST_TASK_RUNNERS if tag != _HOST_FP32_COMBINE_LAYOUT)
+++_HOST_CMAC_LAYOUTS = (_HOST_MOVEMENT_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_GATHER_MAP_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+++  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT, _HOST_FP32_HALF_LAYOUT,
+++  _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
+++  _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT)
+++_HOST_ORDERED_COPY_LAYOUTS = (_HOST_MOVEMENT_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_STATIC_INT_LAYOUT, _HOST_BOOL_HALF_LAYOUT,
+++  _HOST_STATIC_SELECT_HALF_LAYOUT, _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT, _HOST_FP32_HALF_LAYOUT,
+++  _HOST_FP32_RESIDUAL_LAYOUT, _HOST_FP32_COMBINE_LAYOUT, _HOST_HALF_FP32_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
+++  _HOST_PLANE_GATHER_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT,
+++  _HOST_UNPACK_HALF_CHUNK_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+++  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT)
+++_HOST_COPY_DPU_LAYOUTS = (_HOST_MOVEMENT_LAYOUT, _HOST_STATIC_HALF_LAYOUT, _HOST_STATIC_INT_LAYOUT, _HOST_GATHER_MAP_LAYOUT,
+++  _HOST_PLANE_GATHER_LAYOUT, _HOST_PACK_CHUNK_LAYOUT, _HOST_UNPACK_INT_CHUNK_LAYOUT, _HOST_PACK_INT32_CHUNK_LAYOUT,
+++  _HOST_UNPACK_HALF_CHUNK_LAYOUT, _HOST_COMPACT_NATIVE_HALF_LAYOUT, _HOST_ASSEMBLE_INT_BYTES_LAYOUT,
+++  _HOST_PACK_HALF_BITS_LAYOUT, _HOST_UNPACK_HALF_BITS_LAYOUT, _HOST_BOOL_HALF_LAYOUT, _HOST_STATIC_SELECT_HALF_LAYOUT,
+++  _HOST_STATIC_SELECT_INT_LAYOUT, _HOST_HALF_INT_LAYOUT, _HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT,
+++  _HOST_BITWISE_LAYOUT, _HOST_TRUNC_LAYOUT, _HOST_COPYSIGN_LAYOUT, _HOST_ELEMENTWISE_LAYOUT,
+++  _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT)
+++
+++def _run_typed_host_task(task:RKTask, relocs:list[RKReloc]|tuple[RKReloc, ...], bufs:tuple, allowed:tuple[int, ...]) -> bool:
+++  if len(task.layout) <= 1 or task.layout[1] not in allowed: return False
+++  tag = task.layout[1]
+++  if tag in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
+++    _run_host_fp32_view(task, relocs, bufs, tag == _HOST_FP32_RESIDUAL_LAYOUT)
+++  else: _HOST_TASK_RUNNERS[tag](task, relocs, bufs)
+++  return True
+++
++ class RockchipProgram(Program['RockchipDevice']):
++   cmds: list[int]
++   task: RKTask
++@@ -1684,98 +1731,7 @@ class RockchipProgram(Program['RockchipDevice']):
++     if all(st.task.is_copy or st.task.is_fill for st in subtasks):
++       for st in subtasks:
++         task = st.task
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
++-          _run_host_movement(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++-          _run_host_static_half(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
++-          _run_host_static_int(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++-          _pack_static_gather(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
++-          _pack_plane_gather(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
++-          _pack_fp16_chunk(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
++-          _unpack_int32_chunk(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
++-          _pack_int32_chunk(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
++-          _unpack_fp16_chunk(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
++-          _compact_native_half(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
++-          _assemble_int_bytes(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
++-          _pack_half_bits(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
++-          _unpack_half_bits(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
++-          _run_host_bool_half(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
++-          _run_host_half_fp32(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
++-          _run_host_static_select_half(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
++-          _run_host_static_select_int(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
++-          _run_host_half_int(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_SCATTER_LAYOUT:
++-          _run_host_scatter(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_ARGMAX_LAYOUT:
++-          _run_host_argmax(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_AVG_POOL_LAYOUT:
++-          _run_host_avg_pool(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
++-          _run_host_bitwise(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
++-          _run_host_trunc(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
++-          _run_host_copysign(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and \
++-           task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT,
++-                              _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
++-          _run_host_elementwise(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_BCE_LAYOUT:
++-          _run_host_bce(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_CROSS_ENTROPY_LAYOUT:
++-          _run_host_cross_entropy(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_NLL_LAYOUT:
++-          _run_host_nll(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_VARIANCE_LAYOUT:
++-          _run_host_variance(task, st.relocs, bufs)
++-          continue
++-        if len(task.layout) > 1 and task.layout[1] == _HOST_SOFTMAX_ARGMAX_LAYOUT:
++-          _run_host_softmax_argmax(task, st.relocs, bufs)
++-          continue
+++        if _run_typed_host_task(task, st.relocs, bufs, _HOST_ALL_LAYOUTS): continue
++         if task.is_fill:
++           total = task.layout[0]
++           out_slot = st.relocs[0].globals_slot
++@@ -1880,65 +1836,13 @@ class RockchipProgram(Program['RockchipDevice']):
++               self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
++               self.subtasks = None
++               self(*tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
++-              _run_host_movement(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++-              _run_host_static_half(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++-              _pack_static_gather(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
++-              _run_host_bool_half(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
++-              _run_host_static_select_half(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
++-              _run_host_static_select_int(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
++-              _run_host_half_int(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
++-              _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
++-            elif st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
++-              _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
++-            elif st.task.is_copy and len(st.task.layout) > 1 and \
++-                 st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
++-                                       _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
++-              _run_host_elementwise(st.task, st.relocs, tuple(ext))
+++            elif st.task.is_copy and _run_typed_host_task(st.task, st.relocs, tuple(ext), _HOST_CMAC_LAYOUTS): pass
++             else:
++               raise RuntimeError(f"unsupported mixed CMAC stage: {st.task.kind} {st.task.layout}")
++           flush_mixed_dpu()
++           return
++         for st in subtasks:
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_MOVEMENT_LAYOUT:
++-            _run_host_movement(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++-            _run_host_static_half(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++-            _pack_static_gather(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
++-            _run_host_bool_half(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
++-            _run_host_static_select_half(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
++-            _run_host_static_select_int(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_HALF_INT_LAYOUT:
++-            _run_host_half_int(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
++-            _run_host_fp32_view(st.task, st.relocs, tuple(ext), st.task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and st.task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
++-            _run_host_fp32_combine(st.task, st.relocs, tuple(ext))
++-            continue
++-          if st.task.is_copy and len(st.task.layout) > 1 and \
++-             st.task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT,
++-                                   _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT, _HOST_TAN_LAYOUT):
++-            _run_host_elementwise(st.task, st.relocs, tuple(ext))
++-            continue
+++          if st.task.is_copy and _run_typed_host_task(st.task, st.relocs, tuple(ext), _HOST_CMAC_LAYOUTS): continue
++           self.cmds, self.task, self.relocs = list(st.cmds), st.task, list(st.relocs)
++           # CMAC needs its single-task host gather/unpack path. Post-CMAC DPU
++           # stages also stay single-task for reset stability, with the typed
++@@ -2038,33 +1942,8 @@ class RockchipProgram(Program['RockchipDevice']):
++                               if r.globals_slot not in (_CONST_SLOT, _ZERO_SLOT, p.task.out_slot)}
++             pending_outputs = {p.task.out_slot for p in pending}
++             if copy_inputs & pending_outputs or task.out_slot in pending_inputs or task.out_slot in pending_outputs: flush_pending()
++-            if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT: _run_host_movement(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT: _run_host_static_half(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT: _run_host_static_int(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT: _run_host_bool_half(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
++-              _run_host_static_select_half(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
++-              _run_host_static_select_int(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
++-              _run_host_half_int(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
++-              _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_FP32_COMBINE_LAYOUT:
++-              _run_host_fp32_combine(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_HALF_FP32_LAYOUT:
++-              _run_host_half_fp32(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT: _pack_static_gather(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT: _pack_plane_gather(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT: _pack_fp16_chunk(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT: _unpack_int32_chunk(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT: _pack_int32_chunk(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT: _unpack_fp16_chunk(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT: _compact_native_half(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT: _assemble_int_bytes(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT: _pack_half_bits(task, st.relocs, tuple(ext))
++-            elif len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT: _unpack_half_bits(task, st.relocs, tuple(ext))
++-            else: raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
+++            if not _run_typed_host_task(task, st.relocs, tuple(ext), _HOST_ORDERED_COPY_LAYOUTS):
+++              raise RuntimeError(f"rk: unsupported ordered copy layout {task.layout[:2]}")
++             continue
++           if task.fp32_residual_input:
++             # The preceding high-half conversion and this residual conversion
++@@ -2127,73 +2006,7 @@ class RockchipProgram(Program['RockchipDevice']):
++         # Handle copy tasks host-side
++         for st in copy_tasks:
++           task = st.task
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_MOVEMENT_LAYOUT:
++-            _run_host_movement(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_HALF_LAYOUT:
++-            _run_host_static_half(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_INT_LAYOUT:
++-            _run_host_static_int(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_GATHER_MAP_LAYOUT:
++-            _pack_static_gather(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_PLANE_GATHER_LAYOUT:
++-            _pack_plane_gather(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_CHUNK_LAYOUT:
++-            _pack_fp16_chunk(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_INT_CHUNK_LAYOUT:
++-            _unpack_int32_chunk(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_INT32_CHUNK_LAYOUT:
++-            _pack_int32_chunk(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_CHUNK_LAYOUT:
++-            _unpack_fp16_chunk(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_COMPACT_NATIVE_HALF_LAYOUT:
++-            _compact_native_half(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_ASSEMBLE_INT_BYTES_LAYOUT:
++-            _assemble_int_bytes(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_PACK_HALF_BITS_LAYOUT:
++-            _pack_half_bits(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_UNPACK_HALF_BITS_LAYOUT:
++-            _unpack_half_bits(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_BOOL_HALF_LAYOUT:
++-            _run_host_bool_half(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_HALF_LAYOUT:
++-            _run_host_static_select_half(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_STATIC_SELECT_INT_LAYOUT:
++-            _run_host_static_select_int(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_HALF_INT_LAYOUT:
++-            _run_host_half_int(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] in (_HOST_FP32_HALF_LAYOUT, _HOST_FP32_RESIDUAL_LAYOUT):
++-            _run_host_fp32_view(task, st.relocs, tuple(ext), task.layout[1] == _HOST_FP32_RESIDUAL_LAYOUT)
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_BITWISE_LAYOUT:
++-            _run_host_bitwise(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_TRUNC_LAYOUT:
++-            _run_host_trunc(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and task.layout[1] == _HOST_COPYSIGN_LAYOUT:
++-            _run_host_copysign(task, st.relocs, tuple(ext))
++-            continue
++-          if len(task.layout) > 1 and \
++-             task.layout[1] in (_HOST_ELEMENTWISE_LAYOUT, _HOST_ELEMENTWISE_REDUCE_LAYOUT, _HOST_EINSUM_LAYOUT, _HOST_BILINEAR_LAYOUT):
++-            _run_host_elementwise(task, st.relocs, tuple(ext))
++-            continue
+++          if _run_typed_host_task(task, st.relocs, tuple(ext), _HOST_COPY_DPU_LAYOUTS): continue
++           ct = task.layout[0]
++           in_slot = st.relocs[1].globals_slot
++           out_slot = st.relocs[0].globals_slot
++-- 
++2.34.1
++
+diff --git a/0129-rockchip-table-drive-lut-builders.patch b/0129-rockchip-table-drive-lut-builders.patch
+new file mode 100644
+index 000000000..afc151f63
+--- /dev/null
++++ b/0129-rockchip-table-drive-lut-builders.patch
+@@ -0,0 +1,383 @@
++From 6cb4310f6506e6f8bed0237a69de3fd363f115f4 Mon Sep 17 00:00:00 2001
++From: allbilly <53866088+allbilly@users.noreply.github.com>
++Date: Fri, 31 Jul 2026 22:57:50 +0800
++Subject: [PATCH] rockchip: table-drive LUT builder selection
++
++---
++ tinygrad/runtime/support/rockchip.py | 349 +++++----------------------
++ 1 file changed, 56 insertions(+), 293 deletions(-)
++
++diff --git a/tinygrad/runtime/support/rockchip.py b/tinygrad/runtime/support/rockchip.py
++index bdf3c03ef..a162838a6 100644
++--- a/tinygrad/runtime/support/rockchip.py
+++++ b/tinygrad/runtime/support/rockchip.py
++@@ -1731,6 +1731,58 @@ def _build_bce_logits_lut() -> tuple[list[int], int, float, float, int]:
++   for knot_index in (23, 24): lut[_LUT_SIZE+knot_index] += 16
++   return lut, int(np.float16(index_scale).view(np.int16)) & 0xFFFF, output_scale, index_scale, minus_exp
++ 
+++_LUTBuild = tuple[list[int], int, float, float, int]
+++_LUT_STATIC_BUILDERS:dict[Ops, Callable[[], _LUTBuild]] = {
+++  _LUT_EXP_CORRECTION: _build_exp_correction_lut, _LUT_EXP2_SCALE: _build_exp2_scale_lut,
+++  _LUT_EXP2_RESIDUAL: _build_exp2_residual_lut, _LUT_HARDSWISH: _build_hardswish_lut,
+++  _LUT_HARDSWISH_CORRECTION: _build_hardswish_correction_lut, _LUT_ERF: _build_erf_lut,
+++  _LUT_ERF_LOCAL: _build_erf_local_lut, _LUT_QUICK_GELU: _build_quick_gelu_lut,
+++  _LUT_QUICK_GELU_LOCAL: _build_quick_gelu_local_lut, _LUT_TANH: _build_tanh_lut,
+++  _LUT_TANH_LOCAL: _build_tanh_local_lut, _LUT_MISH: _build_mish_lut, _LUT_MISH_LOCAL: _build_mish_local_lut,
+++  Ops.LOG2: _build_log2_lut, Ops.SIN: _build_sin_lut, _LUT_SIN_LOCAL: _build_sin_local_lut,
+++  _LUT_COS: _build_cos_lut, _LUT_COS_LOCAL: _build_cos_local_lut, _LUT_ASIN: _build_asin_lut,
+++  _LUT_ASIN_DETAIL: _build_asin_detail_lut, _LUT_ASIN_DERIVATIVE: _build_asin_derivative_lut,
+++  _LUT_ACOS: _build_acos_lut, _LUT_ACOS_ENDPOINT: _build_acos_endpoint_lut,
+++  _LUT_ACOS_FINE_ENDPOINT: _build_acos_fine_endpoint_lut, _LUT_ATAN: _build_atan_lut,
+++  _LUT_ATAN_LOCAL: _build_atan_local_lut, _LUT_ATANH: _build_atanh_lut, _LUT_ATANH_DETAIL: _build_atanh_detail_lut,
+++  _LUT_POW8: _build_pow8_lut, _LUT_POW8_CORRECTION: _build_pow8_correction_lut, _LUT_POW8_HIGH: _build_pow8_high_lut,
+++  _LUT_POW_BASE07: _build_pow_base07_lut, _LUT_TAN_LOCAL: _build_tan_local_lut, _LUT_TAN_WIDE: _build_tan_wide_lut,
+++  _LUT_SINH: _build_sinh_lut, _LUT_SINH_LOCAL: _build_sinh_local_lut, _LUT_COSH: _build_cosh_lut,
+++  Ops.SQRT: _build_sqrt_lut, Ops.RECIPROCAL: _build_rsqrt_lut, _LUT_SIGMOID: _build_sigmoid_lut,
+++  _LUT_SIGMOID_LOCAL: _build_sigmoid_local_lut, _LUT_BCE_LOGITS: _build_bce_logits_lut,
+++}
+++_LUT_SCALE_BUILDERS:dict[Ops, Callable[[float], _LUTBuild]] = {
+++  Ops.EXP2: _build_exp2_lut, _LUT_CELU: _build_celu_lut, _LUT_CELU_LOCAL: _build_celu_local_lut,
+++  _LUT_ELU: _build_elu_lut, _LUT_ELU_LOCAL: _build_elu_local_lut, _LUT_LOG2_LOCAL: _build_log2_local_lut,
+++  _LUT_LOGSIGMOID_CORRECTION: _build_logsigmoid_correction_lut, _LUT_LOGSIGMOID_TAIL: _build_logsigmoid_tail_lut,
+++  _LUT_SOFTPLUS_TAIL: _build_softplus_tail_lut, _LUT_SOFTPLUS_WIDE: _build_softplus_wide_lut,
+++}
+++_LUT_SCALE_BOOL_BUILDERS:dict[Ops, Callable[[bool], _LUTBuild]] = {
+++  _LUT_GELU: _build_gelu_lut, _LUT_GELU_LOCAL: _build_gelu_local_lut,
+++}
+++_LUT_FIXED_BOOL_BUILDERS:dict[Ops, tuple[Callable[[bool], _LUTBuild], bool]] = {
+++  _LUT_LOG_HALF_LOW: (_build_log_half_lut, False), _LUT_LOG_HALF_HIGH: (_build_log_half_lut, True),
+++  _LUT_ASINH_CORE: (_build_asinh_acosh_core_lut, False), _LUT_ASINH_RANGE: (_build_asinh_acosh_range_lut, False),
+++  _LUT_ACOSH_CORE: (_build_asinh_acosh_core_lut, True), _LUT_ACOSH_RANGE: (_build_asinh_acosh_range_lut, True),
+++  _LUT_POW55: (_build_pow55_lut, False), _LUT_POW55_HIGH: (_build_pow55_lut, True),
+++  _LUT_POW_NEG55_LOW: (_build_pow_neg55_lut, False), _LUT_POW_NEG55_HIGH: (_build_pow_neg55_lut, True),
+++  _LUT_POW_BASE55_LOW: (_build_pow_base55_lut, False), _LUT_POW_BASE55_HIGH: (_build_pow_base55_lut, True),
+++  _LUT_POW_BASE2_LOW: (_build_pow_base2_lut, False), _LUT_POW_BASE2_HIGH: (_build_pow_base2_lut, True),
+++  _LUT_BCE_ZERO: (_build_bce_endpoint_lut, False), _LUT_BCE_ONE: (_build_bce_endpoint_lut, True),
+++}
+++_LUT_REGION_BUILDERS = {
+++  _LUT_POW_BASE8_LOW: 1, _LUT_POW_BASE8_HIGH: 2, _LUT_POW_BASE8_FAR_LOW: 0, _LUT_POW_BASE8_FAR_HIGH: 3,
+++}
+++
+++def _build_lut_tables(lut_op:Ops, input_scale:float) -> _LUTBuild:
+++  if (static_builder := _LUT_STATIC_BUILDERS.get(lut_op)) is not None: return static_builder()
+++  if (scale_builder := _LUT_SCALE_BUILDERS.get(lut_op)) is not None: return scale_builder(input_scale)
+++  if (scale_bool_builder := _LUT_SCALE_BOOL_BUILDERS.get(lut_op)) is not None: return scale_bool_builder(bool(input_scale))
+++  if (fixed_bool_builder := _LUT_FIXED_BOOL_BUILDERS.get(lut_op)) is not None:
+++    return fixed_bool_builder[0](fixed_bool_builder[1])
+++  if (region := _LUT_REGION_BUILDERS.get(lut_op)) is not None: return _build_pow_base8_lut(region)
+++  raise AssertionError(f"dpu_lut: no builder for {lut_op}")
+++
++ def _try_sigmoid(val:UOp) -> int|None:
++   """RECIPROCAL(1 + EXP2(INDEX * -log2(e))) → input slot."""
++   if val.op is not Ops.RECIPROCAL or (add := _unwrap(val.src[0])).op is not Ops.ADD: return None
++@@ -8236,303 +8288,14 @@ def _emit_dpu_lut(plan: RKPlan) -> tuple[tuple[int,...], RKTask, tuple[RKReloc,.
++   # DST_SURF_STRIDE = (width+1) * (channel+1) * 2 bytes
++   surf_stride = (width + 1) * 8 * 2
++   # --- LUT table fill (513 entries × 2 tables) ---
++-  if lut_op is Ops.EXP2:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_lut(input_scale)
++-    lut_le_start = 0xffffc000  # -16384
++-    lut_lo_end = 0x00004000    # 16384
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
++-  elif lut_op is _LUT_EXP_CORRECTION:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp_correction_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_EXP2_SCALE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_scale_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_EXP2_RESIDUAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_exp2_residual_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_HARDSWISH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_HARDSWISH_CORRECTION:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_hardswish_correction_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_CELU:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_celu_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_CELU_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_celu_local_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ELU:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_elu_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ELU_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_elu_local_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ERF:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_erf_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ERF_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_erf_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_GELU:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_gelu_lut(bool(input_scale))
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_GELU_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_gelu_local_lut(bool(input_scale))
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_QUICK_GELU:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_quick_gelu_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_QUICK_GELU_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_quick_gelu_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_TANH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tanh_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_TANH_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tanh_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_LOG2_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_local_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op in (_LUT_LOG_HALF_LOW, _LUT_LOG_HALF_HIGH):
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log_half_lut(lut_op is _LUT_LOG_HALF_HIGH)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_LOGSIGMOID_CORRECTION:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_correction_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_LOGSIGMOID_TAIL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_logsigmoid_tail_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_SOFTPLUS_TAIL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_softplus_tail_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_SOFTPLUS_WIDE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_softplus_wide_lut(input_scale)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_MISH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_mish_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_MISH_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_mish_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is Ops.LOG2:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_log2_lut()
++-    lut_le_start = 0xffffc000  # -16384
++-    lut_lo_end = 0x00004000    # 16384
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
++-  elif lut_op is Ops.SIN:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sin_lut()
++-    lut_le_start = 0xffffc000  # -16384
++-    lut_lo_end = 0x00004000    # 16384
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
++-  elif lut_op is _LUT_SIN_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sin_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_COS:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cos_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_COS_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cos_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ASIN:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ASIN_DETAIL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_detail_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ASIN_DERIVATIVE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asin_derivative_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ACOS:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ACOS_ENDPOINT:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_endpoint_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ACOS_FINE_ENDPOINT:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_acos_fine_endpoint_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ATAN:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ATAN_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atan_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ATANH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atanh_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ATANH_DETAIL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_atanh_detail_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ASINH_CORE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_core_lut(False)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ASINH_RANGE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_range_lut(False)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ACOSH_CORE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_core_lut(True)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ACOSH_RANGE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_asinh_acosh_range_lut(True)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW8:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW8_CORRECTION:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_correction_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW8_HIGH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow8_high_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW55:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow55_lut(False)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW55_HIGH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow55_lut(True)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_NEG55_LOW:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_neg55_lut(False)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_NEG55_HIGH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_neg55_lut(True)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE55_LOW:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base55_lut(False)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE55_HIGH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base55_lut(True)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE8_LOW:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(1)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE8_HIGH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(2)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE8_FAR_LOW:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(0)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE8_FAR_HIGH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base8_lut(3)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_POW_BASE07:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base07_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op in (_LUT_POW_BASE2_LOW, _LUT_POW_BASE2_HIGH):
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_pow_base2_lut(lut_op is _LUT_POW_BASE2_HIGH)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_TAN_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_TAN_WIDE:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_tan_wide_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_SINH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sinh_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_SINH_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sinh_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_COSH:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_cosh_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is Ops.SQRT:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sqrt_lut()
++-    lut_le_start = 0xffffc000  # -16384
++-    lut_lo_end = 0x00004000    # 16384
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
++-  elif lut_op is Ops.RECIPROCAL:
++-    # RECIPROCAL(SQRT(x)) → RSQRT LUT
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_rsqrt_lut()
++-    lut_le_start = 0xffffc000  # -16384
++-    lut_lo_end = 0x00004000    # 16384
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # same as EXP2: HYBRID, OFLOW, LO_LE_MUX=2
++-  elif lut_op is _LUT_SIGMOID:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_SIGMOID_LOCAL:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_sigmoid_local_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op in (_LUT_BCE_ZERO, _LUT_BCE_ONE):
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_bce_endpoint_lut(lut_op is _LUT_BCE_ONE)
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_BCE_LOGITS:
++-    lut, bn_mul_operand, output_scale, index_scale, minus_exp = _build_bce_logits_lut()
++-    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++-  elif lut_op is _LUT_ROUNDOFF:
+++  if lut_op is _LUT_ROUNDOFF:
++     lut = [0 if i % 2 == 0 else 1 << 14 for i in range(_LUT_SIZE)] * 2
++     bn_mul_operand, minus_exp = 0, 0
++     lut_le_start, lut_lo_end = 0x00000000, 0x44800000
++-    lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)
++   else:
++-    raise AssertionError(f"dpu_lut: no builder for {lut_op}")
+++    lut, bn_mul_operand, _, _, minus_exp = _build_lut_tables(lut_op, input_scale)
+++    lut_le_start, lut_lo_end = 0xffffc000, 0x00004000
+++  lut_cfg = (1 << 6) | (1 << 5) | (2 << 2)  # HYBRID_PRIORITY, OFLOW_PRIORITY, LO_LE_MUX=2
++   # Apply output_scale_factor via OUT_CVT_SCALE (Q15 fixed-point) — see below
++   for table_id, base in ((0, 0), (1, _LUT_SIZE)):
++     emitter_emit(cmds, _T_DPU, rk.REG_DPU_LUT_ACCESS_CFG,
++-- 
++2.34.1
++
+diff --git a/progress.md b/progress.md
+index 8343e91a1..9770d711d 100644
+--- a/progress.md
++++ b/progress.md
+@@ -12073,3 +12073,68 @@ Pre-edit recovery copies:
+ `/tmp/test_ops_status.md.20260731-203002`.
+ 
+ Result: the requested forward-only Rockchip `TestOps` goal is complete.
++
++## 2026-07-31 — Rockchip size-compaction milestone
++
++Three table-driven refactors reduce the two Rockchip runtime files by **580
++`sz.py` lines**, from 15,698 to 15,118. Repository size moves from 40,007 to
++39,427 counted lines. Physical Rockchip source moves from 18,059 to 17,479
++lines.
++
++The milestones are:
++
++- `fc69aeff3`, patch `0127-rockchip-compact-classifier-dispatch.patch`:
++  replace the repeated native classifier chain while preserving all 133 active
++  classifiers and their exact order; `support/rockchip.py` saves 153 counted
++  lines.
++- `927996958`, patch `0128-rockchip-centralize-host-dispatch.patch`:
++  centralize typed-host runners with path-specific allowlists;
++  `ops_rockchip.py` saves 189 counted lines.
++- `6cb4310f6`, patch `0129-rockchip-table-drive-lut-builders.patch`:
++  table-drive 74 unique ordinary LUT marker variants while preserving every
++  builder body, roundoff's separate configuration, and the register stream;
++  `support/rockchip.py` saves another 238 counted lines and `_emit_dpu_lut`
++  falls from 388 to 103 counted lines.
++
++`rockchip_size.md` contains the full audit. The dominant source is lowering:
++typed/general plus native/LUT task lowering occupied 10,402 baseline lines,
++77.5% of `support/rockchip.py`. LUT builders were only 742 lines. Of 63 LUT
++builders, 42 static builders occupy 483 counted lines and 21 parameterized
++builders occupy 255.
++
++The recommended external LUT compiler is a generator in `extra/rockchip/`
++with a committed versioned Python artifact in `runtime/autogen/`. It should
++precompile static and finite-variant tables, retain dynamic alpha/beta/scale
++builders, include table metadata and a digest, and have a byte-for-byte
++regeneration check. Merely moving handwritten code into the `sz.py`-excluded
++`autogen` directory is explicitly rejected as metric gaming.
++
++Validation:
++
++- after the first two commits, the complete inventory passed **405 methods,
++  13 skips, and 126 subtests in 2366.21s**;
++- after LUT dispatch, PR1 passed **173/173 in 10.71s** and all LUT tests in the
++  serialized `TestDPU` class passed;
++- the definitive post-LUT inventory passed **405 methods, 13 skips, and 126
++  subtests in 2373.12s (39:33)** with zero failures;
++- mypy remains at the exact 12-error baseline; touched-file Ruff now reports
++  only the eight pre-existing `support/rockchip.py` findings; `git diff
++  --check` passes.
++
++One attempted whole-`test_hw.py` run with `-n12 --dist loadscope` is not a
++valid backend result: xdist assigned separate hardware classes to concurrent
++workers sharing one NPU, producing 48 `EINVAL` submissions and one polluted
++result. Running the LUT-containing class on one worker passed every LUT case;
++the two unrelated argsort/product failures followed the invalid concurrent
++run. The correctly serialized complete TestOps replay above is authoritative.
++
++Pre-edit recovery copies:
++`/tmp/rockchip.py.20260731-215851`,
++`/tmp/ops_rockchip.py.20260731-220353`,
++`/tmp/rockchip.py.20260731-224641`,
++`/tmp/progress.md.20260731-233743`,
++`/tmp/test_ops_status.md.20260731-233743`, and
++`/tmp/rockchip_size.md.20260731-233743`.
++
++Next size step: implement the versioned external compiler for the 42 static
++LUT builders, then validate generated tables byte-for-byte and on hardware.
+diff --git a/rockchip_size.md b/rockchip_size.md
+new file mode 100644
+index 000000000..5f890a437
+--- /dev/null
++++ b/rockchip_size.md
+@@ -0,0 +1,136 @@
++# Rockchip backend size audit
++
++This audit uses `. .venv/bin/activate && python sz.py`. `sz.py` counts source
++lines containing Python tokens, excludes docstrings, and excludes
++`tinygrad/runtime/autogen`. The numbers therefore differ slightly from
++`wc -l` and should be treated as implementation-size signals, not physical
++file sizes.
++
++## Baseline and current size
++
++| Scope | Before | Current | Change |
++|---|---:|---:|---:|
++| `runtime/support/rockchip.py` | 13,422 | 13,031 | -391 |
++| `runtime/ops_rockchip.py` | 2,276 | 2,087 | -189 |
++| Both Rockchip files | 15,698 | 15,118 | **-580** |
++| Entire `tinygrad/runtime` | 22,955 | 22,375 | -580 |
++| Entire repository | 40,007 | 39,427 | -580 |
++
++The two Rockchip files are still 67.6% of counted runtime code and 38.3% of
++the repository. Their physical source size moved from 18,059 to 17,479 lines,
++also a reduction of 580.
++
++Three semantics-preserving dispatch rewrites produced the current reduction:
++
++- `fc69aeff3`: replace the repeated ordered classifier chain with ordered
++  classifier tables, preserving all 133 active classifiers and their order;
++- `927996958`: replace repeated typed-host tag chains with one runner table
++  and path-specific allowlists, preserving which layouts each path accepts.
++- `6cb4310f6`: table-drive all 74 ordinary LUT marker variants, preserving
++  every tuned builder and the roundoff-specific configuration.
++
++PR1 remains 173/173 and the static baselines are unchanged. The definitive
++post-refactor inventory passes 405 methods, 13 expected skips, and 126
++subtests in 2373.12 seconds with zero failures.
++
++## What occupies the lines
++
++The baseline token-line split for `support/rockchip.py` was:
++
++| Category | Counted lines | Share |
++|---|---:|---:|
++| Typed-host and general graph lowering | 5,417 | 40.4% |
++| Native and LUT task lowering | 4,985 | 37.1% |
++| LUT builders | 742 | 5.5% |
++| Register emitters | 678 | 5.1% |
++| LUT recognition and planner | 564 | 4.2% |
++| General graph recognizers | 493 | 3.7% |
++| Native-program dispatch | 241 | 1.8% |
++| Formats, constants, and data classes | 176 | 1.3% |
++| Codec | 126 | 0.9% |
++
++The important result is that lowering accounts for 10,402 lines, or 77.5%
++of the support file. LUT builders are visible but are not the dominant source
++of size.
++
++The baseline split for `ops_rockchip.py` was:
++
++| Category | Counted lines | Share |
++|---|---:|---:|
++| Program submission and runtime control | 1,003 | 44.1% |
++| Typed-host runtime implementations | 807 | 35.5% |
++| CMAC and conversion helpers | 394 | 17.3% |
++| Renderer and device classes | 72 | 3.2% |
++
++The largest current top-level units reinforce the same conclusion:
++
++- `RockchipProgram`: 769 counted lines;
++- `_emit_dpu_lut`: 103 after dispatch compaction (388 before);
++- `_try_tensor_pow_subtasks`: 271;
++- `_try_arg_extrema_subtasks`: 246;
++- `_try_pool_index_subtasks`: 226;
++- `_try_argsort_selected_subtasks`: 214;
++- `_run_host_elementwise`: 215.
++
++Most large blocks are distinct lowering algorithms and hardware state
++handling, not whitespace or trivial helper duplication. They need focused
++algorithm-level refactors and full hardware regression, not mechanical line
++joining.
++
++## LUT compiler assessment
++
++There are 63 `_build_*_lut` functions: 42 static builders occupying 483
++counted lines and 21 parameterized builders occupying 255. The parameterized
++set includes runtime values such as CELU/ELU alpha, Softplus and LogSigmoid
++beta, LOG function scale, generic EXP2 input scale, boolean approximation
++modes, and finite power-table regions.
++
++Moving the current builders into another ordinary `tinygrad` module would not
++change `sz.py`. Moving handwritten implementation into `runtime/autogen`
++would reduce the displayed number only because that directory is excluded;
++that would hide complexity rather than remove it.
++
++A real external compiler should instead use this layout:
++
++```text
++extra/rockchip/compile_luts.py          generator and tuned formulas
++tinygrad/runtime/autogen/rockchip_luts.py  committed generated artifact
++tinygrad/runtime/support/rockchip.py    compact lookup + dynamic builders
++```
++
++The generated artifact should contain a format version, generator revision,
++SHA-256 digest, table name, two signed-int16 513-entry halves, quantized BN
++multiplier, output scale, index scale, minus exponent, and any measured knot
++corrections. A regeneration check must compare the committed artifact byte for
++byte. The runtime should lazily decode/cache tables so normal import time does
++not pay for every LUT.
++
++Recommended split:
++
++1. Precompile the 42 static builders and finite boolean/region variants.
++2. Keep compact runtime builders for truly variable alpha, beta, and scale.
++3. Keep graph recognition, two-level LUT selection, special-value restoration,
++   task ordering, and `_emit_dpu_lut` in the backend; these are runtime policy,
++   not table generation.
++4. Commit the generated Python artifact because current package data includes
++   Python modules but not arbitrary binary assets.
++5. Add software checks for table length/range/metadata and hardware checks for
++   every public LUT family before deleting any old builder implementation.
++
++This can realistically remove roughly 400-500 counted runtime builder lines.
++It cannot remove the remaining 103-line emitter or thousands of lines of
++two-level task composition. The repeated builder-selection portion of
++`_emit_dpu_lut` has already been compacted without changing a table value.
++
++## Refactoring order
++
++1. Compact exact dispatch duplication and prove ordered equivalence.
++2. Introduce the versioned external generator for static tables.
++3. Refactor repeated task-composition primitives only after capturing exact
++   stage lists and buffer-slot dependencies in tests.
++4. Leave register sequences and NPU reset/barrier paths until last; they are
++   small relative to lowering and have the highest state-pollution risk.
++
++Every milestone must retain `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF`, pass PR1,
++preserve mypy/Ruff baselines, pass `git diff --check`, and finish with the
++complete forward-only Rockchip TestOps inventory.
+diff --git a/test_ops_status.md b/test_ops_status.md
+index 18dc33731..641ee22cf 100644
+--- a/test_ops_status.md
++++ b/test_ops_status.md
+@@ -3279,3 +3279,17 @@ suite warning is the known nonfinite fp16-to-fp32 NumPy cast in `test_exp`,
+ whose assertions pass. Worktree is clean except intentional `ref/` clones.
+ 
+ **Final status: all runnable forward-only Rockchip TestOps cases pass.**
++
++### Size compaction remains fully green
++
++Commits `fc69aeff3`, `927996958`, and `6cb4310f6` reduce Rockchip runtime code
++by **580 `sz.py` lines** without changing the forward-only result. The final
++sizes are 13,031 counted lines in `support/rockchip.py` and 2,087 in
++`ops_rockchip.py`, versus 13,422 and 2,276 before the audit.
++
++The definitive post-refactor inventory passes **405 methods, 13 expected
++skips, and 126 subtests in 2373.12s (39:33)** with zero failures. PR1 remains
++**173/173**; mypy remains at its exact 12-error baseline, and touched-file
++Ruff has only eight pre-existing support-file findings. See
++`rockchip_size.md` for the line-category audit and external LUT compiler
++design. Saved implementation patches are `0127`, `0128`, and `0129`.
+-- 
+2.34.1
+
