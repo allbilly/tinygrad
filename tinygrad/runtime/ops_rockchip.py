@@ -52,6 +52,27 @@ class RockchipProgram(Program['RockchipDevice']):
       values = np.frombuffer(ctypes.string_at(int(source.va_addr), count), dtype=np.bool_).astype(np.float16)
       ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]
+    for slot in self.image.int_inputs:
+      if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid int32 input slot {slot}")
+      import numpy as np
+      source, count = bufs[slot], bufs[slot].size//4
+      plane_size, temporary = ((count+7)//8)*16, self.dev._gpu_alloc(((count+7)//8)*64)
+      int_values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.int32).view(np.uint32)
+      for plane, shift in enumerate((24, 16, 8, 0)):
+        encoded = ((int_values >> shift) & 0xff).astype(np.uint8)
+        if shift == 24: encoded ^= 0x80
+        encoded = encoded.astype(np.float16)
+        ctypes.memmove(int(temporary.va_addr)+plane*plane_size, encoded.ctypes.data, encoded.nbytes)  # type: ignore[arg-type]
+      prepared[slot], converted = temporary, [*converted, temporary]
+    for slot in self.image.tiled_inputs:
+      if slot >= len(bufs) or bufs[slot].size % 2 or len(self.image.bool_outputs) != 1:
+        raise RuntimeError(f"invalid suffix-tiled FP16 input slot {slot}")
+      import numpy as np
+      source, count = bufs[slot], bufs[self.image.bool_outputs[0]].size
+      values = np.resize(np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float16), count)
+      temporary = self.dev._gpu_alloc(((count+7)//8)*16)
+      ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      prepared[slot], converted = temporary, [*converted, temporary]
     for slot in self.image.fp32_outputs:
       if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid FP32 output slot {slot}")
       temporary = self.dev._gpu_alloc(bufs[slot].size//2)

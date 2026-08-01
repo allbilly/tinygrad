@@ -454,6 +454,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((image.bool_inputs, image.bool_outputs), ((1,), (0,)))
     self.assertEqual(decode_image(encode_image(image)), image)
 
+  def test_int32_comparisons_use_exact_byte_planes(self):
+    functions = (lambda x,y:x<y, lambda x,y:x>y, lambda x,y:x==y,
+                 lambda x,y:x!=y, lambda x,y:x>=y, lambda x,y:x<=y)
+    for function in functions:
+      x, y = Tensor.empty(16,dtype=dtypes.int), Tensor.empty(16,dtype=dtypes.int)
+      plan = lower_dpu(sink(function(x, y)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual((plan.int_inputs, plan.bool_outputs), ((1,2), (0,)))
+      self.assertLessEqual(len(plan.stages), 64)
+      self.assertFalse(contains_uop(plan))
+    x, y = Tensor.empty(3,4,5,dtype=dtypes.half), Tensor.empty(5,dtype=dtypes.half)
+    plan = lower_dpu(sink(x < y))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.tiled_inputs, (2,))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

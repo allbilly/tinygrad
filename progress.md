@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through lossless typed bool-input widening, the 2026-08-01 census is
-**148 passed, 264 failed, and 13 skipped**. Pytest prints `390 failed` because
+milestones through exact int32 comparison byte planes, the 2026-08-01 census is
+**153 passed, 259 failed, and 13 skipped**. Pytest prints `385 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 58-host/38-NPU
+while recovering the remaining native forward coverage. Focused 59-host/39-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -110,7 +110,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `2651579d8` | Preserve and characterize rejected native TAN designs | `0210-rockchip-record-native-TAN-limits.patch` |
 | `091df1bd8` | Typed bool-output ABI and native IEEE predicates | `0211-rockchip-add-typed-bool-output-ABI.patch` |
 | `bd1b8009a` | IEEE-correct generic FP16 comparison roots | `0212-rockchip-lower-IEEE-FP16-comparisons.patch` |
-| current milestone | Lossless typed bool-input ABI widening | `0213-rockchip-add-lossless-bool-input-ABI.patch` |
+| `25df366fb` | Lossless typed bool-input ABI widening | `0213-rockchip-add-lossless-bool-input-ABI.patch` |
+| current milestone | Exact int32 comparison byte planes and suffix broadcast | `0214-rockchip-add-exact-int32-comparisons.patch` |
 
 ## Architecture now implemented
 
@@ -129,7 +130,7 @@ Important invariants:
 
 - `RKDPUProgram`, `RKContract`, `RKPool`, `RKStage`, and `RKImage` retain no `UOp`.
 - `RKDPUOp` contains only eight hardware stage operations; the 67 generated table identities live separately in `RKLUT` and are data on one `LUT` stage.
-- RKImage version 6 contains only target/version data, command stages, dependencies, relocations, scratch declarations, constants, and typed ABI slot declarations.
+- RKImage version 8 contains only target/version data, command stages, dependencies, relocations, scratch declarations, constants, and typed ABI slot declarations.
 - Runtime NumPy is restricted to declared ABI element-format conversion and never executes tensor semantics on the CPU.
 - Unsupported dtype, layout, or graph combinations reject before device submission.
 - Scratch allocation is liveness-aware and can reuse a dead intermediate in place.
@@ -178,6 +179,8 @@ Implemented forward-only subset:
   than assuming that `not (x<y)` is IEEE `x>=y` in the presence of NaN;
 - lossless public byte-bool input widening to atom-padded FP16 0/1 DMA temporaries, with logical-not evaluated by the NPU and packed through the
   typed bool-output ABI;
+- exact signed-int32 comparison through four unsigned-byte FP16 planes with a sign-biased most-significant byte, plus a narrow declared suffix-tile
+  layout for `(N,...,K)` versus `(K,)` comparison broadcasts;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -189,12 +192,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1652
-tinygrad/runtime/ops_rockchip.py  119
-handwritten Rockchip total  1771
+tinygrad/renderer/rockchip.py  1707
+tinygrad/runtime/ops_rockchip.py  140
+handwritten Rockchip total  1847
 ```
 
-This meets the requested `<5000` research-backend goal with 3,229 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,153 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
@@ -205,14 +208,14 @@ an activation catalog. Approximate current physical source distribution is:
 - UOp canonicalization, affine analysis, and typed lowering: renderer lines 565–1156;
 - register emission: renderer lines 1157–1413;
 - renderer integration: renderer lines 1414 onward;
-- allocation/submission/runtime ABI experiments: 119 `sz.py` lines.
+- allocation/submission/runtime ABI experiments: 140 `sz.py` lines.
 
 This distribution is acceptable only for the frozen research/coverage branch.
 The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,747 `sz.py` lines, a `+1,779` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,747 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 26,823 `sz.py` lines, a `+1,855` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,823 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
@@ -285,7 +288,7 @@ rg -n '_HOST_|run_host|host.*layout' tinygrad/renderer/rockchip.py tinygrad/runt
 ```
 
 Allocator `copyin`/`copyout`, the declared FP32-to-FP16 Sqrt/RSqrt input conversion, the experimental Log `hi/lo` plane encode/output widening,
-lossless byte-bool input widening, and packing NPU-computed FP16 masks into public bool bytes are ABI transport, not semantic CPU execution. The runtime may use NumPy only for these
+lossless byte-bool input widening, exact int32 byte-plane encoding, suffix tiling, and packing NPU-computed FP16 masks into public bool bytes are ABI transport, not semantic CPU execution. The runtime may use NumPy only for these
 representation conversions; it never evaluates a tensor function or predicate on the host. These experiments are research-only and are excluded
 from the planned minimal upstream branch.
 
@@ -293,8 +296,8 @@ from the planned minimal upstream branch.
 
 - Spatial direct convolution. Current tinygrad NCHW storage does not match the proven NPU atom/HWC surface. The frozen branch used host materialization for broad contraction/conv cases, so it is not a valid clean implementation source. A future path needs a typed `RKConv` plus an explicit device layout/weight stage. A 1x1 `1x32 -> 8` convolution canonicalizes to the already-supported affine CMAC contract and cannot be distinguished semantically after simplification.
 - Wider affine/batched contractions and CMAC tiling.
-- Int32 comparison inputs and broader boolean reductions/layouts. Contiguous byte-bool inputs are losslessly widened, generic FP16 comparison outputs
-  and IEEE predicate roots use the public bool-output ABI, and FP16 masks used inside WHERE are native already.
+- General int32 arithmetic/output, non-suffix broadcast layouts, and broader boolean reductions. Int32 comparison inputs are exact, contiguous
+  byte-bool inputs are losslessly widened, and generic FP16 comparison/IEEE predicate outputs use the public bool-output ABI.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
 - General FP32 expressions/inputs, boolean reductions/layouts, general integer inputs/arithmetic/casts, and gradient support. Native FP32/int32 constant fills,
@@ -303,5 +306,5 @@ from the planned minimal upstream branch.
 - Broad TestOps parity. Unsupported graphs deliberately reject rather than run on the CPU.
 
 The next feature should be selected by hardware-native leverage, not raw failed-test count. FP16 masks, IEEE-correct comparison roots, and a
-representation-only public bool ABI now exist. The next boundary is an exact int32 input representation so the mixed-dtype comparison methods and
-leading int-output `test_where` variants can complete. Direct device byte output remains unproven; spatial convolution should wait for an explicit device layout design.
+representation-only public bool ABI and exact int32 comparison inputs now exist. The next boundary is typed int32 output so the leading `test_where`
+variants can complete. Direct device byte output remains unproven; spatial convolution should wait for an explicit device layout design.

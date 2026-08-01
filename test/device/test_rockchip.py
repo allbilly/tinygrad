@@ -264,4 +264,15 @@ class TestRockchip(unittest.TestCase):
     tensor = Tensor(data, device="ROCKCHIP")
     np.testing.assert_equal(tensor.logical_not().numpy(), np.logical_not(data))
 
+  def test_int32_comparison_byte_planes_are_exact(self):
+    lhs = np.array([-(2**31), -65537, -65536, -2049, -1, 0, 1, 2049, 65535, 65536, 2**31-1], dtype=np.int32)
+    rhs = np.array([2**31-1, -65536, -65536, -2048, 0, 0, -1, 2048, 65536, 65535, -(2**31)], dtype=np.int32)
+    x, y = Tensor(lhs, device="ROCKCHIP"), Tensor(rhs, device="ROCKCHIP")
+    for function, reference in ((lambda a,b:a<b, np.less), (lambda a,b:a>b, np.greater), (lambda a,b:a==b, np.equal),
+                                (lambda a,b:a!=b, np.not_equal), (lambda a,b:a>=b, np.greater_equal),
+                                (lambda a,b:a<=b, np.less_equal)):
+      np.testing.assert_equal(function(x, y).numpy(), reference(lhs, rhs))
+    broad, suffix = np.arange(60, dtype=np.float16).reshape(3,4,5), np.array([0, 13, 26, 39, 52], dtype=np.float16)
+    np.testing.assert_equal((Tensor(broad, device="ROCKCHIP") < Tensor(suffix, device="ROCKCHIP")).numpy(), broad < suffix)
+
 if __name__ == "__main__": unittest.main()
