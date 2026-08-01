@@ -50,6 +50,11 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     self.assertEqual((len(plan.stages), len(plan.scratch), len(emit_dpu(plan).stages)), (3, 1, 3))
 
+  def test_scalar_fill_uses_const_zero_index(self):
+    plan = lower_dpu(sink(Tensor.ones((), dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.stages[0].count, 1)
+
   def test_division_canonicalizes_to_generic_fdiv(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(a/b))

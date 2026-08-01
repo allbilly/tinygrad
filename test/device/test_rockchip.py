@@ -18,6 +18,7 @@ class TestRockchip(unittest.TestCase):
     x = Tensor(data, device="ROCKCHIP").realize()
     np.testing.assert_allclose((x*2).realize().numpy(), data*2, rtol=1e-3, atol=1e-3)
     np.testing.assert_equal(Tensor.full((16,), 3.5, dtype=dtypes.half, device="ROCKCHIP").realize().numpy(), np.full(16, 3.5, np.float16))
+    np.testing.assert_equal(Tensor.ones((), dtype=dtypes.half, device="ROCKCHIP").realize().numpy(), np.ones((), np.float16))
 
   def test_where_uses_native_mask(self):
     a = np.linspace(-2, 2, 16, dtype=np.float16)

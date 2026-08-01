@@ -1,0 +1,38 @@
+# Rockchip forward TestOps coverage
+
+The completion target is every non-skipped forward case in the 425-method
+`test/backend/test_ops.py` inventory. Focused tests are recorded as milestone
+evidence but do not replace a complete uncached census.
+
+Run the census serially on RK3588:
+
+```sh
+. /home/orangepi/tinygrad/.venv/bin/activate
+PYTHONPATH=/home/orangepi/rk_2608/test/rockchip:/home/orangepi/rk_upstream \
+CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+python -m pytest test/backend/test_ops.py -p conftest_rockchip -q --tb=no
+```
+
+## Exact baseline
+
+At `aab408cec`, the uncached 2026-08-01 census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 88 |
+| FAIL | 324 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 450 failures because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 65.15 seconds.
+
+## Milestones after the baseline
+
+| Capability | Focused official gain | Full census folded in? |
+|---|---:|---|
+| Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | No |
+
+The next dtype milestone targets exact FP32 and int32 constant fills required by
+`test_full` and both branches of `test_full_like`; those are not counted as
+passes until their complete methods and the next full census succeed.
