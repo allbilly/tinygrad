@@ -34,6 +34,11 @@ class TestRKImage(unittest.TestCase):
       (RKReloc(0, 0, RKBufferKind.CONSTANT, 70000),)),), constants=b"\0"*70002)
     self.assertEqual(decode_image(encode_image(image)), image)
 
+  def test_dependency_mask_is_64_bit(self):
+    stages = tuple(RKStage(RKEngine.DPU, (i,), dependencies=(1 << (i-1)) if i else 0) for i in range(34))
+    image = RKImage(RKTarget.RK3588, stages)
+    self.assertEqual(decode_image(encode_image(image)), image)
+
   def test_rejects_malformed_images(self):
     image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (1,), dependencies=1),))
     with self.assertRaises(ValueError): encode_image(image)

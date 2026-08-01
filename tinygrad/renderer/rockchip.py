@@ -3,15 +3,15 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable, cast
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 2, 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 3, 1
 _HEADER = struct.Struct("<4sHHHHHHIII")
-_STAGE = struct.Struct("<BBHIIIIIQQ")
+_STAGE = struct.Struct("<BBHQIIIIQQ")
 _RELOC = struct.Struct("<HHBBIqIH")
 _SCRATCH = struct.Struct("<II")
 
@@ -73,6 +73,7 @@ class RKImage:
 class RKArg:
   kind: RKBufferKind
   index: int
+  addend: int = 0
 
 @dataclass(frozen=True)
 class RKDPUStage:
@@ -81,6 +82,7 @@ class RKDPUStage:
   lhs: RKArg|float
   rhs: RKArg|float|None
   count: int
+  out_dtype: DType = dtypes.half
 
 @dataclass(frozen=True)
 class RKDPUProgram:
@@ -265,9 +267,9 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   return ret
 
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
-  """Lower one contiguous fp16 store to a UOp-free primitive DPU plan."""
+  """Lower one contiguous fp16/int32 store to a UOp-free primitive DPU plan."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
-  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or store.src[0].dtype is not dtypes.half: return None
+  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or store.src[0].dtype not in (dtypes.half, dtypes.int): return None
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
   if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST: return None
   count = int(out_param.src[0].arg)
@@ -275,9 +277,17 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
      (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)): return None
   root = _parse_dpu_expr(store.src[1], out_index, {})
   if root is None: return None
+  # Native int32 WDMA emits four values per eight-lane fp16 atom. Constant
+  # fills can safely double their source lanes; dynamic conversion needs an
+  # explicit packed layout and is deliberately not inferred here.
+  if store.src[0].dtype is dtypes.int and not isinstance(root, float): return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, _DPUExpr):
-    stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count)
+    if store.src[0].dtype is dtypes.int:
+      fill_stages = tuple(RKDPUStage(RKDPUOp.ADD, RKArg(output.kind, output.index, start*4), 0.0, root,
+                                    min(64, count-start), dtypes.int) for start in range(0, count, 64))
+      return RKDPUProgram(fill_stages, ()) if len(fill_stages) <= 64 else None
+    stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count, store.src[0].dtype)
     return RKDPUProgram((stage,), ())
   order:list[_DPUExpr] = []
   def visit(expr:_DPUExpr) -> None:
@@ -299,7 +309,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count))
+    stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count,
+                             store.src[0].dtype if expr is root else dtypes.half))
     values[expr] = dst
     for source in expr.src:
       if isinstance(source, _DPUExpr):
@@ -423,7 +434,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
   src_word = len(cmds)
   cmds.append(_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0))
   cmds.extend(_command(*x) for x in fixed[30:])
-  relocs = (RKReloc(stage_idx, dst_word, plan.dst.kind, plan.dst.index), RKReloc(stage_idx, src_word, src.kind, src.index))
+  relocs = (RKReloc(stage_idx, dst_word, plan.dst.kind, plan.dst.index, plan.dst.addend),
+            RKReloc(stage_idx, src_word, src.kind, src.index, src.addend))
   reads = (src.index,) if src.kind is RKBufferKind.ARG else ()
   writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
   return RKStage(RKEngine.DPU, tuple(cmds), relocs, reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
@@ -450,7 +462,7 @@ def _emit_mask(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                               (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, src),
                               (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, src)):
     cmds.append(_command(target_id, reg, 0))
-    relocs.append(RKReloc(stage_idx, len(cmds)-1, arg.kind, arg.index))
+    relocs.append(RKReloc(stage_idx, len(cmds)-1, arg.kind, arg.index, arg.addend))
   cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849),
            _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
   reads = (src.index,) if src.kind is RKBufferKind.ARG else ()
@@ -469,30 +481,37 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       constants.extend(bits * (((count+7)//8)*8))
     return RKArg(RKBufferKind.CONSTANT, constant_offsets[key])
   for stage_idx, plan in enumerate(program.stages):
-    lhs, rhs = materialize(plan.lhs, plan.count), materialize(plan.rhs, plan.count) if plan.rhs is not None else None
+    physical_count = plan.count*2 if plan.out_dtype is dtypes.int else plan.count
+    lhs, rhs = materialize(plan.lhs, physical_count), materialize(plan.rhs, physical_count) if plan.rhs is not None else None
     if plan.op is RKDPUOp.EXP2:
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:
       stages.append(_emit_mask(stage_idx, plan, lhs))
       continue
-    width = (plan.count+7)//8-1
-    cmds = [_command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), _command(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),
-            _command(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width),
-            _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007),
-            _command(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0 if plan.op is RKDPUOp.COPY else _EW_CFG[plan.op]),
-            _command(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if plan.op is RKDPUOp.DIV else 0x10001),
-            _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x0e),
-            _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
-            _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
-            _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
-            _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008),
-            _command(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
-            _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0)]
-    relocs = [RKReloc(stage_idx, 13, plan.dst.kind, plan.dst.index), RKReloc(stage_idx, 14, lhs.kind, lhs.index)]
+    width = (physical_count+7)//8-1
+    native_int = plan.out_dtype is dtypes.int
+    dpu_regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),
+      (rk.REG_DPU_DATA_FORMAT, ((4 if native_int else 2)<<29)|(2<<26)|2), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
+      (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0), (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007),
+      (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0),
+      (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if native_int else 7), (rk.REG_DPU_WDMA_SIZE_1, width),
+      (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0),
+      (rk.REG_DPU_EW_CFG, 0 if plan.op is RKDPUOp.COPY else _EW_CFG[plan.op]), (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
+      (rk.REG_DPU_OUT_CVT_OFFSET, 0), (rk.REG_DPU_OUT_CVT_SCALE, 1 if plan.op is RKDPUOp.DIV or native_int else 0x10001),
+      (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
+    rdma_regs = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
+      (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
+      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008))
+    cmds = [_command(_TARGET_DPU, *x) for x in dpu_regs] + [_command(_TARGET_DPU_RDMA, *x) for x in rdma_regs]
+    relocs = []
+    for target_id, reg, arg in ((_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, plan.dst),
+                                (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, lhs)):
+      cmds.append(_command(target_id, reg, 0))
+      relocs.append(RKReloc(stage_idx, len(cmds)-1, arg.kind, arg.index, arg.addend))
     if rhs is not None:
       cmds.append(_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0))
-      relocs.append(RKReloc(stage_idx, 15, rhs.kind, rhs.index))
+      relocs.append(RKReloc(stage_idx, len(cmds)-1, rhs.kind, rhs.index, rhs.addend))
     cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if plan.op is RKDPUOp.DIV else 0x17849),
              _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
     operands = (lhs,) if rhs is None else (lhs, rhs)
@@ -561,7 +580,7 @@ def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
-  def supported_dtypes(self): return {dtypes.half}
+  def supported_dtypes(self): return {dtypes.half, dtypes.int}
   def native_program(self, ast:UOp) -> UOp|None:
     if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
     elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)

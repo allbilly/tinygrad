@@ -4,7 +4,7 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
 from tinygrad.helpers import Target
 from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RKPool, RockchipRenderer, decode_image, emit_contract, emit_dpu,
-                                        emit_pool, lower_contract, lower_dpu, lower_pool)
+                                        emit_pool, encode_image, lower_contract, lower_dpu, lower_pool)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, UOp
 
@@ -25,12 +25,15 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_dpu(plan)
     self.assertEqual(image.stages[0].commands, (
       0x10010000000e4004, 0x1001000001e5400c, 0x1001480000024010, 0x1001000000014030,
-      0x1001000000004034, 0x100100070007403c, 0x1001108202c04070, 0x1001000100014084,
-      0x20010000000e5004, 0x200100000001500c, 0x2001000000005010, 0x2001000000075014,
-      0x2001400000085034, 0x1001000000004020, 0x2001000000005018, 0x2001000000005038,
-      0x2001000178495044, 0x0081000000180008))
+      0x1001000000004034, 0x1001000000004038, 0x100100070007403c, 0x1001000000534040,
+      0x1001000000534060, 0x1001000000004044, 0x1001000000004048, 0x1001000000024050,
+      0x1001000000074058, 0x100100000001405c, 0x1001000000004068, 0x100100000000406c,
+      0x1001108202c04070, 0x1001000000014078, 0x1001000000004080, 0x1001000100014084,
+      0x1001000000004088, 0x10010000004040c0, 0x20010000000e5004, 0x200100000001500c,
+      0x2001000000005010, 0x2001000000075014, 0x2001400000085034, 0x1001000000004020,
+      0x2001000000005018, 0x2001000000005038, 0x2001000178495044, 0x0081000000180008))
     self.assertEqual(tuple((r.word, r.kind, r.index) for r in image.stages[0].relocs),
-                     ((13, RKBufferKind.ARG, 0), (14, RKBufferKind.ARG, 1), (15, RKBufferKind.ARG, 2)))
+                     ((27, RKBufferKind.ARG, 0), (28, RKBufferKind.ARG, 1), (29, RKBufferKind.ARG, 2)))
 
   def test_typed_plan_retains_no_uops(self):
     a, b, c = (Tensor.empty(16,dtype=dtypes.half) for _ in range(3))
@@ -44,11 +47,20 @@ class TestDPUCompiler(unittest.TestCase):
   def test_mul_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
     image = emit_dpu(lower_dpu(sink(a*b)))
-    self.assertEqual(len(image.stages[0].commands), 18)
-    self.assertEqual(image.stages[0].commands[6], 0x1001108003c44070)
-    self.assertEqual(image.stages[0].commands[:6], (
+    self.assertEqual(len(image.stages[0].commands), 32)
+    self.assertEqual(image.stages[0].commands[16], 0x1001108003c44070)
+    self.assertEqual(image.stages[0].commands[:7], (
       0x10010000000e4004, 0x1001000001e5400c, 0x1001480000024010,
-      0x1001000000014030, 0x1001000000004034, 0x100100070007403c))
+      0x1001000000014030, 0x1001000000004034, 0x1001000000004038, 0x100100070007403c))
+
+  def test_int_fill_tiles_native_wdma_limit(self):
+    plan = lower_dpu(sink(Tensor.full((2925,), 4, dtype=dtypes.int)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(len(plan.stages), 46)
+    self.assertTrue(all(stage.count <= 64 and stage.out_dtype is dtypes.int for stage in plan.stages))
+    self.assertEqual(tuple(stage.dst.addend for stage in plan.stages), tuple(range(0, 2925*4, 64*4)))
+    image = emit_dpu(plan)
+    self.assertEqual(decode_image(encode_image(image)), image)
 
   def test_fill_is_dpu_add_not_constant_copy(self):
     plan = lower_dpu(sink(Tensor.full((16,), 3.5, dtype=dtypes.half)))

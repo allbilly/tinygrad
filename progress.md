@@ -12,11 +12,13 @@ collected methods, plus 126 passing subtests.
 
 Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
-ported forward contract is 79 passed, 333 failed, and 13 skipped; pytest also
-reports 126 failing subtests, producing its aggregate `459 failed` summary.
+ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
+typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native-int
+milestones, the 2026-08-01 census is **98 passed, 314 failed, and 13 skipped**.
+Pytest prints `440 failed` because it separately counts 126 failing subtests.
 
 Therefore the clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 18-host/6-NPU
+while recovering the remaining native forward coverage. Focused 26-host/10-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -45,6 +47,15 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `93dc9e35f` | Offline-generated EXP2 LUT and one generic LUT stage | `0164-rockchip-add-generated-EXP2-LUT-stage.patch` |
 | `1d3acac82` | Row sums lowered to constant-backed CMAC contracts | `0165-rockchip-lower-row-sums-as-CMAC-contracts.patch` |
 | `65acc1858` | Exhaustive FP16-domain LUT simulation and error metadata | `0166-rockchip-verify-generated-LUT-error-bounds.patch` |
+| `a9dd8e0da` | Clean rewrite/LUT design documentation | `0167-rockchip-document-clean-rewrite-and-LUT-tuning.patch` |
+| `70f621d04` | Full forward TestOps census contract | `0168-rockchip-restore-full-forward-TestOps-census.patch` |
+| `5b9a088cf` | 32-bit RKImage constant relocation indices | `0169-rockchip-widen-RKImage-constant-relocations.patch` |
+| `9b4479640` | Ordered WHERE extrema normalization | `0170-rockchip-normalize-ordered-WHERE-extrema.patch` |
+| `04f53c58a` | Scalar DPU fills | `0171-rockchip-lower-scalar-DPU-fills.patch` |
+| `3183a307b` | Generic FP16 WHERE masks | `0172-rockchip-lower-generic-half-WHERE-masks.patch` |
+| `5829aaf48` | Fused typed division and ADD-zero copy | `0173-rockchip-fuse-typed-DPU-division.patch` |
+| `fa22d6764` | Native ABS canonicalization | `0174-rockchip-canonicalize-native-absolute-value.patch` |
+| current milestone | Tiled native int32 fills and 64-bit image dependencies | `0175-rockchip-tile-native-int32-fills.patch` |
 
 ## Architecture now implemented
 
@@ -69,27 +80,28 @@ Important invariants:
 - LUT fitting and exhaustive verification live in `extra/rockchip`; runtime imports only generated immutable metadata/data.
 - Hardware tests are serialized because parallel NPU reset/submission pollutes shared device state.
 
-Implemented forward-only FP16 subset:
+Implemented forward-only subset:
 
 - contiguous copy and fill;
-- ADD, MUL, and MAX expression DAGs, including multiple reset-separated stages;
+- ADD, MUL, MAX, DIV, ABS, ordered extrema, and generic FP16 WHERE expression DAGs;
 - scalar operands materialized as declared RKImage constants;
 - EXP2 on one proven 128-element DPU tile over the generated `[-2, 2]` LUT domain;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
+- native int32 constant fills, split into the proven 64-output DPU tile with typed destination offsets.
 
 ## Size result
 
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  449
+tinygrad/renderer/rockchip.py  548
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  523
+handwritten Rockchip total  622
 ```
 
-This meets the requested `<5000` backend goal with 4,477 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 4,378 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -99,7 +111,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 25,499 `sz.py` lines, a `+531` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 499 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 25,598 `sz.py` lines, a `+630` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 598 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 
@@ -153,11 +165,11 @@ Allocator `copyin`/`copyout` is normal buffer transport and is not semantic CPU 
 
 - Spatial direct convolution. Current tinygrad NCHW storage does not match the proven NPU atom/HWC surface. The frozen branch used host materialization for broad contraction/conv cases, so it is not a valid clean implementation source. A future path needs a typed `RKConv` plus an explicit device layout/weight stage. A 1x1 `1x32 -> 8` convolution canonicalizes to the already-supported affine CMAC contract and cannot be distinguished semantically after simplification.
 - Wider affine/batched contractions and CMAC tiling.
-- WHERE/comparison/mask stages.
+- User-visible bool packing and general comparison outputs. FP16 masks used inside WHERE are native already.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
-- FP32, bool, integer, and gradient support. Per user direction this branch is forward-only first.
+- FP32, bool, general integer arithmetic/casts, and gradient support. Native int32 constant fills are the first bounded integer contract.
 - Multicore/program-chain submission beyond the stable reset-separated single-core task sequence.
 - Broad TestOps parity. Unsupported graphs deliberately reject rather than run on the CPU.
 
-The next feature should be selected by hardware-native leverage, not raw failed-test count. A typed comparison/mask stage is the best next DPU primitive; a spatial convolution should wait for an explicit device layout design.
+The next feature should be selected by hardware-native leverage, not raw failed-test count. The FP16 mask primitive now exists; the next boundary is device-native bool output packing and int/bool inputs so comparison and the leading `test_where` variants can complete. Spatial convolution should wait for an explicit device layout design.

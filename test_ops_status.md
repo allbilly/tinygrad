@@ -78,22 +78,34 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch focused verified matrix
 
+Latest complete uncached census after the native-int fill milestone:
+
+| Status | Methods |
+|---|---:|
+| PASS | 98 |
+| FAIL | 314 |
+| SKIP | 13 |
+| Collected | 425 |
+
+Pytest reports `440 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 54.10 seconds.
+
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
 | Native hook | 1 | — | PASS |
-| RKImage codec/validation/relocation | 4 | — | PASS |
-| DPU ADD/MUL/MAX/copy/fill and multistage liveness | included in compiler suite | 2 | PASS |
+| RKImage codec/validation/relocation, including 64-bit dependencies | 6 | — | PASS |
+| DPU ADD/MUL/MAX/DIV/copy/fill/ABS/WHERE and multistage liveness | included in compiler suite | included | PASS |
 | Generated EXP2 LUT | exhaustive 32,770 FP16 encodings in domain | 1 | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean compiler suite total | 18 after spatial-conv rejection test | 6 | PASS |
+| Clean image/compiler suite total | 26 | 10 | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
 ## Supported contracts
 
-- dtype: FP16 only;
+- dtype: FP16 expression graphs plus tiled native int32 constant fills;
 - mode: forward only;
 - static shapes;
 - DPU contiguous storage and one output;
@@ -106,7 +118,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 - FP32, integer, uint8, bool, and gradient graphs;
 - noncontiguous elementwise indexing;
-- WHERE/comparison and fused epilogue families not expressible by current primitives;
+- user-visible bool comparisons and WHERE graphs needing bool/int inputs or non-FP16 outputs;
 - arbitrary EXP2 sizes or values requiring a different domain policy;
 - unpacked/general matmul, batched matmul, arbitrary K, and host-required gather;
 - spatial NCHW convolution without a device layout stage;
@@ -115,14 +127,17 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Next low-hanging group
 
-The best next group is typed DPU comparison/mask/WHERE support, not dtype emulation or spatial convolution:
+The FP16 comparison mask and WHERE graph are implemented. The next low-hanging
+boundary is device-native bool/int representation:
 
-- it reuses the existing expression DAG, scratch allocator, reset/dependency handling, and DPU emitter;
-- it unlocks multiple high-level decompositions without adding named operator recipes;
-- it does not require host layout transforms;
-- it should be implemented as primitive compare/mask/select stages and verified against frozen command oracles.
+- emit byte-wide user-visible comparison results without CPU packing;
+- ingest bool conditions and int32 operands through an explicit NPU layout stage;
+- reuse those typed boundaries for the leading `test_where`, comparison,
+  `maximum`/`minimum`, and `*_like` variants;
+- reject dynamic casts until packing is proven, as native int32 WDMA consumes
+  eight FP16 lanes while producing four int32 lanes.
 
-After that, add one more generated primitive LUT such as LOG2 only if its exact hardware domain and error metadata are proven. Spatial convolution is not low-hanging because it first needs a device-visible layout contract.
+Spatial convolution is not low-hanging because it first needs a device-visible layout contract.
 
 ## Rules for future tally updates
 
