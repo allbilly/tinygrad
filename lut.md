@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 8 |
+| Schema | 9 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -98,6 +98,8 @@ Each variant lowers to 51 stages and six scratch buffers. Both official normal f
 Standalone Erf uses `RKLUT.ERF = 14`, a direct Q15 table over `[-4,4]`, and `RKLUT.ERF_LOCAL = 15`, Q15 `3*erf(x)` over `[-0.25,0.25]` addressed by `z=16*x`. The local result is divided by three on device, while `2*x/sqrt(pi)` replaces both LUTs inside `[-0.04,0.04]`. Device masks select exact `-1/+1` tails outside the broad domain. The 44-stage typed plan passes the official normal, scalar, positive-extreme, and negative-extreme subcases plus a strict 2,049-point `[-8,8]` sweep.
 
 ELU/SELU use three generated broad/local pairs: `ELU1 = 16/17`, `ELU01 = 18/19`, and `SELU = 20/21`. Broad tables cover the negative branch on `[-8,0]`; local tables address `x in [-0.5,0]` through `z=4*x`. Gains use available Q15 precision (1/2 for alpha 1, 8/16 for alpha 0.1, and 0.5/1 for SELU) and are inverted by device MUL stages. A second-order `scale*(x+x^2/2)` handles `[-0.03,0]`, exact negative saturation handles `x<-8`, and ordinary MAX/MUL handles the positive branch. All three share one 35-stage, six-scratch lowering recipe and pass their official methods plus dense `[-10,10]` sweeps.
+
+Mish uses `RKLUT.MISH = 22`, an asymmetric Q15 table on `[-8,8]` whose positive half stores Mish divided by eight, and `RKLUT.MISH_LOCAL = 23`, direct Q15 Mish over `[-1,1]` addressed by `z=2*x`. The NPU restores the positive broad scale with a sign mask, uses `0.6*x+0.32*x^2` inside `[-0.08,0.08]`, and selects zero/identity tails outside the broad domain. Its typed plan has 38 stages and six scratch buffers. The official Torch method passes at `rtol=1e-3`; the supplemental ideal-float dense sweep uses `rtol=1e-2` because it does not model PyTorch's staged FP16 boundaries.
 
 ## Current command contract
 

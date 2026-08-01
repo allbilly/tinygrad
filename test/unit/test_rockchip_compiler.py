@@ -233,6 +233,15 @@ class TestDPUCompiler(unittest.TestCase):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
+  def test_mish_uses_generated_two_level_lut(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).mish()))
+    self.assertEqual((len(plan.stages), len(plan.scratch)), (38, 6))
+    self.assertEqual((sum(x.op is RKDPUOp.MISH for x in plan.stages), sum(x.op is RKDPUOp.MISH_LOCAL for x in plan.stages)), (1, 1))
+    for name in ("MISH", "MISH_LOCAL"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

@@ -113,4 +113,10 @@ class TestRockchip(unittest.TestCase):
     for function, expected in variants:
       np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).numpy(), expected.astype(np.float16), rtol=1e-3, atol=1e-6)
 
+  def test_two_level_mish_lut(self):
+    data = np.linspace(-8, 8, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    expected = (fp32*np.tanh(np.log1p(np.exp(fp32)))).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").mish().numpy(), expected, rtol=1e-2, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()
