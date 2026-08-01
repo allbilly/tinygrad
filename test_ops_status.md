@@ -80,6 +80,8 @@ smoke/contract tests, not a replacement for this census.
 
 Latest complete uncached census after infinity-safe WHERE, signed infinite division, prefix-repeat broadcast, and exact copysign:
 
+The subsequent typed-cast milestone passes focused official `test_cast`; this gain is not folded into the census table until the next complete run.
+
 | Status | Methods |
 |---|---:|
 | PASS | 167 |
@@ -142,10 +144,11 @@ Int32 values are never narrowed: four byte planes preserve all 32 bits and the s
 | Infinity-safe WHERE | threshold clamping plus reciprocal-generated signed infinity | official `test_inf_where`, `test_masked_fill`, and selected/unselected infinity vectors | PASS |
 | Signed infinite division | infinite numerator becomes device multiply on finite nonzero denominator domain | official `test_div_naninf` and signed hardware vector | PASS |
 | Prefix broadcast and exact copysign | distinct repeat/tile metadata plus typed FP16 sign-bit transport | both official copysign methods, two broadcast ADD methods, and layout/sign vectors | PASS |
+| Typed casts | FP32 widening, numeric int input/output, bool widening/packing, and NPU truncation/predicate stages | all five official `test_cast` subcases and boundary vectors | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 65 | 45 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 66 | 46 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

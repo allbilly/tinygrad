@@ -314,4 +314,13 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(Tensor(np.ones(4,dtype=np.float16),device="ROCKCHIP").copysign(
       Tensor(exact_sign,device="ROCKCHIP")).numpy(), np.copysign(np.ones(4,dtype=np.float16), exact_sign))
 
+  def test_typed_cast_abi_boundaries(self):
+    half = np.array([-1.9, -1, -0., .9, 1.9],dtype=np.float16)
+    integer, boolean = np.array([-3,0,2],dtype=np.int32), np.array([False,True],dtype=np.bool_)
+    np.testing.assert_equal(Tensor(half,device="ROCKCHIP").float().numpy(), half.astype(np.float32))
+    np.testing.assert_equal(Tensor(integer,device="ROCKCHIP").float().numpy(), integer.astype(np.float32))
+    np.testing.assert_equal(Tensor(boolean,device="ROCKCHIP").float().numpy(), boolean.astype(np.float32))
+    np.testing.assert_equal(Tensor(half,device="ROCKCHIP").int().numpy(), half.astype(np.int32))
+    np.testing.assert_equal(Tensor(half,device="ROCKCHIP").bool().numpy(), half.astype(np.bool_))
+
 if __name__ == "__main__": unittest.main()

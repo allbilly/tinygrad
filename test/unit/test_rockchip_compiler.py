@@ -524,6 +524,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((repeated.tiled_inputs, repeated.repeated_inputs, repeated.sign_inputs), ((1,), (1,), (1,)))
     self.assertEqual((tiled.tiled_inputs, tiled.repeated_inputs), ((2,), ()))
 
+  def test_typed_cast_abi_contracts(self):
+    half, integer, boolean = (Tensor.empty(9,dtype=dtype) for dtype in (dtypes.half,dtypes.int,dtypes.bool))
+    plans = [lower_dpu(sink(x)) for x in (half.float(), integer.float(), boolean.float(), half.int(), half.bool())]
+    self.assertTrue(all(isinstance(x, RKDPUProgram) and not contains_uop(x) for x in plans))
+    self.assertEqual(plans[0].fp32_outputs, (0,))
+    self.assertEqual((plans[1].numeric_int_inputs, plans[1].fp32_outputs), ((1,), (0,)))
+    self.assertEqual((plans[2].bool_inputs, plans[2].fp32_outputs), ((1,), (0,)))
+    self.assertEqual(plans[3].numeric_int_outputs, (0,))
+    self.assertEqual(plans[4].bool_outputs, (0,))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

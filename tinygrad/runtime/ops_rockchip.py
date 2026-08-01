@@ -40,6 +40,7 @@ class RockchipProgram(Program['RockchipDevice']):
     widened: list[tuple[HCQBuffer, HCQBuffer]] = []
     packed: list[tuple[HCQBuffer, HCQBuffer, int]] = []
     int_packed: list[tuple[HCQBuffer, HCQBuffer, int]] = []
+    numeric_int_packed: list[tuple[HCQBuffer, HCQBuffer, int]] = []
     for slot in self.image.bool_outputs:
       if slot >= len(bufs): raise RuntimeError(f"invalid bool output slot {slot}")
       count, destination = bufs[slot].size, bufs[slot]
@@ -51,6 +52,12 @@ class RockchipProgram(Program['RockchipDevice']):
       temporary = self.dev._gpu_alloc(((count+7)//8)*64)
       prepared[slot], converted = temporary, [*converted, temporary]
       int_packed.append((temporary, destination, count))
+    for slot in self.image.numeric_int_outputs:
+      if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid numeric int32 output slot {slot}")
+      count, destination = bufs[slot].size//4, bufs[slot]
+      temporary = self.dev._gpu_alloc(((count+7)//8)*16)
+      prepared[slot], converted = temporary, [*converted, temporary]
+      numeric_int_packed.append((temporary, destination, count))
     for slot in self.image.bool_inputs:
       if slot >= len(bufs): raise RuntimeError(f"invalid bool input slot {slot}")
       import numpy as np
@@ -167,6 +174,10 @@ class RockchipProgram(Program['RockchipDevice']):
         import numpy as np
         values = np.frombuffer(ctypes.string_at(int(temporary.va_addr), count*2), dtype=np.float16) != 0
         ctypes.memmove(int(destination.va_addr), values.ctypes.data, count)  # type: ignore[arg-type]
+      for temporary, destination, count in numeric_int_packed:
+        import numpy as np
+        values = np.frombuffer(ctypes.string_at(int(temporary.va_addr), count*2), dtype=np.float16).astype(np.int32)
+        ctypes.memmove(int(destination.va_addr), values.ctypes.data, count*4)  # type: ignore[arg-type]
       for temporary, destination, count in int_packed:
         import numpy as np
         plane_size, int_output_values = ((count+7)//8)*16, np.zeros(count, dtype=np.uint32)

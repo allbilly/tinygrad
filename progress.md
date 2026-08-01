@@ -19,7 +19,7 @@ milestones through prefix-repeat broadcast and exact copysign, the 2026-08-01 ce
 it separately counts 113 failing subtests; 13 subtests now pass.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 65-host/45-NPU
+while recovering the remaining native forward coverage. Focused 66-host/46-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -118,7 +118,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `f02b8c970` | Infinity-safe threshold WHERE and masked fill | `0218-rockchip-lower-infinity-safe-WHERE.patch` |
 | `4d07592d6` | Signed infinite-numerator division | `0219-rockchip-preserve-infinite-division-sign.patch` |
 | `751a108e2` | Prefix-repeat broadcast and exact copysign sign ABI | `0220-rockchip-add-prefix-broadcast-and-exact-copysign.patch` |
-| current milestone | Exact 167-pass TestOps census | `0221-rockchip-record-167-pass-TestOps-census.patch` |
+| `a1c1f32ea` | Exact 167-pass TestOps census | `0221-rockchip-record-167-pass-TestOps-census.patch` |
+| current milestone | Typed FP16/int32/bool cast ABIs | `0222-rockchip-add-typed-cast-ABIs.patch` |
 
 ## Architecture now implemented
 
@@ -197,6 +198,7 @@ Implemented forward-only subset:
 - infinity-safe threshold WHERE: device min/max clamping and reciprocal-generated signed infinity avoid `0*inf` in both selected and unselected arms;
 - infinite-numerator division lowered to device multiplication on the tested finite nonzero domain, preserving the denominator sign lost by RK3588 DIV;
 - distinct prefix-repeat versus suffix-tile FP16 layouts, plus typed sign-bit transport and direct `abs(magnitude)*sign` copysign composition;
+- typed casts: FP16/int32/bool inputs widened through declared FP16/FP32 ABI buffers, NPU truncation/predicate stages, and typed int32/bool packing;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -208,12 +210,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1928
-tinygrad/runtime/ops_rockchip.py  187
-handwritten Rockchip total  2115
+tinygrad/renderer/rockchip.py  1943
+tinygrad/runtime/ops_rockchip.py  198
+handwritten Rockchip total  2141
 ```
 
-This meets the requested `<5000` research-backend goal with 2,885 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 2,859 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
@@ -224,14 +226,14 @@ an activation catalog. Approximate current physical source distribution is:
 - UOp canonicalization, affine analysis, and typed lowering: renderer lines 565–1156;
 - register emission: renderer lines 1157–1413;
 - renderer integration: renderer lines 1414 onward;
-- allocation/submission/runtime ABI experiments: 187 `sz.py` lines.
+- allocation/submission/runtime ABI experiments: 198 `sz.py` lines.
 
 This distribution is acceptable only for the frozen research/coverage branch.
 The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 27,091 `sz.py` lines, a `+2,123` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 2,091 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 27,117 `sz.py` lines, a `+2,149` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 2,117 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
@@ -305,7 +307,8 @@ rg -n '_HOST_|run_host|host.*layout' tinygrad/renderer/rockchip.py tinygrad/runt
 
 Allocator `copyin`/`copyout`, the declared FP32-to-FP16 Sqrt/RSqrt input conversion, the experimental Log `hi/lo` plane encode/output widening,
 lossless byte-bool input widening, exact int32 byte-plane encoding/reassembly, declared square-transpose/scalar-tiling layout conversion,
-int32-to-FP16 numeric widening for mixed extrema, prefix-repeat/suffix-tile expansion, typed FP16 sign-bit transport for copysign, and packing
+int32-to-FP16 numeric widening for mixed extrema/casts, FP16-to-int32 packing after NPU truncation, prefix-repeat/suffix-tile expansion,
+typed FP16 sign-bit transport for copysign, and packing
 NPU-computed FP16 masks into public bool bytes are ABI transport, not semantic CPU execution. The runtime may use NumPy only for these
 representation conversions; it never evaluates a tensor function or predicate on the host. These experiments are research-only and are excluded
 from the planned minimal upstream branch.

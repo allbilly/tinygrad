@@ -9,8 +9,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 13, 1
-_HEADER = struct.Struct("<4sHHHHHHIIIQQQQQQQQQQQ")
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 14, 1
+_HEADER = struct.Struct("<4sHHHHHHIIIQQQQQQQQQQQQ")
 _STAGE = struct.Struct("<BBHQIIIIQQ")
 _RELOC = struct.Struct("<HHBBIqIH")
 _SCRATCH = struct.Struct("<II")
@@ -81,6 +81,7 @@ class RKImage:
   numeric_int_inputs: tuple[int, ...] = ()
   repeated_inputs: tuple[int, ...] = ()
   sign_inputs: tuple[int, ...] = ()
+  numeric_int_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKArg:
@@ -118,6 +119,7 @@ class RKDPUProgram:
   numeric_int_inputs: tuple[int, ...] = ()
   repeated_inputs: tuple[int, ...] = ()
   sign_inputs: tuple[int, ...] = ()
+  numeric_int_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKView:
@@ -670,6 +672,7 @@ def validate_image(image:RKImage) -> None:
   _slot_mask(image.numeric_int_inputs)
   _slot_mask(image.repeated_inputs)
   _slot_mask(image.sign_inputs)
+  _slot_mask(image.numeric_int_outputs)
 
 def encode_image(image:RKImage) -> bytes:
   validate_image(image)
@@ -688,7 +691,7 @@ def encode_image(image:RKImage) -> bytes:
                                _slot_mask(image.bool_inputs), _slot_mask(image.int_inputs), _slot_mask(image.tiled_inputs),
                                _slot_mask(image.int_outputs), _slot_mask(image.transposed_int_inputs), _slot_mask(image.tiled_int_inputs),
                                _slot_mask(image.raw_int_inputs), _slot_mask(image.numeric_int_inputs), _slot_mask(image.repeated_inputs),
-                               _slot_mask(image.sign_inputs)))
+                               _slot_mask(image.sign_inputs), _slot_mask(image.numeric_int_outputs)))
   for engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes in stage_rows:
     out += _STAGE.pack(engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes)
   for reloc in relocs:
@@ -701,7 +704,8 @@ def decode_image(blob:bytes) -> RKImage:
   if len(blob) < _HEADER.size: raise ValueError("truncated RKImage header")
   magic, version, target, stage_count, reloc_count, scratch_count, reserved, command_count, constant_size, reserved2, \
     bool_output_mask, bool_input_mask, int_input_mask, tiled_input_mask, int_output_mask, transposed_int_input_mask, \
-    tiled_int_input_mask, raw_int_input_mask, numeric_int_input_mask, repeated_input_mask, sign_input_mask = _HEADER.unpack_from(blob)
+    tiled_int_input_mask, raw_int_input_mask, numeric_int_input_mask, repeated_input_mask, sign_input_mask, \
+    numeric_int_output_mask = _HEADER.unpack_from(blob)
   if magic != RKIMAGE_MAGIC: raise ValueError("invalid RKImage header")
   expected = _HEADER.size + stage_count*_STAGE.size + reloc_count*_RELOC.size + scratch_count*_SCRATCH.size + command_count*8 + constant_size
   if expected != len(blob): raise ValueError("invalid RKImage size")
@@ -729,7 +733,7 @@ def decode_image(blob:bytes) -> RKImage:
                   tuple(x for x in range(32) if reserved2 & (1 << x)), tuple(x for x in range(16) if reserved & (1 << x)),
                   slots(bool_output_mask), slots(bool_input_mask), slots(int_input_mask), slots(tiled_input_mask), slots(int_output_mask),
                   slots(transposed_int_input_mask), slots(tiled_int_input_mask), slots(raw_int_input_mask), slots(numeric_int_input_mask),
-                  slots(repeated_input_mask), slots(sign_input_mask))
+                  slots(repeated_input_mask), slots(sign_input_mask), slots(numeric_int_output_mask))
   validate_image(image)
   return image
 
@@ -1214,7 +1218,7 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
      (u.src[1].op is Ops.CONST and input_count == 1 and int(u.src[1].arg) == 0))
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and (u.src[1].key == output_index.key or suffix_tiled):
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
-  elif u.op is Ops.CAST and u.dtype is dtypes.half and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM and \
+  elif u.op is Ops.CAST and u.dtype in (dtypes.half, dtypes.float) and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM and \
        u.src[0].src[1].key == output_index.key and u.src[0].dtype in (dtypes.int, dtypes.bool):
     ret = RKArg(RKBufferKind.ARG, u.src[0].src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
@@ -1603,7 +1607,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   count = int(out_param.src[0].arg)
   if count <= 0 or int(out_index.vmin) != 0 or int(out_index.vmax) != count-1: return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
-  if store.src[0].dtype is dtypes.int:
+  numeric_int_output = store.src[0].dtype is dtypes.int and store.src[1].op is Ops.CAST and store.src[1].src[0].dtype is dtypes.half
+  if store.src[0].dtype is dtypes.int and not numeric_int_output:
     if (int_fill:=_lower_int_fill(store.src[1], output, count)) is not None: return int_fill
     if (int_bool:=_lower_int_bool_cast(store.src[1], out_index, output, count)) is not None: return int_bool
     if (int_where:=_lower_int_where(store.src[1], out_index, output, count)) is not None: return int_where
@@ -1612,7 +1617,11 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   root: _DPUExpr|RKArg|float|None
   copysign_sign_u = _canonical_copysign_sign(store.src[1])
   predicate = _canonical_finite_predicate(store.src[1]) if store.src[0].dtype is dtypes.bool else None
-  if copysign_sign_u is not None:
+  if numeric_int_output:
+    cast_source = _parse_dpu_expr(store.src[1].src[0], out_index, {})
+    if cast_source is None: return None
+    root = _trunc_expr(cast_source)
+  elif copysign_sign_u is not None:
     magnitude_u = next((x for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.half and x.key != copysign_sign_u.key), None)
     if magnitude_u is None: return None
     magnitude, sign = _parse_dpu_expr(magnitude_u, out_index, {}), _parse_dpu_expr(copysign_sign_u, out_index, {})
@@ -1635,8 +1644,13 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   # Native int32 WDMA emits four values per eight-lane fp16 atom. Constant
   # fills can safely double their source lanes; dynamic conversion needs an
   # explicit packed layout and is deliberately not inferred here.
-  if store.src[0].dtype is dtypes.int and not isinstance(root, float): return None
+  if store.src[0].dtype is dtypes.int and not numeric_int_output and not isinstance(root, float): return None
   if not isinstance(root, _DPUExpr):
+    if store.src[0].dtype is dtypes.float and isinstance(root, RKArg):
+      cast_operand_u = store.src[1].src[0] if store.src[1].op is Ops.CAST else None
+      return RKDPUProgram((RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count),), (), fp32_outputs=(output.index,),
+        bool_inputs=(root.index,) if cast_operand_u is not None and cast_operand_u.dtype is dtypes.bool else (),
+        numeric_int_inputs=(root.index,) if cast_operand_u is not None and cast_operand_u.dtype is dtypes.int else ())
     if store.src[0].dtype in (dtypes.int, dtypes.float):
       tile = 64 if store.src[0].dtype is dtypes.int else 4
       fill_stages = tuple(RKDPUStage(RKDPUOp.ADD, RKArg(output.kind, output.index, start*4), 0.0, root,
@@ -1675,7 +1689,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       dst = RKArg(RKBufferKind.SCRATCH, slot)
     assert isinstance(expr.op, RKDPUOp)
     stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count,
-                             dtypes.half if expr is root and store.src[0].dtype in (dtypes.float, dtypes.bool) else
+                             dtypes.half if expr is root and (store.src[0].dtype in (dtypes.float, dtypes.bool) or numeric_int_output) else
                              (store.src[0].dtype if expr is root else dtypes.half), expr.lut))
     values[expr] = dst
     for dependency in expr.src:
@@ -1693,7 +1707,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   int_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.int and
                                   x.src[0].op is Ops.PARAM))
   numeric_int_inputs = tuple(dict.fromkeys(x.src[0].src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.CAST and
-    x.dtype is dtypes.half and x.src[0].op is Ops.INDEX and x.src[0].dtype is dtypes.int and x.src[0].src[0].op is Ops.PARAM))
+    x.dtype in (dtypes.half, dtypes.float) and x.src[0].op is Ops.INDEX and x.src[0].dtype is dtypes.int and x.src[0].src[0].op is Ops.PARAM))
   int_inputs = tuple(x for x in int_inputs if x not in numeric_int_inputs)
   tiled_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.half and
     x.src[0].op is Ops.PARAM and int(out_index.vmin) == 0 and count % int(x.src[0].src[0].arg) == 0 and
@@ -1706,7 +1720,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   sign_inputs = (copysign_sign_u.src[0].arg.slot,) if copysign_sign_u is not None else ()
   if len(stages) > 64: return None
   return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs, fp32_outputs, bool_outputs, bool_inputs,
-                      int_inputs, tiled_inputs, numeric_int_inputs=numeric_int_inputs, repeated_inputs=repeated_inputs, sign_inputs=sign_inputs)
+                      int_inputs, tiled_inputs, numeric_int_inputs=numeric_int_inputs, repeated_inputs=repeated_inputs, sign_inputs=sign_inputs,
+                      numeric_int_outputs=(output.index,) if numeric_int_output else ())
 
 def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
@@ -1993,7 +2008,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
                  int_inputs=program.int_inputs, tiled_inputs=program.tiled_inputs, int_outputs=program.int_outputs,
                  transposed_int_inputs=program.transposed_int_inputs, tiled_int_inputs=program.tiled_int_inputs,
                  raw_int_inputs=program.raw_int_inputs, numeric_int_inputs=program.numeric_int_inputs, repeated_inputs=program.repeated_inputs,
-                 sign_inputs=program.sign_inputs)
+                 sign_inputs=program.sign_inputs, numeric_int_outputs=program.numeric_int_outputs)
 
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit a direct FP16 CMAC surface; inputs and output are already in hardware-legal layouts."""
