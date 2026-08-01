@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Meaning of this file
 
-This status separates the frozen broad prototype from the clean `rockchip-2608` backend. A rejection is not counted as a pass. The clean runtime has no CPU semantic fallback, so unsupported cases fail during compilation with `RKPLAN_REJECT:unsupported_graph`. A declared FP32-to-FP16 input-format conversion is permitted at the Sqrt/RSqrt ABI boundary; both functions remain NPU task graphs.
+This status separates the frozen broad prototype from the `rockchip-2608` research backend. A rejection is not counted as a pass. The runtime has no CPU semantic fallback, so unsupported cases fail during compilation with `RKPLAN_REJECT:unsupported_graph`. Declared representation-only ABI conversions exist for Sqrt/RSqrt and experimental FP32 Log; all function semantics remain NPU task graphs. These FP32 experiments are not part of the planned minimal upstream FP16 branch.
 
 Use:
 
@@ -78,20 +78,20 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the CELU milestone:
+Latest complete uncached census after the logarithm milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 128 |
-| FAIL | 284 |
+| PASS | 131 |
+| FAIL | 281 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `410 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 254.23 seconds. This
+Pytest reports `407 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 292.18 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
-natural Exp, and CELU α=1–4.
+natural Exp, CELU α=1–4, and Log2/Log/Log10.
 
 ## Focused verified matrix
 
@@ -116,16 +116,17 @@ natural Exp, and CELU α=1–4.
 | Refined RSqrt | typed 42-stage plan plus declared FP32 ABI input | official normal/zero/scalar cases, geometric sweep, and IEEE specials | PASS |
 | Natural Exp | typed 36-stage broad/local plan | official normal/scalar/IEEE cases and dense sweep | PASS |
 | CELU α=1–4 | typed 35/30-stage final-output plans | all official tensor/scalar cases and dense sweeps | PASS |
+| Log2/Log/Log10 | typed 57-stage scale-specific plans; FP32 Log 61 stages | all official methods, measured dense sweep, and FP32 boundary | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 45 | 25 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 46 | 26 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
 ## Supported contracts
 
-- dtype: FP16 expression graphs, tiled native int32/FP32 constant fills, and bounded FP32 Sqrt/RSqrt input conversion;
+- dtype: FP16 expression graphs, tiled native int32/FP32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and experimental FP32 Log two-plane ABI;
 - mode: forward only;
 - static shapes;
 - DPU contiguous storage and one output;
@@ -136,6 +137,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - RSqrt uses exact range scaling, one generated seed LUT, an NPU Newton refinement, and device special-value masks;
 - natural Exp uses generated broad/local LUTs and device special-value masks;
 - CELU α=1–4 uses ELU1 or direct final-output broad/local tables plus near-zero correction;
+- Log2/Log/Log10 use scale-specific broad/local tables, exact power-of-16 normalization, and device special-value masks;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.

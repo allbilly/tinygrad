@@ -173,4 +173,13 @@ class TestRockchip(unittest.TestCase):
       expected = np.where(fp32 > 0, fp32, alpha*np.expm1(fp32/alpha)).astype(np.float16)
       np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").celu(alpha).numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_generated_logarithm_luts_and_fp32_boundary(self):
+    data = np.geomspace(2**-10, 4, 2049).astype(np.float16)
+    for function, reference in ((lambda x:x.log2(), np.log2), (lambda x:x.log(), np.log), (lambda x:x.log10(), np.log10)):
+      expected = reference(data.astype(np.float32)).astype(np.float16)
+      np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).numpy(), expected, rtol=1.1e-3, atol=1e-6)
+    fp32 = np.array([0.19525401, 0.8640957, 1., np.inf, -np.inf, np.nan], dtype=np.float32)
+    with np.errstate(invalid="ignore"):
+      np.testing.assert_allclose(Tensor(fp32, device="ROCKCHIP").log().numpy(), np.log(fp32), rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

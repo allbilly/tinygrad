@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through the direct CELU LUTs, the 2026-08-01 census is
-**128 passed, 284 failed, and 13 skipped**. Pytest prints `410 failed` because
+milestones through the scale-specific logarithm LUTs, the 2026-08-01 census is
+**131 passed, 281 failed, and 13 skipped**. Pytest prints `407 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 45-host/25-NPU
+while recovering the remaining native forward coverage. Focused 46-host/26-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -35,6 +35,22 @@ as full TestOps completion.
 - Required test context: `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF`
 
 The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. Each clean milestone is also archived as a mail-formatted patch in `/home/orangepi/tinygrad`.
+
+## Research branch versus upstream scope
+
+`rockchip-2608` is now explicitly the research/coverage branch, not a proposed
+single upstream PR. Its activation catalog, experimental FP32 two-plane ABI,
+int/FP32 fills, PPU probe, progress files, and full TestOps plugin are retained
+to characterize RK3588 and recover the frozen oracle without losing work.
+
+A future merge-oriented branch must start from current master and carry only a
+small honest FP16 contract. Its target stage IR should use generic `Ops` for ALU
+semantics, a distinct mask stage, and a generic LUT stage whose generated asset
+identity is data rather than one of many pseudo-opcodes. It should reject FP32,
+integer, bool, unsupported layouts, and unimplemented contractions; remove the
+runtime NumPy ABI experiment; include only hardware-native features required by
+a useful end-to-end workload; and satisfy the repository's 25,000-line cap.
+The 425-method census remains informational and must not dictate that upstream IR.
 
 ## Completed milestones
 
@@ -78,7 +94,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `a1c8090c4` | Range-scaled refined RSqrt LUT | `0194-rockchip-add-refined-RSqrt-LUT.patch` |
 | `41ba2345c` | Broad/local natural Exp LUTs | `0195-rockchip-add-natural-Exp-LUTs.patch` |
 | `ddb9d0733` | Rejected int fill probe retained for reference | `0196-rockchip-record-rejected-int-fill-probe.patch` |
-| current milestone | Direct final-output CELU LUTs | `0197-rockchip-add-CELU-LUTs.patch` |
+| `bb115b4a3` | Direct final-output CELU LUTs | `0197-rockchip-add-CELU-LUTs.patch` |
+| current milestone | Scale-specific Log2/Log/Log10 LUTs and experimental typed FP32 ABI | `0198-rockchip-add-logarithm-LUTs.patch` |
 
 ## Architecture now implemented
 
@@ -128,6 +145,8 @@ Implemented forward-only subset:
 - RSqrt using exact power-of-16 input scaling, a dedicated Q13 seed, one NPU Newton step, output rescaling, and IEEE masks;
 - natural Exp using asymmetric broad and direct local tables plus device-generated IEEE special values;
 - CELU α=1–4 using ELU1 or direct final-output broad/local tables and a near-zero polynomial;
+- Log2/natural Log/Log10 using scale-specific broad/local LUTs, power-of-16 normalization, near-one correction, and IEEE masks;
+- experimental FP32 natural Log using atom-aligned `hi/lo` FP16 input planes and declared FP16-to-FP32 output widening;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -139,12 +158,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1166
-tinygrad/runtime/ops_rockchip.py  85
-handwritten Rockchip total  1251
+tinygrad/renderer/rockchip.py  1247
+tinygrad/runtime/ops_rockchip.py  99
+handwritten Rockchip total  1346
 ```
 
-This meets the requested `<5000` backend goal with 3,749 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,654 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -152,9 +171,9 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - semantic analysis and typed lowering: renderer lines 193–334;
 - register emission: renderer lines 335–475;
 - renderer integration: renderer lines 476–485;
-- allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
+- allocation/submission/runtime ABI experiment: 99 physical lines.
 
-The whole repository is 26,189 `sz.py` lines, a `+1,221` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 1,189 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 26,322 `sz.py` lines, a `+1,354` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,322 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
@@ -212,7 +231,7 @@ No-host-semantic-fallback audit:
 rg -n '_HOST_|run_host|host.*layout' tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py
 ```
 
-Allocator `copyin`/`copyout` and the declared FP32-to-FP16 Sqrt/RSqrt input conversion are ABI transport, not semantic CPU execution. The runtime may use NumPy only for this element-format conversion; it never evaluates Sqrt, RSqrt, or another tensor operation on the host.
+Allocator `copyin`/`copyout`, the declared FP32-to-FP16 Sqrt/RSqrt input conversion, and the experimental Log `hi/lo` plane encode/output widening are ABI transport, not semantic CPU execution. The runtime may use NumPy only for these representation conversions; it never evaluates Sqrt, RSqrt, Log, or another tensor operation on the host. This experiment is research-only and is excluded from the planned minimal upstream branch.
 
 ## Explicitly pending
 
@@ -221,7 +240,7 @@ Allocator `copyin`/`copyout` and the declared FP32-to-FP16 Sqrt/RSqrt input conv
 - User-visible bool packing and general comparison outputs. FP16 masks used inside WHERE are native already.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
-- General FP32 expressions/inputs, bool, general integer arithmetic/casts, and gradient support. Native FP32/int32 constant fills and the bounded FP32 Sqrt/RSqrt input ABI are the only current exceptions.
+- General FP32 expressions/inputs, bool, general integer arithmetic/casts, and gradient support. Native FP32/int32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and the experimental FP32 Log two-plane ABI are the only current exceptions.
 - Multicore/program-chain submission beyond the stable reset-separated single-core task sequence.
 - Broad TestOps parity. Unsupported graphs deliberately reject rather than run on the CPU.
 

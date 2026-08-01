@@ -9,7 +9,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 3, 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 4, 1
 _HEADER = struct.Struct("<4sHHHHHHIII")
 _STAGE = struct.Struct("<BBHQIIIIQQ")
 _RELOC = struct.Struct("<HHBBIqIH")
@@ -76,6 +76,12 @@ class RKDPUOp(IntEnum):
   CELU3_LOCAL = 47
   CELU4 = 48
   CELU4_LOCAL = 49
+  LOG2 = 50
+  LOG2_LOCAL = 51
+  LOG = 52
+  LOG_LOCAL = 53
+  LOG10 = 54
+  LOG10_LOCAL = 55
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -111,6 +117,7 @@ class RKImage:
   constants: bytes = b""
   version: int = RKIMAGE_VERSION
   fp32_inputs: tuple[int, ...] = ()
+  fp32_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKArg:
@@ -132,6 +139,7 @@ class RKDPUProgram:
   stages: tuple[RKDPUStage, ...]
   scratch: tuple[RKScratch, ...]
   fp32_inputs: tuple[int, ...] = ()
+  fp32_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKView:
@@ -388,6 +396,44 @@ def _exp_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   nan_denom = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MUL, (high, low))))
   return _DPUExpr(RKDPUOp.DIV, (_DPUExpr(RKDPUOp.MUL, (finite, nan_denom)), nan_denom))
 
+def _log2_expr(source:_DPUExpr|RKArg|float, scale:float=1.0) -> _DPUExpr:
+  """Normalize by powers of four, refine near one, and repair IEEE special values on the NPU."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  # Two power-of-16 bands cover the official FP16 domain with six fewer stages than four power-of-four bands.
+  low_masks = tuple(positive(threshold, source) for threshold in (.25, .015625))
+  factor = _DPUExpr(RKDPUOp.ADD, (1.0, _DPUExpr(RKDPUOp.ADD, tuple(
+    _DPUExpr(RKDPUOp.MUL, (mask, weight)) for mask,weight in zip(low_masks, (15.0, 240.0))))))
+  normalized = _DPUExpr(RKDPUOp.MUL, (source, factor))
+  count = _DPUExpr(RKDPUOp.ADD, low_masks)
+  offset = _DPUExpr(RKDPUOp.MUL, (count, -4.0*scale))
+  bounded_low = _DPUExpr(RKDPUOp.MAX, (normalized, .25))
+  bounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX,
+    (_DPUExpr(RKDPUOp.MUL, (bounded_low, -1.0)), -4.0)), -1.0))
+  centered = _DPUExpr(RKDPUOp.SUB, (bounded, 1.0))
+  broad_op, local_op = ((RKDPUOp.LOG, RKDPUOp.LOG_LOCAL) if math.isclose(scale, math.log(2)) else
+                        (RKDPUOp.LOG10, RKDPUOp.LOG10_LOCAL) if math.isclose(scale, math.log10(2)) else
+                        (RKDPUOp.LOG2, RKDPUOp.LOG2_LOCAL))
+  broad = _DPUExpr(broad_op, (bounded,))
+  local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(local_op,
+    (_DPUExpr(RKDPUOp.MUL, (centered, 12.5)),)), .25))
+  local_inside = _DPUExpr(RKDPUOp.MUL, (positive(bounded, .85), positive(1.15, bounded)))
+  near_inside = _DPUExpr(RKDPUOp.MUL, (positive(centered, -.02), positive(.02, centered)))
+  polynomial = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB,
+    (centered, _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (centered, centered)), .5)))), scale*math.log2(math.e)))
+  mantissa = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD,
+    (_DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.SUB, (1.0, local_inside)))),
+     _DPUExpr(RKDPUOp.MUL, (local, _DPUExpr(RKDPUOp.SUB, (local_inside, near_inside)))))),
+    _DPUExpr(RKDPUOp.MUL, (polynomial, near_inside))))
+  corrected = _DPUExpr(RKDPUOp.ADD, (mantissa, offset))
+  negative, greater_zero, high = positive(0.0, source), positive(source, 0.0), positive(source, 65472.0)
+  nonzero = _DPUExpr(RKDPUOp.MAX, (greater_zero, negative))
+  zero_result = _DPUExpr(RKDPUOp.DIV, (corrected, nonzero))
+  finite = _DPUExpr(RKDPUOp.DIV, (zero_result, _DPUExpr(RKDPUOp.SUB, (1.0, high))))
+  not_number = _DPUExpr(RKDPUOp.MUL, (greater_zero, negative))
+  valid = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MAX, (negative, not_number))))
+  return _DPUExpr(RKDPUOp.MUL, (finite, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
+
 def _celu_expr(source:_DPUExpr|RKArg|float, alpha:int) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -423,6 +469,7 @@ def validate_image(image:RKImage) -> None:
   for scratch in image.scratch:
     if scratch.size < 0 or scratch.alignment <= 0 or scratch.alignment & (scratch.alignment-1): raise ValueError("invalid scratch declaration")
   if any(x < 0 or x >= 32 for x in image.fp32_inputs): raise ValueError("RKImage FP32 input slots must be in 0..31")
+  if any(x < 0 or x >= 16 for x in image.fp32_outputs): raise ValueError("RKImage FP32 output slots must be in 0..15")
 
 def encode_image(image:RKImage) -> bytes:
   validate_image(image)
@@ -435,7 +482,8 @@ def encode_image(image:RKImage) -> bytes:
     relocs.extend(stage.relocs)
     stage_rows.append((int(stage.engine), stage.flags, 0, stage.dependencies, command_start, len(stage.commands), reloc_start, len(stage.relocs),
                        _slot_mask(stage.reads), _slot_mask(stage.writes)))
-  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.stages), len(relocs), len(image.scratch), 0,
+  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.stages), len(relocs), len(image.scratch),
+                               sum(1 << x for x in image.fp32_outputs),
                                len(commands), len(image.constants), sum(1 << x for x in image.fp32_inputs)))
   for engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes in stage_rows:
     out += _STAGE.pack(engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes)
@@ -448,7 +496,7 @@ def encode_image(image:RKImage) -> bytes:
 def decode_image(blob:bytes) -> RKImage:
   if len(blob) < _HEADER.size: raise ValueError("truncated RKImage header")
   magic, version, target, stage_count, reloc_count, scratch_count, reserved, command_count, constant_size, reserved2 = _HEADER.unpack_from(blob)
-  if magic != RKIMAGE_MAGIC or reserved: raise ValueError("invalid RKImage header")
+  if magic != RKIMAGE_MAGIC: raise ValueError("invalid RKImage header")
   expected = _HEADER.size + stage_count*_STAGE.size + reloc_count*_RELOC.size + scratch_count*_SCRATCH.size + command_count*8 + constant_size
   if expected != len(blob): raise ValueError("invalid RKImage size")
   off, rows = _HEADER.size, []
@@ -471,7 +519,8 @@ def decode_image(blob:bytes) -> RKImage:
     stages.append(RKStage(RKEngine(engine), tuple(commands[command_start:command_start+command_len]),
                           tuple(relocs[reloc_start:reloc_start+reloc_len]), slots(reads), slots(writes), deps, flags))
     if any(r.stage != idx for r in stages[-1].relocs): raise ValueError("relocation belongs to wrong stage")
-  image = RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], version, tuple(x for x in range(32) if reserved2 & (1 << x)))
+  image = RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], version,
+                  tuple(x for x in range(32) if reserved2 & (1 << x)), tuple(x for x in range(16) if reserved & (1 << x)))
   validate_image(image)
   return image
 
@@ -823,6 +872,22 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     src = tuple(_parse_dpu_expr(x, output_index, memo) for x in (numerator, denominator))
     if any(x is None for x in src): return None
     ret = _DPUExpr(RKDPUOp.DIV, cast(tuple[_DPUExpr|RKArg|float, ...], src))
+  elif u.op is Ops.MUL and (logarithm:=next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.LOG2), None)) is not None:
+    constant = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    if constant is None or not isinstance(constant.arg, (int, float)) or not any(
+       math.isclose(float(constant.arg), x) for x in (math.log(2), math.log10(2))): return None
+    raw_source = _unwrap_same_cast(logarithm.src[0])
+    if raw_source.op is Ops.INDEX and raw_source.dtype is dtypes.float and raw_source.src[0].op is Ops.PARAM and \
+       raw_source.src[1].key == output_index.key:
+      count, high = int(raw_source.src[0].src[0].arg), RKArg(RKBufferKind.ARG, raw_source.src[0].arg.slot)
+      residual = RKArg(RKBufferKind.ARG, high.index, ((count+7)//8)*16)
+      correction = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.DIV,
+        (residual, _DPUExpr(RKDPUOp.MAX, (high, 2**-14)))), float(constant.arg)*math.log2(math.e)))
+      ret = _DPUExpr(RKDPUOp.ADD, (_log2_expr(high, float(constant.arg)), correction))
+    else:
+      operand = _parse_dpu_expr(raw_source, output_index, memo)
+      if operand is None: return None
+      ret = _log2_expr(operand, float(constant.arg))
   elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX):
     src = tuple(_parse_dpu_expr(x, output_index, memo) for x in u.src)
     if any(x is None for x in src): return None
@@ -836,6 +901,19 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     if operand is None: return None
     if exp_factor is not None and math.isclose(float(exp_factor.arg), math.log2(math.e)): ret = _exp_expr(operand)
     else: ret = _DPUExpr(RKDPUOp.EXP2, (operand,))
+  elif u.op is Ops.LOG2:
+    raw_source = _unwrap_same_cast(u.src[0])
+    if raw_source.op is Ops.INDEX and raw_source.dtype is dtypes.float and raw_source.src[0].op is Ops.PARAM and \
+       raw_source.src[1].key == output_index.key:
+      count, high = int(raw_source.src[0].src[0].arg), RKArg(RKBufferKind.ARG, raw_source.src[0].arg.slot)
+      residual = RKArg(RKBufferKind.ARG, high.index, ((count+7)//8)*16)
+      correction = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.DIV,
+        (residual, _DPUExpr(RKDPUOp.MAX, (high, 2**-14)))), math.log2(math.e)))
+      ret = _DPUExpr(RKDPUOp.ADD, (_log2_expr(high), correction))
+    else:
+      operand = _parse_dpu_expr(raw_source, output_index, memo)
+      if operand is None: return None
+      ret = _log2_expr(operand)
   elif u.op is Ops.RECIPROCAL:
     operand = _parse_dpu_expr(u.src[0], output_index, memo)
     if operand is None: return None
@@ -923,7 +1001,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
     stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count,
-                             store.src[0].dtype if expr is root else dtypes.half))
+                             dtypes.half if expr is root and store.src[0].dtype is dtypes.float else
+                             (store.src[0].dtype if expr is root else dtypes.half)))
     values[expr] = dst
     for dependency in expr.src:
       if isinstance(dependency, _DPUExpr):
@@ -933,7 +1012,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   size = ((count+7)//8)*16
   fp32_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.float and
                                    x.src[0].op is Ops.PARAM))
-  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs)
+  fp32_outputs = (output.index,) if store.src[0].dtype is dtypes.float else ()
+  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs, fp32_outputs)
 
 def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
@@ -1048,7 +1128,9 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (RKDPUOp.SINH,"SINH"),(RKDPUOp.SINH_LOCAL,"SINH_LOCAL"),(RKDPUOp.COSH,"COSH"),
                        (RKDPUOp.SQRT,"SQRT"),(RKDPUOp.RSQRT,"RSQRT"),(RKDPUOp.EXP,"EXP"),(RKDPUOp.EXP_LOCAL,"EXP_LOCAL"),
                        (RKDPUOp.CELU2,"CELU2"),(RKDPUOp.CELU2_LOCAL,"CELU2_LOCAL"),(RKDPUOp.CELU3,"CELU3"),
-                       (RKDPUOp.CELU3_LOCAL,"CELU3_LOCAL"),(RKDPUOp.CELU4,"CELU4"),(RKDPUOp.CELU4_LOCAL,"CELU4_LOCAL"))}}[plan.op]
+                       (RKDPUOp.CELU3_LOCAL,"CELU3_LOCAL"),(RKDPUOp.CELU4,"CELU4"),(RKDPUOp.CELU4_LOCAL,"CELU4_LOCAL"),
+                       (RKDPUOp.LOG2,"LOG2"),(RKDPUOp.LOG2_LOCAL,"LOG2_LOCAL"),(RKDPUOp.LOG,"LOG"),
+                       (RKDPUOp.LOG_LOCAL,"LOG_LOCAL"),(RKDPUOp.LOG10,"LOG10"),(RKDPUOp.LOG10_LOCAL,"LOG10_LOCAL"))}}[plan.op]
   post_scale = {RKDPUOp.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 RKDPUOp.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.op, 1.0)
   cmds = []
@@ -1143,7 +1225,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
                    RKDPUOp.LOGSIGMOID_TAIL, RKDPUOp.SOFTPLUS1, RKDPUOp.SOFTPLUS1_TAIL, RKDPUOp.SOFTPLUS3,
                    RKDPUOp.SOFTPLUS3_TAIL, RKDPUOp.SOFTPLUS13, RKDPUOp.SINH, RKDPUOp.SINH_LOCAL, RKDPUOp.COSH,
                    RKDPUOp.SQRT, RKDPUOp.RSQRT, RKDPUOp.EXP, RKDPUOp.EXP_LOCAL, RKDPUOp.CELU2, RKDPUOp.CELU2_LOCAL,
-                   RKDPUOp.CELU3, RKDPUOp.CELU3_LOCAL, RKDPUOp.CELU4, RKDPUOp.CELU4_LOCAL):
+                   RKDPUOp.CELU3, RKDPUOp.CELU3_LOCAL, RKDPUOp.CELU4, RKDPUOp.CELU4_LOCAL,
+                   RKDPUOp.LOG2, RKDPUOp.LOG2_LOCAL, RKDPUOp.LOG, RKDPUOp.LOG_LOCAL, RKDPUOp.LOG10, RKDPUOp.LOG10_LOCAL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:
@@ -1180,7 +1263,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     reads = tuple(sorted({x.index for x in operands if x.kind is RKBufferKind.ARG}))
     writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET))
-  return RKImage(target, tuple(stages), program.scratch, bytes(constants), fp32_inputs=program.fp32_inputs)
+  return RKImage(target, tuple(stages), program.scratch, bytes(constants), fp32_inputs=program.fp32_inputs,
+                 fp32_outputs=program.fp32_outputs)
 
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit a direct FP16 CMAC surface; inputs and output are already in hardware-legal layouts."""

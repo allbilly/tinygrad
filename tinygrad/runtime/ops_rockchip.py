@@ -35,13 +35,22 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
-    prepared, converted = list(bufs), []  # type: list[HCQBuffer], list[HCQBuffer]
+    prepared, converted, widened = list(bufs), [], []  # type: list[HCQBuffer], list[HCQBuffer], list[tuple[HCQBuffer, HCQBuffer]]
+    for slot in self.image.fp32_outputs:
+      if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid FP32 output slot {slot}")
+      temporary = self.dev._gpu_alloc(bufs[slot].size//2)
+      prepared[slot], converted, widened = temporary, [*converted, temporary], [*widened, (temporary, bufs[slot])]
     for slot in self.image.fp32_inputs:
       if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid FP32 input slot {slot}")
       import numpy as np
-      source, temporary = bufs[slot], self.dev._gpu_alloc(bufs[slot].size//2)
-      values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float32).astype(np.float16)
-      ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      source, count = bufs[slot], bufs[slot].size//4
+      plane_size, temporary = ((count+7)//8)*16, self.dev._gpu_alloc(((count+7)//8)*32)
+      values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float32)
+      high = values.astype(np.float16)
+      residual, finite = np.zeros(values.shape, dtype=np.float16), np.isfinite(values)
+      residual[finite] = (values[finite]-high[finite].astype(np.float32)).astype(np.float16)
+      ctypes.memmove(int(temporary.va_addr), high.ctypes.data, high.nbytes)  # type: ignore[arg-type]
+      ctypes.memmove(int(temporary.va_addr)+plane_size, residual.ctypes.data, residual.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
@@ -72,6 +81,11 @@ class RockchipProgram(Program['RockchipDevice']):
         finally:
           self.dev._gpu_free(cmd)
           self.dev._gpu_free(task)
+      for temporary, destination in widened:
+        import numpy as np
+        with np.errstate(invalid="ignore"):
+          values = np.frombuffer(ctypes.string_at(int(temporary.va_addr), temporary.size), dtype=np.float16).astype(np.float32)
+        ctypes.memmove(int(destination.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
     finally:
       for buf in converted: self.dev._gpu_free(buf)
     return time.perf_counter()-start if wait else None

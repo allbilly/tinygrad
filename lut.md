@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 16 |
+| Schema | 18 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -114,6 +114,10 @@ Reciprocal Sqrt uses `RSQRT = 35`, a Q13 seed clamped to `[0.5,4]` over the same
 Natural Exp uses `EXP = 36`, an asymmetric Q15 broad table over `[-2,2]`: negative knots store `exp(x)` directly while positive knots store `exp(x)/8`, restored by an NPU mask. `EXP_LOCAL = 37` stores direct Q14 Exp over `[-0.25,0.25]` to avoid the broad table's zero-side scale discontinuity. Device masks synthesize positive infinity, zero, and NaN for nonfinite inputs. The 36-stage, four-scratch program passes every official subcase and a dense `[-2,2]` sweep.
 
 CELU α=2/3/4 uses direct final-output broad/local pairs `CELU2 = 38/39`, `CELU3 = 40/41`, and `CELU4 = 42/43`. Broad tables cover `[-4,0]` in Q14 for α=2 and Q13 for α=3/4; Q15 local tables cover `[-0.5,0]`. A second-order `x+x²/(2α)` replaces the LUT inside `[-0.03,0]`, avoiding cancellation after `exp(x/α)-1`. α=1 reuses the ELU1 tables. The 35/30-stage plans pass all official tensor/scalar cases and dense per-α sweeps.
+
+Logarithms use scale-specific broad/local pairs: `LOG2 = 44/45`, natural `LOG = 46/47`, and `LOG10 = 48/49`. Two power-of-16 masks normalize positive inputs into `[0.25,4]` and add the exact `-4` or `-8` exponent offset; this covers values down to `2^-10` with six fewer tasks than four power-of-four bands. Broad tables use Q13/Q14/Q15 according to each base's normalized output range. Q15 local tables store four times the result near one, and `x-x²/2` replaces them inside `|x-1|<0.02`. The natural-log negative local knots 77–78 have a recorded `+8` correction for RK3588 interpolation rounding.
+
+Half inputs use 57 stages and eight reusable scratch buffers. FP32 natural-log inputs use a declared two-plane ABI representation: the runtime encodes `hi=fp16(x)` and `lo=fp16(x-hi)` into atom-aligned planes, the NPU adds the first-order `lo/hi` correction, and the NPU writes an FP16 result that the runtime widens to FP32. These are element-format encode/decode operations only; logarithm evaluation, range selection, correction, and IEEE zero/infinity/NaN semantics remain NPU tasks. The FP32 plan has 61 stages. All three official methods pass at their unchanged `rtol=1e-3`; the supplemental geometric `[2^-10,4]` characterization uses the measured `rtol=1.1e-3` envelope (observed maximum `0.001038`). A rejected `+16` Q14 correction at broad LO knots 295/296/311/312 fixed the two normalized low-input misses but regressed four direct positive inputs, so it is not part of the generated artifact.
 
 ## Current command contract
 

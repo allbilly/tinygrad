@@ -317,6 +317,22 @@ class TestDPUCompiler(unittest.TestCase):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
+  def test_logarithms_use_scaled_generated_luts_and_typed_fp32_abi(self):
+    variants = ((lambda x:x.log2(), (RKDPUOp.LOG2,RKDPUOp.LOG2_LOCAL)),
+                (lambda x:x.log(), (RKDPUOp.LOG,RKDPUOp.LOG_LOCAL)),
+                (lambda x:x.log10(), (RKDPUOp.LOG10,RKDPUOp.LOG10_LOCAL)))
+    for function, operations in variants:
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertEqual((len(plan.stages), len(plan.scratch), plan.fp32_inputs, plan.fp32_outputs), (57,8,(),()))
+      self.assertTrue(all(sum(x.op is op for x in plan.stages) == 1 for op in operations))
+      self.assertFalse(contains_uop(plan))
+    fp32 = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.float).log()))
+    self.assertEqual((len(fp32.stages), len(fp32.scratch), fp32.fp32_inputs, fp32.fp32_outputs), (61,8,(1,),(0,)))
+    self.assertEqual(decode_image(encode_image(emit_dpu(fp32))).fp32_outputs, (0,))
+    for name in ("LOG2", "LOG2_LOCAL", "LOG", "LOG_LOCAL", "LOG10", "LOG10_LOCAL"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))
