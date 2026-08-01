@@ -67,6 +67,20 @@ Pytest reports 428 failures including the 126 failing subtests. Runtime was
 160.17 seconds. A follow-up parser guard restores clean rejection for unrelated
 nonnumeric constants discovered by this census.
 
+At `015e735b1`, after EXP2 special-value preservation and the generated
+two-level EXP LUT, the uncached 2026-08-02 census completed without NPU
+timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 112 |
+| FAIL | 300 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 426 failures including the 126 failing subtests. Runtime was
+204.28 seconds. The two new method passes are `test_exp2` and `test_exp`.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -78,8 +92,8 @@ nonnumeric constants discovered by this census.
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
 | Generated algorithm-23 round-to-nearest-even LUT | `test_round` | Yes (`6ddda80b0`) |
 | Integral rounding composed from the roundoff LUT | `test_trunc`, `test_floor`, `test_ceil` | Yes (`6ddda80b0`) |
-| IEEE special-value wrapper around EXP2 LUT | `test_exp2` | No |
-| Generated two-level EXP LUT with signed-factor recognition | `test_exp` | No |
+| IEEE special-value wrapper around EXP2 LUT | `test_exp2` | Yes (`015e735b1`) |
+| Generated two-level EXP LUT with signed-factor recognition | `test_exp` | Yes (`015e735b1`) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
