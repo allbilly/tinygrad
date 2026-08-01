@@ -170,6 +170,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 32)
     self.assertFalse(contains_uop(plan))
 
+  def test_rsqrt_uses_generated_seed_and_generic_refinement(self):
+    payload = struct.pack(f"<{len(rklut.RK_LUT_RSQRT)}h", *rklut.RK_LUT_RSQRT)
+    self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_RSQRT_SHA256)
+    self.assertLess(rklut.RK_LUT_RSQRT_SIM_MAX_REL_ERROR, 1e-3)
+    plan = lower_dpu(sink(Tensor.empty(16, dtype=dtypes.half).rsqrt()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.RSQRT for stage in plan.stages), 1)
+    self.assertLessEqual(len(plan.stages), 48)
+    self.assertFalse(contains_uop(plan))
+
   def test_round_uses_generated_algorithm23_lut(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_ROUNDOFF)}h", *rklut.RK_LUT_ROUNDOFF)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)

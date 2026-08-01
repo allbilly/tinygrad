@@ -264,6 +264,25 @@ def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   valid = _sub(1.0, _ALUExpr(Ops.MAX, (negative, not_number)))
   return _ALUExpr(Ops.MUL, (zero_result, _ALUExpr(Ops.FDIV, (valid, valid))))
 
+def _rsqrt_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  greater_zero, below_1, below_2 = positive(source, 0.0), positive(.0625, source), positive(.00390625, source)
+  low_1, low_2 = _ALUExpr(Ops.MUL, (greater_zero, below_1)), _ALUExpr(Ops.MUL, (greater_zero, below_2))
+  factors = tuple(_ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (mask, 15.0)))) for mask in (low_1, low_2))
+  scaled = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (source, factors[0])), factors[1]))
+  seed = _LUTExpr(RKLUTId.RSQRT, (scaled,))
+  safe = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (scaled, -1.0)), -4.0)), -1.0))
+  correction = _sub(1.5, _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (safe, _ALUExpr(Ops.MUL, (seed, seed)))), .5)))
+  refined = _ALUExpr(Ops.MUL, (seed, correction))
+  out_factors = tuple(_ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (mask, 3.0)))) for mask in (low_1, low_2))
+  scaled_out = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (refined, out_factors[0])), out_factors[1]))
+  negative, high = positive(0.0, source), positive(source, 65472.0)
+  nonzero = _ALUExpr(Ops.MAX, (greater_zero, negative))
+  finite = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (scaled_out, nonzero)), _sub(1.0, high)))
+  not_number = _ALUExpr(Ops.MUL, (greater_zero, negative))
+  valid = _sub(1.0, _ALUExpr(Ops.MAX, (negative, not_number)))
+  return _ALUExpr(Ops.MUL, (finite, _ALUExpr(Ops.FDIV, (valid, valid))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -354,7 +373,14 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
         ret = _ALUExpr(Ops.MUL, (numerator, sign))
       else: ret = _ALUExpr(Ops.FDIV, (numerator, denominator))
   elif u.op is Ops.RECIPROCAL:
-    reciprocal_denominator = _parse_alu(u.src[0], output_index, memo)
+    reciprocal_source = _unwrap_same_cast(u.src[0])
+    if reciprocal_source.op is Ops.SQRT:
+      operand = _parse_alu(reciprocal_source.src[0], output_index, memo)
+      if operand is None or isinstance(operand, float): return None
+      ret = _rsqrt_expr(operand)
+      memo[u] = ret
+      return ret
+    reciprocal_denominator = _parse_alu(reciprocal_source, output_index, memo)
     if reciprocal_denominator is None: return None
     ret = _ALUExpr(Ops.FDIV, (1.0, reciprocal_denominator))
   elif u.op is Ops.TRUNC:
@@ -591,7 +617,8 @@ def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
 
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
-  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL, RKLUTId.SQRT):
+  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL,
+                      RKLUTId.SQRT, RKLUTId.RSQRT):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

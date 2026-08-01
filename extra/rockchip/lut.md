@@ -87,3 +87,16 @@ The generated simulator exhaustively checks 10,241 FP16 encodings from
 The RK3588 sweep extends through `16` to verify convergence beyond the seed
 table's direct domain and separately checks IEEE special values. Smaller
 positive subnormals are not yet part of the accuracy claim.
+
+## Range-scaled RSQRT
+
+`RSQRT` stores a bounded `[0.5, 4]` seed over the positive part of `[-4, 4]`.
+Two mask-controlled factors of 16 move small inputs into the seed range; one
+Newton correction refines the estimate, and matching factors of four restore
+the output scale. The IEEE epilogue creates positive infinity for zero and NaN
+for negative/NaN inputs while mapping positive infinity to zero.
+
+The generated simulator checks the same 10,241 FP16 encodings from `2^-8`
+through `4`, including FP16 rounding at each stage. The hardware suite uses a
+2,049-point geometric sweep plus special values. Values below `2^-8` are not
+yet part of the declared accuracy range.
