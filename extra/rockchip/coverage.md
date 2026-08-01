@@ -98,6 +98,7 @@ Pytest reports 426 failures including the 126 failing subtests. Runtime was
 | Mask-composed sign preservation for infinite division numerators | `test_div_naninf` | No |
 | Generated SQRT seed with three generic Newton refinements | `test_sqrt` | No |
 | Range-scaled generated RSQRT seed with generic Newton correction | `test_rsqrt` | No |
+| Range-normalized generated logarithm tables | `test_log2`, `test_log10` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

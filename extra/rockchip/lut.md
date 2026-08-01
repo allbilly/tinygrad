@@ -100,3 +100,16 @@ The generated simulator checks the same 10,241 FP16 encodings from `2^-8`
 through `4`, including FP16 rounding at each stage. The hardware suite uses a
 2,049-point geometric sweep plus special values. Values below `2^-8` are not
 yet part of the declared accuracy range.
+
+## Range-normalized logarithms
+
+LOG2 and LOG10 each use a broad table over `[0.25, 4]` plus a high-resolution
+table around one. Two powers-of-16 masks normalize inputs down to `2^-8`; the
+corresponding exponent offset is applied with generic arithmetic. A quadratic
+near-one expression avoids relative-error amplification as the result tends
+to zero. Zero, infinity, negative inputs, and NaN are repaired on the NPU.
+
+The complete 10,241-value FP16 range from `2^-8` through `4` passes the strict
+hardware comparison for both functions. Native `Ops.SUB` is material here:
+using MUL-by-minus-one plus ADD exceeded RKImage's 64-stage dependency limit.
+FP32 logarithms and smaller positive values are outside this contract.

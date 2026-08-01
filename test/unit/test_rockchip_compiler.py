@@ -180,6 +180,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 48)
     self.assertFalse(contains_uop(plan))
 
+  def test_logarithms_use_generated_tables_and_native_subtraction(self):
+    for name in ("LOG2", "LOG2_LOCAL", "LOG10", "LOG10_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    for expression, ids in ((Tensor.empty(16,dtype=dtypes.half).log2(), {rklut.RKLUTId.LOG2,rklut.RKLUTId.LOG2_LOCAL}),
+                            (Tensor.empty(16,dtype=dtypes.half).log10(), {rklut.RKLUTId.LOG10,rklut.RKLUTId.LOG10_LOCAL})):
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, ids)
+      self.assertTrue(any(isinstance(stage, RKALUStage) and stage.op is Ops.SUB for stage in plan.stages))
+      self.assertLessEqual(len(plan.stages), 58)
+      self.assertFalse(contains_uop(plan))
+
   def test_round_uses_generated_algorithm23_lut(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_ROUNDOFF)}h", *rklut.RK_LUT_ROUNDOFF)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)

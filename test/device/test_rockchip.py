@@ -94,6 +94,18 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(divide="ignore", invalid="ignore"): expected_special = 1/np.sqrt(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").rsqrt().realize().numpy(), expected_special)
 
+  def test_generated_logarithm_luts(self):
+    bits = np.arange(1 << 16, dtype=np.uint16)
+    data = bits.view(np.float16)
+    data = data[np.isfinite(data) & (data >= 2**-8) & (data <= 4)]
+    for function, reference in ((lambda x:x.log2(), np.log2), (lambda x:x.log10(), np.log10)):
+      actual = function(Tensor(data, device="ROCKCHIP")).realize().numpy()
+      expected = reference(data.astype(np.float32)).astype(np.float16)
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    special = np.array([-1., -0., 0., 1., np.inf, np.nan], dtype=np.float16)
+    with np.errstate(divide="ignore", invalid="ignore"): expected_special = np.log2(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").log2().realize().numpy(), expected_special)
+
   def test_generated_roundoff_lut(self):
     data = np.linspace(-16, 16, 4097, dtype=np.float16)
     np.testing.assert_equal(Tensor(data, device="ROCKCHIP").round().realize().numpy(), np.round(data))

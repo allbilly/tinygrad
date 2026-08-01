@@ -32,6 +32,22 @@ for table in range(2):
     x = (-(512-i)*SQRT_STEP) if table == 0 else i*SQRT_STEP
     value = max(.5, min(4.0, 1/math.sqrt(x) if x > 0 else 4.0))
     rsqrt_lut.append(max(-32768, min(32767, round(value*8192))))
+LOG_SCALE, LOG_STEP = 4096.0, 32.0/4096.0
+log2_lut, log2_local, log10_lut, log10_local = [], [], [], []
+for table in range(2):
+  for i in range(SIZE):
+    x = (-(512-i)*LOG_STEP) if table == 0 else i*LOG_STEP
+    broad = max(-2.0, min(2.0, math.log2(x) if x > 0 else -2.0))
+    local_x = (-(512-i)*STEP) if table == 0 else i*STEP
+    local = 4*math.log2(1+local_x/12.5)
+    for output, value, scale in ((log2_lut, broad, 8192), (log2_local, local, 32768)):
+      raw = max(-32768, min(32767, round(value*scale)))
+      output.append(1 if raw == 0 else raw)
+    broad10 = max(-math.log10(4), min(math.log10(4), math.log10(x) if x > 0 else -math.log10(4)))
+    local10 = 4*math.log10(1+local_x/12.5)
+    for output, value in ((log10_lut, broad10), (log10_local, local10)):
+      raw = max(-32768, min(32767, round(value*32768)))
+      output.append(1 if raw == 0 else raw)
 roundoff = [0 if i % 2 == 0 else 1 << 14 for i in range(SIZE)] * 2
 def digest(values:list[int]) -> str: return hashlib.sha256(struct.pack(f"<{len(values)}h", *values)).hexdigest()
 def half(value:float) -> float: return struct.unpack("<e", struct.pack("<e", value))[0]
@@ -99,7 +115,11 @@ class RKLUTId(IntEnum):
   SIGMOID_LOCAL = 6
   SQRT = 7
   RSQRT = 8
-RK_LUT_SCHEMA = 7
+  LOG2 = 9
+  LOG2_LOCAL = 10
+  LOG10 = 11
+  LOG10_LOCAL = 12
+RK_LUT_SCHEMA = 9
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -160,5 +180,29 @@ RK_LUT_RSQRT_MINUS_EXP = 13
 RK_LUT_RSQRT_VERIFIED_INPUTS = {len(rsqrt_errors)}
 RK_LUT_RSQRT_SIM_MAX_ABS_ERROR = {max(x[0] for x in rsqrt_errors)!r}
 RK_LUT_RSQRT_SIM_MAX_REL_ERROR = {max(x[1] for x in rsqrt_errors)!r}
-RK_LUT_RSQRT = (\n{rows(rsqrt_lut)}\n)\n'''
+RK_LUT_RSQRT = (\n{rows(rsqrt_lut)}\n)
+RK_LUT_LOG2_SHA256 = "{digest(log2_lut)}"
+RK_LUT_LOG2_DOMAIN = (-4.0, 4.0)
+RK_LUT_LOG2_ENTRIES = {SIZE}
+RK_LUT_LOG2_BN_MUL = {struct.unpack('<H', struct.pack('<e', LOG_SCALE))[0]}
+RK_LUT_LOG2_MINUS_EXP = 13
+RK_LUT_LOG2 = (\n{rows(log2_lut)}\n)
+RK_LUT_LOG2_LOCAL_SHA256 = "{digest(log2_local)}"
+RK_LUT_LOG2_LOCAL_DOMAIN = (-2.0, 2.0)
+RK_LUT_LOG2_LOCAL_ENTRIES = {SIZE}
+RK_LUT_LOG2_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_LOG2_LOCAL_MINUS_EXP = 15
+RK_LUT_LOG2_LOCAL = (\n{rows(log2_local)}\n)
+RK_LUT_LOG10_SHA256 = "{digest(log10_lut)}"
+RK_LUT_LOG10_DOMAIN = (-4.0, 4.0)
+RK_LUT_LOG10_ENTRIES = {SIZE}
+RK_LUT_LOG10_BN_MUL = {struct.unpack('<H', struct.pack('<e', LOG_SCALE))[0]}
+RK_LUT_LOG10_MINUS_EXP = 15
+RK_LUT_LOG10 = (\n{rows(log10_lut)}\n)
+RK_LUT_LOG10_LOCAL_SHA256 = "{digest(log10_local)}"
+RK_LUT_LOG10_LOCAL_DOMAIN = (-2.0, 2.0)
+RK_LUT_LOG10_LOCAL_ENTRIES = {SIZE}
+RK_LUT_LOG10_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_LOG10_LOCAL_MINUS_EXP = 15
+RK_LUT_LOG10_LOCAL = (\n{rows(log10_local)}\n)\n'''
 pathlib.Path(__file__).parents[2].joinpath("tinygrad/runtime/autogen/rockchip_lut.py").write_text(output)

@@ -28,7 +28,7 @@ class RKArg:
   index: int
   addend: int = 0
 
-_RK_ALU_OPS = frozenset((Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV))
+_RK_ALU_OPS = frozenset((Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.SUB))
 
 @dataclass(frozen=True)
 class RKALUStage:
@@ -203,7 +203,7 @@ _Expr = _ALUExpr|_MaskExpr|_LUTExpr
 _Value = _Expr|RKArg|float
 
 def _sub(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _ALUExpr:
-  return _ALUExpr(Ops.ADD, (lhs, _ALUExpr(Ops.MUL, (rhs, -1.0))))
+  return _ALUExpr(Ops.SUB, (lhs, rhs))
 
 def _round_expr(source:_Expr|RKArg|float) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
@@ -279,6 +279,33 @@ def _rsqrt_expr(source:_Expr|RKArg) -> _Expr:
   negative, high = positive(0.0, source), positive(source, 65472.0)
   nonzero = _ALUExpr(Ops.MAX, (greater_zero, negative))
   finite = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (scaled_out, nonzero)), _sub(1.0, high)))
+  not_number = _ALUExpr(Ops.MUL, (greater_zero, negative))
+  valid = _sub(1.0, _ALUExpr(Ops.MAX, (negative, not_number)))
+  return _ALUExpr(Ops.MUL, (finite, _ALUExpr(Ops.FDIV, (valid, valid))))
+
+def _log2_expr(source:_Expr|RKArg, scale:float=1.0) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  low_1, low_2 = positive(.25, source), positive(.015625, source)
+  factor = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (low_1, 15.0)))), _ALUExpr(Ops.MUL, (low_2, 240.0))))
+  normalized = _ALUExpr(Ops.MUL, (source, factor))
+  offset = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.ADD, (low_1, low_2)), -4.0*scale))
+  bounded_low = _ALUExpr(Ops.MAX, (normalized, .25))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (bounded_low, -1.0)), -4.0)), -1.0))
+  centered = _sub(bounded, 1.0)
+  broad_id, local_id = (RKLUTId.LOG10, RKLUTId.LOG10_LOCAL) if math.isclose(scale, math.log10(2)) else \
+    (RKLUTId.LOG2, RKLUTId.LOG2_LOCAL)
+  broad = _LUTExpr(broad_id, (bounded,))
+  local = _ALUExpr(Ops.MUL, (_LUTExpr(local_id, (_ALUExpr(Ops.MUL, (centered, 12.5)),)), .25))
+  local_inside = _ALUExpr(Ops.MUL, (positive(bounded, .85), positive(1.15, bounded)))
+  near_inside = _ALUExpr(Ops.MUL, (positive(centered, -.02), positive(.02, centered)))
+  polynomial = _ALUExpr(Ops.MUL, (_sub(centered, _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (centered, centered)), .5))),
+    scale*math.log2(math.e)))
+  mantissa = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))),
+    _ALUExpr(Ops.MUL, (local, _sub(local_inside, near_inside))))), _ALUExpr(Ops.MUL, (polynomial, near_inside))))
+  corrected = _ALUExpr(Ops.ADD, (mantissa, offset))
+  negative, greater_zero, high = positive(0.0, source), positive(source, 0.0), positive(source, 65472.0)
+  nonzero = _ALUExpr(Ops.MAX, (greater_zero, negative))
+  finite = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.FDIV, (corrected, nonzero)), _sub(1.0, high)))
   not_number = _ALUExpr(Ops.MUL, (greater_zero, negative))
   valid = _sub(1.0, _ALUExpr(Ops.MAX, (negative, not_number)))
   return _ALUExpr(Ops.MUL, (finite, _ALUExpr(Ops.FDIV, (valid, valid))))
@@ -391,6 +418,16 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _sqrt_expr(operand)
+  elif u.op is Ops.LOG2:
+    operand = _parse_alu(u.src[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _log2_expr(operand)
+  elif u.op is Ops.MUL and (logarithm:=next((x for x in u.src if _unwrap_same_cast(x).op is Ops.LOG2), None)) is not None:
+    factor = next((x for x in u.src if x is not logarithm and x.op is Ops.CONST and isinstance(x.arg, (int, float))), None)
+    if factor is None or not math.isclose(float(factor.arg), math.log10(2)): return None
+    operand = _parse_alu(_unwrap_same_cast(logarithm).src[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _log2_expr(operand, float(factor.arg))
   elif u.op is Ops.EXP2:
     exp_operand = _unwrap_same_cast(u.src[0])
     exp_factor = next((x for x in exp_operand.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None) \
@@ -553,7 +590,7 @@ _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
 _EW_BASE = 0x108002c0
 _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8), Ops.MAX:_EW_BASE,
-           Ops.FDIV:_EW_BASE | (3 << 16) | (1 << 8)}
+           Ops.SUB:_EW_BASE | (4 << 16), Ops.FDIV:_EW_BASE | (3 << 16) | (1 << 8)}
 
 def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
@@ -618,7 +655,7 @@ def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
   if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL,
-                      RKLUTId.SQRT, RKLUTId.RSQRT):
+                      RKLUTId.SQRT, RKLUTId.RSQRT, RKLUTId.LOG2, RKLUTId.LOG2_LOCAL, RKLUTId.LOG10, RKLUTId.LOG10_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

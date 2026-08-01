@@ -9,7 +9,7 @@ class TestRKImage(unittest.TestCase):
     plan = RKDPUProgram((RKALUStage(Ops.ADD, arg0, arg1, 1.0, 8), RKMaskStage(arg0, arg1, 8),
                          RKLUTStage(RKLUTId.EXP2, arg0, arg1, 8)))
     self.assertFalse(any(isinstance(x, UOp) for stage in plan.stages for x in stage.__dict__.values()))
-    with self.assertRaises(ValueError): RKALUStage(Ops.SUB, arg0, arg1, 1.0, 8)
+    with self.assertRaises(ValueError): RKALUStage(Ops.SIN, arg0, arg1, 1.0, 8)
 
   def test_roundtrip_is_deterministic(self):
     image = RKImage(RKTarget.RK3588, (
