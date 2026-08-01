@@ -30,4 +30,13 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().exp2().realize().numpy()
     np.testing.assert_allclose(actual, np.exp2(data), rtol=5e-3, atol=5e-3)
 
+  def test_linear_sigmoid_workload(self):
+    rng = np.random.default_rng(2)
+    a_np = rng.uniform(-0.25, 0.25, (1,32)).astype(np.float16)
+    w_np = rng.uniform(-0.25, 0.25, (8,32)).astype(np.float16)
+    a, w = Tensor(a_np, device="ROCKCHIP").realize(), Tensor(w_np, device="ROCKCHIP").realize()
+    actual = (a@w.T).realize().sigmoid().realize().numpy()
+    logits = a_np@w_np.T
+    np.testing.assert_allclose(actual, 1/(1+np.exp(-logits)), rtol=6e-3, atol=6e-3)
+
 if __name__ == "__main__": unittest.main()

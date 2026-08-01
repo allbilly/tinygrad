@@ -4,7 +4,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import RKBufferKind, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_dpu, lower_dpu
+from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image,
+  emit_contract, emit_dpu, lower_contract, lower_dpu)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -83,6 +84,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     image = emit_dpu(plan)
     self.assertEqual((len(image.stages[0].commands), tuple(r.word for r in image.stages[0].relocs)), (1064, (1032, 1059)))
+
+  def test_direct_affine_contract_is_typed(self):
+    a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
+    plan = lower_contract(sink(a@packed_b.T))
+    self.assertIsInstance(plan, RKContract)
+    self.assertFalse(contains_uop(plan))
+    image = emit_contract(plan)
+    self.assertEqual((len(image.stages[0].commands), tuple(r.word for r in image.stages[0].relocs)), (46, (18,24,31)))
+    self.assertIsNone(lower_contract(sink(a@Tensor.empty(32,8,dtype=dtypes.half))))
+    self.assertIsNone(lower_contract(sink((a@packed_b.T).sigmoid())))
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

@@ -15,7 +15,9 @@ _HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHIIIIIQQ")
 _RELOC, _SCRATCH = struct.Struct("<HHBBHqII"), struct.Struct("<II")
 
 class RKTarget(IntEnum): RK3588 = 1
-class RKEngine(IntEnum): DPU = 1
+class RKEngine(IntEnum):
+  DPU = 1
+  CMAC = 2
 class RKBufferKind(IntEnum):
   ARG = 0
   SCRATCH = 1
@@ -61,6 +63,19 @@ class RKScratch:
 class RKDPUProgram:
   stages: tuple[RKDPUStage, ...]
   scratch: tuple[RKScratch, ...] = ()
+
+@dataclass(frozen=True)
+class RKView:
+  slot: int
+  shape: tuple[int, ...]
+  strides: tuple[int, ...]
+
+@dataclass(frozen=True)
+class RKContract:
+  out: RKView
+  lhs: RKView
+  rhs: RKView
+  reduce_axis: int
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -267,7 +282,49 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   size = ((count+7)//8)*16
   return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)))
 
+def _strip_casts(u:UOp) -> UOp:
+  while u.op is Ops.CAST: u = u.src[0]
+  return u
+
+def _affine(u:UOp) -> tuple[dict[int, int], int]|None:
+  if u.op is Ops.RANGE: return ({u.arg[0]:1}, 0)
+  if u.op is Ops.CONST: return ({}, int(u.arg))
+  if u.op is Ops.ADD:
+    a, b = _affine(u.src[0]), _affine(u.src[1])
+    if a is None or b is None: return None
+    return ({k:a[0].get(k, 0)+b[0].get(k, 0) for k in a[0].keys()|b[0].keys()}, a[1]+b[1])
+  if u.op is Ops.MUL:
+    const, value = (u.src[0], u.src[1]) if u.src[0].op is Ops.CONST else (u.src[1], u.src[0])
+    if const.op is not Ops.CONST or (aff:=_affine(value)) is None: return None
+    return ({k:v*int(const.arg) for k,v in aff[0].items()}, aff[1]*int(const.arg))
+  return None
+
+def lower_contract(sink:UOp) -> RKContract|None:
+  """Recognize the directly legal M=1, K=32 FP16 CMAC surface."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return None
+  store, reduce = stores[0], reductions[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].dtype is not dtypes.half or reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2: return None
+  if _strip_casts(store.src[1]).key != reduce.key: return None
+  body, red = _strip_casts(reduce.src[0]), reduce.src[1]
+  out_param, out_aff = store.src[0].src[0], _affine(store.src[0].src[1])
+  if out_param.op is not Ops.PARAM or out_aff is None or out_aff[1] or len(out_aff[0]) != 1 or body.op is not Ops.MUL: return None
+  if red.op is not Ops.RANGE or int(red.src[0].arg) != 32: return None
+  lhs, rhs = (_strip_casts(x) for x in body.src)
+  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half or x.src[0].op is not Ops.PARAM for x in (lhs, rhs)): return None
+  lhs_aff, rhs_aff = _affine(lhs.src[1]), _affine(rhs.src[1])
+  if lhs_aff is None or rhs_aff is None or lhs_aff[1] or rhs_aff[1]: return None
+  red_axis, out_axes = red.arg[0], tuple(out_aff[0])
+  if len(out_axes) != 1 or out_aff[0][out_axes[0]] != 1 or lhs_aff[0] != {red_axis:1}: return None
+  n_axis = out_axes[0]
+  n = next(int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.arg[0] == n_axis)
+  if not 4 <= n <= 16 or rhs_aff[0] != {n_axis:32, red_axis:1}: return None
+  if int(out_param.src[0].arg) != n or int(lhs.src[0].src[0].arg) != 32 or int(rhs.src[0].src[0].arg) != n*32: return None
+  return RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), RKView(lhs.src[0].arg.slot, (1,32), (32,1)),
+                    RKView(rhs.src[0].arg.slot, (n,32), (32,1)), red_axis)
+
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
+_TARGET_CNA, _TARGET_CORE = 0x201, 0x801
 _EW_BASE = 0x108002c0
 _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8), Ops.MAX:_EW_BASE,
            Ops.FDIV:_EW_BASE | (3 << 16) | (1 << 8)}
@@ -380,11 +437,44 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), relocs, reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET))
   return RKImage(target, tuple(stages), program.scratch, bytes(constants))
 
+def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
+  """Emit one direct FP16 CMAC task; all surfaces are already hardware-legal."""
+  if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
+  e, align = _command, 32
+  commands = (
+    e(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), e(_TARGET_CNA, rk.REG_CNA_CONV_CON1, 0x20000120),
+    e(_TARGET_CNA, rk.REG_CNA_CONV_CON2, 0x4000), e(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
+    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, 0x1f0020),
+    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, 1), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE3, 1),
+    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE0, 0x800), e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE1, 0x40),
+    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, 0x1010020), e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, 0xb1),
+    e(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, 1), e(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
+    *(e(_TARGET_CNA, reg, 0x10000) for reg in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4)),
+    e(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0), e(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),
+    e(_TARGET_CNA, rk.REG_CNA_DMA_CON1, 4), e(_TARGET_CNA, rk.REG_CNA_DMA_CON2, 0),
+    e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align),
+    e(_TARGET_CNA, rk.REG_CNA_DCOMP_ADDR0, 0), e(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x201),
+    e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, 0), e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align-1),
+    e(_TARGET_CORE, rk.REG_CORE_RESERVED_3030, 0), e(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e4),
+    e(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), e(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
+    e(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, 0x10), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0),
+    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0x70007),
+    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x1f001f), e(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
+    e(_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 0x126), e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align-1),
+    e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, 0), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
+    e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
+    e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
+  relocs = (RKReloc(0, 18, RKBufferKind.ARG, plan.lhs.slot), RKReloc(0, 24, RKBufferKind.ARG, plan.rhs.slot),
+            RKReloc(0, 31, RKBufferKind.ARG, plan.out.slot))
+  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, (plan.lhs.slot,plan.rhs.slot), (plan.out.slot,), flags=RK_STAGE_RESET),))
+
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
   def native_program(self, ast:UOp) -> UOp|None:
-    if (plan:=lower_dpu(ast)) is None: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-    return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR), UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(emit_dpu(plan)))),
+    if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
+    elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)
+    else: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+    return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR), UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
                arg=ProgramInfo.from_sink(ast, self.target))

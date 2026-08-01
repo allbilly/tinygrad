@@ -2,9 +2,11 @@ from __future__ import annotations
 import ctypes, mmap, os, time
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
-from tinygrad.renderer.rockchip import RKBufferKind, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
+from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
+
+_TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300)}
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
@@ -49,7 +51,8 @@ class RockchipProgram(Program['RockchipDevice']):
       task = self.dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
       try:
         ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64*len(commands))(*commands), len(commands)*8)
-        descriptor = rk.struct_rknpu_task(flags=0, op_idx=4, enable_mask=0x18, int_mask=0x300, int_clear=0x1ffff,
+        op_idx, enable_mask, int_mask = _TASK[stage.engine]
+        descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
           int_status=0, regcfg_amount=len(commands), regcfg_offset=0, regcmd_addr=self._dma(cmd))
         ctypes.memmove(int(task.va_addr), ctypes.addressof(descriptor), ctypes.sizeof(descriptor))
         rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
