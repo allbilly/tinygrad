@@ -54,24 +54,38 @@ class RockchipProgram(Program['RockchipDevice']):
     for slot in self.image.bool_inputs:
       if slot >= len(bufs): raise RuntimeError(f"invalid bool input slot {slot}")
       import numpy as np
-      source, count = bufs[slot], bufs[slot].size
+      source, source_count = bufs[slot], bufs[slot].size
+      count = bufs[self.image.bool_outputs[0]].size if self.image.bool_outputs else \
+        (bufs[self.image.int_outputs[0]].size//4 if self.image.int_outputs else source_count)
       temporary = self.dev._gpu_alloc(((count+7)//8)*16)
-      values = np.frombuffer(ctypes.string_at(int(source.va_addr), count), dtype=np.bool_).astype(np.float16)
+      values = np.resize(np.frombuffer(ctypes.string_at(int(source.va_addr), source_count), dtype=np.bool_), count).astype(np.float16)
+      ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      prepared[slot], converted = temporary, [*converted, temporary]
+    for slot in self.image.numeric_int_inputs:
+      if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid numeric int32 input slot {slot}")
+      import numpy as np
+      writes = tuple(dict.fromkeys(x for stage in self.image.stages for x in stage.writes))
+      if len(writes) != 1: raise RuntimeError("numeric int32 input requires one FP16 output")
+      source, count = bufs[slot], bufs[writes[0]].size//2
+      values = np.resize(np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.int32), count).astype(np.float16)
+      temporary = self.dev._gpu_alloc(((count+7)//8)*16)
       ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]
     for slot in self.image.int_inputs:
       if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid int32 input slot {slot}")
       import numpy as np
-      source, count = bufs[slot], bufs[slot].size//4
+      source, source_count = bufs[slot], bufs[slot].size//4
+      count = bufs[self.image.int_outputs[0]].size//4 if slot in self.image.tiled_int_inputs and self.image.int_outputs else source_count
       plane_size, temporary = ((count+7)//8)*16, self.dev._gpu_alloc(((count+7)//8)*64)
       int_values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.int32).view(np.uint32)
+      if slot in self.image.tiled_int_inputs: int_values = np.resize(int_values, count)
       if slot in self.image.transposed_int_inputs:
         side = math.isqrt(count)
         if side*side != count: raise RuntimeError(f"int32 transpose input slot {slot} is not square")
         int_values = int_values.reshape(side, side).T.flatten()
       for plane, shift in enumerate((24, 16, 8, 0)):
         encoded = ((int_values >> shift) & 0xff).astype(np.uint8)
-        if shift == 24 and slot not in self.image.transposed_int_inputs: encoded ^= 0x80
+        if shift == 24 and slot not in self.image.raw_int_inputs: encoded ^= 0x80
         encoded = encoded.astype(np.float16)
         ctypes.memmove(int(temporary.va_addr)+plane*plane_size, encoded.ctypes.data, encoded.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]

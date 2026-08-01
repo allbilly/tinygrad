@@ -78,22 +78,22 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after exact square int32 transpose/copy:
+Latest complete uncached census after exact int32 extrema and typed mixed-dtype widening:
 
 | Status | Methods |
 |---|---:|
-| PASS | 156 |
-| FAIL | 256 |
+| PASS | 159 |
+| FAIL | 253 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `378 failed` because 122 failing unittest subtests are counted
-in addition to their failed parent methods; four subtests pass. Runtime was 1020.44 seconds. This
+Pytest reports `375 failed` because 122 failing unittest subtests are counted
+in addition to their failed parent methods; four subtests pass. Runtime was 1076.12 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
 natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
 ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, ACOSH, IEEE predicates, all five mixed-dtype comparison methods, scalar `isclose`, logical-not,
-dynamic `WHERE`, square int32 WHERE transpose, and suffix-broadcast ADD.
+dynamic `WHERE`, square int32 WHERE transpose, exact maximum/minimum, zero-axis bool constants, and suffix-broadcast ADD.
 
 All five mixed-dtype `test_cmp_*` methods now pass FP16, exact signed int32, bool, same-shape/suffix-broadcast, scalar, reverse, and infinity cases.
 Int32 values are never narrowed: four byte planes preserve all 32 bits and the sign-biased high byte makes unsigned lexicographic comparison signed-correct.
@@ -137,17 +137,18 @@ Int32 values are never narrowed: four byte planes preserve all 32 bits and the s
 | Exact int32 comparisons | four byte planes plus suffix-tile input declaration | all five official mixed-dtype methods and full-range int32 boundary vector | PASS |
 | Exact int32 WHERE output | four NPU-written byte planes plus lossless reassembly | official `test_where` and full-range constant-arm boundary vector | PASS |
 | Exact square int32 transpose | raw input byte planes, four NPU copy stages, and lossless reassembly | official `test_where_permute` and full-bit-pattern 5x5 transpose | PASS |
+| Exact int32 extrema and mixed dtype | shared signed comparison DAG, raw selected byte planes, typed numeric widening | official `test_maximum`/`test_minimum` and full-range boundary vectors | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 61 | 41 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 62 | 42 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
 ## Supported contracts
 
-- dtype: FP16 expression graphs, lossless contiguous bool inputs/typed bool outputs, exact int32 comparison inputs, constant-arm WHERE outputs,
-  and square int32 transpose/copy,
+- dtype: FP16 expression graphs, lossless contiguous bool inputs/typed bool outputs, exact int32 comparisons/extrema/fill/copy, constant-arm WHERE
+  outputs and square transpose, plus declared int32-to-FP16 mixed-extrema widening,
   tiled native int32/FP32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and experimental FP32 Log two-plane ABI;
 - comparison: all six public FP16 relations preserve IEEE NaN and infinity semantics; plans exceeding 64 stages reject before image encoding;
 - mode: forward only;
@@ -173,7 +174,8 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Expected rejects
 
-- FP32 expression/input graphs, general integer arithmetic/outputs, uint8, boolean reductions/unsupported layouts, and gradients;
+- FP32 expression/input graphs, integer arithmetic/outputs outside the declared extrema/fill/copy/WHERE contracts, uint8, boolean
+  reductions/unsupported layouts, and gradients;
 - noncontiguous elementwise indexing;
 - WHERE graphs needing dynamic int32 arms and comparison graphs with non-suffix layouts; constant-arm int32 WHERE, square transpose/copy, and exact comparisons are supported;
 - composed EXP2 graphs and values requiring overflow/underflow or NaN policy outside `[-2,2]`;
@@ -185,7 +187,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 ## Next low-hanging group
 
 Native round-to-nearest-even, trunc, floor, ceil, IEEE predicates, mixed-dtype
-comparisons, bool logical-not, constant-arm int32 WHERE, and square int32 transpose are implemented
+comparisons/extrema, bool logical-not, constant-arm int32 WHERE, and square int32 transpose are implemented
 without host semantic evaluation. The next low-hanging boundary is dynamic int32 data flow:
 
 - consume and reproduce exact int32 byte planes for dynamic WHERE arms and non-square movement;

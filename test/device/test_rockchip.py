@@ -285,4 +285,12 @@ class TestRockchip(unittest.TestCase):
                      -123456789, 123456789, -42, 42, 7, 8, 9, 10, 11, 12, -13, -14, 15, 16, -17], dtype=np.int32).reshape(5,5)
     np.testing.assert_equal(Tensor(data, device="ROCKCHIP").T.clone().numpy(), data.T)
 
+  def test_int32_extrema_preserve_all_bits(self):
+    lhs = np.array([-(2**31), -65537, -1, 0, 1, 255, 256, 65535, 65536, 2**31-1], dtype=np.int32)
+    rhs = np.array([2**31-1, -65536, 0, -1, 1, 256, 255, 65536, 65535, -(2**31)], dtype=np.int32)
+    tx, ty = Tensor(lhs, device="ROCKCHIP"), Tensor(rhs, device="ROCKCHIP")
+    np.testing.assert_equal(tx.maximum(ty).numpy(), np.maximum(lhs, rhs))
+    np.testing.assert_equal(tx.minimum(ty).numpy(), np.minimum(lhs, rhs))
+    np.testing.assert_equal(tx.maximum(Tensor(np.array(-(2**31), dtype=np.int32), device="ROCKCHIP")).numpy(), lhs)
+
 if __name__ == "__main__": unittest.main()

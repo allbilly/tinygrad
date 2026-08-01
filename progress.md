@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through exact square int32 transpose/copy, the 2026-08-01 census is
-**156 passed, 256 failed, and 13 skipped**. Pytest prints `378 failed` because
+milestones through exact int32 extrema and typed mixed-dtype widening, the 2026-08-01 census is
+**159 passed, 253 failed, and 13 skipped**. Pytest prints `375 failed` because
 it separately counts 122 failing subtests; four subtests now pass.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 61-host/41-NPU
+while recovering the remaining native forward coverage. Focused 62-host/42-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -113,7 +113,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `25df366fb` | Lossless typed bool-input ABI widening | `0213-rockchip-add-lossless-bool-input-ABI.patch` |
 | `4e2931c2c` | Exact int32 comparison byte planes and suffix broadcast | `0214-rockchip-add-exact-int32-comparisons.patch` |
 | `297b6fdc0` | Exact int32 WHERE output planes and general suffix tiling | `0215-rockchip-add-exact-int32-WHERE-output.patch` |
-| current milestone | Exact square int32 transpose/copy through raw byte planes | `0216-rockchip-add-exact-int32-transpose.patch` |
+| `04dd21e23` | Exact square int32 transpose/copy through raw byte planes | `0216-rockchip-add-exact-int32-transpose.patch` |
+| current milestone | Exact int32 extrema, copy/fill, and typed mixed-dtype widening | `0217-rockchip-add-exact-int32-extrema.patch` |
 
 ## Architecture now implemented
 
@@ -185,8 +186,10 @@ Implemented forward-only subset:
   layout for `(N,...,K)` versus `(K,)` comparison broadcasts;
 - exact dynamic int32 constant-arm WHERE output through four NPU-written byte planes and lossless runtime reassembly; scalar/suffix FP16 inputs can
   be tiled for ordinary FP16 outputs as well as bool comparison outputs;
-- exact square int32 transpose/copy through a versioned RKImage v10 layout declaration: the runtime performs only representation/layout conversion
+- exact square int32 transpose/copy through a versioned RKImage layout declaration: the runtime performs only representation/layout conversion
   before raw byte-plane encoding, four NPU ADD-copy stages write the output planes, and runtime reassembly preserves every bit;
+- exact signed-int32 maximum/minimum through one shared lexicographic comparison DAG and four raw selected output planes, plus exact raw byte-plane
+  fill/copy, typed scalar tiling, bool-to-int output, and declared int32-to-FP16 numeric ABI widening for mixed-dtype extrema;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -198,12 +201,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1779
-tinygrad/runtime/ops_rockchip.py  160
-handwritten Rockchip total  1939
+tinygrad/renderer/rockchip.py  1856
+tinygrad/runtime/ops_rockchip.py  174
+handwritten Rockchip total  2030
 ```
 
-This meets the requested `<5000` research-backend goal with 3,061 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 2,970 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
@@ -214,14 +217,14 @@ an activation catalog. Approximate current physical source distribution is:
 - UOp canonicalization, affine analysis, and typed lowering: renderer lines 565–1156;
 - register emission: renderer lines 1157–1413;
 - renderer integration: renderer lines 1414 onward;
-- allocation/submission/runtime ABI experiments: 160 `sz.py` lines.
+- allocation/submission/runtime ABI experiments: 174 `sz.py` lines.
 
 This distribution is acceptable only for the frozen research/coverage branch.
 The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,915 `sz.py` lines, a `+1,947` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,915 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 27,006 `sz.py` lines, a `+2,038` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 2,006 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
@@ -294,7 +297,8 @@ rg -n '_HOST_|run_host|host.*layout' tinygrad/renderer/rockchip.py tinygrad/runt
 ```
 
 Allocator `copyin`/`copyout`, the declared FP32-to-FP16 Sqrt/RSqrt input conversion, the experimental Log `hi/lo` plane encode/output widening,
-lossless byte-bool input widening, exact int32 byte-plane encoding/reassembly, declared square-transpose layout conversion, suffix tiling, and packing
+lossless byte-bool input widening, exact int32 byte-plane encoding/reassembly, declared square-transpose/scalar-tiling layout conversion,
+int32-to-FP16 numeric widening for mixed extrema, and packing
 NPU-computed FP16 masks into public bool bytes are ABI transport, not semantic CPU execution. The runtime may use NumPy only for these
 representation conversions; it never evaluates a tensor function or predicate on the host. These experiments are research-only and are excluded
 from the planned minimal upstream branch.
@@ -303,8 +307,8 @@ from the planned minimal upstream branch.
 
 - Spatial direct convolution. Current tinygrad NCHW storage does not match the proven NPU atom/HWC surface. The frozen branch used host materialization for broad contraction/conv cases, so it is not a valid clean implementation source. A future path needs a typed `RKConv` plus an explicit device layout/weight stage. A 1x1 `1x32 -> 8` convolution canonicalizes to the already-supported affine CMAC contract and cannot be distinguished semantically after simplification.
 - Wider affine/batched contractions and CMAC tiling.
-- General int32 arithmetic/dynamic arms, non-square int32 movement, non-suffix broadcast layouts, and broader boolean reductions. Int32 comparison
-  inputs, constant-arm WHERE outputs, and square transpose/copy are exact; contiguous
+- General int32 arithmetic/dynamic WHERE arms, non-square int32 movement, non-suffix broadcast layouts, and broader boolean reductions. Int32
+  comparisons, extrema, constant-arm WHERE outputs, fills, copies, and square transpose are exact; contiguous
   byte-bool inputs are losslessly widened, and generic FP16 comparison/IEEE predicate outputs use the public bool-output ABI.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
@@ -315,6 +319,6 @@ from the planned minimal upstream branch.
 
 The next feature should be selected by hardware-native leverage, not raw failed-test count. FP16 masks, IEEE-correct comparison roots, and a
 representation-only public bool ABI, exact int32 comparison inputs, constant-arm int32 WHERE outputs, and square transpose/copy now exist.
-`test_where_permute` passes. The next boundary is dynamic int32 WHERE arms and general int32 movement for further integer operators. Direct device
+`test_where_permute`, `test_maximum`, and `test_minimum` pass. The next boundary is dynamic int32 WHERE arms and general int32 movement for further integer operators. Direct device
 byte output remains unproven; spatial
 convolution should wait for an explicit device layout design.

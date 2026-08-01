@@ -57,9 +57,13 @@ class TestDPUCompiler(unittest.TestCase):
     for dtype, count, tile in ((dtypes.int, 2925, 64), (dtypes.float, 6, 4)):
       plan = lower_dpu(sink(Tensor.full((count,), 4, dtype=dtype)))
       self.assertIsInstance(plan, RKDPUProgram)
-      self.assertEqual(len(plan.stages), (count+tile-1)//tile)
-      self.assertTrue(all(stage.count <= tile and stage.out_dtype is dtype for stage in plan.stages))
-      self.assertEqual(tuple(stage.dst.addend for stage in plan.stages), tuple(range(0, count*4, tile*4)))
+      if dtype is dtypes.int:
+        self.assertEqual((len(plan.stages), plan.int_outputs), (8, (0,)))
+        self.assertTrue(all(stage.count == count and stage.out_dtype is dtypes.half for stage in plan.stages))
+      else:
+        self.assertEqual(len(plan.stages), (count+tile-1)//tile)
+        self.assertTrue(all(stage.count <= tile and stage.out_dtype is dtype for stage in plan.stages))
+        self.assertEqual(tuple(stage.dst.addend for stage in plan.stages), tuple(range(0, count*4, tile*4)))
       image = emit_dpu(plan)
       self.assertEqual(decode_image(encode_image(image)), image)
     self.assertIsNone(lower_dpu(sink(Tensor.full((257,), 4, dtype=dtypes.float))))
@@ -482,9 +486,21 @@ class TestDPUCompiler(unittest.TestCase):
     x = Tensor.empty(5,5,dtype=dtypes.int)
     plan = lower_dpu(sink(x.T.clone()))
     self.assertIsInstance(plan, RKDPUProgram)
-    self.assertEqual((plan.int_inputs, plan.int_outputs, plan.transposed_int_inputs), ((1,), (0,), (1,)))
+    self.assertEqual((plan.int_inputs, plan.int_outputs, plan.transposed_int_inputs, plan.raw_int_inputs), ((1,), (0,), (1,), (1,)))
     self.assertEqual(len(plan.stages), 4)
     self.assertFalse(contains_uop(plan))
+
+  def test_int32_extrema_select_exact_planes(self):
+    x, y = Tensor.empty(16,dtype=dtypes.int), Tensor.empty(16,dtype=dtypes.int)
+    for result in (x.maximum(y), x.minimum(y)):
+      plan = lower_dpu(sink(result))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual((plan.int_inputs, plan.int_outputs), ((1,2), (0,)))
+      self.assertLessEqual(len(plan.stages), 64)
+      self.assertFalse(contains_uop(plan))
+    scalar_plan = lower_dpu(sink(x.maximum(Tensor.empty(1,dtype=dtypes.int))))
+    self.assertIsInstance(scalar_plan, RKDPUProgram)
+    self.assertEqual(scalar_plan.tiled_int_inputs, (2,))
 
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
