@@ -292,6 +292,22 @@ to the same generic stage recipe with generated data selected by LUT identity.
 Each plan has 53 typed stages, retains the ordinary TestOps tolerance, and
 performs no host semantic work.
 
+At the generated ELU-family milestone, the uncached 2026-08-02 census completed
+without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 143 |
+| FAIL | 269 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 395 failures including the same 126 failing subtests. Runtime
+was 434.86 seconds. The exact two-method gain is `test_elu` and `test_selu`;
+ELU alpha 1, ELU alpha 0.1, and SELU share one parameterized 35-stage recipe
+and differ only by generated broad/local data identities. CELU remains a
+numerical mismatch and is not claimed by this milestone.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -324,6 +340,7 @@ performs no host semantic work.
 | Generated Hardswish broad range with generic local series | `test_hardswish` | Yes (research branch only) |
 | Generated QuickGELU ranges with generic local series | `test_quick_gelu` | Yes (research branch only) |
 | Generated tanh-approximate and exact GELU ranges | `test_gelu`, `test_gelu_extreme` | Yes (research branch only) |
+| Parameterized generated ELU/SELU ranges | `test_elu`, `test_selu` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

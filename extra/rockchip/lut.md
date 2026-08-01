@@ -326,3 +326,30 @@ The dense 8,193-point RK3588 characterization sweep passes with
 test; both official TestOps GELU methods pass their ordinary comparison without
 a backend-wide tolerance change. There is no GELU hardware opcode, runtime
 conversion, or host semantic work.
+
+## ELU and SELU ranges
+
+ELU alpha 1, ELU alpha 0.1, and SELU use one parameterized generic stage
+recipe. Each variant supplies a broad generated table over the negative tail
+and a higher-resolution local table. The broad table is addressed directly
+over `[-8, 0]`; the local table is addressed with `z=4*x` over
+`[-0.5, 0]`. A second-order `x + x*x/2` form, scaled by the variant's negative
+coefficient, avoids relative-error loss immediately below zero. Generic masks
+select the positive linear branch and the saturated negative tail.
+
+The generated payloads pre-scale low-amplitude variants before quantization:
+ELU(0.1) uses broad/local gains 8 and 16, while SELU uses gains 0.5 and 1.
+Exact reciprocal gains in generic ALU stages restore the final value. This is
+materially more accurate on RK3588 than direct high-`MINUS_EXP` output tables;
+those rejected direct-output experiments produced different hardware
+interpolation/conversion ULPs despite better ideal-table simulation and remain
+preserved in the milestone backup.
+
+Exhaustive simulation over finite FP16 negative inputs measured maximum
+relative error away from zero of 0.00062272163358892 for ELU(1),
+0.0005122214771726992 for ELU(0.1), and 0.0009050371260728453 for SELU.
+Maximum absolute errors were 0.00026157205054166965,
+0.000032820066862115915, and 0.0005252576073564441 respectively. A dense
+8,193-point RK3588 sweep and the ordinary official ELU/SELU comparisons pass
+with `rtol=1e-3, atol=1e-6`. The plans contain 35 typed stages and no ELU/SELU
+hardware opcode or host semantic work.

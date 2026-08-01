@@ -172,6 +172,16 @@ class TestRockchip(unittest.TestCase):
       actual = Tensor(data, device="ROCKCHIP").gelu(approximate=approximate).realize().numpy()
       np.testing.assert_allclose(actual, expected, rtol=1.4e-3, atol=1.3e-4)
 
+  def test_generated_elu_family_assets(self):
+    data = np.linspace(-10, 10, 8193, dtype=np.float16)
+    x = data.astype(np.float32)
+    variants = ((lambda value:value.elu(), np.where(x > 0, x, np.expm1(x))),
+                (lambda value:value.elu(.1), np.where(x > 0, x, .1*np.expm1(x))),
+                (lambda value:value.selu(), 1.0507*np.where(x > 0, x, 1.67326*np.expm1(x))))
+    for function, expected in variants:
+      np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).realize().numpy(), expected.astype(np.float16),
+                                 rtol=1e-3, atol=1e-6)
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)

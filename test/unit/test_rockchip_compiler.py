@@ -320,6 +320,22 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(plan.stages), 56)
       self.assertFalse(contains_uop(plan))
 
+  def test_elu_family_uses_generated_ranges_and_shared_stage_recipe(self):
+    expressions = ((Tensor.empty(128,dtype=dtypes.half).elu(), "ELU1"),
+                   (Tensor.empty(128,dtype=dtypes.half).elu(.1), "ELU01"),
+                   (Tensor.empty(128,dtype=dtypes.half).selu(), "SELU"))
+    for expression, name in expressions:
+      for suffix in ("", "_LOCAL"):
+        table = getattr(rklut, f"RK_LUT_{name}{suffix}")
+        self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(),
+                         getattr(rklut, f"RK_LUT_{name}{suffix}_SHA256"))
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                       {getattr(rklut.RKLUTId, name), getattr(rklut.RKLUTId, f"{name}_LOCAL")})
+      self.assertLessEqual(len(plan.stages), 48)
+      self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

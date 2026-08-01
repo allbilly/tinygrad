@@ -130,6 +130,15 @@ def gelu_local_table(approximate_tanh:bool) -> list[int]:
           for table in range(2) for i in range(SIZE)]
 gelu_tanh, gelu_tanh_local = gelu_table(True), gelu_local_table(True)
 gelu_exact, gelu_exact_local = gelu_table(False), gelu_local_table(False)
+ELU_BROAD_SCALE, ELU_BROAD_STEP = 2048.0, 32.0/2048.0
+ELU_LOCAL_SCALE, ELU_LOCAL_STEP = 8192.0, 32.0/8192.0
+def elu_table(negative_scale:float, gain:float, local:bool) -> list[int]:
+  step = ELU_LOCAL_STEP if local else ELU_BROAD_STEP
+  return [max(-32768, min(32767, round(negative_scale*gain*math.expm1(
+    signed_sample(table, i, step)/(4 if local else 1))*32768))) or 1 for table in range(2) for i in range(SIZE)]
+ELU_VARIANTS = {"ELU1":(1.0,1.0,2.0), "ELU01":(.1,8.0,16.0), "SELU":(1.0507*1.67326,.5,1.0)}
+elu_tables = {name:(elu_table(scale, broad_gain, False), elu_table(scale, local_gain, True))
+              for name,(scale,broad_gain,local_gain) in ELU_VARIANTS.items()}
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -379,6 +388,17 @@ for approximate_tanh in (True, False):
       if x >= 0: got = half(got*4)
     reference = gelu_value(x, approximate_tanh)
     gelu_errors[approximate_tanh].append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
+elu_errors = {name:[] for name in ELU_VARIANTS}
+for name,(negative_scale,broad_gain,local_gain) in ELU_VARIANTS.items():
+  broad, local = elu_tables[name]
+  for bits in range(1 << 16):
+    x = struct.unpack("<e", struct.pack("<H", bits))[0]
+    if not math.isfinite(x) or not -8 <= x <= 0: continue
+    if x < -.5: got = half(interpolate(broad, ELU_BROAD_STEP, 32768, x)/broad_gain)
+    elif x < -.03: got = half(interpolate(local, ELU_LOCAL_STEP, 32768, half(x*4))/local_gain)
+    else: got = half(half(x*negative_scale)+half(half(x*x)*(negative_scale/2)))
+    reference = negative_scale*math.expm1(x)
+    elu_errors[name].append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -452,7 +472,13 @@ class RKLUTId(IntEnum):
   GELU_TANH_LOCAL = 44
   GELU_EXACT = 45
   GELU_EXACT_LOCAL = 46
-RK_LUT_SCHEMA = 37
+  ELU1 = 47
+  ELU1_LOCAL = 48
+  ELU01 = 49
+  ELU01_LOCAL = 50
+  SELU = 51
+  SELU_LOCAL = 52
+RK_LUT_SCHEMA = 43
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -739,6 +765,22 @@ RK_LUT_GELU_EXACT_LOCAL_ENTRIES = {SIZE}
 RK_LUT_GELU_EXACT_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', GELU_SCALE))[0]}
 RK_LUT_GELU_EXACT_LOCAL_MINUS_EXP = 15
 RK_LUT_GELU_EXACT_LOCAL = (\n{rows(gelu_exact_local)}\n)
+{''.join(f'''RK_LUT_{name}_SHA256 = "{digest(elu_tables[name][0])}"
+RK_LUT_{name}_DOMAIN = (-8.0, 0.0)
+RK_LUT_{name}_ENTRIES = {SIZE}
+RK_LUT_{name}_BN_MUL = {struct.unpack('<H', struct.pack('<e', ELU_BROAD_SCALE))[0]}
+RK_LUT_{name}_MINUS_EXP = 15
+RK_LUT_{name}_VERIFIED_INPUTS = {len(elu_errors[name])}
+RK_LUT_{name}_SIM_MAX_ABS_ERROR = {max(x[0] for x in elu_errors[name])!r}
+RK_LUT_{name}_SIM_MAX_REL_ERROR = {max(x[1] for x in elu_errors[name] if x[2] > .01)!r}
+RK_LUT_{name} = (\n{rows(elu_tables[name][0])}\n)
+RK_LUT_{name}_LOCAL_SHA256 = "{digest(elu_tables[name][1])}"
+RK_LUT_{name}_LOCAL_DOMAIN = (-0.5, 0.0)
+RK_LUT_{name}_LOCAL_ENTRIES = {SIZE}
+RK_LUT_{name}_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', ELU_LOCAL_SCALE))[0]}
+RK_LUT_{name}_LOCAL_MINUS_EXP = 15
+RK_LUT_{name}_LOCAL = (\n{rows(elu_tables[name][1])}\n)
+''' for name in ELU_VARIANTS)}
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}
