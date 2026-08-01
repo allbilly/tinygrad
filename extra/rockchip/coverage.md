@@ -32,7 +32,10 @@ in addition to their failed parent methods. Runtime was 65.15 seconds.
 | Capability | Focused official gain | Full census folded in? |
 |---|---:|---|
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | No |
+| Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | No |
 
-The next dtype milestone targets exact FP32 and int32 constant fills required by
-`test_full` and both branches of `test_full_like`; those are not counted as
-passes until their complete methods and the next full census succeed.
+The wide-fill milestone writes the requested dtype directly through DPU WDMA;
+there is no runtime narrowing or host semantic work. It also upgrades RKImage
+dependencies to 64 bits and relocation indices to 32 bits, removing the image
+serialization limits exposed by tiled fills and large constant payloads. These
+focused passes are not counted in the baseline until the next full census.

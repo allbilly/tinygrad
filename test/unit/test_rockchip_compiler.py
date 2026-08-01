@@ -4,8 +4,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image,
-  emit_contract, emit_dpu, lower_contract, lower_dpu)
+from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer,
+  decode_image, emit_contract, emit_dpu, encode_image, lower_contract, lower_dpu)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -36,12 +36,27 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_dpu(plan)
     self.assertEqual(image.stages[0].commands, (
       0x10010000000e4004, 0x1001000001e5400c, 0x1001480000024010, 0x1001000000014030,
-      0x1001000000004034, 0x100100070007403c, 0x1001108202c04070, 0x1001000100014084,
-      0x20010000000e5004, 0x200100000001500c, 0x2001000000005010, 0x2001000000075014,
-      0x2001400000085034, 0x1001000000004020, 0x2001000000005018, 0x2001000000005038,
-      0x2001000178495044, 0x0081000000180008))
+      0x1001000000004034, 0x1001000000004038, 0x100100070007403c, 0x1001000000534040,
+      0x1001000000534060, 0x1001000000004044, 0x1001000000004048, 0x1001000000024050,
+      0x1001000000074058, 0x100100000001405c, 0x1001000000004068, 0x100100000000406c,
+      0x1001108202c04070, 0x1001000000014078, 0x1001000000004080, 0x1001000100014084,
+      0x1001000000004088, 0x10010000004040c0, 0x20010000000e5004, 0x200100000001500c,
+      0x2001000000005010, 0x2001000000075014, 0x2001400000085034, 0x1001000000004020,
+      0x2001000000005018, 0x2001000000005038, 0x2001000178495044, 0x0081000000180008))
     self.assertEqual(tuple((r.word, r.kind, r.index) for r in image.stages[0].relocs),
-                     ((13, RKBufferKind.ARG, 0), (14, RKBufferKind.ARG, 1), (15, RKBufferKind.ARG, 2)))
+                     ((27, RKBufferKind.ARG, 0), (28, RKBufferKind.ARG, 1), (29, RKBufferKind.ARG, 2)))
+
+  def test_wide_fills_tile_native_wdma_limits(self):
+    for dtype, count, tile in ((dtypes.int, 2925, 64), (dtypes.float, 6, 4)):
+      plan = lower_dpu(sink(Tensor.full((count,), 4, dtype=dtype)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual(len(plan.stages), (count+tile-1)//tile)
+      self.assertTrue(all(isinstance(stage, RKALUStage) and stage.count <= tile and stage.out_dtype is dtype for stage in plan.stages))
+      self.assertEqual(tuple(stage.dst.addend for stage in plan.stages if isinstance(stage, RKALUStage)),
+                       tuple(range(0, count*4, tile*4)))
+      image = emit_dpu(plan)
+      self.assertEqual(decode_image(encode_image(image)), image)
+    self.assertIsNone(lower_dpu(sink(Tensor.full((257,), 4, dtype=dtypes.float))))
 
   def test_plan_is_uop_free_and_reuses_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))
