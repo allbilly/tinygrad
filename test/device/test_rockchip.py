@@ -188,4 +188,9 @@ class TestRockchip(unittest.TestCase):
     special = np.array([-np.inf,-2.5,-1.5,-.5,-0.,0.,.5,1.5,2.5,np.inf,np.nan], dtype=np.float16)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").round().numpy(), np.round(special))
 
+  def test_native_integral_rounding(self):
+    data = np.linspace(-16, 16, 4097, dtype=np.float16)
+    for function, reference in ((lambda x:x.trunc(), np.trunc), (lambda x:x.floor(), np.floor), (lambda x:x.ceil(), np.ceil)):
+      np.testing.assert_equal(function(Tensor(data, device="ROCKCHIP")).numpy(), reference(data))
+
 if __name__ == "__main__": unittest.main()

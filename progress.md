@@ -15,11 +15,11 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
 milestones through the native round-to-nearest-even LUT, the 2026-08-01 census is
-**133 passed, 279 failed, and 13 skipped**. Pytest prints `405 failed` because
+**136 passed, 276 failed, and 13 skipped**. Pytest prints `402 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 47-host/27-NPU
+while recovering the remaining native forward coverage. Focused 48-host/28-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -97,7 +97,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `bb115b4a3` | Direct final-output CELU LUTs | `0197-rockchip-add-CELU-LUTs.patch` |
 | `730efd61e` | Scale-specific Log2/Log/Log10 LUTs and experimental typed FP32 ABI | `0198-rockchip-add-logarithm-LUTs.patch` |
 | `1f4cc5da8` | Native round-to-nearest-even algorithm-23 LUT | `0199-rockchip-add-native-roundoff-LUT.patch` |
-| current milestone | Separate hardware stage operations from generated LUT identities | `0200-rockchip-separate-LUT-assets-from-stage-ops.patch` |
+| `e6a88f6c1` | Separate hardware stage operations from generated LUT identities | `0200-rockchip-separate-LUT-assets-from-stage-ops.patch` |
+| current milestone | Compose trunc/floor/ceil from native roundoff and masks | `0201-rockchip-compose-native-integral-rounding.patch` |
 
 ## Architecture now implemented
 
@@ -151,6 +152,7 @@ Implemented forward-only subset:
 - Log2/natural Log/Log10 using scale-specific broad/local LUTs, power-of-16 normalization, near-one correction, and IEEE masks;
 - experimental FP32 natural Log using atom-aligned `hi/lo` FP16 input planes and declared FP16-to-FP32 output widening;
 - round-to-nearest-even using the RK3588 algorithm-23 LUT, with NPU masks preserving sign, infinity, and NaN;
+- trunc, floor, and ceil composed from the same roundoff asset plus primitive DPU comparison masks;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -162,22 +164,22 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1274
+tinygrad/renderer/rockchip.py  1285
 tinygrad/runtime/ops_rockchip.py  99
-handwritten Rockchip total  1373
+handwritten Rockchip total  1384
 ```
 
-This meets the requested `<5000` research-backend goal with 3,627 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,616 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
 an activation catalog. Approximate current physical source distribution is:
 
-- target types and DPU expression recipes: renderer lines 18–435;
-- RKImage validation, codec, and relocation: renderer lines 436–515;
-- UOp canonicalization, affine analysis, and typed lowering: renderer lines 516–1103;
-- register emission: renderer lines 1104–1360;
-- renderer integration: renderer lines 1361 onward;
+- target types and DPU expression recipes: renderer lines 18–443;
+- RKImage validation, codec, and relocation: renderer lines 444–523;
+- UOp canonicalization, affine analysis, and typed lowering: renderer lines 524–1115;
+- register emission: renderer lines 1116–1372;
+- renderer integration: renderer lines 1373 onward;
 - allocation/submission/runtime ABI experiment: 99 `sz.py` lines.
 
 This distribution is acceptable only for the frozen research/coverage branch.
@@ -185,7 +187,7 @@ The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,349 `sz.py` lines, a `+1,381` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,349 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 26,360 `sz.py` lines, a `+1,392` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,360 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 

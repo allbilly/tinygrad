@@ -341,6 +341,12 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)
     self.assertFalse(contains_uop(plan))
 
+  def test_trunc_floor_ceil_compose_roundoff_lut(self):
+    for function in (lambda x:x.trunc(), lambda x:x.floor(), lambda x:x.ceil()):
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertEqual(sum(stage.lut is rklut.RKLUT.ROUNDOFF for stage in plan.stages), 1)
+      self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

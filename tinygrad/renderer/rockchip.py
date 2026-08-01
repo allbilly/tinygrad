@@ -411,6 +411,14 @@ def _round_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   valid = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MUL, (positive_mask, negative_mask))))
   return _DPUExpr(RKDPUOp.MUL, (selected, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
 
+def _trunc_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  rounded = _round_expr(source)
+  decrement = _DPUExpr(RKDPUOp.MUL, (positive(rounded, source), positive(source, 0.0)))
+  increment = _DPUExpr(RKDPUOp.MUL, (positive(source, rounded), positive(0.0, source)))
+  return _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.SUB, (rounded, decrement)), increment))
+
 def _celu_expr(source:_DPUExpr|RKArg|float, alpha:int) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -927,6 +935,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     operand = _parse_dpu_expr(u.src[0], output_index, memo)
     if operand is None: return None
     ret = _DPUExpr(RKDPUOp.DIV, (1.0, operand))
+  elif u.op is Ops.TRUNC:
+    operand = _parse_dpu_expr(u.src[0], output_index, memo)
+    if operand is None: return None
+    ret = _trunc_expr(operand)
   elif u.op is Ops.WHERE:
     cond = _unwrap_same_cast(u.src[0])
     true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
