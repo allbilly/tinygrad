@@ -13,7 +13,7 @@ CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
 python -m pytest test/backend/test_ops.py -p conftest_rockchip -q --tb=no
 ```
 
-## Exact baseline
+## Exact censuses
 
 At `aab408cec`, the uncached 2026-08-01 census completed without NPU timeouts:
 
@@ -27,15 +27,28 @@ At `aab408cec`, the uncached 2026-08-01 census completed without NPU timeouts:
 Pytest reports 450 failures because 126 failing unittest subtests are counted
 in addition to their failed parent methods. Runtime was 65.15 seconds.
 
+At `40c74406c`, after scalar and native wide fills plus the RKImage v2 width
+fixes, the uncached 2026-08-02 census again completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 96 |
+| FAIL | 316 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 442 failures after adding the same 126 failing subtests. Runtime
+was 72.31 seconds. This is an exact eight-method gain from the baseline.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
 |---|---:|---|
-| Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | No |
-| Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | No |
+| Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
+| Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Yes (`40c74406c`) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
 dependencies to 64 bits and relocation indices to 32 bits, removing the image
 serialization limits exposed by tiled fills and large constant payloads. These
-focused passes are not counted in the baseline until the next full census.
+focused passes are included in the 96-pass census above.
