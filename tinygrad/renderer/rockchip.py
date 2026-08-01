@@ -1335,7 +1335,9 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     numerator, denominator = u.src[1-reciprocal], _unwrap_same_cast(u.src[reciprocal]).src[0]
     src = tuple(_parse_dpu_expr(x, output_index, memo) for x in (numerator, denominator))
     if any(x is None for x in src): return None
-    ret = _DPUExpr(RKDPUOp.DIV, cast(tuple[_DPUExpr|RKArg|float, ...], src))
+    parsed_div = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], src)
+    ret = _DPUExpr(RKDPUOp.MUL, (parsed_div[1], parsed_div[0])) if isinstance(parsed_div[0], float) and math.isinf(parsed_div[0]) \
+      else _DPUExpr(RKDPUOp.DIV, parsed_div)
   elif u.op is Ops.MUL and (logarithm:=next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.LOG2), None)) is not None:
     constant = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST), None)
     # Rejected scaled-log/atanh WIP: accepting arbitrary finite scales lowered atanh in 61 stages, but its ratio reaches 199.

@@ -299,4 +299,9 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal((x < 0).where(x, 1).numpy(), np.where(data < 0, data, 1))
     np.testing.assert_equal((x > .1).where(-np.inf, x).numpy(), np.where(data > .1, -np.inf, data))
 
+  def test_infinite_numerator_preserves_sign(self):
+    data = np.array([-2, -.5, .5, 2], dtype=np.float16)
+    x = Tensor(data, device="ROCKCHIP")
+    np.testing.assert_equal((math.inf / x).numpy(), np.array([ -np.inf, -np.inf, np.inf, np.inf], dtype=np.float16))
+
 if __name__ == "__main__": unittest.main()

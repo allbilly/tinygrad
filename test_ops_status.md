@@ -80,7 +80,8 @@ smoke/contract tests, not a replacement for this census.
 
 Latest complete uncached census after exact int32 extrema and typed mixed-dtype widening:
 
-The subsequent infinity-safe WHERE milestone passes focused `test_inf_where` and `test_masked_fill`; those gains are not folded into this table until
+The subsequent infinity-safe WHERE and signed infinite-division milestones pass focused `test_inf_where`, `test_masked_fill`, and `test_div_naninf`;
+those gains are not folded into this table until
 the next complete uncached census.
 
 | Status | Methods |
@@ -142,10 +143,11 @@ Int32 values are never narrowed: four byte planes preserve all 32 bits and the s
 | Exact square int32 transpose | raw input byte planes, four NPU copy stages, and lossless reassembly | official `test_where_permute` and full-bit-pattern 5x5 transpose | PASS |
 | Exact int32 extrema and mixed dtype | shared signed comparison DAG, raw selected byte planes, typed numeric widening | official `test_maximum`/`test_minimum` and full-range boundary vectors | PASS |
 | Infinity-safe WHERE | threshold clamping plus reciprocal-generated signed infinity | official `test_inf_where`, `test_masked_fill`, and selected/unselected infinity vectors | PASS |
+| Signed infinite division | infinite numerator becomes device multiply on finite nonzero denominator domain | official `test_div_naninf` and signed hardware vector | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 63 | 43 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 64 | 44 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

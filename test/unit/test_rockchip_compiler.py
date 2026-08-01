@@ -510,6 +510,12 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(plan.stages), 64)
       self.assertFalse(contains_uop(plan))
 
+  def test_infinite_numerator_preserves_denominator_sign(self):
+    plan = lower_dpu(sink(math.inf / Tensor.empty(16,dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.stages[-1].op, RKDPUOp.MUL)
+    self.assertFalse(contains_uop(plan))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)
