@@ -350,6 +350,11 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       return RKDPUProgram(fill_stages, ()) if len(fill_stages) <= 64 else None
     stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count, store.src[0].dtype)
     return RKDPUProgram((stage,), ())
+  if root.op is RKDPUOp.EXP2 and len(root.src) == 1 and isinstance(root.src[0], RKArg):
+    lut_stages = tuple(RKDPUStage(RKDPUOp.EXP2, RKArg(output.kind, output.index, start*2),
+                                  RKArg(root.src[0].kind, root.src[0].index, start*2), None, 128)
+                       for start in range(0, count, 128))
+    return RKDPUProgram(lut_stages, ()) if len(lut_stages) <= 64 else None
   order:list[_DPUExpr] = []
   def visit(expr:_DPUExpr) -> None:
     for src in expr.src:

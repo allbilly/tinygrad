@@ -56,8 +56,10 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(Tensor(data, device="ROCKCHIP").max(axis=0).realize().numpy(), data.max(axis=0))
 
   def test_generated_exp2_lut(self):
-    data = np.linspace(-2, 2, 128, dtype=np.float16)
-    actual = Tensor(data, device="ROCKCHIP").realize().exp2().realize().numpy()
-    np.testing.assert_allclose(actual, np.exp2(data), rtol=5e-3, atol=5e-3)
+    for count in (1, 128, 129, 2925):
+      with self.subTest(count=count):
+        data = np.linspace(-2, 2, count, dtype=np.float16)
+        actual = Tensor(data, device="ROCKCHIP").realize().exp2().realize().numpy()
+        np.testing.assert_allclose(actual, np.exp2(data), rtol=5e-3, atol=5e-3)
 
 if __name__ == "__main__": unittest.main()

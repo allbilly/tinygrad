@@ -78,7 +78,7 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch focused verified matrix
 
-Latest complete uncached census after the native-int fill milestone:
+Latest complete uncached census after the ordered-clamp milestone:
 
 | Status | Methods |
 |---|---:|
@@ -95,11 +95,11 @@ in addition to their failed parent methods. Runtime was 67.39 seconds.
 | Native hook | 1 | — | PASS |
 | RKImage codec/validation/relocation, including 64-bit dependencies | 6 | — | PASS |
 | DPU ADD/MUL/MAX/DIV/copy/fill/ABS/WHERE/composed masks and structural liveness | included in compiler suite | included | PASS |
-| Generated EXP2 LUT | exhaustive 32,770 FP16 encodings in domain | 1 | PASS |
+| Generated EXP2 LUT | exhaustive 32,770 FP16 encodings in domain | 4 sizes | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 28 | 10 | PASS |
+| Clean image/compiler suite total | 29 | 10 (plus 4 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
@@ -109,7 +109,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - mode: forward only;
 - static shapes;
 - DPU contiguous storage and one output;
-- EXP2 exactly 128 elements for the first proven LUT task;
+- direct EXP2 now tiles arbitrary logical counts up to 8,192 elements, but only the finite `[-2,2]` domain is correct;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.
@@ -119,7 +119,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - FP32 expression/input graphs, integer arithmetic/input graphs, uint8, bool, and gradients;
 - noncontiguous elementwise indexing;
 - user-visible bool comparisons and WHERE graphs needing bool/int inputs or non-FP16 outputs;
-- arbitrary EXP2 sizes or values requiring a different domain policy;
+- composed EXP2 graphs and values requiring overflow/underflow or NaN policy outside `[-2,2]`;
 - unpacked/general matmul, batched matmul, arbitrary K, and host-required gather;
 - spatial NCHW convolution without a device layout stage;
 - windowed NCHW pooling and unsupported PPU kernel shapes;
