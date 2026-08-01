@@ -82,6 +82,7 @@ class RKDPUOp(IntEnum):
   LOG_LOCAL = 53
   LOG10 = 54
   LOG10_LOCAL = 55
+  ROUNDOFF = 56
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -434,6 +435,21 @@ def _log2_expr(source:_DPUExpr|RKArg|float, scale:float=1.0) -> _DPUExpr:
   valid = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MAX, (negative, not_number))))
   return _DPUExpr(RKDPUOp.MUL, (finite, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
 
+def _round_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  negative = _DPUExpr(RKDPUOp.MUL, (source, -1.0))
+  magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative))
+  positive_mask, negative_mask = positive(source, 0.0), positive(0.0, source)
+  sign = _DPUExpr(RKDPUOp.SUB, (positive_mask, negative_mask))
+  rounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.ROUNDOFF, (magnitude,)), sign))
+  high = positive(magnitude, 65472.0)
+  high_result = _DPUExpr(RKDPUOp.DIV, (sign, _DPUExpr(RKDPUOp.SUB, (1.0, high))))
+  selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (rounded, _DPUExpr(RKDPUOp.SUB, (1.0, high)))),
+                                        _DPUExpr(RKDPUOp.MUL, (high_result, high))))
+  valid = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MUL, (positive_mask, negative_mask))))
+  return _DPUExpr(RKDPUOp.MUL, (selected, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
+
 def _celu_expr(source:_DPUExpr|RKArg|float, alpha:int) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -668,6 +684,34 @@ def _canonical_celu(u:UOp) -> tuple[UOp,float]|None:
     sum(x.op is Ops.EXP2 for x in nodes) == 1 and sum(x.op is Ops.MAX for x in nodes) >= 2 and \
     any(math.isclose(x, math.log2(math.e)) for x in constants) else None
 
+def _canonical_round(u:UOp) -> UOp|None:
+  """Recognize tinygrad's exact round-to-nearest-even expansion."""
+  u = _unwrap_same_cast(u)
+  indexes = [x for x in u.toposort() if x.op is Ops.INDEX]
+  if len(indexes) != 1 or (source:=indexes[0]).dtype is not dtypes.half: return None
+  def c(value:float) -> UOp: return UOp.const(value, dtypes.half)
+  truncated = UOp(Ops.TRUNC, dtypes.half, (source,))
+  half_truncated = UOp(Ops.MUL, dtypes.half, (truncated, c(.5)))
+  positive = UOp(Ops.CMPLT, dtypes.bool, (c(0), source))
+  even = UOp(Ops.CMPNE, dtypes.bool, (UOp(Ops.CMPNE, dtypes.bool,
+    (UOp(Ops.TRUNC, dtypes.half, (half_truncated,)), half_truncated)), UOp.const(True, dtypes.bool)))
+  condition = UOp(Ops.CMPNE, dtypes.bool, (positive, even))
+  plus_half = UOp(Ops.ADD, dtypes.half, (source, c(.5)))
+  plus_trunc = UOp(Ops.TRUNC, dtypes.half, (plus_half,))
+  floor_plus = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (plus_half, plus_trunc)),
+    UOp(Ops.ADD, dtypes.half, (plus_trunc, c(-1))), plus_trunc))
+  minus_half = UOp(Ops.ADD, dtypes.half, (source, c(-.5)))
+  minus_trunc = UOp(Ops.TRUNC, dtypes.half, (minus_half,))
+  ceil_minus = UOp(Ops.WHERE, dtypes.half, (UOp(Ops.CMPLT, dtypes.bool, (minus_trunc, minus_half)),
+    UOp(Ops.ADD, dtypes.half, (minus_trunc, c(1))), minus_trunc))
+  expected = UOp(Ops.WHERE, dtypes.half, (condition, floor_plus, ceil_minus))
+  if u is expected: return source
+  # Current master keeps two ±0.5/±1 constants weak while 2607 made them half, so exact UOp identity does not match.
+  counts = {op:sum(x.op is op for x in u.toposort()) for op in (Ops.TRUNC,Ops.ADD,Ops.MUL,Ops.CMPLT,Ops.CMPNE,Ops.WHERE)}
+  constants = [float(x.arg) for x in u.toposort() if x.op is Ops.CONST]
+  required = {Ops.TRUNC:4,Ops.ADD:4,Ops.MUL:1,Ops.CMPLT:3,Ops.CMPNE:3,Ops.WHERE:3}
+  return source if counts == required and all(any(math.isclose(x, value) for x in constants) for value in (-1,-.5,0,.5,1)) else None
+
 def _canonical_mish(u:UOp) -> UOp|None:
   u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
   indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
@@ -782,6 +826,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(celu[0], output_index, memo)
     if source is None: return None
     ret = _elu_expr(source, 1.0, 1.0) if celu[1] == 1 else _celu_expr(source, int(celu[1]))
+  elif (rounded:=_canonical_round(u)) is not None:
+    source = _parse_dpu_expr(rounded, output_index, memo)
+    if source is None: return None
+    ret = _round_expr(source)
   elif (elu:=_canonical_elu(u)) is not None:
     source = _parse_dpu_expr(elu[0], output_index, memo)
     if source is None: return None
@@ -1172,6 +1220,39 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
   writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
   return RKStage(RKEngine.DPU, tuple(cmds), relocs, reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
 
+def _emit_roundoff_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
+  """Emit the RK3588 algorithm-23 round-to-nearest-even LUT contract."""
+  width, surf_stride, cmds = (plan.count+7)//8-1, ((plan.count+7)//8)*16, []
+  table = rklut.RK_LUT_ROUNDOFF
+  for table_id in range(2):
+    cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
+    cmds.extend(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_DATA, value) for value in table[table_id*513:(table_id+1)*513])
+  dpu = ((rk.REG_DPU_S_POINTER, 0x30), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (rk.REG_DPU_DATA_FORMAT, 0x48000002),
+    (rk.REG_DPU_DST_SURF_STRIDE, surf_stride), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
+    (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BS_OW_CFG, 2),
+    (rk.REG_DPU_WDMA_SIZE_0, 7), (rk.REG_DPU_WDMA_SIZE_1, width), (rk.REG_DPU_BN_CFG, 0x53),
+    (rk.REG_DPU_EW_CFG, 0x302), (rk.REG_DPU_SURFACE_ADD, 2*surf_stride), (0x40c4, 0),
+    (rk.REG_DPU_LUT_CFG, 0x68), (rk.REG_DPU_LUT_INFO, 0xe0e00), (rk.REG_DPU_LUT_LE_START, 0),
+    (rk.REG_DPU_LUT_LE_END, 0x44000000), (rk.REG_DPU_LUT_LO_START, 0x44000000),
+    (rk.REG_DPU_LUT_LO_END, 0x44800000), (0x4120, 23107), (0x4124, 22))
+  cmds.extend(_command(_TARGET_DPU, *x) for x in dpu[:3])
+  dst_word = len(cmds)
+  cmds.append(_command(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0))
+  cmds.extend(_command(_TARGET_DPU, *x) for x in dpu[3:])
+  rdma = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
+    (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7), (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 1))
+  cmds.extend(_command(_TARGET_DPU_RDMA, *x) for x in rdma)
+  src_word = len(cmds)
+  cmds.append(_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0))
+  cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849),
+           _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_WEIGHT, 0x01010101),
+           _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
+  relocs = (RKReloc(stage_idx, dst_word, plan.dst.kind, plan.dst.index, plan.dst.addend),
+            RKReloc(stage_idx, src_word, src.kind, src.index, src.addend))
+  reads, writes = ((src.index,) if src.kind is RKBufferKind.ARG else ()), \
+                   ((plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ())
+  return RKStage(RKEngine.DPU, tuple(cmds), relocs, reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
+
 def _emit_mask(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
   width = (plan.count+7)//8-1
   regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (rk.REG_DPU_DATA_FORMAT, 0x48000002),
@@ -1217,6 +1298,9 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     # Rejected partial Maximum WIP: OUT_CVT_OFFSET can fill INT_MAX exactly, but later cases still require int copy/compare and bool packing.
     # int_fill = plan.out_dtype is dtypes.int and plan.op is RKDPUOp.ADD and plan.lhs == 0.0 and isinstance(plan.rhs, float)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
+    if plan.op is RKDPUOp.ROUNDOFF:
+      stages.append(_emit_roundoff_lut(stage_idx, plan, lhs))
+      continue
     if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL,
                    RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL,
                    RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL, RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL,

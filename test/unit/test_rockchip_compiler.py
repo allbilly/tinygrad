@@ -333,6 +333,14 @@ class TestDPUCompiler(unittest.TestCase):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
+  def test_round_uses_native_algorithm23_lut(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).round()))
+    self.assertEqual((len(plan.stages), len(plan.scratch)), (20,6))
+    self.assertEqual(sum(x.op is RKDPUOp.ROUNDOFF for x in plan.stages), 1)
+    table = rklut.RK_LUT_ROUNDOFF
+    self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

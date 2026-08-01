@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 18 |
+| Schema | 19 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -118,6 +118,8 @@ CELU α=2/3/4 uses direct final-output broad/local pairs `CELU2 = 38/39`, `CELU3
 Logarithms use scale-specific broad/local pairs: `LOG2 = 44/45`, natural `LOG = 46/47`, and `LOG10 = 48/49`. Two power-of-16 masks normalize positive inputs into `[0.25,4]` and add the exact `-4` or `-8` exponent offset; this covers values down to `2^-10` with six fewer tasks than four power-of-four bands. Broad tables use Q13/Q14/Q15 according to each base's normalized output range. Q15 local tables store four times the result near one, and `x-x²/2` replaces them inside `|x-1|<0.02`. The natural-log negative local knots 77–78 have a recorded `+8` correction for RK3588 interpolation rounding.
 
 Half inputs use 57 stages and eight reusable scratch buffers. FP32 natural-log inputs use a declared two-plane ABI representation: the runtime encodes `hi=fp16(x)` and `lo=fp16(x-hi)` into atom-aligned planes, the NPU adds the first-order `lo/hi` correction, and the NPU writes an FP16 result that the runtime widens to FP32. These are element-format encode/decode operations only; logarithm evaluation, range selection, correction, and IEEE zero/infinity/NaN semantics remain NPU tasks. The FP32 plan has 61 stages. All three official methods pass at their unchanged `rtol=1e-3`; the supplemental geometric `[2^-10,4]` characterization uses the measured `rtol=1.1e-3` envelope (observed maximum `0.001038`). A rejected `+16` Q14 correction at broad LO knots 295/296/311/312 fixed the two normalized low-input misses but regressed four direct positive inputs, so it is not part of the generated artifact.
+
+Round-to-nearest-even uses `ROUNDOFF = 50`, the RK3588 algorithm-23 index mode rather than an ordinary function-sampled table. Both 513-entry banks alternate between `0` and Q14 `1`; the emitter uses index selector 14, the `0x44000000..0x44800000` endpoint contract, and the proven LE slope scale/shift `23107/22`. NPU arithmetic forms `abs(x)`, the LUT rounds its magnitude, and masks restore sign, signed infinities, and NaN. The 20-stage, six-scratch plan passes the full official method and an exact 4,097-point `[-16,16]` sweep plus half ties, infinities, signed zero, and NaN. The rejected `CVT_ROUND` int32 probe remains insufficient for truncation, so `trunc`, `floor`, and `ceil` are not claimed by this milestone.
 
 ## Current command contract
 

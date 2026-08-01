@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through the scale-specific logarithm LUTs, the 2026-08-01 census is
-**131 passed, 281 failed, and 13 skipped**. Pytest prints `407 failed` because
+milestones through the native round-to-nearest-even LUT, the 2026-08-01 census is
+**133 passed, 279 failed, and 13 skipped**. Pytest prints `405 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 46-host/26-NPU
+while recovering the remaining native forward coverage. Focused 47-host/27-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -95,7 +95,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `41ba2345c` | Broad/local natural Exp LUTs | `0195-rockchip-add-natural-Exp-LUTs.patch` |
 | `ddb9d0733` | Rejected int fill probe retained for reference | `0196-rockchip-record-rejected-int-fill-probe.patch` |
 | `bb115b4a3` | Direct final-output CELU LUTs | `0197-rockchip-add-CELU-LUTs.patch` |
-| current milestone | Scale-specific Log2/Log/Log10 LUTs and experimental typed FP32 ABI | `0198-rockchip-add-logarithm-LUTs.patch` |
+| `730efd61e` | Scale-specific Log2/Log/Log10 LUTs and experimental typed FP32 ABI | `0198-rockchip-add-logarithm-LUTs.patch` |
+| current milestone | Native round-to-nearest-even algorithm-23 LUT | `0199-rockchip-add-native-roundoff-LUT.patch` |
 
 ## Architecture now implemented
 
@@ -147,6 +148,7 @@ Implemented forward-only subset:
 - CELU α=1–4 using ELU1 or direct final-output broad/local tables and a near-zero polynomial;
 - Log2/natural Log/Log10 using scale-specific broad/local LUTs, power-of-16 normalization, near-one correction, and IEEE masks;
 - experimental FP32 natural Log using atom-aligned `hi/lo` FP16 input planes and declared FP16-to-FP32 output widening;
+- round-to-nearest-even using the RK3588 algorithm-23 LUT, with NPU masks preserving sign, infinity, and NaN;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -158,22 +160,30 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1247
+tinygrad/renderer/rockchip.py  1325
 tinygrad/runtime/ops_rockchip.py  99
-handwritten Rockchip total  1346
+handwritten Rockchip total  1424
 ```
 
-This meets the requested `<5000` research-backend goal with 3,654 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,576 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
-Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
+Compared with the frozen implementation, the runtime is thin and the UOp-free
+plan/image boundary is preserved, but this research branch has again accumulated
+an activation catalog. Approximate current physical source distribution is:
 
-- RKImage types, codec, validation, relocation: renderer lines 18–192;
-- semantic analysis and typed lowering: renderer lines 193–334;
-- register emission: renderer lines 335–475;
-- renderer integration: renderer lines 476–485;
-- allocation/submission/runtime ABI experiment: 99 physical lines.
+- target types and DPU expression recipes: renderer lines 18–470;
+- RKImage validation, codec, and relocation: renderer lines 471–554;
+- UOp canonicalization, affine analysis, and typed lowering: renderer lines 555–1141;
+- register emission: renderer lines 1142–1409;
+- renderer integration: renderer lines 1410 onward;
+- allocation/submission/runtime ABI experiment: 99 `sz.py` lines.
 
-The whole repository is 26,322 `sz.py` lines, a `+1,354` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,322 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+This distribution is acceptable only for the frozen research/coverage branch.
+The future upstream branch must replace the catalog with generic `Ops` ALU,
+mask, and LUT stages and include only the minimal assets required by its declared
+FP16 workload.
+
+The whole repository is 26,400 `sz.py` lines, a `+1,432` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,400 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
