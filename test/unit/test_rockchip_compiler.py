@@ -144,6 +144,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     self.assertIn("MASK", tuple(stage.op.name for stage in plan.stages))
 
+  def test_composed_predicates_preserve_shared_mask_liveness(self):
+    sign = lower_dpu(sink(Tensor.empty(3,dtype=dtypes.half).sign()))
+    clipped = lower_dpu(sink(Tensor.empty(3,dtype=dtypes.half).clip(0, 0)))
+    self.assertIsInstance(sign, RKDPUProgram)
+    self.assertIsInstance(clipped, RKDPUProgram)
+    self.assertEqual(len(sign.scratch), 3)
+    self.assertEqual(len(clipped.scratch), 2)
+    self.assertTrue(all(stage.lhs != stage.rhs for stage in sign.stages if stage.op.name == "MAX"))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

@@ -215,6 +215,23 @@ def _canonical_abs(u:UOp) -> UOp|None:
         positive.op is Ops.CONST and float(positive.arg) == 1): return data
   return None
 
+def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float]) -> _DPUExpr|None:
+  """Build an FP16 0/1 predicate from comparisons and boolean composition."""
+  u = _unwrap_same_cast(u)
+  if u.op in (Ops.CMPLT, Ops.CMPNE):
+    operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in u.src)
+    if any(x is None for x in operands): return None
+    lhs, rhs = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], operands)
+    positive = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (rhs, lhs)),))
+    return positive if u.op is Ops.CMPLT else _DPUExpr(RKDPUOp.MAX,
+      (positive, _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))))
+  if u.op in (Ops.OR, Ops.AND):
+    operands = tuple(_parse_mask_expr(x, output_index, memo) for x in u.src)
+    if any(x is None for x in operands): return None
+    return _DPUExpr(RKDPUOp.MAX if u.op is Ops.OR else RKDPUOp.MUL,
+                    cast(tuple[_DPUExpr|RKArg|float, ...], operands))
+  return None
+
 def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float]) -> _DPUExpr|RKArg|float|None:
   u = _unwrap_same_cast(u)
   if u in memo: return memo[u]
@@ -243,23 +260,28 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     operand = _parse_dpu_expr(u.src[0], output_index, memo)
     if operand is None: return None
     ret = _DPUExpr(RKDPUOp.DIV, (1.0, operand))
-  elif u.op is Ops.WHERE and (cond:=_unwrap_same_cast(u.src[0])).op is Ops.CMPLT:
-    lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
+  elif u.op is Ops.WHERE:
+    cond = _unwrap_same_cast(u.src[0])
     true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
-    ordered_max = true_u.key == rhs_u.key and false_u.key == lhs_u.key
-    ordered_min = true_u.key == lhs_u.key and false_u.key == rhs_u.key
-    parsed = tuple(_parse_dpu_expr(x, output_index, memo) for x in (lhs_u, rhs_u))
-    if any(x is None for x in parsed): return None
-    operands = cast(tuple[_DPUExpr|RKArg|float, ...], parsed)
-    if ordered_max: ret = _DPUExpr(RKDPUOp.MAX, operands)
+    if cond.op is Ops.CMPLT:
+      lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
+      ordered_max = true_u.key == rhs_u.key and false_u.key == lhs_u.key
+      ordered_min = true_u.key == lhs_u.key and false_u.key == rhs_u.key
+    else:
+      lhs_u = rhs_u = true_u
+      ordered_max = ordered_min = False
+    operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in (lhs_u, rhs_u))
+    if any(x is None for x in operands): return None
+    parsed = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], operands)
+    if ordered_max: ret = _DPUExpr(RKDPUOp.MAX, parsed)
     elif ordered_min:
-      negative = tuple(_DPUExpr(RKDPUOp.MUL, (x, -1.0)) for x in operands)
+      negative = tuple(_DPUExpr(RKDPUOp.MUL, (x, -1.0)) for x in parsed)
       ret = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, negative), -1.0))
     else:
+      mask = _parse_mask_expr(cond, output_index, memo)
       arms = tuple(_parse_dpu_expr(x, output_index, memo) for x in (true_u, false_u))
-      if any(x is None for x in arms): return None
+      if mask is None or any(x is None for x in arms): return None
       true, false = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], arms)
-      mask = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (operands[1], operands[0])),))
       ret = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (true, mask)),
         _DPUExpr(RKDPUOp.MUL, (false, _DPUExpr(RKDPUOp.SUB, (1.0, mask))))))
   else: return None
@@ -298,7 +320,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
     if expr not in order: order.append(expr)
   visit(root)
   if any(expr.op is RKDPUOp.EXP2 for expr in order) and count != 128: return None
-  uses = {expr:sum(src is expr for node in order for src in node.src) for expr in order}
+  uses = {expr:sum(src == expr for node in order for src in node.src) for expr in order}
   values:dict[_DPUExpr, RKArg] = {}
   free:list[int] = []
   scratch_count, stages = 0, []
