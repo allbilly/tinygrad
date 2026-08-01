@@ -40,14 +40,27 @@ fixes, the uncached 2026-08-02 census again completed without NPU timeouts:
 Pytest reports 442 failures after adding the same 126 failing subtests. Runtime
 was 72.31 seconds. This is an exact eight-method gain from the baseline.
 
+At `fd317872f`, after FP16 extrema canonicalization and composed predicates,
+the uncached 2026-08-03 census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 104 |
+| FAIL | 308 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 434 failures including the 126 failing subtests. Runtime was
+74.26 seconds, another exact eight-method gain.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
 |---|---:|---|
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
 | Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Yes (`40c74406c`) |
-| FP16 absolute value and finite ordered extrema | `test_abs`; `test_relu` remains passing | No |
-| Composed FP16 predicates used inside arithmetic | `test_sign` | No |
+| FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
+| Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
