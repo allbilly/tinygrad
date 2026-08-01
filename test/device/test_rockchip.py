@@ -54,6 +54,8 @@ class TestRockchip(unittest.TestCase):
     self.assertLessEqual(float(relative.max()), 0.0009)
     self.assertLessEqual(int(ulp.max()), 1)
     self.assertTrue(np.all(np.diff(actual[order].astype(np.float32)) >= 0))
+    special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").exp2().realize().numpy(), np.array([np.inf, 0, np.nan], dtype=np.float16))
 
   def test_generated_roundoff_lut(self):
     data = np.linspace(-16, 16, 4097, dtype=np.float16)

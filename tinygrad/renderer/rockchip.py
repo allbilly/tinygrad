@@ -367,6 +367,14 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
                                      store.src[0].dtype) for start in range(0, count, tile))
       return RKDPUProgram(fill_stages) if len(fill_stages) <= 64 else None
     return RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),))
+  if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2 and isinstance(root.src[0], RKArg):
+    input_arg, base = root.src[0], root
+    positive_inf = _MaskExpr((_sub(input_arg, 65504.0),))
+    negative_inf = _MaskExpr((_sub(-65504.0, input_arg),))
+    finite = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
+    not_number = _ALUExpr(Ops.MUL, (positive_inf, negative_inf))
+    nan_denom = _sub(1.0, not_number)
+    root = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (finite, nan_denom)), nan_denom))
   order:list[_Expr] = []
   def visit(expr:_Expr) -> None:
     for src in expr.src:
