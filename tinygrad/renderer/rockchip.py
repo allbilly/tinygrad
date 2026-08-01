@@ -382,6 +382,45 @@ def _atanh_expr(source:_Expr|RKArg) -> _Expr:
   valid = _sub(1.0, outside)
   return _ALUExpr(Ops.MUL, (bounded, _ALUExpr(Ops.FDIV, (valid, valid))))
 
+def _asinh_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  broad, mid = _LUTExpr(RKLUTId.ASINH, (clamp(source, 512.0),)), _LUTExpr(RKLUTId.ASINH_MID, (clamp(source, 8.0),))
+  near = _LUTExpr(RKLUTId.ASINH_NEAR, (clamp(source, 2.0),))
+  local_source = clamp(source, .3)
+  square = _ALUExpr(Ops.MUL, (local_source, local_source))
+  cube = _ALUExpr(Ops.MUL, (local_source, square))
+  local = _ALUExpr(Ops.ADD, (_sub(local_source, _ALUExpr(Ops.MUL, (cube, 1/6))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (cube, square)), 3/40))))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.3), positive(.3, source)))
+  near_inside = _ALUExpr(Ops.MUL, (positive(source, -2.0), positive(2.0, source)))
+  mid_inside = _ALUExpr(Ops.MUL, (positive(source, -8.0), positive(8.0, source)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, mid_inside))),
+    _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (mid, _sub(mid_inside, near_inside))), _ALUExpr(Ops.ADD,
+      (_ALUExpr(Ops.MUL, (near, _sub(near_inside, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))))))
+  infinite = _ALUExpr(Ops.MAX, (positive(source, 65472.0), positive(-65472.0, source)))
+  return _ALUExpr(Ops.FDIV, (selected, _sub(1.0, infinite)))
+
+def _acosh_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  bounded_low = _ALUExpr(Ops.MAX, (source, 1.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (bounded_low, -1.0)), -512.0)), -1.0))
+  distance = _sub(bounded, 1.0)
+  mid_distance = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (distance, -1.0)), -8.0)), -1.0))
+  edge_distance = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (distance, -1.0)), -.125)), -1.0))
+  broad, mid = _LUTExpr(RKLUTId.ACOSH, (bounded,)), _LUTExpr(RKLUTId.ACOSH_MID, (mid_distance,))
+  # Exact LUT input zero overflows on this steep edge payload; duplicate zero and address it one table step above zero.
+  edge_value = _LUTExpr(RKLUTId.ACOSH_EDGE, (_ALUExpr(Ops.ADD, (edge_distance, 32/65504)),))
+  edge = _ALUExpr(Ops.MUL, (edge_value, _MaskExpr((_sub(edge_distance, 0.0),))))
+  edge_inside, mid_inside = positive(1.125, bounded), positive(9.0, bounded)
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, mid_inside))),
+    _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (mid, _sub(mid_inside, edge_inside))), _ALUExpr(Ops.MUL, (edge, edge_inside))))))
+  finite = _ALUExpr(Ops.FDIV, (selected, _sub(1.0, positive(source, 65472.0))))
+  valid = positive(source, 1.0-2**-11)
+  return _ALUExpr(Ops.MUL, (finite, _ALUExpr(Ops.FDIV, (valid, valid))))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -577,6 +616,23 @@ def _canonical_atanh(u:UOp) -> UOp|None:
   den_source = next((_unwrap_same_cast(x) for x in negative.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
   return source if minus_one is not None and float(minus_one.arg) == -1 and den_source is not None and den_source.key == source.key else None
 
+def _canonical_inverse_hyperbolic(u:UOp, offset:float) -> UOp|None:
+  """Recognize log(x+sqrt(x*x+offset)) and recover x."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  factor = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+  logarithm = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.LOG2), None)
+  if factor is None or not math.isclose(float(factor.arg), math.log(2)) or logarithm is None: return None
+  argument = _unwrap_same_cast(logarithm.src[0])
+  if argument.op is not Ops.ADD: return None
+  root = next((_unwrap_same_cast(x) for x in argument.src if _unwrap_same_cast(x).op is Ops.SQRT), None)
+  source = next((_unwrap_same_cast(x) for x in argument.src if _unwrap_same_cast(x).op is not Ops.SQRT), None)
+  if root is None or source is None or (radicand:=_unwrap_same_cast(root.src[0])).op is not Ops.ADD: return None
+  constant = next((_unwrap_same_cast(x) for x in radicand.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+  square = next((_unwrap_same_cast(x) for x in radicand.src if _unwrap_same_cast(x).op is Ops.MUL), None)
+  return source if constant is not None and math.isclose(float(constant.arg), offset) and square is not None and \
+    all(_unwrap_same_cast(x).key == source.key for x in square.src) else None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -658,6 +714,14 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(atanh_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _atanh_expr(operand)
+  elif (asinh_input:=_canonical_inverse_hyperbolic(u, 1.0)) is not None:
+    operand = _parse_alu(asinh_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _asinh_expr(operand)
+  elif (acosh_input:=_canonical_inverse_hyperbolic(u, -1.0)) is not None:
+    operand = _parse_alu(acosh_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _acosh_expr(operand)
   elif (acos_input:=_canonical_acos(u)) is not None:
     operand = _parse_alu(acos_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -958,7 +1022,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL, RKLUTId.TANH, RKLUTId.TANH_MID, RKLUTId.TANH_LOCAL,
                       RKLUTId.SQRT, RKLUTId.RSQRT, RKLUTId.LOG2, RKLUTId.LOG2_LOCAL, RKLUTId.LOG10, RKLUTId.LOG10_LOCAL,
                       RKLUTId.ASIN, RKLUTId.ASIN_LOCAL, RKLUTId.ASIN_EDGE, RKLUTId.ACOS, RKLUTId.ATAN,
-                      RKLUTId.ATANH, RKLUTId.ATANH_EDGE):
+                      RKLUTId.ATANH, RKLUTId.ATANH_EDGE, RKLUTId.ASINH, RKLUTId.ASINH_MID,
+                      RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

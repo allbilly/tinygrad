@@ -52,6 +52,22 @@ for table in range(2):
   for i in range(SIZE):
     distance = abs((-(512-i)*ASIN_LOCAL_STEP) if table == 0 else i*ASIN_LOCAL_STEP)
     atanh_edge.append(max(-32768, min(32767, round((8 if distance == 0 else math.atanh(1-distance))*4096))))
+HYPER_BROAD_SCALE, HYPER_BROAD_STEP = 32.0, 1.0
+HYPER_MID_SCALE, HYPER_MID_STEP = 2048.0, 32.0/2048.0
+ACOSH_EDGE_SCALE, ACOSH_EDGE_STEP = 65504.0, 32.0/65504.0
+def signed_sample(table:int, index:int, step:float) -> float: return (-(512-index)*step) if table == 0 else index*step
+asinh_broad = [max(-32768, min(32767, round(math.asinh(signed_sample(table, i, HYPER_BROAD_STEP))*4096))) or 1
+                 for table in range(2) for i in range(SIZE)]
+asinh_mid = [max(-32768, min(32767, round(math.asinh(signed_sample(table, i, HYPER_MID_STEP))*8192))) or 1
+             for table in range(2) for i in range(SIZE)]
+asinh_near = [max(-32768, min(32767, round(math.asinh(signed_sample(table, i, STEP))*16384))) or 1
+              for table in range(2) for i in range(SIZE)]
+acosh_broad = [max(-32768, min(32767, round(math.acosh(max(1, signed_sample(table, i, HYPER_BROAD_STEP)))*4096))) or 1
+               for table in range(2) for i in range(SIZE)]
+acosh_mid = [max(-32768, min(32767, round(math.acosh(1+max(0, signed_sample(table, i, HYPER_MID_STEP)))*8192))) or 1
+             for table in range(2) for i in range(SIZE)]
+acosh_edge = [max(-32768, min(32767, round(math.acosh(1+max(0, signed_sample(table, i, ACOSH_EDGE_STEP)-ACOSH_EDGE_STEP))*32768))) or 1
+              for table in range(2) for i in range(SIZE)]
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -197,6 +213,30 @@ for bits in range(1 << 16):
     got = half(((1-(position-index))*atanh[base+index] + (position-index)*atanh[base+index+1]) / 8192)
   reference = math.atanh(x)
   atanh_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
+def interpolate(table:list[int], step:float, scale:float, x:float) -> float:
+  position, base = (x/step+512, 0) if x < 0 else (x/step, SIZE)
+  index = min(511, max(0, math.floor(position)))
+  return half(((1-(position-index))*table[base+index] + (position-index)*table[base+index+1]) / scale)
+asinh_errors, acosh_errors = [], []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x): continue
+  if -512 <= x <= 512:
+    if abs(x) < .3:
+      x2, x3 = half(x*x), half(x*half(x*x))
+      asinh_got = half(half(x-half(x3/6))+half(half(x3*x2)*(3/40)))
+    elif abs(x) < 2: asinh_got = interpolate(asinh_near, STEP, 16384, x)
+    elif abs(x) < 8: asinh_got = interpolate(asinh_mid, HYPER_MID_STEP, 8192, x)
+    else: asinh_got = interpolate(asinh_broad, HYPER_BROAD_STEP, 4096, x)
+    reference = math.asinh(x)
+    asinh_errors.append((abs(asinh_got-reference), abs(asinh_got-reference)/max(abs(reference), 2**-24)))
+  if 1 <= x <= 512:
+    distance = x-1
+    if distance < .125: acosh_got = 0.0 if distance == 0 else interpolate(acosh_edge, ACOSH_EDGE_STEP, 32768, distance+ACOSH_EDGE_STEP)
+    elif distance < 8: acosh_got = interpolate(acosh_mid, HYPER_MID_STEP, 8192, distance)
+    else: acosh_got = interpolate(acosh_broad, HYPER_BROAD_STEP, 4096, x)
+    reference = math.acosh(x)
+    acosh_errors.append((abs(acosh_got-reference), abs(acosh_got-reference)/max(abs(reference), 2**-24)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -248,7 +288,13 @@ class RKLUTId(IntEnum):
   ATAN = 22
   ATANH = 23
   ATANH_EDGE = 24
-RK_LUT_SCHEMA = 19
+  ASINH = 25
+  ASINH_MID = 26
+  ACOSH = 27
+  ACOSH_MID = 28
+  ACOSH_EDGE = 29
+  ASINH_NEAR = 30
+RK_LUT_SCHEMA = 25
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -367,6 +413,48 @@ RK_LUT_ATANH_EDGE_ENTRIES = {SIZE}
 RK_LUT_ATANH_EDGE_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_LOCAL_SCALE))[0]}
 RK_LUT_ATANH_EDGE_MINUS_EXP = 12
 RK_LUT_ATANH_EDGE = (\n{rows(atanh_edge)}\n)
+RK_LUT_ASINH_SHA256 = "{digest(asinh_broad)}"
+RK_LUT_ASINH_DOMAIN = (-512.0, 512.0)
+RK_LUT_ASINH_ENTRIES = {SIZE}
+RK_LUT_ASINH_BN_MUL = {struct.unpack('<H', struct.pack('<e', HYPER_BROAD_SCALE))[0]}
+RK_LUT_ASINH_MINUS_EXP = 12
+RK_LUT_ASINH_VERIFIED_INPUTS = {len(asinh_errors)}
+RK_LUT_ASINH_SIM_MAX_ABS_ERROR = {max(x[0] for x in asinh_errors)!r}
+RK_LUT_ASINH_SIM_MAX_REL_ERROR = {max(x[1] for x in asinh_errors)!r}
+RK_LUT_ASINH = (\n{rows(asinh_broad)}\n)
+RK_LUT_ASINH_MID_SHA256 = "{digest(asinh_mid)}"
+RK_LUT_ASINH_MID_DOMAIN = (-8.0, 8.0)
+RK_LUT_ASINH_MID_ENTRIES = {SIZE}
+RK_LUT_ASINH_MID_BN_MUL = {struct.unpack('<H', struct.pack('<e', HYPER_MID_SCALE))[0]}
+RK_LUT_ASINH_MID_MINUS_EXP = 13
+RK_LUT_ASINH_MID = (\n{rows(asinh_mid)}\n)
+RK_LUT_ASINH_NEAR_SHA256 = "{digest(asinh_near)}"
+RK_LUT_ASINH_NEAR_DOMAIN = (-2.0, 2.0)
+RK_LUT_ASINH_NEAR_ENTRIES = {SIZE}
+RK_LUT_ASINH_NEAR_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_ASINH_NEAR_MINUS_EXP = 14
+RK_LUT_ASINH_NEAR = (\n{rows(asinh_near)}\n)
+RK_LUT_ACOSH_SHA256 = "{digest(acosh_broad)}"
+RK_LUT_ACOSH_DOMAIN = (1.0, 512.0)
+RK_LUT_ACOSH_ENTRIES = {SIZE}
+RK_LUT_ACOSH_BN_MUL = {struct.unpack('<H', struct.pack('<e', HYPER_BROAD_SCALE))[0]}
+RK_LUT_ACOSH_MINUS_EXP = 12
+RK_LUT_ACOSH_VERIFIED_INPUTS = {len(acosh_errors)}
+RK_LUT_ACOSH_SIM_MAX_ABS_ERROR = {max(x[0] for x in acosh_errors)!r}
+RK_LUT_ACOSH_SIM_MAX_REL_ERROR = {max(x[1] for x in acosh_errors)!r}
+RK_LUT_ACOSH = (\n{rows(acosh_broad)}\n)
+RK_LUT_ACOSH_MID_SHA256 = "{digest(acosh_mid)}"
+RK_LUT_ACOSH_MID_DOMAIN = (1.0, 9.0)
+RK_LUT_ACOSH_MID_ENTRIES = {SIZE}
+RK_LUT_ACOSH_MID_BN_MUL = {struct.unpack('<H', struct.pack('<e', HYPER_MID_SCALE))[0]}
+RK_LUT_ACOSH_MID_MINUS_EXP = 13
+RK_LUT_ACOSH_MID = (\n{rows(acosh_mid)}\n)
+RK_LUT_ACOSH_EDGE_SHA256 = "{digest(acosh_edge)}"
+RK_LUT_ACOSH_EDGE_DOMAIN = (1.0, 1.125)
+RK_LUT_ACOSH_EDGE_ENTRIES = {SIZE}
+RK_LUT_ACOSH_EDGE_BN_MUL = {struct.unpack('<H', struct.pack('<e', ACOSH_EDGE_SCALE))[0]}
+RK_LUT_ACOSH_EDGE_MINUS_EXP = 15
+RK_LUT_ACOSH_EDGE = (\n{rows(acosh_edge)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

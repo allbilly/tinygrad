@@ -174,3 +174,19 @@ the local interval, and a Q12 edge table is indexed by `1-abs(x)` to retain
 resolution near the singularities. Generic masks turn exact `-1` and `1` into
 signed infinities and values outside the domain into NaN. The complete strict
 forward TestOps method and a dense RK3588 sweep pass without host fallback.
+
+## Inverse hyperbolic sine and cosine
+
+ASINH and ACOSH are recognized from tinygrad's
+`log(x+sqrt(x*x+offset))` decompositions before their generic SQRT and LOG
+recipes exceed the 64-stage image limit. ASINH uses a Q12 table over
+`[-512, 512]`, a Q13 table over `[-8, 8]`, a Q14 near table over `[-2, 2]`,
+and an odd fifth-order series near zero. ACOSH uses a Q12 table over
+`[1, 512]`, a Q13 table indexed by `x-1`
+through `9`, and a Q16 edge table over `[1, 1.125]` to resolve its infinite
+slope at one. Generic masks select ranges and produce NaN below the ACOSH
+domain; the table identities remain data consumed by `RKLUTStage`.
+
+The offline simulator exhaustively checks every finite FP16 encoding in each
+declared range and records maximum absolute and relative error. Hardware tests
+cover dense local/mid ranges, magnitude 300 tails, and invalid ACOSH inputs.

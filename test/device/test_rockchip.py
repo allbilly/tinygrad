@@ -108,6 +108,16 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(divide="ignore", invalid="ignore"): expected = np.arctanh(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").atanh().realize().numpy(), expected)
 
+  def test_generated_inverse_hyperbolic_assets(self):
+    asinh_data = np.concatenate((np.linspace(-8, 8, 4097), [-300, 300])).astype(np.float16)
+    np.testing.assert_allclose(Tensor(asinh_data, device="ROCKCHIP").asinh().realize().numpy(),
+                               np.arcsinh(asinh_data.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    acosh_data = np.concatenate((np.linspace(1, 9, 4097), [300])).astype(np.float16)
+    np.testing.assert_allclose(Tensor(acosh_data, device="ROCKCHIP").acosh().realize().numpy(),
+                               np.arccosh(acosh_data.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    invalid = np.array([-300, -1, 0, .5], dtype=np.float16)
+    self.assertTrue(np.isnan(Tensor(invalid, device="ROCKCHIP").acosh().realize().numpy()).all())
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)
