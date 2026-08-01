@@ -138,6 +138,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.ROUNDOFF for stage in plan.stages), 1)
     self.assertFalse(contains_uop(plan))
 
+  def test_trunc_floor_ceil_compose_roundoff_lut(self):
+    for function in (lambda x:x.trunc(), lambda x:x.floor(), lambda x:x.ceil()):
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.ROUNDOFF for stage in plan.stages), 1)
+      self.assertFalse(contains_uop(plan))
+
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     plan = lower_contract(sink(a@packed_b.T))

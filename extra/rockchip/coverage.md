@@ -63,6 +63,7 @@ Pytest reports 434 failures including the 126 failing subtests. Runtime was
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | No |
 | Generated algorithm-23 round-to-nearest-even LUT | `test_round` | No |
+| Integral rounding composed from the roundoff LUT | `test_trunc`, `test_floor`, `test_ceil` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

@@ -218,6 +218,13 @@ def _round_expr(source:_Expr|RKArg|float) -> _Expr:
   valid = _sub(1.0, _ALUExpr(Ops.MUL, (positive_mask, negative_mask)))
   return _ALUExpr(Ops.MUL, (selected, _ALUExpr(Ops.FDIV, (valid, valid))))
 
+def _trunc_expr(source:_Expr|RKArg|float) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  rounded = _round_expr(source)
+  decrement = _ALUExpr(Ops.MUL, (positive(rounded, source), positive(source, 0.0)))
+  increment = _ALUExpr(Ops.MUL, (positive(source, rounded), positive(0.0, source)))
+  return _ALUExpr(Ops.ADD, (_sub(rounded, decrement), increment))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -286,6 +293,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     denominator = _parse_alu(u.src[0], output_index, memo)
     if denominator is None: return None
     ret = _ALUExpr(Ops.FDIV, (1.0, denominator))
+  elif u.op is Ops.TRUNC:
+    operand = _parse_alu(u.src[0], output_index, memo)
+    if operand is None: return None
+    ret = _trunc_expr(operand)
   elif u.op is Ops.EXP2:
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
