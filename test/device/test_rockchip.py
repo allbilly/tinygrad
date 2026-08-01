@@ -228,4 +228,9 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(divide="ignore", invalid="ignore"): expected_special = np.arctanh(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").atanh().numpy(), expected_special)
 
+  def test_ranged_asinh_luts(self):
+    data = np.linspace(-32, 32, 4097, dtype=np.float16)
+    expected = np.arcsinh(data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").asinh().numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

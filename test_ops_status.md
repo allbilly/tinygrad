@@ -78,20 +78,20 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the bounded ATANH milestone:
+Latest complete uncached census after the ranged ASINH milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 141 |
-| FAIL | 271 |
+| PASS | 142 |
+| FAIL | 270 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `397 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 425.60 seconds. This
+Pytest reports `396 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 441.09 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
-natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, ASIN, ACOS, ATAN, SIN, and ATANH.
+natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, ASIN, ACOS, ATAN, SIN, ATANH, and ASINH.
 
 ## Focused verified matrix
 
@@ -124,10 +124,11 @@ natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
 | Reciprocal-folded ATAN | typed 42-stage broad/detail plan | official method and strict 4,097-point `[-16,16]` sweep | PASS |
 | FP16 SIN/COS | typed 56/59-stage broad/local plans | official FP16 SIN and seeded FP16 hardware SIN/COS contract | PASS; FP32 COS rejects |
 | Bounded ATANH | typed 47-stage broad/detail plan | official method, strict 4,097-point domain sweep, endpoint infinities, invalid inputs, and NaN | PASS |
+| Ranged ASINH | typed 46-stage core/range plan | official method and strict 4,097-point `[-32,32]` sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 52 | 33 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 53 | 34 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

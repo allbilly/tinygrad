@@ -341,6 +341,32 @@ def _atanh_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   valid = _DPUExpr(RKDPUOp.SUB, (1.0, invalid))
   return _DPUExpr(RKDPUOp.MUL, (signed, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
 
+def _asinh_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  """Two physical tables cover ASINH center, broad, middle, and large ranges."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  negative_source = _DPUExpr(RKDPUOp.MUL, (source, -1.0))
+  magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative_source))
+  negative, small_outside, huge = positive(0.0, source), positive(magnitude, 2.0), positive(magnitude, 16.0)
+  nonnegative, small = _DPUExpr(RKDPUOp.SUB, (1.0, negative)), _DPUExpr(RKDPUOp.SUB, (1.0, small_outside))
+  middle = _DPUExpr(RKDPUOp.SUB, (small_outside, huge))
+  near_inside, local_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, .04))), \
+    _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, .25)))
+  local_mask, broad_region = _DPUExpr(RKDPUOp.SUB, (local_inside, near_inside)), _DPUExpr(RKDPUOp.SUB, (small, local_inside))
+  core_input = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (magnitude, -8.0)), local_inside)), _DPUExpr(RKDPUOp.MUL, (magnitude, broad_region))))
+  range_input = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB, (magnitude, 2.0)), -1.0)), middle)),
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (magnitude, 1/19)), huge))))
+  core, ranged = _DPUExpr(rklut.RKLUT.ASINH_CORE, (core_input,)), _DPUExpr(rklut.RKLUT.ASINH_RANGE, (range_input,))
+  result = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (core, .25)), local_mask)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (core, 2.0)), broad_region)))), _DPUExpr(RKDPUOp.ADD,
+    (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (ranged, 4.0)), middle)),
+     _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (ranged, 8.0)), huge)))),
+     _DPUExpr(RKDPUOp.MUL, (magnitude, near_inside))))))
+  return _DPUExpr(RKDPUOp.SUB, (_DPUExpr(RKDPUOp.MUL, (result, nonnegative)), _DPUExpr(RKDPUOp.MUL, (result, negative))))
+
 def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -821,6 +847,15 @@ def _canonical_atanh(u:UOp) -> UOp|None:
     sum(x.op in (Ops.FDIV, Ops.RECIPROCAL) for x in nodes) == 1 and \
     sum(x.op is Ops.ADD for x in nodes) == 2 and any(x == -1.0 for x in constants) else None
 
+def _canonical_asinh(u:UOp) -> UOp|None:
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST]
+  allowed = {Ops.ADD, Ops.MUL, Ops.LOG2, Ops.SQRT, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  return indexes[0] if u.op is Ops.MUL and len(indexes) == 1 and indexes[0].dtype is dtypes.half and \
+    all(x.op in allowed for x in nodes) and sum(x.op is Ops.LOG2 for x in nodes) == 1 and sum(x.op is Ops.SQRT for x in nodes) == 1 and \
+    any(x == 1.0 for x in constants) and not any(x == -1.0 for x in constants) else None
+
 def _canonical_elu(u:UOp) -> tuple[UOp,float,float]|None:
   u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
   indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
@@ -990,6 +1025,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(atanh, output_index, memo)
     if source is None: return None
     ret = _atanh_expr(source)
+  elif (asinh:=_canonical_asinh(u)) is not None:
+    source = _parse_dpu_expr(asinh, output_index, memo)
+    if source is None: return None
+    ret = _asinh_expr(source)
   elif (asin:=_canonical_asin(u)) is not None:
     source = _parse_dpu_expr(asin[0], output_index, memo)
     if source is None: return None
@@ -1364,7 +1403,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (rklut.RKLUT.ACOS_ENDPOINT,"ACOS_ENDPOINT"),(rklut.RKLUT.ACOS_FINE_ENDPOINT,"ACOS_FINE_ENDPOINT"),
                        (rklut.RKLUT.ATAN,"ATAN"),(rklut.RKLUT.ATAN_DETAIL,"ATAN_DETAIL"),(rklut.RKLUT.SIN,"SIN"),
                        (rklut.RKLUT.SIN_LOCAL,"SIN_LOCAL"),(rklut.RKLUT.COS,"COS"),(rklut.RKLUT.COS_LOCAL,"COS_LOCAL"),
-                       (rklut.RKLUT.ATANH,"ATANH"),(rklut.RKLUT.ATANH_DETAIL,"ATANH_DETAIL"))}}[plan.lut]
+                       (rklut.RKLUT.ATANH,"ATANH"),(rklut.RKLUT.ATANH_DETAIL,"ATANH_DETAIL"),
+                       (rklut.RKLUT.ASINH_CORE,"ASINH_CORE"),(rklut.RKLUT.ASINH_RANGE,"ASINH_RANGE"))}}[plan.lut]
   post_scale = {rklut.RKLUT.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 rklut.RKLUT.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.lut, 1.0)
   cmds = []

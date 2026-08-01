@@ -26,7 +26,7 @@ longer expands the hardware-operation enum or the emitter dispatch surface.
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 24 |
+| Schema | 25 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -148,6 +148,8 @@ ATAN uses reciprocal folding before two regional assets: `t=|x|` for `|x|<=1`, o
 SIN/COS use four assets: `SIN = 58` (`e5606a81bda56919a107a8a984f26c96aa0ea5de2f3cdcb9d0138f79ae45aded`), `SIN_LOCAL = 59` (`8f6241fde668f1730cfbbcf6e6509bf025d21f516ab31912a242f364e460b793`), `COS = 60` (`18291b5b8a969a5008744a1016cb1972cf9b1ff8ce82a6b4b27a1aefe1ed4bd9`), and `COS_LOCAL = 61` (`c65278716a32ea5ac9b5cf01c1fc55070713f0c816cf3674bc13f42e3162d88a`). Device arithmetic performs split `2*pi` subtraction after native roundoff. COS also preserves `pi/2` as `1.5703125 + residual`; one FP16 constant lost the residual and failed around cosine zero. A final `x*0` term propagates NaN for infinities without a five-stage mask epilogue. The plans are 56/59 stages and seven scratch buffers. SIN passes the official method; COS is proven only for explicit FP16 because the census plugin changes that method to FP32. A uniform 4,097-point sweep exposed three SIN values near `-0.2` just beyond relative tolerance and wider-range reduction error; the committed contract therefore does not claim exhaustive/wide periodic accuracy, and no tolerance was relaxed.
 
 ATANH uses `ATANH = 62`, storing `atanh(x)/4` over the bounded positive domain (SHA256 `d39dbab63125159da8a8ac83ad3f09286196635064805dc19adee1480726ad75`), and `ATANH_DETAIL = 63`, whose negative bank stores amplified center values while its positive bank stores `atanh(1-d)/8` addressed by endpoint distance (SHA256 `8d84722fe68e3cf37eb640e537b1d5e1f320ce3fe961f0f5dd1a77eb13ad4278`). The shared LE zero knot is corrected offline to the center-table value. Device masks select identity near zero, broad interpolation, and endpoint detail; division creates signed infinity at `±1` and NaN outside `[-1,1]`. The 47-stage, eight-scratch program passes the official method and strict 4,097-point domain/special-value hardware sweep. This is independent of the rejected scaled-LOG experiment.
+
+ASINH uses `ASINH_CORE = 64` (SHA256 `b3c6e1ac213e3a2d2a761bdfef8307deaf0f22ffdee8750b6a53988d6853ff99`) and `ASINH_RANGE = 65` (SHA256 `6bbc9710217283be5d345379952b70dd5043bdf1b3dc966c5f1ac729f5781fbb`). The core table's negative bank amplifies the center while its positive bank covers magnitudes through two. The range table's negative bank covers `[2,18]`; its positive bank receives `x/19` for large inputs. Device masks reconstruct four regions and sign. The range table's shared LE zero knot is corrected offline to the middle-region value. The 46-stage, eight-scratch program passes the official method and strict 4,097-point `[-32,32]` hardware sweep. ACOSH remains separate because its `x≈1` endpoint requires distinct residual/cancellation handling.
 
 ## Current command contract
 
