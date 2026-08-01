@@ -78,20 +78,20 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the ranged ASINH milestone:
+Latest complete uncached census after the endpoint-aware ACOSH milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 142 |
-| FAIL | 270 |
+| PASS | 143 |
+| FAIL | 269 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `396 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 441.09 seconds. This
+Pytest reports `395 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 455.13 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
-natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, ASIN, ACOS, ATAN, SIN, ATANH, and ASINH.
+natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, and ACOSH.
 
 ## Focused verified matrix
 
@@ -125,10 +125,11 @@ natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
 | FP16 SIN/COS | typed 56/59-stage broad/local plans | official FP16 SIN and seeded FP16 hardware SIN/COS contract | PASS; FP32 COS rejects |
 | Bounded ATANH | typed 47-stage broad/detail plan | official method, strict 4,097-point domain sweep, endpoint infinities, invalid inputs, and NaN | PASS |
 | Ranged ASINH | typed 46-stage core/range plan | official method and strict 4,097-point `[-32,32]` sweep | PASS |
+| Endpoint-aware ACOSH | typed 43-stage core/range plan | official method, strict 4,097-point `[1,32]` sweep, exact endpoint, invalid inputs, and NaN | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 53 | 34 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 55 | 35 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
@@ -151,6 +152,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - ASIN uses broad and detail generated assets, with the second table sharing negative coordinates for center precision and positive endpoint distance for the singular region;
 - ACOS uses an asymmetric signed broad table plus coarse and fine endpoint-distance tables; direct `pi/2-ASIN` composition is not part of the contract;
 - ATAN folds `|x|>1` through reciprocal on-device, then uses broad/detail tables and reconstructs the sign with FP16 masks;
+- ACOSH uses `x-1` endpoint coordinates, separate core/range tables, and device masks to preserve exact `acosh(1)=0` and return NaN below one;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.

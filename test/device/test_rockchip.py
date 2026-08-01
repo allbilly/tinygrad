@@ -233,4 +233,12 @@ class TestRockchip(unittest.TestCase):
     expected = np.arcsinh(data.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").asinh().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_endpoint_acosh_luts(self):
+    data = np.linspace(1, 32, 4097, dtype=np.float16)
+    expected = np.arccosh(data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").acosh().numpy(), expected, rtol=1e-3, atol=1e-6)
+    special = np.array([-1, 0, 1, np.nan], dtype=np.float16)
+    with np.errstate(invalid="ignore"): expected_special = np.arccosh(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").acosh().numpy(), expected_special)
+
 if __name__ == "__main__": unittest.main()

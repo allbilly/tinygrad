@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through ranged two-level ASINH, the 2026-08-01 census is
-**142 passed, 270 failed, and 13 skipped**. Pytest prints `396 failed` because
+milestones through endpoint-aware two-table ACOSH, the 2026-08-01 census is
+**143 passed, 269 failed, and 13 skipped**. Pytest prints `395 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 48-host/28-NPU
+while recovering the remaining native forward coverage. Focused 55-host/35-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -105,7 +105,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `26951cf4e` | Reciprocal-folded two-level ATAN LUT | `0205-rockchip-add-reciprocal-folded-ATAN-LUT.patch` |
 | `b5a71b29f` | FP16 SIN/COS regional LUTs with split periodic reduction | `0206-rockchip-add-FP16-SIN-COS-LUTs.patch` |
 | `76e4131f1` | Bounded broad/detail ATANH with device special-value handling | `0207-rockchip-add-bounded-ATANH-LUTs.patch` |
-| current milestone | Ranged two-table FP16 ASINH | `0208-rockchip-add-ranged-ASINH-LUTs.patch` |
+| `3b51f1b65` | Ranged two-table FP16 ASINH | `0208-rockchip-add-ranged-ASINH-LUTs.patch` |
+| current milestone | Endpoint-aware two-table FP16 ACOSH | `0209-rockchip-add-endpoint-ACOSH-LUTs.patch` |
 
 ## Architecture now implemented
 
@@ -123,7 +124,7 @@ post-early_simplify UOps
 Important invariants:
 
 - `RKDPUProgram`, `RKContract`, `RKPool`, `RKStage`, and `RKImage` retain no `UOp`.
-- `RKDPUOp` contains only eight hardware stage operations; the 50 generated table identities live separately in `RKLUT` and are data on one `LUT` stage.
+- `RKDPUOp` contains only eight hardware stage operations; the 67 generated table identities live separately in `RKLUT` and are data on one `LUT` stage.
 - RKImage contains only target/version data, command stages, dependencies, relocations, scratch declarations, and constants.
 - Runtime NumPy is restricted to declared ABI element-format conversion and never executes tensor semantics on the CPU.
 - Unsupported dtype, layout, or graph combinations reject before device submission.
@@ -166,6 +167,7 @@ Implemented forward-only subset:
 - FP16 SIN/COS using split periodic reduction, broad/local LUTs, and device-generated NaN for non-finite inputs; plugin-forced FP32 COS remains rejected;
 - ATANH using distinct broad/detail assets, endpoint-distance addressing, device infinity at `±1`, and NaN outside the domain;
 - ASINH using two physical tables shared across center, broad, middle, and large magnitude regions with device sign reconstruction;
+- ACOSH using endpoint-coordinate core/range tables, device regional composition, exact one handling, and NaN synthesis below the domain;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -177,22 +179,22 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1514
+tinygrad/renderer/rockchip.py  1551
 tinygrad/runtime/ops_rockchip.py  99
-handwritten Rockchip total  1613
+handwritten Rockchip total  1650
 ```
 
-This meets the requested `<5000` research-backend goal with 3,387 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,350 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
 an activation catalog. Approximate current physical source distribution is:
 
-- target types and DPU expression recipes: renderer lines 18–443;
-- RKImage validation, codec, and relocation: renderer lines 444–523;
-- UOp canonicalization, affine analysis, and typed lowering: renderer lines 524–1115;
-- register emission: renderer lines 1116–1372;
-- renderer integration: renderer lines 1373 onward;
+- target types and DPU expression recipes: renderer lines 18–484;
+- RKImage validation, codec, and relocation: renderer lines 485–564;
+- UOp canonicalization, affine analysis, and typed lowering: renderer lines 565–1156;
+- register emission: renderer lines 1157–1413;
+- renderer integration: renderer lines 1414 onward;
 - allocation/submission/runtime ABI experiment: 99 `sz.py` lines.
 
 This distribution is acceptable only for the frozen research/coverage branch.
@@ -200,7 +202,7 @@ The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,589 `sz.py` lines, a `+1,621` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,589 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 26,626 `sz.py` lines, a `+1,658` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,626 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
