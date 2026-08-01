@@ -314,7 +314,7 @@ def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
 
-def _canonical_sigmoid(u:UOp) -> UOp|None:
+def _canonical_sigmoid(u:UOp) -> tuple[UOp,float]|None:
   """Recognize 1/(1+exp2(-log2(e)*x))."""
   u = _unwrap_same_cast(u)
   if u.op is not Ops.RECIPROCAL or (denominator:=_unwrap_same_cast(u.src[0])).op is not Ops.ADD: return None
@@ -323,7 +323,7 @@ def _canonical_sigmoid(u:UOp) -> UOp|None:
   if one is None or float(one.arg) != 1 or exponential is None or (scaled:=_unwrap_same_cast(exponential.src[0])).op is not Ops.MUL: return None
   source = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.INDEX), None)
   factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None)
-  return source if source is not None and factor is not None and math.isclose(factor, -math.log2(math.e)) else None
+  return (source, factor/-math.log2(math.e)) if source is not None and factor is not None and math.isfinite(factor) else None
 
 def _canonical_abs(u:UOp) -> UOp|None:
   u = _unwrap_same_cast(u)
@@ -404,9 +404,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
-  elif (sigmoid_input:=_canonical_sigmoid(u)) is not None:
-    operand = _parse_alu(sigmoid_input, output_index, memo)
+  elif (sigmoid:=_canonical_sigmoid(u)) is not None:
+    operand = _parse_alu(sigmoid[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
+    if not math.isclose(sigmoid[1], 1.0): operand = _ALUExpr(Ops.MUL, (operand, sigmoid[1]))
     ret = _sigmoid_expr(operand)
   elif (rounded:=_canonical_round(u)) is not None:
     source = _parse_alu(rounded, output_index, memo)

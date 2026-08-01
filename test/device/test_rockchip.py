@@ -83,6 +83,14 @@ class TestRockchip(unittest.TestCase):
     special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").sigmoid().realize().numpy(), np.array([1, 0, np.nan], dtype=np.float16))
 
+  def test_scaled_sigmoid_composition(self):
+    data = np.concatenate((np.linspace(-2,2,4097), np.linspace(-400,-300,1001), np.linspace(300,400,1001))).astype(np.float16)
+    with np.errstate(over="ignore"): expected = (data.astype(np.float32)/(1+np.exp(-1.702*data.astype(np.float32)))).astype(np.float16)
+    actual = Tensor(data, device="ROCKCHIP").quick_gelu().realize().numpy()
+    error = np.abs(actual.astype(np.float32)-expected.astype(np.float32))
+    self.assertLessEqual(float(error.max()), 1e-3)
+    self.assertLessEqual(float((error[np.abs(expected)>.05]/np.abs(expected[np.abs(expected)>.05])).max()), 3.1e-3)
+
   def test_generated_refined_sqrt_lut(self):
     data = np.linspace(0, 16, 2049, dtype=np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").sqrt().realize().numpy(),

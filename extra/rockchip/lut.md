@@ -75,6 +75,14 @@ less informative in the negative tail where the reference approaches zero,
 so conformance uses the normal-domain strict relative tolerance plus absolute,
 boundary, and special-value checks.
 
+Early simplification may fold a positive sigmoid input multiplier into the
+EXP2 coefficient. The lowerer recovers that scale and executes it as generic
+`Ops.MUL` before the same sigmoid LUT stages. A hardware sweep of the scaled
+composition records at most `1e-3` absolute error and `3.1e-3` relative error
+away from zero. Saturated QuickGELU tails meet the strict TestOps comparison;
+the normal-range QuickGELU case remains a numerical mismatch and is not
+claimed as passing.
+
 ## Refined SQRT
 
 `SQRT` provides an initial estimate over `[0, 4]` in Q14. Three Newton steps,

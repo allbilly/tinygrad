@@ -115,6 +115,7 @@ the FP32-only `test_log` remains an intentional unsupported-dtype rejection.
 | Range-scaled generated RSQRT seed with generic Newton correction | `test_rsqrt` | Yes (`9db9a4d33`) |
 | Range-normalized generated logarithm tables | `test_log2`, `test_log10` | Yes (`9db9a4d33`) |
 | Stable generic clip for ReLU-difference saturation | `test_hardsigmoid_extreme` | No |
+| Scaled-input reuse of the generated sigmoid LUT | `test_quick_gelu_extreme` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

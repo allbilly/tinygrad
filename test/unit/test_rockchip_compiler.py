@@ -160,7 +160,8 @@ class TestDPUCompiler(unittest.TestCase):
       payload = struct.pack(f"<{len(table)}h", *table)
       self.assertEqual(hashlib.sha256(payload).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
     self.assertLess(rklut.RK_LUT_SIGMOID_SIM_MAX_ABS_ERROR, 3e-4)
-    for expression in (Tensor.empty(128, dtype=dtypes.half).sigmoid(), Tensor.empty(128, dtype=dtypes.half).silu()):
+    for expression in (Tensor.empty(128, dtype=dtypes.half).sigmoid(), Tensor.empty(128, dtype=dtypes.half).silu(),
+                       Tensor.empty(128, dtype=dtypes.half).quick_gelu()):
       plan = lower_dpu(sink(expression))
       self.assertIsInstance(plan, RKDPUProgram)
       self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
