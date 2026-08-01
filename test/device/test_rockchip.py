@@ -201,4 +201,12 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(invalid="ignore"): expected_special = np.arcsin(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").asin().numpy(), expected_special)
 
+  def test_regional_acos_luts(self):
+    data = np.linspace(-1, 1, 4097, dtype=np.float16)
+    expected = np.arccos(data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").acos().numpy(), expected, rtol=1e-3, atol=1e-6)
+    special = np.array([-2, -1, -0., 0., 1, 2, np.nan], dtype=np.float16)
+    with np.errstate(invalid="ignore"): expected_special = np.arccos(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").acos().numpy(), expected_special)
+
 if __name__ == "__main__": unittest.main()

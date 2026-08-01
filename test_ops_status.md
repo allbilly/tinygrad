@@ -78,20 +78,20 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the native two-level ASIN milestone:
+Latest complete uncached census after the regional ACOS milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 137 |
-| FAIL | 275 |
+| PASS | 138 |
+| FAIL | 274 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `401 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 368.22 seconds. This
+Pytest reports `400 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 378.80 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
-natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, and ASIN.
+natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, ASIN, and ACOS.
 
 ## Focused verified matrix
 
@@ -120,10 +120,11 @@ natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
 | Native round-to-nearest-even | typed 20-stage algorithm-23 plan | official method, exact dense sweep, ties, signed zero, infinity, and NaN | PASS |
 | Integral rounding composition | one shared roundoff asset plus masks per plan | all three official trunc/floor/ceil methods and exact dense sweeps | PASS |
 | Two-level ASIN | typed 43-stage broad/detail plan | official method, strict 4,097-point domain sweep, invalid inputs, and NaN | PASS |
+| Regional ACOS | typed 47-stage asymmetric broad/coarse/fine endpoint plan | official method, strict 4,097-point sweep, invalid inputs, and NaN | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 48 | 29 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 49 | 30 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
@@ -144,6 +145,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - round-to-nearest-even uses the native algorithm-23 LUT and device-side sign/special-value masks;
 - trunc/floor/ceil reuse round-to-nearest-even and correct direction with primitive device masks;
 - ASIN uses broad and detail generated assets, with the second table sharing negative coordinates for center precision and positive endpoint distance for the singular region;
+- ACOS uses an asymmetric signed broad table plus coarse and fine endpoint-distance tables; direct `pi/2-ASIN` composition is not part of the contract;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.

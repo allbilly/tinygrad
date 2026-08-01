@@ -26,7 +26,7 @@ longer expands the hardware-operation enum or the emitter dispatch surface.
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 20 |
+| Schema | 21 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -133,7 +133,15 @@ ASIN uses two ordinary NPU LUT tasks selected and composed entirely with typed D
 - masks select identity inside `|x|<=0.04`, the detail center through `0.125`, broad interpolation through `0.875`, then endpoint-distance detail through one;
 - sign and invalid-domain NaN are reconstructed on the NPU; no host semantic path is used.
 
-The complete expression is 43 stages with eight scratch buffers and one instance of each asset. It passes the official ASIN method and strict FP16 comparison over a 4,097-point `[-1,1]` sweep plus `[-2,-1,-0,+0,+1,+2,nan]`. ACOS deliberately remains separate because subtraction from π/2 creates a different cancellation-sensitive endpoint contract.
+The complete expression is 43 stages with eight scratch buffers and one instance of each asset. It passes the official ASIN method and strict FP16 comparison over a 4,097-point `[-1,1]` sweep plus `[-2,-1,-0,+0,+1,+2,nan]`.
+
+ACOS cannot safely reuse ASIN through subtraction from π/2. That first probe compiled in 44 stages but missed 156/2,925 official outputs, with max absolute error `0.000977` and relative error `0.00812`. The committed design therefore uses three ordinary regional LUT assets:
+
+- `ACOS = 53` stores `acos(x)/4` in the negative bank and `acos(x)/2` in the positive bank; SHA256 `6f23bcf3d689aa5641e4051aac740be8024c13deb76db202711a9528f48ec448`;
+- `ACOS_ENDPOINT = 54` stores direct `acos(1-d)` for endpoint distance `d`; SHA256 `da0c3dc5469308b4d1ee30b237cc22c31dc92a311c558b55e920377613014bfc`;
+- `ACOS_FINE_ENDPOINT = 55` stores `8*acos(1-d)` addressed with `64*d`, then the NPU decodes by `1/8`; SHA256 `1a42b99e01379b7c4c564298e940f3358ace5efeaeca2b7e1a4517f1982a5d13`.
+
+The coarse/fine split is at `d=0.003`, while the endpoint region begins at `|x|>0.85`. One offline correction changes the negative bank's shared zero knot from positive-bank half scaling to negative-bank quarter scaling; without it, exactly three dense-sweep values immediately below zero were corrupted by the table discontinuity. The 47-stage, nine-scratch plan passes both the official method and strict 4,097-point domain/special-value hardware test without tolerance changes or host evaluation.
 
 ## Current command contract
 

@@ -234,6 +234,34 @@ def _asin_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   valid = _DPUExpr(RKDPUOp.SUB, (1.0, invalid))
   return _DPUExpr(RKDPUOp.MUL, (signed, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
 
+def _acos_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  """Asymmetric broad ACOS plus coarse/fine endpoint-distance LUTs."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  negative_source = _DPUExpr(RKDPUOp.MUL, (source, -1.0))
+  magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative_source))
+  bounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (magnitude, -1.0)), -1.0)), -1.0))
+  negative, invalid = positive(0.0, source), positive(magnitude, 1.0)
+  positive_sign, endpoint = _DPUExpr(RKDPUOp.SUB, (1.0, negative)), positive(bounded, .85)
+  distance = _DPUExpr(RKDPUOp.SUB, (1.0, bounded))
+  broad = _DPUExpr(rklut.RKLUT.ACOS, (_DPUExpr(RKDPUOp.SUB, (bounded,
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (bounded, negative)), 2.0)))),))
+  coarse, fine = _DPUExpr(rklut.RKLUT.ACOS_ENDPOINT, (distance,)), _DPUExpr(rklut.RKLUT.ACOS_FINE_ENDPOINT,
+    (_DPUExpr(RKDPUOp.MUL, (distance, 64.0)),))
+  coarse_mask = positive(distance, .003)
+  endpoint_value = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (coarse, coarse_mask)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (fine, .125)), _DPUExpr(RKDPUOp.SUB, (1.0, coarse_mask))))))
+  broad_decoded = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (broad, 2.0)), positive_sign)),
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (broad, 4.0)), negative))))
+  exact_one = positive(bounded, .99975)
+  endpoint_value = _DPUExpr(RKDPUOp.MUL, (endpoint_value, _DPUExpr(RKDPUOp.SUB, (1.0, exact_one))))
+  endpoint_decoded = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (endpoint_value, positive_sign)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.SUB, (math.pi, endpoint_value)), negative))))
+  selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad_decoded, _DPUExpr(RKDPUOp.SUB, (1.0, endpoint)))),
+    _DPUExpr(RKDPUOp.MUL, (endpoint_decoded, endpoint))))
+  valid = _DPUExpr(RKDPUOp.SUB, (1.0, invalid))
+  return _DPUExpr(RKDPUOp.MUL, (selected, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
+
 def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -657,14 +685,26 @@ def _canonical_erf(u:UOp) -> UOp|None:
   return indexes[0] if len(indexes) == 1 and indexes[0].dtype is dtypes.half and sum(x.op is Ops.EXP2 for x in nodes) == 1 and \
     sum(x.op is Ops.WHERE for x in nodes) == 2 and any(math.isclose(x, 0.3275911) for x in constants) else None
 
-def _canonical_asin(u:UOp) -> UOp|None:
-  """Recognize tinygrad's asin polynomial; ACOS deliberately remains separate."""
-  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+def _canonical_asin(u:UOp) -> tuple[UOp,bool]|None:
+  """Recognize tinygrad's asin polynomial, optionally wrapped as pi/2-asin(x)."""
+  u = _unwrap_same_cast(u)
+  indexes = list(dict.fromkeys(x for x in u.toposort() if x.op is Ops.INDEX))
+  if len(indexes) != 1 or indexes[0].dtype is not dtypes.half: return None
+  core, is_acos = u, False
+  if u.op is Ops.ADD:
+    pi_half = next((x for x in u.src if x.op is Ops.CONST and math.isclose(float(x.arg), math.pi/2)), None)
+    negated = next((_unwrap_same_cast(x) for x in u.src if x is not pi_half), None)
+    if pi_half is None or negated is None or negated.op is not Ops.MUL: return None
+    minus_one = next((x for x in negated.src if x.op is Ops.CONST and float(x.arg) == -1.0), None)
+    if minus_one is None: return None
+    core = next((_unwrap_same_cast(x) for x in negated.src if x is not minus_one), negated)
+    is_acos = True
+  nodes = core.toposort()
   indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
   coefficients = (-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810,
                   -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050)
   allowed = {Ops.ADD, Ops.MUL, Ops.SQRT, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
-  return indexes[0] if u.op is Ops.MUL and len(indexes) == 1 and indexes[0].dtype is dtypes.half and \
+  return (indexes[0], is_acos) if core.op is Ops.MUL and len(indexes) == 1 and indexes[0].dtype is dtypes.half and \
     all(x.op in allowed for x in nodes) and sum(x.op is Ops.SQRT for x in nodes) == 1 and sum(x.op is Ops.WHERE for x in nodes) == 2 and \
     all(any(x.op is Ops.CONST and math.isclose(float(x.arg), coefficient) for x in nodes) for coefficient in coefficients) else None
 
@@ -826,9 +866,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     if source is None: return None
     ret = _erf_expr(source)
   elif (asin:=_canonical_asin(u)) is not None:
-    source = _parse_dpu_expr(asin, output_index, memo)
+    source = _parse_dpu_expr(asin[0], output_index, memo)
     if source is None: return None
-    ret = _asin_expr(source)
+    # pi/2-asin missed 156/2925 official outputs: ACOS needs its own endpoint coordinate.
+    ret = _acos_expr(source) if asin[1] else _asin_expr(source)
   elif (celu:=_canonical_celu(u)) is not None:
     source = _parse_dpu_expr(celu[0], output_index, memo)
     if source is None: return None
@@ -1194,7 +1235,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (rklut.RKLUT.CELU3_LOCAL,"CELU3_LOCAL"),(rklut.RKLUT.CELU4,"CELU4"),(rklut.RKLUT.CELU4_LOCAL,"CELU4_LOCAL"),
                        (rklut.RKLUT.LOG2,"LOG2"),(rklut.RKLUT.LOG2_LOCAL,"LOG2_LOCAL"),(rklut.RKLUT.LOG,"LOG"),
                        (rklut.RKLUT.LOG_LOCAL,"LOG_LOCAL"),(rklut.RKLUT.LOG10,"LOG10"),(rklut.RKLUT.LOG10_LOCAL,"LOG10_LOCAL"),
-                       (rklut.RKLUT.ASIN,"ASIN"),(rklut.RKLUT.ASIN_DETAIL,"ASIN_DETAIL"))}}[plan.lut]
+                       (rklut.RKLUT.ASIN,"ASIN"),(rklut.RKLUT.ASIN_DETAIL,"ASIN_DETAIL"),(rklut.RKLUT.ACOS,"ACOS"),
+                       (rklut.RKLUT.ACOS_ENDPOINT,"ACOS_ENDPOINT"),(rklut.RKLUT.ACOS_FINE_ENDPOINT,"ACOS_FINE_ENDPOINT"))}}[plan.lut]
   post_scale = {rklut.RKLUT.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 rklut.RKLUT.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.lut, 1.0)
   cmds = []
