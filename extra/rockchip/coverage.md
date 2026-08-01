@@ -95,6 +95,7 @@ Pytest reports 426 failures including the 126 failing subtests. Runtime was
 | IEEE special-value wrapper around EXP2 LUT | `test_exp2` | Yes (`015e735b1`) |
 | Generated two-level EXP LUT with signed-factor recognition | `test_exp` | Yes (`015e735b1`) |
 | Generated two-level sigmoid reused by generic MUL | `test_sigmoid`, `test_silu`, `test_swish` | No |
+| Mask-composed sign preservation for infinite division numerators | `test_div_naninf` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

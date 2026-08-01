@@ -336,11 +336,15 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     else:
       div_src = (_parse_alu(u.src[1-reciprocal], output_index, memo), _parse_alu(u.src[reciprocal].src[0], output_index, memo))
       if any(x is None for x in div_src): return None
-      ret = _ALUExpr(Ops.FDIV, div_src)  # type: ignore[arg-type]
+      numerator, denominator = cast(tuple[_Value, _Value], div_src)
+      if isinstance(numerator, float) and math.isinf(numerator):
+        sign = _sub(_MaskExpr((_sub(denominator, 0.0),)), _MaskExpr((_sub(0.0, denominator),)))
+        ret = _ALUExpr(Ops.MUL, (numerator, sign))
+      else: ret = _ALUExpr(Ops.FDIV, (numerator, denominator))
   elif u.op is Ops.RECIPROCAL:
-    denominator = _parse_alu(u.src[0], output_index, memo)
-    if denominator is None: return None
-    ret = _ALUExpr(Ops.FDIV, (1.0, denominator))
+    reciprocal_denominator = _parse_alu(u.src[0], output_index, memo)
+    if reciprocal_denominator is None: return None
+    ret = _ALUExpr(Ops.FDIV, (1.0, reciprocal_denominator))
   elif u.op is Ops.TRUNC:
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None: return None

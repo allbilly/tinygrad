@@ -100,6 +100,10 @@ class TestDPUCompiler(unittest.TestCase):
     plan = lower_dpu(sink(a/b))
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual(plan.stages[0].op, Ops.FDIV)
+    signed_inf = lower_dpu(sink(float("inf")/a))
+    self.assertIsInstance(signed_inf, RKDPUProgram)
+    self.assertTrue(any(isinstance(stage, RKMaskStage) for stage in signed_inf.stages))
+    self.assertFalse(contains_uop(signed_inf))
 
   def test_where_uses_generic_mask_stage(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

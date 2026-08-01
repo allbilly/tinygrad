@@ -13,6 +13,12 @@ class TestRockchip(unittest.TestCase):
                           (((a+b)*c)+d, ((values[0]+values[1])*values[2])+values[3])):
       np.testing.assert_allclose(out.realize().numpy(), expected, rtol=2e-3, atol=2e-3)
 
+  def test_dpu_division_infinite_numerator_sign(self):
+    data = np.array([-2, -1, 1, 2, np.nan], dtype=np.float16)
+    x = Tensor(data, device="ROCKCHIP").realize()
+    for numerator in (np.inf, -np.inf):
+      np.testing.assert_equal((numerator/x).realize().numpy(), numerator/data)
+
   def test_dpu_scalar_and_fill(self):
     data = np.linspace(-2, 2, 16, dtype=np.float16)
     x = Tensor(data, device="ROCKCHIP").realize()
