@@ -130,6 +130,14 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_dpu(plan)
     self.assertEqual((len(image.stages[0].commands), tuple(r.word for r in image.stages[0].relocs)), (1064, (1032, 1059)))
 
+  def test_round_uses_generated_algorithm23_lut(self):
+    payload = struct.pack(f"<{len(rklut.RK_LUT_ROUNDOFF)}h", *rklut.RK_LUT_ROUNDOFF)
+    self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).round()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.ROUNDOFF for stage in plan.stages), 1)
+    self.assertFalse(contains_uop(plan))
+
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     plan = lower_contract(sink(a@packed_b.T))

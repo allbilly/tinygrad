@@ -55,6 +55,12 @@ class TestRockchip(unittest.TestCase):
     self.assertLessEqual(int(ulp.max()), 1)
     self.assertTrue(np.all(np.diff(actual[order].astype(np.float32)) >= 0))
 
+  def test_generated_roundoff_lut(self):
+    data = np.linspace(-16, 16, 4097, dtype=np.float16)
+    np.testing.assert_equal(Tensor(data, device="ROCKCHIP").round().realize().numpy(), np.round(data))
+    special = np.array([-np.inf,-2.5,-1.5,-.5,-0.,0.,.5,1.5,2.5,np.inf,np.nan], dtype=np.float16)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").round().realize().numpy(), np.round(special))
+
   def test_linear_sigmoid_workload(self):
     rng = np.random.default_rng(2)
     a_np = rng.uniform(-0.25, 0.25, (1,32)).astype(np.float16)

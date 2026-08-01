@@ -205,6 +205,19 @@ _Value = _Expr|RKArg|float
 def _sub(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _ALUExpr:
   return _ALUExpr(Ops.ADD, (lhs, _ALUExpr(Ops.MUL, (rhs, -1.0))))
 
+def _round_expr(source:_Expr|RKArg|float) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  negative = _ALUExpr(Ops.MUL, (source, -1.0))
+  magnitude = _ALUExpr(Ops.MAX, (source, negative))
+  positive_mask, negative_mask = positive(source, 0.0), positive(0.0, source)
+  sign = _sub(positive_mask, negative_mask)
+  rounded = _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.ROUNDOFF, (magnitude,)), sign))
+  high = positive(magnitude, 65472.0)
+  high_result = _ALUExpr(Ops.FDIV, (sign, _sub(1.0, high)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (rounded, _sub(1.0, high))), _ALUExpr(Ops.MUL, (high_result, high))))
+  valid = _sub(1.0, _ALUExpr(Ops.MUL, (positive_mask, negative_mask)))
+  return _ALUExpr(Ops.MUL, (selected, _ALUExpr(Ops.FDIV, (valid, valid))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -224,6 +237,16 @@ def _canonical_abs(u:UOp) -> UOp|None:
         float(_unwrap_same_cast(less.src[1]).arg) == 0 and negative.op is Ops.CONST and float(negative.arg) == -1 and
         positive.op is Ops.CONST and float(positive.arg) == 1): return data
   return None
+
+def _canonical_round(u:UOp) -> UOp|None:
+  """Recognize tinygrad's exact round-to-nearest-even expansion."""
+  u = _unwrap_same_cast(u)
+  indexes = [x for x in u.toposort() if x.op is Ops.INDEX]
+  if len(indexes) != 1 or (source:=indexes[0]).dtype is not dtypes.half: return None
+  counts = {op:sum(x.op is op for x in u.toposort()) for op in (Ops.TRUNC, Ops.ADD, Ops.MUL, Ops.CMPLT, Ops.CMPNE, Ops.WHERE)}
+  constants = [float(x.arg) for x in u.toposort() if x.op is Ops.CONST]
+  required = {Ops.TRUNC:4, Ops.ADD:4, Ops.MUL:1, Ops.CMPLT:3, Ops.CMPNE:3, Ops.WHERE:3}
+  return source if counts == required and all(any(math.isclose(x, value) for x in constants) for value in (-1,-.5,0,.5,1)) else None
 
 def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|None:
   """Build an FP16 0/1 predicate from comparisons and boolean composition."""
@@ -246,6 +269,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (rounded:=_canonical_round(u)) is not None:
+    source = _parse_alu(rounded, output_index, memo)
+    if source is None: return None
+    ret = _round_expr(source)
   elif (abs_input:=_canonical_abs(u)) is not None:
     operand = _parse_alu(abs_input, output_index, memo)
     if operand is None: return None
@@ -438,7 +465,38 @@ def _emit_mask(stage_idx:int, plan:RKMaskStage) -> RKStage:
                    ((plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ())
   return RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
 
+def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
+  width, surf_stride, cmds = (plan.count+7)//8-1, ((plan.count+7)//8)*16, []
+  for table_id in range(2):
+    cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
+    cmds.extend(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_DATA, value) for value in
+                rklut.RK_LUT_ROUNDOFF[table_id*rklut.RK_LUT_ROUNDOFF_ENTRIES:(table_id+1)*rklut.RK_LUT_ROUNDOFF_ENTRIES])
+  dpu = ((rk.REG_DPU_S_POINTER, 0x30), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (rk.REG_DPU_DATA_FORMAT, 0x48000002),
+    (rk.REG_DPU_DST_SURF_STRIDE, surf_stride), (rk.REG_DPU_DATA_CUBE_WIDTH, width), (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007),
+    (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 7), (rk.REG_DPU_WDMA_SIZE_1, width),
+    (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_EW_CFG, 0x302), (rk.REG_DPU_SURFACE_ADD, 2*surf_stride), (0x40c4, 0),
+    (rk.REG_DPU_LUT_CFG, 0x68), (rk.REG_DPU_LUT_INFO, 0xe0e00), (rk.REG_DPU_LUT_LE_START, 0),
+    (rk.REG_DPU_LUT_LE_END, 0x44000000), (rk.REG_DPU_LUT_LO_START, 0x44000000), (rk.REG_DPU_LUT_LO_END, 0x44800000),
+    (0x4120, 23107), (0x4124, 22))
+  cmds.extend(_command(_TARGET_DPU, *x) for x in dpu[:3])
+  dst_word = len(cmds)
+  cmds.append(_command(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0))
+  cmds.extend(_command(_TARGET_DPU, *x) for x in dpu[3:])
+  rdma = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
+    (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7), (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 1))
+  cmds.extend(_command(_TARGET_DPU_RDMA, *x) for x in rdma)
+  src_word = len(cmds)
+  cmds.append(_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0))
+  cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849),
+           _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_WEIGHT, 0x01010101), _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
+  relocs = (RKReloc(stage_idx, dst_word, plan.dst.kind, plan.dst.index, plan.dst.addend),
+            RKReloc(stage_idx, src_word, plan.src.kind, plan.src.index, plan.src.addend))
+  reads, writes = ((plan.src.index,) if plan.src.kind is RKBufferKind.ARG else ()), \
+                   ((plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ())
+  return RKStage(RKEngine.DPU, tuple(cmds), relocs, reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
+
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
+  if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
   if plan.lut is not RKLUTId.EXP2: raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   width, surf_stride, cmds = (plan.count+7)//8-1, ((plan.count+7)//8)*16, []
   for table_id in range(2):

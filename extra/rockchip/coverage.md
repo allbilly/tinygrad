@@ -62,6 +62,7 @@ Pytest reports 434 failures including the 126 failing subtests. Runtime was
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | No |
+| Generated algorithm-23 round-to-nearest-even LUT | `test_round` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
