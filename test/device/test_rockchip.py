@@ -249,4 +249,14 @@ class TestRockchip(unittest.TestCase):
                              (tensor.isinf(True, False), np.isposinf(data)), (tensor.isinf(False, True), np.isneginf(data))):
       np.testing.assert_equal(actual.numpy(), expected)
 
+  def test_generic_comparisons_preserve_ieee_specials(self):
+    pairs = [(0,0), (1,0), (0,1), (np.inf,np.inf), (-np.inf,-np.inf), (np.inf,-np.inf), (-np.inf,np.inf),
+             (np.nan,0), (0,np.nan), (np.nan,np.nan)]
+    lhs, rhs = (np.array(values, dtype=np.float16) for values in zip(*pairs))
+    x, y = Tensor(lhs, device="ROCKCHIP"), Tensor(rhs, device="ROCKCHIP")
+    for function, reference in ((lambda a,b:a<b, np.less), (lambda a,b:a>b, np.greater), (lambda a,b:a==b, np.equal),
+                                (lambda a,b:a!=b, np.not_equal), (lambda a,b:a>=b, np.greater_equal),
+                                (lambda a,b:a<=b, np.less_equal)):
+      np.testing.assert_equal(function(x, y).numpy(), reference(lhs, rhs))
+
 if __name__ == "__main__": unittest.main()

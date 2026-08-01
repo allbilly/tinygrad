@@ -958,17 +958,39 @@ def _canonical_logsigmoid(u:UOp) -> UOp|None:
     any(math.isclose(x, -math.log(2)) for x in constants) else None
 
 def _canonical_finite_predicate(u:UOp) -> tuple[UOp,str]|None:
-  nodes = list(u.toposort())
-  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
-  if len(indexes) != 1 or indexes[0].dtype is not dtypes.half: return None
-  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
-  has_infinities = math.inf in constants and -math.inf in constants
-  if not has_infinities and u.op is Ops.CMPNE and u.src[0].key == u.src[1].key: return indexes[0], "nan"
-  if not has_infinities and u.op is Ops.CMPNE and math.inf in constants: return indexes[0], "positive_inf"
-  if not has_infinities and u.op is Ops.CMPNE and -math.inf in constants: return indexes[0], "negative_inf"
-  if has_infinities and u.op is Ops.OR: return indexes[0], "inf"
-  if has_infinities and u.op is Ops.CMPNE: return indexes[0], "finite"
-  return None
+  def logical_not(x:UOp) -> UOp|None:
+    x = _unwrap_same_cast(x)
+    if x.op is not Ops.CMPNE: return None
+    for value, marker in (x.src, x.src[::-1]):
+      marker = _unwrap_same_cast(marker)
+      if marker.op is Ops.CONST and marker.dtype is dtypes.bool and marker.arg is True: return value
+    return None
+  def atom(x:UOp) -> tuple[UOp,str]|None:
+    x = _unwrap_same_cast(x)
+    if x.op is Ops.CMPNE and x.src[0].key == x.src[1].key and x.src[0].op is Ops.INDEX and x.src[0].dtype is dtypes.half:
+      return x.src[0], "nan"
+    if (unequal:=logical_not(x)) is None or (unequal:=_unwrap_same_cast(unequal)).op is not Ops.CMPNE: return None
+    for source, constant in (unequal.src, unequal.src[::-1]):
+      source, constant = _unwrap_same_cast(source), _unwrap_same_cast(constant)
+      if source.op is Ops.INDEX and source.dtype is dtypes.half and constant.op is Ops.CONST and constant.arg in (math.inf, -math.inf):
+        return source, "positive_inf" if constant.arg == math.inf else "negative_inf"
+    return None
+  def flatten_or(x:UOp) -> list[UOp]:
+    x = _unwrap_same_cast(x)
+    return [child for source in x.src for child in flatten_or(source)] if x.op is Ops.OR else [x]
+
+  if (single:=atom(u)) is not None: return single
+  inverted, kind = logical_not(u), "finite"
+  expression = _unwrap_same_cast(inverted) if inverted is not None else _unwrap_same_cast(u)
+  if expression.op is not Ops.OR: return None
+  matches = [atom(x) for x in flatten_or(expression)]
+  if any(x is None for x in matches): return None
+  predicates = cast(list[tuple[UOp,str]], matches)
+  if len({x.key for x,_ in predicates}) != 1: return None
+  tags = sorted(tag for _,tag in predicates)
+  if inverted is None and tags == ["negative_inf", "positive_inf"]: kind = "inf"
+  elif inverted is None or tags != ["nan", "negative_inf", "positive_inf"]: return None
+  return predicates[0][0], kind
 
 def _canonical_softplus(u:UOp) -> tuple[UOp,float]|None:
   u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
@@ -1029,18 +1051,59 @@ def _canonical_relu_difference(u:UOp) -> UOp|None:
     if pos is not None and neg is not None and pos[0].key == neg[0].key and pos[1] == 0.5 and neg[1] == -0.5: return pos[0]
   return None
 
-def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float]) -> _DPUExpr|None:
+def _ieee_mask_expr(op:Ops, lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float, invert:bool=False) -> _DPUExpr:
+  def classifications(x:_DPUExpr|RKArg|float) -> tuple[_DPUExpr,_DPUExpr,_DPUExpr,_DPUExpr]:
+    high = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (x, 65504.0)),))
+    low = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (-65504.0, x)),))
+    nan = _DPUExpr(RKDPUOp.MUL, (high, low))
+    return nan, _DPUExpr(RKDPUOp.SUB, (high, nan)), _DPUExpr(RKDPUOp.SUB, (low, nan)), \
+      _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MAX, (high, low))))
+  lhs_nan, lhs_pos, lhs_neg, lhs_finite = classifications(lhs)
+  rhs_nan, rhs_pos, rhs_neg, rhs_finite = classifications(rhs)
+  positive = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (rhs, lhs)),))
+  if op is Ops.CMPLT:
+    valid = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MAX, (lhs_nan, rhs_nan))))
+    forced = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lhs_neg, _DPUExpr(RKDPUOp.SUB, (1.0, rhs_neg)))),
+      _DPUExpr(RKDPUOp.MUL, (rhs_pos, _DPUExpr(RKDPUOp.SUB, (1.0, lhs_pos))))))
+    finite = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (lhs_finite, rhs_finite)), positive))
+    comparison = _DPUExpr(RKDPUOp.MAX, (forced, finite))
+    return _DPUExpr(RKDPUOp.MUL, (valid, _DPUExpr(RKDPUOp.SUB, (1.0, comparison)) if invert else comparison))
+  unequal = _DPUExpr(RKDPUOp.MAX, (positive, _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))))
+  finite_equal = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (lhs_finite, rhs_finite)),
+    _DPUExpr(RKDPUOp.SUB, (1.0, unequal))))
+  equal = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MAX, (finite_equal, _DPUExpr(RKDPUOp.MUL, (lhs_pos, rhs_pos)))),
+    _DPUExpr(RKDPUOp.MUL, (lhs_neg, rhs_neg))))
+  return _DPUExpr(RKDPUOp.SUB, (1.0, equal))
+
+def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float], ieee:bool=False) -> _DPUExpr|float|None:
   """Build an FP16 0/1 predicate from comparisons and boolean composition."""
   u = _unwrap_same_cast(u)
+  if u.op is Ops.CONST and u.dtype is dtypes.bool: return float(u.arg)
+  if u.op is Ops.CMPNE and any(x.dtype is dtypes.bool for x in u.src):
+    if ieee:
+      for expression, marker in (u.src, u.src[::-1]):
+        expression, marker = _unwrap_same_cast(expression), _unwrap_same_cast(marker)
+        if marker.op is Ops.CONST and marker.dtype is dtypes.bool and marker.arg is True and expression.op is Ops.CMPLT:
+          compared = tuple(_parse_dpu_expr(x, output_index, memo) for x in expression.src)
+          if any(x is None for x in compared): return None
+          scalar_lhs, scalar_rhs = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], compared)
+          return _ieee_mask_expr(Ops.CMPLT, scalar_lhs, scalar_rhs, invert=True)
+    mask_operands = tuple(_parse_mask_expr(x, output_index, memo, ieee) for x in u.src)
+    if any(x is None for x in mask_operands): return None
+    lhs, rhs = cast(tuple[_DPUExpr|float, _DPUExpr|float], mask_operands)
+    if isinstance(lhs, float): return rhs if lhs == 0.0 else _DPUExpr(RKDPUOp.SUB, (1.0, rhs))
+    if isinstance(rhs, float): return lhs if rhs == 0.0 else _DPUExpr(RKDPUOp.SUB, (1.0, lhs))
+    return _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)), _DPUExpr(RKDPUOp.SUB, (rhs, lhs))))
   if u.op in (Ops.CMPLT, Ops.CMPNE):
-    operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in u.src)
-    if any(x is None for x in operands): return None
-    lhs, rhs = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], operands)
-    positive = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (rhs, lhs)),))
+    scalar_operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in u.src)
+    if any(x is None for x in scalar_operands): return None
+    scalar_lhs, scalar_rhs = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], scalar_operands)
+    if ieee: return _ieee_mask_expr(u.op, scalar_lhs, scalar_rhs)
+    positive = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (scalar_rhs, scalar_lhs)),))
     return positive if u.op is Ops.CMPLT else _DPUExpr(RKDPUOp.MAX,
-      (positive, _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))))
+      (positive, _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (scalar_lhs, scalar_rhs)),))))
   if u.op in (Ops.OR, Ops.AND):
-    operands = tuple(_parse_mask_expr(x, output_index, memo) for x in u.src)
+    operands = tuple(_parse_mask_expr(x, output_index, memo, ieee) for x in u.src)
     if any(x is None for x in operands): return None
     return _DPUExpr(RKDPUOp.MAX if u.op is Ops.OR else RKDPUOp.MUL,
                     cast(tuple[_DPUExpr|RKArg|float, ...], operands))
@@ -1290,7 +1353,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       positive_inf if predicate[1] == "positive_inf" else negative_inf if predicate[1] == "negative_inf" else either, both))
       if predicate[1] != "finite" else _DPUExpr(RKDPUOp.SUB, (1.0, either)))
   else:
-    root = (_parse_mask_expr(store.src[1], out_index, {}) if store.src[0].dtype is dtypes.bool else
+    root = (_parse_mask_expr(store.src[1], out_index, {}, ieee=True) if store.src[0].dtype is dtypes.bool else
             _parse_dpu_expr(store.src[1], out_index, {}))
   if root is None: return None
   # Native int32 WDMA emits four values per eight-lane fp16 atom. Constant
@@ -1350,6 +1413,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
                                    x.src[0].op is Ops.PARAM))
   fp32_outputs = (output.index,) if store.src[0].dtype is dtypes.float else ()
   bool_outputs = (output.index,) if store.src[0].dtype is dtypes.bool else ()
+  if len(stages) > 64: return None
   return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs, fp32_outputs, bool_outputs)
 
 def _strip_casts(u:UOp) -> UOp:

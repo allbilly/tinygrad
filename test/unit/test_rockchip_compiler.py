@@ -430,6 +430,20 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertFalse(contains_uop(plan))
       self.assertEqual(emit_dpu(plan).bool_outputs, (0,))
 
+  def test_generic_comparisons_are_ieee_correct_typed_plans(self):
+    functions = (lambda x,y:x<y, lambda x,y:x>y, lambda x,y:x==y,
+                 lambda x,y:x!=y, lambda x,y:x>=y, lambda x,y:x<=y)
+    for function in functions:
+      x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
+      plan = lower_dpu(sink(function(x, y)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertLessEqual(len(plan.stages), 64)
+      self.assertEqual(plan.bool_outputs, (0,))
+      self.assertFalse(contains_uop(plan))
+    # A boolean tree merely containing infinity checks is not an isinf canonical form.
+    x = Tensor.empty(16,dtype=dtypes.half)
+    self.assertIsNone(lower_dpu(sink(x.isclose(x))))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

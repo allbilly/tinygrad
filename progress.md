@@ -14,13 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through typed bool-output packing and native IEEE predicates, the
-2026-08-01 census is **146 passed, 266 failed, and 13 skipped**. Pytest prints
-`392 failed` because
+milestones through IEEE-correct generic FP16 comparison roots, the 2026-08-01
+census is **147 passed, 265 failed, and 13 skipped**. Pytest prints `391 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 56-host/36-NPU
+while recovering the remaining native forward coverage. Focused 57-host/37-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -109,7 +108,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `3b51f1b65` | Ranged two-table FP16 ASINH | `0208-rockchip-add-ranged-ASINH-LUTs.patch` |
 | `2da53e486` | Endpoint-aware two-table FP16 ACOSH | `0209-rockchip-add-endpoint-ACOSH-LUTs.patch` |
 | `2651579d8` | Preserve and characterize rejected native TAN designs | `0210-rockchip-record-native-TAN-limits.patch` |
-| current milestone | Typed bool-output ABI and native IEEE predicates | `0211-rockchip-add-typed-bool-output-ABI.patch` |
+| `091df1bd8` | Typed bool-output ABI and native IEEE predicates | `0211-rockchip-add-typed-bool-output-ABI.patch` |
+| current milestone | IEEE-correct generic FP16 comparison roots | `0212-rockchip-lower-IEEE-FP16-comparisons.patch` |
 
 ## Architecture now implemented
 
@@ -173,6 +173,8 @@ Implemented forward-only subset:
 - ACOSH using endpoint-coordinate core/range tables, device regional composition, exact one handling, and NaN synthesis below the domain;
 - `isnan`, `isinf` (including directional modes), and `isfinite` using native FP16 masks, with a declared bool-output slot converted from the
   atom-padded FP16 NPU representation to the public byte ABI after submission;
+- all six generic FP16 comparison roots with explicit NaN and signed-infinity classification; boolean inversion is lowered structurally rather
+  than assuming that `not (x<y)` is IEEE `x>=y` in the presence of NaN;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -184,12 +186,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1581
+tinygrad/renderer/rockchip.py  1643
 tinygrad/runtime/ops_rockchip.py  111
-handwritten Rockchip total  1692
+handwritten Rockchip total  1754
 ```
 
-This meets the requested `<5000` research-backend goal with 3,308 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,246 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
@@ -207,7 +209,7 @@ The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,668 `sz.py` lines, a `+1,700` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,668 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 26,730 `sz.py` lines, a `+1,762` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,730 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
@@ -251,6 +253,10 @@ Useful failure interpretations:
 
 Recent precision probes that must not be rediscovered as final fixes:
 
+- Do not recognize `isinf`/`isfinite` by scanning an expression for infinity constants: `isclose` contains the same constants and was falsely
+  accepted as `isinf`. Match the exact nested `CMPNE(..., true)`/`OR` structure and require every atom to share the same direct FP16 index.
+- The raw DPU `MASK(rhs-lhs)` comparison reports true for `inf-inf` and NaN differences. Public comparison roots must classify NaN, positive
+  infinity, negative infinity, and finite values on-device; in particular, IEEE `x>=y` is not `not (x<y)` when either operand is NaN.
 - DPU `out_precision=0` int8 output from the proven FP16 mask task timed out with both eight-lane and 16-lane WDMA/data-cube layouts. The TRM advertises int8 output, but FP16-to-int8 conversion is not yet a proven byte-wide bool ABI; do not enable it from the format field alone.
 - Arbitrary scaled LOG2 made atanh compile in 61 stages, but the `(1+x)/(1-x)` ratio reaches 199 and saturated above 4. Symmetric `>4`/`>64` power-of-16 normalization fixed the range but expanded direct log/atanh to 69/73 stages, beyond RKImage's 64-bit dependency contract. Fuse stages or introduce a justified wide-domain asset; do not relax the image invariant.
 - Frozen `rockchip-2607` does not provide a native TAN oracle: its final path is `_run_host_tan`, which calls NumPy. The clean shared SIN/COS quotient first required 78 stages; common reduction and hierarchical selection reached 60 stages but still missed 73/2,925 values at strict tolerance because the two LUT results round independently.
@@ -284,7 +290,7 @@ from the planned minimal upstream branch.
 
 - Spatial direct convolution. Current tinygrad NCHW storage does not match the proven NPU atom/HWC surface. The frozen branch used host materialization for broad contraction/conv cases, so it is not a valid clean implementation source. A future path needs a typed `RKConv` plus an explicit device layout/weight stage. A 1x1 `1x32 -> 8` convolution canonicalizes to the already-supported affine CMAC contract and cannot be distinguished semantically after simplification.
 - Wider affine/batched contractions and CMAC tiling.
-- General comparison outputs and bool inputs. The public bool-output ABI is proven for native IEEE predicate roots, while FP16 masks used inside WHERE are native already.
+- Int/bool comparison inputs. Generic FP16 comparison outputs and IEEE predicate roots use the public bool-output ABI, while FP16 masks used inside WHERE are native already.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
 - General FP32 expressions/inputs, bool inputs/arithmetic, general integer arithmetic/casts, and gradient support. Native FP32/int32 constant fills,
@@ -292,6 +298,6 @@ from the planned minimal upstream branch.
 - Multicore/program-chain submission beyond the stable reset-separated single-core task sequence.
 - Broad TestOps parity. Unsupported graphs deliberately reject rather than run on the CPU.
 
-The next feature should be selected by hardware-native leverage, not raw failed-test count. The FP16 mask primitive and a representation-only public
-bool-output ABI now exist. The next boundary is general predicate-root lowering and then int/bool inputs so comparison and the leading `test_where`
-variants can complete. Direct device byte output remains unproven; spatial convolution should wait for an explicit device layout design.
+The next feature should be selected by hardware-native leverage, not raw failed-test count. FP16 masks, IEEE-correct comparison roots, and a
+representation-only public bool-output ABI now exist. The next boundary is int/bool input representation so the mixed-dtype comparison methods and
+leading `test_where` variants can complete. Direct device byte output remains unproven; spatial convolution should wait for an explicit device layout design.
