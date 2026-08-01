@@ -123,8 +123,9 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(tuple(r.word for r in image.stages[0].relocs), (1032, 1059))
     small = lower_dpu(sink(Tensor.empty(16, dtype=dtypes.half).exp2()))
     large = lower_dpu(sink(Tensor.empty(2925, dtype=dtypes.half).exp2()))
-    self.assertEqual((len(small.stages), small.stages[0].count), (1, 16))
-    self.assertEqual((len(large.stages), large.stages[0].count), (1, 2925))
+    self.assertEqual((len(small.stages), small.stages[0].count, len(small.scratch)), (13, 16, 4))
+    self.assertEqual((len(large.stages), large.stages[0].count, len(large.scratch)), (13, 2925, 4))
+    self.assertEqual(tuple(stage.op for stage in large.stages).count(RKDPUOp.EXP2), 1)
 
   def test_rejects_noncontiguous_and_nonhalf(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)

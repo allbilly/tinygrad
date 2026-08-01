@@ -90,12 +90,14 @@ Latest complete uncached census after the two-level tanh milestone:
 Pytest reports `430 failed` because 126 failing unittest subtests are counted
 in addition to their failed parent methods. Runtime was 85.25 seconds.
 
+After that exact census, the isolated direct-EXP2 special-value milestone moves `test_exp2` from FAIL to PASS, giving a current method delta of 109 PASS / 303 FAIL / 13 SKIP. A new full-census runtime has not yet been recorded.
+
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
 | Native hook | 1 | — | PASS |
 | RKImage codec/validation/relocation, including 64-bit dependencies | 6 | — | PASS |
 | DPU ADD/MUL/MAX/DIV/copy/fill/ABS/WHERE/composed masks and structural liveness | included in compiler suite | included | PASS |
-| Generated variable-width EXP2 LUT | exhaustive 32,770 FP16 encodings in domain | 4 sizes | PASS |
+| Generated variable-width EXP2 LUT plus IEEE epilogue | exhaustive 32,770 FP16 encodings in domain | 4 sizes and special values | PASS |
 | Two-level HardSwish LUT | typed 36-stage plan | 1 dense sweep | PASS |
 | Two-level tanh LUT and saturation | typed 35-stage plan | 1 dense sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |

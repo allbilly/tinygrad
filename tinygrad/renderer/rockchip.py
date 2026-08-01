@@ -444,7 +444,14 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
     stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count, store.src[0].dtype)
     return RKDPUProgram((stage,), ())
   if root.op is RKDPUOp.EXP2 and len(root.src) == 1 and isinstance(root.src[0], RKArg):
-    return RKDPUProgram((RKDPUStage(RKDPUOp.EXP2, output, root.src[0], None, count),), ())
+    source, base = root.src[0], root
+    positive_inf = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, 65504.0)),))
+    negative_inf = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (-65504.0, source)),))
+    finite = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.DIV, (base, _DPUExpr(RKDPUOp.SUB, (1.0, positive_inf)))),
+      _DPUExpr(RKDPUOp.SUB, (1.0, negative_inf))))
+    not_number = _DPUExpr(RKDPUOp.MUL, (positive_inf, negative_inf))
+    nan_denom = _DPUExpr(RKDPUOp.SUB, (1.0, not_number))
+    root = _DPUExpr(RKDPUOp.DIV, (_DPUExpr(RKDPUOp.MUL, (finite, nan_denom)), nan_denom))
   # Rejected HardSwish WIP: OUT_CVT post-scaling overflowed; BS FP16 1/6 missed 9 cases, its upper neighbor 92, and reordered stages 4.
   order:list[_DPUExpr] = []
   def visit(expr:_DPUExpr) -> None:
@@ -468,11 +475,11 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
     stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count,
                              store.src[0].dtype if expr is root else dtypes.half))
     values[expr] = dst
-    for source in expr.src:
-      if isinstance(source, _DPUExpr):
-        uses[source] -= 1
-        arg = values[source]
-        if uses[source] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
+    for dependency in expr.src:
+      if isinstance(dependency, _DPUExpr):
+        uses[dependency] -= 1
+        arg = values[dependency]
+        if uses[dependency] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
   size = ((count+7)//8)*16
   return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)))
 

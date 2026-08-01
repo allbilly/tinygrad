@@ -36,6 +36,8 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 
 The simulator includes output rounding to FP16. It models table interpolation for the declared domain. Hardware tests remain required because register interpretation, internal rounding, saturation, and chip revision behavior can differ from the mathematical simulator.
 
+Direct EXP2 appends a 13-stage typed program. Threshold masks distinguish `+inf`, `-inf`, and NaN: NaN activates both high and low masks, while each infinity activates only its matching mask. Device divisions synthesize positive infinity and NaN, and multiplication restores negative underflow to zero. This passes `[+inf,-inf,nan] -> [inf,0,nan]` without inspecting values on the host.
+
 Regenerate and verify:
 
 ```sh
