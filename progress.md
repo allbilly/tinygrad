@@ -13,9 +13,9 @@ collected methods, plus 126 passing subtests.
 Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
-typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native-int
-milestones, the 2026-08-01 census is **98 passed, 314 failed, and 13 skipped**.
-Pytest prints `440 failed` because it separately counts 126 failing subtests.
+typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
+milestones, the 2026-08-01 census is **101 passed, 311 failed, and 13 skipped**.
+Pytest prints `437 failed` because it separately counts 126 failing subtests.
 
 Therefore the clean branch must preserve its `<5000` handwritten-line target
 while recovering the remaining native forward coverage. Focused 26-host/10-NPU
@@ -55,7 +55,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `3183a307b` | Generic FP16 WHERE masks | `0172-rockchip-lower-generic-half-WHERE-masks.patch` |
 | `5829aaf48` | Fused typed division and ADD-zero copy | `0173-rockchip-fuse-typed-DPU-division.patch` |
 | `fa22d6764` | Native ABS canonicalization | `0174-rockchip-canonicalize-native-absolute-value.patch` |
-| current milestone | Tiled native int32 fills and 64-bit image dependencies | `0175-rockchip-tile-native-int32-fills.patch` |
+| `89a5cffbc` | Tiled native int32 fills and 64-bit image dependencies | `0175-rockchip-tile-native-int32-fills.patch` |
+| current milestone | Tiled native FP32 constant fills | `0176-rockchip-tile-native-FP32-fills.patch` |
 
 ## Architecture now implemented
 
@@ -90,18 +91,19 @@ Implemented forward-only subset:
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
 - native int32 constant fills, split into the proven 64-output DPU tile with typed destination offsets.
+- native FP32 constant fills, split into the proven four-output/64-byte source tile.
 
 ## Size result
 
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  548
+tinygrad/renderer/rockchip.py  552
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  622
+handwritten Rockchip total  626
 ```
 
-This meets the requested `<5000` backend goal with 4,378 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 4,374 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -111,7 +113,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 25,598 `sz.py` lines, a `+630` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 598 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 25,602 `sz.py` lines, a `+634` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 602 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 
@@ -168,7 +170,7 @@ Allocator `copyin`/`copyout` is normal buffer transport and is not semantic CPU 
 - User-visible bool packing and general comparison outputs. FP16 masks used inside WHERE are native already.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
-- FP32, bool, general integer arithmetic/casts, and gradient support. Native int32 constant fills are the first bounded integer contract.
+- FP32 expressions/inputs, bool, general integer arithmetic/casts, and gradient support. Native FP32/int32 constant fills are bounded output contracts.
 - Multicore/program-chain submission beyond the stable reset-separated single-core task sequence.
 - Broad TestOps parity. Unsupported graphs deliberately reject rather than run on the CPU.
 

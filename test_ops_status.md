@@ -82,13 +82,13 @@ Latest complete uncached census after the native-int fill milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 98 |
-| FAIL | 314 |
+| PASS | 101 |
+| FAIL | 311 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `440 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 54.10 seconds.
+Pytest reports `437 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 54.75 seconds.
 
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
@@ -105,7 +105,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Supported contracts
 
-- dtype: FP16 expression graphs plus tiled native int32 constant fills;
+- dtype: FP16 expression graphs plus tiled native int32/FP32 constant fills;
 - mode: forward only;
 - static shapes;
 - DPU contiguous storage and one output;
@@ -116,7 +116,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Expected rejects
 
-- FP32, integer, uint8, bool, and gradient graphs;
+- FP32 expression/input graphs, integer arithmetic/input graphs, uint8, bool, and gradients;
 - noncontiguous elementwise indexing;
 - user-visible bool comparisons and WHERE graphs needing bool/int inputs or non-FP16 outputs;
 - arbitrary EXP2 sizes or values requiring a different domain policy;

@@ -269,7 +269,8 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   """Lower one contiguous fp16/int32 store to a UOp-free primitive DPU plan."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
-  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or store.src[0].dtype not in (dtypes.half, dtypes.int): return None
+  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or \
+     store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float): return None
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
   if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST: return None
   count = int(out_param.src[0].arg)
@@ -280,12 +281,13 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   # Native int32 WDMA emits four values per eight-lane fp16 atom. Constant
   # fills can safely double their source lanes; dynamic conversion needs an
   # explicit packed layout and is deliberately not inferred here.
-  if store.src[0].dtype is dtypes.int and not isinstance(root, float): return None
+  if store.src[0].dtype is not dtypes.half and not isinstance(root, float): return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, _DPUExpr):
-    if store.src[0].dtype is dtypes.int:
+    if store.src[0].dtype in (dtypes.int, dtypes.float):
+      tile = 64 if store.src[0].dtype is dtypes.int else 4
       fill_stages = tuple(RKDPUStage(RKDPUOp.ADD, RKArg(output.kind, output.index, start*4), 0.0, root,
-                                    min(64, count-start), dtypes.int) for start in range(0, count, 64))
+                                    min(tile, count-start), store.src[0].dtype) for start in range(0, count, tile))
       return RKDPUProgram(fill_stages, ()) if len(fill_stages) <= 64 else None
     stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count, store.src[0].dtype)
     return RKDPUProgram((stage,), ())
@@ -481,24 +483,26 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       constants.extend(bits * (((count+7)//8)*8))
     return RKArg(RKBufferKind.CONSTANT, constant_offsets[key])
   for stage_idx, plan in enumerate(program.stages):
-    physical_count = plan.count*2 if plan.out_dtype is dtypes.int else plan.count
-    lhs, rhs = materialize(plan.lhs, physical_count), materialize(plan.rhs, physical_count) if plan.rhs is not None else None
+    material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
+    lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
     if plan.op is RKDPUOp.EXP2:
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:
       stages.append(_emit_mask(stage_idx, plan, lhs))
       continue
-    width = (physical_count+7)//8-1
-    native_int = plan.out_dtype is dtypes.int
+    width = ((plan.count*2 if plan.out_dtype is dtypes.int else plan.count)+7)//8-1
+    wide_out = plan.out_dtype in (dtypes.int, dtypes.float)
+    out_precision = 4 if plan.out_dtype is dtypes.int else (5 if plan.out_dtype is dtypes.float else 2)
     dpu_regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),
-      (rk.REG_DPU_DATA_FORMAT, ((4 if native_int else 2)<<29)|(2<<26)|2), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
+      (rk.REG_DPU_DATA_FORMAT, (out_precision<<29)|(2<<26)|2), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0), (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007),
       (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0),
-      (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if native_int else 7), (rk.REG_DPU_WDMA_SIZE_1, width),
+      (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if wide_out else 7), (rk.REG_DPU_WDMA_SIZE_1, width),
       (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0),
       (rk.REG_DPU_EW_CFG, 0 if plan.op is RKDPUOp.COPY else _EW_CFG[plan.op]), (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
-      (rk.REG_DPU_OUT_CVT_OFFSET, 0), (rk.REG_DPU_OUT_CVT_SCALE, 1 if plan.op is RKDPUOp.DIV or native_int else 0x10001),
+      (rk.REG_DPU_OUT_CVT_OFFSET, 0), (rk.REG_DPU_OUT_CVT_SCALE,
+       0 if plan.out_dtype is dtypes.float else (1 if plan.op is RKDPUOp.DIV or plan.out_dtype is dtypes.int else 0x10001)),
       (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
     rdma_regs = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
@@ -580,7 +584,7 @@ def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
-  def supported_dtypes(self): return {dtypes.half, dtypes.int}
+  def supported_dtypes(self): return {dtypes.half, dtypes.int, dtypes.float}
   def native_program(self, ast:UOp) -> UOp|None:
     if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
     elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)

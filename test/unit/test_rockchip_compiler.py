@@ -53,14 +53,16 @@ class TestDPUCompiler(unittest.TestCase):
       0x10010000000e4004, 0x1001000001e5400c, 0x1001480000024010,
       0x1001000000014030, 0x1001000000004034, 0x1001000000004038, 0x100100070007403c))
 
-  def test_int_fill_tiles_native_wdma_limit(self):
-    plan = lower_dpu(sink(Tensor.full((2925,), 4, dtype=dtypes.int)))
-    self.assertIsInstance(plan, RKDPUProgram)
-    self.assertEqual(len(plan.stages), 46)
-    self.assertTrue(all(stage.count <= 64 and stage.out_dtype is dtypes.int for stage in plan.stages))
-    self.assertEqual(tuple(stage.dst.addend for stage in plan.stages), tuple(range(0, 2925*4, 64*4)))
-    image = emit_dpu(plan)
-    self.assertEqual(decode_image(encode_image(image)), image)
+  def test_wide_fills_tile_native_wdma_limits(self):
+    for dtype, count, tile in ((dtypes.int, 2925, 64), (dtypes.float, 6, 4)):
+      plan = lower_dpu(sink(Tensor.full((count,), 4, dtype=dtype)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual(len(plan.stages), (count+tile-1)//tile)
+      self.assertTrue(all(stage.count <= tile and stage.out_dtype is dtype for stage in plan.stages))
+      self.assertEqual(tuple(stage.dst.addend for stage in plan.stages), tuple(range(0, count*4, tile*4)))
+      image = emit_dpu(plan)
+      self.assertEqual(decode_image(encode_image(image)), image)
+    self.assertIsNone(lower_dpu(sink(Tensor.full((257,), 4, dtype=dtypes.float))))
 
   def test_fill_is_dpu_add_not_constant_copy(self):
     plan = lower_dpu(sink(Tensor.full((16,), 3.5, dtype=dtypes.half)))
