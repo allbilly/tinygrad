@@ -26,6 +26,11 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(x.relu().realize().numpy(), np.maximum(data, 0))
     np.testing.assert_equal(x.clip(-1, 1).realize().numpy(), np.clip(data, -1, 1))
 
+  def test_generic_where_mask(self):
+    lhs, rhs = np.linspace(-2, 2, 16, dtype=np.float16), np.linspace(3, 4, 16, dtype=np.float16)
+    x, y = Tensor(lhs, device="ROCKCHIP").realize(), Tensor(rhs, device="ROCKCHIP").realize()
+    np.testing.assert_equal((x<0).where(x, y).realize().numpy(), np.where(lhs<0, lhs, rhs))
+
   def test_direct_fp16_contract(self):
     rng = np.random.default_rng(2)
     a_np, packed_b_np = rng.uniform(-1,1,(1,32)).astype(np.float16), rng.uniform(-1,1,(8,32)).astype(np.float16)

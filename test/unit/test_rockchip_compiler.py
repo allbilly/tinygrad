@@ -116,6 +116,13 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertFalse(contains_uop(plan))
     self.assertEqual(lower_dpu(sink(x.relu())).stages[0].op.name, "MAX")
 
+  def test_generic_where_uses_typed_mask_graph(self):
+    x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
+    plan = lower_dpu(sink((x<0).where(x, y)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertFalse(contains_uop(plan))
+    self.assertIn("MASK", tuple(stage.op.name for stage in plan.stages))
+
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     plan = lower_contract(sink(a@packed_b.T))
