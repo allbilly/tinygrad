@@ -31,6 +31,12 @@ class TestRockchip(unittest.TestCase):
     x, y = Tensor(lhs, device="ROCKCHIP").realize(), Tensor(rhs, device="ROCKCHIP").realize()
     np.testing.assert_equal((x<0).where(x, y).realize().numpy(), np.where(lhs<0, lhs, rhs))
 
+  def test_reciprocal_and_division(self):
+    lhs, rhs = np.linspace(1, 2, 16, dtype=np.float16), np.linspace(2, 4, 16, dtype=np.float16)
+    x, y = Tensor(lhs, device="ROCKCHIP").realize(), Tensor(rhs, device="ROCKCHIP").realize()
+    np.testing.assert_allclose(x.reciprocal().realize().numpy(), 1/lhs, rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose((x/y).realize().numpy(), lhs/rhs, rtol=2e-3, atol=2e-3)
+
   def test_direct_fp16_contract(self):
     rng = np.random.default_rng(2)
     a_np, packed_b_np = rng.uniform(-1,1,(1,32)).astype(np.float16), rng.uniform(-1,1,(8,32)).astype(np.float16)

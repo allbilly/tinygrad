@@ -33,6 +33,7 @@ class RKDPUOp(IntEnum):
   SUB = 4
   EXP2 = 5
   MASK = 6
+  DIV = 7
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -202,6 +203,12 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif u.op is Ops.MUL and any(_unwrap_same_cast(x).op is Ops.RECIPROCAL for x in u.src):
+    reciprocal = next(i for i,x in enumerate(u.src) if _unwrap_same_cast(x).op is Ops.RECIPROCAL)
+    numerator, denominator = u.src[1-reciprocal], _unwrap_same_cast(u.src[reciprocal]).src[0]
+    src = tuple(_parse_dpu_expr(x, output_index, memo) for x in (numerator, denominator))
+    if any(x is None for x in src): return None
+    ret = _DPUExpr(RKDPUOp.DIV, cast(tuple[_DPUExpr|RKArg|float, ...], src))
   elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX):
     src = tuple(_parse_dpu_expr(x, output_index, memo) for x in u.src)
     if any(x is None for x in src): return None
@@ -210,6 +217,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     operand = _parse_dpu_expr(u.src[0], output_index, memo)
     if operand is None: return None
     ret = _DPUExpr(RKDPUOp.EXP2, (operand,))
+  elif u.op is Ops.RECIPROCAL:
+    operand = _parse_dpu_expr(u.src[0], output_index, memo)
+    if operand is None: return None
+    ret = _DPUExpr(RKDPUOp.DIV, (1.0, operand))
   elif u.op is Ops.WHERE and (cond:=_unwrap_same_cast(u.src[0])).op is Ops.CMPLT:
     lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
     true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
@@ -246,7 +257,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   if root is None: return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, _DPUExpr):
-    stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count) if isinstance(root, float) else RKDPUStage(RKDPUOp.COPY, output, root, None, count)
+    stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count)
     return RKDPUProgram((stage,), ())
   order:list[_DPUExpr] = []
   def visit(expr:_DPUExpr) -> None:
@@ -352,7 +363,7 @@ _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
 _TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
 _EW_BASE = 0x108002c0
 _EW_CFG = {RKDPUOp.ADD:_EW_BASE | (2 << 16), RKDPUOp.MUL:_EW_BASE | (1 << 2) | (1 << 8),
-           RKDPUOp.MAX:_EW_BASE, RKDPUOp.SUB:_EW_BASE | (4 << 16)}
+           RKDPUOp.MAX:_EW_BASE, RKDPUOp.SUB:_EW_BASE | (4 << 16), RKDPUOp.DIV:_EW_BASE | (3 << 16) | (1 << 8)}
 
 def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
@@ -450,7 +461,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
             _command(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, width),
             _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007),
             _command(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0 if plan.op is RKDPUOp.COPY else _EW_CFG[plan.op]),
-            _command(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
+            _command(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 1 if plan.op is RKDPUOp.DIV else 0x10001),
             _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x0e),
             _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
             _command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
@@ -462,7 +473,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     if rhs is not None:
       cmds.append(_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, 0))
       relocs.append(RKReloc(stage_idx, 15, rhs.kind, rhs.index))
-    cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849),
+    cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if plan.op is RKDPUOp.DIV else 0x17849),
              _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
     operands = (lhs,) if rhs is None else (lhs, rhs)
     reads = tuple(sorted({x.index for x in operands if x.kind is RKBufferKind.ARG}))

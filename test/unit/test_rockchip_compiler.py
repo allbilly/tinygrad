@@ -56,6 +56,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(plan.stages[0].op.name, "ADD")
     self.assertEqual(len(emit_dpu(plan).constants), 64)
 
+  def test_copy_is_canonical_dpu_add_zero(self):
+    x = Tensor.empty(45,65,dtype=dtypes.half)
+    plan = lower_dpu(sink(x/1))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.stages[0].op.name, "ADD")
+    self.assertEqual(plan.stages[0].lhs, 0.0)
+
   def test_scalar_fill_uses_const_zero_index(self):
     plan = lower_dpu(sink(Tensor.ones((), dtype=dtypes.half)))
     self.assertIsInstance(plan, RKDPUProgram)
@@ -122,6 +129,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertFalse(contains_uop(plan))
     self.assertIn("MASK", tuple(stage.op.name for stage in plan.stages))
+
+  def test_reciprocal_lowers_to_typed_division(self):
+    x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
+    plan = lower_dpu(sink(x.reciprocal()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.stages[0].op.name, "DIV")
+    self.assertFalse(contains_uop(plan))
+    self.assertEqual(tuple(stage.op.name for stage in lower_dpu(sink(x/y)).stages), ("DIV",))
 
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
