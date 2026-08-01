@@ -78,20 +78,21 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the endpoint-aware ACOSH milestone:
+Latest complete uncached census after the typed bool-output/IEEE-predicate milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 143 |
-| FAIL | 269 |
+| PASS | 146 |
+| FAIL | 266 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `395 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 455.13 seconds. This
+Pytest reports `392 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 460.05 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
-natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor, ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, and ACOSH.
+natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
+ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, ACOSH, and the IEEE `isnan`/`isinf`/`isfinite` predicates.
 
 ## Focused verified matrix
 
@@ -126,16 +127,17 @@ natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
 | Bounded ATANH | typed 47-stage broad/detail plan | official method, strict 4,097-point domain sweep, endpoint infinities, invalid inputs, and NaN | PASS |
 | Ranged ASINH | typed 46-stage core/range plan | official method and strict 4,097-point `[-32,32]` sweep | PASS |
 | Endpoint-aware ACOSH | typed 43-stage core/range plan | official method, strict 4,097-point `[1,32]` sweep, exact endpoint, invalid inputs, and NaN | PASS |
+| Typed bool output and IEEE predicates | versioned slot declaration plus native FP16 masks | official `isnan`, `isinf` directional modes, `isfinite`, and direct ABI pack checks | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 55 | 35 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 56 | 36 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
 ## Supported contracts
 
-- dtype: FP16 expression graphs, tiled native int32/FP32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and experimental FP32 Log two-plane ABI;
+- dtype: FP16 expression graphs, typed IEEE-predicate bool outputs, tiled native int32/FP32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and experimental FP32 Log two-plane ABI;
 - mode: forward only;
 - static shapes;
 - DPU contiguous storage and one output;
@@ -159,9 +161,9 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Expected rejects
 
-- FP32 expression/input graphs, integer arithmetic/input graphs, uint8, bool, and gradients;
+- FP32 expression/input graphs, integer arithmetic/input graphs, uint8, bool inputs/general bool expressions, and gradients;
 - noncontiguous elementwise indexing;
-- user-visible bool comparisons and WHERE graphs needing bool/int inputs or non-FP16 outputs;
+- general user-visible bool comparisons and WHERE graphs needing bool/int inputs or non-FP16 outputs; the IEEE predicate roots are the narrow exception;
 - composed EXP2 graphs and values requiring overflow/underflow or NaN policy outside `[-2,2]`;
 - unpacked/general matmul, batched matmul, arbitrary K, and host-required gather;
 - spatial NCHW convolution without a device layout stage;
@@ -170,11 +172,11 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Next low-hanging group
 
-Native round-to-nearest-even, trunc, floor, and ceil are implemented without
-the frozen branch's host layouts. The next low-hanging boundary remains
-device-native bool/int representation:
+Native round-to-nearest-even, trunc, floor, ceil, and the three IEEE predicate
+methods are implemented without host semantic evaluation. The next low-hanging
+boundary is general predicate lowering followed by bool/int input representation:
 
-- emit byte-wide user-visible comparison results without CPU packing;
+- reuse the declared bool-output slot for generic FP16 comparison roots;
 - ingest bool conditions and int32 operands through an explicit NPU layout stage;
 - reuse those typed boundaries for the leading `test_where`, comparison,
   `maximum`/`minimum`, and `*_like` variants;
@@ -188,8 +190,9 @@ the measured 78/60-stage SIN-COS quotient and 64-stage regional designs.
 
 Two direct hardware probes of DPU FP16-mask to int8 output timed out: one kept
 the proven eight-lane cube/WDMA geometry, and one used a 16-lane int8 atom.
-Therefore byte-wide bool output remains an honest unimplemented boundary; the
-TRM precision enum alone is not a valid hardware contract.
+Therefore direct byte-wide NPU bool output remains an honest unimplemented
+boundary; the current research ABI only packs already-computed FP16 masks after
+submission, and the TRM precision enum alone is not a valid hardware contract.
 
 Scaled-log reuse for ATANH remains rejected: its first 61-stage form saturated
 ratios above four, while correct two-band high-range normalization required

@@ -241,4 +241,12 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(invalid="ignore"): expected_special = np.arccosh(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").acosh().numpy(), expected_special)
 
+  def test_ieee_predicates_pack_native_masks_to_bool(self):
+    data = np.array([-np.inf, -1, -0.0, 1, np.inf, np.nan], dtype=np.float16)
+    tensor = Tensor(data, device="ROCKCHIP")
+    for actual, expected in ((tensor.isnan(), np.isnan(data)), (tensor.isinf(), np.isinf(data)),
+                             (tensor.isfinite(), np.isfinite(data)),
+                             (tensor.isinf(True, False), np.isposinf(data)), (tensor.isinf(False, True), np.isneginf(data))):
+      np.testing.assert_equal(actual.numpy(), expected)
+
 if __name__ == "__main__": unittest.main()

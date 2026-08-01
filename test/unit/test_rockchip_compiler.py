@@ -422,6 +422,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     self.assertEqual(tuple(stage.op.name for stage in lower_dpu(sink(x/y)).stages), ("DIV",))
 
+  def test_ieee_predicates_use_typed_bool_output_abi(self):
+    for function in (lambda x:x.isnan(), lambda x:x.isinf(), lambda x:x.isfinite()):
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual(plan.bool_outputs, (0,))
+      self.assertFalse(contains_uop(plan))
+      self.assertEqual(emit_dpu(plan).bool_outputs, (0,))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

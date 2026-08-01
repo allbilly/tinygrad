@@ -9,8 +9,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 4, 1
-_HEADER = struct.Struct("<4sHHHHHHIII")
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 5, 1
+_HEADER = struct.Struct("<4sHHHHHHIIIQ")
 _STAGE = struct.Struct("<BBHQIIIIQQ")
 _RELOC = struct.Struct("<HHBBIqIH")
 _SCRATCH = struct.Struct("<II")
@@ -70,6 +70,7 @@ class RKImage:
   version: int = RKIMAGE_VERSION
   fp32_inputs: tuple[int, ...] = ()
   fp32_outputs: tuple[int, ...] = ()
+  bool_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKArg:
@@ -96,6 +97,7 @@ class RKDPUProgram:
   scratch: tuple[RKScratch, ...]
   fp32_inputs: tuple[int, ...] = ()
   fp32_outputs: tuple[int, ...] = ()
+  bool_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKView:
@@ -637,6 +639,7 @@ def validate_image(image:RKImage) -> None:
     if scratch.size < 0 or scratch.alignment <= 0 or scratch.alignment & (scratch.alignment-1): raise ValueError("invalid scratch declaration")
   if any(x < 0 or x >= 32 for x in image.fp32_inputs): raise ValueError("RKImage FP32 input slots must be in 0..31")
   if any(x < 0 or x >= 16 for x in image.fp32_outputs): raise ValueError("RKImage FP32 output slots must be in 0..15")
+  _slot_mask(image.bool_outputs)
 
 def encode_image(image:RKImage) -> bytes:
   validate_image(image)
@@ -651,7 +654,7 @@ def encode_image(image:RKImage) -> bytes:
                        _slot_mask(stage.reads), _slot_mask(stage.writes)))
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.stages), len(relocs), len(image.scratch),
                                sum(1 << x for x in image.fp32_outputs),
-                               len(commands), len(image.constants), sum(1 << x for x in image.fp32_inputs)))
+                               len(commands), len(image.constants), sum(1 << x for x in image.fp32_inputs), _slot_mask(image.bool_outputs)))
   for engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes in stage_rows:
     out += _STAGE.pack(engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes)
   for reloc in relocs:
@@ -662,7 +665,8 @@ def encode_image(image:RKImage) -> bytes:
 
 def decode_image(blob:bytes) -> RKImage:
   if len(blob) < _HEADER.size: raise ValueError("truncated RKImage header")
-  magic, version, target, stage_count, reloc_count, scratch_count, reserved, command_count, constant_size, reserved2 = _HEADER.unpack_from(blob)
+  magic, version, target, stage_count, reloc_count, scratch_count, reserved, command_count, constant_size, reserved2, \
+    bool_mask = _HEADER.unpack_from(blob)
   if magic != RKIMAGE_MAGIC: raise ValueError("invalid RKImage header")
   expected = _HEADER.size + stage_count*_STAGE.size + reloc_count*_RELOC.size + scratch_count*_SCRATCH.size + command_count*8 + constant_size
   if expected != len(blob): raise ValueError("invalid RKImage size")
@@ -687,7 +691,7 @@ def decode_image(blob:bytes) -> RKImage:
                           tuple(relocs[reloc_start:reloc_start+reloc_len]), slots(reads), slots(writes), deps, flags))
     if any(r.stage != idx for r in stages[-1].relocs): raise ValueError("relocation belongs to wrong stage")
   image = RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], version,
-                  tuple(x for x in range(32) if reserved2 & (1 << x)), tuple(x for x in range(16) if reserved & (1 << x)))
+                  tuple(x for x in range(32) if reserved2 & (1 << x)), tuple(x for x in range(16) if reserved & (1 << x)), slots(bool_mask))
   validate_image(image)
   return image
 
@@ -952,6 +956,19 @@ def _canonical_logsigmoid(u:UOp) -> UOp|None:
   return indexes[0] if len(indexes) == 1 and indexes[0].dtype is dtypes.half and sum(x.op is Ops.EXP2 for x in nodes) == 2 and \
     sum(x.op is Ops.LOG2 for x in nodes) == 1 and sum(x.op is Ops.MAX for x in nodes) == 1 and \
     any(math.isclose(x, -math.log(2)) for x in constants) else None
+
+def _canonical_finite_predicate(u:UOp) -> tuple[UOp,str]|None:
+  nodes = list(u.toposort())
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  if len(indexes) != 1 or indexes[0].dtype is not dtypes.half: return None
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  has_infinities = math.inf in constants and -math.inf in constants
+  if not has_infinities and u.op is Ops.CMPNE and u.src[0].key == u.src[1].key: return indexes[0], "nan"
+  if not has_infinities and u.op is Ops.CMPNE and math.inf in constants: return indexes[0], "positive_inf"
+  if not has_infinities and u.op is Ops.CMPNE and -math.inf in constants: return indexes[0], "negative_inf"
+  if has_infinities and u.op is Ops.OR: return indexes[0], "inf"
+  if has_infinities and u.op is Ops.CMPNE: return indexes[0], "finite"
+  return None
 
 def _canonical_softplus(u:UOp) -> tuple[UOp,float]|None:
   u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
@@ -1252,16 +1269,29 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   return ret
 
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
-  """Lower one contiguous fp16/int32 store to a UOp-free primitive DPU plan."""
+  """Lower one contiguous fp16/int32/bool-ABI store to a UOp-free primitive DPU plan."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
   if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or \
-     store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float): return None
+     store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float, dtypes.bool): return None
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
   if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST: return None
   count = int(out_param.src[0].arg)
   if count <= 0 or (out_index.op is Ops.RANGE and int(out_index.src[0].arg) != count) or \
      (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)): return None
-  root = _parse_dpu_expr(store.src[1], out_index, {})
+  root: _DPUExpr|RKArg|float|None
+  predicate = _canonical_finite_predicate(store.src[1]) if store.src[0].dtype is dtypes.bool else None
+  if predicate is not None:
+    source = _parse_dpu_expr(predicate[0], out_index, {})
+    if source is None: return None
+    positive_inf = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, 65504.0)),))
+    negative_inf = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (-65504.0, source)),))
+    either, both = _DPUExpr(RKDPUOp.MAX, (positive_inf, negative_inf)), _DPUExpr(RKDPUOp.MUL, (positive_inf, negative_inf))
+    root = (both if predicate[1] == "nan" else _DPUExpr(RKDPUOp.SUB, (
+      positive_inf if predicate[1] == "positive_inf" else negative_inf if predicate[1] == "negative_inf" else either, both))
+      if predicate[1] != "finite" else _DPUExpr(RKDPUOp.SUB, (1.0, either)))
+  else:
+    root = (_parse_mask_expr(store.src[1], out_index, {}) if store.src[0].dtype is dtypes.bool else
+            _parse_dpu_expr(store.src[1], out_index, {}))
   if root is None: return None
   # Native int32 WDMA emits four values per eight-lane fp16 atom. Constant
   # fills can safely double their source lanes; dynamic conversion needs an
@@ -1307,7 +1337,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       dst = RKArg(RKBufferKind.SCRATCH, slot)
     assert isinstance(expr.op, RKDPUOp)
     stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count,
-                             dtypes.half if expr is root and store.src[0].dtype is dtypes.float else
+                             dtypes.half if expr is root and store.src[0].dtype in (dtypes.float, dtypes.bool) else
                              (store.src[0].dtype if expr is root else dtypes.half), expr.lut))
     values[expr] = dst
     for dependency in expr.src:
@@ -1319,7 +1349,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   fp32_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.float and
                                    x.src[0].op is Ops.PARAM))
   fp32_outputs = (output.index,) if store.src[0].dtype is dtypes.float else ()
-  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs, fp32_outputs)
+  bool_outputs = (output.index,) if store.src[0].dtype is dtypes.bool else ()
+  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs, fp32_outputs, bool_outputs)
 
 def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
@@ -1602,7 +1633,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET))
   return RKImage(target, tuple(stages), program.scratch, bytes(constants), fp32_inputs=program.fp32_inputs,
-                 fp32_outputs=program.fp32_outputs)
+                 fp32_outputs=program.fp32_outputs, bool_outputs=program.bool_outputs)
 
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit a direct FP16 CMAC surface; inputs and output are already in hardware-legal layouts."""

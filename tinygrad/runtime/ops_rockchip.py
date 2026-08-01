@@ -35,7 +35,15 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
-    prepared, converted, widened = list(bufs), [], []  # type: list[HCQBuffer], list[HCQBuffer], list[tuple[HCQBuffer, HCQBuffer]]
+    prepared: list[HCQBuffer] = list(bufs)
+    converted: list[HCQBuffer] = []
+    widened: list[tuple[HCQBuffer, HCQBuffer]] = []
+    packed: list[tuple[HCQBuffer, HCQBuffer, int]] = []
+    for slot in self.image.bool_outputs:
+      if slot >= len(bufs): raise RuntimeError(f"invalid bool output slot {slot}")
+      count, destination = bufs[slot].size, bufs[slot]
+      temporary = self.dev._gpu_alloc(((count+7)//8)*16)
+      prepared[slot], converted, packed = temporary, [*converted, temporary], [*packed, (temporary, destination, count)]
     for slot in self.image.fp32_outputs:
       if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid FP32 output slot {slot}")
       temporary = self.dev._gpu_alloc(bufs[slot].size//2)
@@ -86,6 +94,10 @@ class RockchipProgram(Program['RockchipDevice']):
         with np.errstate(invalid="ignore"):
           values = np.frombuffer(ctypes.string_at(int(temporary.va_addr), temporary.size), dtype=np.float16).astype(np.float32)
         ctypes.memmove(int(destination.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      for temporary, destination, count in packed:
+        import numpy as np
+        values = np.frombuffer(ctypes.string_at(int(temporary.va_addr), count*2), dtype=np.float16) != 0
+        ctypes.memmove(int(destination.va_addr), values.ctypes.data, count)  # type: ignore[arg-type]
     finally:
       for buf in converted: self.dev._gpu_free(buf)
     return time.perf_counter()-start if wait else None
