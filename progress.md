@@ -14,11 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones, the 2026-08-01 census is **105 passed, 307 failed, and 13 skipped**.
-Pytest prints `433 failed` because it separately counts 126 failing subtests.
+milestones through dedicated two-level QuickGELU, the 2026-08-01 census is
+**114 passed, 298 failed, and 13 skipped**. Pytest prints `424 failed` because
+it separately counts 126 failing subtests.
 
 Therefore the clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 29-host/10-NPU
+while recovering the remaining native forward coverage. Focused 33-host/14-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -63,7 +64,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `d7fce428a` | Variable-width LUT tasks and two-level HardSwish | `0180-rockchip-add-two-level-HardSwish-LUT.patch` |
 | `9baa14d7d` | Two-level tanh with device saturation | `0181-rockchip-add-two-level-tanh-LUT.patch` |
 | `228e2b51a` | Direct EXP2 IEEE special-value epilogue | `0182-rockchip-handle-EXP2-special-values.patch` |
-| current milestone | Shared two-level sigmoid for sigmoid/SiLU/Swish | `0183-rockchip-add-two-level-sigmoid-LUT.patch` |
+| `a1a966fe8` | Shared two-level sigmoid for sigmoid/SiLU/Swish | `0183-rockchip-add-two-level-sigmoid-LUT.patch` |
+| current milestone | Dedicated two-level QuickGELU with bounded tails | `0184-rockchip-add-two-level-QuickGELU-LUT.patch` |
 
 ## Architecture now implemented
 
@@ -100,6 +102,7 @@ Implemented forward-only subset:
 - HardSwish using the oracle-proven Q14 broad LUT, arithmetic outer fallback, and Q15 near-zero LUT correction, all selected on the NPU;
 - tanh using the oracle-proven Q15 broad/local LUTs, identity correction near zero, and exact device-side saturation outside `[-4,4]`;
 - sigmoid using Q15 broad/local LUTs and device saturation, reused directly by SiLU and Swish;
+- QuickGELU using dedicated Q14 broad/Q15 negative-local LUTs, a near-zero polynomial, and bounded shared-sigmoid tails;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -111,12 +114,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  755
+tinygrad/renderer/rockchip.py  793
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  829
+handwritten Rockchip total  867
 ```
 
-This meets the requested `<5000` backend goal with 4,171 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 4,133 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -126,7 +129,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 25,805 `sz.py` lines, a `+837` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 805 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 25,843 `sz.py` lines, a `+875` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 843 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 
@@ -175,7 +178,8 @@ Recent precision probes that must not be rediscovered as final fixes:
 - `x*(clamp/6)` reduced it to 4/2925; `(x*clamp)/6` produced 13/2925;
 - the adjacent upper FP16 BS coefficient produced 92/2925 mismatches; Q16 and Q12 `OUT_CVT` scale probes respectively overflowed and divided by `MINUS_EXP` without applying the assumed numerator;
 - the final passing path uses `rockchip-2607`'s Q14 broad/Q15 local two-LUT policy, reduced to 36 typed stages by variable-width LUT tasks;
-- EXP2 tiling is accurate for finite inputs in `[-2,2]`, but raw LUT overflow handling currently maps `[+inf,-inf,nan]` to `[8,0.25,8]` instead of `[inf,0,nan]`.
+- raw EXP2 LUT overflow handling mapped `[+inf,-inf,nan]` to `[8,0.25,8]`; the committed device-mask epilogue now restores `[inf,0,nan]`.
+- reusing the sigmoid LUT for QuickGELU fixed extreme inputs but left 116/2,925 normal mismatches; dedicated 2607-proven Q14/Q15 tables reduced the official normal and extreme methods to zero failures.
 
 No-host-fallback audit:
 

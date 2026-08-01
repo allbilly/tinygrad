@@ -79,4 +79,12 @@ class TestRockchip(unittest.TestCase):
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").sigmoid().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_two_level_quick_gelu_lut(self):
+    data = np.linspace(-4, 4, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    expected = (fp32/(1+np.exp(-1.702*fp32))).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").quick_gelu().numpy(), expected, rtol=3e-2, atol=1e-4)
+    extreme = np.array([-350, 350], dtype=np.float16)
+    np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").quick_gelu().numpy(), np.array([-0., 350], dtype=np.float16))
+
 if __name__ == "__main__": unittest.main()

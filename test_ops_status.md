@@ -76,23 +76,23 @@ unittest subtests. Runtime was 71.82 seconds. This is the honest clean-rewrite
 parity baseline; the 18 host compiler tests and six focused hardware tests are
 smoke/contract tests, not a replacement for this census.
 
-## Clean branch focused verified matrix
+## Clean branch current exact census
 
-Latest complete uncached census after the two-level tanh milestone:
+Latest complete uncached census after the dedicated two-level QuickGELU milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 108 |
-| FAIL | 304 |
+| PASS | 114 |
+| FAIL | 298 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `430 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 85.25 seconds.
+Pytest reports `424 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 113.41 seconds. Relative
+to the preceding exact tanh census, EXP2 special values add one passing method,
+shared sigmoid/SiLU/Swish add three, and normal/extreme QuickGELU add two.
 
-After that exact census, the isolated direct-EXP2 special-value milestone moves `test_exp2` from FAIL to PASS, giving a current method delta of 109 PASS / 303 FAIL / 13 SKIP. A new full-census runtime has not yet been recorded.
-
-The shared two-level sigmoid milestone additionally moves `test_sigmoid`, `test_silu`, and `test_swish` to PASS. Current validated delta: 112 PASS / 300 FAIL / 13 SKIP.
+## Focused verified matrix
 
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
@@ -103,10 +103,11 @@ The shared two-level sigmoid milestone additionally moves `test_sigmoid`, `test_
 | Two-level HardSwish LUT | typed 36-stage plan | 1 dense sweep | PASS |
 | Two-level tanh LUT and saturation | typed 35-stage plan | 1 dense sweep | PASS |
 | Shared two-level sigmoid/SiLU/Swish | typed 24/25-stage plans | 1 dense local sweep | PASS |
+| Dedicated two-level QuickGELU | typed 58-stage plan | normal/extreme official methods and 1 broad sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 32 | 13 (plus 4 subtests) | PASS |
+| Clean image/compiler suite total | 33 | 14 (plus 4 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

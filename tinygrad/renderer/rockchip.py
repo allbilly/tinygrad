@@ -40,6 +40,8 @@ class RKDPUOp(IntEnum):
   TANH_LOCAL = 11
   SIGMOID = 12
   SIGMOID_LOCAL = 13
+  QUICK_GELU = 14
+  QUICK_GELU_LOCAL = 15
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -120,6 +122,40 @@ class RKPool:
 class _DPUExpr:
   op: RKDPUOp
   src: tuple[_DPUExpr|RKArg|float, ...]
+
+def _sigmoid_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  """Two-level sigmoid LUT with analytic tails and preserved NaN behavior."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  broad, local = _DPUExpr(RKDPUOp.SIGMOID, (source,)), _DPUExpr(RKDPUOp.SIGMOID_LOCAL, (source,))
+  local_outside = _DPUExpr(RKDPUOp.MAX, (positive(-2.0, source), positive(source, 2.0)))
+  selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, local_outside)),
+    _DPUExpr(RKDPUOp.MUL, (local, _DPUExpr(RKDPUOp.SUB, (1.0, local_outside))))))
+  high, low = positive(source, 8.0), positive(-8.0, source)
+  high_result = _DPUExpr(RKDPUOp.ADD, (selected, _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB, (1.0, selected)), high))))
+  bounded = _DPUExpr(RKDPUOp.MUL, (high_result, _DPUExpr(RKDPUOp.SUB, (1.0, low))))
+  nan_denom = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MUL, (high, low))))
+  return _DPUExpr(RKDPUOp.DIV, (_DPUExpr(RKDPUOp.MUL, (bounded, nan_denom)), nan_denom))
+
+def _quick_gelu_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  """Dedicated broad/local LUTs plus a polynomial near zero and bounded sigmoid tails."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  base = _DPUExpr(RKDPUOp.MUL, (source, _sigmoid_expr(_DPUExpr(RKDPUOp.MUL, (source, 1.702)))))
+  broad, local = _DPUExpr(RKDPUOp.QUICK_GELU, (source,)), _DPUExpr(RKDPUOp.QUICK_GELU_LOCAL,
+    (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.ADD, (source, 1.5)), 4.0)),))
+  below, above = positive(-2.0, source), positive(source, 2.0)
+  outside = _DPUExpr(RKDPUOp.MAX, (below, above))
+  inside = _DPUExpr(RKDPUOp.SUB, (1.0, outside))
+  local_inside = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MAX, (below, positive(source, -1.0)))))
+  poly_inside = _DPUExpr(RKDPUOp.MUL, (positive(source, -0.16), positive(0.16, source)))
+  broad_mask = _DPUExpr(RKDPUOp.SUB, (_DPUExpr(RKDPUOp.SUB, (inside, local_inside)), poly_inside))
+  poly_x = _DPUExpr(RKDPUOp.MUL, (source, poly_inside))
+  polynomial = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (poly_x, 0.5)),
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (poly_x, poly_x)), 0.4253))))
+  inner = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, broad_mask)),
+    _DPUExpr(RKDPUOp.MUL, (local, local_inside)))), polynomial))
+  return _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (base, outside)), inner))
 
 def _slot_mask(slots:tuple[int, ...]) -> int:
   if any(x < 0 or x >= 64 for x in slots): raise ValueError("RKImage supports argument slots 0..63")
@@ -271,8 +307,8 @@ def _canonical_tanh(u:UOp) -> UOp|None:
   factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
   return source if source is not None and factor is not None and abs(factor + 2.8853900817779268) < 1e-3 else None
 
-def _canonical_sigmoid(u:UOp) -> UOp|None:
-  """Recognize 1/(1+exp2(-log2(e)*x))."""
+def _canonical_scaled_sigmoid(u:UOp, scale:float=1.0) -> UOp|None:
+  """Recognize 1/(1+exp2(-scale*log2(e)*x))."""
   u = _unwrap_same_cast(u)
   if u.op is not Ops.RECIPROCAL or (_unwrap_same_cast(u.src[0])).op is not Ops.ADD: return None
   denominator = _unwrap_same_cast(u.src[0])
@@ -282,7 +318,19 @@ def _canonical_sigmoid(u:UOp) -> UOp|None:
   scaled = _unwrap_same_cast(exponential.src[0])
   source = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.INDEX), None)
   factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
-  return source if source is not None and factor is not None and abs(factor + 1.4426950408889634) < 1e-3 else None
+  return source if source is not None and factor is not None and abs(factor + scale*1.4426950408889634) < 1e-3 else None
+
+def _canonical_sigmoid(u:UOp) -> UOp|None: return _canonical_scaled_sigmoid(u)
+
+def _canonical_quick_gelu(u:UOp) -> UOp|None:
+  """Recognize x*sigmoid(1.702*x)."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  for source, sigmoid in (u.src, u.src[::-1]):
+    source, sigmoid = _unwrap_same_cast(source), _unwrap_same_cast(sigmoid)
+    if source.op is Ops.INDEX and (sigmoid_source:=_canonical_scaled_sigmoid(sigmoid, 1.702)) is not None and sigmoid_source.key == source.key:
+      return source
+  return None
 
 def _canonical_silu(u:UOp) -> tuple[UOp,UOp]|None:
   u = _unwrap_same_cast(u)
@@ -348,6 +396,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (quick_gelu:=_canonical_quick_gelu(u)) is not None:
+    source = _parse_dpu_expr(quick_gelu, output_index, memo)
+    if source is None: return None
+    ret = _quick_gelu_expr(source)
   elif (silu:=_canonical_silu(u)) is not None:
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in silu)
     if any(x is None for x in operands): return None
@@ -395,17 +447,7 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   elif (sigmoid_input:=_canonical_sigmoid(u)) is not None:
     source = _parse_dpu_expr(sigmoid_input, output_index, memo)
     if source is None: return None
-    def sigpos(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
-      return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-    broad, local = _DPUExpr(RKDPUOp.SIGMOID, (source,)), _DPUExpr(RKDPUOp.SIGMOID_LOCAL, (source,))
-    local_outside = _DPUExpr(RKDPUOp.MAX, (sigpos(-2.0, source), sigpos(source, 2.0)))
-    selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, local_outside)),
-      _DPUExpr(RKDPUOp.MUL, (local, _DPUExpr(RKDPUOp.SUB, (1.0, local_outside))))))
-    high, low = sigpos(source, 8.0), sigpos(-8.0, source)
-    high_result = _DPUExpr(RKDPUOp.ADD, (selected, _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB, (1.0, selected)), high))))
-    bounded = _DPUExpr(RKDPUOp.MUL, (high_result, _DPUExpr(RKDPUOp.SUB, (1.0, low))))
-    nan_denom = _DPUExpr(RKDPUOp.SUB, (1.0, _DPUExpr(RKDPUOp.MUL, (high, low))))
-    ret = _DPUExpr(RKDPUOp.DIV, (_DPUExpr(RKDPUOp.MUL, (bounded, nan_denom)), nan_denom))
+    ret = _sigmoid_expr(source)
   elif (clamp_base:=_canonical_relu_difference(u)) is not None:
     base = _parse_dpu_expr(clamp_base, output_index, memo)
     if base is None: return None
@@ -617,7 +659,10 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
     RKDPUOp.TANH_LOCAL:(rklut.RK_LUT_TANH_LOCAL, rklut.RK_LUT_TANH_LOCAL_BN_MUL, rklut.RK_LUT_TANH_LOCAL_MINUS_EXP),
     RKDPUOp.SIGMOID:(rklut.RK_LUT_SIGMOID, rklut.RK_LUT_SIGMOID_BN_MUL, rklut.RK_LUT_SIGMOID_MINUS_EXP),
     RKDPUOp.SIGMOID_LOCAL:(rklut.RK_LUT_SIGMOID_LOCAL, rklut.RK_LUT_SIGMOID_LOCAL_BN_MUL,
-                          rklut.RK_LUT_SIGMOID_LOCAL_MINUS_EXP)}[plan.op]
+                          rklut.RK_LUT_SIGMOID_LOCAL_MINUS_EXP),
+    RKDPUOp.QUICK_GELU:(rklut.RK_LUT_QUICK_GELU, rklut.RK_LUT_QUICK_GELU_BN_MUL, rklut.RK_LUT_QUICK_GELU_MINUS_EXP),
+    RKDPUOp.QUICK_GELU_LOCAL:(rklut.RK_LUT_QUICK_GELU_LOCAL, rklut.RK_LUT_QUICK_GELU_LOCAL_BN_MUL,
+                             rklut.RK_LUT_QUICK_GELU_LOCAL_MINUS_EXP)}[plan.op]
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
@@ -700,7 +745,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
     if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL,
-                   RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL):
+                   RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:

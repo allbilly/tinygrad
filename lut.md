@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 4 |
+| Schema | 5 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -73,6 +73,17 @@ Tanh uses the same regional-correction structure:
 The official normal and `[-300,-297]` extreme methods both pass. The plan is 35 stages with five scratch buffers.
 
 Sigmoid adds `RKLUT.SIGMOID = 6` over `[-8,8]` and `RKLUT.SIGMOID_LOCAL = 7` over `[-2,2]`, both Q15. NPU masks select the dense local table, saturate infinities, and preserve NaN. The 24-stage sigmoid expression is reused by SiLU/Swish with one final MUL, so all three official methods pass without duplicate runtime recipes. Dense strict-relative validation is guaranteed for the local domain; finite tails beyond the broad domain currently follow the frozen branch's saturation policy.
+
+QuickGELU uses two additional generated NPU tasks rather than retuning sigmoid and risking regressions:
+
+- `RKLUT.QUICK_GELU = 8` is Q14 over `[-2,2]`, with index scale 8192 and output scale 16384;
+- five measured integer-knot corrections from the passing 2607 oracle are applied after quantization: `(LE,276,+4)`, `(LE,375,+1)`, `(LE,408,+1)`, `(LE,427,+1)`, and `(LO,49,+1)`;
+- `RKLUT.QUICK_GELU_LOCAL = 9` is Q15 for `x in [-2,-1]`, addressed by `z=(x+1.5)*4`;
+- local knots blend the ideal curve and PyTorch-style staged FP16 multiplication/sigmoid result equally, so fitting includes intermediate half rounding;
+- a device polynomial `0.5*x + 0.4253*x^2` handles `[-0.16,0.16]`;
+- the shared bounded sigmoid expression supplies tails outside `[-2,2]`, including exact zero/identity asymptotes for extreme negative/positive inputs.
+
+The typed plan has 58 stages and six reusable scratch buffers. The official normal and both extreme subcases pass at `rtol=0.001, atol=1e-6`. A mathematically ideal dense float32 curve is not the tuning oracle: it differs from PyTorch's staged FP16 boundaries, which is why the sparse corrections and local blend must remain generator inputs rather than unexplained edits to generated data.
 
 ## Current command contract
 
