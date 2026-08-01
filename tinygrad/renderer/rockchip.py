@@ -231,9 +231,10 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
   if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or store.src[0].dtype is not dtypes.half: return None
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
-  if out_param.op is not Ops.PARAM or out_index.op is not Ops.RANGE or out_param.src[0].op is not Ops.CONST: return None
+  if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST: return None
   count = int(out_param.src[0].arg)
-  if count <= 0 or int(out_index.src[0].arg) != count: return None
+  if count <= 0 or (out_index.op is Ops.RANGE and int(out_index.src[0].arg) != count) or \
+     (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)): return None
   root = _parse_dpu_expr(store.src[1], out_index, {})
   if root is None: return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)

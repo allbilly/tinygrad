@@ -56,6 +56,11 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(plan.stages[0].op.name, "ADD")
     self.assertEqual(len(emit_dpu(plan).constants), 64)
 
+  def test_scalar_fill_uses_const_zero_index(self):
+    plan = lower_dpu(sink(Tensor.ones((), dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.stages[0].count, 1)
+
   def test_liveness_reuses_dead_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))
     plan = lower_dpu(sink(((a+b)*c)+d))
