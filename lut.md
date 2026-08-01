@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 12 |
+| Schema | 13 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -106,6 +106,8 @@ LogSigmoid uses `RKLUT.LOGSIGMOID = 24`, Q15 `-log1p(exp(-abs(x)))` over `[-8,8]
 Softplus uses broad/tail pairs `SOFTPLUS1 = 26/27` and `SOFTPLUS3 = 28/29`, plus the Q13 wide `SOFTPLUS13 = 30` table. The β=3 pair stores full-Q15 corrections and sets `OUT_CVT_SCALE` to Q15 `1/3` with an integer shift of 15, applying scale before FP16 storage; baking `/3` into knots or using a later MUL both miss strict FP16 boundaries. Inputs are clamped to each table's declared domain before lookup, and masks enforce zero/identity asymptotes. β=1 and β=3 use 27 stages/four scratch buffers; β=1/3 uses eight stages/two buffers. All official normal, extreme, and scalar cases pass. The ideal dense sweep uses `atol=3e-6` for amplified-tail values that intentionally round to zero.
 
 Hyperbolic functions use `SINH = 31`, Q13 on `[-2,2]`, `SINH_LOCAL = 32`, Q15 `4*sinh(x)` near zero, and `COSH = 33`, Q13 on `[-2,2]`. Sinh selects the local table inside `|x|<0.125` and identity inside `|x|<0.04`; Cosh needs only the broad table. Inputs are clamped before lookup, and division by a device mask creates signed Sinh infinity or positive Cosh infinity for `|x|>10`. The 30/11-stage plans pass normal and ±300 official cases plus strict central dense sweeps.
+
+Sqrt uses `SQRT = 34`, a Q14 seed table over `[0,4]` with index scale 4090. Three Newton steps execute on the NPU as `y=(y+x/y)/2`, removing the linear interpolation curvature error. Device masks preserve exact signed zero, synthesize positive infinity above the FP16 finite range, and return NaN for negative or NaN input. The typed program has 25 stages and four reusable scratch buffers. FP32 explicit/scalar inputs are narrowed once at the declared runtime ABI boundary; the LUT, refinement, and all special-value semantics remain NPU operations. The official method and a dense 2,049-point `[0,16]` sweep pass.
 
 ## Current command contract
 

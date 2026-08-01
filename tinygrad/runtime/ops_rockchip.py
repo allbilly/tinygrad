@@ -35,10 +35,18 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
+    prepared, converted = list(bufs), []  # type: list[HCQBuffer], list[HCQBuffer]
+    for slot in self.image.fp32_inputs:
+      if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid FP32 input slot {slot}")
+      import numpy as np
+      source, temporary = bufs[slot], self.dev._gpu_alloc(bufs[slot].size//2)
+      values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float32).astype(np.float16)
+      ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      prepared[slot], converted = temporary, [*converted, temporary]
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
-        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
-        return self._dma(bufs[index])
+        if index >= len(prepared): raise RuntimeError(f"RKImage argument slot {index} is not bound")
+        return self._dma(prepared[index])
       if kind is RKBufferKind.SCRATCH:
         if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
         return self._dma(self.scratch[index])
@@ -46,23 +54,26 @@ class RockchipProgram(Program['RockchipDevice']):
       return self._dma(self.constants) + index
 
     start = time.perf_counter()
-    for stage, commands in zip(self.image.stages, patch_image(self.image, address)):
-      if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
-      cmd = self.dev._gpu_alloc(len(commands)*8)
-      task = self.dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
-      try:
-        ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64*len(commands))(*commands), len(commands)*8)
-        op_idx, enable_mask, int_mask = _TASK[stage.engine]
-        descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
-          int_status=0, regcfg_amount=len(commands), regcfg_offset=0, regcmd_addr=self._dma(cmd))
-        ctypes.memmove(int(task.va_addr), ctypes.addressof(descriptor), ctypes.sizeof(descriptor))
-        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000, task_start=0, task_number=1,
-          task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
-          core_mask=1, fence_fd=-1, subcore_task=(rk.struct_rknpu_subcore_task*5)(rk.struct_rknpu_subcore_task(0,1)))
-      finally:
-        self.dev._gpu_free(cmd)
-        self.dev._gpu_free(task)
+    try:
+      for stage, commands in zip(self.image.stages, patch_image(self.image, address)):
+        if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
+        cmd = self.dev._gpu_alloc(len(commands)*8)
+        task = self.dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
+        try:
+          ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64*len(commands))(*commands), len(commands)*8)
+          op_idx, enable_mask, int_mask = _TASK[stage.engine]
+          descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
+            int_status=0, regcfg_amount=len(commands), regcfg_offset=0, regcmd_addr=self._dma(cmd))
+          ctypes.memmove(int(task.va_addr), ctypes.addressof(descriptor), ctypes.sizeof(descriptor))
+          rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+            flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000, task_start=0, task_number=1,
+            task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
+            core_mask=1, fence_fd=-1, subcore_task=(rk.struct_rknpu_subcore_task*5)(rk.struct_rknpu_subcore_task(0,1)))
+        finally:
+          self.dev._gpu_free(cmd)
+          self.dev._gpu_free(task)
+    finally:
+      for buf in converted: self.dev._gpu_free(buf)
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):

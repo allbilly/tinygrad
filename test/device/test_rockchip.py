@@ -138,4 +138,14 @@ class TestRockchip(unittest.TestCase):
                                (lambda x:x.cosh(), np.cosh(data.astype(np.float32)))):
       np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).numpy(), expected.astype(np.float16), rtol=1e-3, atol=1e-6)
 
+  def test_refined_sqrt_lut_and_fp32_boundary(self):
+    data = np.linspace(0, 16, 2049, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").sqrt().numpy(), np.sqrt(data.astype(np.float32)).astype(np.float16),
+                               rtol=1e-3, atol=1e-6)
+    special = np.array([-1, -0., 0., np.inf, np.nan], dtype=np.float16)
+    with np.errstate(invalid="ignore"): expected_special = np.sqrt(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").sqrt().numpy(), expected_special)
+    fp32 = np.array([0., 1., 4.], dtype=np.float32)
+    np.testing.assert_equal(Tensor(fp32, device="ROCKCHIP").sqrt().numpy(), np.sqrt(fp32))
+
 if __name__ == "__main__": unittest.main()

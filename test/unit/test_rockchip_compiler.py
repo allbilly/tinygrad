@@ -133,6 +133,13 @@ class TestDPUCompiler(unittest.TestCase):
     x, y = Tensor.empty(16,dtype=dtypes.float), Tensor.empty(16,dtype=dtypes.float)
     self.assertIsNone(lower_dpu(sink(x+y)))
 
+  def test_sqrt_records_fp32_input_boundary(self):
+    plan = lower_dpu(sink(Tensor.empty(1, dtype=dtypes.float).sqrt()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(plan.fp32_inputs, (1,))
+    image = emit_dpu(plan)
+    self.assertEqual(decode_image(encode_image(image)).fp32_inputs, (1,))
+
   def test_ordered_where_normalizes_to_dpu_extrema(self):
     x = Tensor.empty(16,dtype=dtypes.half)
     for expression in (x.relu(), x.clip(-1, 1)):
@@ -275,6 +282,14 @@ class TestDPUCompiler(unittest.TestCase):
     for name in ("SINH", "SINH_LOCAL", "COSH"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+
+  def test_sqrt_uses_refined_generated_lut(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).sqrt()))
+    self.assertEqual((len(plan.stages), len(plan.scratch), plan.fp32_inputs), (25, 4, ()))
+    self.assertEqual(sum(x.op is RKDPUOp.SQRT for x in plan.stages), 1)
+    table = rklut.RK_LUT_SQRT
+    self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_SQRT_SHA256)
+    self.assertFalse(contains_uop(plan))
 
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

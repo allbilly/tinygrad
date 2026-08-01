@@ -66,6 +66,7 @@ class RKDPUOp(IntEnum):
   SINH = 37
   SINH_LOCAL = 38
   COSH = 39
+  SQRT = 40
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -100,6 +101,7 @@ class RKImage:
   scratch: tuple[RKScratch, ...] = ()
   constants: bytes = b""
   version: int = RKIMAGE_VERSION
+  fp32_inputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKArg:
@@ -120,6 +122,7 @@ class RKDPUStage:
 class RKDPUProgram:
   stages: tuple[RKDPUStage, ...]
   scratch: tuple[RKScratch, ...]
+  fp32_inputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKView:
@@ -321,6 +324,21 @@ def _sinh_cosh_expr(source:_DPUExpr|RKArg|float, is_cosh:bool) -> _DPUExpr:
   denominator = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, 10.0)))
   return _DPUExpr(RKDPUOp.DIV, (selected, denominator))
 
+def _sqrt_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  refined:_DPUExpr = _DPUExpr(RKDPUOp.SQRT, (source,))
+  for _ in range(3): refined = _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.ADD, (refined, _DPUExpr(RKDPUOp.DIV, (source, refined)))), .5))
+  high, negative = positive(source, 65472.0), positive(0.0, source)
+  nonzero = _DPUExpr(RKDPUOp.MAX, (positive(source, 0.0), negative))
+  not_number = _DPUExpr(RKDPUOp.MUL, (positive(source, 0.0), negative))
+  positive_result = _DPUExpr(RKDPUOp.DIV, (refined, _DPUExpr(RKDPUOp.SUB, (1.0, high))))
+  zero_result = _DPUExpr(RKDPUOp.MUL, (positive_result, nonzero))
+  invalid = _DPUExpr(RKDPUOp.MAX, (negative, not_number))
+  valid = _DPUExpr(RKDPUOp.SUB, (1.0, invalid))
+  return _DPUExpr(RKDPUOp.MUL, (zero_result, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
+
 def _slot_mask(slots:tuple[int, ...]) -> int:
   if any(x < 0 or x >= 64 for x in slots): raise ValueError("RKImage supports argument slots 0..63")
   return sum(1 << x for x in slots)
@@ -337,6 +355,7 @@ def validate_image(image:RKImage) -> None:
         raise ValueError("invalid relocation field")
   for scratch in image.scratch:
     if scratch.size < 0 or scratch.alignment <= 0 or scratch.alignment & (scratch.alignment-1): raise ValueError("invalid scratch declaration")
+  if any(x < 0 or x >= 32 for x in image.fp32_inputs): raise ValueError("RKImage FP32 input slots must be in 0..31")
 
 def encode_image(image:RKImage) -> bytes:
   validate_image(image)
@@ -350,7 +369,7 @@ def encode_image(image:RKImage) -> bytes:
     stage_rows.append((int(stage.engine), stage.flags, 0, stage.dependencies, command_start, len(stage.commands), reloc_start, len(stage.relocs),
                        _slot_mask(stage.reads), _slot_mask(stage.writes)))
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.stages), len(relocs), len(image.scratch), 0,
-                               len(commands), len(image.constants), 0))
+                               len(commands), len(image.constants), sum(1 << x for x in image.fp32_inputs)))
   for engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes in stage_rows:
     out += _STAGE.pack(engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes)
   for reloc in relocs:
@@ -362,7 +381,7 @@ def encode_image(image:RKImage) -> bytes:
 def decode_image(blob:bytes) -> RKImage:
   if len(blob) < _HEADER.size: raise ValueError("truncated RKImage header")
   magic, version, target, stage_count, reloc_count, scratch_count, reserved, command_count, constant_size, reserved2 = _HEADER.unpack_from(blob)
-  if magic != RKIMAGE_MAGIC or reserved or reserved2: raise ValueError("invalid RKImage header")
+  if magic != RKIMAGE_MAGIC or reserved: raise ValueError("invalid RKImage header")
   expected = _HEADER.size + stage_count*_STAGE.size + reloc_count*_RELOC.size + scratch_count*_SCRATCH.size + command_count*8 + constant_size
   if expected != len(blob): raise ValueError("invalid RKImage size")
   off, rows = _HEADER.size, []
@@ -385,7 +404,7 @@ def decode_image(blob:bytes) -> RKImage:
     stages.append(RKStage(RKEngine(engine), tuple(commands[command_start:command_start+command_len]),
                           tuple(relocs[reloc_start:reloc_start+reloc_len]), slots(reads), slots(writes), deps, flags))
     if any(r.stage != idx for r in stages[-1].relocs): raise ValueError("relocation belongs to wrong stage")
-  image = RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], version)
+  image = RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], version, tuple(x for x in range(32) if reserved2 & (1 << x)))
   validate_image(image)
   return image
 
@@ -653,6 +672,13 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(hyperbolic[0], output_index, memo)
     if source is None: return None
     ret = _sinh_cosh_expr(source, hyperbolic[1])
+  elif u.op is Ops.SQRT:
+    raw_source = _unwrap_same_cast(u.src[0])
+    source = (RKArg(RKBufferKind.ARG, raw_source.src[0].arg.slot) if raw_source.op is Ops.INDEX and raw_source.dtype is dtypes.float and
+              raw_source.src[0].op is Ops.PARAM and raw_source.src[1].key == output_index.key else
+              _parse_dpu_expr(raw_source, output_index, memo))
+    if source is None: return None
+    ret = _sqrt_expr(source)
   elif (silu:=_canonical_silu(u)) is not None:
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in silu)
     if any(x is None for x in operands): return None
@@ -771,7 +797,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   # Native int32 WDMA emits four values per eight-lane fp16 atom. Constant
   # fills can safely double their source lanes; dynamic conversion needs an
   # explicit packed layout and is deliberately not inferred here.
-  if store.src[0].dtype is not dtypes.half and not isinstance(root, float): return None
+  if store.src[0].dtype is dtypes.int and not isinstance(root, float): return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, _DPUExpr):
     if store.src[0].dtype in (dtypes.int, dtypes.float):
@@ -819,7 +845,9 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
         arg = values[dependency]
         if uses[dependency] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
   size = ((count+7)//8)*16
-  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)))
+  fp32_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.float and
+                                   x.src[0].op is Ops.PARAM))
+  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs)
 
 def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
@@ -931,7 +959,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (RKDPUOp.LOGSIGMOID_TAIL,"LOGSIGMOID_TAIL"),(RKDPUOp.SOFTPLUS1,"SOFTPLUS1"),
                        (RKDPUOp.SOFTPLUS1_TAIL,"SOFTPLUS1_TAIL"),(RKDPUOp.SOFTPLUS3,"SOFTPLUS3"),
                        (RKDPUOp.SOFTPLUS3_TAIL,"SOFTPLUS3_TAIL"),(RKDPUOp.SOFTPLUS13,"SOFTPLUS13"),
-                       (RKDPUOp.SINH,"SINH"),(RKDPUOp.SINH_LOCAL,"SINH_LOCAL"),(RKDPUOp.COSH,"COSH"))}}[plan.op]
+                       (RKDPUOp.SINH,"SINH"),(RKDPUOp.SINH_LOCAL,"SINH_LOCAL"),(RKDPUOp.COSH,"COSH"),
+                       (RKDPUOp.SQRT,"SQRT"))}}[plan.op]
   post_scale = {RKDPUOp.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 RKDPUOp.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.op, 1.0)
   cmds = []
@@ -1022,7 +1051,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
                    RKDPUOp.ERF, RKDPUOp.ERF_LOCAL, RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL,
                    RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, RKDPUOp.MISH, RKDPUOp.MISH_LOCAL, RKDPUOp.LOGSIGMOID,
                    RKDPUOp.LOGSIGMOID_TAIL, RKDPUOp.SOFTPLUS1, RKDPUOp.SOFTPLUS1_TAIL, RKDPUOp.SOFTPLUS3,
-                   RKDPUOp.SOFTPLUS3_TAIL, RKDPUOp.SOFTPLUS13, RKDPUOp.SINH, RKDPUOp.SINH_LOCAL, RKDPUOp.COSH):
+                   RKDPUOp.SOFTPLUS3_TAIL, RKDPUOp.SOFTPLUS13, RKDPUOp.SINH, RKDPUOp.SINH_LOCAL, RKDPUOp.COSH,
+                   RKDPUOp.SQRT):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:
@@ -1059,7 +1089,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     reads = tuple(sorted({x.index for x in operands if x.kind is RKBufferKind.ARG}))
     writes = (plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ()
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET))
-  return RKImage(target, tuple(stages), program.scratch, bytes(constants))
+  return RKImage(target, tuple(stages), program.scratch, bytes(constants), fp32_inputs=program.fp32_inputs)
 
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit a direct FP16 CMAC surface; inputs and output are already in hardware-legal layouts."""

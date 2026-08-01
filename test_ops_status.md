@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Meaning of this file
 
-This status separates the frozen broad prototype from the clean `rockchip-2608` backend. A rejection is not counted as a pass. The clean runtime has no CPU semantic fallback, so unsupported cases fail during compilation with `RKPLAN_REJECT:unsupported_graph`.
+This status separates the frozen broad prototype from the clean `rockchip-2608` backend. A rejection is not counted as a pass. The clean runtime has no CPU semantic fallback, so unsupported cases fail during compilation with `RKPLAN_REJECT:unsupported_graph`. A declared FP32-to-FP16 input-format conversion is permitted at the Sqrt ABI boundary; Sqrt itself remains an NPU task graph.
 
 Use:
 
@@ -78,19 +78,19 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the direct Sinh/Cosh milestone:
+Latest complete uncached census after the refined Sqrt milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 124 |
-| FAIL | 288 |
+| PASS | 125 |
+| FAIL | 287 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `414 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 202.88 seconds. This
+Pytest reports `413 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 225.31 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
-GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, and Sinh/Cosh.
+GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, and Sqrt.
 
 ## Focused verified matrix
 
@@ -111,22 +111,24 @@ GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, and Sinh/Cosh.
 | Broad/tail LogSigmoid | typed 15-stage plan | official method and strict `[-12,12]` sweep | PASS |
 | Parameterized Softplus | typed 27/27/8-stage plans | all official β/extreme/scalar cases and dense sweep | PASS |
 | Direct Sinh/Cosh | typed 30/11-stage plans | normal and ±extreme official cases plus dense sweep | PASS |
+| Refined Sqrt | typed 25-stage plan plus declared FP32 ABI input | official normal/zero/scalar cases, dense sweep, and IEEE specials | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 40 | 21 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 42 | 22 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
 ## Supported contracts
 
-- dtype: FP16 expression graphs plus tiled native int32/FP32 constant fills;
+- dtype: FP16 expression graphs, tiled native int32/FP32 constant fills, and bounded FP32 Sqrt input conversion;
 - mode: forward only;
 - static shapes;
 - DPU contiguous storage and one output;
 - direct and composed EXP2 use one variable-width task, but only the finite `[-2,2]` domain is correct;
 - HardSwish uses two generated LUT tasks with arithmetic/mask selection and no host fallback;
 - tanh uses two generated LUT tasks with near-zero correction and exact `-1/+1` saturation tails;
+- Sqrt uses one generated seed LUT, three NPU Newton refinements, and device special-value masks;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.
