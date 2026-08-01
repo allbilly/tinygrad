@@ -20,6 +20,11 @@ class TestRKImage(unittest.TestCase):
     self.assertEqual(decode_image(blob), image)
     self.assertEqual(encode_image(decode_image(blob)), blob)
 
+  def test_roundtrip_preserves_wide_constant_offset(self):
+    image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (0,),
+      (RKReloc(0, 0, RKBufferKind.CONSTANT, 0x10000),)),), constants=b"\0"*0x10001)
+    self.assertEqual(decode_image(encode_image(image)), image)
+
   def test_relocation_patches_only_value_field(self):
     command = 0x1001a5a5a5a50040
     image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (command,),

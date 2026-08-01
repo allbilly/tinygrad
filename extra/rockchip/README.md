@@ -22,6 +22,10 @@ The runtime does not import NumPy, narrow FP32 buffers, execute tensor
 semantics on the host, or provide a CPU fallback. Unsupported graphs reject
 before submission with `RKPLAN_REJECT:unsupported_graph`.
 
+RKImage v2 uses 64-bit dependency masks and 32-bit constant relocation
+offsets. Its encoder validates serialized field bounds so oversized or
+unsupported graphs cannot leak a late `struct.error` from image packing.
+
 ## Declared contract
 
 - static, contiguous FP16 elementwise ADD, MUL, MAX, and division;
@@ -75,8 +79,8 @@ and has no skip on an RK3588 host.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This backend branch contains
-25,487, so `MAX_LINE_COUNT=25000 python sz.py` fails by 487 lines even though
-the handwritten backend is only 514 counted lines (441 renderer/compiler and
+25,490, so `MAX_LINE_COUNT=25000 python sz.py` fails by 490 lines even though
+the handwritten backend is only 517 counted lines (444 renderer/compiler and
 73 runtime). The code must not be hidden under `runtime/autogen` or moved out of
 tree to evade this limit. The generic native-program hook is an independent
 five-line counted change and can be reviewed separately; the backend needs

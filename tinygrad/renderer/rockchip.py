@@ -10,9 +10,9 @@ from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 1, 1
-_HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHIIIIIQQ")
-_RELOC, _SCRATCH = struct.Struct("<HHBBHqII"), struct.Struct("<II")
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 2, 1
+_HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHQIIIIQQ")
+_RELOC, _SCRATCH = struct.Struct("<HHBBIqIH"), struct.Struct("<II")
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum):
@@ -112,15 +112,18 @@ def _slot_mask(slots:tuple[int, ...]) -> int:
 
 def validate_image(image:RKImage) -> None:
   if image.version != RKIMAGE_VERSION: raise ValueError(f"unsupported RKImage version {image.version}")
-  if len(image.stages) > 64: raise ValueError("too many RKImage stages")
+  if len(image.stages) > 64 or sum(len(x.relocs) for x in image.stages) >> 16: raise ValueError("too many RKImage records")
+  if len(image.constants) >> 32 or len(image.scratch) >> 16: raise ValueError("RKImage payload is too large")
   for stage_idx, stage in enumerate(image.stages):
     if stage.dependencies >> stage_idx: raise ValueError("stage dependency must refer to an earlier stage")
     _slot_mask(stage.reads), _slot_mask(stage.writes)
     for reloc in stage.relocs:
       if reloc.stage != stage_idx or not 0 <= reloc.word < len(stage.commands): raise ValueError("invalid relocation location")
-      if reloc.index < 0 or reloc.shift < 0 or reloc.field_shift < 0 or reloc.mask >> 32: raise ValueError("invalid relocation field")
+      if reloc.word >> 16 or reloc.index < 0 or reloc.index >> 32 or not 0 <= reloc.shift < 64 or \
+         not 0 <= reloc.field_shift < 32 or reloc.mask >> 32: raise ValueError("invalid relocation field")
   for scratch in image.scratch:
-    if scratch.size < 0 or scratch.alignment <= 0 or scratch.alignment & (scratch.alignment-1): raise ValueError("invalid scratch declaration")
+    if scratch.size < 0 or scratch.size >> 32 or scratch.alignment <= 0 or scratch.alignment >> 32 or \
+       scratch.alignment & (scratch.alignment-1): raise ValueError("invalid scratch declaration")
 
 def encode_image(image:RKImage) -> bytes:
   validate_image(image)
