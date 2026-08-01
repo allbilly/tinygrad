@@ -2,6 +2,24 @@
 
 Last updated: 2026-08-01
 
+## TestOps parity correction
+
+The size/architecture rewrite is complete, but behavioral parity is not. The
+earlier 129-pass/287-fail table was an intermediate `rockchip-2607` baseline,
+not its final state. Oracle commit `1eb757cad` records zero forward-only
+failures: 405 passed and 13 intentional skips across its then-current 418
+collected methods, plus 126 passing subtests.
+
+Current master collects 425 methods (it adds `test_softmin` relative to the
+424-method oracle inventory). The first uncached clean-branch census with the
+ported forward contract is 79 passed, 333 failed, and 13 skipped; pytest also
+reports 126 failing subtests, producing its aggregate `459 failed` summary.
+
+Therefore the clean branch must preserve its `<5000` handwritten-line target
+while recovering the remaining native forward coverage. Focused 18-host/6-NPU
+tests prove only the implemented compiler contracts and must not be described
+as full TestOps completion.
+
 ## Branch and recovery points
 
 - Oracle branch: `rockchip-2607`

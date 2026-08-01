@@ -15,9 +15,30 @@ FORWARD_ONLY=1 DEFAULT_FLOAT=HALF ...
 
 Gradients are intentionally out of scope until forward coverage is stable.
 
-## Frozen prototype baseline
+## Frozen prototype final result
 
-The last recorded broad run on the old implementation was:
+The final `rockchip-2607` forward-only run at commit `1eb757cad` completed with
+zero failures:
+
+| Status | Methods |
+|---|---:|
+| PASS | 405 |
+| FAIL | 0 |
+| SKIP | 13 |
+| Collected | 418 |
+
+It additionally recorded 126 passing unittest subtests. The 13 skips were five
+explicit manual-gradient methods outside `FORWARD_ONLY=1` and eight upstream
+skips. This is the behavioral oracle target.
+
+The current master version of `test_ops.py` collects 425 methods. The only
+inventory addition relative to the 424-method final `rockchip-2607` tree is
+`TestOps.test_softmin`; the older complete run collected 418 because six more
+methods were added to `test_ops.py` between its base and current master.
+
+## Historical prototype baseline
+
+The earlier July 31 baseline, before the complete forward milestone, was:
 
 | Status | Count |
 |---|---:|
@@ -28,9 +49,34 @@ The last recorded broad run on the old implementation was:
 
 The supplied root-cause table classified 176 failures: 94 unsupported ops, 22 unsupported dtypes, 42 numerical assertions, 6 timeouts, 6 uint8 overflow errors, 2 missing expected errors, 2 `NotImplementedError`, and 2 unsupported layouts. It did not account for the remaining 111 failed cases, so that table must not be presented as a complete partition.
 
-That tally belongs to `rockchip-2607`; it is not evidence for the clean branch because the architecture and supported contract changed.
+That 129/287 tally is historical and must not be presented as the final
+`rockchip-2607` result.
 
-## Clean branch verified matrix
+## Clean branch full baseline
+
+Command:
+
+```sh
+CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+  python -m pytest test/backend/test_ops.py \
+  -p test.rockchip.conftest_rockchip -q --tb=no
+```
+
+At `a9dd8e0da` plus the current-master-compatible forward plugin:
+
+| Status | Methods |
+|---|---:|
+| PASS | 79 |
+| FAIL | 333 |
+| SKIP | 13 |
+| Collected | 425 |
+
+Pytest reports `459 failed` because the 333 failed methods contain 126 failing
+unittest subtests. Runtime was 71.82 seconds. This is the honest clean-rewrite
+parity baseline; the 18 host compiler tests and six focused hardware tests are
+smoke/contract tests, not a replacement for this census.
+
+## Clean branch focused verified matrix
 
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
