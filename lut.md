@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 3 |
+| Schema | 4 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -71,6 +71,8 @@ Tanh uses the same regional-correction structure:
 - device masks select exact `-1/+1` tails outside `[-4,4]`.
 
 The official normal and `[-300,-297]` extreme methods both pass. The plan is 35 stages with five scratch buffers.
+
+Sigmoid adds `RKLUT.SIGMOID = 6` over `[-8,8]` and `RKLUT.SIGMOID_LOCAL = 7` over `[-2,2]`, both Q15. NPU masks select the dense local table, saturate infinities, and preserve NaN. The 24-stage sigmoid expression is reused by SiLU/Swish with one final MUL, so all three official methods pass without duplicate runtime recipes. Dense strict-relative validation is guaranteed for the local domain; finite tails beyond the broad domain currently follow the frozen branch's saturation policy.
 
 ## Current command contract
 

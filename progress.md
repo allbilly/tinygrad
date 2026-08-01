@@ -62,7 +62,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `b34d5f283` | Partial and multi-tile EXP2 LUT launches | `0179-rockchip-tile-generated-EXP2-LUT.patch` |
 | `d7fce428a` | Variable-width LUT tasks and two-level HardSwish | `0180-rockchip-add-two-level-HardSwish-LUT.patch` |
 | `9baa14d7d` | Two-level tanh with device saturation | `0181-rockchip-add-two-level-tanh-LUT.patch` |
-| current milestone | Direct EXP2 IEEE special-value epilogue | `0182-rockchip-handle-EXP2-special-values.patch` |
+| `228e2b51a` | Direct EXP2 IEEE special-value epilogue | `0182-rockchip-handle-EXP2-special-values.patch` |
+| current milestone | Shared two-level sigmoid for sigmoid/SiLU/Swish | `0183-rockchip-add-two-level-sigmoid-LUT.patch` |
 
 ## Architecture now implemented
 
@@ -98,6 +99,7 @@ Implemented forward-only subset:
 - direct EXP2 device masks/divisions restore `+inf`, `0`, and `NaN` for `+inf`, `-inf`, and `NaN` inputs;
 - HardSwish using the oracle-proven Q14 broad LUT, arithmetic outer fallback, and Q15 near-zero LUT correction, all selected on the NPU;
 - tanh using the oracle-proven Q15 broad/local LUTs, identity correction near zero, and exact device-side saturation outside `[-4,4]`;
+- sigmoid using Q15 broad/local LUTs and device saturation, reused directly by SiLU and Swish;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -109,12 +111,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  711
+tinygrad/renderer/rockchip.py  755
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  785
+handwritten Rockchip total  829
 ```
 
-This meets the requested `<5000` backend goal with 4,215 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 4,171 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -124,7 +126,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 25,761 `sz.py` lines, a `+793` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 761 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 25,805 `sz.py` lines, a `+837` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 805 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 

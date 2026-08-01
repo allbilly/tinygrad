@@ -74,4 +74,9 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").tanh().numpy(), np.tanh(data.astype(np.float32)).astype(np.float16),
                                rtol=1e-3, atol=1e-6)
 
+  def test_two_level_sigmoid_lut(self):
+    data = np.linspace(-2, 2, 2049, dtype=np.float16)
+    expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").sigmoid().numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

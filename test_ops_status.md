@@ -92,6 +92,8 @@ in addition to their failed parent methods. Runtime was 85.25 seconds.
 
 After that exact census, the isolated direct-EXP2 special-value milestone moves `test_exp2` from FAIL to PASS, giving a current method delta of 109 PASS / 303 FAIL / 13 SKIP. A new full-census runtime has not yet been recorded.
 
+The shared two-level sigmoid milestone additionally moves `test_sigmoid`, `test_silu`, and `test_swish` to PASS. Current validated delta: 112 PASS / 300 FAIL / 13 SKIP.
+
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
 | Native hook | 1 | — | PASS |
@@ -100,10 +102,11 @@ After that exact census, the isolated direct-EXP2 special-value milestone moves 
 | Generated variable-width EXP2 LUT plus IEEE epilogue | exhaustive 32,770 FP16 encodings in domain | 4 sizes and special values | PASS |
 | Two-level HardSwish LUT | typed 36-stage plan | 1 dense sweep | PASS |
 | Two-level tanh LUT and saturation | typed 35-stage plan | 1 dense sweep | PASS |
+| Shared two-level sigmoid/SiLU/Swish | typed 24/25-stage plans | 1 dense local sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 31 | 12 (plus 4 subtests) | PASS |
+| Clean image/compiler suite total | 32 | 13 (plus 4 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

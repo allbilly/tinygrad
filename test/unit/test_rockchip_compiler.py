@@ -177,6 +177,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.TANH_LOCAL), 1)
     self.assertFalse(contains_uop(plan))
 
+  def test_sigmoid_and_silu_reuse_two_generated_luts(self):
+    sigmoid = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).sigmoid()))
+    silu = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).silu()))
+    self.assertEqual((len(sigmoid.stages), len(silu.stages)), (24, 25))
+    for plan in (sigmoid, silu):
+      self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.SIGMOID), 1)
+      self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.SIGMOID_LOCAL), 1)
+      self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))
