@@ -25,4 +25,9 @@ class TestRockchip(unittest.TestCase):
     ta, tb = Tensor(a, device="ROCKCHIP").realize(), Tensor(b, device="ROCKCHIP").realize()
     np.testing.assert_equal((ta<0).where(ta, tb).realize().numpy(), np.where(a<0, a, b))
 
+  def test_generated_exp2_lut(self):
+    data = np.linspace(-2, 2, 128, dtype=np.float16)
+    actual = Tensor(data, device="ROCKCHIP").realize().exp2().realize().numpy()
+    np.testing.assert_allclose(actual, np.exp2(data), rtol=5e-3, atol=5e-3)
+
 if __name__ == "__main__": unittest.main()

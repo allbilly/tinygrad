@@ -1,10 +1,11 @@
-import unittest
+import hashlib, struct, unittest
 from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import RKBufferKind, RKDPUProgram, RKMaskStage, RockchipRenderer, decode_image, emit_dpu, lower_dpu
+from tinygrad.renderer.rockchip import RKBufferKind, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_dpu, lower_dpu
+from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
 class CaptureRenderer(Renderer):
@@ -60,6 +61,28 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertTrue(any(isinstance(stage, RKMaskStage) for stage in plan.stages))
     self.assertFalse(contains_uop(plan))
+
+  def test_exp2_uses_generated_generic_lut(self):
+    payload = struct.pack(f"<{len(rklut.RK_LUT_EXP2)}h", *rklut.RK_LUT_EXP2)
+    self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_EXP2_SHA256)
+    errors = []
+    for bits in range(1 << 16):
+      x = struct.unpack("<e", struct.pack("<H", bits))[0]
+      if not -2 <= x <= 2: continue
+      position, base = ((x+2)*256, 0) if x < 0 else (x*256, rklut.RK_LUT_EXP2_ENTRIES)
+      index = min(511, max(0, int(position//1)))
+      got = struct.unpack("<e", struct.pack("<e", ((1-(position-index))*rklut.RK_LUT_EXP2[base+index] +
+        (position-index)*rklut.RK_LUT_EXP2[base+index+1]) / 8192))[0]
+      reference = 2**x
+      errors.append((abs(got-reference), abs(got-reference)/reference))
+    self.assertEqual((len(errors), max(x[0] for x in errors), max(x[1] for x in errors)),
+      (rklut.RK_LUT_EXP2_VERIFIED_INPUTS, rklut.RK_LUT_EXP2_SIM_MAX_ABS_ERROR, rklut.RK_LUT_EXP2_SIM_MAX_REL_ERROR))
+    plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).exp2()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertIsInstance(plan.stages[0], RKLUTStage)
+    self.assertFalse(contains_uop(plan))
+    image = emit_dpu(plan)
+    self.assertEqual((len(image.stages[0].commands), tuple(r.word for r in image.stages[0].relocs)), (1064, (1032, 1059)))
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
