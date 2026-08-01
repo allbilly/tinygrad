@@ -225,6 +225,21 @@ def _canonical_abs(u:UOp) -> UOp|None:
         positive.op is Ops.CONST and float(positive.arg) == 1): return data
   return None
 
+def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|None:
+  """Build an FP16 0/1 predicate from comparisons and boolean composition."""
+  u = _unwrap_same_cast(u)
+  if u.op in (Ops.CMPLT, Ops.CMPNE):
+    operands = tuple(_parse_alu(x, output_index, memo) for x in u.src)
+    if any(x is None for x in operands): return None
+    lhs, rhs = cast(tuple[_Value, _Value], operands)
+    positive = _MaskExpr((_sub(rhs, lhs),))
+    return positive if u.op is Ops.CMPLT else _ALUExpr(Ops.MAX, (positive, _MaskExpr((_sub(lhs, rhs),))))
+  if u.op in (Ops.OR, Ops.AND):
+    operands = tuple(_parse_mask_expr(x, output_index, memo) for x in u.src)
+    if any(x is None for x in operands): return None
+    return _ALUExpr(Ops.MAX if u.op is Ops.OR else Ops.MUL, cast(tuple[_Value, _Value], operands))
+  return None
+
 def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|RKArg|float|None:
   u = _unwrap_same_cast(u)
   if u in memo: return memo[u]
@@ -248,10 +263,16 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _LUTExpr(RKLUTId.EXP2, (operand,))
-  elif u.op is Ops.WHERE and (cond:=_unwrap_same_cast(u.src[0])).op is Ops.CMPLT:
-    lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
+  elif u.op is Ops.WHERE:
+    cond = _unwrap_same_cast(u.src[0])
     true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
-    ordered_max, ordered_min = true_u.key == rhs_u.key and false_u.key == lhs_u.key, true_u.key == lhs_u.key and false_u.key == rhs_u.key
+    if cond.op is Ops.CMPLT:
+      lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
+      ordered_max = true_u.key == rhs_u.key and false_u.key == lhs_u.key
+      ordered_min = true_u.key == lhs_u.key and false_u.key == rhs_u.key
+    else:
+      lhs_u = rhs_u = true_u
+      ordered_max = ordered_min = False
     compared = tuple(_parse_alu(x, output_index, memo) for x in (lhs_u, rhs_u))
     if any(x is None for x in compared): return None
     lhs, rhs = cast(tuple[_Value, _Value], compared)
@@ -260,10 +281,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
       negative = (_ALUExpr(Ops.MUL, (lhs, -1.0)), _ALUExpr(Ops.MUL, (rhs, -1.0)))
       ret = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, negative), -1.0))
     else:
+      mask = _parse_mask_expr(cond, output_index, memo)
       arms = tuple(_parse_alu(x, output_index, memo) for x in (true_u, false_u))
-      if any(x is None for x in arms) or any(isinstance(x, float) and not math.isfinite(x) for x in arms): return None
+      if mask is None or any(x is None for x in arms) or any(isinstance(x, float) and not math.isfinite(x) for x in arms): return None
       true, false = cast(tuple[_Value, _Value], arms)
-      mask = _MaskExpr((_sub(rhs, lhs),))
       ret = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (true, mask)),
         _ALUExpr(Ops.MUL, (false, _sub(1.0, mask)))))
   elif u.op in _RK_ALU_OPS:
@@ -301,7 +322,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       if isinstance(src, (_ALUExpr, _MaskExpr, _LUTExpr)) and src not in order: visit(src)
     if expr not in order: order.append(expr)
   visit(root)
-  uses = {expr:sum(src is expr for node in order for src in node.src) for expr in order}
+  uses = {expr:sum(src == expr for node in order for src in node.src) for expr in order}
   values:dict[_Expr, RKArg] = {}
   free:list[int] = []
   scratch_count, stages = 0, cast(list[RKDPUStage], [])

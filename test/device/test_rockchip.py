@@ -34,6 +34,7 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(x.abs().realize().numpy(), np.abs(data))
     finite = data[:4]
     np.testing.assert_equal(Tensor(finite, device="ROCKCHIP").maximum(0).realize().numpy(), np.maximum(finite, np.float16(0)))
+    np.testing.assert_equal(Tensor(finite, device="ROCKCHIP").sign().realize().numpy(), np.sign(finite))
 
   def test_generated_exp2_lut(self):
     encodings = np.arange(1 << 16, dtype=np.uint16)

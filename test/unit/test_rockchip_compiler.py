@@ -81,6 +81,14 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertFalse(contains_uop(plan))
     self.assertEqual(lower_dpu(sink(x.relu())).stages[0].op, Ops.MAX)
 
+  def test_composed_fp16_predicates_preserve_mask_liveness(self):
+    x = Tensor.empty(3,dtype=dtypes.half)
+    sign, clipped = lower_dpu(sink(x.sign())), lower_dpu(sink(x.clip(0, 0)))
+    self.assertIsInstance(sign, RKDPUProgram)
+    self.assertIsInstance(clipped, RKDPUProgram)
+    self.assertTrue(any(isinstance(stage, RKMaskStage) for stage in sign.stages))
+    self.assertFalse(contains_uop(sign))
+
   def test_division_canonicalizes_to_generic_fdiv(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(a/b))

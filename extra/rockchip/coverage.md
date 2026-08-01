@@ -47,6 +47,7 @@ was 72.31 seconds. This is an exact eight-method gain from the baseline.
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
 | Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Yes (`40c74406c`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`; `test_relu` remains passing | No |
+| Composed FP16 predicates used inside arithmetic | `test_sign` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
