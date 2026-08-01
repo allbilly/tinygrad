@@ -190,3 +190,13 @@ domain; the table identities remain data consumed by `RKLUTStage`.
 The offline simulator exhaustively checks every finite FP16 encoding in each
 declared range and records maximum absolute and relative error. Hardware tests
 cover dense local/mid ranges, magnitude 300 tails, and invalid ACOSH inputs.
+
+## Hyperbolic sine and cosine
+
+Tinygrad decomposes SINH and COSH into two EXP graphs. Recognizing the shared
+`(exp(x) +/- exp(-x))/2` structure avoids duplicating the already multistage
+EXP implementation. Generated Q13 SINH and COSH tables cover `[-2, 2]`; SINH
+uses its odd fifth-order series near zero to avoid relative-error amplification.
+Generic masks and division create the signed or positive overflow tails on the
+NPU. The simulator exhaustively covers the declared FP16 range, while hardware
+tests add magnitude-300 overflow cases.

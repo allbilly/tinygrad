@@ -236,6 +236,19 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(plan.stages), 64)
       self.assertFalse(contains_uop(plan))
 
+  def test_hyperbolic_uses_generated_assets(self):
+    for name in ("SINH", "COSH"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+      self.assertLess(getattr(rklut, f"RK_LUT_{name}_SIM_MAX_REL_ERROR"), 1e-3)
+    for expression, lut in ((Tensor.empty(128,dtype=dtypes.half).sinh(), rklut.RKLUTId.SINH),
+                            (Tensor.empty(128,dtype=dtypes.half).cosh(), rklut.RKLUTId.COSH)):
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, {lut})
+      self.assertLessEqual(len(plan.stages), 32)
+      self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

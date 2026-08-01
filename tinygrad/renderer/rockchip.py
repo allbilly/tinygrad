@@ -421,6 +421,28 @@ def _acosh_expr(source:_Expr|RKArg) -> _Expr:
   valid = positive(source, 1.0-2**-11)
   return _ALUExpr(Ops.MUL, (finite, _ALUExpr(Ops.FDIV, (valid, valid))))
 
+def _sinh_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  lower = _ALUExpr(Ops.MAX, (source, -2.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -2.0)), -1.0))
+  local_lower = _ALUExpr(Ops.MAX, (source, -.3))
+  local_source = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (local_lower, -1.0)), -.3)), -1.0))
+  square, broad = _ALUExpr(Ops.MUL, (local_source, local_source)), _LUTExpr(RKLUTId.SINH, (bounded,))
+  cube = _ALUExpr(Ops.MUL, (local_source, square))
+  local = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (local_source, _ALUExpr(Ops.MUL, (cube, 1/6)))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (cube, square)), 1/120))))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.3), positive(.3, source)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))
+  overflow = _ALUExpr(Ops.MAX, (positive(source, 11.78), positive(-11.78, source)))
+  return _ALUExpr(Ops.FDIV, (selected, _sub(1.0, overflow)))
+
+def _cosh_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  lower = _ALUExpr(Ops.MAX, (source, -2.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -2.0)), -1.0))
+  overflow = _ALUExpr(Ops.MAX, (positive(source, 11.78), positive(-11.78, source)))
+  return _ALUExpr(Ops.FDIV, (_LUTExpr(RKLUTId.COSH, (bounded,)), _sub(1.0, overflow)))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -633,6 +655,38 @@ def _canonical_inverse_hyperbolic(u:UOp, offset:float) -> UOp|None:
   return source if constant is not None and math.isclose(float(constant.arg), offset) and square is not None and \
     all(_unwrap_same_cast(x).key == source.key for x in square.src) else None
 
+def _canonical_hyperbolic(u:UOp) -> tuple[UOp,bool]|None:
+  """Recognize (exp(x) +/- exp(-x))/2; bool is true for sinh."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  half_const = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+  body = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+  if half_const is None or float(half_const.arg) != .5 or body is None or body.op is not Ops.ADD: return None
+  def exponential(term:UOp) -> tuple[UOp,int,int]|None:
+    term, outer = _unwrap_fp_cast(term), 1
+    if term.op is Ops.MUL:
+      negative = next((_unwrap_same_cast(x) for x in term.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      candidate = next((_unwrap_fp_cast(x) for x in term.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+      if negative is None or float(negative.arg) != -1 or candidate is None: return None
+      term, outer = candidate, -1
+    if term.op is not Ops.EXP2 or (scaled:=_unwrap_fp_cast(term.src[0])).op is not Ops.MUL: return None
+    factor = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    operand = next((_unwrap_fp_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+    if factor is None or not math.isclose(float(factor.arg), math.log2(math.e)) or operand is None: return None
+    exponent = 1
+    if operand.op is Ops.MUL:
+      negative = next((_unwrap_same_cast(x) for x in operand.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      source = next((_unwrap_same_cast(x) for x in operand.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+      if negative is None or float(negative.arg) != -1 or source is None: return None
+      operand, exponent = source, -1
+    return operand, outer, exponent
+  terms = tuple(exponential(x) for x in body.src)
+  if any(x is None for x in terms): return None
+  lhs, rhs = cast(tuple[tuple[UOp,int,int], tuple[UOp,int,int]], terms)
+  if lhs[0].key != rhs[0].key: return None
+  signatures = {(lhs[1],lhs[2]), (rhs[1],rhs[2])}
+  return (lhs[0], True) if signatures == {(1,1),(-1,-1)} else (lhs[0], False) if signatures == {(1,1),(1,-1)} else None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -696,6 +750,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (hyperbolic:=_canonical_hyperbolic(u)) is not None:
+    operand = _parse_alu(hyperbolic[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _sinh_expr(operand) if hyperbolic[1] else _cosh_expr(operand)
   elif (tanh_input:=_canonical_tanh(u)) is not None:
     operand = _parse_alu(tanh_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -1023,7 +1081,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.SQRT, RKLUTId.RSQRT, RKLUTId.LOG2, RKLUTId.LOG2_LOCAL, RKLUTId.LOG10, RKLUTId.LOG10_LOCAL,
                       RKLUTId.ASIN, RKLUTId.ASIN_LOCAL, RKLUTId.ASIN_EDGE, RKLUTId.ACOS, RKLUTId.ATAN,
                       RKLUTId.ATANH, RKLUTId.ATANH_EDGE, RKLUTId.ASINH, RKLUTId.ASINH_MID,
-                      RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR):
+                      RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR,
+                      RKLUTId.SINH, RKLUTId.COSH):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

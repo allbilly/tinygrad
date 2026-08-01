@@ -68,6 +68,10 @@ acosh_mid = [max(-32768, min(32767, round(math.acosh(1+max(0, signed_sample(tabl
              for table in range(2) for i in range(SIZE)]
 acosh_edge = [max(-32768, min(32767, round(math.acosh(1+max(0, signed_sample(table, i, ACOSH_EDGE_STEP)-ACOSH_EDGE_STEP))*32768))) or 1
               for table in range(2) for i in range(SIZE)]
+sinh_lut = [max(-32768, min(32767, round(math.sinh(signed_sample(table, i, STEP))*8192))) or 1
+            for table in range(2) for i in range(SIZE)]
+cosh_lut = [max(-32768, min(32767, round(math.cosh(signed_sample(table, i, STEP))*8192)))
+            for table in range(2) for i in range(SIZE)]
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -237,6 +241,18 @@ for bits in range(1 << 16):
     else: acosh_got = interpolate(acosh_broad, HYPER_BROAD_STEP, 4096, x)
     reference = math.acosh(x)
     acosh_errors.append((abs(acosh_got-reference), abs(acosh_got-reference)/max(abs(reference), 2**-24)))
+sinh_errors, cosh_errors = [], []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 2: continue
+  if abs(x) < .3:
+    x2, x3 = half(x*x), half(x*half(x*x))
+    sinh_got = half(half(x+half(x3/6))+half(half(x3*x2)/120))
+  else: sinh_got = interpolate(sinh_lut, STEP, 8192, x)
+  cosh_got = interpolate(cosh_lut, STEP, 8192, x)
+  sinh_reference, cosh_reference = math.sinh(x), math.cosh(x)
+  sinh_errors.append((abs(sinh_got-sinh_reference), abs(sinh_got-sinh_reference)/max(abs(sinh_reference), 2**-24)))
+  cosh_errors.append((abs(cosh_got-cosh_reference), abs(cosh_got-cosh_reference)/cosh_reference))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -294,7 +310,9 @@ class RKLUTId(IntEnum):
   ACOSH_MID = 28
   ACOSH_EDGE = 29
   ASINH_NEAR = 30
-RK_LUT_SCHEMA = 25
+  SINH = 31
+  COSH = 32
+RK_LUT_SCHEMA = 27
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -455,6 +473,24 @@ RK_LUT_ACOSH_EDGE_ENTRIES = {SIZE}
 RK_LUT_ACOSH_EDGE_BN_MUL = {struct.unpack('<H', struct.pack('<e', ACOSH_EDGE_SCALE))[0]}
 RK_LUT_ACOSH_EDGE_MINUS_EXP = 15
 RK_LUT_ACOSH_EDGE = (\n{rows(acosh_edge)}\n)
+RK_LUT_SINH_SHA256 = "{digest(sinh_lut)}"
+RK_LUT_SINH_DOMAIN = (-2.0, 2.0)
+RK_LUT_SINH_ENTRIES = {SIZE}
+RK_LUT_SINH_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_SINH_MINUS_EXP = 13
+RK_LUT_SINH_VERIFIED_INPUTS = {len(sinh_errors)}
+RK_LUT_SINH_SIM_MAX_ABS_ERROR = {max(x[0] for x in sinh_errors)!r}
+RK_LUT_SINH_SIM_MAX_REL_ERROR = {max(x[1] for x in sinh_errors)!r}
+RK_LUT_SINH = (\n{rows(sinh_lut)}\n)
+RK_LUT_COSH_SHA256 = "{digest(cosh_lut)}"
+RK_LUT_COSH_DOMAIN = (-2.0, 2.0)
+RK_LUT_COSH_ENTRIES = {SIZE}
+RK_LUT_COSH_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_COSH_MINUS_EXP = 13
+RK_LUT_COSH_VERIFIED_INPUTS = {len(cosh_errors)}
+RK_LUT_COSH_SIM_MAX_ABS_ERROR = {max(x[0] for x in cosh_errors)!r}
+RK_LUT_COSH_SIM_MAX_REL_ERROR = {max(x[1] for x in cosh_errors)!r}
+RK_LUT_COSH = (\n{rows(cosh_lut)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

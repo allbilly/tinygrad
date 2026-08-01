@@ -171,6 +171,21 @@ was 358.37 seconds. The exact two-method gain is `test_asinh` and
 `test_acosh`; both now replace oversized SQRT-plus-LOG compositions with
 generated multirange assets selected by generic ALU and mask stages.
 
+At the generated SINH/COSH milestone, the uncached 2026-08-02 census again
+completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 133 |
+| FAIL | 279 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 405 failures including the same 126 failing subtests. Runtime
+was 372.28 seconds. The exact two-method gain is `test_sinh` and `test_cosh`;
+recognition of their shared two-EXP decomposition replaces oversized plans
+with generated math assets and generic overflow repair.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -196,6 +211,7 @@ generated multirange assets selected by generic ALU and mask stages.
 | Generic dynamic LOG2 multiplication and compact nested EXP2 special values | `test_exp2_log2_zero_times_negative` | Yes |
 | Generated ATANH broad/edge tables with generic local arithmetic | `test_atanh` | Yes (research branch only) |
 | Generated multirange inverse-hyperbolic tables and local arithmetic | `test_asinh`, `test_acosh` | Yes (research branch only) |
+| Generated hyperbolic tables and generic overflow repair | `test_sinh`, `test_cosh` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
