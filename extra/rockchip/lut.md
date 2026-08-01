@@ -353,3 +353,21 @@ Maximum absolute errors were 0.00026157205054166965,
 8,193-point RK3588 sweep and the ordinary official ELU/SELU comparisons pass
 with `rtol=1e-3, atol=1e-6`. The plans contain 35 typed stages and no ELU/SELU
 hardware opcode or host semantic work.
+
+## CELU alpha ranges
+
+CELU with alpha 1 reuses the ELU(1) assets. Integer alpha 2, 3, and 4 each use
+a broad table over `[-4, 0]` and a local table over `[-0.5, 0]`, but all three
+lower through one parameterized generic stage recipe. The generated function
+is `alpha*expm1(x/alpha)`. Broad Q14/Q13 output scaling accommodates the
+variant's range; each local table uses Q15 output. Inside `[-0.03, 0]`, generic
+ALU stages evaluate `x + x*x/(2*alpha)`, while masks select the identity
+positive branch and the `-alpha` negative asymptote.
+
+Exhaustive finite-FP16 simulation measured maximum relative errors away from
+zero of 0.000687979569515798 for alpha 2, 0.0007054917053128772 for alpha 3,
+and 0.0006771198232960968 for alpha 4. Corresponding maximum absolute errors
+were 0.0005126327182432, 0.001013749418772747, and 0.001036372608194558. The
+dense 8,193-point RK3588 sweep and every official matrix/scalar subcase pass
+with `rtol=1e-3, atol=1e-6`. CELU identity remains generated data consumed by
+the generic LUT stage; there is no CELU hardware opcode or host semantic work.

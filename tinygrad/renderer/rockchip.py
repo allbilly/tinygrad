@@ -585,6 +585,23 @@ def _elu_expr(source:_Expr|RKArg, negative_scale:float, positive_scale:float) ->
   positive_result = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, 0.0)), positive_scale)), positive_mask))
   return _ALUExpr(Ops.ADD, (tails, positive_result))
 
+def _celu_expr(source:_Expr|RKArg, alpha:int) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  broad_id, local_id = {2:(RKLUTId.CELU2,RKLUTId.CELU2_LOCAL), 3:(RKLUTId.CELU3,RKLUTId.CELU3_LOCAL),
+                        4:(RKLUTId.CELU4,RKLUTId.CELU4_LOCAL)}[alpha]
+  broad, local = _LUTExpr(broad_id, (_ALUExpr(Ops.MAX, (source, -4.0)),)), \
+                 _LUTExpr(local_id, (_ALUExpr(Ops.MAX, (source, -.5)),))
+  below, local_below, poly_below, negative = (positive(x, source) for x in (-4.0, -.5, -.03, 0.0))
+  broad_mask, local_mask = _sub(local_below, below), _sub(poly_below, local_below)
+  poly_mask, positive_mask = _sub(negative, poly_below), _sub(1.0, negative)
+  poly_input = _ALUExpr(Ops.MAX, (source, -.03))
+  polynomial = _ALUExpr(Ops.ADD, (poly_input, _ALUExpr(Ops.MUL,
+    (_ALUExpr(Ops.MUL, (poly_input, poly_input)), 1/(2*alpha)))))
+  negative_sum = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, broad_mask)),
+    _ALUExpr(Ops.MUL, (local, local_mask)))), _ALUExpr(Ops.MUL, (polynomial, poly_mask))))
+  return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (negative_sum, _ALUExpr(Ops.MUL, (-float(alpha), below)))),
+                            _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, 0.0)), positive_mask))))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -917,6 +934,16 @@ def _canonical_elu(u:UOp) -> tuple[UOp,float,float]|None:
     return indexes[0], 1.0507*1.67326, 1.0507
   return None
 
+def _canonical_celu(u:UOp) -> tuple[UOp,int]|None:
+  """Recognize CELU for the integer alpha values exercised by the native generated-table contract."""
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = [x for x in nodes if x.op is Ops.INDEX and x.dtype is dtypes.half]
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  alpha = next((x for x in (4,3,2,1) if any(math.isclose(c, -x) for c in constants)), None)
+  return (indexes[0], alpha) if u.op is Ops.ADD and len(indexes) == 1 and alpha is not None and \
+    sum(x.op is Ops.EXP2 for x in nodes) == 1 and sum(x.op is Ops.MAX for x in nodes) >= 2 and \
+    any(math.isclose(x, math.log2(math.e)) for x in constants) else None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -992,6 +1019,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(erf_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _erf_expr(operand)
+  elif (celu:=_canonical_celu(u)) is not None:
+    operand = _parse_alu(celu[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _elu_expr(operand, 1.0, 1.0) if celu[1] == 1 else _celu_expr(operand, celu[1])
   elif (elu:=_canonical_elu(u)) is not None:
     operand = _parse_alu(elu[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -1350,7 +1381,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.SOFTPLUS_DIV3_NEAR, RKLUTId.SOFTPLUS_DIV3_FAR, RKLUTId.MISH, RKLUTId.MISH_MID,
                       RKLUTId.HARDSWISH, RKLUTId.QUICK_GELU, RKLUTId.QUICK_GELU_LOCAL, RKLUTId.GELU_TANH,
                       RKLUTId.GELU_TANH_LOCAL, RKLUTId.GELU_EXACT, RKLUTId.GELU_EXACT_LOCAL, RKLUTId.ELU1,
-                      RKLUTId.ELU1_LOCAL, RKLUTId.ELU01, RKLUTId.ELU01_LOCAL, RKLUTId.SELU, RKLUTId.SELU_LOCAL):
+                      RKLUTId.ELU1_LOCAL, RKLUTId.ELU01, RKLUTId.ELU01_LOCAL, RKLUTId.SELU, RKLUTId.SELU_LOCAL,
+                      RKLUTId.CELU2, RKLUTId.CELU2_LOCAL, RKLUTId.CELU3, RKLUTId.CELU3_LOCAL, RKLUTId.CELU4, RKLUTId.CELU4_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

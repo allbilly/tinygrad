@@ -182,6 +182,13 @@ class TestRockchip(unittest.TestCase):
       np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).realize().numpy(), expected.astype(np.float16),
                                  rtol=1e-3, atol=1e-6)
 
+  def test_generated_celu_assets(self):
+    data = np.linspace(-4, 4, 8193, dtype=np.float16)
+    x = data.astype(np.float32)
+    for alpha in range(1,5):
+      expected = np.where(x > 0, x, alpha*np.expm1(x/alpha)).astype(np.float16)
+      np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").celu(alpha).realize().numpy(), expected, rtol=1e-3, atol=1e-6)
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)

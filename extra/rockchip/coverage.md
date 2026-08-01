@@ -308,6 +308,22 @@ ELU alpha 1, ELU alpha 0.1, and SELU share one parameterized 35-stage recipe
 and differ only by generated broad/local data identities. CELU remains a
 numerical mismatch and is not claimed by this milestone.
 
+At the generated CELU milestone, the uncached 2026-08-02 census completed
+without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 144 |
+| FAIL | 268 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 394 failures including the same 126 failing subtests. Runtime
+was 441.47 seconds. The exact one-method gain is `test_celu`, including all
+matrix and scalar subcases for integer alpha 1 through 4. Alpha 1 reuses ELU;
+alpha 2 through 4 share one generic typed recipe selected by six generated
+payload identities.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -341,6 +357,7 @@ numerical mismatch and is not claimed by this milestone.
 | Generated QuickGELU ranges with generic local series | `test_quick_gelu` | Yes (research branch only) |
 | Generated tanh-approximate and exact GELU ranges | `test_gelu`, `test_gelu_extreme` | Yes (research branch only) |
 | Parameterized generated ELU/SELU ranges | `test_elu`, `test_selu` | Yes (research branch only) |
+| Parameterized generated CELU alpha 1–4 ranges | `test_celu` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

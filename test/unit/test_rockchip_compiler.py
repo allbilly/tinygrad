@@ -336,6 +336,21 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(plan.stages), 48)
       self.assertFalse(contains_uop(plan))
 
+  def test_celu_integer_alphas_reuse_parameterized_generated_recipe(self):
+    for alpha in range(1,5):
+      plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).celu(alpha)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      if alpha == 1: expected = {rklut.RKLUTId.ELU1, rklut.RKLUTId.ELU1_LOCAL}
+      else:
+        expected = {getattr(rklut.RKLUTId, f"CELU{alpha}"), getattr(rklut.RKLUTId, f"CELU{alpha}_LOCAL")}
+        for suffix in ("", "_LOCAL"):
+          table = getattr(rklut, f"RK_LUT_CELU{alpha}{suffix}")
+          self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(),
+                           getattr(rklut, f"RK_LUT_CELU{alpha}{suffix}_SHA256"))
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, expected)
+      self.assertLessEqual(len(plan.stages), 48)
+      self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)
