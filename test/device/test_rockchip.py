@@ -259,4 +259,9 @@ class TestRockchip(unittest.TestCase):
                                 (lambda a,b:a<=b, np.less_equal)):
       np.testing.assert_equal(function(x, y).numpy(), reference(lhs, rhs))
 
+  def test_bool_input_abi_is_lossless(self):
+    data = np.array([True, False, True, True, False, False, True, False, True], dtype=np.bool_)
+    tensor = Tensor(data, device="ROCKCHIP")
+    np.testing.assert_equal(tensor.logical_not().numpy(), np.logical_not(data))
+
 if __name__ == "__main__": unittest.main()

@@ -444,6 +444,16 @@ class TestDPUCompiler(unittest.TestCase):
     x = Tensor.empty(16,dtype=dtypes.half)
     self.assertIsNone(lower_dpu(sink(x.isclose(x))))
 
+  def test_bool_input_widens_through_typed_abi(self):
+    x = Tensor.empty(16,dtype=dtypes.bool)
+    plan = lower_dpu(sink(x.logical_not()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual((plan.bool_inputs, plan.bool_outputs), ((1,), (0,)))
+    self.assertFalse(contains_uop(plan))
+    image = emit_dpu(plan)
+    self.assertEqual((image.bool_inputs, image.bool_outputs), ((1,), (0,)))
+    self.assertEqual(decode_image(encode_image(image)), image)
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

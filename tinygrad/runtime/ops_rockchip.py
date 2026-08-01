@@ -44,6 +44,14 @@ class RockchipProgram(Program['RockchipDevice']):
       count, destination = bufs[slot].size, bufs[slot]
       temporary = self.dev._gpu_alloc(((count+7)//8)*16)
       prepared[slot], converted, packed = temporary, [*converted, temporary], [*packed, (temporary, destination, count)]
+    for slot in self.image.bool_inputs:
+      if slot >= len(bufs): raise RuntimeError(f"invalid bool input slot {slot}")
+      import numpy as np
+      source, count = bufs[slot], bufs[slot].size
+      temporary = self.dev._gpu_alloc(((count+7)//8)*16)
+      values = np.frombuffer(ctypes.string_at(int(source.va_addr), count), dtype=np.bool_).astype(np.float16)
+      ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      prepared[slot], converted = temporary, [*converted, temporary]
     for slot in self.image.fp32_outputs:
       if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid FP32 output slot {slot}")
       temporary = self.dev._gpu_alloc(bufs[slot].size//2)

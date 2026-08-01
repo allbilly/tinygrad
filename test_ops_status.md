@@ -78,24 +78,24 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after IEEE-correct generic FP16 comparisons:
+Latest complete uncached census after lossless typed bool-input widening:
 
 | Status | Methods |
 |---|---:|
-| PASS | 147 |
-| FAIL | 265 |
+| PASS | 148 |
+| FAIL | 264 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `391 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 476.02 seconds. This
+Pytest reports `390 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 480.26 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
 natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
-ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, ACOSH, the IEEE `isnan`/`isinf`/`isfinite` predicates, generic FP16 comparison roots, and scalar `isclose`.
+ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, ACOSH, the IEEE `isnan`/`isinf`/`isfinite` predicates, generic FP16 comparison roots, scalar `isclose`, and logical-not.
 
-The five mixed-dtype `test_cmp_*` methods still fail at their second, int32-input case; their first FP16 subcase is now native and IEEE-correct. The
-single method gain in this census is `test_isclose_scalar`.
+The five mixed-dtype `test_cmp_*` methods still fail at their second, int32-input case; their first FP16 subcase is now native and IEEE-correct.
+The comparison milestone gained `test_isclose_scalar`; this bool-input milestone additionally gains `test_logical_not`.
 
 ## Focused verified matrix
 
@@ -132,16 +132,17 @@ single method gain in this census is `test_isclose_scalar`.
 | Endpoint-aware ACOSH | typed 43-stage core/range plan | official method, strict 4,097-point `[1,32]` sweep, exact endpoint, invalid inputs, and NaN | PASS |
 | Typed bool output and IEEE predicates | versioned slot declaration plus native FP16 masks | official `isnan`, `isinf` directional modes, `isfinite`, and direct ABI pack checks | PASS |
 | Generic FP16 comparisons | typed 31/32-stage plans with native NaN/infinity classification | all six relations over finite values, equal/opposite infinities, and NaNs | PASS |
+| Lossless bool-input ABI | versioned input slot plus byte-to-FP16 0/1 widening | official bool/FP16 logical-not and direct odd-size ABI check | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 57 | 37 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 58 | 38 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
 ## Supported contracts
 
-- dtype: FP16 expression graphs, typed IEEE-predicate bool outputs, tiled native int32/FP32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and experimental FP32 Log two-plane ABI;
+- dtype: FP16 expression graphs, lossless contiguous bool inputs and typed bool outputs, tiled native int32/FP32 constant fills, bounded FP32 Sqrt/RSqrt input conversion, and experimental FP32 Log two-plane ABI;
 - comparison: all six public FP16 relations preserve IEEE NaN and infinity semantics; plans exceeding 64 stages reject before image encoding;
 - mode: forward only;
 - static shapes;
@@ -166,9 +167,9 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Expected rejects
 
-- FP32 expression/input graphs, integer arithmetic/input graphs, uint8, bool inputs/general bool expressions, and gradients;
+- FP32 expression/input graphs, integer arithmetic/input graphs, uint8, boolean reductions/unsupported layouts, and gradients;
 - noncontiguous elementwise indexing;
-- comparison and WHERE graphs needing bool/int inputs or non-FP16 outputs; public FP16 comparison roots and IEEE predicates are the exceptions;
+- comparison and WHERE graphs needing int inputs or non-FP16 outputs; public FP16 comparison roots, contiguous bool conditions, and IEEE predicates are the exceptions;
 - composed EXP2 graphs and values requiring overflow/underflow or NaN policy outside `[-2,2]`;
 - unpacked/general matmul, batched matmul, arbitrary K, and host-required gather;
 - spatial NCHW convolution without a device layout stage;
@@ -177,11 +178,11 @@ The host total is the collected total across `test/null/test_native_program.py`,
 
 ## Next low-hanging group
 
-Native round-to-nearest-even, trunc, floor, ceil, IEEE predicates, and generic
-FP16 comparisons are implemented without host semantic evaluation. The next
-low-hanging boundary is bool/int input representation:
+Native round-to-nearest-even, trunc, floor, ceil, IEEE predicates, generic
+FP16 comparisons, and bool logical-not are implemented without host semantic
+evaluation. The next low-hanging boundary is exact int32 representation:
 
-- ingest bool conditions and int32 operands through an explicit NPU layout stage;
+- encode int32 operands losslessly rather than silently narrowing them to FP16;
 - reuse those typed boundaries for the leading `test_where`, comparison,
   `maximum`/`minimum`, and `*_like` variants;
 - reject dynamic casts until packing is proven, as native int32 WDMA consumes
