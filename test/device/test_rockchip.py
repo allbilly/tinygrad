@@ -62,4 +62,9 @@ class TestRockchip(unittest.TestCase):
         actual = Tensor(data, device="ROCKCHIP").realize().exp2().realize().numpy()
         np.testing.assert_allclose(actual, np.exp2(data), rtol=5e-3, atol=5e-3)
 
+  def test_two_level_hardswish_lut(self):
+    data = np.linspace(-4, 4, 1025, dtype=np.float16)
+    expected = (data.astype(np.float32)*np.clip(data.astype(np.float32)+3, 0, 6)/6).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").hardswish().numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

@@ -16,12 +16,12 @@ extra/rockchip/gen_lut.py
 
 This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps runtime execution deterministic.
 
-## Current EXP2 artifact
+## Current generated artifacts
 
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 1 |
+| Schema | 2 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -32,7 +32,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Exhaustive simulated encodings | 32,770 finite FP16 encodings in domain, including both signed zeros |
 | Simulated max absolute error | `0.0010343084909396616` |
 | Simulated max relative error | `0.0007054306848276658` |
-| Proven hardware tile | 128 FP16 values (`16 x 8` DPU view) |
+| Proven hardware widths | 1, 128, 129, and 2,925 FP16 values in one task |
 
 The simulator includes output rounding to FP16. It models table interpolation for the declared domain. Hardware tests remain required because register interpretation, internal rounding, saturation, and chip revision behavior can differ from the mathematical simulator.
 
@@ -50,6 +50,16 @@ FORWARD_ONLY=1 DEFAULT_FLOAT=HALF python -m pytest \
 
 Regeneration should produce no diff unless the specification intentionally changed.
 
+HardSwish adds two immutable tables and follows the final `rockchip-2607` algorithm:
+
+- `RKLUT.HARDSWISH = 2`: Q14 broad approximation on `[-2,2]`;
+- ordinary DPU arithmetic computes the exact decomposed fallback outside `[-2,2]`;
+- `RKLUT.HARDSWISH_LOCAL = 3`: Q15 approximation of `16*hardswish(x)` after an NPU `x*16` stage;
+- the local result is scaled by `1/16` and selected on `[-0.125, 15/128]`;
+- an NPU nonzero mask removes the one-count LUT-zero workaround at exact zero.
+
+This is two NPU LUT tasks, not host evaluation. On the official 2,925-element case it lowers to 36 stages and five scratch buffers and passes `rtol=0.001, atol=1e-6`.
+
 ## Current command contract
 
 One EXP2 task emits 1,064 commands:
@@ -62,7 +72,7 @@ The important fields are:
 
 - DPU/RDMA `S_POINTER = 0x30`;
 - FP16 data format `0x48000002`;
-- width 15 and channel `0x70007` for the 128-element tile;
+- width `ceil(count/8)-1`, channel `0x70007`, and a matching rounded surface stride;
 - `BN_MUL_CFG = half(8192) << 16` for LUT indexing;
 - `OUT_CVT_SCALE = 0x10001` and `OUT_CVT_SHIFT = 13 << 12`;
 - hybrid/overflow LUT config `0x68` and index selection `0x50500`;
@@ -119,12 +129,15 @@ Always save the worst input, simulated intermediate index/fraction, neighboring 
 
 ## When a two-level LUT is justified
 
-A two-level LUT means two NPU LUT tasks with a declared scratch tensor between them. It is not a larger hidden host table and it is not runtime fitting.
+A two-level LUT means two NPU LUT tasks with declared scratch tensors and NPU-side composition. It is not a larger hidden host table and it is not runtime fitting. Two useful forms are a cascade and a regional correction:
 
 The clean representation is:
 
 ```text
 x -> LUT_A -> scratch FP16 z -> LUT_B -> y
+
+x -> LUT_broad  --+
+x -> LUT_local  --+-> masks/select -> y
 ```
 
 This composition can help when:
@@ -134,7 +147,7 @@ This composition can help when:
 - the first LUT gives a coarse monotonic approximation and the second calibrates systematic output-domain error;
 - one task cannot cover the needed dynamic range without poor index resolution.
 
-It is most suitable for monotonic functions such as EXP2/LOG2 because the intermediate can remain a single-valued monotonic coordinate. It is less useful for nonmonotonic functions unless the domain is explicitly split, because one FP16 intermediate cannot preserve both a region identifier and a local coordinate without a proven encoding.
+A cascade is most suitable for monotonic functions such as EXP2/LOG2 because the intermediate can remain a single-valued monotonic coordinate. A regional correction supports nonmonotonic functions when masks explicitly preserve the region; HardSwish uses this second form.
 
 Costs and risks:
 

@@ -34,6 +34,8 @@ class RKDPUOp(IntEnum):
   EXP2 = 5
   MASK = 6
   DIV = 7
+  HARDSWISH = 8
+  HARDSWISH_LOCAL = 9
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -215,6 +217,36 @@ def _canonical_abs(u:UOp) -> UOp|None:
         positive.op is Ops.CONST and float(positive.arg) == 1): return data
   return None
 
+def _canonical_hardswish(u:UOp) -> UOp|None:
+  """Recognize x*relu6(x+3)/6 and return its single FP16 source INDEX."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  scale = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST and float(x.arg) == 1/6), None)
+  product = next((_unwrap_same_cast(x) for x in u.src if scale is not None and _unwrap_same_cast(x).key != scale.key), None)
+  if product is None or product.op is not Ops.MUL: return None
+  source = next((_unwrap_same_cast(x) for x in product.src if _unwrap_same_cast(x).op is Ops.INDEX), None)
+  clamp = next((_unwrap_same_cast(x) for x in product.src if source is not None and _unwrap_same_cast(x).key != source.key), None)
+  if source is None or source.dtype is not dtypes.half or clamp is None or clamp.op is not Ops.ADD: return None
+  def shifted_relu(v:UOp, negated:bool) -> tuple[UOp,float]|None:
+    v = _unwrap_same_cast(v)
+    if negated:
+      if v.op is not Ops.MUL: return None
+      negative = next((_unwrap_same_cast(x) for x in v.src if _unwrap_same_cast(x).op is Ops.CONST and float(x.arg) == -1), None)
+      if negative is None: return None
+      v = _unwrap_same_cast(v.src[0] if _unwrap_same_cast(v.src[1]).key == negative.key else v.src[1])
+    if v.op is not Ops.WHERE: return None
+    cond, shifted, zero = (_unwrap_same_cast(x) for x in v.src)
+    if (cond.op is not Ops.CMPLT or _unwrap_same_cast(cond.src[0]).op is not Ops.CONST or float(cond.src[0].arg) != 0 or
+        _unwrap_same_cast(cond.src[1]).key != shifted.key or zero.op is not Ops.CONST or float(zero.arg) != 0 or shifted.op is not Ops.ADD):
+      return None
+    offset = next((_unwrap_same_cast(x) for x in shifted.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    base = next((_unwrap_same_cast(x) for x in shifted.src if offset is not None and _unwrap_same_cast(x).key != offset.key), None)
+    return (base, float(offset.arg)) if base is not None and offset is not None else None
+  for positive, negative in (clamp.src, clamp.src[::-1]):
+    pos, neg = shifted_relu(positive, False), shifted_relu(negative, True)
+    if pos is not None and neg is not None and pos[0].key == source.key == neg[0].key and pos[1] == 3 and neg[1] == -3: return source
+  return None
+
 def _canonical_relu_difference(u:UOp) -> UOp|None:
   """Recognize relu(x+0.5)-relu(x-0.5), tinygrad's clip(x+0.5, 0, 1)."""
   u = _unwrap_same_cast(u)
@@ -270,6 +302,27 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (hs_input:=_canonical_hardswish(u)) is not None:
+    source = _parse_dpu_expr(hs_input, output_index, memo)
+    if source is None: return None
+    broad = _DPUExpr(RKDPUOp.HARDSWISH, (source,))
+    positive = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.ADD, (source, 3.0)), 0.0))
+    relu_negative = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.ADD, (source, -3.0)), 0.0)), -1.0))
+    relu6 = _DPUExpr(RKDPUOp.ADD, (positive, relu_negative))
+    fallback = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (source, relu6)), 1/6))
+    wide_outside = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (-2.0, source)),)),
+      _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, 2.0)),))))
+    wide = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.SUB, (1.0, wide_outside)))),
+      _DPUExpr(RKDPUOp.MUL, (fallback, wide_outside))))
+    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.HARDSWISH_LOCAL,
+      (_DPUExpr(RKDPUOp.MUL, (source, 16.0)),)), 1/16))
+    inside = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, -0.125)),)),
+      _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (15/128, source)),))))
+    nonzero = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (0.0, source)),)),
+      _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, 0.0)),))))
+    corrected = _DPUExpr(RKDPUOp.MUL, (local, nonzero))
+    ret = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (wide, _DPUExpr(RKDPUOp.SUB, (1.0, inside)))),
+      _DPUExpr(RKDPUOp.MUL, (corrected, inside))))
   elif (clamp_base:=_canonical_relu_difference(u)) is not None:
     base = _parse_dpu_expr(clamp_base, output_index, memo)
     if base is None: return None
@@ -351,17 +404,14 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
     stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count, store.src[0].dtype)
     return RKDPUProgram((stage,), ())
   if root.op is RKDPUOp.EXP2 and len(root.src) == 1 and isinstance(root.src[0], RKArg):
-    lut_stages = tuple(RKDPUStage(RKDPUOp.EXP2, RKArg(output.kind, output.index, start*2),
-                                  RKArg(root.src[0].kind, root.src[0].index, start*2), None, 128)
-                       for start in range(0, count, 128))
-    return RKDPUProgram(lut_stages, ()) if len(lut_stages) <= 64 else None
+    return RKDPUProgram((RKDPUStage(RKDPUOp.EXP2, output, root.src[0], None, count),), ())
+  # Rejected HardSwish WIP: OUT_CVT post-scaling overflowed; BS FP16 1/6 missed 9 cases, its upper neighbor 92, and reordered stages 4.
   order:list[_DPUExpr] = []
   def visit(expr:_DPUExpr) -> None:
     for src in expr.src:
       if isinstance(src, _DPUExpr) and src not in order: visit(src)
     if expr not in order: order.append(expr)
   visit(root)
-  if any(expr.op is RKDPUOp.EXP2 for expr in order) and count != 128: return None
   uses = {expr:sum(src == expr for node in order for src in node.src) for expr in order}
   values:dict[_DPUExpr, RKArg] = {}
   free:list[int] = []
@@ -466,12 +516,17 @@ def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
 
 def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
-  """Emit one generated 128-element EXP2 LUT task; fitting stays in extra/rockchip/gen_lut.py."""
-  width, surf_stride = 15, 256
+  """Emit one variable-width generated LUT task; fitting stays in extra/rockchip/gen_lut.py."""
+  width, surf_stride = (plan.count+7)//8-1, ((plan.count+7)//8)*16
+  table, bn_mul, minus_exp = {
+    RKDPUOp.EXP2:(rklut.RK_LUT_EXP2, rklut.RK_LUT_EXP2_BN_MUL, rklut.RK_LUT_EXP2_MINUS_EXP),
+    RKDPUOp.HARDSWISH:(rklut.RK_LUT_HARDSWISH, rklut.RK_LUT_HARDSWISH_BN_MUL, rklut.RK_LUT_HARDSWISH_MINUS_EXP),
+    RKDPUOp.HARDSWISH_LOCAL:(rklut.RK_LUT_HARDSWISH_LOCAL, rklut.RK_LUT_HARDSWISH_LOCAL_BN_MUL,
+                            rklut.RK_LUT_HARDSWISH_LOCAL_MINUS_EXP)}[plan.op]
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
-    for value in rklut.RK_LUT_EXP2[table_id*513:(table_id+1)*513]:
+    for value in table[table_id*513:(table_id+1)*513]:
       cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_DATA, value & 0xffffffff if value < 0 else value))
   fixed = (
     (_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x30), (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30),
@@ -480,9 +535,9 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
     (_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
     (_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 2), (_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, 7),
     (_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, width), (_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x20040),
-    (_TARGET_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000), (_TARGET_DPU, rk.REG_DPU_BN_MUL_CFG, rklut.RK_LUT_EXP2_BN_MUL << 16),
+    (_TARGET_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000), (_TARGET_DPU, rk.REG_DPU_BN_MUL_CFG, bn_mul << 16),
     (_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x302), (_TARGET_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
-    (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001), (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SHIFT, rklut.RK_LUT_EXP2_MINUS_EXP << 12),
+    (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001), (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SHIFT, minus_exp << 12),
     (_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 2*surf_stride), (_TARGET_DPU, 0x40c4, 0),
     (_TARGET_DPU, rk.REG_DPU_LUT_CFG, 0x68), (_TARGET_DPU, rk.REG_DPU_LUT_INFO, 0x50500),
     (_TARGET_DPU, rk.REG_DPU_LUT_LE_START, 0xffffc000), (_TARGET_DPU, rk.REG_DPU_LUT_LE_END, 0),
@@ -549,7 +604,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   for stage_idx, plan in enumerate(program.stages):
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
-    if plan.op is RKDPUOp.EXP2:
+    if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:

@@ -3,8 +3,8 @@ from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
 from tinygrad.helpers import Target
-from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUProgram, RKPool, RockchipRenderer, decode_image, emit_contract, emit_dpu,
-                                        emit_pool, encode_image, lower_contract, lower_dpu, lower_pool)
+from tinygrad.renderer.rockchip import (RKBufferKind, RKContract, RKDPUOp, RKDPUProgram, RKPool, RockchipRenderer, decode_image,
+                                        emit_contract, emit_dpu, emit_pool, encode_image, lower_contract, lower_dpu, lower_pool)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, UOp
 
@@ -123,9 +123,8 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(tuple(r.word for r in image.stages[0].relocs), (1032, 1059))
     small = lower_dpu(sink(Tensor.empty(16, dtype=dtypes.half).exp2()))
     large = lower_dpu(sink(Tensor.empty(2925, dtype=dtypes.half).exp2()))
-    self.assertEqual((len(small.stages), small.stages[0].count), (1, 128))
-    self.assertEqual(len(large.stages), 23)
-    self.assertEqual(tuple(stage.dst.addend for stage in large.stages), tuple(range(0, 2925*2, 128*2)))
+    self.assertEqual((len(small.stages), small.stages[0].count), (1, 16))
+    self.assertEqual((len(large.stages), large.stages[0].count), (1, 2925))
 
   def test_rejects_noncontiguous_and_nonhalf(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
@@ -162,6 +161,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual(tuple(stage.op.name for stage in plan.stages), ("MUL", "ADD", "MAX", "MUL", "MAX", "MUL"))
     self.assertEqual(len(plan.scratch), 1)
+
+  def test_hardswish_uses_two_generated_luts(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).hardswish()))
+    self.assertEqual((len(plan.stages), len(plan.scratch)), (36, 5))
+    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.HARDSWISH), 1)
+    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.HARDSWISH_LOCAL), 1)
+    self.assertFalse(contains_uop(plan))
 
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
