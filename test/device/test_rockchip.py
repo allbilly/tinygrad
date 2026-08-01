@@ -209,4 +209,9 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(invalid="ignore"): expected_special = np.arccos(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").acos().numpy(), expected_special)
 
+  def test_reciprocal_folded_atan_luts(self):
+    data = np.linspace(-16, 16, 4097, dtype=np.float16)
+    expected = np.arctan(data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").atan().numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

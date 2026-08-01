@@ -26,7 +26,7 @@ longer expands the hardware-operation enum or the emitter dispatch surface.
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 21 |
+| Schema | 22 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -142,6 +142,8 @@ ACOS cannot safely reuse ASIN through subtraction from π/2. That first probe co
 - `ACOS_FINE_ENDPOINT = 55` stores `8*acos(1-d)` addressed with `64*d`, then the NPU decodes by `1/8`; SHA256 `1a42b99e01379b7c4c564298e940f3358ace5efeaeca2b7e1a4517f1982a5d13`.
 
 The coarse/fine split is at `d=0.003`, while the endpoint region begins at `|x|>0.85`. One offline correction changes the negative bank's shared zero knot from positive-bank half scaling to negative-bank quarter scaling; without it, exactly three dense-sweep values immediately below zero were corrupted by the table discontinuity. The 47-stage, nine-scratch plan passes both the official method and strict 4,097-point domain/special-value hardware test without tolerance changes or host evaluation.
+
+ATAN uses reciprocal folding before two regional assets: `t=|x|` for `|x|<=1`, otherwise `t=1/|x|`. `ATAN = 56` stores direct `atan(t)` over `[0,1]` (SHA256 `e178bdb3306b8d89dbd7eadaaef377321d590e6ed8a0dc092f2c17e4e5460536`). `ATAN_DETAIL = 57` uses its negative bank for amplified `4*atan(t)` near zero and its positive bank for `atan(1/t)/2` in the folded large-input region (SHA256 `03fe0306f38b96b414bc16dc39531b11b3dfe1ac59e18483664ef359ce7bafdf`). As with ACOS, the negative bank's shared zero knot is corrected offline because the positive-bank formula has different scaling there. The 42-stage, eight-scratch program passes the official method and a strict 4,097-point `[-16,16]` hardware sweep.
 
 ## Current command contract
 

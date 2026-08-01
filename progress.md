@@ -14,8 +14,8 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through the regional ACOS LUTs, the 2026-08-01 census is
-**138 passed, 274 failed, and 13 skipped**. Pytest prints `400 failed` because
+milestones through reciprocal-folded ATAN, the 2026-08-01 census is
+**139 passed, 273 failed, and 13 skipped**. Pytest prints `399 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
@@ -101,7 +101,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `29559149c` | Compose trunc/floor/ceil from native roundoff and masks | `0201-rockchip-compose-native-integral-rounding.patch` |
 | `4d174db23` | Preserve rejected scaled-log high-range normalization probe | `0202-rockchip-record-rejected-scaled-log-probe.patch` |
 | `a2fc51580` | Native two-level ASIN LUT with device-only regional composition | `0203-rockchip-add-two-level-ASIN-LUT.patch` |
-| current milestone | Regional ACOS LUTs with fine endpoint interpolation | `0204-rockchip-add-regional-ACOS-LUTs.patch` |
+| `81bd7960c` | Regional ACOS LUTs with fine endpoint interpolation | `0204-rockchip-add-regional-ACOS-LUTs.patch` |
+| current milestone | Reciprocal-folded two-level ATAN LUT | `0205-rockchip-add-reciprocal-folded-ATAN-LUT.patch` |
 
 ## Architecture now implemented
 
@@ -158,6 +159,7 @@ Implemented forward-only subset:
 - trunc, floor, and ceil composed from the same roundoff asset plus primitive DPU comparison masks;
 - ASIN on the declared FP16 `[-1,1]` domain using one broad and one shared center/endpoint detail LUT, with device masks for sign and invalid inputs;
 - ACOS on `[-1,1]` using asymmetric broad, endpoint-distance, and fine-endpoint LUT assets; `pi/2-ASIN` was measured and rejected rather than hidden by relaxed tolerance;
+- ATAN using device-side reciprocal magnitude folding and broad/detail LUT selection over a bounded `[0,1]` coordinate;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -169,12 +171,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1359
+tinygrad/renderer/rockchip.py  1397
 tinygrad/runtime/ops_rockchip.py  99
-handwritten Rockchip total  1458
+handwritten Rockchip total  1496
 ```
 
-This meets the requested `<5000` research-backend goal with 3,542 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,504 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
@@ -192,7 +194,7 @@ The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,434 `sz.py` lines, a `+1,466` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,434 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 26,472 `sz.py` lines, a `+1,504` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,472 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
