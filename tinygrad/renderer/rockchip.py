@@ -540,6 +540,30 @@ def _quick_gelu_expr(source:_Expr|RKArg) -> _Expr:
     _ALUExpr(Ops.MUL, (local, local_inside)))), _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (polynomial, poly_inside)),
     _ALUExpr(Ops.MUL, (fallback, _sub(1.0, inside)))))))
 
+def _gelu_expr(source:_Expr|RKArg, approximate_tanh:bool) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  range_inside = _ALUExpr(Ops.MUL, (positive(source, -4.0), positive(4.0, source)))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.5), positive(.5, source)))
+  poly_inside = _ALUExpr(Ops.MUL, (positive(source, -.04), positive(.04, source)))
+  broad_id, local_id = (RKLUTId.GELU_TANH, RKLUTId.GELU_TANH_LOCAL) if approximate_tanh else \
+    (RKLUTId.GELU_EXACT, RKLUTId.GELU_EXACT_LOCAL)
+  broad = _LUTExpr(broad_id, (_ALUExpr(Ops.ADD, (clamp(source, 4.0), local_inside)),))
+  local_input = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (clamp(source, .5), 8.0)), poly_inside))
+  local = _ALUExpr(Ops.MUL, (_LUTExpr(local_id, (local_input,)), .5))
+  poly_source = clamp(source, .04)
+  polynomial = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (poly_source, .5)),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (poly_source, poly_source)), 1/math.sqrt(2*math.pi)))))
+  positive_scale = _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (positive(source, 0.0), 3.0))))
+  broad_selected = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (broad, positive_scale)), _sub(range_inside, local_inside)))
+  local_selected = _ALUExpr(Ops.MUL, (local, _sub(local_inside, poly_inside)))
+  interior = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (broad_selected, local_selected)),
+    _ALUExpr(Ops.MUL, (polynomial, poly_inside))))
+  fallback = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, 0.0)), _sub(1.0, range_inside)))
+  return _ALUExpr(Ops.ADD, (interior, fallback))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -849,6 +873,17 @@ def _canonical_quick_gelu(u:UOp) -> UOp|None:
        _unwrap_same_cast(sigmoid[0]).key == source.key: return source
   return None
 
+def _canonical_gelu(u:UOp) -> tuple[UOp,bool]|None:
+  """Recognize tanh-approximate and exact GELU decompositions."""
+  u = _unwrap_same_cast(u)
+  indexes = [x for x in u.toposort() if x.op is Ops.INDEX and x.dtype is dtypes.half]
+  if len(indexes) != 1 or u.op is not Ops.MUL or sum(x.op is Ops.EXP2 for x in u.toposort()) != 1: return None
+  constants = [float(x.arg) for x in u.toposort() if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  if any(math.isclose(x, .044715) for x in constants): return indexes[0], True
+  if any(math.isclose(x, 1/math.sqrt(2)) for x in constants) and any(math.isclose(x, .231641888, rel_tol=1e-6) for x in constants):
+    return indexes[0], False
+  return None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -916,6 +951,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(hyperbolic[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _sinh_expr(operand) if hyperbolic[1] else _cosh_expr(operand)
+  elif (gelu:=_canonical_gelu(u)) is not None:
+    operand = _parse_alu(gelu[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _gelu_expr(operand, gelu[1])
   elif (erf_input:=_canonical_erf(u)) is not None:
     operand = _parse_alu(erf_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -1272,7 +1311,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR,
                       RKLUTId.SINH, RKLUTId.COSH, RKLUTId.ERF, RKLUTId.ERF_LOCAL, RKLUTId.SOFTPLUS_NEG,
                       RKLUTId.SOFTPLUS_DIV3_NEAR, RKLUTId.SOFTPLUS_DIV3_FAR, RKLUTId.MISH, RKLUTId.MISH_MID,
-                      RKLUTId.HARDSWISH, RKLUTId.QUICK_GELU, RKLUTId.QUICK_GELU_LOCAL):
+                      RKLUTId.HARDSWISH, RKLUTId.QUICK_GELU, RKLUTId.QUICK_GELU_LOCAL, RKLUTId.GELU_TANH,
+                      RKLUTId.GELU_TANH_LOCAL, RKLUTId.GELU_EXACT, RKLUTId.GELU_EXACT_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

@@ -275,6 +275,23 @@ generated ranges and a generic near-zero series meet the ordinary comparison
 while retaining the already-passing magnitude-300 extreme method. The plan is
 63 typed stages and performs no host semantic work.
 
+At the generated GELU milestone, the uncached 2026-08-02 census completed
+without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 141 |
+| FAIL | 271 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 397 failures including the same 126 failing subtests. Runtime
+was 434.68 seconds. The exact two-method gain is `test_gelu` and
+`test_gelu_extreme`; both the tanh approximation and exact decomposition lower
+to the same generic stage recipe with generated data selected by LUT identity.
+Each plan has 53 typed stages, retains the ordinary TestOps tolerance, and
+performs no host semantic work.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -306,6 +323,7 @@ while retaining the already-passing magnitude-300 extreme method. The plan is
 | Generated Mish ranges with generic local arithmetic | `test_mish` | Yes (research branch only) |
 | Generated Hardswish broad range with generic local series | `test_hardswish` | Yes (research branch only) |
 | Generated QuickGELU ranges with generic local series | `test_quick_gelu` | Yes (research branch only) |
+| Generated tanh-approximate and exact GELU ranges | `test_gelu`, `test_gelu_extreme` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

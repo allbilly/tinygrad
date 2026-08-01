@@ -297,3 +297,32 @@ but moved exact neighboring FP16 knots outside tolerance. The final one-count
 value passes the dense hardware sweep, the official ordinary case, and both
 extreme cases. The plan contains 63 typed stages and no QuickGELU opcode or host
 semantic work.
+
+## GELU ranges
+
+The GELU recognizer distinguishes tinygrad's tanh approximation from its exact
+normal-CDF decomposition, but both lower to the same generic 53-stage shape.
+The choice between `GELU_TANH`/`GELU_TANH_LOCAL` and
+`GELU_EXACT`/`GELU_EXACT_LOCAL` is generated data, not a DPU opcode.
+
+For each variant, an asymmetric Q15 broad table covers `[-4, 4]`: the negative
+half stores GELU directly, while the positive half stores GELU divided by four
+and generic ALU stages restore that factor. A local table addresses `z=8*x`
+for `x` in `[-0.5, 0.5]` and stores twice the output. Inside
+`[-0.04, 0.04]`, generic ALU stages evaluate the stable second-order series
+`x/2 + x*x/sqrt(2*pi)`. Outside the broad domain, GELU's FP16 asymptote is
+selected as `max(x, 0)`.
+
+Exhaustive table simulation over the declared finite FP16 domain measured the
+following worst cases:
+
+| Variant | Maximum absolute error | Maximum relative error away from zero |
+|---|---:|---:|
+| Tanh approximation | 0.0010298173716480896 | 0.0013396107993934327 |
+| Exact | 0.0010362402345185373 | 0.0011341739120070283 |
+
+The dense 8,193-point RK3588 characterization sweep passes with
+`rtol=1.4e-3, atol=1.3e-4`. Those bounds apply only to the characterization
+test; both official TestOps GELU methods pass their ordinary comparison without
+a backend-wide tolerance change. There is no GELU hardware opcode, runtime
+conversion, or host semantic work.

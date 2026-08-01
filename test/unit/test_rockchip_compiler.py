@@ -307,6 +307,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 64)
     self.assertFalse(contains_uop(plan))
 
+  def test_gelu_variants_use_generated_ranges_and_local_series(self):
+    for variant in ("TANH", "EXACT"):
+      for suffix in ("", "_LOCAL"):
+        name = f"GELU_{variant}{suffix}"
+        table = getattr(rklut, f"RK_LUT_{name}")
+        self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+      plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).gelu(approximate="tanh" if variant == "TANH" else "none")))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                       {getattr(rklut.RKLUTId, f"GELU_{variant}"), getattr(rklut.RKLUTId, f"GELU_{variant}_LOCAL")})
+      self.assertLessEqual(len(plan.stages), 56)
+      self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

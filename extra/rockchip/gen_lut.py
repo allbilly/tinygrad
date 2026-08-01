@@ -119,6 +119,17 @@ for table in range(2):
     sigmoid_staged = struct.unpack("<e", struct.pack("<e", 1/(1+math.exp(-scaled))))[0]
     staged = struct.unpack("<e", struct.pack("<e", xh*sigmoid_staged))[0]
     quick_gelu_local.append(max(-32768, min(32767, round((.5*ideal+.5*staged)*32768))) or 1)
+def gelu_value(x:float, approximate_tanh:bool) -> float:
+  return .5*x*(1+math.tanh(math.sqrt(2/math.pi)*(x+.044715*x**3))) if approximate_tanh else .5*x*(1+math.erf(x/math.sqrt(2)))
+GELU_SCALE, GELU_STEP = 4096.0, 32.0/4096.0
+def gelu_table(approximate_tanh:bool) -> list[int]:
+  return [max(-32768, min(32767, round(gelu_value(x:=signed_sample(table, i, GELU_STEP), approximate_tanh)/
+    (4 if x >= 0 else 1)*32768))) or 1 for table in range(2) for i in range(SIZE)]
+def gelu_local_table(approximate_tanh:bool) -> list[int]:
+  return [max(-32768, min(32767, round(2*gelu_value(signed_sample(table, i, GELU_STEP)/8, approximate_tanh)*32768))) or 1
+          for table in range(2) for i in range(SIZE)]
+gelu_tanh, gelu_tanh_local = gelu_table(True), gelu_local_table(True)
+gelu_exact, gelu_exact_local = gelu_table(False), gelu_local_table(False)
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -355,6 +366,19 @@ for bits in range(1 << 16):
   else: got = interpolate(quick_gelu, QUICK_GELU_STEP, 16384, x)
   reference = quick_gelu_value(x)
   quick_gelu_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
+gelu_errors = {True:[], False:[]}
+for approximate_tanh in (True, False):
+  broad, local = (gelu_tanh, gelu_tanh_local) if approximate_tanh else (gelu_exact, gelu_exact_local)
+  for bits in range(1 << 16):
+    x = struct.unpack("<e", struct.pack("<H", bits))[0]
+    if not math.isfinite(x) or not -4 <= x <= 4: continue
+    if abs(x) < .04: got = half(half(x*.5)+half(half(x*x)*(1/math.sqrt(2*math.pi))))
+    elif abs(x) < .5: got = half(interpolate(local, GELU_STEP, 32768, half(x*8))*.5)
+    else:
+      got = interpolate(broad, GELU_STEP, 32768, x)
+      if x >= 0: got = half(got*4)
+    reference = gelu_value(x, approximate_tanh)
+    gelu_errors[approximate_tanh].append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -424,7 +448,11 @@ class RKLUTId(IntEnum):
   HARDSWISH = 40
   QUICK_GELU = 41
   QUICK_GELU_LOCAL = 42
-RK_LUT_SCHEMA = 36
+  GELU_TANH = 43
+  GELU_TANH_LOCAL = 44
+  GELU_EXACT = 45
+  GELU_EXACT_LOCAL = 46
+RK_LUT_SCHEMA = 37
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -681,6 +709,36 @@ RK_LUT_QUICK_GELU_LOCAL_ENTRIES = {SIZE}
 RK_LUT_QUICK_GELU_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
 RK_LUT_QUICK_GELU_LOCAL_MINUS_EXP = 15
 RK_LUT_QUICK_GELU_LOCAL = (\n{rows(quick_gelu_local)}\n)
+RK_LUT_GELU_TANH_SHA256 = "{digest(gelu_tanh)}"
+RK_LUT_GELU_TANH_DOMAIN = (-4.0, 4.0)
+RK_LUT_GELU_TANH_ENTRIES = {SIZE}
+RK_LUT_GELU_TANH_BN_MUL = {struct.unpack('<H', struct.pack('<e', GELU_SCALE))[0]}
+RK_LUT_GELU_TANH_MINUS_EXP = 15
+RK_LUT_GELU_TANH_VERIFIED_INPUTS = {len(gelu_errors[True])}
+RK_LUT_GELU_TANH_SIM_MAX_ABS_ERROR = {max(x[0] for x in gelu_errors[True])!r}
+RK_LUT_GELU_TANH_SIM_MAX_REL_ERROR = {max(x[1] for x in gelu_errors[True] if x[2] > .01)!r}
+RK_LUT_GELU_TANH = (\n{rows(gelu_tanh)}\n)
+RK_LUT_GELU_TANH_LOCAL_SHA256 = "{digest(gelu_tanh_local)}"
+RK_LUT_GELU_TANH_LOCAL_DOMAIN = (-0.5, 0.5)
+RK_LUT_GELU_TANH_LOCAL_ENTRIES = {SIZE}
+RK_LUT_GELU_TANH_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', GELU_SCALE))[0]}
+RK_LUT_GELU_TANH_LOCAL_MINUS_EXP = 15
+RK_LUT_GELU_TANH_LOCAL = (\n{rows(gelu_tanh_local)}\n)
+RK_LUT_GELU_EXACT_SHA256 = "{digest(gelu_exact)}"
+RK_LUT_GELU_EXACT_DOMAIN = (-4.0, 4.0)
+RK_LUT_GELU_EXACT_ENTRIES = {SIZE}
+RK_LUT_GELU_EXACT_BN_MUL = {struct.unpack('<H', struct.pack('<e', GELU_SCALE))[0]}
+RK_LUT_GELU_EXACT_MINUS_EXP = 15
+RK_LUT_GELU_EXACT_VERIFIED_INPUTS = {len(gelu_errors[False])}
+RK_LUT_GELU_EXACT_SIM_MAX_ABS_ERROR = {max(x[0] for x in gelu_errors[False])!r}
+RK_LUT_GELU_EXACT_SIM_MAX_REL_ERROR = {max(x[1] for x in gelu_errors[False] if x[2] > .01)!r}
+RK_LUT_GELU_EXACT = (\n{rows(gelu_exact)}\n)
+RK_LUT_GELU_EXACT_LOCAL_SHA256 = "{digest(gelu_exact_local)}"
+RK_LUT_GELU_EXACT_LOCAL_DOMAIN = (-0.5, 0.5)
+RK_LUT_GELU_EXACT_LOCAL_ENTRIES = {SIZE}
+RK_LUT_GELU_EXACT_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', GELU_SCALE))[0]}
+RK_LUT_GELU_EXACT_LOCAL_MINUS_EXP = 15
+RK_LUT_GELU_EXACT_LOCAL = (\n{rows(gelu_exact_local)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

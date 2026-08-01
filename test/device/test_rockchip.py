@@ -163,6 +163,15 @@ class TestRockchip(unittest.TestCase):
     expected = (data.astype(np.float32)/(1+np.exp(-1.702*data.astype(np.float32)))).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").quick_gelu().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_generated_gelu_assets(self):
+    data = np.linspace(-4, 4, 8193, dtype=np.float16)
+    x = data.astype(np.float32)
+    for approximate in ("tanh", "none"):
+      expected = (.5*x*(1+np.tanh(np.sqrt(2/np.pi)*(x+.044715*x**3))) if approximate == "tanh" else
+                  .5*x*(1+np.vectorize(math.erf)(x/np.sqrt(2)))).astype(np.float16)
+      actual = Tensor(data, device="ROCKCHIP").gelu(approximate=approximate).realize().numpy()
+      np.testing.assert_allclose(actual, expected, rtol=1.4e-3, atol=1.3e-4)
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)
