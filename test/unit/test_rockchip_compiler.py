@@ -291,6 +291,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_SQRT_SHA256)
     self.assertFalse(contains_uop(plan))
 
+  def test_rsqrt_uses_range_scaled_refined_lut(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).rsqrt()))
+    self.assertEqual((len(plan.stages), len(plan.scratch), plan.fp32_inputs), (42, 6, ()))
+    self.assertEqual(sum(x.op is RKDPUOp.RSQRT for x in plan.stages), 1)
+    table = rklut.RK_LUT_RSQRT
+    self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_RSQRT_SHA256)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

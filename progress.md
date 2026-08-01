@@ -15,11 +15,11 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
 milestones through the refined Sqrt LUT, the 2026-08-01 census is
-**125 passed, 287 failed, and 13 skipped**. Pytest prints `413 failed` because
+**126 passed, 286 failed, and 13 skipped**. Pytest prints `412 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 42-host/22-NPU
+while recovering the remaining native forward coverage. Focused 43-host/23-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -74,7 +74,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `6157fcb05` | Parameterized Softplus with LUT post-scaling | `0190-rockchip-add-Softplus-LUTs.patch` |
 | `b304b9204` | Direct Sinh/Cosh LUTs with infinite tails | `0191-rockchip-add-Sinh-Cosh-LUTs.patch` |
 | `5d0a9360a` | Exact 124-pass TestOps census | `0192-rockchip-record-124-pass-TestOps-census.patch` |
-| current milestone | Refined Sqrt LUT and bounded FP32 input ABI | `0193-rockchip-add-refined-Sqrt-LUT.patch` |
+| `705877b63` | Refined Sqrt LUT and bounded FP32 input ABI | `0193-rockchip-add-refined-Sqrt-LUT.patch` |
+| current milestone | Range-scaled refined RSqrt LUT | `0194-rockchip-add-refined-RSqrt-LUT.patch` |
 
 ## Architecture now implemented
 
@@ -120,7 +121,8 @@ Implemented forward-only subset:
 - Softplus beta 1, 3, and 1/3 using generated corrections, amplified tails, and Q15 LUT post-scaling;
 - Sinh/Cosh using direct central LUTs, local Sinh correction, and device-generated infinite tails;
 - Sqrt using a Q14 seed, three NPU Newton steps, and device masks for zero, infinity, negative input, and NaN;
-- bounded FP32 Sqrt inputs narrowed to FP16 only at the runtime ABI boundary, with all function semantics remaining in the NPU program;
+- bounded FP32 Sqrt/RSqrt inputs narrowed to FP16 only at the runtime ABI boundary, with all function semantics remaining in the NPU program;
+- RSqrt using exact power-of-16 input scaling, a dedicated Q13 seed, one NPU Newton step, output rescaling, and IEEE masks;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -132,12 +134,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1082
+tinygrad/renderer/rockchip.py  1103
 tinygrad/runtime/ops_rockchip.py  85
-handwritten Rockchip total  1167
+handwritten Rockchip total  1188
 ```
 
-This meets the requested `<5000` backend goal with 3,833 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 3,812 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -147,7 +149,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 26,143 `sz.py` lines, a `+1,175` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 1,143 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 26,164 `sz.py` lines, a `+1,196` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 1,164 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 
@@ -205,7 +207,7 @@ No-host-semantic-fallback audit:
 rg -n '_HOST_|run_host|host.*layout' tinygrad/renderer/rockchip.py tinygrad/runtime/ops_rockchip.py
 ```
 
-Allocator `copyin`/`copyout` and the declared FP32-to-FP16 Sqrt input conversion are ABI transport, not semantic CPU execution. The runtime may use NumPy only for this element-format conversion; it never evaluates Sqrt or another tensor operation on the host.
+Allocator `copyin`/`copyout` and the declared FP32-to-FP16 Sqrt/RSqrt input conversion are ABI transport, not semantic CPU execution. The runtime may use NumPy only for this element-format conversion; it never evaluates Sqrt, RSqrt, or another tensor operation on the host.
 
 ## Explicitly pending
 
@@ -214,7 +216,7 @@ Allocator `copyin`/`copyout` and the declared FP32-to-FP16 Sqrt input conversion
 - User-visible bool packing and general comparison outputs. FP16 masks used inside WHERE are native already.
 - LOG2, reciprocal, SIN, and additional generated LUT identifiers.
 - Windowed pooling until layout/channel padding is expressed on device.
-- General FP32 expressions/inputs, bool, general integer arithmetic/casts, and gradient support. Native FP32/int32 constant fills and the bounded FP32 Sqrt input ABI are the only current exceptions.
+- General FP32 expressions/inputs, bool, general integer arithmetic/casts, and gradient support. Native FP32/int32 constant fills and the bounded FP32 Sqrt/RSqrt input ABI are the only current exceptions.
 - Multicore/program-chain submission beyond the stable reset-separated single-core task sequence.
 - Broad TestOps parity. Unsupported graphs deliberately reject rather than run on the CPU.
 

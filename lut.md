@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 13 |
+| Schema | 14 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -108,6 +108,8 @@ Softplus uses broad/tail pairs `SOFTPLUS1 = 26/27` and `SOFTPLUS3 = 28/29`, plus
 Hyperbolic functions use `SINH = 31`, Q13 on `[-2,2]`, `SINH_LOCAL = 32`, Q15 `4*sinh(x)` near zero, and `COSH = 33`, Q13 on `[-2,2]`. Sinh selects the local table inside `|x|<0.125` and identity inside `|x|<0.04`; Cosh needs only the broad table. Inputs are clamped before lookup, and division by a device mask creates signed Sinh infinity or positive Cosh infinity for `|x|>10`. The 30/11-stage plans pass normal and ±300 official cases plus strict central dense sweeps.
 
 Sqrt uses `SQRT = 34`, a Q14 seed table over `[0,4]` with index scale 4090. Three Newton steps execute on the NPU as `y=(y+x/y)/2`, removing the linear interpolation curvature error. Device masks preserve exact signed zero, synthesize positive infinity above the FP16 finite range, and return NaN for negative or NaN input. The typed program has 25 stages and four reusable scratch buffers. FP32 explicit/scalar inputs are narrowed once at the declared runtime ABI boundary; the LUT, refinement, and all special-value semantics remain NPU operations. The official method and a dense 2,049-point `[0,16]` sweep pass.
+
+Reciprocal Sqrt uses `RSQRT = 35`, a Q13 seed clamped to `[0.5,4]` over the same `[0,4]` address domain. Positive inputs below `1/16` and `1/256` are multiplied by exact powers of 16 before lookup; the result is multiplied by the corresponding powers of four. One NPU inverse-square-root Newton step, `y=y*(1.5-0.5*x*y*y)`, removes interpolation error without the extra FP16 rounding of `1/sqrt(x)`. Device masks restore positive-zero/infinity/negative/NaN semantics. The 42-stage, six-scratch program passes the official method and a dense geometric sweep from `2^-8` to 4. DPU division currently normalizes `-0`, and general finite inputs above 4 still need high-range reduction.
 
 ## Current command contract
 

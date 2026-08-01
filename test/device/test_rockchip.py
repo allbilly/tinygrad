@@ -148,4 +148,15 @@ class TestRockchip(unittest.TestCase):
     fp32 = np.array([0., 1., 4.], dtype=np.float32)
     np.testing.assert_equal(Tensor(fp32, device="ROCKCHIP").sqrt().numpy(), np.sqrt(fp32))
 
+  def test_range_scaled_refined_rsqrt_lut(self):
+    data = np.geomspace(2**-8, 4, 2049).astype(np.float16)
+    expected = (1/np.sqrt(data.astype(np.float32))).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").rsqrt().numpy(), expected, rtol=1e-3, atol=1e-6)
+    special = np.array([-1, 0., np.inf, np.nan], dtype=np.float16)
+    with np.errstate(divide="ignore", invalid="ignore"): expected_special = 1/np.sqrt(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").rsqrt().numpy(), expected_special)
+    fp32 = np.array([0., 1., 4.], dtype=np.float32)
+    with np.errstate(divide="ignore"): expected_fp32 = 1/np.sqrt(fp32)
+    np.testing.assert_equal(Tensor(fp32, device="ROCKCHIP").rsqrt().numpy(), expected_fp32)
+
 if __name__ == "__main__": unittest.main()
