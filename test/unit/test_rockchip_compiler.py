@@ -89,6 +89,12 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(any(isinstance(stage, RKMaskStage) for stage in sign.stages))
     self.assertFalse(contains_uop(sign))
 
+  def test_threshold_where_avoids_multiply_blend(self):
+    x = Tensor.empty(16,dtype=dtypes.half)
+    plan = lower_dpu(sink((x < 0).where(x, 1)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertFalse(contains_uop(plan))
+
   def test_division_canonicalizes_to_generic_fdiv(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(a/b))

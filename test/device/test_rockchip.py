@@ -27,6 +27,9 @@ class TestRockchip(unittest.TestCase):
     b = np.linspace(3, 6, 16, dtype=np.float16)
     ta, tb = Tensor(a, device="ROCKCHIP").realize(), Tensor(b, device="ROCKCHIP").realize()
     np.testing.assert_equal((ta<0).where(ta, tb).realize().numpy(), np.where(a<0, a, b))
+    special = np.array([-np.inf, -2, 0, 2, np.inf], dtype=np.float16)
+    ts = Tensor(special, device="ROCKCHIP").realize()
+    np.testing.assert_equal((ts<0).where(ts, 1).realize().numpy(), np.where(special<0, special, 1))
 
   def test_fp16_abs_specials_and_finite_extrema(self):
     data = np.array([-2, -0., 0., 2., np.inf, -np.inf, np.nan, -np.nan], dtype=np.float16)

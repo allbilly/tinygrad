@@ -276,7 +276,20 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     compared = tuple(_parse_alu(x, output_index, memo) for x in (lhs_u, rhs_u))
     if any(x is None for x in compared): return None
     lhs, rhs = cast(tuple[_Value, _Value], compared)
-    if ordered_max: ret = _ALUExpr(Ops.MAX, (lhs, rhs))
+    threshold_select = cond.op is Ops.CMPLT and isinstance(rhs, float) and \
+      ((true_u.key == lhs_u.key and false_u.op is Ops.CONST and math.isfinite(float(false_u.arg)) and float(false_u.arg) != rhs) or
+       (false_u.key == lhs_u.key and true_u.op is Ops.CONST and math.isfinite(float(true_u.arg)) and float(true_u.arg) != rhs))
+    if threshold_select:
+      mask = _parse_mask_expr(cond, output_index, memo)
+      if mask is None: return None
+      threshold = cast(float, rhs)
+      if true_u.key == lhs_u.key:
+        base = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lhs, -1.0)), -threshold)), -1.0))
+        ret = _ALUExpr(Ops.ADD, (base, _ALUExpr(Ops.MUL, (float(false_u.arg)-threshold, _sub(1.0, mask)))))
+      else:
+        base = _ALUExpr(Ops.MAX, (lhs, threshold))
+        ret = _ALUExpr(Ops.ADD, (base, _ALUExpr(Ops.MUL, (float(true_u.arg)-threshold, mask))))
+    elif ordered_max: ret = _ALUExpr(Ops.MAX, (lhs, rhs))
     elif ordered_min:
       negative = (_ALUExpr(Ops.MUL, (lhs, -1.0)), _ALUExpr(Ops.MUL, (rhs, -1.0)))
       ret = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, negative), -1.0))
