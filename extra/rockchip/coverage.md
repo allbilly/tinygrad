@@ -79,6 +79,7 @@ nonnumeric constants discovered by this census.
 | Generated algorithm-23 round-to-nearest-even LUT | `test_round` | Yes (`6ddda80b0`) |
 | Integral rounding composed from the roundoff LUT | `test_trunc`, `test_floor`, `test_ceil` | Yes (`6ddda80b0`) |
 | IEEE special-value wrapper around EXP2 LUT | `test_exp2` | No |
+| Generated two-level EXP LUT with signed-factor recognition | `test_exp` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

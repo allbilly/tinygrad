@@ -57,6 +57,14 @@ class TestRockchip(unittest.TestCase):
     special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").exp2().realize().numpy(), np.array([np.inf, 0, np.nan], dtype=np.float16))
 
+  def test_generated_two_level_exp_lut(self):
+    data = np.linspace(-2, 2, 4097, dtype=np.float16)
+    actual = Tensor(data, device="ROCKCHIP").exp().realize().numpy()
+    reference = np.exp(data.astype(np.float32))
+    np.testing.assert_allclose(actual, reference, rtol=1e-3, atol=1e-6)
+    special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").exp().realize().numpy(), np.array([np.inf, 0, np.nan], dtype=np.float16))
+
   def test_generated_roundoff_lut(self):
     data = np.linspace(-16, 16, 4097, dtype=np.float16)
     np.testing.assert_equal(Tensor(data, device="ROCKCHIP").round().realize().numpy(), np.round(data))

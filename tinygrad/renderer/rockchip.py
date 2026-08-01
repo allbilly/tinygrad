@@ -225,6 +225,21 @@ def _trunc_expr(source:_Expr|RKArg|float) -> _Expr:
   increment = _ALUExpr(Ops.MUL, (positive(source, rounded), positive(0.0, source)))
   return _ALUExpr(Ops.ADD, (_sub(rounded, decrement), increment))
 
+def _exp_expr(source:_Expr|RKArg|float) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg|float, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  broad:_Expr = _LUTExpr(RKLUTId.EXP, (clamp(source, 2.0),))
+  broad = _ALUExpr(Ops.MUL, (broad, _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (positive(source, 0.0), 7.0))))))
+  local = _LUTExpr(RKLUTId.EXP_LOCAL, (clamp(source, .25),))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.25), positive(.25, source)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))
+  high, low = positive(source, 65472.0), positive(-65472.0, source)
+  finite = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (selected, _sub(1.0, high))), _sub(1.0, low)))
+  nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
+  return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (finite, nan_denom)), nan_denom))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -271,6 +286,7 @@ def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float])
   return None
 
 def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|RKArg|float|None:
+  while u.op is Ops.CAST and u.dtype in (dtypes.half, dtypes.float) and u.src[0].dtype in (dtypes.half, dtypes.float): u = u.src[0]
   u = _unwrap_same_cast(u)
   if u in memo: return memo[u]
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
@@ -298,9 +314,16 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     if operand is None: return None
     ret = _trunc_expr(operand)
   elif u.op is Ops.EXP2:
-    operand = _parse_alu(u.src[0], output_index, memo)
+    exp_operand = _unwrap_same_cast(u.src[0])
+    exp_factor = next((x for x in exp_operand.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None) \
+      if exp_operand.op is Ops.MUL else None
+    exp_source = next((x for x in exp_operand.src if x is not exp_factor), None) if exp_factor is not None else None
+    exp_scale = float(exp_factor.arg) if exp_factor is not None else None
+    is_exp = exp_scale is not None and math.isclose(abs(exp_scale), math.log2(math.e))
+    operand = _parse_alu(exp_source if is_exp and exp_source is not None else u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
-    ret = _LUTExpr(RKLUTId.EXP2, (operand,))
+    if is_exp: ret = _exp_expr(_ALUExpr(Ops.MUL, (operand, -1.0))) if cast(float, exp_scale) < 0 else _exp_expr(operand)
+    else: ret = _LUTExpr(RKLUTId.EXP2, (operand,))
   elif u.op is Ops.WHERE:
     cond = _unwrap_same_cast(u.src[0])
     true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
@@ -516,12 +539,15 @@ def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
 
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
-  if plan.lut is not RKLUTId.EXP2: raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
+  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL): raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
+  name = plan.lut.name
+  table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")
+  bn_mul, minus_exp = getattr(rklut, f"RK_LUT_{name}_BN_MUL"), getattr(rklut, f"RK_LUT_{name}_MINUS_EXP")
   width, surf_stride, cmds = (plan.count+7)//8-1, ((plan.count+7)//8)*16, []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
     cmds.extend(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_DATA, value) for value in
-                rklut.RK_LUT_EXP2[table_id*rklut.RK_LUT_EXP2_ENTRIES:(table_id+1)*rklut.RK_LUT_EXP2_ENTRIES])
+                table[table_id*entries:(table_id+1)*entries])
   fixed = (
     (_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x30), (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0x30),
     (_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002),
@@ -529,9 +555,9 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
     (_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
     (_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 2), (_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, 7),
     (_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, width), (_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x20040),
-    (_TARGET_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000), (_TARGET_DPU, rk.REG_DPU_BN_MUL_CFG, rklut.RK_LUT_EXP2_BN_MUL << 16),
+    (_TARGET_DPU, rk.REG_DPU_BN_ALU_CFG, 0x80000000), (_TARGET_DPU, rk.REG_DPU_BN_MUL_CFG, bn_mul << 16),
     (_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x302), (_TARGET_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
-    (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001), (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SHIFT, rklut.RK_LUT_EXP2_MINUS_EXP << 12),
+    (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001), (_TARGET_DPU, rk.REG_DPU_OUT_CVT_SHIFT, minus_exp << 12),
     (_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 2*surf_stride), (_TARGET_DPU, 0x40c4, 0),
     (_TARGET_DPU, rk.REG_DPU_LUT_CFG, 0x68), (_TARGET_DPU, rk.REG_DPU_LUT_INFO, 0x50500),
     (_TARGET_DPU, rk.REG_DPU_LUT_LE_START, 0xffffc000), (_TARGET_DPU, rk.REG_DPU_LUT_LE_END, 0),

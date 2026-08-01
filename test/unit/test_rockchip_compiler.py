@@ -130,6 +130,23 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_dpu(plan)
     self.assertEqual((len(image.stages[0].commands), tuple(r.word for r in image.stages[0].relocs)), (1064, (1032, 1059)))
 
+  def test_exp_composes_generated_generic_luts(self):
+    for name in ("EXP", "EXP_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      payload = struct.pack(f"<{len(table)}h", *table)
+      self.assertEqual(hashlib.sha256(payload).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_EXP_SIM_MAX_REL_ERROR, 1e-3)
+    plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).exp()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.EXP, rklut.RKLUTId.EXP_LOCAL})
+    self.assertFalse(contains_uop(plan))
+    self.assertEqual(len(emit_dpu(plan).stages), len(plan.stages))
+    sigmoid = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).sigmoid()))
+    self.assertIsInstance(sigmoid, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in sigmoid.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.EXP, rklut.RKLUTId.EXP_LOCAL})
+
   def test_round_uses_generated_algorithm23_lut(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_ROUNDOFF)}h", *rklut.RK_LUT_ROUNDOFF)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)
