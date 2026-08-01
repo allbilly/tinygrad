@@ -1401,7 +1401,39 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in (lhs_u, rhs_u))
     if any(x is None for x in operands): return None
     parsed = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], operands)
-    if ordered_max: ret = _DPUExpr(RKDPUOp.MAX, parsed)
+    reverse_inf_select = cond.op is Ops.CMPLT and isinstance(parsed[0], float) and \
+      ((false_u.key == rhs_u.key and true_u.op is Ops.CONST and math.isinf(float(true_u.arg))) or
+       (true_u.key == rhs_u.key and false_u.op is Ops.CONST and math.isinf(float(false_u.arg))))
+    threshold_select = cond.op is Ops.CMPLT and isinstance(parsed[1], float) and \
+      ((true_u.key == lhs_u.key and false_u.op is Ops.CONST and math.isfinite(float(false_u.arg)) and float(false_u.arg) != parsed[1]) or
+       (false_u.key == lhs_u.key and true_u.op is Ops.CONST and math.isfinite(float(true_u.arg)) and float(true_u.arg) != parsed[1]))
+    select_denominator:_DPUExpr|RKArg|float
+    if reverse_inf_select:
+      mask = _parse_mask_expr(cond, output_index, memo)
+      if mask is None: return None
+      threshold_value, source_value = cast(float, parsed[0]), parsed[1]
+      if false_u.key == rhs_u.key:
+        base_value, inf_value, select_denominator = (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX,
+          (_DPUExpr(RKDPUOp.MUL, (source_value, -1.0)), -threshold_value)), -1.0)),
+          float(true_u.arg), _DPUExpr(RKDPUOp.SUB, (1.0, mask)))
+      else:
+        base_value, inf_value, select_denominator = _DPUExpr(RKDPUOp.MAX, (source_value, threshold_value)), float(false_u.arg), mask
+      correction = _DPUExpr(RKDPUOp.MUL, (math.copysign(1.0, inf_value),
+        _DPUExpr(RKDPUOp.SUB, (_DPUExpr(RKDPUOp.DIV, (1.0, select_denominator)), 1.0))))
+      ret = _DPUExpr(RKDPUOp.ADD, (base_value, correction))
+    elif threshold_select:
+      mask = _parse_mask_expr(cond, output_index, memo)
+      if mask is None: return None
+      source_value, threshold_value = parsed[0], cast(float, parsed[1])
+      if true_u.key == lhs_u.key:
+        base_value = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX,
+          (_DPUExpr(RKDPUOp.MUL, (source_value, -1.0)), -threshold_value)), -1.0))
+        ret = _DPUExpr(RKDPUOp.ADD, (base_value, _DPUExpr(RKDPUOp.MUL,
+          (float(false_u.arg)-threshold_value, _DPUExpr(RKDPUOp.SUB, (1.0, mask))))))
+      else:
+        base_value = _DPUExpr(RKDPUOp.MAX, (source_value, threshold_value))
+        ret = _DPUExpr(RKDPUOp.ADD, (base_value, _DPUExpr(RKDPUOp.MUL, (float(true_u.arg)-threshold_value, mask))))
+    elif ordered_max: ret = _DPUExpr(RKDPUOp.MAX, parsed)
     elif ordered_min:
       negative = tuple(_DPUExpr(RKDPUOp.MUL, (x, -1.0)) for x in parsed)
       ret = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, negative), -1.0))
@@ -1410,8 +1442,17 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
       arms = tuple(_parse_dpu_expr(x, output_index, memo) for x in (true_u, false_u))
       if mask is None or any(x is None for x in arms): return None
       true, false = cast(tuple[_DPUExpr|RKArg|float, _DPUExpr|RKArg|float], arms)
-      ret = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (true, mask)),
-        _DPUExpr(RKDPUOp.MUL, (false, _DPUExpr(RKDPUOp.SUB, (1.0, mask))))))
+      inf_arm = next(((idx, arm) for idx,arm in enumerate((true, false)) if isinstance(arm, float) and math.isinf(arm)), None)
+      other_arm = (false, true)[inf_arm[0]] if inf_arm is not None else None
+      if inf_arm is not None and not (isinstance(other_arm, float) and math.isinf(other_arm)):
+        inf_index, inf_value = inf_arm
+        finite_value, select_denominator = (false, _DPUExpr(RKDPUOp.SUB, (1.0, mask))) if inf_index == 0 else (true, mask)
+        correction = _DPUExpr(RKDPUOp.MUL, (math.copysign(1.0, inf_value),
+          _DPUExpr(RKDPUOp.SUB, (_DPUExpr(RKDPUOp.DIV, (1.0, select_denominator)), 1.0))))
+        ret = _DPUExpr(RKDPUOp.ADD, (finite_value, correction))
+      else:
+        ret = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (true, mask)),
+          _DPUExpr(RKDPUOp.MUL, (false, _DPUExpr(RKDPUOp.SUB, (1.0, mask))))))
   else: return None
   memo[u] = ret
   return ret

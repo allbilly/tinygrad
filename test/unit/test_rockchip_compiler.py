@@ -1,4 +1,4 @@
-import hashlib, struct, unittest
+import hashlib, math, struct, unittest
 from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import early_simplify
@@ -501,6 +501,14 @@ class TestDPUCompiler(unittest.TestCase):
     scalar_plan = lower_dpu(sink(x.maximum(Tensor.empty(1,dtype=dtypes.int))))
     self.assertIsInstance(scalar_plan, RKDPUProgram)
     self.assertEqual(scalar_plan.tiled_int_inputs, (2,))
+
+  def test_infinity_safe_where_avoids_multiply_blend(self):
+    x = Tensor.empty(16,dtype=dtypes.half)
+    for result in ((x < 0).where(x, 1), (x > 0.1).where(-math.inf, x)):
+      plan = lower_dpu(sink(result))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertLessEqual(len(plan.stages), 64)
+      self.assertFalse(contains_uop(plan))
 
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))

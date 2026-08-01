@@ -293,4 +293,10 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(tx.minimum(ty).numpy(), np.minimum(lhs, rhs))
     np.testing.assert_equal(tx.maximum(Tensor(np.array(-(2**31), dtype=np.int32), device="ROCKCHIP")).numpy(), lhs)
 
+  def test_where_preserves_selected_infinities(self):
+    data = np.array([-np.inf, -2, 0, 2, np.inf], dtype=np.float16)
+    x = Tensor(data, device="ROCKCHIP")
+    np.testing.assert_equal((x < 0).where(x, 1).numpy(), np.where(data < 0, data, 1))
+    np.testing.assert_equal((x > .1).where(-np.inf, x).numpy(), np.where(data > .1, -np.inf, data))
+
 if __name__ == "__main__": unittest.main()
