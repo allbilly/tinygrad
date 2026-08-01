@@ -14,13 +14,11 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through dedicated two-level GELU variants, the 2026-08-01 census is
-**116 passed, 296 failed, and 13 skipped**. Pytest prints `422 failed` because
+milestones through direct Sinh/Cosh LUTs, the 2026-08-01 census is
+**124 passed, 288 failed, and 13 skipped**. Pytest prints `414 failed` because
 it separately counts 126 failing subtests.
 
-Standalone Erf, ELU/SELU, Mish, LogSigmoid, Softplus, and Sinh/Cosh are additionally green, giving a current validated delta of
-**124 passed, 288 failed, and 13 skipped** without relabeling it as a new full
-census. The clean branch must preserve its `<5000` handwritten-line target
+The clean branch must preserve its `<5000` handwritten-line target
 while recovering the remaining native forward coverage. Focused 40-host/21-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.

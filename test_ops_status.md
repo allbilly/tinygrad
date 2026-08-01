@@ -78,24 +78,19 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the dedicated two-level GELU milestone:
+Latest complete uncached census after the direct Sinh/Cosh milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 116 |
-| FAIL | 296 |
+| PASS | 124 |
+| FAIL | 288 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `422 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 144.99 seconds. Relative
-to the preceding exact tanh census, EXP2 special values add one passing method,
-shared sigmoid/SiLU/Swish add three, normal/extreme QuickGELU add two, and
-normal/extreme tanh/exact GELU add two.
-
-The isolated standalone `test_erf`, `test_elu`, `test_selu`, `test_mish`, `test_logsigmoid`, `test_softplus`, `test_sinh`, and `test_cosh` methods additionally pass.
-Current validated delta after the exact census: 124 PASS / 288 FAIL / 13 SKIP.
-A new full-census runtime has not yet been recorded for that eight-method delta.
+Pytest reports `414 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 202.88 seconds. This
+exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
+GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, and Sinh/Cosh.
 
 ## Focused verified matrix
 
