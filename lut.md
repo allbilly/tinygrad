@@ -26,7 +26,7 @@ longer expands the hardware-operation enum or the emitter dispatch surface.
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 23 |
+| Schema | 24 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -146,6 +146,8 @@ The coarse/fine split is at `d=0.003`, while the endpoint region begins at `|x|>
 ATAN uses reciprocal folding before two regional assets: `t=|x|` for `|x|<=1`, otherwise `t=1/|x|`. `ATAN = 56` stores direct `atan(t)` over `[0,1]` (SHA256 `e178bdb3306b8d89dbd7eadaaef377321d590e6ed8a0dc092f2c17e4e5460536`). `ATAN_DETAIL = 57` uses its negative bank for amplified `4*atan(t)` near zero and its positive bank for `atan(1/t)/2` in the folded large-input region (SHA256 `03fe0306f38b96b414bc16dc39531b11b3dfe1ac59e18483664ef359ce7bafdf`). As with ACOS, the negative bank's shared zero knot is corrected offline because the positive-bank formula has different scaling there. The 42-stage, eight-scratch program passes the official method and a strict 4,097-point `[-16,16]` hardware sweep.
 
 SIN/COS use four assets: `SIN = 58` (`e5606a81bda56919a107a8a984f26c96aa0ea5de2f3cdcb9d0138f79ae45aded`), `SIN_LOCAL = 59` (`8f6241fde668f1730cfbbcf6e6509bf025d21f516ab31912a242f364e460b793`), `COS = 60` (`18291b5b8a969a5008744a1016cb1972cf9b1ff8ce82a6b4b27a1aefe1ed4bd9`), and `COS_LOCAL = 61` (`c65278716a32ea5ac9b5cf01c1fc55070713f0c816cf3674bc13f42e3162d88a`). Device arithmetic performs split `2*pi` subtraction after native roundoff. COS also preserves `pi/2` as `1.5703125 + residual`; one FP16 constant lost the residual and failed around cosine zero. A final `x*0` term propagates NaN for infinities without a five-stage mask epilogue. The plans are 56/59 stages and seven scratch buffers. SIN passes the official method; COS is proven only for explicit FP16 because the census plugin changes that method to FP32. A uniform 4,097-point sweep exposed three SIN values near `-0.2` just beyond relative tolerance and wider-range reduction error; the committed contract therefore does not claim exhaustive/wide periodic accuracy, and no tolerance was relaxed.
+
+ATANH uses `ATANH = 62`, storing `atanh(x)/4` over the bounded positive domain (SHA256 `d39dbab63125159da8a8ac83ad3f09286196635064805dc19adee1480726ad75`), and `ATANH_DETAIL = 63`, whose negative bank stores amplified center values while its positive bank stores `atanh(1-d)/8` addressed by endpoint distance (SHA256 `8d84722fe68e3cf37eb640e537b1d5e1f320ce3fe961f0f5dd1a77eb13ad4278`). The shared LE zero knot is corrected offline to the center-table value. Device masks select identity near zero, broad interpolation, and endpoint detail; division creates signed infinity at `±1` and NaN outside `[-1,1]`. The 47-stage, eight-scratch program passes the official method and strict 4,097-point domain/special-value hardware sweep. This is independent of the rejected scaled-LOG experiment.
 
 ## Current command contract
 

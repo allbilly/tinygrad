@@ -384,6 +384,16 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertTrue(all(sum(stage.lut is op for stage in plan.stages) == 1 for op in assets))
       self.assertFalse(contains_uop(plan))
 
+  def test_atanh_uses_bounded_broad_detail_luts(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).atanh()))
+    assets = (rklut.RKLUT.ATANH, rklut.RKLUT.ATANH_DETAIL)
+    self.assertLess(len(plan.stages), 64)
+    self.assertTrue(all(sum(stage.lut is op for stage in plan.stages) == 1 for op in assets))
+    for op in assets:
+      table, digest = getattr(rklut, f"RK_LUT_{op.name}"), getattr(rklut, f"RK_LUT_{op.name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))
