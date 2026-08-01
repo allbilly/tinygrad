@@ -478,6 +478,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 64)
     self.assertFalse(contains_uop(plan))
 
+  def test_square_int32_transpose_copies_exact_planes(self):
+    x = Tensor.empty(5,5,dtype=dtypes.int)
+    plan = lower_dpu(sink(x.T.clone()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual((plan.int_inputs, plan.int_outputs, plan.transposed_int_inputs), ((1,), (0,), (1,)))
+    self.assertEqual(len(plan.stages), 4)
+    self.assertFalse(contains_uop(plan))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

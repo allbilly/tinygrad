@@ -9,7 +9,7 @@ class TestRKImage(unittest.TestCase):
               (RKReloc(0, 0, RKBufferKind.ARG, 1, addend=64, shift=4, mask=0xfffffff0),), (1,), (0,)),
       RKStage(RKEngine.CMAC, (7, 8), dependencies=1, reads=(0,), writes=(2,))),
       (RKScratch(8192, 4096),), b"constant payload", fp32_inputs=(1,), fp32_outputs=(0,), bool_outputs=(2,), bool_inputs=(3,), int_inputs=(4,),
-      tiled_inputs=(5,), int_outputs=(6,))
+      tiled_inputs=(5,), int_outputs=(6,), transposed_int_inputs=(7,))
     blob = encode_image(image)
     self.assertEqual(decode_image(blob), image)
     self.assertEqual(encode_image(decode_image(blob)), blob)

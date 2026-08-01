@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, mmap, os, time
+import ctypes, math, mmap, os, time
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
@@ -65,9 +65,13 @@ class RockchipProgram(Program['RockchipDevice']):
       source, count = bufs[slot], bufs[slot].size//4
       plane_size, temporary = ((count+7)//8)*16, self.dev._gpu_alloc(((count+7)//8)*64)
       int_values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.int32).view(np.uint32)
+      if slot in self.image.transposed_int_inputs:
+        side = math.isqrt(count)
+        if side*side != count: raise RuntimeError(f"int32 transpose input slot {slot} is not square")
+        int_values = int_values.reshape(side, side).T.flatten()
       for plane, shift in enumerate((24, 16, 8, 0)):
         encoded = ((int_values >> shift) & 0xff).astype(np.uint8)
-        if shift == 24: encoded ^= 0x80
+        if shift == 24 and slot not in self.image.transposed_int_inputs: encoded ^= 0x80
         encoded = encoded.astype(np.float16)
         ctypes.memmove(int(temporary.va_addr)+plane*plane_size, encoded.ctypes.data, encoded.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]

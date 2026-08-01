@@ -280,4 +280,9 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(condition, device="ROCKCHIP").where(0x12345678, -3).clone().numpy()
     np.testing.assert_equal(actual, np.where(condition, 0x12345678, -3).astype(np.int32))
 
+  def test_square_int32_transpose_preserves_all_bits(self):
+    data = np.array([-(2**31), -65537, -1, 0, 1, 255, 256, 65535, 65536, 2**31-1,
+                     -123456789, 123456789, -42, 42, 7, 8, 9, 10, 11, 12, -13, -14, 15, 16, -17], dtype=np.int32).reshape(5,5)
+    np.testing.assert_equal(Tensor(data, device="ROCKCHIP").T.clone().numpy(), data.T)
+
 if __name__ == "__main__": unittest.main()
