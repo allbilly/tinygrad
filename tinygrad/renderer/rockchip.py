@@ -197,12 +197,32 @@ def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
 
+def _canonical_abs(u:UOp) -> UOp|None:
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  for data, sign in (u.src, u.src[::-1]):
+    data, sign = _unwrap_same_cast(data), _unwrap_same_cast(sign)
+    if data.op is not Ops.INDEX or sign.op is not Ops.WHERE: continue
+    cond, nonzero, zero = _unwrap_same_cast(sign.src[0]), _unwrap_same_cast(sign.src[1]), _unwrap_same_cast(sign.src[2])
+    if cond.op is not Ops.CMPNE or zero.op is not Ops.CONST or float(zero.arg) != 0 or nonzero.op is not Ops.WHERE: continue
+    less, negative, positive = (_unwrap_same_cast(x) for x in nonzero.src)
+    compared = tuple(_unwrap_same_cast(x) for x in cond.src)
+    if (less.op is Ops.CMPLT and compared[0].key == data.key and compared[1].op is Ops.CONST and float(compared[1].arg) == 0 and
+        _unwrap_same_cast(less.src[0]).key == data.key and _unwrap_same_cast(less.src[1]).op is Ops.CONST and
+        float(_unwrap_same_cast(less.src[1]).arg) == 0 and negative.op is Ops.CONST and float(negative.arg) == -1 and
+        positive.op is Ops.CONST and float(positive.arg) == 1): return data
+  return None
+
 def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float]) -> _DPUExpr|RKArg|float|None:
   u = _unwrap_same_cast(u)
   if u in memo: return memo[u]
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (abs_input:=_canonical_abs(u)) is not None:
+    operand = _parse_dpu_expr(abs_input, output_index, memo)
+    if operand is None: return None
+    ret = _DPUExpr(RKDPUOp.MAX, (operand, _DPUExpr(RKDPUOp.MUL, (operand, -1.0))))
   elif u.op is Ops.MUL and any(_unwrap_same_cast(x).op is Ops.RECIPROCAL for x in u.src):
     reciprocal = next(i for i,x in enumerate(u.src) if _unwrap_same_cast(x).op is Ops.RECIPROCAL)
     numerator, denominator = u.src[1-reciprocal], _unwrap_same_cast(u.src[reciprocal]).src[0]

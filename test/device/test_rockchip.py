@@ -37,6 +37,10 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_allclose(x.reciprocal().realize().numpy(), 1/lhs, rtol=2e-3, atol=2e-3)
     np.testing.assert_allclose((x/y).realize().numpy(), lhs/rhs, rtol=2e-3, atol=2e-3)
 
+  def test_abs_specials(self):
+    data = np.array([-2, -0., 0., 2., np.inf, -np.inf, np.nan, -np.nan], dtype=np.float16)
+    np.testing.assert_equal(Tensor(data, device="ROCKCHIP").abs().realize().numpy(), np.abs(data))
+
   def test_direct_fp16_contract(self):
     rng = np.random.default_rng(2)
     a_np, packed_b_np = rng.uniform(-1,1,(1,32)).astype(np.float16), rng.uniform(-1,1,(8,32)).astype(np.float16)

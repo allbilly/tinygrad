@@ -138,6 +138,12 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     self.assertEqual(tuple(stage.op.name for stage in lower_dpu(sink(x/y)).stages), ("DIV",))
 
+  def test_abs_canonicalizes_to_mul_max(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual(tuple(stage.op.name for stage in plan.stages), ("MUL", "MAX"))
+    self.assertFalse(contains_uop(plan))
+
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     plan = lower_contract(sink(a@packed_b.T))
