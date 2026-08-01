@@ -516,6 +516,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(plan.stages[-1].op, RKDPUOp.MUL)
     self.assertFalse(contains_uop(plan))
 
+  def test_prefix_broadcast_declares_repeat_layout(self):
+    x, row, suffix = Tensor.empty(45,65,dtype=dtypes.half), Tensor.empty(45,1,dtype=dtypes.half), Tensor.empty(65,dtype=dtypes.half)
+    repeated, tiled = lower_dpu(sink(x.copysign(row))), lower_dpu(sink(x+suffix))
+    self.assertIsInstance(repeated, RKDPUProgram)
+    self.assertIsInstance(tiled, RKDPUProgram)
+    self.assertEqual((repeated.tiled_inputs, repeated.repeated_inputs, repeated.sign_inputs), ((1,), (1,), (1,)))
+    self.assertEqual((tiled.tiled_inputs, tiled.repeated_inputs), ((2,), ()))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

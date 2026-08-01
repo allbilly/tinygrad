@@ -90,13 +90,26 @@ class RockchipProgram(Program['RockchipDevice']):
         ctypes.memmove(int(temporary.va_addr)+plane*plane_size, encoded.ctypes.data, encoded.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]
     for slot in self.image.tiled_inputs:
+      if slot in self.image.sign_inputs: continue
       writes = tuple(dict.fromkeys(x for stage in self.image.stages for x in stage.writes))
       if slot >= len(bufs) or bufs[slot].size % 2 or (not self.image.bool_outputs and len(writes) != 1):
         raise RuntimeError(f"invalid tiled FP16 input slot {slot}")
       import numpy as np
       source = bufs[slot]
       count = bufs[self.image.bool_outputs[0]].size if self.image.bool_outputs else bufs[writes[0]].size//2
-      values = np.resize(np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float16), count)
+      source_values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float16)
+      values = np.repeat(source_values, count//source_values.size) if slot in self.image.repeated_inputs else np.resize(source_values, count)
+      temporary = self.dev._gpu_alloc(((count+7)//8)*16)
+      ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
+      prepared[slot], converted = temporary, [*converted, temporary]
+    for slot in self.image.sign_inputs:
+      writes = tuple(dict.fromkeys(x for stage in self.image.stages for x in stage.writes))
+      if slot >= len(bufs) or bufs[slot].size % 2 or len(writes) != 1: raise RuntimeError(f"invalid sign input slot {slot}")
+      import numpy as np
+      source, count = bufs[slot], bufs[writes[0]].size//2
+      source_values = np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float16)
+      signs = np.where(np.signbit(source_values), -1.0, 1.0).astype(np.float16)
+      values = np.repeat(signs, count//signs.size) if slot in self.image.repeated_inputs else np.resize(signs, count)
       temporary = self.dev._gpu_alloc(((count+7)//8)*16)
       ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]

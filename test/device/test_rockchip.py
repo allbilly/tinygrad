@@ -302,6 +302,16 @@ class TestRockchip(unittest.TestCase):
   def test_infinite_numerator_preserves_sign(self):
     data = np.array([-2, -.5, .5, 2], dtype=np.float16)
     x = Tensor(data, device="ROCKCHIP")
-    np.testing.assert_equal((math.inf / x).numpy(), np.array([ -np.inf, -np.inf, np.inf, np.inf], dtype=np.float16))
+    np.testing.assert_equal((math.inf / x).numpy(), np.array([-np.inf, -np.inf, np.inf, np.inf], dtype=np.float16))
+
+  def test_prefix_and_suffix_broadcast_layouts(self):
+    x = np.arange(12,dtype=np.float16).reshape(3,4)-6
+    row, suffix = np.array([[-1],[1],[-1]],dtype=np.float16), np.array([1,2,3,4],dtype=np.float16)
+    tx = Tensor(x, device="ROCKCHIP")
+    np.testing.assert_equal(tx.copysign(Tensor(row,device="ROCKCHIP")).numpy(), np.copysign(x, row))
+    np.testing.assert_equal((tx+Tensor(suffix,device="ROCKCHIP")).numpy(), x+suffix)
+    exact_sign = np.array([-0., 0., -np.inf, np.inf],dtype=np.float16)
+    np.testing.assert_equal(Tensor(np.ones(4,dtype=np.float16),device="ROCKCHIP").copysign(
+      Tensor(exact_sign,device="ROCKCHIP")).numpy(), np.copysign(np.ones(4,dtype=np.float16), exact_sign))
 
 if __name__ == "__main__": unittest.main()
