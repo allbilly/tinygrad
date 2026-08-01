@@ -9,10 +9,10 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 1, 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 2, 1
 _HEADER = struct.Struct("<4sHHHHHHIII")
 _STAGE = struct.Struct("<BBHIIIIIQQ")
-_RELOC = struct.Struct("<HHBBHqII")
+_RELOC = struct.Struct("<HHBBIqIH")
 _SCRATCH = struct.Struct("<II")
 
 class RKTarget(IntEnum): RK3588 = 1
@@ -123,7 +123,8 @@ def validate_image(image:RKImage) -> None:
     _slot_mask(stage.reads), _slot_mask(stage.writes)
     for reloc in stage.relocs:
       if reloc.stage != stage_idx or not 0 <= reloc.word < len(stage.commands): raise ValueError("invalid relocation location")
-      if reloc.index < 0 or reloc.shift < 0 or reloc.field_shift < 0 or reloc.mask >> 32: raise ValueError("invalid relocation field")
+      if reloc.index < 0 or reloc.index >> 32 or not 0 <= reloc.shift < 64 or not 0 <= reloc.field_shift < 32 or reloc.mask >> 32:
+        raise ValueError("invalid relocation field")
   for scratch in image.scratch:
     if scratch.size < 0 or scratch.alignment <= 0 or scratch.alignment & (scratch.alignment-1): raise ValueError("invalid scratch declaration")
 

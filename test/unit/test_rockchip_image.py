@@ -29,6 +29,11 @@ class TestRKImage(unittest.TestCase):
     patched = patch_image(image, lambda kind, index: 0x12345670)[0][0]
     self.assertEqual((patched >> 16) & 0xffffffff, 0x12345670)
 
+  def test_large_constant_relocation_roundtrip(self):
+    image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (0,),
+      (RKReloc(0, 0, RKBufferKind.CONSTANT, 70000),)),), constants=b"\0"*70002)
+    self.assertEqual(decode_image(encode_image(image)), image)
+
   def test_rejects_malformed_images(self):
     image = RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (1,), dependencies=1),))
     with self.assertRaises(ValueError): encode_image(image)
