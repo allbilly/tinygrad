@@ -78,6 +78,14 @@ class TestRockchip(unittest.TestCase):
     special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").sigmoid().realize().numpy(), np.array([1, 0, np.nan], dtype=np.float16))
 
+  def test_generated_refined_sqrt_lut(self):
+    data = np.linspace(0, 16, 2049, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").sqrt().realize().numpy(),
+                               np.sqrt(data.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    special = np.array([-1, -0., 0., np.inf, np.nan], dtype=np.float16)
+    with np.errstate(invalid="ignore"): expected = np.sqrt(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").sqrt().realize().numpy(), expected)
+
   def test_generated_roundoff_lut(self):
     data = np.linspace(-16, 16, 4097, dtype=np.float16)
     np.testing.assert_equal(Tensor(data, device="ROCKCHIP").round().realize().numpy(), np.round(data))

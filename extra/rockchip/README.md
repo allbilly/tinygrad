@@ -27,7 +27,8 @@ before submission with `RKPLAN_REJECT:unsupported_graph`.
 - static, contiguous FP16 elementwise ADD, MUL, MAX, and division;
 - scalar operands and FP16 fills through the same ALU stages;
 - FP16 `WHERE` with a directly representable less-than mask and finite arms;
-- generated EXP2, EXP, and sigmoid LUT assets with declared domains;
+- generated EXP2, EXP, sigmoid, and refined SQRT LUT assets with declared
+  domains;
 - direct FP16 CMAC for `M=1`, `K=32`, and `4 <= N <= 16` when the right-hand
   input is already stored as `(N, 32)`;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
@@ -78,8 +79,8 @@ and has no skip on an RK3588 host.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This backend branch currently
-contains 25,703, so `MAX_LINE_COUNT=25000 python sz.py` fails by 703 lines. The
-handwritten backend is 730 counted lines (657 renderer/compiler and 73
+contains 25,718, so `MAX_LINE_COUNT=25000 python sz.py` fails by 718 lines. The
+handwritten backend is 745 counted lines (672 renderer/compiler and 73
 runtime). The code must not be hidden under `runtime/autogen` or moved out of
 tree to evade this limit. The generic native-program hook is an independent
 five-line counted change and can be reviewed separately; the backend needs

@@ -74,3 +74,16 @@ and records absolute and relative bounds. Relative error is expected to be
 less informative in the negative tail where the reference approaches zero,
 so conformance uses the normal-domain strict relative tolerance plus absolute,
 boundary, and special-value checks.
+
+## Refined SQRT
+
+`SQRT` provides an initial estimate over `[0, 4]` in Q14. Three Newton steps,
+`y = (y + x/y)/2`, execute as ordinary ALU/division stages on the NPU. The
+epilogue uses masks and division to restore zero, positive infinity, negative
+input NaN, and input NaN semantics. No host correction is involved.
+
+The generated simulator exhaustively checks 10,241 FP16 encodings from
+`2^-8` through `4`, including FP16 rounding after every refinement operation.
+The RK3588 sweep extends through `16` to verify convergence beyond the seed
+table's direct domain and separately checks IEEE special values. Smaller
+positive subnormals are not yet part of the accuracy claim.

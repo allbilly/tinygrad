@@ -252,6 +252,18 @@ def _sigmoid_expr(source:_Expr|RKArg) -> _Expr:
   nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
   return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (bounded, nan_denom)), nan_denom))
 
+def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
+  for _ in range(3): refined = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.ADD, (refined, _ALUExpr(Ops.FDIV, (source, refined)))), .5))
+  high, negative = positive(source, 65472.0), positive(0.0, source)
+  nonzero = _ALUExpr(Ops.MAX, (positive(source, 0.0), negative))
+  not_number = _ALUExpr(Ops.MUL, (positive(source, 0.0), negative))
+  positive_result = _ALUExpr(Ops.FDIV, (refined, _sub(1.0, high)))
+  zero_result = _ALUExpr(Ops.MUL, (positive_result, nonzero))
+  valid = _sub(1.0, _ALUExpr(Ops.MAX, (negative, not_number)))
+  return _ALUExpr(Ops.MUL, (zero_result, _ALUExpr(Ops.FDIV, (valid, valid))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -349,6 +361,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None: return None
     ret = _trunc_expr(operand)
+  elif u.op is Ops.SQRT:
+    operand = _parse_alu(u.src[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _sqrt_expr(operand)
   elif u.op is Ops.EXP2:
     exp_operand = _unwrap_same_cast(u.src[0])
     exp_factor = next((x for x in exp_operand.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None) \
@@ -575,7 +591,7 @@ def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
 
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
-  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL):
+  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL, RKLUTId.SQRT):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")
