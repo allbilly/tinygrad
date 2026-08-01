@@ -154,6 +154,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     self.assertEqual(len(emit_dpu(plan).stages), len(plan.stages))
 
+  def test_expm1_composes_generated_generic_luts(self):
+    for name in ("EXPM1", "EXPM1_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_EXPM1_SIM_MAX_ABS_ERROR, 3e-3)
+    x = Tensor.empty(128, dtype=dtypes.half)
+    for expression in (x.exp()-1, 1-x.exp()):
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                       {rklut.RKLUTId.EXPM1, rklut.RKLUTId.EXPM1_LOCAL})
+      self.assertFalse(contains_uop(plan))
+
   def test_sigmoid_family_uses_generated_generic_luts(self):
     for name in ("SIGMOID", "SIGMOID_LOCAL"):
       table = getattr(rklut, f"RK_LUT_{name}")
@@ -167,6 +180,17 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
                        {rklut.RKLUTId.SIGMOID, rklut.RKLUTId.SIGMOID_LOCAL})
       self.assertFalse(contains_uop(plan))
+
+  def test_tanh_uses_generated_tables_and_local_polynomial(self):
+    for name in ("TANH", "TANH_MID", "TANH_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_TANH_SIM_MAX_REL_ERROR, 1e-3)
+    plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).tanh()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.TANH, rklut.RKLUTId.TANH_MID})
+    self.assertFalse(contains_uop(plan))
 
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)

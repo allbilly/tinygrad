@@ -121,3 +121,23 @@ The complete 10,241-value FP16 range from `2^-8` through `4` passes the strict
 hardware comparison for both functions. Native `Ops.SUB` is material here:
 using MUL-by-minus-one plus ADD exceeded RKImage's 64-stage dependency limit.
 FP32 logarithms and smaller positive values are outside this contract.
+
+## Cancellation-resistant EXPM1
+
+The generic EXPM1 recognizer replaces both `exp(x)-1` and `1-exp(x)` after EXP
+has decomposed to EXP2. A broad table covers `[-2, 2]`; a Q17 local table
+covers `[-0.25, 0.25]` so subtraction near zero does not lose the significant
+bits before the DPU writes FP16. Positive payloads are range-scaled and restored
+with generic masks and arithmetic. This materially narrows CELU, ELU, and SELU
+error, but those complete methods remain numerical mismatches and are not yet
+claimed as passing.
+
+## Tanh ranges and local polynomial
+
+Tanh is recognized from tinygrad's `2*sigmoid(2*x)-1` decomposition. A broad
+Q15 table handles `[-2, 2]`, a Q16 mid table resolves `[-0.5, 0.5]`, and the
+clamped local interval uses `x-x^3/3`. The polynomial avoids the LUT output
+quantization that remained visible near zero and is clamped before evaluation
+so unselected extreme inputs cannot overflow and contaminate the result.
+Generic masks saturate finite tails and preserve NaN behavior. Both strict
+`test_tanh` methods pass on RK3588 without a tanh DPU opcode or host fallback.

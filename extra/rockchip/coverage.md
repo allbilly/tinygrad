@@ -96,6 +96,22 @@ Pytest reports 418 failures including the 126 failing subtests. Runtime was
 229.50 seconds. This is an exact eight-method gain from the preceding census;
 the FP32-only `test_log` remains an intentional unsupported-dtype rejection.
 
+At the generated EXPM1/tanh milestone, the uncached 2026-08-02 census again
+completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 124 |
+| FAIL | 288 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 414 failures including the same 126 failing subtests. Runtime
+was 265.33 seconds. This is an exact four-method gain from `9db9a4d33`:
+`test_hardsigmoid_extreme`, `test_quick_gelu_extreme`, `test_tanh`, and
+`test_tanh_extreme`. EXPM1 materially reduces the CELU/ELU/SELU residuals but
+does not yet turn those complete methods into passes.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -116,6 +132,7 @@ the FP32-only `test_log` remains an intentional unsupported-dtype rejection.
 | Range-normalized generated logarithm tables | `test_log2`, `test_log10` | Yes (`9db9a4d33`) |
 | Stable generic clip for ReLU-difference saturation | `test_hardsigmoid_extreme` | No |
 | Scaled-input reuse of the generated sigmoid LUT | `test_quick_gelu_extreme` | No |
+| Generated tanh ranges with a stable local polynomial | `test_tanh`, `test_tanh_extreme` | No |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

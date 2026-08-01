@@ -240,6 +240,20 @@ def _exp_expr(source:_Expr|RKArg|float) -> _Expr:
   nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
   return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (finite, nan_denom)), nan_denom))
 
+def _expm1_expr(source:_Expr|RKArg|float) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg|float, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  positive_input = positive(source, 0.0)
+  broad_scale = _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (positive_input, 7.0))))
+  broad = _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.EXPM1, (clamp(source, 2.0),)), broad_scale))
+  local = _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.EXPM1_LOCAL, (clamp(source, .25),)), _ALUExpr(Ops.ADD, (1.0, positive_input))))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.25), positive(.25, source)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))
+  nonzero = _ALUExpr(Ops.MAX, (positive_input, positive(0.0, source)))
+  return _ALUExpr(Ops.MUL, (selected, nonzero))
+
 def _sigmoid_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   broad, local = _LUTExpr(RKLUTId.SIGMOID, (source,)), _LUTExpr(RKLUTId.SIGMOID_LOCAL, (source,))
@@ -249,6 +263,25 @@ def _sigmoid_expr(source:_Expr|RKArg) -> _Expr:
   high, low = positive(source, 8.0), positive(-8.0, source)
   high_result = _ALUExpr(Ops.ADD, (selected, _ALUExpr(Ops.MUL, (_sub(1.0, selected), high))))
   bounded = _ALUExpr(Ops.MUL, (high_result, _sub(1.0, low)))
+  nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
+  return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (bounded, nan_denom)), nan_denom))
+
+def _tanh_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  broad, mid = _LUTExpr(RKLUTId.TANH, (clamp(source, 8.0),)), _LUTExpr(RKLUTId.TANH_MID, (clamp(source, .5),))
+  local_source = clamp(source, .125)
+  square = _ALUExpr(Ops.MUL, (local_source, local_source))
+  local = _sub(local_source, _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (square, local_source)), 1/3)))
+  mid_inside = _ALUExpr(Ops.MUL, (positive(source, -.5), positive(.5, source)))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.125), positive(.125, source)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, mid_inside))), _ALUExpr(Ops.MUL, (mid, _sub(mid_inside, local_inside)))))
+  selected = _ALUExpr(Ops.ADD, (selected, _ALUExpr(Ops.MUL, (local, local_inside))))
+  high, low = positive(source, 8.0), positive(-8.0, source)
+  high_result = _ALUExpr(Ops.ADD, (selected, _ALUExpr(Ops.MUL, (_sub(1.0, selected), high))))
+  bounded = _ALUExpr(Ops.ADD, (high_result, _ALUExpr(Ops.MUL, (_sub(-1.0, high_result), low))))
   nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
   return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (bounded, nan_denom)), nan_denom))
 
@@ -314,6 +347,10 @@ def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
 
+def _unwrap_fp_cast(u:UOp) -> UOp:
+  while u.op is Ops.CAST and u.dtype in (dtypes.half, dtypes.float) and u.src[0].dtype in (dtypes.half, dtypes.float): u = u.src[0]
+  return _unwrap_same_cast(u)
+
 def _canonical_sigmoid(u:UOp) -> tuple[UOp,float]|None:
   """Recognize 1/(1+exp2(-log2(e)*x))."""
   u = _unwrap_same_cast(u)
@@ -321,9 +358,42 @@ def _canonical_sigmoid(u:UOp) -> tuple[UOp,float]|None:
   one = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.CONST), None)
   exponential = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.EXP2), None)
   if one is None or float(one.arg) != 1 or exponential is None or (scaled:=_unwrap_same_cast(exponential.src[0])).op is not Ops.MUL: return None
-  source = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.INDEX), None)
+  source = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
   factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None)
   return (source, factor/-math.log2(math.e)) if source is not None and factor is not None and math.isfinite(factor) else None
+
+def _canonical_tanh(u:UOp) -> UOp|None:
+  """Recognize 2*sigmoid(2*x)-1."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.ADD: return None
+  for scaled, offset in (u.src, u.src[::-1]):
+    scaled, offset = _unwrap_same_cast(scaled), _unwrap_same_cast(offset)
+    if offset.op is not Ops.CONST or float(offset.arg) != -1 or scaled.op is not Ops.MUL: continue
+    two = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    sigmoid_u = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+    if two is None or float(two.arg) != 2 or sigmoid_u is None or (sigmoid:=_canonical_sigmoid(sigmoid_u)) is None: continue
+    if math.isclose(sigmoid[1], 2.0): return sigmoid[0]
+  return None
+
+def _canonical_expm1(u:UOp) -> tuple[UOp,float,float]|None:
+  """Recognize +/- (exp(+/- x)-1) after EXP has become EXP2."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.ADD: return None
+  for exponential, constant in (u.src, u.src[::-1]):
+    exponential, constant = _unwrap_fp_cast(exponential), _unwrap_same_cast(constant)
+    polarity = 1.0
+    if exponential.op is Ops.MUL:
+      neg = next((_unwrap_same_cast(x) for x in exponential.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      if neg is None or float(neg.arg) != -1: continue
+      exp_source = exponential.src[0] if _unwrap_same_cast(exponential.src[1]).key == neg.key else exponential.src[1]
+      exponential, polarity = _unwrap_fp_cast(exp_source), -1.0
+    if constant.op is not Ops.CONST or float(constant.arg) != -polarity or exponential.op is not Ops.EXP2: continue
+    scaled = _unwrap_fp_cast(exponential.src[0])
+    if scaled.op is not Ops.MUL: continue
+    factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None)
+    source = next((_unwrap_same_cast(x) for x in scaled.src if x.op is not Ops.CONST), None)
+    if source is not None and factor is not None and math.isclose(abs(factor), math.log2(math.e)): return source, math.copysign(1.0, factor), polarity
+  return None
 
 def _canonical_abs(u:UOp) -> UOp|None:
   u = _unwrap_same_cast(u)
@@ -404,6 +474,16 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (tanh_input:=_canonical_tanh(u)) is not None:
+    operand = _parse_alu(tanh_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _tanh_expr(operand)
+  elif (expm1:=_canonical_expm1(u)) is not None:
+    operand = _parse_alu(expm1[0], output_index, memo)
+    if operand is None: return None
+    if expm1[1] < 0: operand = _ALUExpr(Ops.MUL, (operand, -1.0))
+    ret = _expm1_expr(operand)
+    if expm1[2] < 0: ret = _ALUExpr(Ops.MUL, (ret, -1.0))
   elif (sigmoid:=_canonical_sigmoid(u)) is not None:
     operand = _parse_alu(sigmoid[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -691,7 +771,8 @@ def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
 
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
-  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL,
+  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.EXPM1, RKLUTId.EXPM1_LOCAL,
+                      RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL, RKLUTId.TANH, RKLUTId.TANH_MID, RKLUTId.TANH_LOCAL,
                       RKLUTId.SQRT, RKLUTId.RSQRT, RKLUTId.LOG2, RKLUTId.LOG2_LOCAL, RKLUTId.LOG10, RKLUTId.LOG10_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
