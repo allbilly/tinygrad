@@ -276,3 +276,24 @@ second-level LUT is retained as commented WIP in the generator: scaling the
 input and output by 16 improved ordinary local values but exposed the RK3588
 zero-entry quirk for FP16 subnormals. The final plan has 47 typed stages, one
 generic LUT stage, and no Hardswish opcode or host semantic work.
+
+## QuickGELU ranges
+
+QuickGELU recognizes `x*sigmoid(1.702*x)` and uses two generated assets inside
+`[-2, 2]`. A Q14 broad table covers the full interval. A Q15 local table covers
+the sensitive negative interval `(-2, -1)` by addressing
+`z=(x+1.5)*4`. Generic ALU stages use `x/2 + 0.4253*x*x` inside
+`(-0.16, 0.16)`. Outside the generated interval, the existing two-level
+Sigmoid plan remains the native fallback, preserving the already-passing
+positive and negative magnitude-300 tails.
+
+The exhaustive simulator covers 32,770 finite FP16 encodings in `[-2, 2]` and
+records maximum absolute error 0.0005186564341288502 and maximum relative error
+0.0013792703374361527 for outputs above 0.01. Hardware tuning retained a
+one-count adjustment at broad negative-table index 277. The 2607 adjustment of
+four counts at index 276 and trials of two/four counts at index 277 are retained
+as WIP history in the generator comments: they fixed one staged PyTorch sample
+but moved exact neighboring FP16 knots outside tolerance. The final one-count
+value passes the dense hardware sweep, the official ordinary case, and both
+extreme cases. The plan contains 63 typed stages and no QuickGELU opcode or host
+semantic work.

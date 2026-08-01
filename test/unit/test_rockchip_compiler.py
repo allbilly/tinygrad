@@ -173,8 +173,7 @@ class TestDPUCompiler(unittest.TestCase):
       payload = struct.pack(f"<{len(table)}h", *table)
       self.assertEqual(hashlib.sha256(payload).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
     self.assertLess(rklut.RK_LUT_SIGMOID_SIM_MAX_ABS_ERROR, 3e-4)
-    for expression in (Tensor.empty(128, dtype=dtypes.half).sigmoid(), Tensor.empty(128, dtype=dtypes.half).silu(),
-                       Tensor.empty(128, dtype=dtypes.half).quick_gelu()):
+    for expression in (Tensor.empty(128, dtype=dtypes.half).sigmoid(), Tensor.empty(128, dtype=dtypes.half).silu()):
       plan = lower_dpu(sink(expression))
       self.assertIsInstance(plan, RKDPUProgram)
       self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
@@ -294,6 +293,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, {rklut.RKLUTId.HARDSWISH})
     self.assertLessEqual(len(plan.stages), 48)
+    self.assertFalse(contains_uop(plan))
+
+  def test_quick_gelu_uses_generated_ranges_and_local_series(self):
+    for name in ("QUICK_GELU", "QUICK_GELU_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_QUICK_GELU_SIM_MAX_REL_ERROR, 2e-3)
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).quick_gelu()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertTrue({rklut.RKLUTId.QUICK_GELU, rklut.RKLUTId.QUICK_GELU_LOCAL}.issubset(
+      {stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}))
+    self.assertLessEqual(len(plan.stages), 64)
     self.assertFalse(contains_uop(plan))
 
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):

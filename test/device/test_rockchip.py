@@ -158,6 +158,11 @@ class TestRockchip(unittest.TestCase):
     expected = (data.astype(np.float32)*np.minimum(6, np.maximum(0, data.astype(np.float32)+3))/6).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").hardswish().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_generated_quick_gelu_assets(self):
+    data = np.linspace(-2, 2, 4097, dtype=np.float16)
+    expected = (data.astype(np.float32)/(1+np.exp(-1.702*data.astype(np.float32)))).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").quick_gelu().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)

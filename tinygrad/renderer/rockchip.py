@@ -521,6 +521,25 @@ def _hardswish_expr(source:_Expr|RKArg) -> _Expr:
     _ALUExpr(Ops.ADD, (negative_fallback, positive_tail))))
   return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (wide, _sub(1.0, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))
 
+def _quick_gelu_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  inside = _ALUExpr(Ops.MUL, (positive(source, -2.0), positive(2.0, source)))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -2.0), positive(-1.0, source)))
+  poly_inside = _ALUExpr(Ops.MUL, (positive(source, -.16), positive(.16, source)))
+  lower = _ALUExpr(Ops.MAX, (source, -2.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -2.0)), -1.0))
+  safe_source = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (bounded, local_inside)), poly_inside))
+  broad = _LUTExpr(RKLUTId.QUICK_GELU, (safe_source,))
+  local_input = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.ADD, (source, 1.5)), 4.0))
+  local = _LUTExpr(RKLUTId.QUICK_GELU_LOCAL, (local_input,))
+  polynomial = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (bounded, .5)),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (bounded, bounded)), .4253))))
+  broad_mask = _sub(_sub(inside, local_inside), poly_inside)
+  fallback = _ALUExpr(Ops.MUL, (source, _sigmoid_expr(_ALUExpr(Ops.MUL, (source, 1.702)))))
+  return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, broad_mask)),
+    _ALUExpr(Ops.MUL, (local, local_inside)))), _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (polynomial, poly_inside)),
+    _ALUExpr(Ops.MUL, (fallback, _sub(1.0, inside)))))))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -820,6 +839,16 @@ def _canonical_hardswish(u:UOp) -> UOp|None:
   required = {Ops.MUL:3, Ops.ADD:3, Ops.WHERE:2, Ops.CMPLT:2}
   return indexes[0] if counts == required and all(any(math.isclose(x, value) for x in constants) for value in (-3,-1,0,1/6,3)) else None
 
+def _canonical_quick_gelu(u:UOp) -> UOp|None:
+  """Recognize source*sigmoid(1.702*source)."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  for source, sigmoid_u in (u.src, u.src[::-1]):
+    source = _unwrap_same_cast(source)
+    if (sigmoid:=_canonical_sigmoid(sigmoid_u)) is not None and math.isclose(sigmoid[1], 1.702) and \
+       _unwrap_same_cast(sigmoid[0]).key == source.key: return source
+  return None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -899,6 +928,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(hardswish_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _hardswish_expr(operand)
+  elif (quick_gelu_input:=_canonical_quick_gelu(u)) is not None:
+    operand = _parse_alu(quick_gelu_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _quick_gelu_expr(operand)
   elif (softplus_input:=_canonical_softplus(u)) is not None:
     softplus_source, input_scale = softplus_input[0], 1.0
     if softplus_source.op is Ops.MUL:
@@ -1239,7 +1272,7 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR,
                       RKLUTId.SINH, RKLUTId.COSH, RKLUTId.ERF, RKLUTId.ERF_LOCAL, RKLUTId.SOFTPLUS_NEG,
                       RKLUTId.SOFTPLUS_DIV3_NEAR, RKLUTId.SOFTPLUS_DIV3_FAR, RKLUTId.MISH, RKLUTId.MISH_MID,
-                      RKLUTId.HARDSWISH):
+                      RKLUTId.HARDSWISH, RKLUTId.QUICK_GELU, RKLUTId.QUICK_GELU_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

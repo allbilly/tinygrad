@@ -100,6 +100,25 @@ hardswish = [max(-32768, min(32767, round(hardswish_value(signed_sample(table, i
 # WIP reference: a second table consuming z=16*x and returning 16*hardswish(float16(z/16)) regressed FP16 subnormals at the zero entry.
 # hardswish_local = [max(-32768, min(32767, round(hardswish_value(struct.unpack("<e", struct.pack("<e",
 #   signed_sample(table, i, STEP)/16))[0])*16*32768))) or 1 for table in range(2) for i in range(SIZE)]
+def quick_gelu_value(x:float) -> float: return x/(1+math.exp(-1.702*x))
+QUICK_GELU_SCALE, QUICK_GELU_STEP = 8192.0, 32.0/8192.0
+quick_gelu = [max(-32768, min(32767, round(quick_gelu_value(signed_sample(table, i, QUICK_GELU_STEP))*16384))) or 1
+              for table in range(2) for i in range(SIZE)]
+# WIP reference: the 2607 emitter also added `(0,276,4)`, but that moves exact x=-0.921875 one FP16 ULP away under this emitter.
+# Two- and four-count trials at index 277 likewise moved its exact knot; one count covers both exact and staged PyTorch samples.
+for table, index, correction in ((0,277,1), (0,375,1), (0,408,1), (0,427,1), (1,49,1)):
+  quick_gelu[table*SIZE+index] += correction
+quick_gelu_local = []
+for table in range(2):
+  for i in range(SIZE):
+    z = signed_sample(table, i, STEP)
+    x = -1.5+z/4
+    ideal = quick_gelu_value(x)
+    xh = struct.unpack("<e", struct.pack("<e", x))[0]
+    scaled = struct.unpack("<e", struct.pack("<e", xh*1.702))[0]
+    sigmoid_staged = struct.unpack("<e", struct.pack("<e", 1/(1+math.exp(-scaled))))[0]
+    staged = struct.unpack("<e", struct.pack("<e", xh*sigmoid_staged))[0]
+    quick_gelu_local.append(max(-32768, min(32767, round((.5*ideal+.5*staged)*32768))) or 1)
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -325,6 +344,17 @@ for bits in range(1 << 16):
   got = half(half(half(x*x)*(1/6))+half(x*.5)) if -.125 < x < 15/128 else interpolate(hardswish, HARDSWISH_STEP, 16384, x)
   reference = hardswish_value(x)
   hardswish_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
+quick_gelu_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 2: continue
+  if -.16 < x < .16: got = half(half(x*.5)+half(half(x*x)*.4253))
+  elif -2 < x < -1:
+    local_input = half(half(x+1.5)*4)
+    got = interpolate(quick_gelu_local, STEP, 32768, local_input)
+  else: got = interpolate(quick_gelu, QUICK_GELU_STEP, 16384, x)
+  reference = quick_gelu_value(x)
+  quick_gelu_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -392,7 +422,9 @@ class RKLUTId(IntEnum):
   MISH = 38
   MISH_MID = 39
   HARDSWISH = 40
-RK_LUT_SCHEMA = 35
+  QUICK_GELU = 41
+  QUICK_GELU_LOCAL = 42
+RK_LUT_SCHEMA = 36
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -634,6 +666,21 @@ RK_LUT_HARDSWISH_VERIFIED_INPUTS = {len(hardswish_errors)}
 RK_LUT_HARDSWISH_SIM_MAX_ABS_ERROR = {max(x[0] for x in hardswish_errors)!r}
 RK_LUT_HARDSWISH_SIM_MAX_REL_ERROR = {max(x[1] for x in hardswish_errors if x[2] > .01)!r}
 RK_LUT_HARDSWISH = (\n{rows(hardswish)}\n)
+RK_LUT_QUICK_GELU_SHA256 = "{digest(quick_gelu)}"
+RK_LUT_QUICK_GELU_DOMAIN = (-2.0, 2.0)
+RK_LUT_QUICK_GELU_ENTRIES = {SIZE}
+RK_LUT_QUICK_GELU_BN_MUL = {struct.unpack('<H', struct.pack('<e', QUICK_GELU_SCALE))[0]}
+RK_LUT_QUICK_GELU_MINUS_EXP = 14
+RK_LUT_QUICK_GELU_VERIFIED_INPUTS = {len(quick_gelu_errors)}
+RK_LUT_QUICK_GELU_SIM_MAX_ABS_ERROR = {max(x[0] for x in quick_gelu_errors)!r}
+RK_LUT_QUICK_GELU_SIM_MAX_REL_ERROR = {max(x[1] for x in quick_gelu_errors if x[2] > .01)!r}
+RK_LUT_QUICK_GELU = (\n{rows(quick_gelu)}\n)
+RK_LUT_QUICK_GELU_LOCAL_SHA256 = "{digest(quick_gelu_local)}"
+RK_LUT_QUICK_GELU_LOCAL_DOMAIN = (-2.0, -1.0)
+RK_LUT_QUICK_GELU_LOCAL_ENTRIES = {SIZE}
+RK_LUT_QUICK_GELU_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_QUICK_GELU_LOCAL_MINUS_EXP = 15
+RK_LUT_QUICK_GELU_LOCAL = (\n{rows(quick_gelu_local)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}
