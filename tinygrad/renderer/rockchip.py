@@ -205,12 +205,36 @@ _Value = _Expr|RKArg|float
 def _sub(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _ALUExpr:
   return _ALUExpr(Ops.ADD, (lhs, _ALUExpr(Ops.MUL, (rhs, -1.0))))
 
-def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|RKArg|float|None:
+def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
+  return u
+
+def _canonical_abs(u:UOp) -> UOp|None:
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  for data, sign in (u.src, u.src[::-1]):
+    data, sign = _unwrap_same_cast(data), _unwrap_same_cast(sign)
+    if data.op is not Ops.INDEX or sign.op is not Ops.WHERE: continue
+    cond, nonzero, zero = (_unwrap_same_cast(x) for x in sign.src)
+    if cond.op is not Ops.CMPNE or zero.op is not Ops.CONST or float(zero.arg) != 0 or nonzero.op is not Ops.WHERE: continue
+    less, negative, positive = (_unwrap_same_cast(x) for x in nonzero.src)
+    compared = tuple(_unwrap_same_cast(x) for x in cond.src)
+    if (less.op is Ops.CMPLT and compared[0].key == data.key and compared[1].op is Ops.CONST and float(compared[1].arg) == 0 and
+        _unwrap_same_cast(less.src[0]).key == data.key and _unwrap_same_cast(less.src[1]).op is Ops.CONST and
+        float(_unwrap_same_cast(less.src[1]).arg) == 0 and negative.op is Ops.CONST and float(negative.arg) == -1 and
+        positive.op is Ops.CONST and float(positive.arg) == 1): return data
+  return None
+
+def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|RKArg|float|None:
+  u = _unwrap_same_cast(u)
   if u in memo: return memo[u]
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (abs_input:=_canonical_abs(u)) is not None:
+    operand = _parse_alu(abs_input, output_index, memo)
+    if operand is None: return None
+    ret = _ALUExpr(Ops.MAX, (operand, _ALUExpr(Ops.MUL, (operand, -1.0))))
   elif u.op is Ops.MUL and any(x.op is Ops.RECIPROCAL for x in u.src):
     reciprocal = next(i for i,x in enumerate(u.src) if x.op is Ops.RECIPROCAL)
     div_src = (_parse_alu(u.src[1-reciprocal], output_index, memo), _parse_alu(u.src[reciprocal].src[0], output_index, memo))
@@ -224,15 +248,24 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _LUTExpr(RKLUTId.EXP2, (operand,))
-  elif u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT:
-    compared = tuple(_parse_alu(x, output_index, memo) for x in u.src[0].src)
-    arms = tuple(_parse_alu(x, output_index, memo) for x in u.src[1:])
-    if any(x is None for x in compared+arms) or any(isinstance(x, float) and not math.isfinite(x) for x in arms): return None
+  elif u.op is Ops.WHERE and (cond:=_unwrap_same_cast(u.src[0])).op is Ops.CMPLT:
+    lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
+    true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
+    ordered_max, ordered_min = true_u.key == rhs_u.key and false_u.key == lhs_u.key, true_u.key == lhs_u.key and false_u.key == rhs_u.key
+    compared = tuple(_parse_alu(x, output_index, memo) for x in (lhs_u, rhs_u))
+    if any(x is None for x in compared): return None
     lhs, rhs = cast(tuple[_Value, _Value], compared)
-    true, false = cast(tuple[_Value, _Value], arms)
-    mask = _MaskExpr((_sub(rhs, lhs),))
-    ret = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (true, mask)),
-      _ALUExpr(Ops.MUL, (false, _sub(1.0, mask)))))
+    if ordered_max: ret = _ALUExpr(Ops.MAX, (lhs, rhs))
+    elif ordered_min:
+      negative = (_ALUExpr(Ops.MUL, (lhs, -1.0)), _ALUExpr(Ops.MUL, (rhs, -1.0)))
+      ret = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, negative), -1.0))
+    else:
+      arms = tuple(_parse_alu(x, output_index, memo) for x in (true_u, false_u))
+      if any(x is None for x in arms) or any(isinstance(x, float) and not math.isfinite(x) for x in arms): return None
+      true, false = cast(tuple[_Value, _Value], arms)
+      mask = _MaskExpr((_sub(rhs, lhs),))
+      ret = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (true, mask)),
+        _ALUExpr(Ops.MUL, (false, _sub(1.0, mask)))))
   elif u.op in _RK_ALU_OPS:
     src = tuple(_parse_alu(x, output_index, memo) for x in u.src)
     if len(src) != 2 or any(x is None for x in src): return None

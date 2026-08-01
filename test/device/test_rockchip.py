@@ -28,6 +28,13 @@ class TestRockchip(unittest.TestCase):
     ta, tb = Tensor(a, device="ROCKCHIP").realize(), Tensor(b, device="ROCKCHIP").realize()
     np.testing.assert_equal((ta<0).where(ta, tb).realize().numpy(), np.where(a<0, a, b))
 
+  def test_fp16_abs_specials_and_finite_extrema(self):
+    data = np.array([-2, -0., 0., 2., np.inf, -np.inf, np.nan, -np.nan], dtype=np.float16)
+    x = Tensor(data, device="ROCKCHIP").realize()
+    np.testing.assert_equal(x.abs().realize().numpy(), np.abs(data))
+    finite = data[:4]
+    np.testing.assert_equal(Tensor(finite, device="ROCKCHIP").maximum(0).realize().numpy(), np.maximum(finite, np.float16(0)))
+
   def test_generated_exp2_lut(self):
     encodings = np.arange(1 << 16, dtype=np.uint16)
     data = encodings.view(np.float16)

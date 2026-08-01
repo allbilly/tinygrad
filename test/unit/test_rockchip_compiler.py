@@ -70,6 +70,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual(plan.stages[0].count, 1)
 
+  def test_fp16_abs_and_ordered_extrema_use_generic_alu(self):
+    x = Tensor.empty(16,dtype=dtypes.half)
+    absolute = lower_dpu(sink(x.abs()))
+    self.assertIsInstance(absolute, RKDPUProgram)
+    self.assertEqual(tuple(stage.op for stage in absolute.stages if isinstance(stage, RKALUStage)), (Ops.MUL, Ops.MAX))
+    for expression in (x.relu(), x.clip(-1, 1)):
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertFalse(contains_uop(plan))
+    self.assertEqual(lower_dpu(sink(x.relu())).stages[0].op, Ops.MAX)
+
   def test_division_canonicalizes_to_generic_fdiv(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(a/b))
