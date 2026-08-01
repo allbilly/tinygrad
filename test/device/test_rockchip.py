@@ -26,9 +26,20 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal((ta<0).where(ta, tb).realize().numpy(), np.where(a<0, a, b))
 
   def test_generated_exp2_lut(self):
-    data = np.linspace(-2, 2, 128, dtype=np.float16)
+    encodings = np.arange(1 << 16, dtype=np.uint16)
+    data = encodings.view(np.float16)
+    data = data[np.isfinite(data) & (data >= -2) & (data <= 2)]
     actual = Tensor(data, device="ROCKCHIP").realize().exp2().realize().numpy()
-    np.testing.assert_allclose(actual, np.exp2(data), rtol=5e-3, atol=5e-3)
+    reference = np.exp2(data.astype(np.float32))
+    absolute = np.abs(actual.astype(np.float32)-reference)
+    relative = absolute/reference
+    ulp = np.abs(actual.view(np.uint16).astype(np.int32)-reference.astype(np.float16).view(np.uint16).astype(np.int32))
+    order = np.argsort(data.astype(np.float32), kind="stable")
+    self.assertEqual(data.size, 32770)
+    self.assertLessEqual(float(absolute.max()), 0.0011)
+    self.assertLessEqual(float(relative.max()), 0.0009)
+    self.assertLessEqual(int(ulp.max()), 1)
+    self.assertTrue(np.all(np.diff(actual[order].astype(np.float32)) >= 0))
 
   def test_linear_sigmoid_workload(self):
     rng = np.random.default_rng(2)
