@@ -1,4 +1,4 @@
-import os, unittest
+import math, os, unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
 
@@ -86,5 +86,17 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").quick_gelu().numpy(), expected, rtol=3e-2, atol=1e-4)
     extreme = np.array([-350, 350], dtype=np.float16)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").quick_gelu().numpy(), np.array([-0., 350], dtype=np.float16))
+
+  def test_two_level_gelu_luts(self):
+    data = np.linspace(-6, 6, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    expected_tanh = (0.5*fp32*(1+np.tanh(np.sqrt(2/np.pi)*(fp32+0.044715*fp32**3)))).astype(np.float16)
+    expected_exact = np.array([0.5*x*(1+math.erf(x/math.sqrt(2))) for x in fp32], dtype=np.float16)
+    for approximate, expected in (("tanh", expected_tanh), ("none", expected_exact)):
+      with self.subTest(approximate=approximate):
+        actual = Tensor(data, device="ROCKCHIP").gelu(approximate=approximate).numpy()
+        np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=2e-4)
+        extreme = Tensor(np.array([-350, 350], dtype=np.float16), device="ROCKCHIP").gelu(approximate=approximate).numpy()
+        np.testing.assert_equal(extreme, np.array([-0., 350], dtype=np.float16))
 
 if __name__ == "__main__": unittest.main()

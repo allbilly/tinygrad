@@ -196,6 +196,20 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
+  def test_gelu_variants_use_dedicated_two_level_luts(self):
+    for approximate, broad, local in (("tanh", RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL),
+                                      ("none", RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL)):
+      plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).gelu(approximate=approximate)))
+      self.assertEqual((len(plan.stages), len(plan.scratch)), (51, 6))
+      self.assertEqual(tuple(stage.op for stage in plan.stages).count(broad), 1)
+      self.assertEqual(tuple(stage.op for stage in plan.stages).count(local), 1)
+      self.assertFalse(contains_uop(plan))
+    for table, digest in ((rklut.RK_LUT_GELU_TANH, rklut.RK_LUT_GELU_TANH_SHA256),
+                          (rklut.RK_LUT_GELU_TANH_LOCAL, rklut.RK_LUT_GELU_TANH_LOCAL_SHA256),
+                          (rklut.RK_LUT_GELU_EXACT, rklut.RK_LUT_GELU_EXACT_SHA256),
+                          (rklut.RK_LUT_GELU_EXACT_LOCAL, rklut.RK_LUT_GELU_EXACT_LOCAL_SHA256)):
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

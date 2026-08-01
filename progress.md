@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through dedicated two-level QuickGELU, the 2026-08-01 census is
-**114 passed, 298 failed, and 13 skipped**. Pytest prints `424 failed` because
+milestones through dedicated two-level GELU variants, the 2026-08-01 census is
+**116 passed, 296 failed, and 13 skipped**. Pytest prints `422 failed` because
 it separately counts 126 failing subtests.
 
 Therefore the clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 33-host/14-NPU
+while recovering the remaining native forward coverage. Focused 34-host/15-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -65,7 +65,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `9baa14d7d` | Two-level tanh with device saturation | `0181-rockchip-add-two-level-tanh-LUT.patch` |
 | `228e2b51a` | Direct EXP2 IEEE special-value epilogue | `0182-rockchip-handle-EXP2-special-values.patch` |
 | `a1a966fe8` | Shared two-level sigmoid for sigmoid/SiLU/Swish | `0183-rockchip-add-two-level-sigmoid-LUT.patch` |
-| current milestone | Dedicated two-level QuickGELU with bounded tails | `0184-rockchip-add-two-level-QuickGELU-LUT.patch` |
+| `91f57be47` | Dedicated two-level QuickGELU with bounded tails | `0184-rockchip-add-two-level-QuickGELU-LUT.patch` |
+| current milestone | Dedicated two-level tanh/exact GELU | `0185-rockchip-add-two-level-GELU-LUTs.patch` |
 
 ## Architecture now implemented
 
@@ -103,6 +104,7 @@ Implemented forward-only subset:
 - tanh using the oracle-proven Q15 broad/local LUTs, identity correction near zero, and exact device-side saturation outside `[-4,4]`;
 - sigmoid using Q15 broad/local LUTs and device saturation, reused directly by SiLU and Swish;
 - QuickGELU using dedicated Q14 broad/Q15 negative-local LUTs, a near-zero polynomial, and bounded shared-sigmoid tails;
+- tanh and exact GELU using separate Q15 broad/local LUTs, near-zero polynomials, and exact zero/x tails;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -114,12 +116,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  793
+tinygrad/renderer/rockchip.py  842
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  867
+handwritten Rockchip total  916
 ```
 
-This meets the requested `<5000` backend goal with 4,133 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 4,084 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -129,7 +131,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 25,843 `sz.py` lines, a `+875` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 843 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 25,892 `sz.py` lines, a `+924` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 892 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import struct
+import math, struct
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable, cast
@@ -42,6 +42,10 @@ class RKDPUOp(IntEnum):
   SIGMOID_LOCAL = 13
   QUICK_GELU = 14
   QUICK_GELU_LOCAL = 15
+  GELU_TANH = 16
+  GELU_TANH_LOCAL = 17
+  GELU_EXACT = 18
+  GELU_EXACT_LOCAL = 19
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -156,6 +160,33 @@ def _quick_gelu_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   inner = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, broad_mask)),
     _DPUExpr(RKDPUOp.MUL, (local, local_inside)))), polynomial))
   return _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (base, outside)), inner))
+
+def _gelu_expr(source:_DPUExpr|RKArg|float, approximate_tanh:bool) -> _DPUExpr:
+  """Broad/local GELU LUTs, near-zero series, and exact zero/x asymptotes."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  def clamp(value:_DPUExpr|RKArg|float, limit:float) -> _DPUExpr:
+    lower = _DPUExpr(RKDPUOp.MAX, (value, -limit))
+    return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
+  broad_op, local_op = ((RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL) if approximate_tanh else
+                        (RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL))
+  broad = _DPUExpr(broad_op, (clamp(source, 4.0),))
+  local = _DPUExpr(local_op, (_DPUExpr(RKDPUOp.MUL, (clamp(source, 0.5), 8.0)),))
+  range_outside = _DPUExpr(RKDPUOp.MAX, (positive(-4.0, source), positive(source, 4.0)))
+  range_inside = _DPUExpr(RKDPUOp.SUB, (1.0, range_outside))
+  local_inside = _DPUExpr(RKDPUOp.MUL, (positive(source, -0.5), positive(0.5, source)))
+  poly_inside = _DPUExpr(RKDPUOp.MUL, (positive(source, -0.04), positive(0.04, source)))
+  local_mask = _DPUExpr(RKDPUOp.SUB, (local_inside, poly_inside))
+  broad_mask = _DPUExpr(RKDPUOp.SUB, (range_inside, local_inside))
+  poly_input = clamp(source, 0.04)
+  polynomial = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (poly_input, 0.5)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (poly_input, poly_input)), 1/math.sqrt(2*math.pi)))))
+  broad_scale = _DPUExpr(RKDPUOp.ADD, (1.0, _DPUExpr(RKDPUOp.MUL, (positive(source, 0.0), 3.0))))
+  interior = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (broad, broad_scale)), broad_mask)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (local, 0.5)), local_mask)))), _DPUExpr(RKDPUOp.MUL, (polynomial, poly_inside))))
+  fallback = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (source, 0.0)), range_outside))
+  return _DPUExpr(RKDPUOp.ADD, (interior, fallback))
 
 def _slot_mask(slots:tuple[int, ...]) -> int:
   if any(x < 0 or x >= 64 for x in slots): raise ValueError("RKImage supports argument slots 0..63")
@@ -332,6 +363,17 @@ def _canonical_quick_gelu(u:UOp) -> UOp|None:
       return source
   return None
 
+def _canonical_gelu(u:UOp) -> tuple[UOp,bool]|None:
+  """Recognize current tanh and exact GELU decompositions."""
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  if len(indexes) != 1 or indexes[0].dtype is not dtypes.half or sum(x.op is Ops.EXP2 for x in nodes) != 1 or \
+     sum(x.op is Ops.RECIPROCAL for x in nodes) != 1: return None
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  if sum(x.op is Ops.WHERE for x in nodes) == 0 and any(math.isclose(x, 0.044715) for x in constants): return indexes[0], True
+  if sum(x.op is Ops.WHERE for x in nodes) == 2 and any(math.isclose(x, 1/math.sqrt(2)) for x in constants): return indexes[0], False
+  return None
+
 def _canonical_silu(u:UOp) -> tuple[UOp,UOp]|None:
   u = _unwrap_same_cast(u)
   if u.op is not Ops.MUL: return None
@@ -400,6 +442,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(quick_gelu, output_index, memo)
     if source is None: return None
     ret = _quick_gelu_expr(source)
+  elif (gelu:=_canonical_gelu(u)) is not None:
+    source = _parse_dpu_expr(gelu[0], output_index, memo)
+    if source is None: return None
+    ret = _gelu_expr(source, gelu[1])
   elif (silu:=_canonical_silu(u)) is not None:
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in silu)
     if any(x is None for x in operands): return None
@@ -662,7 +708,13 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                           rklut.RK_LUT_SIGMOID_LOCAL_MINUS_EXP),
     RKDPUOp.QUICK_GELU:(rklut.RK_LUT_QUICK_GELU, rklut.RK_LUT_QUICK_GELU_BN_MUL, rklut.RK_LUT_QUICK_GELU_MINUS_EXP),
     RKDPUOp.QUICK_GELU_LOCAL:(rklut.RK_LUT_QUICK_GELU_LOCAL, rklut.RK_LUT_QUICK_GELU_LOCAL_BN_MUL,
-                             rklut.RK_LUT_QUICK_GELU_LOCAL_MINUS_EXP)}[plan.op]
+                             rklut.RK_LUT_QUICK_GELU_LOCAL_MINUS_EXP),
+    RKDPUOp.GELU_TANH:(rklut.RK_LUT_GELU_TANH, rklut.RK_LUT_GELU_TANH_BN_MUL, rklut.RK_LUT_GELU_TANH_MINUS_EXP),
+    RKDPUOp.GELU_TANH_LOCAL:(rklut.RK_LUT_GELU_TANH_LOCAL, rklut.RK_LUT_GELU_TANH_LOCAL_BN_MUL,
+                            rklut.RK_LUT_GELU_TANH_LOCAL_MINUS_EXP),
+    RKDPUOp.GELU_EXACT:(rklut.RK_LUT_GELU_EXACT, rklut.RK_LUT_GELU_EXACT_BN_MUL, rklut.RK_LUT_GELU_EXACT_MINUS_EXP),
+    RKDPUOp.GELU_EXACT_LOCAL:(rklut.RK_LUT_GELU_EXACT_LOCAL, rklut.RK_LUT_GELU_EXACT_LOCAL_BN_MUL,
+                             rklut.RK_LUT_GELU_EXACT_LOCAL_MINUS_EXP)}[plan.op]
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
@@ -745,7 +797,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
     if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL,
-                   RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL):
+                   RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL,
+                   RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL, RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:

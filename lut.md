@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 5 |
+| Schema | 6 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -84,6 +84,16 @@ QuickGELU uses two additional generated NPU tasks rather than retuning sigmoid a
 - the shared bounded sigmoid expression supplies tails outside `[-2,2]`, including exact zero/identity asymptotes for extreme negative/positive inputs.
 
 The typed plan has 58 stages and six reusable scratch buffers. The official normal and both extreme subcases pass at `rtol=0.001, atol=1e-6`. A mathematically ideal dense float32 curve is not the tuning oracle: it differs from PyTorch's staged FP16 boundaries, which is why the sparse corrections and local blend must remain generator inputs rather than unexplained edits to generated data.
+
+GELU has separate immutable artifacts because the tanh approximation and exact-erf form are observably different at FP16 boundaries:
+
+- `RKLUT.GELU_TANH = 10` and `RKLUT.GELU_EXACT = 12` are asymmetric Q15 broad tables over `[-4,4]`;
+- negative entries store GELU directly, while positive entries store GELU divided by four to fit Q15 and are multiplied by four with a device sign mask;
+- `RKLUT.GELU_TANH_LOCAL = 11` and `RKLUT.GELU_EXACT_LOCAL = 13` store `2*GELU(x)` over `[-0.5,0.5]`, addressed by `z=8*x`, then scale by one-half on device;
+- a shared near-zero series `0.5*x + x^2/sqrt(2*pi)` handles `[-0.04,0.04]`;
+- device masks return zero for `x < -4` and identity for `x > 4`.
+
+Each variant lowers to 51 stages and six scratch buffers. Both official normal forms and all four `[-400,-300]`/`[300,400]` extreme subcases pass at the strict TestOps tolerance. The supplemental exact-erf dense sweep allows `atol=2e-4` because the declared negative tail intentionally saturates to zero while ideal erf remains a sub-`1.3e-4` negative value near the boundary.
 
 ## Current command contract
 

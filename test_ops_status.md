@@ -78,19 +78,20 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the dedicated two-level QuickGELU milestone:
+Latest complete uncached census after the dedicated two-level GELU milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 114 |
-| FAIL | 298 |
+| PASS | 116 |
+| FAIL | 296 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `424 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 113.41 seconds. Relative
+Pytest reports `422 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 144.99 seconds. Relative
 to the preceding exact tanh census, EXP2 special values add one passing method,
-shared sigmoid/SiLU/Swish add three, and normal/extreme QuickGELU add two.
+shared sigmoid/SiLU/Swish add three, normal/extreme QuickGELU add two, and
+normal/extreme tanh/exact GELU add two.
 
 ## Focused verified matrix
 
@@ -104,10 +105,11 @@ shared sigmoid/SiLU/Swish add three, and normal/extreme QuickGELU add two.
 | Two-level tanh LUT and saturation | typed 35-stage plan | 1 dense sweep | PASS |
 | Shared two-level sigmoid/SiLU/Swish | typed 24/25-stage plans | 1 dense local sweep | PASS |
 | Dedicated two-level QuickGELU | typed 58-stage plan | normal/extreme official methods and 1 broad sweep | PASS |
+| Dedicated tanh/exact GELU | two typed 51-stage plans | normal/extreme official methods and 2 broad sweeps | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 33 | 14 (plus 4 subtests) | PASS |
+| Clean image/compiler suite total | 34 | 15 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
