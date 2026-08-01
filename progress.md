@@ -14,9 +14,9 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through exact int32 extrema and typed mixed-dtype widening, the 2026-08-01 census is
-**159 passed, 253 failed, and 13 skipped**. Pytest prints `375 failed` because
-it separately counts 122 failing subtests; four subtests now pass.
+milestones through prefix-repeat broadcast and exact copysign, the 2026-08-01 census is
+**167 passed, 245 failed, and 13 skipped**. Pytest prints `358 failed` because
+it separately counts 113 failing subtests; 13 subtests now pass.
 
 The clean branch must preserve its `<5000` handwritten-line target
 while recovering the remaining native forward coverage. Focused 65-host/45-NPU
@@ -117,7 +117,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `8e75af4a8` | Exact int32 extrema, copy/fill, and typed mixed-dtype widening | `0217-rockchip-add-exact-int32-extrema.patch` |
 | `f02b8c970` | Infinity-safe threshold WHERE and masked fill | `0218-rockchip-lower-infinity-safe-WHERE.patch` |
 | `4d07592d6` | Signed infinite-numerator division | `0219-rockchip-preserve-infinite-division-sign.patch` |
-| current milestone | Prefix-repeat broadcast and exact copysign sign ABI | `0220-rockchip-add-prefix-broadcast-and-exact-copysign.patch` |
+| `751a108e2` | Prefix-repeat broadcast and exact copysign sign ABI | `0220-rockchip-add-prefix-broadcast-and-exact-copysign.patch` |
+| current milestone | Exact 167-pass TestOps census | `0221-rockchip-record-167-pass-TestOps-census.patch` |
 
 ## Architecture now implemented
 

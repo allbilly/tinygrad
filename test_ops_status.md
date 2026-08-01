@@ -78,27 +78,23 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after exact int32 extrema and typed mixed-dtype widening:
-
-The subsequent infinity-safe WHERE, signed infinite-division, prefix-broadcast, and exact copysign milestones pass focused `test_inf_where`,
-`test_masked_fill`, `test_div_naninf`, both copysign methods, `test_broadcasted_add`, and `test_broadcast_simple`;
-those gains are not folded into this table until
-the next complete uncached census.
+Latest complete uncached census after infinity-safe WHERE, signed infinite division, prefix-repeat broadcast, and exact copysign:
 
 | Status | Methods |
 |---|---:|
-| PASS | 159 |
-| FAIL | 253 |
+| PASS | 167 |
+| FAIL | 245 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `375 failed` because 122 failing unittest subtests are counted
-in addition to their failed parent methods; four subtests pass. Runtime was 1076.12 seconds. This
+Pytest reports `358 failed` because 113 failing unittest subtests are counted
+in addition to their failed parent methods; 13 subtests pass. Runtime was 1087.02 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
 GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
 natural Exp, CELU α=1–4, Log2/Log/Log10, round-to-nearest-even, trunc, floor,
 ceil, ASIN, ACOS, ATAN, SIN, ATANH, ASINH, ACOSH, IEEE predicates, all five mixed-dtype comparison methods, scalar `isclose`, logical-not,
-dynamic `WHERE`, square int32 WHERE transpose, exact maximum/minimum, zero-axis bool constants, and suffix-broadcast ADD.
+dynamic and infinity-safe `WHERE`, square int32 WHERE transpose, exact maximum/minimum and copysign, zero-axis bool constants, signed infinite
+division, and both suffix-tile and prefix-repeat broadcast ADD.
 
 All five mixed-dtype `test_cmp_*` methods now pass FP16, exact signed int32, bool, same-shape/suffix-broadcast, scalar, reverse, and infinity cases.
 Int32 values are never narrowed: four byte planes preserve all 32 bits and the sign-biased high byte makes unsigned lexicographic comparison signed-correct.
