@@ -275,4 +275,9 @@ class TestRockchip(unittest.TestCase):
     broad, suffix = np.arange(60, dtype=np.float16).reshape(3,4,5), np.array([0, 13, 26, 39, 52], dtype=np.float16)
     np.testing.assert_equal((Tensor(broad, device="ROCKCHIP") < Tensor(suffix, device="ROCKCHIP")).numpy(), broad < suffix)
 
+  def test_int32_where_output_planes_are_exact(self):
+    condition = np.array([True, False, False, True, True, False, True, False, True], dtype=np.bool_)
+    actual = Tensor(condition, device="ROCKCHIP").where(0x12345678, -3).clone().numpy()
+    np.testing.assert_equal(actual, np.where(condition, 0x12345678, -3).astype(np.int32))
+
 if __name__ == "__main__": unittest.main()

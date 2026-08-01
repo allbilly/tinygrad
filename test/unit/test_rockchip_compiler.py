@@ -469,6 +469,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual(plan.tiled_inputs, (2,))
 
+  def test_int32_where_emits_four_exact_output_planes(self):
+    cond = Tensor.empty(9,dtype=dtypes.bool)
+    plan = lower_dpu(sink(cond.where(0x12345678, -3).clone()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual((plan.bool_inputs, plan.int_outputs), ((1,), (0,)))
+    self.assertEqual({stage.dst.addend for stage in plan.stages if stage.dst.kind is RKBufferKind.ARG}, {0, 32, 64, 96})
+    self.assertLessEqual(len(plan.stages), 64)
+    self.assertFalse(contains_uop(plan))
+
   def test_abs_canonicalizes_to_mul_max(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).abs()))
     self.assertIsInstance(plan, RKDPUProgram)

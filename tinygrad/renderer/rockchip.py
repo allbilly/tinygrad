@@ -9,8 +9,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import Ops, ProgramInfo, UOp
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 8, 1
-_HEADER = struct.Struct("<4sHHHHHHIIIQQQQ")
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 9, 1
+_HEADER = struct.Struct("<4sHHHHHHIIIQQQQQ")
 _STAGE = struct.Struct("<BBHQIIIIQQ")
 _RELOC = struct.Struct("<HHBBIqIH")
 _SCRATCH = struct.Struct("<II")
@@ -74,6 +74,7 @@ class RKImage:
   bool_inputs: tuple[int, ...] = ()
   int_inputs: tuple[int, ...] = ()
   tiled_inputs: tuple[int, ...] = ()
+  int_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKArg:
@@ -104,6 +105,7 @@ class RKDPUProgram:
   bool_inputs: tuple[int, ...] = ()
   int_inputs: tuple[int, ...] = ()
   tiled_inputs: tuple[int, ...] = ()
+  int_outputs: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKView:
@@ -649,6 +651,7 @@ def validate_image(image:RKImage) -> None:
   _slot_mask(image.bool_inputs)
   _slot_mask(image.int_inputs)
   _slot_mask(image.tiled_inputs)
+  _slot_mask(image.int_outputs)
 
 def encode_image(image:RKImage) -> bytes:
   validate_image(image)
@@ -664,7 +667,8 @@ def encode_image(image:RKImage) -> bytes:
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.stages), len(relocs), len(image.scratch),
                                sum(1 << x for x in image.fp32_outputs),
                                len(commands), len(image.constants), sum(1 << x for x in image.fp32_inputs), _slot_mask(image.bool_outputs),
-                               _slot_mask(image.bool_inputs), _slot_mask(image.int_inputs), _slot_mask(image.tiled_inputs)))
+                               _slot_mask(image.bool_inputs), _slot_mask(image.int_inputs), _slot_mask(image.tiled_inputs),
+                               _slot_mask(image.int_outputs)))
   for engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes in stage_rows:
     out += _STAGE.pack(engine, flags, reserved, deps, command_start, command_count, reloc_start, reloc_count, reads, writes)
   for reloc in relocs:
@@ -676,7 +680,7 @@ def encode_image(image:RKImage) -> bytes:
 def decode_image(blob:bytes) -> RKImage:
   if len(blob) < _HEADER.size: raise ValueError("truncated RKImage header")
   magic, version, target, stage_count, reloc_count, scratch_count, reserved, command_count, constant_size, reserved2, \
-    bool_output_mask, bool_input_mask, int_input_mask, tiled_input_mask = _HEADER.unpack_from(blob)
+    bool_output_mask, bool_input_mask, int_input_mask, tiled_input_mask, int_output_mask = _HEADER.unpack_from(blob)
   if magic != RKIMAGE_MAGIC: raise ValueError("invalid RKImage header")
   expected = _HEADER.size + stage_count*_STAGE.size + reloc_count*_RELOC.size + scratch_count*_SCRATCH.size + command_count*8 + constant_size
   if expected != len(blob): raise ValueError("invalid RKImage size")
@@ -702,7 +706,7 @@ def decode_image(blob:bytes) -> RKImage:
     if any(r.stage != idx for r in stages[-1].relocs): raise ValueError("relocation belongs to wrong stage")
   image = RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], version,
                   tuple(x for x in range(32) if reserved2 & (1 << x)), tuple(x for x in range(16) if reserved & (1 << x)),
-                  slots(bool_output_mask), slots(bool_input_mask), slots(int_input_mask), slots(tiled_input_mask))
+                  slots(bool_output_mask), slots(bool_input_mask), slots(int_input_mask), slots(tiled_input_mask), slots(int_output_mask))
   validate_image(image)
   return image
 
@@ -1168,8 +1172,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   u = _unwrap_same_cast(u)
   if u in memo: return memo[u]
   output_count = int(output_index.vmax)+1 if int(output_index.vmin) == 0 else 0
-  suffix_tiled = u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[1].op is Ops.RANGE and output_count > 0 and \
-    int(u.src[0].src[0].arg) == int(u.src[1].src[0].arg) and output_count % int(u.src[1].src[0].arg) == 0
+  input_count = int(u.src[0].src[0].arg) if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM else 0
+  suffix_tiled = u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and output_count > 0 and output_count % input_count == 0 and \
+    ((u.src[1].op is Ops.RANGE and input_count == int(u.src[1].src[0].arg)) or
+     (u.src[1].op is Ops.CONST and input_count == 1 and int(u.src[1].arg) == 0))
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and (u.src[1].key == output_index.key or suffix_tiled):
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
@@ -1388,6 +1394,50 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   memo[u] = ret
   return ret
 
+def _lower_int_where(u:UOp, output_index:UOp, output:RKArg, count:int) -> RKDPUProgram|None:
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.WHERE: return None
+  true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
+  if any(x.op is not Ops.CONST or not dtypes.is_int(x.dtype) for x in (true_u, false_u)): return None
+  mask = _parse_mask_expr(u.src[0], output_index, {})
+  if mask is None: return None
+  plane_size, stages, scratch_count = ((count+7)//8)*16, [], 0
+  for plane, shift in enumerate((24, 16, 8, 0)):
+    true_byte, false_byte = (float((int(x.arg) >> shift) & 0xff) for x in (true_u, false_u))
+    root = _DPUExpr(RKDPUOp.ADD, (false_byte, _DPUExpr(RKDPUOp.MUL, (mask, true_byte-false_byte))))
+    order:list[_DPUExpr] = []
+    def visit(expr:_DPUExpr) -> None:
+      for src in expr.src:
+        if isinstance(src, _DPUExpr) and src not in order: visit(src)
+      if expr not in order: order.append(expr)
+    visit(root)
+    uses = {expr:sum(src == expr for node in order for src in node.src) for expr in order}
+    values:dict[_DPUExpr, RKArg] = {}
+    free:list[int] = []
+    base, local_count = scratch_count, 0
+    for expr in order:
+      src = tuple(values[x] if isinstance(x, _DPUExpr) else x for x in expr.src)
+      if expr is root: dst = RKArg(output.kind, output.index, plane*plane_size)
+      elif (reuse:=next((values[x] for x in expr.src if isinstance(x, _DPUExpr) and uses[x] == 1 and
+                         values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
+      else:
+        slot = free.pop() if free else base+local_count
+        if slot == base+local_count: local_count += 1
+        dst = RKArg(RKBufferKind.SCRATCH, slot)
+      stages.append(RKDPUStage(cast(RKDPUOp, expr.op), dst, src[0], src[1] if len(src) > 1 else None, count))
+      values[expr] = dst
+      for dependency in expr.src:
+        if isinstance(dependency, _DPUExpr):
+          uses[dependency] -= 1
+          arg = values[dependency]
+          if uses[dependency] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
+    scratch_count += local_count
+  if len(stages) > 64: return None
+  bool_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in u.toposort() if x.op is Ops.INDEX and x.dtype is dtypes.bool and
+                                   x.src[0].op is Ops.PARAM))
+  return RKDPUProgram(tuple(stages), tuple(RKScratch(plane_size) for _ in range(scratch_count)), bool_inputs=bool_inputs,
+                      int_outputs=(output.index,))
+
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   """Lower one contiguous fp16/int32/bool-ABI store to a UOp-free primitive DPU plan."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
@@ -1397,6 +1447,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   if out_param.op is not Ops.PARAM or out_param.src[0].op is not Ops.CONST: return None
   count = int(out_param.src[0].arg)
   if count <= 0 or int(out_index.vmin) != 0 or int(out_index.vmax) != count-1: return None
+  output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  if store.src[0].dtype is dtypes.int and (int_where:=_lower_int_where(store.src[1], out_index, output, count)) is not None: return int_where
   root: _DPUExpr|RKArg|float|None
   predicate = _canonical_finite_predicate(store.src[1]) if store.src[0].dtype is dtypes.bool else None
   if predicate is not None:
@@ -1416,7 +1468,6 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   # fills can safely double their source lanes; dynamic conversion needs an
   # explicit packed layout and is deliberately not inferred here.
   if store.src[0].dtype is dtypes.int and not isinstance(root, float): return None
-  output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, _DPUExpr):
     if store.src[0].dtype in (dtypes.int, dtypes.float):
       tile = 64 if store.src[0].dtype is dtypes.int else 4
@@ -1474,9 +1525,9 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   int_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.int and
                                   x.src[0].op is Ops.PARAM))
   tiled_inputs = tuple(dict.fromkeys(x.src[0].arg.slot for x in store.src[1].toposort() if x.op is Ops.INDEX and x.dtype is dtypes.half and
-    x.src[0].op is Ops.PARAM and x.src[1].op is Ops.RANGE and int(out_index.vmin) == 0 and
-    int(x.src[0].src[0].arg) == int(x.src[1].src[0].arg) and count % int(x.src[1].src[0].arg) == 0 and
-    x.src[1].key != out_index.key))
+    x.src[0].op is Ops.PARAM and int(out_index.vmin) == 0 and count % int(x.src[0].src[0].arg) == 0 and
+    ((x.src[1].op is Ops.RANGE and int(x.src[0].src[0].arg) == int(x.src[1].src[0].arg)) or
+     (x.src[1].op is Ops.CONST and int(x.src[0].src[0].arg) == 1 and int(x.src[1].arg) == 0)) and x.src[1].key != out_index.key))
   if len(stages) > 64: return None
   return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)), fp32_inputs, fp32_outputs, bool_outputs, bool_inputs,
                       int_inputs, tiled_inputs)
@@ -1763,7 +1814,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET))
   return RKImage(target, tuple(stages), program.scratch, bytes(constants), fp32_inputs=program.fp32_inputs,
                  fp32_outputs=program.fp32_outputs, bool_outputs=program.bool_outputs, bool_inputs=program.bool_inputs,
-                 int_inputs=program.int_inputs, tiled_inputs=program.tiled_inputs)
+                 int_inputs=program.int_inputs, tiled_inputs=program.tiled_inputs, int_outputs=program.int_outputs)
 
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit a direct FP16 CMAC surface; inputs and output are already in hardware-legal layouts."""

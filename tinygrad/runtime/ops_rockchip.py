@@ -39,11 +39,18 @@ class RockchipProgram(Program['RockchipDevice']):
     converted: list[HCQBuffer] = []
     widened: list[tuple[HCQBuffer, HCQBuffer]] = []
     packed: list[tuple[HCQBuffer, HCQBuffer, int]] = []
+    int_packed: list[tuple[HCQBuffer, HCQBuffer, int]] = []
     for slot in self.image.bool_outputs:
       if slot >= len(bufs): raise RuntimeError(f"invalid bool output slot {slot}")
       count, destination = bufs[slot].size, bufs[slot]
       temporary = self.dev._gpu_alloc(((count+7)//8)*16)
       prepared[slot], converted, packed = temporary, [*converted, temporary], [*packed, (temporary, destination, count)]
+    for slot in self.image.int_outputs:
+      if slot >= len(bufs) or bufs[slot].size % 4: raise RuntimeError(f"invalid int32 output slot {slot}")
+      count, destination = bufs[slot].size//4, bufs[slot]
+      temporary = self.dev._gpu_alloc(((count+7)//8)*64)
+      prepared[slot], converted = temporary, [*converted, temporary]
+      int_packed.append((temporary, destination, count))
     for slot in self.image.bool_inputs:
       if slot >= len(bufs): raise RuntimeError(f"invalid bool input slot {slot}")
       import numpy as np
@@ -65,10 +72,12 @@ class RockchipProgram(Program['RockchipDevice']):
         ctypes.memmove(int(temporary.va_addr)+plane*plane_size, encoded.ctypes.data, encoded.nbytes)  # type: ignore[arg-type]
       prepared[slot], converted = temporary, [*converted, temporary]
     for slot in self.image.tiled_inputs:
-      if slot >= len(bufs) or bufs[slot].size % 2 or len(self.image.bool_outputs) != 1:
-        raise RuntimeError(f"invalid suffix-tiled FP16 input slot {slot}")
+      writes = tuple(dict.fromkeys(x for stage in self.image.stages for x in stage.writes))
+      if slot >= len(bufs) or bufs[slot].size % 2 or (not self.image.bool_outputs and len(writes) != 1):
+        raise RuntimeError(f"invalid tiled FP16 input slot {slot}")
       import numpy as np
-      source, count = bufs[slot], bufs[self.image.bool_outputs[0]].size
+      source = bufs[slot]
+      count = bufs[self.image.bool_outputs[0]].size if self.image.bool_outputs else bufs[writes[0]].size//2
       values = np.resize(np.frombuffer(ctypes.string_at(int(source.va_addr), source.size), dtype=np.float16), count)
       temporary = self.dev._gpu_alloc(((count+7)//8)*16)
       ctypes.memmove(int(temporary.va_addr), values.ctypes.data, values.nbytes)  # type: ignore[arg-type]
@@ -127,6 +136,13 @@ class RockchipProgram(Program['RockchipDevice']):
         import numpy as np
         values = np.frombuffer(ctypes.string_at(int(temporary.va_addr), count*2), dtype=np.float16) != 0
         ctypes.memmove(int(destination.va_addr), values.ctypes.data, count)  # type: ignore[arg-type]
+      for temporary, destination, count in int_packed:
+        import numpy as np
+        plane_size, int_output_values = ((count+7)//8)*16, np.zeros(count, dtype=np.uint32)
+        for plane, shift in enumerate((24, 16, 8, 0)):
+          encoded = np.frombuffer(ctypes.string_at(int(temporary.va_addr)+plane*plane_size, count*2), dtype=np.float16).astype(np.uint32)
+          int_output_values |= encoded << shift
+        ctypes.memmove(int(destination.va_addr), int_output_values.ctypes.data, count*4)  # type: ignore[arg-type]
     finally:
       for buf in converted: self.dev._gpu_free(buf)
     return time.perf_counter()-start if wait else None
