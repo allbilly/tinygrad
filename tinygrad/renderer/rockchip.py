@@ -253,6 +253,7 @@ def _expm1_expr(source:_Expr|RKArg|float) -> _Expr:
   broad_scale = _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (positive_input, 7.0))))
   broad = _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.EXPM1, (clamp(source, 2.0),)), broad_scale))
   local = _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.EXPM1_LOCAL, (clamp(source, .25),)), _ALUExpr(Ops.ADD, (1.0, positive_input))))
+  # WIP rejected on RK3588: x+x*x/2+x*x*x/6+x*x*x*x/24 simulates well but staged DPU rounding regresses CELU.
   local_inside = _ALUExpr(Ops.MUL, (positive(source, -.25), positive(.25, source)))
   selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))
   nonzero = _ALUExpr(Ops.MAX, (positive_input, positive(0.0, source)))
@@ -407,9 +408,8 @@ def _log2_expr(source:_Expr|RKArg, scale:float=1.0) -> _Expr:
   corrected = _ALUExpr(Ops.ADD, (mantissa, offset))
   negative, greater_zero, high = positive(0.0, source), positive(source, 0.0), positive(source, 65472.0)
   nonzero = _ALUExpr(Ops.MAX, (greater_zero, negative))
-  finite = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.FDIV, (corrected, nonzero)), _sub(1.0, high)))
-  not_number = _ALUExpr(Ops.MUL, (greater_zero, negative))
-  valid = _sub(1.0, _ALUExpr(Ops.MAX, (negative, not_number)))
+  finite = _ALUExpr(Ops.FDIV, (corrected, _sub(nonzero, high)))
+  valid = _sub(1.0, negative)
   return _ALUExpr(Ops.MUL, (finite, _ALUExpr(Ops.FDIV, (valid, valid))))
 
 def _unwrap_same_cast(u:UOp) -> UOp:
@@ -670,10 +670,14 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     ret = _log2_expr(operand)
   elif u.op is Ops.MUL and (logarithm:=next((x for x in u.src if _unwrap_same_cast(x).op is Ops.LOG2), None)) is not None:
     factor = next((x for x in u.src if x is not logarithm and x.op is Ops.CONST and isinstance(x.arg, (int, float))), None)
-    if factor is None or not math.isclose(float(factor.arg), math.log10(2)): return None
-    operand = _parse_alu(_unwrap_same_cast(logarithm).src[0], output_index, memo)
-    if operand is None or isinstance(operand, float): return None
-    ret = _log2_expr(operand, float(factor.arg))
+    if factor is not None and math.isclose(float(factor.arg), math.log10(2)):
+      operand = _parse_alu(_unwrap_same_cast(logarithm).src[0], output_index, memo)
+      if operand is None or isinstance(operand, float): return None
+      ret = _log2_expr(operand, float(factor.arg))
+    else:
+      src = tuple(_parse_alu(x, output_index, memo) for x in u.src)
+      if len(src) != 2 or any(x is None for x in src): return None
+      ret = _ALUExpr(Ops.MUL, (src[0], src[1]))  # type: ignore[arg-type]
   elif u.op is Ops.EXP2:
     exp_operand = _unwrap_same_cast(u.src[0])
     exp_factor = next((x for x in exp_operand.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None) \
@@ -751,14 +755,11 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
                                      store.src[0].dtype) for start in range(0, count, tile))
       return RKDPUProgram(fill_stages) if len(fill_stages) <= 64 else None
     return RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),))
-  if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2 and isinstance(root.src[0], RKArg):
-    input_arg, base = root.src[0], root
-    positive_inf = _MaskExpr((_sub(input_arg, 65504.0),))
-    negative_inf = _MaskExpr((_sub(-65504.0, input_arg),))
-    finite = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
-    not_number = _ALUExpr(Ops.MUL, (positive_inf, negative_inf))
-    nan_denom = _sub(1.0, not_number)
-    root = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (finite, nan_denom)), nan_denom))
+  if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2:
+    exp_source, base = root.src[0], root
+    positive_inf = _MaskExpr((_sub(exp_source, 65504.0),))
+    negative_inf = _MaskExpr((_sub(-65504.0, exp_source),))
+    root = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
   order:list[_Expr] = []
   def visit(expr:_Expr) -> None:
     for src in expr.src:

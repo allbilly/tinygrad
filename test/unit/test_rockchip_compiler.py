@@ -241,6 +241,13 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertTrue(any(isinstance(stage, RKALUStage) and stage.op is Ops.SUB for stage in plan.stages))
       self.assertLessEqual(len(plan.stages), 58)
       self.assertFalse(contains_uop(plan))
+    x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
+    composed = lower_dpu(sink((x.log2()*y).exp2()))
+    self.assertIsInstance(composed, RKDPUProgram)
+    self.assertEqual(len(composed.stages), 64)
+    self.assertEqual({stage.lut for stage in composed.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.LOG2, rklut.RKLUTId.LOG2_LOCAL, rklut.RKLUTId.EXP2})
+    self.assertFalse(contains_uop(composed))
 
   def test_round_uses_generated_algorithm23_lut(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_ROUNDOFF)}h", *rklut.RK_LUT_ROUNDOFF)

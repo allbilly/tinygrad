@@ -126,6 +126,21 @@ Pytest reports 411 failures including the same 126 failing subtests. Runtime
 was 299.24 seconds. The exact three-method gain is `test_asin`, `test_acos`,
 and `test_atan`; all use generated math assets through the generic LUT stage.
 
+After generic LOG2 multiplication and compact expression-input EXP2 special
+value handling, the uncached 2026-08-02 census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 128 |
+| FAIL | 284 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 410 failures including the same 126 failing subtests. Runtime
+was 317.88 seconds. The exact one-method gain is
+`test_exp2_log2_zero_times_negative`; the direct EXP2, LOG2, and LOG10 methods
+remain passing.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -148,6 +163,7 @@ and `test_atan`; all use generated math assets through the generic LUT stage.
 | Scaled-input reuse of the generated sigmoid LUT | `test_quick_gelu_extreme` | No |
 | Generated tanh ranges with a stable local polynomial | `test_tanh`, `test_tanh_extreme` | No |
 | Generated inverse-trigonometric tables and local/tail arithmetic | `test_asin`, `test_acos`, `test_atan` | Yes |
+| Generic dynamic LOG2 multiplication and compact nested EXP2 special values | `test_exp2_log2_zero_times_negative` | Yes |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

@@ -122,6 +122,13 @@ hardware comparison for both functions. Native `Ops.SUB` is material here:
 using MUL-by-minus-one plus ADD exceeded RKImage's 64-stage dependency limit.
 FP32 logarithms and smaller positive values are outside this contract.
 
+Arbitrary multiplication of a LOG2 result now falls through to the generic
+ALU path; only the constant `log10(2)` scale selects LOG10 tables. EXP2 repairs
+special values for expression inputs as well as direct buffers. The compact
+repair divides by the positive-infinity validity mask and multiplies by the
+negative-infinity validity mask, so the LOG2-zero times negative composition
+fits exactly in the 64-stage image while retaining infinity and NaN behavior.
+
 ## Cancellation-resistant EXPM1
 
 The generic EXPM1 recognizer replaces both `exp(x)-1` and `1-exp(x)` after EXP

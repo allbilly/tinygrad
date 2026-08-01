@@ -142,6 +142,8 @@ class TestRockchip(unittest.TestCase):
     special = np.array([-1., -0., 0., 1., np.inf, np.nan], dtype=np.float16)
     with np.errstate(divide="ignore", invalid="ignore"): expected_special = np.log2(special)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").log2().realize().numpy(), expected_special)
+    zero, negative = Tensor([0.], device="ROCKCHIP"), Tensor([-.7], device="ROCKCHIP")
+    np.testing.assert_equal((zero.log2()*negative).exp2().realize().numpy(), np.array([np.inf], dtype=np.float16))
 
   def test_generated_roundoff_lut(self):
     data = np.linspace(-16, 16, 4097, dtype=np.float16)
