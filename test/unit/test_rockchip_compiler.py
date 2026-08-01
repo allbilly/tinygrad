@@ -299,6 +299,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_RSQRT_SHA256)
     self.assertFalse(contains_uop(plan))
 
+  def test_exp_uses_generated_broad_local_luts(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).exp()))
+    self.assertEqual((len(plan.stages), len(plan.scratch)), (36, 4))
+    self.assertEqual((sum(x.op is RKDPUOp.EXP for x in plan.stages), sum(x.op is RKDPUOp.EXP_LOCAL for x in plan.stages)), (1, 1))
+    for name in ("EXP", "EXP_LOCAL"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

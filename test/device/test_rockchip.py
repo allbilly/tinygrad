@@ -159,4 +159,11 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(divide="ignore"): expected_fp32 = 1/np.sqrt(fp32)
     np.testing.assert_equal(Tensor(fp32, device="ROCKCHIP").rsqrt().numpy(), expected_fp32)
 
+  def test_generated_exp_luts(self):
+    data = np.linspace(-2, 2, 2049, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").exp().numpy(), np.exp(data.astype(np.float32)).astype(np.float16),
+                               rtol=1e-3, atol=1e-6)
+    special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").exp().numpy(), np.array([np.inf, 0, np.nan], dtype=np.float16))
+
 if __name__ == "__main__": unittest.main()
