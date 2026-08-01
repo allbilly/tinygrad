@@ -53,6 +53,20 @@ the uncached 2026-08-03 census completed without NPU timeouts:
 Pytest reports 434 failures including the 126 failing subtests. Runtime was
 74.26 seconds, another exact eight-method gain.
 
+At `6ddda80b0`, after infinity-safe selection and generated integral rounding,
+the uncached 2026-08-02 census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 110 |
+| FAIL | 302 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 428 failures including the 126 failing subtests. Runtime was
+160.17 seconds. A follow-up parser guard restores clean rejection for unrelated
+nonnumeric constants discovered by this census.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -61,9 +75,9 @@ Pytest reports 434 failures including the 126 failing subtests. Runtime was
 | Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Yes (`40c74406c`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
-| Infinity-safe ordered threshold selection | `test_inf_where` | No |
-| Generated algorithm-23 round-to-nearest-even LUT | `test_round` | No |
-| Integral rounding composed from the roundoff LUT | `test_trunc`, `test_floor`, `test_ceil` | No |
+| Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
+| Generated algorithm-23 round-to-nearest-even LUT | `test_round` | Yes (`6ddda80b0`) |
+| Integral rounding composed from the roundoff LUT | `test_trunc`, `test_floor`, `test_ceil` | Yes (`6ddda80b0`) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

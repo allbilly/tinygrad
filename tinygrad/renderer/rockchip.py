@@ -251,7 +251,7 @@ def _canonical_round(u:UOp) -> UOp|None:
   indexes = [x for x in u.toposort() if x.op is Ops.INDEX]
   if len(indexes) != 1 or (source:=indexes[0]).dtype is not dtypes.half: return None
   counts = {op:sum(x.op is op for x in u.toposort()) for op in (Ops.TRUNC, Ops.ADD, Ops.MUL, Ops.CMPLT, Ops.CMPNE, Ops.WHERE)}
-  constants = [float(x.arg) for x in u.toposort() if x.op is Ops.CONST]
+  constants = [float(x.arg) for x in u.toposort() if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
   required = {Ops.TRUNC:4, Ops.ADD:4, Ops.MUL:1, Ops.CMPLT:3, Ops.CMPNE:3, Ops.WHERE:3}
   return source if counts == required and all(any(math.isclose(x, value) for x in constants) for value in (-1,-.5,0,.5,1)) else None
 
