@@ -14,11 +14,11 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones, the 2026-08-01 census is **104 passed, 308 failed, and 13 skipped**.
-Pytest prints `434 failed` because it separately counts 126 failing subtests.
+milestones, the 2026-08-01 census is **105 passed, 307 failed, and 13 skipped**.
+Pytest prints `433 failed` because it separately counts 126 failing subtests.
 
 Therefore the clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 28-host/10-NPU
+while recovering the remaining native forward coverage. Focused 29-host/10-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -57,7 +57,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `fa22d6764` | Native ABS canonicalization | `0174-rockchip-canonicalize-native-absolute-value.patch` |
 | `89a5cffbc` | Tiled native int32 fills and 64-bit image dependencies | `0175-rockchip-tile-native-int32-fills.patch` |
 | `f49f99acf` | Tiled native FP32 constant fills | `0176-rockchip-tile-native-FP32-fills.patch` |
-| current milestone | Composed FP16 predicates and structural DAG liveness | `0177-rockchip-compose-native-FP16-predicates.patch` |
+| `3f763ea7b` | Composed FP16 predicates and structural DAG liveness | `0177-rockchip-compose-native-FP16-predicates.patch` |
+| current milestone | Ordered clamp canonicalization for stable saturation | `0178-rockchip-canonicalize-stable-ordered-clamp.patch` |
 
 ## Architecture now implemented
 
@@ -87,6 +88,7 @@ Implemented forward-only subset:
 - contiguous copy and fill;
 - ADD, MUL, MAX, DIV, ABS, ordered extrema, and generic FP16 WHERE expression DAGs;
 - CMPLT, CMPNE, OR, and AND composition into internal FP16 masks, with structural common-expression liveness;
+- stable ordered-clamp recovery from `relu(x+0.5)-relu(x-0.5)`, avoiding large-value FP16 cancellation;
 - scalar operands materialized as declared RKImage constants;
 - EXP2 on one proven 128-element DPU tile over the generated `[-2, 2]` LUT domain;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
@@ -100,12 +102,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  572
+tinygrad/renderer/rockchip.py  607
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  646
+handwritten Rockchip total  681
 ```
 
-This meets the requested `<5000` backend goal with 4,354 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 4,319 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -115,7 +117,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 25,622 `sz.py` lines, a `+654` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 622 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 25,657 `sz.py` lines, a `+689` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 657 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 

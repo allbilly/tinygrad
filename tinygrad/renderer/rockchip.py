@@ -215,6 +215,38 @@ def _canonical_abs(u:UOp) -> UOp|None:
         positive.op is Ops.CONST and float(positive.arg) == 1): return data
   return None
 
+def _canonical_relu_difference(u:UOp) -> UOp|None:
+  """Recognize relu(x+0.5)-relu(x-0.5), tinygrad's clip(x+0.5, 0, 1)."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.ADD: return None
+  def shifted_relu(v:UOp, negated:bool) -> tuple[UOp,float]|None:
+    v = _unwrap_same_cast(v)
+    if negated:
+      if v.op is not Ops.MUL: return None
+      const = next((_unwrap_same_cast(x) for x in v.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      if const is None or float(const.arg) != -1: return None
+      v = _unwrap_same_cast(v.src[0] if _unwrap_same_cast(v.src[1]).key == const.key else v.src[1])
+    if v.op is Ops.WHERE:
+      cond, shifted, where_zero = (_unwrap_same_cast(x) for x in v.src)
+      if (cond.op is not Ops.CMPLT or _unwrap_same_cast(cond.src[0]).op is not Ops.CONST or
+          float(_unwrap_same_cast(cond.src[0]).arg) != 0 or _unwrap_same_cast(cond.src[1]).key != shifted.key or
+          where_zero.op is not Ops.CONST or float(where_zero.arg) != 0): return None
+    elif v.op is Ops.MAX:
+      max_zero = next((_unwrap_same_cast(x) for x in v.src if _unwrap_same_cast(x).op is Ops.CONST and
+                       float(_unwrap_same_cast(x).arg) == 0), None)
+      if max_zero is None: return None
+      shifted = _unwrap_same_cast(v.src[0] if _unwrap_same_cast(v.src[1]).key == max_zero.key else v.src[1])
+    else: return None
+    if shifted.op is not Ops.ADD: return None
+    offset = next((_unwrap_same_cast(x) for x in shifted.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    if offset is None: return None
+    base = _unwrap_same_cast(shifted.src[0] if _unwrap_same_cast(shifted.src[1]).key == offset.key else shifted.src[1])
+    return base, float(offset.arg)
+  for positive, negative in (u.src, u.src[::-1]):
+    pos, neg = shifted_relu(positive, False), shifted_relu(negative, True)
+    if pos is not None and neg is not None and pos[0].key == neg[0].key and pos[1] == 0.5 and neg[1] == -0.5: return pos[0]
+  return None
+
 def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float]) -> _DPUExpr|None:
   """Build an FP16 0/1 predicate from comparisons and boolean composition."""
   u = _unwrap_same_cast(u)
@@ -238,6 +270,11 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:RKArg|float|_DPUExpr = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (clamp_base:=_canonical_relu_difference(u)) is not None:
+    base = _parse_dpu_expr(clamp_base, output_index, memo)
+    if base is None: return None
+    positive = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.ADD, (base, 0.5)), 0.0))
+    ret = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (positive, -1.0)), -1.0)), -1.0))
   elif (abs_input:=_canonical_abs(u)) is not None:
     operand = _parse_dpu_expr(abs_input, output_index, memo)
     if operand is None: return None

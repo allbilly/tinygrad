@@ -82,13 +82,13 @@ Latest complete uncached census after the native-int fill milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 104 |
-| FAIL | 308 |
+| PASS | 105 |
+| FAIL | 307 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `434 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 66.92 seconds.
+Pytest reports `433 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 67.39 seconds.
 
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
@@ -99,7 +99,7 @@ in addition to their failed parent methods. Runtime was 66.92 seconds.
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 27 | 10 | PASS |
+| Clean image/compiler suite total | 28 | 10 | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
