@@ -93,6 +93,11 @@ to the preceding exact tanh census, EXP2 special values add one passing method,
 shared sigmoid/SiLU/Swish add three, normal/extreme QuickGELU add two, and
 normal/extreme tanh/exact GELU add two.
 
+The isolated standalone `test_erf` method, including normal, scalar, and both
+extreme subcases, additionally passes. Current validated delta after the exact
+census: 117 PASS / 295 FAIL / 13 SKIP. A new full-census runtime has not yet
+been recorded for that one-method delta.
+
 ## Focused verified matrix
 
 | Group | Host compile checks | RK3588 checks | Status |
@@ -106,10 +111,11 @@ normal/extreme tanh/exact GELU add two.
 | Shared two-level sigmoid/SiLU/Swish | typed 24/25-stage plans | 1 dense local sweep | PASS |
 | Dedicated two-level QuickGELU | typed 58-stage plan | normal/extreme official methods and 1 broad sweep | PASS |
 | Dedicated tanh/exact GELU | two typed 51-stage plans | normal/extreme official methods and 2 broad sweeps | PASS |
+| Dedicated two-level Erf | typed 44-stage plan | official normal/scalar/extremes and 1 strict dense sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 34 | 15 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 35 | 16 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

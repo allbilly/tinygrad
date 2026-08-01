@@ -99,4 +99,9 @@ class TestRockchip(unittest.TestCase):
         extreme = Tensor(np.array([-350, 350], dtype=np.float16), device="ROCKCHIP").gelu(approximate=approximate).numpy()
         np.testing.assert_equal(extreme, np.array([-0., 350], dtype=np.float16))
 
+  def test_two_level_erf_lut(self):
+    data = np.linspace(-8, 8, 2049, dtype=np.float16)
+    expected = np.array([math.erf(float(x)) for x in data], dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").erf().numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

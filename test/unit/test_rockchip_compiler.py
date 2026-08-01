@@ -210,6 +210,16 @@ class TestDPUCompiler(unittest.TestCase):
                           (rklut.RK_LUT_GELU_EXACT_LOCAL, rklut.RK_LUT_GELU_EXACT_LOCAL_SHA256)):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
+  def test_erf_uses_dedicated_two_level_lut(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).erf()))
+    self.assertEqual((len(plan.stages), len(plan.scratch)), (44, 9))
+    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.ERF), 1)
+    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.ERF_LOCAL), 1)
+    for table, digest in ((rklut.RK_LUT_ERF, rklut.RK_LUT_ERF_SHA256),
+                          (rklut.RK_LUT_ERF_LOCAL, rklut.RK_LUT_ERF_LOCAL_SHA256)):
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))
