@@ -891,6 +891,8 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     ret = _DPUExpr(RKDPUOp.DIV, cast(tuple[_DPUExpr|RKArg|float, ...], src))
   elif u.op is Ops.MUL and (logarithm:=next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.LOG2), None)) is not None:
     constant = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    # Rejected scaled-log/atanh WIP: accepting arbitrary finite scales lowered atanh in 61 stages, but its ratio reaches 199.
+    # Adding symmetric >4/>64 power-of-16 bands made log/atanh 69/73 stages, beyond RKImage's 64-stage dependency contract.
     if constant is None or not isinstance(constant.arg, (int, float)) or not any(
        math.isclose(float(constant.arg), x) for x in (math.log(2), math.log10(2))): return None
     raw_source = _unwrap_same_cast(logarithm.src[0])

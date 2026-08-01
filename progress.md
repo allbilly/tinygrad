@@ -98,7 +98,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `730efd61e` | Scale-specific Log2/Log/Log10 LUTs and experimental typed FP32 ABI | `0198-rockchip-add-logarithm-LUTs.patch` |
 | `1f4cc5da8` | Native round-to-nearest-even algorithm-23 LUT | `0199-rockchip-add-native-roundoff-LUT.patch` |
 | `e6a88f6c1` | Separate hardware stage operations from generated LUT identities | `0200-rockchip-separate-LUT-assets-from-stage-ops.patch` |
-| current milestone | Compose trunc/floor/ceil from native roundoff and masks | `0201-rockchip-compose-native-integral-rounding.patch` |
+| `29559149c` | Compose trunc/floor/ceil from native roundoff and masks | `0201-rockchip-compose-native-integral-rounding.patch` |
+| current milestone | Preserve rejected scaled-log high-range normalization probe | `0202-rockchip-record-rejected-scaled-log-probe.patch` |
 
 ## Architecture now implemented
 
@@ -232,6 +233,7 @@ Useful failure interpretations:
 Recent precision probes that must not be rediscovered as final fixes:
 
 - DPU `out_precision=0` int8 output from the proven FP16 mask task timed out with both eight-lane and 16-lane WDMA/data-cube layouts. The TRM advertises int8 output, but FP16-to-int8 conversion is not yet a proven byte-wide bool ABI; do not enable it from the format field alone.
+- Arbitrary scaled LOG2 made atanh compile in 61 stages, but the `(1+x)/(1-x)` ratio reaches 199 and saturated above 4. Symmetric `>4`/`>64` power-of-16 normalization fixed the range but expanded direct log/atanh to 69/73 stages, beyond RKImage's 64-bit dependency contract. Fuse stages or introduce a justified wide-domain asset; do not relax the image invariant.
 
 - `hardswish` baseline (`(x*clamp)*half(1/6)`) mismatched 34/2925 values;
 - one-task BS pre-scaling reduced that to 9/2925, but still missed the official tolerance;

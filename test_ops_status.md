@@ -175,6 +175,11 @@ the proven eight-lane cube/WDMA geometry, and one used a 16-lane int8 atom.
 Therefore byte-wide bool output remains an honest unimplemented boundary; the
 TRM precision enum alone is not a valid hardware contract.
 
+Scaled-log reuse for atanh was also rejected: its first 61-stage form saturated
+ratios above four, while correct two-band high-range normalization required
+73 stages and violated the typed image's 64-stage dependency limit. Atanh
+remains `REJECT_UNIMPLEMENTED`, not a numerical pass.
+
 Spatial convolution is not low-hanging because it first needs a device-visible layout contract.
 
 ## Rules for future tally updates
