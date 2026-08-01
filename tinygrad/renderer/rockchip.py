@@ -1,8 +1,8 @@
 from __future__ import annotations
-import struct
+import math, struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable
+from typing import Callable, cast
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
@@ -171,13 +171,23 @@ def patch_image(image:RKImage, address:Callable[[RKBufferKind, int], int]) -> tu
 @dataclass(frozen=True)
 class _ALUExpr:
   op: Ops
-  src: tuple[_ALUExpr|RKArg|float, _ALUExpr|RKArg|float]
+  src: tuple[_ALUExpr|_MaskExpr|RKArg|float, _ALUExpr|_MaskExpr|RKArg|float]
 
-def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _ALUExpr|RKArg|float]) -> _ALUExpr|RKArg|float|None:
+@dataclass(frozen=True)
+class _MaskExpr:
+  src: tuple[_ALUExpr|_MaskExpr|RKArg]
+
+_Expr = _ALUExpr|_MaskExpr
+_Value = _Expr|RKArg|float
+
+def _sub(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _ALUExpr:
+  return _ALUExpr(Ops.ADD, (lhs, _ALUExpr(Ops.MUL, (rhs, -1.0))))
+
+def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|RKArg|float|None:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   if u in memo: return memo[u]
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
-    ret:_ALUExpr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
+    ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
   elif u.op is Ops.MUL and any(x.op is Ops.RECIPROCAL for x in u.src):
     reciprocal = next(i for i,x in enumerate(u.src) if x.op is Ops.RECIPROCAL)
@@ -188,6 +198,15 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _ALUExpr|RKArg|float]) ->
     denominator = _parse_alu(u.src[0], output_index, memo)
     if denominator is None: return None
     ret = _ALUExpr(Ops.FDIV, (1.0, denominator))
+  elif u.op is Ops.WHERE and u.src[0].op is Ops.CMPLT:
+    compared = tuple(_parse_alu(x, output_index, memo) for x in u.src[0].src)
+    arms = tuple(_parse_alu(x, output_index, memo) for x in u.src[1:])
+    if any(x is None for x in compared+arms) or any(isinstance(x, float) and not math.isfinite(x) for x in arms): return None
+    lhs, rhs = cast(tuple[_Value, _Value], compared)
+    true, false = cast(tuple[_Value, _Value], arms)
+    mask = _MaskExpr((_sub(rhs, lhs),))
+    ret = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (true, mask)),
+      _ALUExpr(Ops.MUL, (false, _sub(1.0, mask)))))
   elif u.op in _RK_ALU_OPS:
     src = tuple(_parse_alu(x, output_index, memo) for x in u.src)
     if len(src) != 2 or any(x is None for x in src): return None
@@ -207,30 +226,32 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   root = _parse_alu(store.src[1], out_index, {})
   if root is None: return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
-  if not isinstance(root, _ALUExpr): return RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),))
-  order:list[_ALUExpr] = []
-  def visit(expr:_ALUExpr) -> None:
+  if not isinstance(root, (_ALUExpr, _MaskExpr)): return RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),))
+  order:list[_Expr] = []
+  def visit(expr:_Expr) -> None:
     for src in expr.src:
-      if isinstance(src, _ALUExpr) and src not in order: visit(src)
+      if isinstance(src, (_ALUExpr, _MaskExpr)) and src not in order: visit(src)
     if expr not in order: order.append(expr)
   visit(root)
   uses = {expr:sum(src is expr for node in order for src in node.src) for expr in order}
-  values:dict[_ALUExpr, RKArg] = {}
+  values:dict[_Expr, RKArg] = {}
   free:list[int] = []
-  scratch_count, stages = 0, []
+  scratch_count, stages = 0, cast(list[RKDPUStage], [])
   for expr in order:
-    src = tuple(values[x] if isinstance(x, _ALUExpr) else x for x in expr.src)
+    src = tuple(values[x] if isinstance(x, (_ALUExpr, _MaskExpr)) else x for x in expr.src)
     if expr is root: dst = output
-    elif (reuse:=next((values[x] for x in expr.src if isinstance(x, _ALUExpr) and uses[x] == 1 and
-                       values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
+    elif isinstance(expr, _ALUExpr) and (reuse:=next((values[x] for x in expr.src if isinstance(x, (_ALUExpr, _MaskExpr)) and uses[x] == 1 and
+                                                     values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
     else:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    stages.append(RKALUStage(expr.op, dst, src[0], src[1], count))
+    if isinstance(expr, _ALUExpr): stages.append(RKALUStage(expr.op, dst, src[0], src[1], count))
+    elif isinstance(src[0], RKArg): stages.append(RKMaskStage(dst, src[0], count))
+    else: return None
     values[expr] = dst
     for source in expr.src:
-      if isinstance(source, _ALUExpr):
+      if isinstance(source, (_ALUExpr, _MaskExpr)):
         uses[source] -= 1
         arg = values[source]
         if uses[source] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
@@ -245,6 +266,33 @@ _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8),
 def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
 
+def _emit_mask(stage_idx:int, plan:RKMaskStage) -> RKStage:
+  width = (plan.count+7)//8-1
+  regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (rk.REG_DPU_DATA_FORMAT, 0x48000002),
+    (rk.REG_DPU_DATA_CUBE_WIDTH, width), (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0),
+    (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53),
+    (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0), (rk.REG_DPU_BS_OW_CFG, 2),
+    (rk.REG_DPU_WDMA_SIZE_0, 7), (rk.REG_DPU_WDMA_SIZE_1, width), (rk.REG_DPU_BN_MUL_CFG, 0),
+    (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0), (rk.REG_DPU_BS_CFG, 0x40040), (rk.REG_DPU_BS_ALU_CFG, 0x33800000),
+    (rk.REG_DPU_BS_MUL_CFG, 0x40000000), (rk.REG_DPU_BN_CFG, 0x40082), (rk.REG_DPU_BN_MUL_CFG, 0x7c000000),
+    (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0x3f800000), (rk.REG_DPU_EW_CFG, _EW_BASE|1), (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
+    (rk.REG_DPU_OUT_CVT_OFFSET, 0), (rk.REG_DPU_OUT_CVT_SCALE, 0x10001), (rk.REG_DPU_OUT_CVT_SHIFT, 0),
+    (rk.REG_DPU_SURFACE_ADD, 0x40))
+  cmds = [_command(_TARGET_DPU, reg, value) for reg,value in regs]
+  cmds += [_command(_TARGET_DPU_RDMA, reg, value) for reg,value in ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe),
+    (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
+    (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7), (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008))]
+  relocs = []
+  for target_id, reg, arg in ((_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, plan.dst),
+                              (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, plan.src),
+                              (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, plan.src)):
+    cmds.append(_command(target_id, reg, 0))
+    relocs.append(RKReloc(stage_idx, len(cmds)-1, arg.kind, arg.index))
+  cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849), _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
+  reads, writes = ((plan.src.index,) if plan.src.kind is RKBufferKind.ARG else ()), \
+                   ((plan.dst.index,) if plan.dst.kind is RKBufferKind.ARG else ())
+  return RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), reads, writes, (1 << (stage_idx-1)) if stage_idx else 0, RK_STAGE_RESET)
+
 def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   constants, constant_offsets, stages = bytearray(), {}, []
@@ -256,6 +304,9 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       constants.extend(bits * (((count+7)//8)*8))
     return RKArg(RKBufferKind.CONSTANT, constant_offsets[key])
   for stage_idx, plan in enumerate(program.stages):
+    if isinstance(plan, RKMaskStage):
+      stages.append(_emit_mask(stage_idx, plan))
+      continue
     if not isinstance(plan, RKALUStage): raise ValueError(f"unimplemented Rockchip stage {type(plan).__name__}")
     lhs, rhs, width = materialize(plan.lhs, plan.count), materialize(plan.rhs, plan.count), (plan.count+7)//8-1
     cmds = [_command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), _command(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),

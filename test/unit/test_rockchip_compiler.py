@@ -4,7 +4,7 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import RKBufferKind, RKDPUProgram, RockchipRenderer, decode_image, emit_dpu, lower_dpu
+from tinygrad.renderer.rockchip import RKBufferKind, RKDPUProgram, RKMaskStage, RockchipRenderer, decode_image, emit_dpu, lower_dpu
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
 class CaptureRenderer(Renderer):
@@ -53,6 +53,13 @@ class TestDPUCompiler(unittest.TestCase):
     plan = lower_dpu(sink(a/b))
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual(plan.stages[0].op, Ops.FDIV)
+
+  def test_where_uses_generic_mask_stage(self):
+    a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
+    plan = lower_dpu(sink((a<0).where(a, b)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertTrue(any(isinstance(stage, RKMaskStage) for stage in plan.stages))
+    self.assertFalse(contains_uop(plan))
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
