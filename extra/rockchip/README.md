@@ -1,5 +1,10 @@
 # RK3588 fixed-function NPU backend
 
+This branch is frozen as the coverage/research continuation. The merge-oriented
+branch stops after the minimal generic ALU, mask, EXP2, image, runtime, and
+direct-CMAC slice; activation and transcendental assets beyond EXP2 remain here
+for characterization and future model-driven changes.
+
 This branch is the merge-oriented reduction of the `rockchip-2608` research
 backend. It deliberately implements a small FP16 inference contract instead of
 using the full `test_ops.py` inventory as an operator catalog.
@@ -78,9 +83,9 @@ and has no skip on an RK3588 host.
 
 ## Current upstream blocker
 
-The base master contains 24,968 counted lines. This backend branch currently
-contains 26,006, so `MAX_LINE_COUNT=25000 python sz.py` fails by 1,006 lines. The
-handwritten backend is 1,033 counted lines (960 renderer/compiler and 73
+The base master contains 24,968 counted lines. This research branch currently
+contains 26,057, so `MAX_LINE_COUNT=25000 python sz.py` fails by 1,057 lines. The
+handwritten backend is 1,084 counted lines (1,011 renderer/compiler and 73
 runtime). The code must not be hidden under `runtime/autogen` or moved out of
 tree to evade this limit. The generic native-program hook is an independent
 five-line counted change and can be reviewed separately; the backend needs

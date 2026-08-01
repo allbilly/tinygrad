@@ -100,6 +100,14 @@ class TestRockchip(unittest.TestCase):
     invalid = np.array([-300, 300], dtype=np.float16)
     self.assertTrue(np.isnan(Tensor(invalid, device="ROCKCHIP").asin().realize().numpy()).all())
 
+  def test_generated_atanh_assets(self):
+    data = np.linspace(-.9995, .9995, 4097, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").atanh().realize().numpy(),
+                               np.arctanh(data.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    special = np.array([-2, -1, 1, 2, np.nan], dtype=np.float16)
+    with np.errstate(divide="ignore", invalid="ignore"): expected = np.arctanh(special)
+    np.testing.assert_equal(Tensor(special, device="ROCKCHIP").atanh().realize().numpy(), expected)
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)

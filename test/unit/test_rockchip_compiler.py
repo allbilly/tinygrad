@@ -209,6 +209,18 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(plan.stages), 64)
       self.assertFalse(contains_uop(plan))
 
+  def test_atanh_uses_generated_broad_and_edge_assets(self):
+    for name in ("ATANH", "ATANH_EDGE"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_ATANH_SIM_MAX_REL_ERROR, 1e-3)
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).atanh()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.ATANH, rklut.RKLUTId.ATANH_EDGE})
+    self.assertLessEqual(len(plan.stages), 64)
+    self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

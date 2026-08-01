@@ -165,3 +165,12 @@ fifth power, and the generic asymptotic tail `sign(x)*pi/2-1/x`. ASIN, ACOS,
 and ATAN all pass their complete forward-only TestOps methods, including the
 declared invalid-domain and large-magnitude cases. These are LUT asset
 identities consumed by `RKLUTStage`, not target opcodes.
+
+## Inverse hyperbolic tangent
+
+ATANH is recognized from tinygrad's `log((1+x)/(1-x))/2` decomposition. A
+broad Q13 table covers `[-0.875, 0.875]`, the odd fifth-order series handles
+the local interval, and a Q12 edge table is indexed by `1-abs(x)` to retain
+resolution near the singularities. Generic masks turn exact `-1` and `1` into
+signed infinities and values outside the domain into NaN. The complete strict
+forward TestOps method and a dense RK3588 sweep pass without host fallback.

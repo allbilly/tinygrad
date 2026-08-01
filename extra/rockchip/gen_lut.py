@@ -16,6 +16,7 @@ def expm1_value(table:int, index:int) -> int:
   x = (-(512-index)*STEP) if table == 0 else index*STEP
   return max(-32768, min(32767, round(math.expm1(x) / (8 if x >= 0 else 1) * 32768)))
 expm1 = [expm1_value(table, i) for table in range(2) for i in range(SIZE)]
+# WIP rejected on RK3588: a Q16 table of expm1(x)+0.5 restores the offset with enough staged error to regress ELU/SELU.
 EXPM1_LOCAL_SCALE, EXPM1_LOCAL_STEP = 65504.0, 32.0/65504.0
 expm1_local = [max(-32768, min(32767, round(math.expm1((-(512-i)*EXPM1_LOCAL_STEP) if table == 0 else i*EXPM1_LOCAL_STEP) /
   (2 if table else 1) * 131072))) for table in range(2) for i in range(SIZE)]
@@ -44,6 +45,13 @@ acos = [max(-32768, min(32767, round(math.acos((-(512-i)*ASIN_STEP) if table == 
 ATAN_SCALE, ATAN_STEP = 2048.0, 32.0/2048.0
 atan = [max(-32768, min(32767, round(math.atan((-(512-i)*ATAN_STEP) if table == 0 else i*ATAN_STEP) * 16384)))
         for table in range(2) for i in range(SIZE)]
+atanh = [max(-32768, min(32767, round(math.atanh(max(-.875, min(.875,
+  (-(512-i)*ASIN_STEP) if table == 0 else i*ASIN_STEP))) * 8192))) for table in range(2) for i in range(SIZE)]
+atanh_edge = []
+for table in range(2):
+  for i in range(SIZE):
+    distance = abs((-(512-i)*ASIN_LOCAL_STEP) if table == 0 else i*ASIN_LOCAL_STEP)
+    atanh_edge.append(max(-32768, min(32767, round((8 if distance == 0 else math.atanh(1-distance))*4096))))
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -170,6 +178,25 @@ for bits in range(1 << 16):
     got = half(((1-(position-index))*atan[base+index] + (position-index)*atan[base+index+1]) / 16384)
   reference = math.atan(x)
   atan_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
+atanh_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -1 < x < 1: continue
+  if abs(x) < .3:
+    x2, x3 = half(x*x), half(x*half(x*x))
+    got = half(half(x+half(x3/3))+half(half(x3*x2)/5))
+  elif abs(x) > .875:
+    distance = half(1-abs(x))
+    position, base = distance/ASIN_LOCAL_STEP, SIZE
+    index = min(511, max(0, math.floor(position)))
+    got = math.copysign(half(((1-(position-index))*atanh_edge[base+index] +
+      (position-index)*atanh_edge[base+index+1]) / 4096), x)
+  else:
+    position, base = (x/ASIN_STEP+512, 0) if x < 0 else (x/ASIN_STEP, SIZE)
+    index = min(511, max(0, math.floor(position)))
+    got = half(((1-(position-index))*atanh[base+index] + (position-index)*atanh[base+index+1]) / 8192)
+  reference = math.atanh(x)
+  atanh_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -219,7 +246,9 @@ class RKLUTId(IntEnum):
   ASIN_EDGE = 20
   ACOS = 21
   ATAN = 22
-RK_LUT_SCHEMA = 17
+  ATANH = 23
+  ATANH_EDGE = 24
+RK_LUT_SCHEMA = 19
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -323,6 +352,21 @@ RK_LUT_ATAN_VERIFIED_INPUTS = {len(atan_errors)}
 RK_LUT_ATAN_SIM_MAX_ABS_ERROR = {max(x[0] for x in atan_errors)!r}
 RK_LUT_ATAN_SIM_MAX_REL_ERROR = {max(x[1] for x in atan_errors)!r}
 RK_LUT_ATAN = (\n{rows(atan)}\n)
+RK_LUT_ATANH_SHA256 = "{digest(atanh)}"
+RK_LUT_ATANH_DOMAIN = (-0.875, 0.875)
+RK_LUT_ATANH_ENTRIES = {SIZE}
+RK_LUT_ATANH_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_SCALE))[0]}
+RK_LUT_ATANH_MINUS_EXP = 13
+RK_LUT_ATANH_VERIFIED_INPUTS = {len(atanh_errors)}
+RK_LUT_ATANH_SIM_MAX_ABS_ERROR = {max(x[0] for x in atanh_errors)!r}
+RK_LUT_ATANH_SIM_MAX_REL_ERROR = {max(x[1] for x in atanh_errors)!r}
+RK_LUT_ATANH = (\n{rows(atanh)}\n)
+RK_LUT_ATANH_EDGE_SHA256 = "{digest(atanh_edge)}"
+RK_LUT_ATANH_EDGE_DOMAIN = (0.0, 0.125)
+RK_LUT_ATANH_EDGE_ENTRIES = {SIZE}
+RK_LUT_ATANH_EDGE_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_LOCAL_SCALE))[0]}
+RK_LUT_ATANH_EDGE_MINUS_EXP = 12
+RK_LUT_ATANH_EDGE = (\n{rows(atanh_edge)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}
