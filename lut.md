@@ -26,7 +26,7 @@ longer expands the hardware-operation enum or the emitter dispatch surface.
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 22 |
+| Schema | 23 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -144,6 +144,8 @@ ACOS cannot safely reuse ASIN through subtraction from π/2. That first probe co
 The coarse/fine split is at `d=0.003`, while the endpoint region begins at `|x|>0.85`. One offline correction changes the negative bank's shared zero knot from positive-bank half scaling to negative-bank quarter scaling; without it, exactly three dense-sweep values immediately below zero were corrupted by the table discontinuity. The 47-stage, nine-scratch plan passes both the official method and strict 4,097-point domain/special-value hardware test without tolerance changes or host evaluation.
 
 ATAN uses reciprocal folding before two regional assets: `t=|x|` for `|x|<=1`, otherwise `t=1/|x|`. `ATAN = 56` stores direct `atan(t)` over `[0,1]` (SHA256 `e178bdb3306b8d89dbd7eadaaef377321d590e6ed8a0dc092f2c17e4e5460536`). `ATAN_DETAIL = 57` uses its negative bank for amplified `4*atan(t)` near zero and its positive bank for `atan(1/t)/2` in the folded large-input region (SHA256 `03fe0306f38b96b414bc16dc39531b11b3dfe1ac59e18483664ef359ce7bafdf`). As with ACOS, the negative bank's shared zero knot is corrected offline because the positive-bank formula has different scaling there. The 42-stage, eight-scratch program passes the official method and a strict 4,097-point `[-16,16]` hardware sweep.
+
+SIN/COS use four assets: `SIN = 58` (`e5606a81bda56919a107a8a984f26c96aa0ea5de2f3cdcb9d0138f79ae45aded`), `SIN_LOCAL = 59` (`8f6241fde668f1730cfbbcf6e6509bf025d21f516ab31912a242f364e460b793`), `COS = 60` (`18291b5b8a969a5008744a1016cb1972cf9b1ff8ce82a6b4b27a1aefe1ed4bd9`), and `COS_LOCAL = 61` (`c65278716a32ea5ac9b5cf01c1fc55070713f0c816cf3674bc13f42e3162d88a`). Device arithmetic performs split `2*pi` subtraction after native roundoff. COS also preserves `pi/2` as `1.5703125 + residual`; one FP16 constant lost the residual and failed around cosine zero. A final `x*0` term propagates NaN for infinities without a five-stage mask epilogue. The plans are 56/59 stages and seven scratch buffers. SIN passes the official method; COS is proven only for explicit FP16 because the census plugin changes that method to FP32. A uniform 4,097-point sweep exposed three SIN values near `-0.2` just beyond relative tolerance and wider-range reduction error; the committed contract therefore does not claim exhaustive/wide periodic accuracy, and no tolerance was relaxed.
 
 ## Current command contract
 

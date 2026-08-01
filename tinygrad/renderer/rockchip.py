@@ -286,6 +286,35 @@ def _atan_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
      _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (detail, 2.0)), large))))))
   return _DPUExpr(RKDPUOp.SUB, (_DPUExpr(RKDPUOp.MUL, (magnitude, nonnegative)), _DPUExpr(RKDPUOp.MUL, (magnitude, negative))))
 
+def _sin_cos_expr(source:_DPUExpr|RKArg|float, is_cos:bool) -> _DPUExpr:
+  """Cody-Waite FP16 range reduction followed by regional sine/cosine LUTs."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  bounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX,
+    (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (source, -10000.0)), -1.0)), -10000.0)), -1.0))
+  rounded = _round_expr(_DPUExpr(RKDPUOp.MUL, (bounded, 1/(2*math.pi))))
+  reduced:_DPUExpr|RKArg|float = bounded
+  for coefficient in (4.0, 2.0, .25, .03125, 2*math.pi-6.28125):
+    reduced = _DPUExpr(RKDPUOp.SUB, (reduced, _DPUExpr(RKDPUOp.MUL, (rounded, coefficient))))
+  if is_cos:
+    broad, local = _DPUExpr(rklut.RKLUT.COS, (reduced,)), _DPUExpr(rklut.RKLUT.COS_LOCAL, (reduced,))
+    abs_broad = _DPUExpr(RKDPUOp.MAX, (broad, _DPUExpr(RKDPUOp.MUL, (broad, -1.0))))
+    local_inside, near_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(abs_broad, .5))), _DPUExpr(RKDPUOp.SUB, (1.0, positive(abs_broad, .01)))
+    middle, broad_mask = _DPUExpr(RKDPUOp.SUB, (local_inside, near_inside)), _DPUExpr(RKDPUOp.SUB, (1.0, local_inside))
+    abs_reduced = _DPUExpr(RKDPUOp.MAX, (reduced, _DPUExpr(RKDPUOp.MUL, (reduced, -1.0))))
+    near = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.SUB, (1.5703125, abs_reduced)), math.pi/2-1.5703125))
+    normal = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, broad_mask)), _DPUExpr(RKDPUOp.ADD,
+      (_DPUExpr(RKDPUOp.MUL, (near, near_inside)),
+       _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (local, .5)), middle))))))
+  else:
+    broad, local = _DPUExpr(rklut.RKLUT.SIN, (reduced,)), _DPUExpr(rklut.RKLUT.SIN_LOCAL, (_DPUExpr(RKDPUOp.MUL, (reduced, 16.0)),))
+    abs_reduced = _DPUExpr(RKDPUOp.MAX, (reduced, _DPUExpr(RKDPUOp.MUL, (reduced, -1.0))))
+    local_inside, near_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(abs_reduced, .125))), _DPUExpr(RKDPUOp.SUB, (1.0, positive(abs_reduced, .04)))
+    normal = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.SUB, (1.0, local_inside)))),
+      _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (local, .125)),
+      _DPUExpr(RKDPUOp.SUB, (local_inside, near_inside)))), _DPUExpr(RKDPUOp.MUL, (reduced, near_inside))))))
+  return _DPUExpr(RKDPUOp.ADD, (normal, _DPUExpr(RKDPUOp.MUL, (source, 0.0))))
+
 def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -745,6 +774,17 @@ def _canonical_atan(u:UOp) -> UOp|None:
     sum(x.op in (Ops.RECIPROCAL, Ops.FDIV) for x in nodes) == 1 and sum(x.op is Ops.WHERE for x in nodes) == 2 and \
     all(any(x.op is Ops.CONST and math.isclose(float(x.arg), coefficient) for x in nodes) for coefficient in coefficients) else None
 
+def _canonical_sin_cos(u:UOp) -> tuple[UOp,bool]|None:
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.SIN: return None
+  phase = u.src[0]
+  while phase.op is Ops.CAST and phase.dtype in (dtypes.half,dtypes.float): phase = phase.src[0]
+  if phase.op is Ops.INDEX and phase.dtype is dtypes.half: return phase, False
+  indexes = list(dict.fromkeys(x for x in phase.toposort() if x.op is Ops.INDEX))
+  constants = [float(x.arg) for x in phase.toposort() if x.op is Ops.CONST]
+  return (indexes[0], True) if phase.op is Ops.ADD and len(indexes) == 1 and indexes[0].dtype is dtypes.half and \
+    any(math.isclose(x, math.pi/2) for x in constants) and any(math.isclose(x, -1.0) for x in constants) else None
+
 def _canonical_elu(u:UOp) -> tuple[UOp,float,float]|None:
   u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
   indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
@@ -906,6 +946,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(atan, output_index, memo)
     if source is None: return None
     ret = _atan_expr(source)
+  elif (trig:=_canonical_sin_cos(u)) is not None:
+    source = _parse_dpu_expr(trig[0], output_index, memo)
+    if source is None: return None
+    ret = _sin_cos_expr(source, trig[1])
   elif (asin:=_canonical_asin(u)) is not None:
     source = _parse_dpu_expr(asin[0], output_index, memo)
     if source is None: return None
@@ -1278,7 +1322,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (rklut.RKLUT.LOG_LOCAL,"LOG_LOCAL"),(rklut.RKLUT.LOG10,"LOG10"),(rklut.RKLUT.LOG10_LOCAL,"LOG10_LOCAL"),
                        (rklut.RKLUT.ASIN,"ASIN"),(rklut.RKLUT.ASIN_DETAIL,"ASIN_DETAIL"),(rklut.RKLUT.ACOS,"ACOS"),
                        (rklut.RKLUT.ACOS_ENDPOINT,"ACOS_ENDPOINT"),(rklut.RKLUT.ACOS_FINE_ENDPOINT,"ACOS_FINE_ENDPOINT"),
-                       (rklut.RKLUT.ATAN,"ATAN"),(rklut.RKLUT.ATAN_DETAIL,"ATAN_DETAIL"))}}[plan.lut]
+                       (rklut.RKLUT.ATAN,"ATAN"),(rklut.RKLUT.ATAN_DETAIL,"ATAN_DETAIL"),(rklut.RKLUT.SIN,"SIN"),
+                       (rklut.RKLUT.SIN_LOCAL,"SIN_LOCAL"),(rklut.RKLUT.COS,"COS"),(rklut.RKLUT.COS_LOCAL,"COS_LOCAL"))}}[plan.lut]
   post_scale = {rklut.RKLUT.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 rklut.RKLUT.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.lut, 1.0)
   cmds = []

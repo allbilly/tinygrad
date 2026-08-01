@@ -214,4 +214,10 @@ class TestRockchip(unittest.TestCase):
     expected = np.arctan(data.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").atan().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_periodic_sin_cos_luts(self):
+    data = np.random.RandomState(0).uniform(-2, 2, (45,65)).astype(np.float16)
+    for function, reference in ((lambda x:x.sin(), np.sin), (lambda x:x.cos(), np.cos)):
+      expected = reference(data.astype(np.float32)).astype(np.float16)
+      np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

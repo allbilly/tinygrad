@@ -376,6 +376,14 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
+  def test_sin_cos_use_shared_periodic_reduction(self):
+    for function, assets in ((lambda x:x.sin(), (rklut.RKLUT.SIN,rklut.RKLUT.SIN_LOCAL)),
+                             (lambda x:x.cos(), (rklut.RKLUT.COS,rklut.RKLUT.COS_LOCAL))):
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertLess(len(plan.stages), 64)
+      self.assertTrue(all(sum(stage.lut is op for stage in plan.stages) == 1 for op in assets))
+      self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))
