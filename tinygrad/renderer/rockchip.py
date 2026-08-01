@@ -351,6 +351,37 @@ def _canonical_round(u:UOp) -> UOp|None:
   required = {Ops.TRUNC:4, Ops.ADD:4, Ops.MUL:1, Ops.CMPLT:3, Ops.CMPNE:3, Ops.WHERE:3}
   return source if counts == required and all(any(math.isclose(x, value) for x in constants) for value in (-1,-.5,0,.5,1)) else None
 
+def _canonical_relu_difference(u:UOp) -> UOp|None:
+  """Recognize relu(x+0.5)-relu(x-0.5), the stable clip(x+0.5, 0, 1) form."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.ADD: return None
+  def shifted_relu(v:UOp, negated:bool) -> tuple[UOp,float]|None:
+    v = _unwrap_same_cast(v)
+    if negated:
+      if v.op is not Ops.MUL: return None
+      const = next((_unwrap_same_cast(x) for x in v.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      if const is None or float(const.arg) != -1: return None
+      v = _unwrap_same_cast(v.src[0] if _unwrap_same_cast(v.src[1]).key == const.key else v.src[1])
+    if v.op is Ops.WHERE:
+      cond, shifted, zero = (_unwrap_same_cast(x) for x in v.src)
+      if cond.op is not Ops.CMPLT or _unwrap_same_cast(cond.src[0]).op is not Ops.CONST or float(_unwrap_same_cast(cond.src[0]).arg) != 0 or \
+         _unwrap_same_cast(cond.src[1]).key != shifted.key or zero.op is not Ops.CONST or float(zero.arg) != 0: return None
+    elif v.op is Ops.MAX:
+      zero_const = next((_unwrap_same_cast(x) for x in v.src if _unwrap_same_cast(x).op is Ops.CONST and float(_unwrap_same_cast(x).arg) == 0), None)
+      if zero_const is None: return None
+      shifted = _unwrap_same_cast(v.src[0] if _unwrap_same_cast(v.src[1]).key == zero_const.key else v.src[1])
+    else: return None
+    if shifted.op is not Ops.ADD: return None
+    offset = next((_unwrap_same_cast(x) for x in shifted.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    if offset is None: return None
+    base = _unwrap_same_cast(shifted.src[0] if _unwrap_same_cast(shifted.src[1]).key == offset.key else shifted.src[1])
+    return base, float(offset.arg)
+  for positive, negative in (u.src, u.src[::-1]):
+    pos, neg = shifted_relu(positive, False), shifted_relu(negative, True)
+    if pos is not None and neg is not None and pos[0].key == neg[0].key and math.isclose(pos[1], .5) and math.isclose(neg[1], -.5):
+      return pos[0]
+  return None
+
 def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|None:
   """Build an FP16 0/1 predicate from comparisons and boolean composition."""
   u = _unwrap_same_cast(u)
@@ -385,6 +416,11 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(abs_input, output_index, memo)
     if operand is None: return None
     ret = _ALUExpr(Ops.MAX, (operand, _ALUExpr(Ops.MUL, (operand, -1.0))))
+  elif (clamp_base:=_canonical_relu_difference(u)) is not None:
+    base = _parse_alu(clamp_base, output_index, memo)
+    if base is None: return None
+    positive = _ALUExpr(Ops.MAX, (_ALUExpr(Ops.ADD, (base, .5)), 0.0))
+    ret = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (positive, -1.0)), -1.0)), -1.0))
   elif u.op is Ops.MUL and any(x.op is Ops.RECIPROCAL for x in u.src):
     reciprocal = next(i for i,x in enumerate(u.src) if x.op is Ops.RECIPROCAL)
     if _canonical_sigmoid(u.src[reciprocal]) is not None:

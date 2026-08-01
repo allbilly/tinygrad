@@ -45,6 +45,11 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(Tensor(finite, device="ROCKCHIP").maximum(0).realize().numpy(), np.maximum(finite, np.float16(0)))
     np.testing.assert_equal(Tensor(finite, device="ROCKCHIP").sign().realize().numpy(), np.sign(finite))
 
+  def test_stable_hardsigmoid_saturation(self):
+    data = np.concatenate((np.linspace(-400,-300,1001), np.linspace(300,400,1001))).astype(np.float16)
+    expected = np.concatenate((np.zeros(1001,np.float16), np.ones(1001,np.float16)))
+    np.testing.assert_equal(Tensor(data, device="ROCKCHIP").hardsigmoid().realize().numpy(), expected)
+
   def test_generated_exp2_lut(self):
     encodings = np.arange(1 << 16, dtype=np.uint16)
     data = encodings.view(np.float16)

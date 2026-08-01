@@ -81,6 +81,13 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertFalse(contains_uop(plan))
     self.assertEqual(lower_dpu(sink(x.relu())).stages[0].op, Ops.MAX)
 
+  def test_relu_difference_uses_stable_generic_clip(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).hardsigmoid()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertLessEqual(len(plan.stages), 6)
+    self.assertTrue(any(isinstance(stage, RKALUStage) and stage.op is Ops.MAX for stage in plan.stages))
+    self.assertFalse(contains_uop(plan))
+
   def test_composed_fp16_predicates_preserve_mask_liveness(self):
     x = Tensor.empty(3,dtype=dtypes.half)
     sign, clipped = lower_dpu(sink(x.sign())), lower_dpu(sink(x.clip(0, 0)))
