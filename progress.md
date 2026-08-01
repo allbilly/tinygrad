@@ -106,7 +106,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `b5a71b29f` | FP16 SIN/COS regional LUTs with split periodic reduction | `0206-rockchip-add-FP16-SIN-COS-LUTs.patch` |
 | `76e4131f1` | Bounded broad/detail ATANH with device special-value handling | `0207-rockchip-add-bounded-ATANH-LUTs.patch` |
 | `3b51f1b65` | Ranged two-table FP16 ASINH | `0208-rockchip-add-ranged-ASINH-LUTs.patch` |
-| current milestone | Endpoint-aware two-table FP16 ACOSH | `0209-rockchip-add-endpoint-ACOSH-LUTs.patch` |
+| `2da53e486` | Endpoint-aware two-table FP16 ACOSH | `0209-rockchip-add-endpoint-ACOSH-LUTs.patch` |
+| current milestone | Preserve and characterize rejected native TAN designs | `0210-rockchip-record-native-TAN-limits.patch` |
 
 ## Architecture now implemented
 
@@ -248,6 +249,9 @@ Recent precision probes that must not be rediscovered as final fixes:
 
 - DPU `out_precision=0` int8 output from the proven FP16 mask task timed out with both eight-lane and 16-lane WDMA/data-cube layouts. The TRM advertises int8 output, but FP16-to-int8 conversion is not yet a proven byte-wide bool ABI; do not enable it from the format field alone.
 - Arbitrary scaled LOG2 made atanh compile in 61 stages, but the `(1+x)/(1-x)` ratio reaches 199 and saturated above 4. Symmetric `>4`/`>64` power-of-16 normalization fixed the range but expanded direct log/atanh to 69/73 stages, beyond RKImage's 64-bit dependency contract. Fuse stages or introduce a justified wide-domain asset; do not relax the image invariant.
+- Frozen `rockchip-2607` does not provide a native TAN oracle: its final path is `_run_host_tan`, which calls NumPy. The clean shared SIN/COS quotient first required 78 stages; common reduction and hierarchical selection reached 60 stages but still missed 73/2,925 values at strict tolerance because the two LUT results round independently.
+- A two-task `TAN_CORE`/`TAN_EDGE` regional design reached 64 stages and reduced the first `[-1.5,1.5]` method to five boundary misses. Amplified signed pole-distance variants passed that first method, but the `[-5,5]` method retained 18–22 near-pole misses; storing the reduced angle in FP16 loses the distance to odd multiples of `pi/2`.
+- A stable `d/tan(d)` correction avoids table quantization at the reciprocal pole, but direct pole-distance reduction made 752/2,925 strict misses away from poles, and combining it with the regional core reached 65 stages before optimization and remained inaccurate. The complete experimental diff is preserved at `/home/orangepi/tinygrad/tan-native-wip-20260801.patch`; no failed TAN path is enabled in the green branch.
 
 - `hardswish` baseline (`(x*clamp)*half(1/6)`) mismatched 34/2925 values;
 - one-task BS pre-scaling reduced that to 9/2925, but still missed the official tolerance;

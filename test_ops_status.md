@@ -181,6 +181,11 @@ device-native bool/int representation:
 - reject dynamic casts until packing is proven, as native int32 WDMA consumes
   eight FP16 lanes while producing four int32 lanes.
 
+TAN is explicitly not in this category. The frozen branch computes it on the
+host; clean native two-table experiments fit the image limit but fail strict
+near-pole accuracy after FP16 range reduction. The retained WIP patch documents
+the measured 78/60-stage SIN-COS quotient and 64-stage regional designs.
+
 Two direct hardware probes of DPU FP16-mask to int8 output timed out: one kept
 the proven eight-lane cube/WDMA geometry, and one used a 16-lane int8 atom.
 Therefore byte-wide bool output remains an honest unimplemented boundary; the
