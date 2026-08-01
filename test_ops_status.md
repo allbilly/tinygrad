@@ -191,16 +191,20 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - windowed NCHW pooling and unsupported PPU kernel shapes;
 - generic unsupported `Ops.*` graphs.
 
-## Next low-hanging group
+## Research freeze and next direction
 
-Native round-to-nearest-even, trunc, floor, ceil, IEEE predicates, mixed-dtype
-comparisons/extrema, bool logical-not, constant-arm int32 WHERE, and square int32 transpose are implemented
-without host semantic evaluation. The next low-hanging boundary is dynamic int32 data flow:
+The coverage branch is frozen at `815003d78`. Native round-to-nearest-even,
+trunc, floor, ceil, IEEE predicates, mixed-dtype comparisons/extrema, bool
+logical-not, constant-arm int32 WHERE, square int32 transpose, and typed casts
+are retained here as hardware research. They are not the contract of the first
+upstream-oriented branch.
 
-- consume and reproduce exact int32 byte planes for dynamic WHERE arms and non-square movement;
-- reuse those typed boundaries for `maximum`/`minimum`, `*_like`, and further integer variants;
-- reject dynamic casts until packing is proven, as native int32 WDMA consumes
-  eight FP16 lanes while producing four int32 lanes.
+Further raw TestOps recovery on this branch would next require dynamic int32
+data flow and general movement, but that work is intentionally deferred. The
+merge-oriented rewrite starts from current master with only contiguous FP16
+arithmetic, mask/WHERE, one generic LUT stage and EXP2, plus a useful direct
+contraction only if its layout contract remains small. FP32/int/bool ABI
+experiments and the activation catalog remain on this frozen branch.
 
 TAN is explicitly not in this category. The frozen branch computes it on the
 host; clean native two-table experiments fit the image limit but fail strict

@@ -28,7 +28,8 @@ as full TestOps completion.
 - Oracle branch: `rockchip-2607`
 - Frozen oracle tag: `rockchip-2607-frozen-20260801`
 - Frozen oracle commit: `51b4f919e`
-- Clean branch: `rockchip-2608`
+- Frozen research branch: `rockchip-2608`
+- Research freeze commit: `815003d78` (`rockchip: add typed cast ABIs`)
 - Clean worktree: `/home/orangepi/rk_2608`
 - Clean base: `277433259eb71b5fc3d6d5cc33c5a1be1458e9fa` (`master` and `upstream/master` when the branch was created)
 - Python environment: `. /home/orangepi/tinygrad/.venv/bin/activate`
@@ -119,7 +120,7 @@ The 425-method census remains informational and must not dictate that upstream I
 | `4d07592d6` | Signed infinite-numerator division | `0219-rockchip-preserve-infinite-division-sign.patch` |
 | `751a108e2` | Prefix-repeat broadcast and exact copysign sign ABI | `0220-rockchip-add-prefix-broadcast-and-exact-copysign.patch` |
 | `a1c1f32ea` | Exact 167-pass TestOps census | `0221-rockchip-record-167-pass-TestOps-census.patch` |
-| current milestone | Typed FP16/int32/bool cast ABIs | `0222-rockchip-add-typed-cast-ABIs.patch` |
+| `815003d78` | Typed FP16/int32/bool cast ABIs | `0222-rockchip-add-typed-cast-ABIs.patch` |
 
 ## Architecture now implemented
 
