@@ -2,7 +2,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable
+from typing import Callable, cast
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
@@ -209,6 +209,19 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     operand = _parse_dpu_expr(u.src[0], output_index, memo)
     if operand is None: return None
     ret = _DPUExpr(RKDPUOp.EXP2, (operand,))
+  elif u.op is Ops.WHERE and (cond:=_unwrap_same_cast(u.src[0])).op is Ops.CMPLT:
+    lhs_u, rhs_u = (_unwrap_same_cast(x) for x in cond.src)
+    true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
+    ordered_max = true_u.key == rhs_u.key and false_u.key == lhs_u.key
+    ordered_min = true_u.key == lhs_u.key and false_u.key == rhs_u.key
+    if not ordered_max and not ordered_min: return None
+    parsed = tuple(_parse_dpu_expr(x, output_index, memo) for x in (lhs_u, rhs_u))
+    if any(x is None for x in parsed): return None
+    operands = cast(tuple[_DPUExpr|RKArg|float, ...], parsed)
+    if ordered_max: ret = _DPUExpr(RKDPUOp.MAX, operands)
+    else:
+      negative = tuple(_DPUExpr(RKDPUOp.MUL, (x, -1.0)) for x in operands)
+      ret = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, negative), -1.0))
   else: return None
   memo[u] = ret
   return ret

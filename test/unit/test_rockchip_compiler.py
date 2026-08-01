@@ -103,6 +103,14 @@ class TestDPUCompiler(unittest.TestCase):
     x, y = Tensor.empty(16,dtype=dtypes.float), Tensor.empty(16,dtype=dtypes.float)
     self.assertIsNone(lower_dpu(sink(x+y)))
 
+  def test_ordered_where_normalizes_to_dpu_extrema(self):
+    x = Tensor.empty(16,dtype=dtypes.half)
+    for expression in (x.relu(), x.clip(-1, 1)):
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertFalse(contains_uop(plan))
+    self.assertEqual(lower_dpu(sink(x.relu())).stages[0].op.name, "MAX")
+
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     plan = lower_contract(sink(a@packed_b.T))
