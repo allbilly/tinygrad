@@ -443,6 +443,28 @@ def _cosh_expr(source:_Expr|RKArg) -> _Expr:
   overflow = _ALUExpr(Ops.MAX, (positive(source, 11.78), positive(-11.78, source)))
   return _ALUExpr(Ops.FDIV, (_LUTExpr(RKLUTId.COSH, (bounded,)), _sub(1.0, overflow)))
 
+def _erf_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  local_source = clamp(source, .05)
+  square = _ALUExpr(Ops.MUL, (local_source, local_source))
+  cube = _ALUExpr(Ops.MUL, (local_source, square))
+  series = _ALUExpr(Ops.ADD, (_sub(local_source, _ALUExpr(Ops.MUL, (cube, 1/3))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (cube, square)), 1/10))))
+  local = _ALUExpr(Ops.MUL, (series, 2/math.sqrt(math.pi)))
+  polynomial_inside = _ALUExpr(Ops.MUL, (positive(source, -.05), positive(.05, source)))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.25), positive(.25, source)))
+  # Q16 LUT conversion is undefined for its near-zero payload on DPU; that result is eagerly evaluated even when masked.
+  # Move only the polynomial-selected input away from zero, where the LUT result is dead, without changing the live LUT domain.
+  safe_local_source = _ALUExpr(Ops.ADD, (source, _ALUExpr(Ops.MUL, (polynomial_inside, .125))))
+  broad, local_table = _LUTExpr(RKLUTId.ERF, (clamp(source, 2.0),)), _LUTExpr(RKLUTId.ERF_LOCAL, (clamp(safe_local_source, .25),))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.ADD,
+    (_ALUExpr(Ops.MUL, (local_table, _sub(local_inside, polynomial_inside))), _ALUExpr(Ops.MUL, (local, polynomial_inside))))))
+  high, low = positive(source, 2.0), positive(-2.0, source)
+  return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (selected, _sub(1.0, _ALUExpr(Ops.MAX, (high, low))))), _sub(high, low)))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -687,6 +709,15 @@ def _canonical_hyperbolic(u:UOp) -> tuple[UOp,bool]|None:
   signatures = {(lhs[1],lhs[2]), (rhs[1],rhs[2])}
   return (lhs[0], True) if signatures == {(1,1),(-1,-1)} else (lhs[0], False) if signatures == {(1,1),(1,-1)} else None
 
+def _canonical_erf(u:UOp) -> UOp|None:
+  """Recognize tinygrad's Abramowitz-Stegun erf expansion."""
+  nodes = _unwrap_same_cast(u).toposort()
+  indexes = [x for x in nodes if x.op is Ops.INDEX and x.dtype is dtypes.half]
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  coefficients = (0.3275911, 1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592)
+  return indexes[0] if len(indexes) == 1 and any(x.op is Ops.EXP2 for x in nodes) and \
+    all(any(math.isclose(x, value) for x in constants) for value in coefficients) else None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -754,6 +785,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(hyperbolic[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _sinh_expr(operand) if hyperbolic[1] else _cosh_expr(operand)
+  elif (erf_input:=_canonical_erf(u)) is not None:
+    operand = _parse_alu(erf_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _erf_expr(operand)
   elif (tanh_input:=_canonical_tanh(u)) is not None:
     operand = _parse_alu(tanh_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -1082,7 +1117,7 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.ASIN, RKLUTId.ASIN_LOCAL, RKLUTId.ASIN_EDGE, RKLUTId.ACOS, RKLUTId.ATAN,
                       RKLUTId.ATANH, RKLUTId.ATANH_EDGE, RKLUTId.ASINH, RKLUTId.ASINH_MID,
                       RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR,
-                      RKLUTId.SINH, RKLUTId.COSH):
+                      RKLUTId.SINH, RKLUTId.COSH, RKLUTId.ERF, RKLUTId.ERF_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

@@ -200,3 +200,22 @@ uses its odd fifth-order series near zero to avoid relative-error amplification.
 Generic masks and division create the signed or positive overflow tails on the
 NPU. The simulator exhaustively covers the declared FP16 range, while hardware
 tests add magnitude-300 overflow cases.
+
+## Error function
+
+The compiler recognizes tinygrad's Abramowitz-Stegun ERF expansion before its
+polynomial and EXP graph exceeds the image stage limit. A generated Q15 table
+covers `[-2, 2]`, a Q16 table covers `[-0.25, 0.25]`, and the odd fifth-order
+Maclaurin series handles the immediate near-zero range. Generic masks saturate
+finite tails to `-1` or `1`. The offline
+simulator exhaustively checks the declared FP16 domain and the RK3588 suite
+adds magnitude-300 saturation inputs.
+
+The local Q16 LUT produces an undefined conversion result for its smallest
+near-zero payload on RK3588. DPU stages are eager, so multiplying that dead
+result by a zero selection mask still contaminates the final value. The
+lowerer therefore shifts only the polynomial-selected local-LUT input away
+from zero; that LUT output is dead by construction, while every live local-LUT
+input and the near-zero polynomial remain unchanged. This is preferable to a
+tolerance exception because exact zero and the complete dense hardware sweep
+then follow the intended numerical path.

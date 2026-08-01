@@ -72,6 +72,10 @@ sinh_lut = [max(-32768, min(32767, round(math.sinh(signed_sample(table, i, STEP)
             for table in range(2) for i in range(SIZE)]
 cosh_lut = [max(-32768, min(32767, round(math.cosh(signed_sample(table, i, STEP))*8192)))
             for table in range(2) for i in range(SIZE)]
+erf_lut = [max(-32768, min(32767, round(math.erf(signed_sample(table, i, STEP))*32768))) or 1
+           for table in range(2) for i in range(SIZE)]
+erf_local = [max(-32768, min(32767, round(math.erf(signed_sample(table, i, ASIN_LOCAL_STEP))*65536))) or 1
+             for table in range(2) for i in range(SIZE)]
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -253,6 +257,17 @@ for bits in range(1 << 16):
   sinh_reference, cosh_reference = math.sinh(x), math.cosh(x)
   sinh_errors.append((abs(sinh_got-sinh_reference), abs(sinh_got-sinh_reference)/max(abs(sinh_reference), 2**-24)))
   cosh_errors.append((abs(cosh_got-cosh_reference), abs(cosh_got-cosh_reference)/cosh_reference))
+erf_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 2: continue
+  if abs(x) < .05:
+    x2, x3 = half(x*x), half(x*half(x*x))
+    got = half(half(half(x-half(x3/3))+half(half(x3*x2)/10))*(2/math.sqrt(math.pi)))
+  elif abs(x) < .25: got = interpolate(erf_local, ASIN_LOCAL_STEP, 65536, x)
+  else: got = interpolate(erf_lut, STEP, 32768, x)
+  reference = math.erf(x)
+  erf_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -312,7 +327,9 @@ class RKLUTId(IntEnum):
   ASINH_NEAR = 30
   SINH = 31
   COSH = 32
-RK_LUT_SCHEMA = 27
+  ERF = 33
+  ERF_LOCAL = 34
+RK_LUT_SCHEMA = 29
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -491,6 +508,21 @@ RK_LUT_COSH_VERIFIED_INPUTS = {len(cosh_errors)}
 RK_LUT_COSH_SIM_MAX_ABS_ERROR = {max(x[0] for x in cosh_errors)!r}
 RK_LUT_COSH_SIM_MAX_REL_ERROR = {max(x[1] for x in cosh_errors)!r}
 RK_LUT_COSH = (\n{rows(cosh_lut)}\n)
+RK_LUT_ERF_SHA256 = "{digest(erf_lut)}"
+RK_LUT_ERF_DOMAIN = (-2.0, 2.0)
+RK_LUT_ERF_ENTRIES = {SIZE}
+RK_LUT_ERF_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
+RK_LUT_ERF_MINUS_EXP = 15
+RK_LUT_ERF_VERIFIED_INPUTS = {len(erf_errors)}
+RK_LUT_ERF_SIM_MAX_ABS_ERROR = {max(x[0] for x in erf_errors)!r}
+RK_LUT_ERF_SIM_MAX_REL_ERROR = {max(x[1] for x in erf_errors)!r}
+RK_LUT_ERF = (\n{rows(erf_lut)}\n)
+RK_LUT_ERF_LOCAL_SHA256 = "{digest(erf_local)}"
+RK_LUT_ERF_LOCAL_DOMAIN = (-0.25, 0.25)
+RK_LUT_ERF_LOCAL_ENTRIES = {SIZE}
+RK_LUT_ERF_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_LOCAL_SCALE))[0]}
+RK_LUT_ERF_LOCAL_MINUS_EXP = 16
+RK_LUT_ERF_LOCAL = (\n{rows(erf_local)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

@@ -1,4 +1,4 @@
-import os, unittest
+import math, os, unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
 
@@ -127,6 +127,13 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(over="ignore"): sinh_expected, cosh_expected = np.sinh(extreme), np.cosh(extreme)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").sinh().realize().numpy(), sinh_expected)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").cosh().realize().numpy(), cosh_expected)
+
+  def test_generated_erf_asset(self):
+    data = np.linspace(-2, 2, 4097, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").erf().realize().numpy(),
+                               np.vectorize(math.erf)(data.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    extreme = np.array([-300, 300], dtype=np.float16)
+    np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").erf().realize().numpy(), np.array([-1, 1], dtype=np.float16))
 
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)

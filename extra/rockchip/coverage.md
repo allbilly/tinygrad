@@ -186,6 +186,29 @@ was 372.28 seconds. The exact two-method gain is `test_sinh` and `test_cosh`;
 recognition of their shared two-EXP decomposition replaces oversized plans
 with generated math assets and generic overflow repair.
 
+At the generated two-level ERF milestone, the uncached 2026-08-02 census
+completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 134 |
+| FAIL | 278 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 404 failures including the same 126 failing subtests. Runtime
+was 388.00 seconds. The exact one-method gain is `test_erf`; its broad Q15 and
+local Q16 generated assets plus a generic near-zero polynomial fit in 50 typed
+stages and execute entirely on the NPU.
+
+Hardware jobs must remain serial. A long-running pytest invocation may return
+a terminal session id before it finishes; poll that same session rather than
+starting another device command. Overlapping two RKNN submitters produced a
+temporary cascade of `EINVAL` submits and repeated kernel soft resets during
+this milestone. Killing the accidentally overlapping process restored normal
+operation without a reboot. This is a test-orchestration failure signature,
+not a numerical or compiler failure.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -204,14 +227,15 @@ with generated math assets and generic overflow repair.
 | Generated SQRT seed with three generic Newton refinements | `test_sqrt` | Yes (`9db9a4d33`) |
 | Range-scaled generated RSQRT seed with generic Newton correction | `test_rsqrt` | Yes (`9db9a4d33`) |
 | Range-normalized generated logarithm tables | `test_log2`, `test_log10` | Yes (`9db9a4d33`) |
-| Stable generic clip for ReLU-difference saturation | `test_hardsigmoid_extreme` | No |
-| Scaled-input reuse of the generated sigmoid LUT | `test_quick_gelu_extreme` | No |
-| Generated tanh ranges with a stable local polynomial | `test_tanh`, `test_tanh_extreme` | No |
+| Stable generic clip for ReLU-difference saturation | `test_hardsigmoid_extreme` | Yes |
+| Scaled-input reuse of the generated sigmoid LUT | `test_quick_gelu_extreme` | Yes |
+| Generated tanh ranges with a stable local polynomial | `test_tanh`, `test_tanh_extreme` | Yes |
 | Generated inverse-trigonometric tables and local/tail arithmetic | `test_asin`, `test_acos`, `test_atan` | Yes |
 | Generic dynamic LOG2 multiplication and compact nested EXP2 special values | `test_exp2_log2_zero_times_negative` | Yes |
 | Generated ATANH broad/edge tables with generic local arithmetic | `test_atanh` | Yes (research branch only) |
 | Generated multirange inverse-hyperbolic tables and local arithmetic | `test_asinh`, `test_acosh` | Yes (research branch only) |
 | Generated hyperbolic tables and generic overflow repair | `test_sinh`, `test_cosh` | Yes (research branch only) |
+| Generated two-level ERF tables and generic local polynomial | `test_erf` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
