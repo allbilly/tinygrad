@@ -179,6 +179,15 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _ALUExpr|RKArg|float]) ->
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_ALUExpr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif u.op is Ops.MUL and any(x.op is Ops.RECIPROCAL for x in u.src):
+    reciprocal = next(i for i,x in enumerate(u.src) if x.op is Ops.RECIPROCAL)
+    div_src = (_parse_alu(u.src[1-reciprocal], output_index, memo), _parse_alu(u.src[reciprocal].src[0], output_index, memo))
+    if any(x is None for x in div_src): return None
+    ret = _ALUExpr(Ops.FDIV, div_src)  # type: ignore[arg-type]
+  elif u.op is Ops.RECIPROCAL:
+    denominator = _parse_alu(u.src[0], output_index, memo)
+    if denominator is None: return None
+    ret = _ALUExpr(Ops.FDIV, (1.0, denominator))
   elif u.op in _RK_ALU_OPS:
     src = tuple(_parse_alu(x, output_index, memo) for x in u.src)
     if len(src) != 2 or any(x is None for x in src): return None
