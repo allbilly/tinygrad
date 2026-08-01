@@ -211,6 +211,29 @@ def _erf_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   tail = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB, (high, low)), outside))
   return _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (interior, inside)), tail))
 
+def _asin_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  """Two-task asin: broad interior plus one detail LUT for center and singular endpoints."""
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  negative_source = _DPUExpr(RKDPUOp.MUL, (source, -1.0))
+  magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative_source))
+  bounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (magnitude, -1.0)), -1.0)), -1.0))
+  negative, invalid = positive(0.0, source), positive(magnitude, 1.0)
+  positive_sign = _DPUExpr(RKDPUOp.SUB, (1.0, negative))
+  endpoint, near_outside, local_outside = (positive(bounded, x) for x in (.875, .04, .125))
+  near_inside, local_inside = (_DPUExpr(RKDPUOp.SUB, (1.0, x)) for x in (near_outside, local_outside))
+  local_mask, middle_mask = (_DPUExpr(RKDPUOp.SUB, x) for x in ((local_inside, near_inside), (local_outside, endpoint)))
+  detail_input = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (bounded, -1.0)), local_inside)),
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB, (1.0, bounded)), endpoint))))
+  broad, detail = _DPUExpr(rklut.RKLUT.ASIN, (bounded,)), _DPUExpr(rklut.RKLUT.ASIN_DETAIL, (detail_input,))
+  absolute = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (broad, 2.0)), middle_mask)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (detail, .25)), local_mask)))), _DPUExpr(RKDPUOp.ADD,
+    (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (detail, 2.0)), endpoint)), _DPUExpr(RKDPUOp.MUL, (bounded, near_inside))))))
+  signed = _DPUExpr(RKDPUOp.SUB, (_DPUExpr(RKDPUOp.MUL, (absolute, positive_sign)), _DPUExpr(RKDPUOp.MUL, (absolute, negative))))
+  valid = _DPUExpr(RKDPUOp.SUB, (1.0, invalid))
+  return _DPUExpr(RKDPUOp.MUL, (signed, _DPUExpr(RKDPUOp.DIV, (valid, valid))))
+
 def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
@@ -634,6 +657,17 @@ def _canonical_erf(u:UOp) -> UOp|None:
   return indexes[0] if len(indexes) == 1 and indexes[0].dtype is dtypes.half and sum(x.op is Ops.EXP2 for x in nodes) == 1 and \
     sum(x.op is Ops.WHERE for x in nodes) == 2 and any(math.isclose(x, 0.3275911) for x in constants) else None
 
+def _canonical_asin(u:UOp) -> UOp|None:
+  """Recognize tinygrad's asin polynomial; ACOS deliberately remains separate."""
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  coefficients = (-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810,
+                  -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050)
+  allowed = {Ops.ADD, Ops.MUL, Ops.SQRT, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.INDEX, Ops.PARAM, Ops.RANGE, Ops.CONST}
+  return indexes[0] if u.op is Ops.MUL and len(indexes) == 1 and indexes[0].dtype is dtypes.half and \
+    all(x.op in allowed for x in nodes) and sum(x.op is Ops.SQRT for x in nodes) == 1 and sum(x.op is Ops.WHERE for x in nodes) == 2 and \
+    all(any(x.op is Ops.CONST and math.isclose(float(x.arg), coefficient) for x in nodes) for coefficient in coefficients) else None
+
 def _canonical_elu(u:UOp) -> tuple[UOp,float,float]|None:
   u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
   indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
@@ -791,6 +825,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(erf, output_index, memo)
     if source is None: return None
     ret = _erf_expr(source)
+  elif (asin:=_canonical_asin(u)) is not None:
+    source = _parse_dpu_expr(asin, output_index, memo)
+    if source is None: return None
+    ret = _asin_expr(source)
   elif (celu:=_canonical_celu(u)) is not None:
     source = _parse_dpu_expr(celu[0], output_index, memo)
     if source is None: return None
@@ -1155,7 +1193,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (rklut.RKLUT.CELU2,"CELU2"),(rklut.RKLUT.CELU2_LOCAL,"CELU2_LOCAL"),(rklut.RKLUT.CELU3,"CELU3"),
                        (rklut.RKLUT.CELU3_LOCAL,"CELU3_LOCAL"),(rklut.RKLUT.CELU4,"CELU4"),(rklut.RKLUT.CELU4_LOCAL,"CELU4_LOCAL"),
                        (rklut.RKLUT.LOG2,"LOG2"),(rklut.RKLUT.LOG2_LOCAL,"LOG2_LOCAL"),(rklut.RKLUT.LOG,"LOG"),
-                       (rklut.RKLUT.LOG_LOCAL,"LOG_LOCAL"),(rklut.RKLUT.LOG10,"LOG10"),(rklut.RKLUT.LOG10_LOCAL,"LOG10_LOCAL"))}}[plan.lut]
+                       (rklut.RKLUT.LOG_LOCAL,"LOG_LOCAL"),(rklut.RKLUT.LOG10,"LOG10"),(rklut.RKLUT.LOG10_LOCAL,"LOG10_LOCAL"),
+                       (rklut.RKLUT.ASIN,"ASIN"),(rklut.RKLUT.ASIN_DETAIL,"ASIN_DETAIL"))}}[plan.lut]
   post_scale = {rklut.RKLUT.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 rklut.RKLUT.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.lut, 1.0)
   cmds = []

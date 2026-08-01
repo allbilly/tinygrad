@@ -26,7 +26,7 @@ longer expands the hardware-operation enum or the emitter dispatch surface.
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 19 |
+| Schema | 20 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -125,6 +125,15 @@ Logarithms use scale-specific broad/local pairs: `LOG2 = 44/45`, natural `LOG = 
 Half inputs use 57 stages and eight reusable scratch buffers. FP32 natural-log inputs use a declared two-plane ABI representation: the runtime encodes `hi=fp16(x)` and `lo=fp16(x-hi)` into atom-aligned planes, the NPU adds the first-order `lo/hi` correction, and the NPU writes an FP16 result that the runtime widens to FP32. These are element-format encode/decode operations only; logarithm evaluation, range selection, correction, and IEEE zero/infinity/NaN semantics remain NPU tasks. The FP32 plan has 61 stages. All three official methods pass at their unchanged `rtol=1e-3`; the supplemental geometric `[2^-10,4]` characterization uses the measured `rtol=1.1e-3` envelope (observed maximum `0.001038`). A rejected `+16` Q14 correction at broad LO knots 295/296/311/312 fixed the two normalized low-input misses but regressed four direct positive inputs, so it is not part of the generated artifact.
 
 Round-to-nearest-even uses `ROUNDOFF = 50`, the RK3588 algorithm-23 index mode rather than an ordinary function-sampled table. Both 513-entry banks alternate between `0` and Q14 `1`; the emitter uses index selector 14, the `0x44000000..0x44800000` endpoint contract, and the proven LE slope scale/shift `23107/22`. NPU arithmetic forms `abs(x)`, the LUT rounds its magnitude, and masks restore sign, signed infinities, and NaN. The 20-stage, six-scratch plan passes the full official method and an exact 4,097-point `[-16,16]` sweep plus half ties, infinities, signed zero, and NaN. Truncation reuses that result and subtracts/adds one only when the rounded value crossed zeroward; tinygrad's floor and ceil WHERE graphs then compose from truncation and the same primitive masks. All three official methods and dense sweeps pass. The rejected standalone `CVT_ROUND` int32 probe remains documented but is unnecessary.
+
+ASIN uses two ordinary NPU LUT tasks selected and composed entirely with typed DPU arithmetic:
+
+- `ASIN = 51` stores `0.5*asin(x)` over `[0,1]` at index scale 16,384 and Q15 output; SHA256 `e3bfd3ca769499c1818f3d05f5536a371cf06ef96d855d4d338f8dea96ee5ec9`;
+- `ASIN_DETAIL = 52` uses the LE bank for `4*asin(abs(x))` near zero and the LO bank for `0.5*asin(1-x)` near the endpoint, at index scale 65,504 and Q15 output; SHA256 `6b2daeebe2393a0a0e4ddd6f298458a9cc50d0db6dae9b662c4d56813e16bf5d`;
+- masks select identity inside `|x|<=0.04`, the detail center through `0.125`, broad interpolation through `0.875`, then endpoint-distance detail through one;
+- sign and invalid-domain NaN are reconstructed on the NPU; no host semantic path is used.
+
+The complete expression is 43 stages with eight scratch buffers and one instance of each asset. It passes the official ASIN method and strict FP16 comparison over a 4,097-point `[-1,1]` sweep plus `[-2,-1,-0,+0,+1,+2,nan]`. ACOS deliberately remains separate because subtraction from π/2 creates a different cancellation-sensitive endpoint contract.
 
 ## Current command contract
 

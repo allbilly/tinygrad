@@ -347,6 +347,15 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(sum(stage.lut is rklut.RKLUT.ROUNDOFF for stage in plan.stages), 1)
       self.assertFalse(contains_uop(plan))
 
+  def test_asin_uses_two_generated_lut_assets(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).asin()))
+    self.assertLess(len(plan.stages), 64)
+    self.assertTrue(all(sum(stage.lut is op for stage in plan.stages) == 1 for op in (rklut.RKLUT.ASIN, rklut.RKLUT.ASIN_DETAIL)))
+    for name in ("ASIN", "ASIN_DETAIL"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))
