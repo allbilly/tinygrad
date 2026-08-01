@@ -16,6 +16,11 @@ extra/rockchip/gen_lut.py
 
 This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps runtime execution deterministic.
 
+LUT identity is data, not a DPU opcode. `RKDPUOp` has one generic `LUT` stage;
+its typed plan carries an `RKLUT` identifier that selects immutable payload,
+scale, shift, and special algorithm metadata. Adding a generated table no
+longer expands the hardware-operation enum or the emitter dispatch surface.
+
 ## Current generated artifacts
 
 | Field | Value |

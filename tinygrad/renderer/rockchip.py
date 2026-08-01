@@ -31,58 +31,9 @@ class RKDPUOp(IntEnum):
   MUL = 2
   MAX = 3
   SUB = 4
-  EXP2 = 5
-  MASK = 6
-  DIV = 7
-  HARDSWISH = 8
-  HARDSWISH_LOCAL = 9
-  TANH = 10
-  TANH_LOCAL = 11
-  SIGMOID = 12
-  SIGMOID_LOCAL = 13
-  QUICK_GELU = 14
-  QUICK_GELU_LOCAL = 15
-  GELU_TANH = 16
-  GELU_TANH_LOCAL = 17
-  GELU_EXACT = 18
-  GELU_EXACT_LOCAL = 19
-  ERF = 20
-  ERF_LOCAL = 21
-  ELU1 = 22
-  ELU1_LOCAL = 23
-  ELU01 = 24
-  ELU01_LOCAL = 25
-  SELU = 26
-  SELU_LOCAL = 27
-  MISH = 28
-  MISH_LOCAL = 29
-  LOGSIGMOID = 30
-  LOGSIGMOID_TAIL = 31
-  SOFTPLUS1 = 32
-  SOFTPLUS1_TAIL = 33
-  SOFTPLUS3 = 34
-  SOFTPLUS3_TAIL = 35
-  SOFTPLUS13 = 36
-  SINH = 37
-  SINH_LOCAL = 38
-  COSH = 39
-  SQRT = 40
-  RSQRT = 41
-  EXP = 42
-  EXP_LOCAL = 43
-  CELU2 = 44
-  CELU2_LOCAL = 45
-  CELU3 = 46
-  CELU3_LOCAL = 47
-  CELU4 = 48
-  CELU4_LOCAL = 49
-  LOG2 = 50
-  LOG2_LOCAL = 51
-  LOG = 52
-  LOG_LOCAL = 53
-  LOG10 = 54
-  LOG10_LOCAL = 55
-  ROUNDOFF = 56
+  MASK = 5
+  DIV = 6
+  LUT = 7
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -134,6 +85,10 @@ class RKDPUStage:
   rhs: RKArg|float|None
   count: int
   out_dtype: DType = dtypes.half
+  lut: rklut.RKLUT|None = None
+
+  def __post_init__(self):
+    if (self.op is RKDPUOp.LUT) != (self.lut is not None): raise ValueError("Rockchip LUT stage requires exactly one LUT asset")
 
 @dataclass(frozen=True)
 class RKDPUProgram:
@@ -165,14 +120,20 @@ class RKPool:
 
 @dataclass(frozen=True)
 class _DPUExpr:
-  op: RKDPUOp
+  op: RKDPUOp|rklut.RKLUT
   src: tuple[_DPUExpr|RKArg|float, ...]
+  lut: rklut.RKLUT|None = None
+
+  def __post_init__(self):
+    if isinstance(self.op, rklut.RKLUT):
+      object.__setattr__(self, "lut", self.op)
+      object.__setattr__(self, "op", RKDPUOp.LUT)
 
 def _sigmoid_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   """Two-level sigmoid LUT with analytic tails and preserved NaN behavior."""
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-  broad, local = _DPUExpr(RKDPUOp.SIGMOID, (source,)), _DPUExpr(RKDPUOp.SIGMOID_LOCAL, (source,))
+  broad, local = _DPUExpr(rklut.RKLUT.SIGMOID, (source,)), _DPUExpr(rklut.RKLUT.SIGMOID_LOCAL, (source,))
   local_outside = _DPUExpr(RKDPUOp.MAX, (positive(-2.0, source), positive(source, 2.0)))
   selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, local_outside)),
     _DPUExpr(RKDPUOp.MUL, (local, _DPUExpr(RKDPUOp.SUB, (1.0, local_outside))))))
@@ -187,7 +148,7 @@ def _quick_gelu_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
   base = _DPUExpr(RKDPUOp.MUL, (source, _sigmoid_expr(_DPUExpr(RKDPUOp.MUL, (source, 1.702)))))
-  broad, local = _DPUExpr(RKDPUOp.QUICK_GELU, (source,)), _DPUExpr(RKDPUOp.QUICK_GELU_LOCAL,
+  broad, local = _DPUExpr(rklut.RKLUT.QUICK_GELU, (source,)), _DPUExpr(rklut.RKLUT.QUICK_GELU_LOCAL,
     (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.ADD, (source, 1.5)), 4.0)),))
   below, above = positive(-2.0, source), positive(source, 2.0)
   outside = _DPUExpr(RKDPUOp.MAX, (below, above))
@@ -209,8 +170,8 @@ def _gelu_expr(source:_DPUExpr|RKArg|float, approximate_tanh:bool) -> _DPUExpr:
   def clamp(value:_DPUExpr|RKArg|float, limit:float) -> _DPUExpr:
     lower = _DPUExpr(RKDPUOp.MAX, (value, -limit))
     return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
-  broad_op, local_op = ((RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL) if approximate_tanh else
-                        (RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL))
+  broad_op, local_op = ((rklut.RKLUT.GELU_TANH, rklut.RKLUT.GELU_TANH_LOCAL) if approximate_tanh else
+                        (rklut.RKLUT.GELU_EXACT, rklut.RKLUT.GELU_EXACT_LOCAL))
   broad = _DPUExpr(broad_op, (clamp(source, 4.0),))
   local = _DPUExpr(local_op, (_DPUExpr(RKDPUOp.MUL, (clamp(source, 0.5), 8.0)),))
   range_outside = _DPUExpr(RKDPUOp.MAX, (positive(-4.0, source), positive(source, 4.0)))
@@ -236,8 +197,8 @@ def _erf_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   def clamp(value:_DPUExpr|RKArg|float, limit:float) -> _DPUExpr:
     lower = _DPUExpr(RKDPUOp.MAX, (value, -limit))
     return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
-  broad = _DPUExpr(RKDPUOp.ERF, (clamp(source, 4.0),))
-  local = _DPUExpr(RKDPUOp.ERF_LOCAL, (_DPUExpr(RKDPUOp.MUL, (clamp(source, 0.25), 16.0)),))
+  broad = _DPUExpr(rklut.RKLUT.ERF, (clamp(source, 4.0),))
+  local = _DPUExpr(rklut.RKLUT.ERF_LOCAL, (_DPUExpr(RKDPUOp.MUL, (clamp(source, 0.25), 16.0)),))
   low, high = positive(-4.0, source), positive(source, 4.0)
   outside = _DPUExpr(RKDPUOp.MAX, (low, high))
   inside = _DPUExpr(RKDPUOp.SUB, (1.0, outside))
@@ -253,9 +214,9 @@ def _erf_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
 def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-  if negative_scale < 0.2: broad_op, local_op, broad_gain, local_gain = RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL, 8.0, 16.0
-  elif negative_scale > 1.5: broad_op, local_op, broad_gain, local_gain = RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, 0.5, 1.0
-  else: broad_op, local_op, broad_gain, local_gain = RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, 1.0, 2.0
+  if negative_scale < 0.2: broad_op, local_op, broad_gain, local_gain = rklut.RKLUT.ELU01, rklut.RKLUT.ELU01_LOCAL, 8.0, 16.0
+  elif negative_scale > 1.5: broad_op, local_op, broad_gain, local_gain = rklut.RKLUT.SELU, rklut.RKLUT.SELU_LOCAL, 0.5, 1.0
+  else: broad_op, local_op, broad_gain, local_gain = rklut.RKLUT.ELU1, rklut.RKLUT.ELU1_LOCAL, 1.0, 2.0
   broad_input = _DPUExpr(RKDPUOp.MAX, (source, -8.0))
   local_input = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (source, -0.5)), 4.0))
   broad, local = _DPUExpr(broad_op, (broad_input,)), _DPUExpr(local_op, (local_input,))
@@ -275,7 +236,7 @@ def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:
 def _mish_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-  broad, local = _DPUExpr(RKDPUOp.MISH, (source,)), _DPUExpr(RKDPUOp.MISH_LOCAL, (_DPUExpr(RKDPUOp.MUL, (source, 2.0)),))
+  broad, local = _DPUExpr(rklut.RKLUT.MISH, (source,)), _DPUExpr(rklut.RKLUT.MISH_LOCAL, (_DPUExpr(RKDPUOp.MUL, (source, 2.0)),))
   range_outside = _DPUExpr(RKDPUOp.MAX, (positive(-8.0, source), positive(source, 8.0)))
   range_inside = _DPUExpr(RKDPUOp.SUB, (1.0, range_outside))
   local_inside = _DPUExpr(RKDPUOp.MUL, (positive(source, -1.0), positive(1.0, source)))
@@ -293,7 +254,7 @@ def _mish_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
 def _logsigmoid_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-  correction, tail = _DPUExpr(RKDPUOp.LOGSIGMOID, (source,)), _DPUExpr(RKDPUOp.LOGSIGMOID_TAIL, (source,))
+  correction, tail = _DPUExpr(rklut.RKLUT.LOGSIGMOID, (source,)), _DPUExpr(rklut.RKLUT.LOGSIGMOID_TAIL, (source,))
   positive_source = _DPUExpr(RKDPUOp.MAX, (source, 0.0))
   minimum = _DPUExpr(RKDPUOp.SUB, (source, positive_source))
   tail_mask = positive(source, 3.5)
@@ -311,10 +272,10 @@ def _softplus_expr(source:_DPUExpr|RKArg|float, beta:float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
   positive_source = _DPUExpr(RKDPUOp.MAX, (source, 0.0))
   if beta < 1:
-    raw = _DPUExpr(RKDPUOp.SUB, (positive_source, _DPUExpr(RKDPUOp.SOFTPLUS13, (source,))))
+    raw = _DPUExpr(RKDPUOp.SUB, (positive_source, _DPUExpr(rklut.RKLUT.SOFTPLUS13, (source,))))
     finite = _DPUExpr(RKDPUOp.SUB, (1.0, positive(-100.0, source)))
     return _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (raw, finite)), 0.0))
-  broad_op, tail_op = (RKDPUOp.SOFTPLUS3, RKDPUOp.SOFTPLUS3_TAIL) if beta == 3 else (RKDPUOp.SOFTPLUS1, RKDPUOp.SOFTPLUS1_TAIL)
+  broad_op, tail_op = (rklut.RKLUT.SOFTPLUS3, rklut.RKLUT.SOFTPLUS3_TAIL) if beta == 3 else (rklut.RKLUT.SOFTPLUS1, rklut.RKLUT.SOFTPLUS1_TAIL)
   broad, tail = _DPUExpr(broad_op, (clamp(source, 8/beta),)), _DPUExpr(tail_op, (clamp(source, 16/beta),))
   tail_mask = positive(-3.05/beta, source)
   correction = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.SUB, (1.0, tail_mask)))),
@@ -329,11 +290,11 @@ def _sinh_cosh_expr(source:_DPUExpr|RKArg|float, is_cosh:bool) -> _DPUExpr:
   def clamp(value:_DPUExpr|RKArg|float, limit:float) -> _DPUExpr:
     lower = _DPUExpr(RKDPUOp.MAX, (value, -limit))
     return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
-  selected:_DPUExpr = _DPUExpr(RKDPUOp.COSH if is_cosh else RKDPUOp.SINH, (clamp(source, 2.0),))
+  selected:_DPUExpr = _DPUExpr(rklut.RKLUT.COSH if is_cosh else rklut.RKLUT.SINH, (clamp(source, 2.0),))
   negative = _DPUExpr(RKDPUOp.MUL, (source, -1.0))
   magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative))
   if not is_cosh:
-    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SINH_LOCAL, (clamp(source, .25),)), .25))
+    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(rklut.RKLUT.SINH_LOCAL, (clamp(source, .25),)), .25))
     near_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, .04)))
     local_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, .125)))
     selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (selected,
@@ -345,7 +306,7 @@ def _sinh_cosh_expr(source:_DPUExpr|RKArg|float, is_cosh:bool) -> _DPUExpr:
 def _sqrt_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-  refined:_DPUExpr = _DPUExpr(RKDPUOp.SQRT, (source,))
+  refined:_DPUExpr = _DPUExpr(rklut.RKLUT.SQRT, (source,))
   for _ in range(3): refined = _DPUExpr(RKDPUOp.MUL,
     (_DPUExpr(RKDPUOp.ADD, (refined, _DPUExpr(RKDPUOp.DIV, (source, refined)))), .5))
   high, negative = positive(source, 65472.0), positive(0.0, source)
@@ -364,7 +325,7 @@ def _rsqrt_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   low_1, low_2 = _DPUExpr(RKDPUOp.MUL, (greater_zero, below_1)), _DPUExpr(RKDPUOp.MUL, (greater_zero, below_2))
   factor_1, factor_2 = (_DPUExpr(RKDPUOp.ADD, (1.0, _DPUExpr(RKDPUOp.MUL, (mask, 15.0)))) for mask in (low_1, low_2))
   scaled = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (source, factor_1)), factor_2))
-  seed = _DPUExpr(RKDPUOp.RSQRT, (scaled,))
+  seed = _DPUExpr(rklut.RKLUT.RSQRT, (scaled,))
   safe = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (scaled, -1.0)), -4.0)), -1.0))
   correction = _DPUExpr(RKDPUOp.SUB, (1.5, _DPUExpr(RKDPUOp.MUL,
     (_DPUExpr(RKDPUOp.MUL, (safe, _DPUExpr(RKDPUOp.MUL, (seed, seed)))), .5))))
@@ -385,9 +346,9 @@ def _exp_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   def clamp(value:_DPUExpr|RKArg|float, limit:float) -> _DPUExpr:
     lower = _DPUExpr(RKDPUOp.MAX, (value, -limit))
     return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
-  broad = _DPUExpr(RKDPUOp.EXP, (clamp(source, 2.0),))
+  broad = _DPUExpr(rklut.RKLUT.EXP, (clamp(source, 2.0),))
   broad = _DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.ADD, (1.0, _DPUExpr(RKDPUOp.MUL, (positive(source, 0.0), 7.0))))))
-  local = _DPUExpr(RKDPUOp.EXP_LOCAL, (clamp(source, .25),))
+  local = _DPUExpr(rklut.RKLUT.EXP_LOCAL, (clamp(source, .25),))
   local_inside = _DPUExpr(RKDPUOp.MUL, (positive(source, -.25), positive(.25, source)))
   selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.SUB, (1.0, local_inside)))),
                                       _DPUExpr(RKDPUOp.MUL, (local, local_inside))))
@@ -412,9 +373,9 @@ def _log2_expr(source:_DPUExpr|RKArg|float, scale:float=1.0) -> _DPUExpr:
   bounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX,
     (_DPUExpr(RKDPUOp.MUL, (bounded_low, -1.0)), -4.0)), -1.0))
   centered = _DPUExpr(RKDPUOp.SUB, (bounded, 1.0))
-  broad_op, local_op = ((RKDPUOp.LOG, RKDPUOp.LOG_LOCAL) if math.isclose(scale, math.log(2)) else
-                        (RKDPUOp.LOG10, RKDPUOp.LOG10_LOCAL) if math.isclose(scale, math.log10(2)) else
-                        (RKDPUOp.LOG2, RKDPUOp.LOG2_LOCAL))
+  broad_op, local_op = ((rklut.RKLUT.LOG, rklut.RKLUT.LOG_LOCAL) if math.isclose(scale, math.log(2)) else
+                        (rklut.RKLUT.LOG10, rklut.RKLUT.LOG10_LOCAL) if math.isclose(scale, math.log10(2)) else
+                        (rklut.RKLUT.LOG2, rklut.RKLUT.LOG2_LOCAL))
   broad = _DPUExpr(broad_op, (bounded,))
   local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(local_op,
     (_DPUExpr(RKDPUOp.MUL, (centered, 12.5)),)), .25))
@@ -442,7 +403,7 @@ def _round_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
   magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative))
   positive_mask, negative_mask = positive(source, 0.0), positive(0.0, source)
   sign = _DPUExpr(RKDPUOp.SUB, (positive_mask, negative_mask))
-  rounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.ROUNDOFF, (magnitude,)), sign))
+  rounded = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(rklut.RKLUT.ROUNDOFF, (magnitude,)), sign))
   high = positive(magnitude, 65472.0)
   high_result = _DPUExpr(RKDPUOp.DIV, (sign, _DPUExpr(RKDPUOp.SUB, (1.0, high))))
   selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (rounded, _DPUExpr(RKDPUOp.SUB, (1.0, high)))),
@@ -453,8 +414,8 @@ def _round_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
 def _celu_expr(source:_DPUExpr|RKArg|float, alpha:int) -> _DPUExpr:
   def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
     return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
-  broad_op, local_op = {2:(RKDPUOp.CELU2,RKDPUOp.CELU2_LOCAL), 3:(RKDPUOp.CELU3,RKDPUOp.CELU3_LOCAL),
-                        4:(RKDPUOp.CELU4,RKDPUOp.CELU4_LOCAL)}[alpha]
+  broad_op, local_op = {2:(rklut.RKLUT.CELU2,rklut.RKLUT.CELU2_LOCAL), 3:(rklut.RKLUT.CELU3,rklut.RKLUT.CELU3_LOCAL),
+                        4:(rklut.RKLUT.CELU4,rklut.RKLUT.CELU4_LOCAL)}[alpha]
   broad, local = _DPUExpr(broad_op, (_DPUExpr(RKDPUOp.MAX, (source, -4.0)),)), \
                  _DPUExpr(local_op, (_DPUExpr(RKDPUOp.MAX, (source, -.5)),))
   below, local_below, poly_below, negative = (positive(x, source) for x in (-4.0, -.5, -.03, 0.0))
@@ -864,7 +825,7 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
   elif (hs_input:=_canonical_hardswish(u)) is not None:
     source = _parse_dpu_expr(hs_input, output_index, memo)
     if source is None: return None
-    broad = _DPUExpr(RKDPUOp.HARDSWISH, (source,))
+    broad = _DPUExpr(rklut.RKLUT.HARDSWISH, (source,))
     positive = _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.ADD, (source, 3.0)), 0.0))
     relu_negative = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.ADD, (source, -3.0)), 0.0)), -1.0))
     relu6 = _DPUExpr(RKDPUOp.ADD, (positive, relu_negative))
@@ -873,7 +834,7 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
       _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, 2.0)),))))
     wide = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (broad, _DPUExpr(RKDPUOp.SUB, (1.0, wide_outside)))),
       _DPUExpr(RKDPUOp.MUL, (fallback, wide_outside))))
-    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.HARDSWISH_LOCAL,
+    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(rklut.RKLUT.HARDSWISH_LOCAL,
       (_DPUExpr(RKDPUOp.MUL, (source, 16.0)),)), 1/16))
     inside = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, -0.125)),)),
       _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (15/128, source)),))))
@@ -889,8 +850,8 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     def posmask(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
       return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
     def interval(low:float, high:float) -> _DPUExpr: return _DPUExpr(RKDPUOp.MUL, (posmask(tanh_source, low), posmask(high, tanh_source)))
-    broad, local_inside, near_inside = _DPUExpr(RKDPUOp.TANH, (source,)), interval(-0.25, 0.25), interval(-0.04, 0.04)
-    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.TANH_LOCAL, (_DPUExpr(RKDPUOp.MUL, (source, 16.0)),)), 0.25))
+    broad, local_inside, near_inside = _DPUExpr(rklut.RKLUT.TANH, (source,)), interval(-0.25, 0.25), interval(-0.04, 0.04)
+    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(rklut.RKLUT.TANH_LOCAL, (_DPUExpr(RKDPUOp.MUL, (source, 16.0)),)), 0.25))
     lower = _DPUExpr(RKDPUOp.MAX, (source, -0.04))
     identity = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -0.04)), -1.0))
     interior = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
@@ -948,7 +909,7 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     operand = _parse_dpu_expr(exp_source if exp_source is not None else u.src[0], output_index, memo)
     if operand is None: return None
     if exp_factor is not None and math.isclose(float(exp_factor.arg), math.log2(math.e)): ret = _exp_expr(operand)
-    else: ret = _DPUExpr(RKDPUOp.EXP2, (operand,))
+    else: ret = _DPUExpr(rklut.RKLUT.EXP2, (operand,))
   elif u.op is Ops.LOG2:
     raw_source = _unwrap_same_cast(u.src[0])
     if raw_source.op is Ops.INDEX and raw_source.dtype is dtypes.float and raw_source.src[0].op is Ops.PARAM and \
@@ -1019,7 +980,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       return RKDPUProgram(fill_stages, ()) if len(fill_stages) <= 64 else None
     stage = RKDPUStage(RKDPUOp.ADD, output, 0.0, root, count, store.src[0].dtype)
     return RKDPUProgram((stage,), ())
-  if root.op is RKDPUOp.EXP2 and len(root.src) == 1 and isinstance(root.src[0], RKArg):
+  if root.op is RKDPUOp.LUT and root.lut is rklut.RKLUT.EXP2 and len(root.src) == 1 and isinstance(root.src[0], RKArg):
     source, base = root.src[0], root
     positive_inf = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (source, 65504.0)),))
     negative_inf = _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (-65504.0, source)),))
@@ -1048,9 +1009,10 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
+    assert isinstance(expr.op, RKDPUOp)
     stages.append(RKDPUStage(expr.op, dst, src[0], src[1] if len(src) > 1 else None, count,
                              dtypes.half if expr is root and store.src[0].dtype is dtypes.float else
-                             (store.src[0].dtype if expr is root else dtypes.half)))
+                             (store.src[0].dtype if expr is root else dtypes.half), expr.lut))
     values[expr] = dst
     for dependency in expr.src:
       if isinstance(dependency, _DPUExpr):
@@ -1144,43 +1106,44 @@ def _command(target:int, reg:int, value:int) -> int:
 
 def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
   """Emit one variable-width generated LUT task; fitting stays in extra/rockchip/gen_lut.py."""
+  assert plan.op is RKDPUOp.LUT and plan.lut is not None
   width, surf_stride = (plan.count+7)//8-1, ((plan.count+7)//8)*16
   table, bn_mul, minus_exp = {
-    RKDPUOp.EXP2:(rklut.RK_LUT_EXP2, rklut.RK_LUT_EXP2_BN_MUL, rklut.RK_LUT_EXP2_MINUS_EXP),
-    RKDPUOp.HARDSWISH:(rklut.RK_LUT_HARDSWISH, rklut.RK_LUT_HARDSWISH_BN_MUL, rklut.RK_LUT_HARDSWISH_MINUS_EXP),
-    RKDPUOp.HARDSWISH_LOCAL:(rklut.RK_LUT_HARDSWISH_LOCAL, rklut.RK_LUT_HARDSWISH_LOCAL_BN_MUL,
+    rklut.RKLUT.EXP2:(rklut.RK_LUT_EXP2, rklut.RK_LUT_EXP2_BN_MUL, rklut.RK_LUT_EXP2_MINUS_EXP),
+    rklut.RKLUT.HARDSWISH:(rklut.RK_LUT_HARDSWISH, rklut.RK_LUT_HARDSWISH_BN_MUL, rklut.RK_LUT_HARDSWISH_MINUS_EXP),
+    rklut.RKLUT.HARDSWISH_LOCAL:(rklut.RK_LUT_HARDSWISH_LOCAL, rklut.RK_LUT_HARDSWISH_LOCAL_BN_MUL,
                             rklut.RK_LUT_HARDSWISH_LOCAL_MINUS_EXP),
-    RKDPUOp.TANH:(rklut.RK_LUT_TANH, rklut.RK_LUT_TANH_BN_MUL, rklut.RK_LUT_TANH_MINUS_EXP),
-    RKDPUOp.TANH_LOCAL:(rklut.RK_LUT_TANH_LOCAL, rklut.RK_LUT_TANH_LOCAL_BN_MUL, rklut.RK_LUT_TANH_LOCAL_MINUS_EXP),
-    RKDPUOp.SIGMOID:(rklut.RK_LUT_SIGMOID, rklut.RK_LUT_SIGMOID_BN_MUL, rklut.RK_LUT_SIGMOID_MINUS_EXP),
-    RKDPUOp.SIGMOID_LOCAL:(rklut.RK_LUT_SIGMOID_LOCAL, rklut.RK_LUT_SIGMOID_LOCAL_BN_MUL,
+    rklut.RKLUT.TANH:(rklut.RK_LUT_TANH, rklut.RK_LUT_TANH_BN_MUL, rklut.RK_LUT_TANH_MINUS_EXP),
+    rklut.RKLUT.TANH_LOCAL:(rklut.RK_LUT_TANH_LOCAL, rklut.RK_LUT_TANH_LOCAL_BN_MUL, rklut.RK_LUT_TANH_LOCAL_MINUS_EXP),
+    rklut.RKLUT.SIGMOID:(rklut.RK_LUT_SIGMOID, rklut.RK_LUT_SIGMOID_BN_MUL, rklut.RK_LUT_SIGMOID_MINUS_EXP),
+    rklut.RKLUT.SIGMOID_LOCAL:(rklut.RK_LUT_SIGMOID_LOCAL, rklut.RK_LUT_SIGMOID_LOCAL_BN_MUL,
                           rklut.RK_LUT_SIGMOID_LOCAL_MINUS_EXP),
-    RKDPUOp.QUICK_GELU:(rklut.RK_LUT_QUICK_GELU, rklut.RK_LUT_QUICK_GELU_BN_MUL, rklut.RK_LUT_QUICK_GELU_MINUS_EXP),
-    RKDPUOp.QUICK_GELU_LOCAL:(rklut.RK_LUT_QUICK_GELU_LOCAL, rklut.RK_LUT_QUICK_GELU_LOCAL_BN_MUL,
+    rklut.RKLUT.QUICK_GELU:(rklut.RK_LUT_QUICK_GELU, rklut.RK_LUT_QUICK_GELU_BN_MUL, rklut.RK_LUT_QUICK_GELU_MINUS_EXP),
+    rklut.RKLUT.QUICK_GELU_LOCAL:(rklut.RK_LUT_QUICK_GELU_LOCAL, rklut.RK_LUT_QUICK_GELU_LOCAL_BN_MUL,
                              rklut.RK_LUT_QUICK_GELU_LOCAL_MINUS_EXP),
-    RKDPUOp.GELU_TANH:(rklut.RK_LUT_GELU_TANH, rklut.RK_LUT_GELU_TANH_BN_MUL, rklut.RK_LUT_GELU_TANH_MINUS_EXP),
-    RKDPUOp.GELU_TANH_LOCAL:(rklut.RK_LUT_GELU_TANH_LOCAL, rklut.RK_LUT_GELU_TANH_LOCAL_BN_MUL,
+    rklut.RKLUT.GELU_TANH:(rklut.RK_LUT_GELU_TANH, rklut.RK_LUT_GELU_TANH_BN_MUL, rklut.RK_LUT_GELU_TANH_MINUS_EXP),
+    rklut.RKLUT.GELU_TANH_LOCAL:(rklut.RK_LUT_GELU_TANH_LOCAL, rklut.RK_LUT_GELU_TANH_LOCAL_BN_MUL,
                             rklut.RK_LUT_GELU_TANH_LOCAL_MINUS_EXP),
-    RKDPUOp.GELU_EXACT:(rklut.RK_LUT_GELU_EXACT, rklut.RK_LUT_GELU_EXACT_BN_MUL, rklut.RK_LUT_GELU_EXACT_MINUS_EXP),
-    RKDPUOp.GELU_EXACT_LOCAL:(rklut.RK_LUT_GELU_EXACT_LOCAL, rklut.RK_LUT_GELU_EXACT_LOCAL_BN_MUL,
+    rklut.RKLUT.GELU_EXACT:(rklut.RK_LUT_GELU_EXACT, rklut.RK_LUT_GELU_EXACT_BN_MUL, rklut.RK_LUT_GELU_EXACT_MINUS_EXP),
+    rklut.RKLUT.GELU_EXACT_LOCAL:(rklut.RK_LUT_GELU_EXACT_LOCAL, rklut.RK_LUT_GELU_EXACT_LOCAL_BN_MUL,
                              rklut.RK_LUT_GELU_EXACT_LOCAL_MINUS_EXP),
-    RKDPUOp.ERF:(rklut.RK_LUT_ERF, rklut.RK_LUT_ERF_BN_MUL, rklut.RK_LUT_ERF_MINUS_EXP),
-    RKDPUOp.ERF_LOCAL:(rklut.RK_LUT_ERF_LOCAL, rklut.RK_LUT_ERF_LOCAL_BN_MUL, rklut.RK_LUT_ERF_LOCAL_MINUS_EXP),
+    rklut.RKLUT.ERF:(rklut.RK_LUT_ERF, rklut.RK_LUT_ERF_BN_MUL, rklut.RK_LUT_ERF_MINUS_EXP),
+    rklut.RKLUT.ERF_LOCAL:(rklut.RK_LUT_ERF_LOCAL, rklut.RK_LUT_ERF_LOCAL_BN_MUL, rklut.RK_LUT_ERF_LOCAL_MINUS_EXP),
     **{op:(getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_BN_MUL"), getattr(rklut, f"RK_LUT_{name}_MINUS_EXP"))
-       for op,name in ((RKDPUOp.ELU1,"ELU1"),(RKDPUOp.ELU1_LOCAL,"ELU1_LOCAL"),(RKDPUOp.ELU01,"ELU01"),
-                       (RKDPUOp.ELU01_LOCAL,"ELU01_LOCAL"),(RKDPUOp.SELU,"SELU"),(RKDPUOp.SELU_LOCAL,"SELU_LOCAL"),
-                       (RKDPUOp.MISH,"MISH"),(RKDPUOp.MISH_LOCAL,"MISH_LOCAL"),(RKDPUOp.LOGSIGMOID,"LOGSIGMOID"),
-                       (RKDPUOp.LOGSIGMOID_TAIL,"LOGSIGMOID_TAIL"),(RKDPUOp.SOFTPLUS1,"SOFTPLUS1"),
-                       (RKDPUOp.SOFTPLUS1_TAIL,"SOFTPLUS1_TAIL"),(RKDPUOp.SOFTPLUS3,"SOFTPLUS3"),
-                       (RKDPUOp.SOFTPLUS3_TAIL,"SOFTPLUS3_TAIL"),(RKDPUOp.SOFTPLUS13,"SOFTPLUS13"),
-                       (RKDPUOp.SINH,"SINH"),(RKDPUOp.SINH_LOCAL,"SINH_LOCAL"),(RKDPUOp.COSH,"COSH"),
-                       (RKDPUOp.SQRT,"SQRT"),(RKDPUOp.RSQRT,"RSQRT"),(RKDPUOp.EXP,"EXP"),(RKDPUOp.EXP_LOCAL,"EXP_LOCAL"),
-                       (RKDPUOp.CELU2,"CELU2"),(RKDPUOp.CELU2_LOCAL,"CELU2_LOCAL"),(RKDPUOp.CELU3,"CELU3"),
-                       (RKDPUOp.CELU3_LOCAL,"CELU3_LOCAL"),(RKDPUOp.CELU4,"CELU4"),(RKDPUOp.CELU4_LOCAL,"CELU4_LOCAL"),
-                       (RKDPUOp.LOG2,"LOG2"),(RKDPUOp.LOG2_LOCAL,"LOG2_LOCAL"),(RKDPUOp.LOG,"LOG"),
-                       (RKDPUOp.LOG_LOCAL,"LOG_LOCAL"),(RKDPUOp.LOG10,"LOG10"),(RKDPUOp.LOG10_LOCAL,"LOG10_LOCAL"))}}[plan.op]
-  post_scale = {RKDPUOp.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
-                RKDPUOp.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.op, 1.0)
+       for op,name in ((rklut.RKLUT.ELU1,"ELU1"),(rklut.RKLUT.ELU1_LOCAL,"ELU1_LOCAL"),(rklut.RKLUT.ELU01,"ELU01"),
+                       (rklut.RKLUT.ELU01_LOCAL,"ELU01_LOCAL"),(rklut.RKLUT.SELU,"SELU"),(rklut.RKLUT.SELU_LOCAL,"SELU_LOCAL"),
+                       (rklut.RKLUT.MISH,"MISH"),(rklut.RKLUT.MISH_LOCAL,"MISH_LOCAL"),(rklut.RKLUT.LOGSIGMOID,"LOGSIGMOID"),
+                       (rklut.RKLUT.LOGSIGMOID_TAIL,"LOGSIGMOID_TAIL"),(rklut.RKLUT.SOFTPLUS1,"SOFTPLUS1"),
+                       (rklut.RKLUT.SOFTPLUS1_TAIL,"SOFTPLUS1_TAIL"),(rklut.RKLUT.SOFTPLUS3,"SOFTPLUS3"),
+                       (rklut.RKLUT.SOFTPLUS3_TAIL,"SOFTPLUS3_TAIL"),(rklut.RKLUT.SOFTPLUS13,"SOFTPLUS13"),
+                       (rklut.RKLUT.SINH,"SINH"),(rklut.RKLUT.SINH_LOCAL,"SINH_LOCAL"),(rklut.RKLUT.COSH,"COSH"),
+                       (rklut.RKLUT.SQRT,"SQRT"),(rklut.RKLUT.RSQRT,"RSQRT"),(rklut.RKLUT.EXP,"EXP"),(rklut.RKLUT.EXP_LOCAL,"EXP_LOCAL"),
+                       (rklut.RKLUT.CELU2,"CELU2"),(rklut.RKLUT.CELU2_LOCAL,"CELU2_LOCAL"),(rklut.RKLUT.CELU3,"CELU3"),
+                       (rklut.RKLUT.CELU3_LOCAL,"CELU3_LOCAL"),(rklut.RKLUT.CELU4,"CELU4"),(rklut.RKLUT.CELU4_LOCAL,"CELU4_LOCAL"),
+                       (rklut.RKLUT.LOG2,"LOG2"),(rklut.RKLUT.LOG2_LOCAL,"LOG2_LOCAL"),(rklut.RKLUT.LOG,"LOG"),
+                       (rklut.RKLUT.LOG_LOCAL,"LOG_LOCAL"),(rklut.RKLUT.LOG10,"LOG10"),(rklut.RKLUT.LOG10_LOCAL,"LOG10_LOCAL"))}}[plan.lut]
+  post_scale = {rklut.RKLUT.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
+                rklut.RKLUT.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.lut, 1.0)
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
@@ -1298,20 +1261,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     # Rejected partial Maximum WIP: OUT_CVT_OFFSET can fill INT_MAX exactly, but later cases still require int copy/compare and bool packing.
     # int_fill = plan.out_dtype is dtypes.int and plan.op is RKDPUOp.ADD and plan.lhs == 0.0 and isinstance(plan.rhs, float)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
-    if plan.op is RKDPUOp.ROUNDOFF:
-      stages.append(_emit_roundoff_lut(stage_idx, plan, lhs))
-      continue
-    if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL,
-                   RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL,
-                   RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL, RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL,
-                   RKDPUOp.ERF, RKDPUOp.ERF_LOCAL, RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL,
-                   RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, RKDPUOp.MISH, RKDPUOp.MISH_LOCAL, RKDPUOp.LOGSIGMOID,
-                   RKDPUOp.LOGSIGMOID_TAIL, RKDPUOp.SOFTPLUS1, RKDPUOp.SOFTPLUS1_TAIL, RKDPUOp.SOFTPLUS3,
-                   RKDPUOp.SOFTPLUS3_TAIL, RKDPUOp.SOFTPLUS13, RKDPUOp.SINH, RKDPUOp.SINH_LOCAL, RKDPUOp.COSH,
-                   RKDPUOp.SQRT, RKDPUOp.RSQRT, RKDPUOp.EXP, RKDPUOp.EXP_LOCAL, RKDPUOp.CELU2, RKDPUOp.CELU2_LOCAL,
-                   RKDPUOp.CELU3, RKDPUOp.CELU3_LOCAL, RKDPUOp.CELU4, RKDPUOp.CELU4_LOCAL,
-                   RKDPUOp.LOG2, RKDPUOp.LOG2_LOCAL, RKDPUOp.LOG, RKDPUOp.LOG_LOCAL, RKDPUOp.LOG10, RKDPUOp.LOG10_LOCAL):
-      stages.append(_emit_lut(stage_idx, plan, lhs))
+    if plan.op is RKDPUOp.LUT:
+      stages.append(_emit_roundoff_lut(stage_idx, plan, lhs) if plan.lut is rklut.RKLUT.ROUNDOFF else _emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:
       stages.append(_emit_mask(stage_idx, plan, lhs))

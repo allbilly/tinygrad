@@ -168,6 +168,11 @@ low-hanging boundary remains device-native bool/int representation:
 - reject dynamic casts until packing is proven, as native int32 WDMA consumes
   eight FP16 lanes while producing four int32 lanes.
 
+Two direct hardware probes of DPU FP16-mask to int8 output timed out: one kept
+the proven eight-lane cube/WDMA geometry, and one used a 16-lane int8 atom.
+Therefore byte-wide bool output remains an honest unimplemented boundary; the
+TRM precision enum alone is not a valid hardware contract.
+
 Spatial convolution is not low-hanging because it first needs a device-visible layout contract.
 
 ## Rules for future tally updates

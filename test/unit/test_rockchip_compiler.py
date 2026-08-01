@@ -115,7 +115,7 @@ class TestDPUCompiler(unittest.TestCase):
     plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).exp2()))
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertFalse(contains_uop(plan))
-    self.assertEqual(plan.stages[0].op.name, "EXP2")
+    self.assertEqual((plan.stages[0].op, plan.stages[0].lut), (RKDPUOp.LUT, rklut.RKLUT.EXP2))
     image = emit_dpu(plan)
     self.assertEqual(len(image.stages[0].commands), 1064)
     self.assertEqual(image.stages[0].commands[:3],
@@ -125,7 +125,7 @@ class TestDPUCompiler(unittest.TestCase):
     large = lower_dpu(sink(Tensor.empty(2925, dtype=dtypes.half).exp2()))
     self.assertEqual((len(small.stages), small.stages[0].count, len(small.scratch)), (13, 16, 4))
     self.assertEqual((len(large.stages), large.stages[0].count, len(large.scratch)), (13, 2925, 4))
-    self.assertEqual(tuple(stage.op for stage in large.stages).count(RKDPUOp.EXP2), 1)
+    self.assertEqual(tuple(stage.lut for stage in large.stages).count(rklut.RKLUT.EXP2), 1)
 
   def test_rejects_noncontiguous_and_nonhalf(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
@@ -173,15 +173,15 @@ class TestDPUCompiler(unittest.TestCase):
   def test_hardswish_uses_two_generated_luts(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).hardswish()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (36, 5))
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.HARDSWISH), 1)
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.HARDSWISH_LOCAL), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.HARDSWISH), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.HARDSWISH_LOCAL), 1)
     self.assertFalse(contains_uop(plan))
 
   def test_tanh_uses_two_generated_luts(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).tanh()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (35, 5))
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.TANH), 1)
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.TANH_LOCAL), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.TANH), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.TANH_LOCAL), 1)
     self.assertFalse(contains_uop(plan))
 
   def test_sigmoid_and_silu_reuse_two_generated_luts(self):
@@ -189,27 +189,27 @@ class TestDPUCompiler(unittest.TestCase):
     silu = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).silu()))
     self.assertEqual((len(sigmoid.stages), len(silu.stages)), (24, 25))
     for plan in (sigmoid, silu):
-      self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.SIGMOID), 1)
-      self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.SIGMOID_LOCAL), 1)
+      self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.SIGMOID), 1)
+      self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.SIGMOID_LOCAL), 1)
       self.assertFalse(contains_uop(plan))
 
   def test_quick_gelu_uses_dedicated_two_level_lut(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).quick_gelu()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (58, 6))
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.QUICK_GELU), 1)
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.QUICK_GELU_LOCAL), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.QUICK_GELU), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.QUICK_GELU_LOCAL), 1)
     for table, digest in ((rklut.RK_LUT_QUICK_GELU, rklut.RK_LUT_QUICK_GELU_SHA256),
                           (rklut.RK_LUT_QUICK_GELU_LOCAL, rklut.RK_LUT_QUICK_GELU_LOCAL_SHA256)):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
   def test_gelu_variants_use_dedicated_two_level_luts(self):
-    for approximate, broad, local in (("tanh", RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL),
-                                      ("none", RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL)):
+    for approximate, broad, local in (("tanh", rklut.RKLUT.GELU_TANH, rklut.RKLUT.GELU_TANH_LOCAL),
+                                      ("none", rklut.RKLUT.GELU_EXACT, rklut.RKLUT.GELU_EXACT_LOCAL)):
       plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).gelu(approximate=approximate)))
       self.assertEqual((len(plan.stages), len(plan.scratch)), (51, 6))
-      self.assertEqual(tuple(stage.op for stage in plan.stages).count(broad), 1)
-      self.assertEqual(tuple(stage.op for stage in plan.stages).count(local), 1)
+      self.assertEqual(tuple(stage.lut for stage in plan.stages).count(broad), 1)
+      self.assertEqual(tuple(stage.lut for stage in plan.stages).count(local), 1)
       self.assertFalse(contains_uop(plan))
     for table, digest in ((rklut.RK_LUT_GELU_TANH, rklut.RK_LUT_GELU_TANH_SHA256),
                           (rklut.RK_LUT_GELU_TANH_LOCAL, rklut.RK_LUT_GELU_TANH_LOCAL_SHA256),
@@ -220,21 +220,21 @@ class TestDPUCompiler(unittest.TestCase):
   def test_erf_uses_dedicated_two_level_lut(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).erf()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (44, 9))
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.ERF), 1)
-    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.ERF_LOCAL), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.ERF), 1)
+    self.assertEqual(tuple(stage.lut for stage in plan.stages).count(rklut.RKLUT.ERF_LOCAL), 1)
     for table, digest in ((rklut.RK_LUT_ERF, rklut.RK_LUT_ERF_SHA256),
                           (rklut.RK_LUT_ERF_LOCAL, rklut.RK_LUT_ERF_LOCAL_SHA256)):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
   def test_elu_variants_use_generated_two_level_luts(self):
-    variants = ((lambda x:x.elu(), RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL),
-                (lambda x:x.elu(.1), RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL),
-                (lambda x:x.selu(), RKDPUOp.SELU, RKDPUOp.SELU_LOCAL))
+    variants = ((lambda x:x.elu(), rklut.RKLUT.ELU1, rklut.RKLUT.ELU1_LOCAL),
+                (lambda x:x.elu(.1), rklut.RKLUT.ELU01, rklut.RKLUT.ELU01_LOCAL),
+                (lambda x:x.selu(), rklut.RKLUT.SELU, rklut.RKLUT.SELU_LOCAL))
     for function, broad, local in variants:
       plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
       self.assertEqual((len(plan.stages), len(plan.scratch)), (35, 6))
-      self.assertEqual((sum(x.op is broad for x in plan.stages), sum(x.op is local for x in plan.stages)), (1, 1))
+      self.assertEqual((sum(x.lut is broad for x in plan.stages), sum(x.lut is local for x in plan.stages)), (1, 1))
       self.assertFalse(contains_uop(plan))
     for name in ("ELU1", "ELU1_LOCAL", "ELU01", "ELU01_LOCAL", "SELU", "SELU_LOCAL"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
@@ -243,7 +243,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_mish_uses_generated_two_level_lut(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).mish()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (38, 6))
-    self.assertEqual((sum(x.op is RKDPUOp.MISH for x in plan.stages), sum(x.op is RKDPUOp.MISH_LOCAL for x in plan.stages)), (1, 1))
+    self.assertEqual((sum(x.lut is rklut.RKLUT.MISH for x in plan.stages), sum(x.lut is rklut.RKLUT.MISH_LOCAL for x in plan.stages)), (1, 1))
     for name in ("MISH", "MISH_LOCAL"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
@@ -252,32 +252,32 @@ class TestDPUCompiler(unittest.TestCase):
   def test_logsigmoid_uses_broad_and_tail_luts(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).logsigmoid()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (15, 4))
-    self.assertEqual((sum(x.op is RKDPUOp.LOGSIGMOID for x in plan.stages),
-                      sum(x.op is RKDPUOp.LOGSIGMOID_TAIL for x in plan.stages)), (1, 1))
+    self.assertEqual((sum(x.lut is rklut.RKLUT.LOGSIGMOID for x in plan.stages),
+                      sum(x.lut is rklut.RKLUT.LOGSIGMOID_TAIL for x in plan.stages)), (1, 1))
     for name in ("LOGSIGMOID", "LOGSIGMOID_TAIL"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
   def test_softplus_variants_use_generated_luts(self):
-    variants = ((1, (27,4), (RKDPUOp.SOFTPLUS1,RKDPUOp.SOFTPLUS1_TAIL)),
-                (3, (27,4), (RKDPUOp.SOFTPLUS3,RKDPUOp.SOFTPLUS3_TAIL)),
-                (1/3, (8,2), (RKDPUOp.SOFTPLUS13,)))
+    variants = ((1, (27,4), (rklut.RKLUT.SOFTPLUS1,rklut.RKLUT.SOFTPLUS1_TAIL)),
+                (3, (27,4), (rklut.RKLUT.SOFTPLUS3,rklut.RKLUT.SOFTPLUS3_TAIL)),
+                (1/3, (8,2), (rklut.RKLUT.SOFTPLUS13,)))
     for beta, shape, operations in variants:
       plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).softplus(beta=beta)))
       self.assertEqual((len(plan.stages), len(plan.scratch)), shape)
-      self.assertTrue(all(sum(x.op is op for x in plan.stages) == 1 for op in operations))
+      self.assertTrue(all(sum(x.lut is op for x in plan.stages) == 1 for op in operations))
       self.assertFalse(contains_uop(plan))
     for name in ("SOFTPLUS1", "SOFTPLUS1_TAIL", "SOFTPLUS3", "SOFTPLUS3_TAIL", "SOFTPLUS13"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
   def test_sinh_cosh_use_generated_luts(self):
-    for function, shape, operations in ((lambda x:x.sinh(), (30,5), (RKDPUOp.SINH,RKDPUOp.SINH_LOCAL)),
-                                        (lambda x:x.cosh(), (11,2), (RKDPUOp.COSH,))):
+    for function, shape, operations in ((lambda x:x.sinh(), (30,5), (rklut.RKLUT.SINH,rklut.RKLUT.SINH_LOCAL)),
+                                        (lambda x:x.cosh(), (11,2), (rklut.RKLUT.COSH,))):
       plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
       self.assertEqual((len(plan.stages), len(plan.scratch)), shape)
-      self.assertTrue(all(sum(x.op is op for x in plan.stages) == 1 for op in operations))
+      self.assertTrue(all(sum(x.lut is op for x in plan.stages) == 1 for op in operations))
       self.assertFalse(contains_uop(plan))
     for name in ("SINH", "SINH_LOCAL", "COSH"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
@@ -286,7 +286,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_sqrt_uses_refined_generated_lut(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).sqrt()))
     self.assertEqual((len(plan.stages), len(plan.scratch), plan.fp32_inputs), (25, 4, ()))
-    self.assertEqual(sum(x.op is RKDPUOp.SQRT for x in plan.stages), 1)
+    self.assertEqual(sum(x.lut is rklut.RKLUT.SQRT for x in plan.stages), 1)
     table = rklut.RK_LUT_SQRT
     self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_SQRT_SHA256)
     self.assertFalse(contains_uop(plan))
@@ -294,7 +294,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_rsqrt_uses_range_scaled_refined_lut(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).rsqrt()))
     self.assertEqual((len(plan.stages), len(plan.scratch), plan.fp32_inputs), (42, 6, ()))
-    self.assertEqual(sum(x.op is RKDPUOp.RSQRT for x in plan.stages), 1)
+    self.assertEqual(sum(x.lut is rklut.RKLUT.RSQRT for x in plan.stages), 1)
     table = rklut.RK_LUT_RSQRT
     self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_RSQRT_SHA256)
     self.assertFalse(contains_uop(plan))
@@ -302,7 +302,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_exp_uses_generated_broad_local_luts(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).exp()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (36, 4))
-    self.assertEqual((sum(x.op is RKDPUOp.EXP for x in plan.stages), sum(x.op is RKDPUOp.EXP_LOCAL for x in plan.stages)), (1, 1))
+    self.assertEqual((sum(x.lut is rklut.RKLUT.EXP for x in plan.stages), sum(x.lut is rklut.RKLUT.EXP_LOCAL for x in plan.stages)), (1, 1))
     for name in ("EXP", "EXP_LOCAL"):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
@@ -318,13 +318,13 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
   def test_logarithms_use_scaled_generated_luts_and_typed_fp32_abi(self):
-    variants = ((lambda x:x.log2(), (RKDPUOp.LOG2,RKDPUOp.LOG2_LOCAL)),
-                (lambda x:x.log(), (RKDPUOp.LOG,RKDPUOp.LOG_LOCAL)),
-                (lambda x:x.log10(), (RKDPUOp.LOG10,RKDPUOp.LOG10_LOCAL)))
+    variants = ((lambda x:x.log2(), (rklut.RKLUT.LOG2,rklut.RKLUT.LOG2_LOCAL)),
+                (lambda x:x.log(), (rklut.RKLUT.LOG,rklut.RKLUT.LOG_LOCAL)),
+                (lambda x:x.log10(), (rklut.RKLUT.LOG10,rklut.RKLUT.LOG10_LOCAL)))
     for function, operations in variants:
       plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
       self.assertEqual((len(plan.stages), len(plan.scratch), plan.fp32_inputs, plan.fp32_outputs), (57,8,(),()))
-      self.assertTrue(all(sum(x.op is op for x in plan.stages) == 1 for op in operations))
+      self.assertTrue(all(sum(x.lut is op for x in plan.stages) == 1 for op in operations))
       self.assertFalse(contains_uop(plan))
     fp32 = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.float).log()))
     self.assertEqual((len(fp32.stages), len(fp32.scratch), fp32.fp32_inputs, fp32.fp32_outputs), (61,8,(1,),(0,)))
@@ -336,7 +336,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_round_uses_native_algorithm23_lut(self):
     plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).round()))
     self.assertEqual((len(plan.stages), len(plan.scratch)), (20,6))
-    self.assertEqual(sum(x.op is RKDPUOp.ROUNDOFF for x in plan.stages), 1)
+    self.assertEqual(sum(x.lut is rklut.RKLUT.ROUNDOFF for x in plan.stages), 1)
     table = rklut.RK_LUT_ROUNDOFF
     self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_ROUNDOFF_SHA256)
     self.assertFalse(contains_uop(plan))

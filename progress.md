@@ -96,7 +96,8 @@ The 425-method census remains informational and must not dictate that upstream I
 | `ddb9d0733` | Rejected int fill probe retained for reference | `0196-rockchip-record-rejected-int-fill-probe.patch` |
 | `bb115b4a3` | Direct final-output CELU LUTs | `0197-rockchip-add-CELU-LUTs.patch` |
 | `730efd61e` | Scale-specific Log2/Log/Log10 LUTs and experimental typed FP32 ABI | `0198-rockchip-add-logarithm-LUTs.patch` |
-| current milestone | Native round-to-nearest-even algorithm-23 LUT | `0199-rockchip-add-native-roundoff-LUT.patch` |
+| `1f4cc5da8` | Native round-to-nearest-even algorithm-23 LUT | `0199-rockchip-add-native-roundoff-LUT.patch` |
+| current milestone | Separate hardware stage operations from generated LUT identities | `0200-rockchip-separate-LUT-assets-from-stage-ops.patch` |
 
 ## Architecture now implemented
 
@@ -114,6 +115,7 @@ post-early_simplify UOps
 Important invariants:
 
 - `RKDPUProgram`, `RKContract`, `RKPool`, `RKStage`, and `RKImage` retain no `UOp`.
+- `RKDPUOp` contains only eight hardware stage operations; the 50 generated table identities live separately in `RKLUT` and are data on one `LUT` stage.
 - RKImage contains only target/version data, command stages, dependencies, relocations, scratch declarations, and constants.
 - Runtime NumPy is restricted to declared ABI element-format conversion and never executes tensor semantics on the CPU.
 - Unsupported dtype, layout, or graph combinations reject before device submission.
@@ -160,22 +162,22 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1325
+tinygrad/renderer/rockchip.py  1274
 tinygrad/runtime/ops_rockchip.py  99
-handwritten Rockchip total  1424
+handwritten Rockchip total  1373
 ```
 
-This meets the requested `<5000` research-backend goal with 3,576 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` research-backend goal with 3,627 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the runtime is thin and the UOp-free
 plan/image boundary is preserved, but this research branch has again accumulated
 an activation catalog. Approximate current physical source distribution is:
 
-- target types and DPU expression recipes: renderer lines 18–470;
-- RKImage validation, codec, and relocation: renderer lines 471–554;
-- UOp canonicalization, affine analysis, and typed lowering: renderer lines 555–1141;
-- register emission: renderer lines 1142–1409;
-- renderer integration: renderer lines 1410 onward;
+- target types and DPU expression recipes: renderer lines 18–435;
+- RKImage validation, codec, and relocation: renderer lines 436–515;
+- UOp canonicalization, affine analysis, and typed lowering: renderer lines 516–1103;
+- register emission: renderer lines 1104–1360;
+- renderer integration: renderer lines 1361 onward;
 - allocation/submission/runtime ABI experiment: 99 `sz.py` lines.
 
 This distribution is acceptable only for the frozen research/coverage branch.
@@ -183,7 +185,7 @@ The future upstream branch must replace the catalog with generic `Ops` ALU,
 mask, and LUT stages and include only the minimal assets required by its declared
 FP16 workload.
 
-The whole repository is 26,400 `sz.py` lines, a `+1,432` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,400 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
+The whole repository is 26,349 `sz.py` lines, a `+1,381` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` fails globally by 1,349 lines even though the research backend itself is below 5,000. This is an explicit blocker for upstream submission and must be resolved by constructing a minimal branch, not hidden through unrelated compression or generated files.
 
 ## Exact validation commands
 
@@ -226,6 +228,8 @@ Useful failure interpretations:
 - LUT mismatch: regenerate, verify payload SHA, run exhaustive simulator, then run a hardware sweep inside the declared domain.
 
 Recent precision probes that must not be rediscovered as final fixes:
+
+- DPU `out_precision=0` int8 output from the proven FP16 mask task timed out with both eight-lane and 16-lane WDMA/data-cube layouts. The TRM advertises int8 output, but FP16-to-int8 conversion is not yet a proven byte-wide bool ABI; do not enable it from the format field alone.
 
 - `hardswish` baseline (`(x*clamp)*half(1/6)`) mismatched 34/2925 values;
 - one-task BS pre-scaling reduced that to 9/2925, but still missed the official tolerance;
