@@ -252,6 +252,19 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
+  def test_softplus_variants_use_generated_luts(self):
+    variants = ((1, (27,4), (RKDPUOp.SOFTPLUS1,RKDPUOp.SOFTPLUS1_TAIL)),
+                (3, (27,4), (RKDPUOp.SOFTPLUS3,RKDPUOp.SOFTPLUS3_TAIL)),
+                (1/3, (8,2), (RKDPUOp.SOFTPLUS13,)))
+    for beta, shape, operations in variants:
+      plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).softplus(beta=beta)))
+      self.assertEqual((len(plan.stages), len(plan.scratch)), shape)
+      self.assertTrue(all(sum(x.op is op for x in plan.stages) == 1 for op in operations))
+      self.assertFalse(contains_uop(plan))
+    for name in ("SOFTPLUS1", "SOFTPLUS1_TAIL", "SOFTPLUS3", "SOFTPLUS3_TAIL", "SOFTPLUS13"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

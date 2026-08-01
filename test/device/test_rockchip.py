@@ -125,4 +125,11 @@ class TestRockchip(unittest.TestCase):
     expected = (-np.logaddexp(0, -fp32)).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").logsigmoid().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_generated_softplus_luts(self):
+    data = np.linspace(-8, 8, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    for beta in (1, 3, 1/3):
+      expected = (np.logaddexp(0, beta*fp32)/beta).astype(np.float16)
+      np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").softplus(beta=beta).numpy(), expected, rtol=1e-3, atol=3e-6)
+
 if __name__ == "__main__": unittest.main()
