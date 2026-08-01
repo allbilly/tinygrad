@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 2 |
+| Schema | 3 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -59,6 +59,16 @@ HardSwish adds two immutable tables and follows the final `rockchip-2607` algori
 - an NPU nonzero mask removes the one-count LUT-zero workaround at exact zero.
 
 This is two NPU LUT tasks, not host evaluation. On the official 2,925-element case it lowers to 36 stages and five scratch buffers and passes `rtol=0.001, atol=1e-6`.
+
+Tanh uses the same regional-correction structure:
+
+- `RKLUT.TANH = 4`: signed Q15 tanh on `[-4,4]`;
+- `RKLUT.TANH_LOCAL = 5`: Q15 `4*tanh(x)` addressed by `z=16*x` near zero;
+- the local result is scaled by `1/4` on the NPU and selected on `[-0.25,0.25]`;
+- a clamped identity replaces the LUT inside `[-0.04,0.04]`;
+- device masks select exact `-1/+1` tails outside `[-4,4]`.
+
+The official normal and `[-300,-297]` extreme methods both pass. The plan is 35 stages with five scratch buffers.
 
 ## Current command contract
 

@@ -78,17 +78,17 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch focused verified matrix
 
-Latest complete uncached census after the two-level HardSwish milestone:
+Latest complete uncached census after the two-level tanh milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 106 |
-| FAIL | 306 |
+| PASS | 108 |
+| FAIL | 304 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `432 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 74.96 seconds.
+Pytest reports `430 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 85.25 seconds.
 
 | Group | Host compile checks | RK3588 checks | Status |
 |---|---:|---:|---|
@@ -97,10 +97,11 @@ in addition to their failed parent methods. Runtime was 74.96 seconds.
 | DPU ADD/MUL/MAX/DIV/copy/fill/ABS/WHERE/composed masks and structural liveness | included in compiler suite | included | PASS |
 | Generated variable-width EXP2 LUT | exhaustive 32,770 FP16 encodings in domain | 4 sizes | PASS |
 | Two-level HardSwish LUT | typed 36-stage plan | 1 dense sweep | PASS |
+| Two-level tanh LUT and saturation | typed 35-stage plan | 1 dense sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 30 | 11 (plus 4 subtests) | PASS |
+| Clean image/compiler suite total | 31 | 12 (plus 4 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
@@ -112,6 +113,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - DPU contiguous storage and one output;
 - direct and composed EXP2 use one variable-width task, but only the finite `[-2,2]` domain is correct;
 - HardSwish uses two generated LUT tasks with arithmetic/mask selection and no host fallback;
+- tanh uses two generated LUT tasks with near-zero correction and exact `-1/+1` saturation tails;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.

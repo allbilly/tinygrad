@@ -169,6 +169,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.HARDSWISH_LOCAL), 1)
     self.assertFalse(contains_uop(plan))
 
+  def test_tanh_uses_two_generated_luts(self):
+    plan = lower_dpu(sink(Tensor.empty(16,dtype=dtypes.half).tanh()))
+    self.assertEqual((len(plan.stages), len(plan.scratch)), (35, 5))
+    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.TANH), 1)
+    self.assertEqual(tuple(stage.op for stage in plan.stages).count(RKDPUOp.TANH_LOCAL), 1)
+    self.assertFalse(contains_uop(plan))
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

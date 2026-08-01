@@ -36,6 +36,8 @@ class RKDPUOp(IntEnum):
   DIV = 7
   HARDSWISH = 8
   HARDSWISH_LOCAL = 9
+  TANH = 10
+  TANH_LOCAL = 11
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -247,6 +249,26 @@ def _canonical_hardswish(u:UOp) -> UOp|None:
     if pos is not None and neg is not None and pos[0].key == source.key == neg[0].key and pos[1] == 3 and neg[1] == -3: return source
   return None
 
+def _canonical_tanh(u:UOp) -> UOp|None:
+  """Recognize tinygrad's 2/(1+exp2(-2*log2(e)*x))-1 decomposition."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.ADD: return None
+  term, offset = u.src
+  if _unwrap_same_cast(offset).op is not Ops.CONST: term, offset = offset, term
+  term, offset = _unwrap_same_cast(term), _unwrap_same_cast(offset)
+  if offset.op is not Ops.CONST or float(offset.arg) != -1 or term.op is not Ops.MUL: return None
+  scale = next((_unwrap_same_cast(x) for x in term.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+  reciprocal = next((_unwrap_same_cast(x) for x in term.src if _unwrap_same_cast(x).op is Ops.RECIPROCAL), None)
+  if scale is None or float(scale.arg) != 2 or reciprocal is None or (_unwrap_same_cast(reciprocal.src[0])).op is not Ops.ADD: return None
+  denominator = _unwrap_same_cast(reciprocal.src[0])
+  exponential = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.EXP2), None)
+  one = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+  if exponential is None or one is None or float(one.arg) != 1 or (_unwrap_same_cast(exponential.src[0])).op is not Ops.MUL: return None
+  scaled = _unwrap_same_cast(exponential.src[0])
+  source = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.INDEX), None)
+  factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST), None)
+  return source if source is not None and factor is not None and abs(factor + 2.8853900817779268) < 1e-3 else None
+
 def _canonical_relu_difference(u:UOp) -> UOp|None:
   """Recognize relu(x+0.5)-relu(x-0.5), tinygrad's clip(x+0.5, 0, 1)."""
   u = _unwrap_same_cast(u)
@@ -323,6 +345,24 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     corrected = _DPUExpr(RKDPUOp.MUL, (local, nonzero))
     ret = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (wide, _DPUExpr(RKDPUOp.SUB, (1.0, inside)))),
       _DPUExpr(RKDPUOp.MUL, (corrected, inside))))
+  elif (tanh_input:=_canonical_tanh(u)) is not None:
+    source = _parse_dpu_expr(tanh_input, output_index, memo)
+    if source is None: return None
+    def posmask(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+      return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+    def interval(low:float, high:float) -> _DPUExpr: return _DPUExpr(RKDPUOp.MUL, (posmask(source, low), posmask(high, source)))
+    broad, local_inside, near_inside = _DPUExpr(RKDPUOp.TANH, (source,)), interval(-0.25, 0.25), interval(-0.04, 0.04)
+    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.TANH_LOCAL, (_DPUExpr(RKDPUOp.MUL, (source, 16.0)),)), 0.25))
+    lower = _DPUExpr(RKDPUOp.MAX, (source, -0.04))
+    identity = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -0.04)), -1.0))
+    interior = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+      (broad, _DPUExpr(RKDPUOp.SUB, (1.0, local_inside)))), _DPUExpr(RKDPUOp.MUL,
+      (local, _DPUExpr(RKDPUOp.SUB, (local_inside, near_inside)))))), _DPUExpr(RKDPUOp.MUL, (identity, near_inside))))
+    low_mask, high_mask = posmask(-4.0, source), posmask(source, 4.0)
+    outside = _DPUExpr(RKDPUOp.MAX, (high_mask, low_mask))
+    sign = _DPUExpr(RKDPUOp.SUB, (high_mask, low_mask))
+    ret = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (interior, _DPUExpr(RKDPUOp.SUB, (1.0, outside)))),
+      _DPUExpr(RKDPUOp.MUL, (sign, outside))))
   elif (clamp_base:=_canonical_relu_difference(u)) is not None:
     base = _parse_dpu_expr(clamp_base, output_index, memo)
     if base is None: return None
@@ -522,7 +562,9 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
     RKDPUOp.EXP2:(rklut.RK_LUT_EXP2, rklut.RK_LUT_EXP2_BN_MUL, rklut.RK_LUT_EXP2_MINUS_EXP),
     RKDPUOp.HARDSWISH:(rklut.RK_LUT_HARDSWISH, rklut.RK_LUT_HARDSWISH_BN_MUL, rklut.RK_LUT_HARDSWISH_MINUS_EXP),
     RKDPUOp.HARDSWISH_LOCAL:(rklut.RK_LUT_HARDSWISH_LOCAL, rklut.RK_LUT_HARDSWISH_LOCAL_BN_MUL,
-                            rklut.RK_LUT_HARDSWISH_LOCAL_MINUS_EXP)}[plan.op]
+                            rklut.RK_LUT_HARDSWISH_LOCAL_MINUS_EXP),
+    RKDPUOp.TANH:(rklut.RK_LUT_TANH, rklut.RK_LUT_TANH_BN_MUL, rklut.RK_LUT_TANH_MINUS_EXP),
+    RKDPUOp.TANH_LOCAL:(rklut.RK_LUT_TANH_LOCAL, rklut.RK_LUT_TANH_LOCAL_BN_MUL, rklut.RK_LUT_TANH_LOCAL_MINUS_EXP)}[plan.op]
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
@@ -604,7 +646,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   for stage_idx, plan in enumerate(program.stages):
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
-    if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL):
+    if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:

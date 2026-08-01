@@ -67,4 +67,9 @@ class TestRockchip(unittest.TestCase):
     expected = (data.astype(np.float32)*np.clip(data.astype(np.float32)+3, 0, 6)/6).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").hardswish().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_two_level_tanh_lut(self):
+    data = np.linspace(-8, 8, 2049, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").tanh().numpy(), np.tanh(data.astype(np.float32)).astype(np.float16),
+                               rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()
