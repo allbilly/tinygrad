@@ -243,6 +243,22 @@ broad and midrange LUT assets plus a local polynomial replace the 61-stage
 Softplus/Tanh composition with 34 generic typed stages and meet the strict
 official comparison without host semantic work.
 
+At the generated Hardswish milestone, the uncached 2026-08-02 census completed
+without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 138 |
+| FAIL | 274 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 400 failures including the same 126 failing subtests. Runtime
+was 398.61 seconds. The exact one-method gain is `test_hardswish`; one generated
+broad LUT plus generic local and positive-tail arithmetic replaces the
+rounding-sensitive direct decomposition in 47 typed stages, entirely on the
+NPU.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -272,6 +288,7 @@ official comparison without host semantic work.
 | Generated two-level ERF tables and generic local polynomial | `test_erf` | Yes (research branch only) |
 | Generated Softplus tables reused by LogSigmoid | `test_softplus`, `test_logsigmoid` | Yes (research branch only) |
 | Generated Mish ranges with generic local arithmetic | `test_mish` | Yes (research branch only) |
+| Generated Hardswish broad range with generic local series | `test_hardswish` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

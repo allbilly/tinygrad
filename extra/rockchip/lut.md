@@ -259,3 +259,20 @@ the local selection masks. This prevents the RK3588 zero-entry conversion
 quirk from contaminating exact `mish(0)`. The compiler plan contains 34 typed
 stages and no Mish hardware opcode; `MISH` and `MISH_MID` are generated asset
 identities consumed by the generic LUT stage.
+
+## Hardswish range and local series
+
+The Hardswish recognizer recovers the input of tinygrad's
+`x*relu6(x+3)/6` decomposition. One generated Q14 table covers `[-2, 2]`;
+inside `[-0.125, 15/128]`, generic ALU stages evaluate the cancellation-safe
+identity `x*x/6 + x/2`. The same identity handles the positive `(2, 3)` tail,
+and values at or above three select the input directly. The original staged
+formula remains the negative-tail fallback.
+
+The generator exhaustively simulates all 32,770 finite FP16 encodings in the
+table domain. Its maximum absolute error is 0.00051116943359375, and maximum
+relative error for outputs above 0.01 is 0.0007416965546671742. A rejected
+second-level LUT is retained as commented WIP in the generator: scaling the
+input and output by 16 improved ordinary local values but exposed the RK3588
+zero-entry quirk for FP16 subnormals. The final plan has 47 typed stages, one
+generic LUT stage, and no Hardswish opcode or host semantic work.

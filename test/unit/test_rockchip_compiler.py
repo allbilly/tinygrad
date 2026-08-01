@@ -286,6 +286,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 40)
     self.assertFalse(contains_uop(plan))
 
+  def test_hardswish_uses_generated_broad_asset_and_local_series(self):
+    table = rklut.RK_LUT_HARDSWISH
+    self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), rklut.RK_LUT_HARDSWISH_SHA256)
+    self.assertLess(rklut.RK_LUT_HARDSWISH_SIM_MAX_REL_ERROR, 1e-3)
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).hardswish()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, {rklut.RKLUTId.HARDSWISH})
+    self.assertLessEqual(len(plan.stages), 48)
+    self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

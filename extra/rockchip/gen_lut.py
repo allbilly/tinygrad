@@ -93,6 +93,13 @@ MISH_MID_SCALE, MISH_MID_STEP = 8192.0, 32.0/8192.0
 mish_mid = [max(-32768, min(32767, round(mish_value(signed_sample(table, i, MISH_MID_STEP))*65536))) or 1
             for table in range(2) for i in range(SIZE)]
 # WIP reference: Q18/Q19 immediate-local MISH tables were less accurate on hardware than the FP16 Horner series.
+def hardswish_value(x:float) -> float: return x*min(6.0, max(0.0, x+3.0))/6.0
+HARDSWISH_SCALE, HARDSWISH_STEP = 8192.0, 32.0/8192.0
+hardswish = [max(-32768, min(32767, round(hardswish_value(signed_sample(table, i, HARDSWISH_STEP))*16384))) or 1
+             for table in range(2) for i in range(SIZE)]
+# WIP reference: a second table consuming z=16*x and returning 16*hardswish(float16(z/16)) regressed FP16 subnormals at the zero entry.
+# hardswish_local = [max(-32768, min(32767, round(hardswish_value(struct.unpack("<e", struct.pack("<e",
+#   signed_sample(table, i, STEP)/16))[0])*16*32768))) or 1 for table in range(2) for i in range(SIZE)]
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -311,6 +318,13 @@ for bits in range(1 << 16):
   else: got = interpolate(mish_mid, MISH_MID_STEP, 65536, x) if abs(x) < .5 else interpolate(mish_lut, MISH_STEP, 16384, x)
   reference = mish_value(x)
   mish_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
+hardswish_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 2: continue
+  got = half(half(half(x*x)*(1/6))+half(x*.5)) if -.125 < x < 15/128 else interpolate(hardswish, HARDSWISH_STEP, 16384, x)
+  reference = hardswish_value(x)
+  hardswish_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24), abs(reference)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -377,7 +391,8 @@ class RKLUTId(IntEnum):
   SOFTPLUS_DIV3_FAR = 37
   MISH = 38
   MISH_MID = 39
-RK_LUT_SCHEMA = 34
+  HARDSWISH = 40
+RK_LUT_SCHEMA = 35
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -610,6 +625,15 @@ RK_LUT_MISH_MID_ENTRIES = {SIZE}
 RK_LUT_MISH_MID_BN_MUL = {struct.unpack('<H', struct.pack('<e', MISH_MID_SCALE))[0]}
 RK_LUT_MISH_MID_MINUS_EXP = 16
 RK_LUT_MISH_MID = (\n{rows(mish_mid)}\n)
+RK_LUT_HARDSWISH_SHA256 = "{digest(hardswish)}"
+RK_LUT_HARDSWISH_DOMAIN = (-2.0, 2.0)
+RK_LUT_HARDSWISH_ENTRIES = {SIZE}
+RK_LUT_HARDSWISH_BN_MUL = {struct.unpack('<H', struct.pack('<e', HARDSWISH_SCALE))[0]}
+RK_LUT_HARDSWISH_MINUS_EXP = 14
+RK_LUT_HARDSWISH_VERIFIED_INPUTS = {len(hardswish_errors)}
+RK_LUT_HARDSWISH_SIM_MAX_ABS_ERROR = {max(x[0] for x in hardswish_errors)!r}
+RK_LUT_HARDSWISH_SIM_MAX_REL_ERROR = {max(x[1] for x in hardswish_errors if x[2] > .01)!r}
+RK_LUT_HARDSWISH = (\n{rows(hardswish)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}
