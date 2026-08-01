@@ -85,6 +85,14 @@ softplus_div3_near = [max(-32768, min(32767, round(math.log1p(math.exp(3*signed_
 SOFTPLUS_DIV3_FAR_SCALE, SOFTPLUS_DIV3_FAR_STEP = 8192.0, 32.0/8192.0
 softplus_div3_far = [max(-32768, min(32767, round(math.log1p(math.exp(3*signed_sample(table, i, SOFTPLUS_DIV3_FAR_STEP)))/3*1048576))) or 1
                      for table in range(2) for i in range(SIZE)]
+MISH_SCALE, MISH_STEP = 4096.0, 32.0/4096.0
+def mish_value(x:float) -> float: return x*math.tanh(math.log1p(math.exp(x)))
+mish_lut = [max(-32768, min(32767, round(mish_value(signed_sample(table, i, MISH_STEP))*16384))) or 1
+            for table in range(2) for i in range(SIZE)]
+MISH_MID_SCALE, MISH_MID_STEP = 8192.0, 32.0/8192.0
+mish_mid = [max(-32768, min(32767, round(mish_value(signed_sample(table, i, MISH_MID_STEP))*65536))) or 1
+            for table in range(2) for i in range(SIZE)]
+# WIP reference: Q18/Q19 immediate-local MISH tables were less accurate on hardware than the FP16 Horner series.
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -291,6 +299,18 @@ for bits in range(1 << 16):
         interpolate(softplus_div3_far, SOFTPLUS_DIV3_FAR_STEP, 1048576, x)
   reference = math.log1p(math.exp(3*x))/3
   softplus_div3_errors.append((abs(got-reference), abs(got-reference)/reference))
+mish_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 2: continue
+  if abs(x) < .125:
+    polynomial = half(-.016+half(x*(-86/1875)))
+    polynomial = half(.32+half(x*polynomial))
+    polynomial = half(.6+half(x*polynomial))
+    got = half(x*polynomial)
+  else: got = interpolate(mish_mid, MISH_MID_STEP, 65536, x) if abs(x) < .5 else interpolate(mish_lut, MISH_STEP, 16384, x)
+  reference = mish_value(x)
+  mish_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -355,7 +375,9 @@ class RKLUTId(IntEnum):
   SOFTPLUS_NEG = 35
   SOFTPLUS_DIV3_NEAR = 36
   SOFTPLUS_DIV3_FAR = 37
-RK_LUT_SCHEMA = 32
+  MISH = 38
+  MISH_MID = 39
+RK_LUT_SCHEMA = 34
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -573,6 +595,21 @@ RK_LUT_SOFTPLUS_DIV3_FAR_ENTRIES = {SIZE}
 RK_LUT_SOFTPLUS_DIV3_FAR_BN_MUL = {struct.unpack('<H', struct.pack('<e', SOFTPLUS_DIV3_FAR_SCALE))[0]}
 RK_LUT_SOFTPLUS_DIV3_FAR_MINUS_EXP = 20
 RK_LUT_SOFTPLUS_DIV3_FAR = (\n{rows(softplus_div3_far)}\n)
+RK_LUT_MISH_SHA256 = "{digest(mish_lut)}"
+RK_LUT_MISH_DOMAIN = (-2.0, 2.0)
+RK_LUT_MISH_ENTRIES = {SIZE}
+RK_LUT_MISH_BN_MUL = {struct.unpack('<H', struct.pack('<e', MISH_SCALE))[0]}
+RK_LUT_MISH_MINUS_EXP = 14
+RK_LUT_MISH_VERIFIED_INPUTS = {len(mish_errors)}
+RK_LUT_MISH_SIM_MAX_ABS_ERROR = {max(x[0] for x in mish_errors)!r}
+RK_LUT_MISH_SIM_MAX_REL_ERROR = {max(x[1] for x in mish_errors)!r}
+RK_LUT_MISH = (\n{rows(mish_lut)}\n)
+RK_LUT_MISH_MID_SHA256 = "{digest(mish_mid)}"
+RK_LUT_MISH_MID_DOMAIN = (-0.5, 0.5)
+RK_LUT_MISH_MID_ENTRIES = {SIZE}
+RK_LUT_MISH_MID_BN_MUL = {struct.unpack('<H', struct.pack('<e', MISH_MID_SCALE))[0]}
+RK_LUT_MISH_MID_MINUS_EXP = 16
+RK_LUT_MISH_MID = (\n{rows(mish_mid)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

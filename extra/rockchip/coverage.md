@@ -227,6 +227,22 @@ LUT tasks over the original input so the NPU does not expose an intermediate
 FP16 `3*x` rounding point. Mish now lowers to 61 typed stages but remains a
 strict numerical mismatch and is still counted as FAIL.
 
+At the generated Mish milestone, the uncached 2026-08-02 census completed
+without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 137 |
+| FAIL | 275 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 401 failures including the same 126 failing subtests. Runtime
+was 394.30 seconds. The exact one-method gain is `test_mish`; the generated
+broad and midrange LUT assets plus a local polynomial replace the 61-stage
+Softplus/Tanh composition with 34 generic typed stages and meet the strict
+official comparison without host semantic work.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -255,6 +271,7 @@ strict numerical mismatch and is still counted as FAIL.
 | Generated hyperbolic tables and generic overflow repair | `test_sinh`, `test_cosh` | Yes (research branch only) |
 | Generated two-level ERF tables and generic local polynomial | `test_erf` | Yes (research branch only) |
 | Generated Softplus tables reused by LogSigmoid | `test_softplus`, `test_logsigmoid` | Yes (research branch only) |
+| Generated Mish ranges with generic local arithmetic | `test_mish` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

@@ -485,6 +485,22 @@ def _softplus_expr(source:_Expr|RKArg, scale:float=1.0, input_scale:float=1.0) -
   negative_part = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.ADD, (residual, .5*scale)), inside))
   return _ALUExpr(Ops.ADD, (negative_part, positive_part))
 
+def _mish_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  mid_inside = _ALUExpr(Ops.MUL, (positive(source, -.5), positive(.5, source)))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.125), positive(.125, source)))
+  broad_source = _ALUExpr(Ops.ADD, (source, mid_inside))
+  lower = _ALUExpr(Ops.MAX, (broad_source, -2.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -2.0)), -1.0))
+  mid_source = _ALUExpr(Ops.ADD, (source, _ALUExpr(Ops.MUL, (local_inside, .25))))
+  local = _ALUExpr(Ops.MUL, (source, _ALUExpr(Ops.ADD, (.6, _ALUExpr(Ops.MUL, (source, _ALUExpr(Ops.ADD,
+    (.32, _ALUExpr(Ops.MUL, (source, _ALUExpr(Ops.ADD, (-.016, _ALUExpr(Ops.MUL, (source, -86/1875))))))))))))))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.MISH, (bounded,)), _sub(1.0, mid_inside))),
+    _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.MISH_MID, (mid_source,)), _sub(mid_inside, local_inside))))),
+    _ALUExpr(Ops.MUL, (local, local_inside))))
+  nonzero = _ALUExpr(Ops.MAX, (positive(source, 0.0), positive(0.0, source)))
+  return _ALUExpr(Ops.MUL, (selected, nonzero))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -763,6 +779,17 @@ def _canonical_softplus(u:UOp) -> tuple[UOp,float]|None:
        all(any(math.isclose(x, value) for x in constants) for value in (math.log2(math.e), polarity*math.log(2), -1.0)): return source, polarity
   return None
 
+def _canonical_mish(u:UOp) -> UOp|None:
+  """Recognize source*tanh(softplus(source))."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  for source, hyperbolic in (u.src, u.src[::-1]):
+    source, hyperbolic = _unwrap_same_cast(source), _unwrap_same_cast(hyperbolic)
+    softplus_u = _canonical_tanh(hyperbolic)
+    if softplus_u is None or (softplus:=_canonical_softplus(softplus_u)) is None: continue
+    if math.isclose(softplus[1], 1.0) and _unwrap_same_cast(softplus[0]).key == source.key: return source
+  return None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -834,6 +861,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(erf_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _erf_expr(operand)
+  elif (mish_input:=_canonical_mish(u)) is not None:
+    operand = _parse_alu(mish_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _mish_expr(operand)
   elif (softplus_input:=_canonical_softplus(u)) is not None:
     softplus_source, input_scale = softplus_input[0], 1.0
     if softplus_source.op is Ops.MUL:
@@ -1173,7 +1204,7 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.ATANH, RKLUTId.ATANH_EDGE, RKLUTId.ASINH, RKLUTId.ASINH_MID,
                       RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR,
                       RKLUTId.SINH, RKLUTId.COSH, RKLUTId.ERF, RKLUTId.ERF_LOCAL, RKLUTId.SOFTPLUS_NEG,
-                      RKLUTId.SOFTPLUS_DIV3_NEAR, RKLUTId.SOFTPLUS_DIV3_FAR):
+                      RKLUTId.SOFTPLUS_DIV3_NEAR, RKLUTId.SOFTPLUS_DIV3_FAR, RKLUTId.MISH, RKLUTId.MISH_MID):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

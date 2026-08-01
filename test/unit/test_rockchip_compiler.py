@@ -268,14 +268,23 @@ class TestDPUCompiler(unittest.TestCase):
     expressions = ((Tensor.empty(128,dtype=dtypes.half).softplus(), {rklut.RKLUTId.SOFTPLUS_NEG}),
                    (Tensor.empty(128,dtype=dtypes.half).softplus(beta=3),
                     {rklut.RKLUTId.SOFTPLUS_DIV3_NEAR, rklut.RKLUTId.SOFTPLUS_DIV3_FAR}),
-                   (Tensor.empty(128,dtype=dtypes.half).logsigmoid(), {rklut.RKLUTId.SOFTPLUS_NEG}),
-                   (Tensor.empty(128,dtype=dtypes.half).mish(), {rklut.RKLUTId.SOFTPLUS_NEG}))
+                   (Tensor.empty(128,dtype=dtypes.half).logsigmoid(), {rklut.RKLUTId.SOFTPLUS_NEG}))
     for expression, expected_luts in expressions:
       plan = lower_dpu(sink(expression))
       self.assertIsInstance(plan, RKDPUProgram)
       self.assertTrue(expected_luts.issubset({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}))
       self.assertLessEqual(len(plan.stages), 64)
       self.assertFalse(contains_uop(plan))
+
+  def test_mish_uses_generated_ranges_and_local_series(self):
+    for name in ("MISH", "MISH_MID"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).mish()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, {rklut.RKLUTId.MISH, rklut.RKLUTId.MISH_MID})
+    self.assertLessEqual(len(plan.stages), 40)
+    self.assertFalse(contains_uop(plan))
 
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)

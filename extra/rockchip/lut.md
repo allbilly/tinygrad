@@ -243,3 +243,19 @@ declared ranges, and the hardware test densely sweeps the default and scaled
 local domains plus magnitude-300 tails. Mish reuses the generic Softplus and
 Tanh plans and now fits in 61 stages, but it remains a strict numerical
 mismatch by up to one additional FP16 ULP and is not claimed by this milestone.
+
+## Mish ranges
+
+The follow-up Mish asset recognizes the existing
+`x*tanh(softplus(x))` decomposition and replaces its 61-stage composition with
+two generated data ranges plus generic local arithmetic. A broad Q14 table
+covers `[-2, 2]`, a Q16 table covers `[-0.5, 0.5]`, and the immediate
+`[-0.125, 0.125]` interval uses the fourth-order Horner series
+`x*(0.6+x*(0.32+x*(-0.016+x*(-86/1875))))`. The polynomial avoids the output
+quantization that exceeded strict relative tolerance near zero.
+
+Both LUT inputs are moved away from zero only when their outputs are dead under
+the local selection masks. This prevents the RK3588 zero-entry conversion
+quirk from contaminating exact `mish(0)`. The compiler plan contains 34 typed
+stages and no Mish hardware opcode; `MISH` and `MISH_MID` are generated asset
+identities consumed by the generic LUT stage.

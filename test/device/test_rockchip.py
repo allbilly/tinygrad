@@ -148,6 +148,11 @@ class TestRockchip(unittest.TestCase):
     extreme = np.array([-300, 300], dtype=np.float16)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").softplus().realize().numpy(), np.array([0, 300], dtype=np.float16))
 
+  def test_generated_mish_assets(self):
+    data = np.linspace(-2, 2, 4097, dtype=np.float16)
+    expected = (data.astype(np.float32)*np.tanh(np.logaddexp(data.astype(np.float32), 0))).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").mish().realize().numpy(), expected, rtol=1e-3, atol=1e-6)
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)
