@@ -112,6 +112,20 @@ was 265.33 seconds. This is an exact four-method gain from `9db9a4d33`:
 `test_tanh_extreme`. EXPM1 materially reduces the CELU/ELU/SELU residuals but
 does not yet turn those complete methods into passes.
 
+At the generated inverse-trigonometric milestone, the uncached 2026-08-02
+census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 127 |
+| FAIL | 285 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 411 failures including the same 126 failing subtests. Runtime
+was 299.24 seconds. The exact three-method gain is `test_asin`, `test_acos`,
+and `test_atan`; all use generated math assets through the generic LUT stage.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -133,6 +147,7 @@ does not yet turn those complete methods into passes.
 | Stable generic clip for ReLU-difference saturation | `test_hardsigmoid_extreme` | No |
 | Scaled-input reuse of the generated sigmoid LUT | `test_quick_gelu_extreme` | No |
 | Generated tanh ranges with a stable local polynomial | `test_tanh`, `test_tanh_extreme` | No |
+| Generated inverse-trigonometric tables and local/tail arithmetic | `test_asin`, `test_acos`, `test_atan` | Yes |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage

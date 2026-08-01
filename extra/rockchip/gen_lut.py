@@ -28,6 +28,22 @@ tanh_mid = [max(-32768, min(32767, round(math.tanh((-(512-i)*TANH_MID_STEP) if t
 TANH_LOCAL_SCALE, TANH_LOCAL_STEP = 65504.0, 32.0/65504.0
 tanh_local = [max(-32768, min(32767, round(math.tanh((-(512-i)*TANH_LOCAL_STEP) if table == 0 else i*TANH_LOCAL_STEP) * 262144)))
               for table in range(2) for i in range(SIZE)]
+ASIN_SCALE, ASIN_STEP = 16384.0, 32.0/16384.0
+asin = [max(-32768, min(32767, round(math.asin((-(512-i)*ASIN_STEP) if table == 0 else i*ASIN_STEP) * 16384)))
+        for table in range(2) for i in range(SIZE)]
+ASIN_LOCAL_SCALE, ASIN_LOCAL_STEP = 65504.0, 32.0/65504.0
+asin_local = [max(-32768, min(32767, round(math.asin((-(512-i)*ASIN_LOCAL_STEP) if table == 0 else i*ASIN_LOCAL_STEP) * 262144)))
+              for table in range(2) for i in range(SIZE)]
+asin_edge = []
+for table in range(2):
+  for i in range(SIZE):
+    raw = max(-32768, min(32767, round(math.acos(1-abs((-(512-i)*ASIN_LOCAL_STEP) if table == 0 else i*ASIN_LOCAL_STEP)) * 32768)))
+    asin_edge.append(1 if raw == 0 else raw)
+acos = [max(-32768, min(32767, round(math.acos((-(512-i)*ASIN_STEP) if table == 0 else i*ASIN_STEP) * 8192)))
+        for table in range(2) for i in range(SIZE)]
+ATAN_SCALE, ATAN_STEP = 2048.0, 32.0/2048.0
+atan = [max(-32768, min(32767, round(math.atan((-(512-i)*ATAN_STEP) if table == 0 else i*ATAN_STEP) * 16384)))
+        for table in range(2) for i in range(SIZE)]
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -71,6 +87,8 @@ errors = []
 exp_errors = []
 expm1_errors = []
 tanh_errors = []
+asin_errors = []
+acos_errors = []
 for bits in range(1 << 16):
   x = struct.unpack("<e", struct.pack("<H", bits))[0]
   if not math.isfinite(x) or not -2 <= x <= 2: continue
@@ -103,6 +121,31 @@ for bits in range(1 << 16):
     (tanh_position-tanh_index)*tanh_table[tanh_base+tanh_index+1]) / tanh_scale)
   tanh_reference = math.tanh(x)
   tanh_errors.append((abs(tanh_got-tanh_reference), abs(tanh_got-tanh_reference)/max(abs(tanh_reference), 2**-24)))
+  if -1 <= x <= 1:
+    if abs(x) > .875:
+      asin_position, asin_base, asin_table, asin_scale = (1-abs(x))/ASIN_LOCAL_STEP, SIZE, asin_edge, 32768
+      asin_index = min(511, max(0, math.floor(asin_position)))
+      edge_got = half(((1-(asin_position-asin_index))*asin_table[asin_base+asin_index] +
+        (asin_position-asin_index)*asin_table[asin_base+asin_index+1]) / asin_scale)
+      if abs(x) == 1: edge_got = 0.0
+      asin_got = half(math.copysign(half(half(math.pi/2)-edge_got), x))
+    else:
+      asin_step, asin_table, asin_scale = (ASIN_LOCAL_STEP, asin_local, 262144) if abs(x) < .125 else (ASIN_STEP, asin, 16384)
+      asin_position, asin_base = (x/asin_step+512, 0) if x < 0 else (x/asin_step, SIZE)
+      asin_index = min(511, max(0, math.floor(asin_position)))
+      asin_got = half(((1-(asin_position-asin_index))*asin_table[asin_base+asin_index] +
+        (asin_position-asin_index)*asin_table[asin_base+asin_index+1]) / asin_scale)
+    asin_reference = math.asin(x)
+    asin_errors.append((abs(asin_got-asin_reference), abs(asin_got-asin_reference)/max(abs(asin_reference), 2**-24)))
+    if abs(x) > .875:
+      acos_got = edge_got if x >= 0 else half(half(math.pi)-edge_got)
+    else:
+      acos_position, acos_base = (x/ASIN_STEP+512, 0) if x < 0 else (x/ASIN_STEP, SIZE)
+      acos_index = min(511, max(0, math.floor(acos_position)))
+      acos_got = half(((1-(acos_position-acos_index))*acos[acos_base+acos_index] +
+        (acos_position-acos_index)*acos[acos_base+acos_index+1]) / 8192)
+    acos_reference = math.acos(x)
+    acos_errors.append((abs(acos_got-acos_reference), abs(acos_got-acos_reference)/max(abs(acos_reference), 2**-24)))
 sigmoid_errors = []
 for bits in range(1 << 16):
   x = struct.unpack("<e", struct.pack("<H", bits))[0]
@@ -114,6 +157,19 @@ for bits in range(1 << 16):
   got = half(((1-(position-index))*table[base+index] + (position-index)*table[base+index+1]) / 32768)
   reference = sigmoid_value(x)
   sigmoid_errors.append((abs(got-reference), abs(got-reference)/reference))
+atan_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -8 <= x <= 8: continue
+  if abs(x) < .3:
+    x2, x3 = half(x*x), half(x*half(x*x))
+    got = half(half(x-half(x3/3))+half(half(x3*x2)/5))
+  else:
+    position, base = (x/ATAN_STEP+512, 0) if x < 0 else (x/ATAN_STEP, SIZE)
+    index = min(511, max(0, math.floor(position)))
+    got = half(((1-(position-index))*atan[base+index] + (position-index)*atan[base+index+1]) / 16384)
+  reference = math.atan(x)
+  atan_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -158,7 +214,12 @@ class RKLUTId(IntEnum):
   TANH = 15
   TANH_LOCAL = 16
   TANH_MID = 17
-RK_LUT_SCHEMA = 12
+  ASIN = 18
+  ASIN_LOCAL = 19
+  ASIN_EDGE = 20
+  ACOS = 21
+  ATAN = 22
+RK_LUT_SCHEMA = 17
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -223,6 +284,45 @@ RK_LUT_TANH_MID_MINUS_EXP = 16
 RK_LUT_TANH = (\n{rows(tanh)}\n)
 RK_LUT_TANH_LOCAL = (\n{rows(tanh_local)}\n)
 RK_LUT_TANH_MID = (\n{rows(tanh_mid)}\n)
+RK_LUT_ASIN_SHA256 = "{digest(asin)}"
+RK_LUT_ASIN_DOMAIN = (-1.0, 1.0)
+RK_LUT_ASIN_ENTRIES = {SIZE}
+RK_LUT_ASIN_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_SCALE))[0]}
+RK_LUT_ASIN_MINUS_EXP = 14
+RK_LUT_ASIN_VERIFIED_INPUTS = {len(asin_errors)}
+RK_LUT_ASIN_SIM_MAX_ABS_ERROR = {max(x[0] for x in asin_errors)!r}
+RK_LUT_ASIN_SIM_MAX_REL_ERROR = {max(x[1] for x in asin_errors)!r}
+RK_LUT_ASIN = (\n{rows(asin)}\n)
+RK_LUT_ASIN_LOCAL_SHA256 = "{digest(asin_local)}"
+RK_LUT_ASIN_LOCAL_DOMAIN = (-0.125, 0.125)
+RK_LUT_ASIN_LOCAL_ENTRIES = {SIZE}
+RK_LUT_ASIN_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_LOCAL_SCALE))[0]}
+RK_LUT_ASIN_LOCAL_MINUS_EXP = 18
+RK_LUT_ASIN_LOCAL = (\n{rows(asin_local)}\n)
+RK_LUT_ASIN_EDGE_SHA256 = "{digest(asin_edge)}"
+RK_LUT_ASIN_EDGE_DOMAIN = (-0.125, 0.125)
+RK_LUT_ASIN_EDGE_ENTRIES = {SIZE}
+RK_LUT_ASIN_EDGE_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_LOCAL_SCALE))[0]}
+RK_LUT_ASIN_EDGE_MINUS_EXP = 15
+RK_LUT_ASIN_EDGE = (\n{rows(asin_edge)}\n)
+RK_LUT_ACOS_SHA256 = "{digest(acos)}"
+RK_LUT_ACOS_DOMAIN = (-1.0, 1.0)
+RK_LUT_ACOS_ENTRIES = {SIZE}
+RK_LUT_ACOS_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_SCALE))[0]}
+RK_LUT_ACOS_MINUS_EXP = 13
+RK_LUT_ACOS_VERIFIED_INPUTS = {len(acos_errors)}
+RK_LUT_ACOS_SIM_MAX_ABS_ERROR = {max(x[0] for x in acos_errors)!r}
+RK_LUT_ACOS_SIM_MAX_REL_ERROR = {max(x[1] for x in acos_errors)!r}
+RK_LUT_ACOS = (\n{rows(acos)}\n)
+RK_LUT_ATAN_SHA256 = "{digest(atan)}"
+RK_LUT_ATAN_DOMAIN = (-8.0, 8.0)
+RK_LUT_ATAN_ENTRIES = {SIZE}
+RK_LUT_ATAN_BN_MUL = {struct.unpack('<H', struct.pack('<e', ATAN_SCALE))[0]}
+RK_LUT_ATAN_MINUS_EXP = 14
+RK_LUT_ATAN_VERIFIED_INPUTS = {len(atan_errors)}
+RK_LUT_ATAN_SIM_MAX_ABS_ERROR = {max(x[0] for x in atan_errors)!r}
+RK_LUT_ATAN_SIM_MAX_REL_ERROR = {max(x[1] for x in atan_errors)!r}
+RK_LUT_ATAN = (\n{rows(atan)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

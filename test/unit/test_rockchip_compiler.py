@@ -192,6 +192,23 @@ class TestDPUCompiler(unittest.TestCase):
                      {rklut.RKLUTId.TANH, rklut.RKLUTId.TANH_MID})
     self.assertFalse(contains_uop(plan))
 
+  def test_inverse_trig_uses_generated_math_assets(self):
+    for name in ("ASIN", "ASIN_LOCAL", "ASIN_EDGE", "ACOS", "ATAN"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_ASIN_SIM_MAX_ABS_ERROR, 3e-3)
+    self.assertLess(rklut.RK_LUT_ACOS_SIM_MAX_ABS_ERROR, 3e-3)
+    self.assertLess(rklut.RK_LUT_ATAN_SIM_MAX_REL_ERROR, 1e-3)
+    expected = ((Tensor.empty(128, dtype=dtypes.half).asin(), {rklut.RKLUTId.ASIN, rklut.RKLUTId.ASIN_EDGE}),
+                (Tensor.empty(128, dtype=dtypes.half).acos(), {rklut.RKLUTId.ACOS, rklut.RKLUTId.ASIN_EDGE}),
+                (Tensor.empty(128, dtype=dtypes.half).atan(), {rklut.RKLUTId.ATAN}))
+    for expression, luts in expected:
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}, luts)
+      self.assertLessEqual(len(plan.stages), 64)
+      self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

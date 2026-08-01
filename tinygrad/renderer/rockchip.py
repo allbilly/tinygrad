@@ -205,6 +205,10 @@ _Value = _Expr|RKArg|float
 def _sub(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _ALUExpr:
   return _ALUExpr(Ops.SUB, (lhs, rhs))
 
+def _nonzero_lut(lut:RKLUTId, source:_Expr|RKArg) -> _Expr:
+  nonzero = _ALUExpr(Ops.MAX, (_MaskExpr((_sub(source, 0.0),)), _MaskExpr((_sub(0.0, source),))))
+  return _ALUExpr(Ops.MUL, (_LUTExpr(lut, (source,)), nonzero))
+
 def _round_expr(source:_Expr|RKArg|float) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   negative = _ALUExpr(Ops.MUL, (source, -1.0))
@@ -284,6 +288,71 @@ def _tanh_expr(source:_Expr|RKArg) -> _Expr:
   bounded = _ALUExpr(Ops.ADD, (high_result, _ALUExpr(Ops.MUL, (_sub(-1.0, high_result), low))))
   nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
   return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (bounded, nan_denom)), nan_denom))
+
+def _asin_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  lower = _ALUExpr(Ops.MAX, (source, -1.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -1.0)), -1.0))
+  local_source = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, -.125)), -1.0)), -.125)), -1.0))
+  local_square = _ALUExpr(Ops.MUL, (local_source, local_source))
+  local_cube = _ALUExpr(Ops.MUL, (local_source, local_square))
+  local = _ALUExpr(Ops.ADD, (local_source, _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (local_cube, 1/6)),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (local_cube, local_square)), 3/40))))))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.125), positive(.125, source)))
+  magnitude = _ALUExpr(Ops.MAX, (source, _ALUExpr(Ops.MUL, (source, -1.0))))
+  distance = _ALUExpr(Ops.MAX, (_sub(1.0, magnitude), 0.0))
+  distance = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (distance, -1.0)), -.125)), -1.0))
+  # WIP alternative kept for hardware study: sqrt(2*d)*(1+d/12+3*d*d/160+5*d*d*d/896).
+  # It is accurate but needs enough generic stages to exceed RKImage's dependency mask on atan.
+  edge = _nonzero_lut(RKLUTId.ASIN_EDGE, distance)
+  sign = _sub(positive(source, 0.0), positive(0.0, source))
+  edge_result = _ALUExpr(Ops.MUL, (_sub(math.pi/2, edge), sign))
+  edge_inside = positive(magnitude, .875)
+  broad_inside = _sub(1.0, _ALUExpr(Ops.MAX, (local_inside, edge_inside)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.ASIN, (bounded,)), broad_inside)),
+    _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (local, local_inside)), _ALUExpr(Ops.MUL, (edge_result, edge_inside))))))
+  invalid = _ALUExpr(Ops.MAX, (positive(source, 1.0), positive(-1.0, source)))
+  valid = _sub(1.0, invalid)
+  return _ALUExpr(Ops.MUL, (selected, _ALUExpr(Ops.FDIV, (valid, valid))))
+
+def _acos_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  lower = _ALUExpr(Ops.MAX, (source, -1.0))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -1.0)), -1.0))
+  magnitude = _ALUExpr(Ops.MAX, (source, _ALUExpr(Ops.MUL, (source, -1.0))))
+  distance = _ALUExpr(Ops.MAX, (_sub(1.0, magnitude), 0.0))
+  distance = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (distance, -1.0)), -.125)), -1.0))
+  edge = _nonzero_lut(RKLUTId.ASIN_EDGE, distance)
+  positive_input, negative_input = positive(source, 0.0), positive(0.0, source)
+  edge_result = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (edge, positive_input)),
+    _ALUExpr(Ops.MUL, (_sub(math.pi, edge), negative_input))))
+  edge_inside = positive(magnitude, .875)
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.ACOS, (bounded,)), _sub(1.0, edge_inside))),
+    _ALUExpr(Ops.MUL, (edge_result, edge_inside))))
+  invalid = _ALUExpr(Ops.MAX, (positive(source, 1.0), positive(-1.0, source)))
+  valid = _sub(1.0, invalid)
+  return _ALUExpr(Ops.MUL, (selected, _ALUExpr(Ops.FDIV, (valid, valid))))
+
+def _atan_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def clamp(value:_Expr|RKArg, limit:float) -> _Expr:
+    lower = _ALUExpr(Ops.MAX, (value, -limit))
+    return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (lower, -1.0)), -limit)), -1.0))
+  broad = _LUTExpr(RKLUTId.ATAN, (clamp(source, 8.0),))
+  local_source = clamp(source, .3)
+  local_square = _ALUExpr(Ops.MUL, (local_source, local_source))
+  local_cube = _ALUExpr(Ops.MUL, (local_source, local_square))
+  local = _ALUExpr(Ops.ADD, (_sub(local_source, _ALUExpr(Ops.MUL, (local_cube, 1/3))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (local_cube, local_square)), 1/5))))
+  local_inside = _ALUExpr(Ops.MUL, (positive(source, -.3), positive(.3, source)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.MUL, (local, local_inside))))
+  high, low = positive(source, 8.0), positive(-8.0, source)
+  tail_inside = _ALUExpr(Ops.MAX, (high, low))
+  safe_denominator = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (source, tail_inside)), _sub(1.0, tail_inside)))
+  tail = _sub(_ALUExpr(Ops.MUL, (_sub(high, low), math.pi/2)), _ALUExpr(Ops.FDIV, (1.0, safe_denominator)))
+  bounded = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (selected, _sub(1.0, tail_inside))), _ALUExpr(Ops.MUL, (tail, tail_inside))))
+  valid = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
+  return _ALUExpr(Ops.MUL, (bounded, _ALUExpr(Ops.FDIV, (valid, valid))))
 
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
@@ -395,20 +464,68 @@ def _canonical_expm1(u:UOp) -> tuple[UOp,float,float]|None:
     if source is not None and factor is not None and math.isclose(abs(factor), math.log2(math.e)): return source, math.copysign(1.0, factor), polarity
   return None
 
+def _canonical_sign(u:UOp) -> UOp|None:
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.WHERE: return None
+  cond, nonzero, zero = (_unwrap_same_cast(x) for x in u.src)
+  if cond.op is not Ops.CMPNE or zero.op is not Ops.CONST or float(zero.arg) != 0 or nonzero.op is not Ops.WHERE: return None
+  less, negative, positive = (_unwrap_same_cast(x) for x in nonzero.src)
+  compared = tuple(_unwrap_same_cast(x) for x in cond.src)
+  for data, zero_cmp in (compared, compared[::-1]):
+    if zero_cmp.op is not Ops.CONST or float(zero_cmp.arg) != 0 or less.op is not Ops.CMPLT: continue
+    less_lhs, less_rhs = (_unwrap_same_cast(x) for x in less.src)
+    if (less_lhs.key == data.key and less_rhs.op is Ops.CONST and float(less_rhs.arg) == 0 and
+        negative.op is Ops.CONST and float(negative.arg) == -1 and positive.op is Ops.CONST and float(positive.arg) == 1): return data
+  return None
+
 def _canonical_abs(u:UOp) -> UOp|None:
   u = _unwrap_same_cast(u)
   if u.op is not Ops.MUL: return None
   for data, sign in (u.src, u.src[::-1]):
     data, sign = _unwrap_same_cast(data), _unwrap_same_cast(sign)
-    if data.op is not Ops.INDEX or sign.op is not Ops.WHERE: continue
-    cond, nonzero, zero = (_unwrap_same_cast(x) for x in sign.src)
-    if cond.op is not Ops.CMPNE or zero.op is not Ops.CONST or float(zero.arg) != 0 or nonzero.op is not Ops.WHERE: continue
-    less, negative, positive = (_unwrap_same_cast(x) for x in nonzero.src)
-    compared = tuple(_unwrap_same_cast(x) for x in cond.src)
-    if (less.op is Ops.CMPLT and compared[0].key == data.key and compared[1].op is Ops.CONST and float(compared[1].arg) == 0 and
-        _unwrap_same_cast(less.src[0]).key == data.key and _unwrap_same_cast(less.src[1]).op is Ops.CONST and
-        float(_unwrap_same_cast(less.src[1]).arg) == 0 and negative.op is Ops.CONST and float(negative.arg) == -1 and
-        positive.op is Ops.CONST and float(positive.arg) == 1): return data
+    sign_input = _canonical_sign(sign)
+    if sign_input is not None and sign_input.key == data.key: return data
+  return None
+
+def _canonical_asin(u:UOp) -> UOp|None:
+  """Recognize tinygrad's sign(x)*(pi/2-sqrt(1-abs(x))*poly(abs(x)))."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.MUL: return None
+  coefficients = (-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810,
+                  -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050)
+  for sign, body in (u.src, u.src[::-1]):
+    source = _canonical_sign(sign)
+    if source is None: continue
+    nodes = _unwrap_same_cast(body).toposort()
+    constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+    if not any(x.op is Ops.SQRT for x in nodes) or not all(any(math.isclose(x, value) for x in constants) for value in coefficients): continue
+    if any((absolute:=_canonical_abs(x)) is not None and absolute.key == source.key for x in nodes): return source
+  return None
+
+def _canonical_acos(u:UOp) -> UOp|None:
+  """Recognize pi/2-asin(x) after asin has decomposed."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.ADD: return None
+  for constant, negative in (u.src, u.src[::-1]):
+    constant, negative = _unwrap_same_cast(constant), _unwrap_same_cast(negative)
+    if constant.op is not Ops.CONST or not math.isclose(float(constant.arg), math.pi/2) or negative.op is not Ops.MUL: continue
+    minus_one = next((_unwrap_same_cast(x) for x in negative.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    asin_u = next((_unwrap_same_cast(x) for x in negative.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+    if minus_one is not None and float(minus_one.arg) == -1 and asin_u is not None and (source:=_canonical_asin(asin_u)) is not None: return source
+  return None
+
+def _canonical_atan(u:UOp) -> UOp|None:
+  """Recognize asin(x/sqrt(1+x*x)) and recover x."""
+  if (normalized:=_canonical_asin(u)) is None or (normalized:=_unwrap_same_cast(normalized)).op is not Ops.MUL: return None
+  for source, reciprocal in (normalized.src, normalized.src[::-1]):
+    source, reciprocal = _unwrap_same_cast(source), _unwrap_same_cast(reciprocal)
+    if reciprocal.op is not Ops.RECIPROCAL or (root:=_unwrap_same_cast(reciprocal.src[0])).op is not Ops.SQRT: continue
+    denominator = _unwrap_same_cast(root.src[0])
+    if denominator.op is not Ops.ADD: continue
+    one = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    square = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.MUL), None)
+    if (one is not None and float(one.arg) == 1 and square is not None and
+        all(_unwrap_same_cast(x).key == source.key for x in square.src)): return source
   return None
 
 def _canonical_round(u:UOp) -> UOp|None:
@@ -484,6 +601,18 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     if expm1[1] < 0: operand = _ALUExpr(Ops.MUL, (operand, -1.0))
     ret = _expm1_expr(operand)
     if expm1[2] < 0: ret = _ALUExpr(Ops.MUL, (ret, -1.0))
+  elif (atan_input:=_canonical_atan(u)) is not None:
+    operand = _parse_alu(atan_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _atan_expr(operand)
+  elif (acos_input:=_canonical_acos(u)) is not None:
+    operand = _parse_alu(acos_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _acos_expr(operand)
+  elif (asin_input:=_canonical_asin(u)) is not None:
+    operand = _parse_alu(asin_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _asin_expr(operand)
   elif (sigmoid:=_canonical_sigmoid(u)) is not None:
     operand = _parse_alu(sigmoid[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -773,7 +902,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
   if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.EXPM1, RKLUTId.EXPM1_LOCAL,
                       RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL, RKLUTId.TANH, RKLUTId.TANH_MID, RKLUTId.TANH_LOCAL,
-                      RKLUTId.SQRT, RKLUTId.RSQRT, RKLUTId.LOG2, RKLUTId.LOG2_LOCAL, RKLUTId.LOG10, RKLUTId.LOG10_LOCAL):
+                      RKLUTId.SQRT, RKLUTId.RSQRT, RKLUTId.LOG2, RKLUTId.LOG2_LOCAL, RKLUTId.LOG10, RKLUTId.LOG10_LOCAL,
+                      RKLUTId.ASIN, RKLUTId.ASIN_LOCAL, RKLUTId.ASIN_EDGE, RKLUTId.ACOS, RKLUTId.ATAN):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

@@ -88,6 +88,18 @@ class TestRockchip(unittest.TestCase):
     extreme = np.array([-400, -300, 300, 400], dtype=np.float16)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").tanh().realize().numpy(), np.tanh(extreme))
 
+  def test_generated_inverse_trig_assets(self):
+    unit = np.linspace(-1, 1, 4097, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(unit, device="ROCKCHIP").asin().realize().numpy(),
+                               np.arcsin(unit.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    np.testing.assert_allclose(Tensor(unit, device="ROCKCHIP").acos().realize().numpy(),
+                               np.arccos(unit.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    broad = np.linspace(-8, 8, 4097, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(broad, device="ROCKCHIP").atan().realize().numpy(),
+                               np.arctan(broad.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
+    invalid = np.array([-300, 300], dtype=np.float16)
+    self.assertTrue(np.isnan(Tensor(invalid, device="ROCKCHIP").asin().realize().numpy()).all())
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)

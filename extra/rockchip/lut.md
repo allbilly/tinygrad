@@ -141,3 +141,20 @@ quantization that remained visible near zero and is clamped before evaluation
 so unselected extreme inputs cannot overflow and contaminate the result.
 Generic masks saturate finite tails and preserve NaN behavior. Both strict
 `test_tanh` methods pass on RK3588 without a tanh DPU opcode or host fallback.
+
+## Inverse trigonometric functions
+
+Tinygrad decomposes `acos(x)` through `asin(x)` and `atan(x)` through
+`asin(x/sqrt(1+x*x))`. The compiler recognizes those decompositions before
+they consume the 64-stage dependency mask. ASIN and ACOS use independent broad
+generated tables because subtracting a Q14 ASIN result from pi/2 loses ACOS
+precision. They share a high-resolution edge table indexed by `1-abs(x)`;
+ASIN additionally uses a local odd polynomial near zero. The edge payload
+encodes mathematical zero as the smallest nonzero value and a generic nonzero
+mask restores exact zero, avoiding the RK3588 LUT engine's zero-entry quirk.
+
+ATAN uses one broad table over `[-8, 8]`, an odd local polynomial through the
+fifth power, and the generic asymptotic tail `sign(x)*pi/2-1/x`. ASIN, ACOS,
+and ATAN all pass their complete forward-only TestOps methods, including the
+declared invalid-domain and large-magnitude cases. These are LUT asset
+identities consumed by `RKLUTStage`, not target opcodes.

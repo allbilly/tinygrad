@@ -79,8 +79,8 @@ and has no skip on an RK3588 host.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This backend branch currently
-contains 25,889, so `MAX_LINE_COUNT=25000 python sz.py` fails by 889 lines. The
-handwritten backend is 916 counted lines (843 renderer/compiler and 73
+contains 26,006, so `MAX_LINE_COUNT=25000 python sz.py` fails by 1,006 lines. The
+handwritten backend is 1,033 counted lines (960 renderer/compiler and 73
 runtime). The code must not be hidden under `runtime/autogen` or moved out of
 tree to evade this limit. The generic native-program hook is an independent
 five-line counted change and can be reviewed separately; the backend needs
