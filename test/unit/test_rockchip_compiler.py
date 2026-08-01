@@ -259,6 +259,24 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 52)
     self.assertFalse(contains_uop(plan))
 
+  def test_softplus_asset_is_reused_by_compositions(self):
+    for name in ("SOFTPLUS_NEG", "SOFTPLUS_DIV3_NEAR", "SOFTPLUS_DIV3_FAR"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_SOFTPLUS_NEG_SIM_MAX_REL_ERROR, 1e-3)
+    self.assertLess(rklut.RK_LUT_SOFTPLUS_DIV3_NEAR_SIM_MAX_REL_ERROR, 1e-3)
+    expressions = ((Tensor.empty(128,dtype=dtypes.half).softplus(), {rklut.RKLUTId.SOFTPLUS_NEG}),
+                   (Tensor.empty(128,dtype=dtypes.half).softplus(beta=3),
+                    {rklut.RKLUTId.SOFTPLUS_DIV3_NEAR, rklut.RKLUTId.SOFTPLUS_DIV3_FAR}),
+                   (Tensor.empty(128,dtype=dtypes.half).logsigmoid(), {rklut.RKLUTId.SOFTPLUS_NEG}),
+                   (Tensor.empty(128,dtype=dtypes.half).mish(), {rklut.RKLUTId.SOFTPLUS_NEG}))
+    for expression, expected_luts in expressions:
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertTrue(expected_luts.issubset({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}))
+      self.assertLessEqual(len(plan.stages), 64)
+      self.assertFalse(contains_uop(plan))
+
   def test_sqrt_uses_generated_seed_and_generic_refinement(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_SQRT)}h", *rklut.RK_LUT_SQRT)
     self.assertEqual(hashlib.sha256(payload).hexdigest(), rklut.RK_LUT_SQRT_SHA256)

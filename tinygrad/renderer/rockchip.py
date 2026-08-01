@@ -465,6 +465,26 @@ def _erf_expr(source:_Expr|RKArg) -> _Expr:
   high, low = positive(source, 2.0), positive(-2.0, source)
   return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (selected, _sub(1.0, _ALUExpr(Ops.MAX, (high, low))))), _sub(high, low)))
 
+def _softplus_expr(source:_Expr|RKArg, scale:float=1.0, input_scale:float=1.0) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  negative_abs = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, _ALUExpr(Ops.MUL, (source, -1.0)))), -1.0))
+  if math.isclose(input_scale, 3.0) and math.isclose(scale, 1/3):
+    near_source = _ALUExpr(Ops.MAX, (negative_abs, -1.0))
+    far_lower = _ALUExpr(Ops.MAX, (negative_abs, -2.0))
+    far_source = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (far_lower, -1.0)), 2.5/3)), -1.0))
+    near_inside, domain_inside = positive(negative_abs, -.834), positive(negative_abs, -2.01)
+    negative_part = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.SOFTPLUS_DIV3_NEAR, (near_source,)), near_inside)),
+      _ALUExpr(Ops.MUL, (_LUTExpr(RKLUTId.SOFTPLUS_DIV3_FAR, (far_source,)), _sub(domain_inside, near_inside)))))
+    return _ALUExpr(Ops.ADD, (negative_part, _ALUExpr(Ops.MAX, (source, 0.0))))
+  bounded = _ALUExpr(Ops.MAX, (negative_abs, -4.0))
+  inside = positive(negative_abs, -4.01)
+  residual:_Expr = _LUTExpr(RKLUTId.SOFTPLUS_NEG, (bounded,))
+  positive_part:_Expr = _ALUExpr(Ops.MAX, (source, 0.0))
+  if scale != 1.0:
+    residual, positive_part = _ALUExpr(Ops.MUL, (residual, scale)), _ALUExpr(Ops.MUL, (positive_part, scale))
+  negative_part = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.ADD, (residual, .5*scale)), inside))
+  return _ALUExpr(Ops.ADD, (negative_part, positive_part))
+
 def _sqrt_expr(source:_Expr|RKArg) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   refined:_Expr = _LUTExpr(RKLUTId.SQRT, (source,))
@@ -718,6 +738,31 @@ def _canonical_erf(u:UOp) -> UOp|None:
   return indexes[0] if len(indexes) == 1 and any(x.op is Ops.EXP2 for x in nodes) and \
     all(any(math.isclose(x, value) for x in constants) for value in coefficients) else None
 
+def _canonical_softplus(u:UOp) -> tuple[UOp,float]|None:
+  """Recognize +/-logaddexp(source, 0) after EXP and LOG decomposition."""
+  u = _unwrap_same_cast(u)
+  if u.op is Ops.MUL:
+    factor = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+    body = next((_unwrap_same_cast(x) for x in u.src if _unwrap_same_cast(x).op is not Ops.CONST), None)
+    if factor is not None and body is not None and (base:=_canonical_softplus(body)) is not None: return base[0], base[1]*float(factor.arg)
+  if u.op is not Ops.ADD: return None
+  for maximum, logarithm in (u.src, u.src[::-1]):
+    maximum, polarity = _unwrap_same_cast(maximum), 1.0
+    if maximum.op is Ops.MUL:
+      factor = next((_unwrap_same_cast(x) for x in maximum.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      if factor is None or float(factor.arg) != -1: continue
+      maximum, polarity = _unwrap_same_cast(maximum.src[0] if _unwrap_same_cast(maximum.src[1]).key == factor.key else maximum.src[1]), -1.0
+    if maximum.op is not Ops.MAX: continue
+    operands = tuple(_unwrap_same_cast(x) for x in maximum.src)
+    zero = next((x for x in operands if x.op is Ops.CONST and float(x.arg) == 0), None)
+    if zero is None: continue
+    source = operands[0] if operands[1].key == zero.key else operands[1]
+    nodes = _unwrap_same_cast(logarithm).toposort()
+    constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+    if sum(x.op is Ops.EXP2 for x in nodes) == 2 and sum(x.op is Ops.LOG2 for x in nodes) == 1 and \
+       all(any(math.isclose(x, value) for x in constants) for value in (math.log2(math.e), polarity*math.log(2), -1.0)): return source, polarity
+  return None
+
 def _canonical_round(u:UOp) -> UOp|None:
   """Recognize tinygrad's exact round-to-nearest-even expansion."""
   u = _unwrap_same_cast(u)
@@ -789,6 +834,16 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(erf_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _erf_expr(operand)
+  elif (softplus_input:=_canonical_softplus(u)) is not None:
+    softplus_source, input_scale = softplus_input[0], 1.0
+    if softplus_source.op is Ops.MUL:
+      factor = next((_unwrap_same_cast(x) for x in softplus_source.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+      if factor is not None and math.isclose(float(factor.arg), 3.0):
+        input_scale = 3.0
+        softplus_source = softplus_source.src[0] if _unwrap_same_cast(softplus_source.src[1]).key == factor.key else softplus_source.src[1]
+    operand = _parse_alu(softplus_source, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _softplus_expr(operand, softplus_input[1], input_scale)
   elif (tanh_input:=_canonical_tanh(u)) is not None:
     operand = _parse_alu(tanh_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -829,9 +884,9 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     if not math.isclose(sigmoid[1], 1.0): operand = _ALUExpr(Ops.MUL, (operand, sigmoid[1]))
     ret = _sigmoid_expr(operand)
   elif (rounded:=_canonical_round(u)) is not None:
-    source = _parse_alu(rounded, output_index, memo)
-    if source is None: return None
-    ret = _round_expr(source)
+    rounded_source = _parse_alu(rounded, output_index, memo)
+    if rounded_source is None: return None
+    ret = _round_expr(rounded_source)
   elif (abs_input:=_canonical_abs(u)) is not None:
     operand = _parse_alu(abs_input, output_index, memo)
     if operand is None: return None
@@ -1117,7 +1172,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.ASIN, RKLUTId.ASIN_LOCAL, RKLUTId.ASIN_EDGE, RKLUTId.ACOS, RKLUTId.ATAN,
                       RKLUTId.ATANH, RKLUTId.ATANH_EDGE, RKLUTId.ASINH, RKLUTId.ASINH_MID,
                       RKLUTId.ACOSH, RKLUTId.ACOSH_MID, RKLUTId.ACOSH_EDGE, RKLUTId.ASINH_NEAR,
-                      RKLUTId.SINH, RKLUTId.COSH, RKLUTId.ERF, RKLUTId.ERF_LOCAL):
+                      RKLUTId.SINH, RKLUTId.COSH, RKLUTId.ERF, RKLUTId.ERF_LOCAL, RKLUTId.SOFTPLUS_NEG,
+                      RKLUTId.SOFTPLUS_DIV3_NEAR, RKLUTId.SOFTPLUS_DIV3_FAR):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

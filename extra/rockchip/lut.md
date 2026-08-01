@@ -219,3 +219,27 @@ from zero; that LUT output is dead by construction, while every live local-LUT
 input and the near-zero polynomial remain unchanged. This is preferable to a
 tolerance exception because exact zero and the complete dense hardware sweep
 then follow the intended numerical path.
+
+## Softplus and LogSigmoid
+
+The compiler recognizes the stable `logaddexp(x, 0)` decomposition rather
+than matching a Tensor method name. It evaluates
+`softplus(x) = softplus(-abs(x)) + max(x, 0)`: the generated signed Q16 table
+stores the cancellation-resistant residual `softplus(-abs(x)) - 0.5`, and
+generic ALU stages restore the offset and positive part. Negating the same
+recognized form implements LogSigmoid, so no separate LogSigmoid asset or
+target opcode is required.
+
+`beta=3` needs a two-task table over the original input. If `3*x` is first
+written to FP16 scratch, its rounding differs from the fused Softplus
+reference at the strict TestOps threshold. The near Q17 table covers original
+inputs `[-5/6, 0]`; the far Q20 table covers `[-2, -5/6]`. Both directly encode
+`softplus(3*x)/3`, and `max(x, 0)` supplies the positive branch. Their input
+scales are powers of two (`16384` and `8192`), avoiding the hardware index
+drift observed with the non-representable ideal scale `6553.6`.
+
+The generator exhaustively simulates every finite FP16 encoding in the
+declared ranges, and the hardware test densely sweeps the default and scaled
+local domains plus magnitude-300 tails. Mish reuses the generic Softplus and
+Tanh plans and now fits in 61 stages, but it remains a strict numerical
+mismatch by up to one additional FP16 ULP and is not claimed by this milestone.

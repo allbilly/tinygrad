@@ -135,6 +135,19 @@ class TestRockchip(unittest.TestCase):
     extreme = np.array([-300, 300], dtype=np.float16)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").erf().realize().numpy(), np.array([-1, 1], dtype=np.float16))
 
+  def test_generated_softplus_assets_and_logsigmoid(self):
+    data = np.linspace(-2, 2, 4097, dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").softplus().realize().numpy(),
+                               np.logaddexp(data.astype(np.float32), 0).astype(np.float16), rtol=1e-3, atol=1e-6)
+    local = np.linspace(-.5, .5, 2049, dtype=np.float16)
+    for beta in (3, 1/3):
+      expected = (np.logaddexp(beta*local.astype(np.float32), 0)/beta).astype(np.float16)
+      np.testing.assert_allclose(Tensor(local, device="ROCKCHIP").softplus(beta=beta).realize().numpy(), expected, rtol=1e-3, atol=1e-6)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").logsigmoid().realize().numpy(),
+                               -np.logaddexp(-data.astype(np.float32), 0).astype(np.float16), rtol=1e-3, atol=1e-6)
+    extreme = np.array([-300, 300], dtype=np.float16)
+    np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").softplus().realize().numpy(), np.array([0, 300], dtype=np.float16))
+
   def test_generated_two_level_sigmoid_lut(self):
     data = np.linspace(-2, 2, 4097, dtype=np.float16)
     expected = (1/(1+np.exp(-data.astype(np.float32)))).astype(np.float16)

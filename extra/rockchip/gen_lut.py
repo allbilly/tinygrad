@@ -76,6 +76,15 @@ erf_lut = [max(-32768, min(32767, round(math.erf(signed_sample(table, i, STEP))*
            for table in range(2) for i in range(SIZE)]
 erf_local = [max(-32768, min(32767, round(math.erf(signed_sample(table, i, ASIN_LOCAL_STEP))*65536))) or 1
              for table in range(2) for i in range(SIZE)]
+SOFTPLUS_SCALE, SOFTPLUS_STEP = 4096.0, 32.0/4096.0
+softplus_neg = [max(-32768, min(32767, round((math.log1p(math.exp(signed_sample(table, i, SOFTPLUS_STEP)))-.5)*65536))) or 1
+                for table in range(2) for i in range(SIZE)]
+SOFTPLUS_DIV3_NEAR_SCALE, SOFTPLUS_DIV3_NEAR_STEP = 16384.0, 32.0/16384.0
+softplus_div3_near = [max(-32768, min(32767, round(math.log1p(math.exp(3*signed_sample(table, i, SOFTPLUS_DIV3_NEAR_STEP)))/3*131072))) or 1
+                      for table in range(2) for i in range(SIZE)]
+SOFTPLUS_DIV3_FAR_SCALE, SOFTPLUS_DIV3_FAR_STEP = 8192.0, 32.0/8192.0
+softplus_div3_far = [max(-32768, min(32767, round(math.log1p(math.exp(3*signed_sample(table, i, SOFTPLUS_DIV3_FAR_STEP)))/3*1048576))) or 1
+                     for table in range(2) for i in range(SIZE)]
 def sigmoid_value(x:float) -> float: return 1/(1+math.exp(-x))
 SIGMOID_SCALE, SIGMOID_STEP = 2048.0, 32.0/2048.0
 sigmoid = [max(-32768, min(32767, round(sigmoid_value((-(512-i)*SIGMOID_STEP) if table == 0 else i*SIGMOID_STEP) * 32768)))
@@ -268,6 +277,20 @@ for bits in range(1 << 16):
   else: got = interpolate(erf_lut, STEP, 32768, x)
   reference = math.erf(x)
   erf_errors.append((abs(got-reference), abs(got-reference)/max(abs(reference), 2**-24)))
+softplus_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 0: continue
+  got, reference = interpolate(softplus_neg, SOFTPLUS_STEP, 65536, x)+.5, math.log1p(math.exp(x))
+  softplus_errors.append((abs(got-reference), abs(got-reference)/reference))
+softplus_div3_errors = []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 0: continue
+  got = interpolate(softplus_div3_near, SOFTPLUS_DIV3_NEAR_STEP, 131072, x) if x >= -2.5/3 else \
+        interpolate(softplus_div3_far, SOFTPLUS_DIV3_FAR_STEP, 1048576, x)
+  reference = math.log1p(math.exp(3*x))/3
+  softplus_div3_errors.append((abs(got-reference), abs(got-reference)/reference))
 sqrt_errors = []
 rsqrt_errors = []
 for bits in range(1 << 16):
@@ -329,7 +352,10 @@ class RKLUTId(IntEnum):
   COSH = 32
   ERF = 33
   ERF_LOCAL = 34
-RK_LUT_SCHEMA = 29
+  SOFTPLUS_NEG = 35
+  SOFTPLUS_DIV3_NEAR = 36
+  SOFTPLUS_DIV3_FAR = 37
+RK_LUT_SCHEMA = 32
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -523,6 +549,30 @@ RK_LUT_ERF_LOCAL_ENTRIES = {SIZE}
 RK_LUT_ERF_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', ASIN_LOCAL_SCALE))[0]}
 RK_LUT_ERF_LOCAL_MINUS_EXP = 16
 RK_LUT_ERF_LOCAL = (\n{rows(erf_local)}\n)
+RK_LUT_SOFTPLUS_NEG_SHA256 = "{digest(softplus_neg)}"
+RK_LUT_SOFTPLUS_NEG_DOMAIN = (-2.0, 0.0)
+RK_LUT_SOFTPLUS_NEG_ENTRIES = {SIZE}
+RK_LUT_SOFTPLUS_NEG_BN_MUL = {struct.unpack('<H', struct.pack('<e', SOFTPLUS_SCALE))[0]}
+RK_LUT_SOFTPLUS_NEG_MINUS_EXP = 16
+RK_LUT_SOFTPLUS_NEG_VERIFIED_INPUTS = {len(softplus_errors)}
+RK_LUT_SOFTPLUS_NEG_SIM_MAX_ABS_ERROR = {max(x[0] for x in softplus_errors)!r}
+RK_LUT_SOFTPLUS_NEG_SIM_MAX_REL_ERROR = {max(x[1] for x in softplus_errors)!r}
+RK_LUT_SOFTPLUS_NEG = (\n{rows(softplus_neg)}\n)
+RK_LUT_SOFTPLUS_DIV3_NEAR_SHA256 = "{digest(softplus_div3_near)}"
+RK_LUT_SOFTPLUS_DIV3_NEAR_DOMAIN = (-0.8333333333333334, 0.0)
+RK_LUT_SOFTPLUS_DIV3_NEAR_ENTRIES = {SIZE}
+RK_LUT_SOFTPLUS_DIV3_NEAR_BN_MUL = {struct.unpack('<H', struct.pack('<e', SOFTPLUS_DIV3_NEAR_SCALE))[0]}
+RK_LUT_SOFTPLUS_DIV3_NEAR_MINUS_EXP = 17
+RK_LUT_SOFTPLUS_DIV3_NEAR_VERIFIED_INPUTS = {len(softplus_div3_errors)}
+RK_LUT_SOFTPLUS_DIV3_NEAR_SIM_MAX_ABS_ERROR = {max(x[0] for x in softplus_div3_errors)!r}
+RK_LUT_SOFTPLUS_DIV3_NEAR_SIM_MAX_REL_ERROR = {max(x[1] for x in softplus_div3_errors)!r}
+RK_LUT_SOFTPLUS_DIV3_NEAR = (\n{rows(softplus_div3_near)}\n)
+RK_LUT_SOFTPLUS_DIV3_FAR_SHA256 = "{digest(softplus_div3_far)}"
+RK_LUT_SOFTPLUS_DIV3_FAR_DOMAIN = (-2.0, -0.8333333333333334)
+RK_LUT_SOFTPLUS_DIV3_FAR_ENTRIES = {SIZE}
+RK_LUT_SOFTPLUS_DIV3_FAR_BN_MUL = {struct.unpack('<H', struct.pack('<e', SOFTPLUS_DIV3_FAR_SCALE))[0]}
+RK_LUT_SOFTPLUS_DIV3_FAR_MINUS_EXP = 20
+RK_LUT_SOFTPLUS_DIV3_FAR = (\n{rows(softplus_div3_far)}\n)
 RK_LUT_SIGMOID_SHA256 = "{digest(sigmoid)}"
 RK_LUT_SIGMOID_DOMAIN = (-8.0, 8.0)
 RK_LUT_SIGMOID_ENTRIES = {SIZE}

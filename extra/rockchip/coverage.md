@@ -209,6 +209,24 @@ this milestone. Killing the accidentally overlapping process restored normal
 operation without a reboot. This is a test-orchestration failure signature,
 not a numerical or compiler failure.
 
+At the generated Softplus/LogSigmoid milestone, the uncached 2026-08-02
+census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 136 |
+| FAIL | 276 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 402 failures including the same 126 failing subtests. Runtime
+was 395.69 seconds. The exact two-method gain is `test_softplus` and
+`test_logsigmoid`. The Softplus method includes beta 1, 3, and 1/3, positive
+and negative magnitude-300 tails, and a scalar case. Beta 3 uses two generated
+LUT tasks over the original input so the NPU does not expose an intermediate
+FP16 `3*x` rounding point. Mish now lowers to 61 typed stages but remains a
+strict numerical mismatch and is still counted as FAIL.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -236,6 +254,7 @@ not a numerical or compiler failure.
 | Generated multirange inverse-hyperbolic tables and local arithmetic | `test_asinh`, `test_acosh` | Yes (research branch only) |
 | Generated hyperbolic tables and generic overflow repair | `test_sinh`, `test_cosh` | Yes (research branch only) |
 | Generated two-level ERF tables and generic local polynomial | `test_erf` | Yes (research branch only) |
+| Generated Softplus tables reused by LogSigmoid | `test_softplus`, `test_logsigmoid` | Yes (research branch only) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
