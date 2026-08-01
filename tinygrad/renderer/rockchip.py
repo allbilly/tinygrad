@@ -1093,6 +1093,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     return RKArg(RKBufferKind.CONSTANT, constant_offsets[key])
   for stage_idx, plan in enumerate(program.stages):
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
+    # Rejected partial Maximum WIP: OUT_CVT_OFFSET can fill INT_MAX exactly, but later cases still require int copy/compare and bool packing.
+    # int_fill = plan.out_dtype is dtypes.int and plan.op is RKDPUOp.ADD and plan.lhs == 0.0 and isinstance(plan.rhs, float)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count) if plan.rhs is not None else None
     if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL,
                    RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL,
