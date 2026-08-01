@@ -240,9 +240,32 @@ def _exp_expr(source:_Expr|RKArg|float) -> _Expr:
   nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
   return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (finite, nan_denom)), nan_denom))
 
+def _sigmoid_expr(source:_Expr|RKArg) -> _Expr:
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  broad, local = _LUTExpr(RKLUTId.SIGMOID, (source,)), _LUTExpr(RKLUTId.SIGMOID_LOCAL, (source,))
+  local_outside = _ALUExpr(Ops.MAX, (positive(-2.0, source), positive(source, 2.0)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, local_outside)),
+    _ALUExpr(Ops.MUL, (local, _sub(1.0, local_outside)))))
+  high, low = positive(source, 8.0), positive(-8.0, source)
+  high_result = _ALUExpr(Ops.ADD, (selected, _ALUExpr(Ops.MUL, (_sub(1.0, selected), high))))
+  bounded = _ALUExpr(Ops.MUL, (high_result, _sub(1.0, low)))
+  nan_denom = _sub(1.0, _ALUExpr(Ops.MUL, (high, low)))
+  return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (bounded, nan_denom)), nan_denom))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
+
+def _canonical_sigmoid(u:UOp) -> UOp|None:
+  """Recognize 1/(1+exp2(-log2(e)*x))."""
+  u = _unwrap_same_cast(u)
+  if u.op is not Ops.RECIPROCAL or (denominator:=_unwrap_same_cast(u.src[0])).op is not Ops.ADD: return None
+  one = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.CONST), None)
+  exponential = next((_unwrap_same_cast(x) for x in denominator.src if _unwrap_same_cast(x).op is Ops.EXP2), None)
+  if one is None or float(one.arg) != 1 or exponential is None or (scaled:=_unwrap_same_cast(exponential.src[0])).op is not Ops.MUL: return None
+  source = next((_unwrap_same_cast(x) for x in scaled.src if _unwrap_same_cast(x).op is Ops.INDEX), None)
+  factor = next((float(x.arg) for x in scaled.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))), None)
+  return source if source is not None and factor is not None and math.isclose(factor, -math.log2(math.e)) else None
 
 def _canonical_abs(u:UOp) -> UOp|None:
   u = _unwrap_same_cast(u)
@@ -292,6 +315,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (sigmoid_input:=_canonical_sigmoid(u)) is not None:
+    operand = _parse_alu(sigmoid_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _sigmoid_expr(operand)
   elif (rounded:=_canonical_round(u)) is not None:
     source = _parse_alu(rounded, output_index, memo)
     if source is None: return None
@@ -302,9 +329,14 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     ret = _ALUExpr(Ops.MAX, (operand, _ALUExpr(Ops.MUL, (operand, -1.0))))
   elif u.op is Ops.MUL and any(x.op is Ops.RECIPROCAL for x in u.src):
     reciprocal = next(i for i,x in enumerate(u.src) if x.op is Ops.RECIPROCAL)
-    div_src = (_parse_alu(u.src[1-reciprocal], output_index, memo), _parse_alu(u.src[reciprocal].src[0], output_index, memo))
-    if any(x is None for x in div_src): return None
-    ret = _ALUExpr(Ops.FDIV, div_src)  # type: ignore[arg-type]
+    if _canonical_sigmoid(u.src[reciprocal]) is not None:
+      mul_src = tuple(_parse_alu(x, output_index, memo) for x in u.src)
+      if any(x is None for x in mul_src): return None
+      ret = _ALUExpr(Ops.MUL, cast(tuple[_Value, _Value], mul_src))
+    else:
+      div_src = (_parse_alu(u.src[1-reciprocal], output_index, memo), _parse_alu(u.src[reciprocal].src[0], output_index, memo))
+      if any(x is None for x in div_src): return None
+      ret = _ALUExpr(Ops.FDIV, div_src)  # type: ignore[arg-type]
   elif u.op is Ops.RECIPROCAL:
     denominator = _parse_alu(u.src[0], output_index, memo)
     if denominator is None: return None
@@ -539,7 +571,8 @@ def _emit_roundoff(stage_idx:int, plan:RKLUTStage) -> RKStage:
 
 def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
   if plan.lut is RKLUTId.ROUNDOFF: return _emit_roundoff(stage_idx, plan)
-  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL): raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
+  if plan.lut not in (RKLUTId.EXP2, RKLUTId.EXP, RKLUTId.EXP_LOCAL, RKLUTId.SIGMOID, RKLUTId.SIGMOID_LOCAL):
+    raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")
   bn_mul, minus_exp = getattr(rklut, f"RK_LUT_{name}_BN_MUL"), getattr(rklut, f"RK_LUT_{name}_MINUS_EXP")

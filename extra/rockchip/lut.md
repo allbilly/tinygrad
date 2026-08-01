@@ -59,3 +59,18 @@ encodings in `[-2, 2]` and records its exact worst-case bounds in the catalog.
 The RK3588 test additionally samples 4,097 evenly spaced values and checks the
 special values. Inputs outside the declared domain are not part of this LUT's
 accuracy contract.
+
+## Two-level sigmoid
+
+Sigmoid is the single activation-specific asset included for the demonstrated
+CMAC-to-activation workload. Its broad Q15 table covers `[-8, 8]`; its local
+Q15 table covers `[-2, 2]` at four times the index resolution. Generic mask
+and ALU stages select the local result, saturate finite tails, and restore
+infinity and NaN behavior. The same typed expression is reused by SiLU and
+Swish through `Ops.MUL`; those functions do not have separate LUT identities.
+
+The generated simulator checks all 36,866 finite FP16 encodings in `[-8, 8]`
+and records absolute and relative bounds. Relative error is expected to be
+less informative in the negative tail where the reference approaches zero,
+so conformance uses the normal-domain strict relative tolerance plus absolute,
+boundary, and special-value checks.

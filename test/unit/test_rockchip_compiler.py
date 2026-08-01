@@ -142,10 +142,19 @@ class TestDPUCompiler(unittest.TestCase):
                      {rklut.RKLUTId.EXP, rklut.RKLUTId.EXP_LOCAL})
     self.assertFalse(contains_uop(plan))
     self.assertEqual(len(emit_dpu(plan).stages), len(plan.stages))
-    sigmoid = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).sigmoid()))
-    self.assertIsInstance(sigmoid, RKDPUProgram)
-    self.assertEqual({stage.lut for stage in sigmoid.stages if isinstance(stage, RKLUTStage)},
-                     {rklut.RKLUTId.EXP, rklut.RKLUTId.EXP_LOCAL})
+
+  def test_sigmoid_family_uses_generated_generic_luts(self):
+    for name in ("SIGMOID", "SIGMOID_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      payload = struct.pack(f"<{len(table)}h", *table)
+      self.assertEqual(hashlib.sha256(payload).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    self.assertLess(rklut.RK_LUT_SIGMOID_SIM_MAX_ABS_ERROR, 3e-4)
+    for expression in (Tensor.empty(128, dtype=dtypes.half).sigmoid(), Tensor.empty(128, dtype=dtypes.half).silu()):
+      plan = lower_dpu(sink(expression))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                       {rklut.RKLUTId.SIGMOID, rklut.RKLUTId.SIGMOID_LOCAL})
+      self.assertFalse(contains_uop(plan))
 
   def test_round_uses_generated_algorithm23_lut(self):
     payload = struct.pack(f"<{len(rklut.RK_LUT_ROUNDOFF)}h", *rklut.RK_LUT_ROUNDOFF)
