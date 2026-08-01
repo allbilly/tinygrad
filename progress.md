@@ -18,10 +18,10 @@ milestones through dedicated two-level GELU variants, the 2026-08-01 census is
 **116 passed, 296 failed, and 13 skipped**. Pytest prints `422 failed` because
 it separately counts 126 failing subtests.
 
-Standalone Erf, ELU/SELU, Mish, LogSigmoid, and Softplus are additionally green, giving a current validated delta of
-**122 passed, 290 failed, and 13 skipped** without relabeling it as a new full
+Standalone Erf, ELU/SELU, Mish, LogSigmoid, Softplus, and Sinh/Cosh are additionally green, giving a current validated delta of
+**124 passed, 288 failed, and 13 skipped** without relabeling it as a new full
 census. The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 39-host/20-NPU
+while recovering the remaining native forward coverage. Focused 40-host/21-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -73,7 +73,8 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `30f2bf666` | Parameter-specialized two-level ELU/SELU | `0187-rockchip-add-two-level-ELU-LUTs.patch` |
 | `bf260860a` | Asymmetric two-level Mish | `0188-rockchip-add-two-level-Mish-LUT.patch` |
 | `865e1201f` | Broad plus amplified-tail LogSigmoid | `0189-rockchip-add-two-level-LogSigmoid-LUT.patch` |
-| current milestone | Parameterized Softplus with LUT post-scaling | `0190-rockchip-add-Softplus-LUTs.patch` |
+| `6157fcb05` | Parameterized Softplus with LUT post-scaling | `0190-rockchip-add-Softplus-LUTs.patch` |
+| current milestone | Direct Sinh/Cosh LUTs with infinite tails | `0191-rockchip-add-Sinh-Cosh-LUTs.patch` |
 
 ## Architecture now implemented
 
@@ -117,6 +118,7 @@ Implemented forward-only subset:
 - Mish using an asymmetric broad table, central local table, near-zero polynomial, and exact tails;
 - LogSigmoid using a broad correction and 32x amplified positive-tail table;
 - Softplus beta 1, 3, and 1/3 using generated corrections, amplified tails, and Q15 LUT post-scaling;
+- Sinh/Cosh using direct central LUTs, local Sinh correction, and device-generated infinite tails;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -128,12 +130,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1021
+tinygrad/renderer/rockchip.py  1053
 tinygrad/runtime/ops_rockchip.py  74
-handwritten Rockchip total  1095
+handwritten Rockchip total  1127
 ```
 
-This meets the requested `<5000` backend goal with 3,905 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 3,873 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 
@@ -143,7 +145,7 @@ Compared with the frozen implementation, the dominant 77.5% task/graph-lowering 
 - renderer integration: renderer lines 476–485;
 - allocation/submission runtime: 85 physical lines, 74 `sz.py` lines.
 
-The whole repository is 26,071 `sz.py` lines, a `+1,103` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 1,071 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
+The whole repository is 26,103 `sz.py` lines, a `+1,135` delta from the 24,968-line base. Therefore `MAX_LINE_COUNT=25000 python sz.py` still fails globally by 1,103 lines even though the backend itself is well below 5,000. Fixing that would require an upstream cap decision or unrelated repository reductions; no unrelated master code was compressed to disguise this backend cost.
 
 ## Exact validation commands
 

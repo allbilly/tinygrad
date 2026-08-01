@@ -93,9 +93,9 @@ to the preceding exact tanh census, EXP2 special values add one passing method,
 shared sigmoid/SiLU/Swish add three, normal/extreme QuickGELU add two, and
 normal/extreme tanh/exact GELU add two.
 
-The isolated standalone `test_erf`, `test_elu`, `test_selu`, `test_mish`, `test_logsigmoid`, and `test_softplus` methods additionally pass.
-Current validated delta after the exact census: 122 PASS / 290 FAIL / 13 SKIP.
-A new full-census runtime has not yet been recorded for that six-method delta.
+The isolated standalone `test_erf`, `test_elu`, `test_selu`, `test_mish`, `test_logsigmoid`, `test_softplus`, `test_sinh`, and `test_cosh` methods additionally pass.
+Current validated delta after the exact census: 124 PASS / 288 FAIL / 13 SKIP.
+A new full-census runtime has not yet been recorded for that eight-method delta.
 
 ## Focused verified matrix
 
@@ -115,10 +115,11 @@ A new full-census runtime has not yet been recorded for that six-method delta.
 | Asymmetric two-level Mish | typed 38-stage plan | strict official method and 1 ideal-curve sweep | PASS |
 | Broad/tail LogSigmoid | typed 15-stage plan | official method and strict `[-12,12]` sweep | PASS |
 | Parameterized Softplus | typed 27/27/8-stage plans | all official β/extreme/scalar cases and dense sweep | PASS |
+| Direct Sinh/Cosh | typed 30/11-stage plans | normal and ±extreme official cases plus dense sweep | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 39 | 20 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 40 | 21 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 

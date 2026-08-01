@@ -132,4 +132,10 @@ class TestRockchip(unittest.TestCase):
       expected = (np.logaddexp(0, beta*fp32)/beta).astype(np.float16)
       np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").softplus(beta=beta).numpy(), expected, rtol=1e-3, atol=3e-6)
 
+  def test_generated_sinh_cosh_luts(self):
+    data = np.linspace(-2, 2, 2049, dtype=np.float16)
+    for function, expected in ((lambda x:x.sinh(), np.sinh(data.astype(np.float32))),
+                               (lambda x:x.cosh(), np.cosh(data.astype(np.float32)))):
+      np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).numpy(), expected.astype(np.float16), rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

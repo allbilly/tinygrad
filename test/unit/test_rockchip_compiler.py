@@ -265,6 +265,17 @@ class TestDPUCompiler(unittest.TestCase):
       table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
 
+  def test_sinh_cosh_use_generated_luts(self):
+    for function, shape, operations in ((lambda x:x.sinh(), (30,5), (RKDPUOp.SINH,RKDPUOp.SINH_LOCAL)),
+                                        (lambda x:x.cosh(), (11,2), (RKDPUOp.COSH,))):
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertEqual((len(plan.stages), len(plan.scratch)), shape)
+      self.assertTrue(all(sum(x.op is op for x in plan.stages) == 1 for op in operations))
+      self.assertFalse(contains_uop(plan))
+    for name in ("SINH", "SINH_LOCAL", "COSH"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

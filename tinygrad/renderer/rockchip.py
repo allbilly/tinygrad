@@ -63,6 +63,9 @@ class RKDPUOp(IntEnum):
   SOFTPLUS3 = 34
   SOFTPLUS3_TAIL = 35
   SOFTPLUS13 = 36
+  SINH = 37
+  SINH_LOCAL = 38
+  COSH = 39
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -299,6 +302,25 @@ def _softplus_expr(source:_DPUExpr|RKArg|float, beta:float) -> _DPUExpr:
   correction = _DPUExpr(RKDPUOp.MUL, (correction, _DPUExpr(RKDPUOp.SUB, (1.0, correction_outside))))
   return _DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.SUB, (positive_source, correction)), 0.0))
 
+def _sinh_cosh_expr(source:_DPUExpr|RKArg|float, is_cosh:bool) -> _DPUExpr:
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  def clamp(value:_DPUExpr|RKArg|float, limit:float) -> _DPUExpr:
+    lower = _DPUExpr(RKDPUOp.MAX, (value, -limit))
+    return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (lower, -1.0)), -limit)), -1.0))
+  selected:_DPUExpr = _DPUExpr(RKDPUOp.COSH if is_cosh else RKDPUOp.SINH, (clamp(source, 2.0),))
+  negative = _DPUExpr(RKDPUOp.MUL, (source, -1.0))
+  magnitude = _DPUExpr(RKDPUOp.MAX, (source, negative))
+  if not is_cosh:
+    local = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SINH_LOCAL, (clamp(source, .25),)), .25))
+    near_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, .04)))
+    local_inside = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, .125)))
+    selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (selected,
+      _DPUExpr(RKDPUOp.SUB, (1.0, local_inside)))), _DPUExpr(RKDPUOp.MUL, (local,
+      _DPUExpr(RKDPUOp.SUB, (local_inside, near_inside)))))), _DPUExpr(RKDPUOp.MUL, (source, near_inside))))
+  denominator = _DPUExpr(RKDPUOp.SUB, (1.0, positive(magnitude, 10.0)))
+  return _DPUExpr(RKDPUOp.DIV, (selected, denominator))
+
 def _slot_mask(slots:tuple[int, ...]) -> int:
   if any(x < 0 or x >= 64 for x in slots): raise ValueError("RKImage supports argument slots 0..63")
   return sum(1 << x for x in slots)
@@ -528,6 +550,13 @@ def _canonical_softplus(u:UOp) -> tuple[UOp,float]|None:
   root_scale = next((float(x.arg) for x in u.src if x.op is Ops.CONST), None)
   return (indexes[0], 3.0 if root_scale is not None and math.isclose(root_scale, 1/3) else 1/3) if root_scale is not None else None
 
+def _canonical_sinh_cosh(u:UOp) -> tuple[UOp,bool]|None:
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  if u.op is not Ops.MUL or len(indexes) != 1 or indexes[0].dtype is not dtypes.half or \
+     sum(x.op is Ops.EXP2 for x in nodes) != 2 or sum(x.op is Ops.ADD for x in nodes) != 1: return None
+  return indexes[0], sum(x.op is Ops.MUL for x in nodes) == 4
+
 def _canonical_silu(u:UOp) -> tuple[UOp,UOp]|None:
   u = _unwrap_same_cast(u)
   if u.op is not Ops.MUL: return None
@@ -620,6 +649,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(softplus[0], output_index, memo)
     if source is None: return None
     ret = _softplus_expr(source, softplus[1])
+  elif (hyperbolic:=_canonical_sinh_cosh(u)) is not None:
+    source = _parse_dpu_expr(hyperbolic[0], output_index, memo)
+    if source is None: return None
+    ret = _sinh_cosh_expr(source, hyperbolic[1])
   elif (silu:=_canonical_silu(u)) is not None:
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in silu)
     if any(x is None for x in operands): return None
@@ -897,7 +930,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
                        (RKDPUOp.MISH,"MISH"),(RKDPUOp.MISH_LOCAL,"MISH_LOCAL"),(RKDPUOp.LOGSIGMOID,"LOGSIGMOID"),
                        (RKDPUOp.LOGSIGMOID_TAIL,"LOGSIGMOID_TAIL"),(RKDPUOp.SOFTPLUS1,"SOFTPLUS1"),
                        (RKDPUOp.SOFTPLUS1_TAIL,"SOFTPLUS1_TAIL"),(RKDPUOp.SOFTPLUS3,"SOFTPLUS3"),
-                       (RKDPUOp.SOFTPLUS3_TAIL,"SOFTPLUS3_TAIL"),(RKDPUOp.SOFTPLUS13,"SOFTPLUS13"))}}[plan.op]
+                       (RKDPUOp.SOFTPLUS3_TAIL,"SOFTPLUS3_TAIL"),(RKDPUOp.SOFTPLUS13,"SOFTPLUS13"),
+                       (RKDPUOp.SINH,"SINH"),(RKDPUOp.SINH_LOCAL,"SINH_LOCAL"),(RKDPUOp.COSH,"COSH"))}}[plan.op]
   post_scale = {RKDPUOp.SOFTPLUS3:rklut.RK_LUT_SOFTPLUS3_POST_SCALE,
                 RKDPUOp.SOFTPLUS3_TAIL:rklut.RK_LUT_SOFTPLUS3_TAIL_POST_SCALE}.get(plan.op, 1.0)
   cmds = []
@@ -988,7 +1022,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
                    RKDPUOp.ERF, RKDPUOp.ERF_LOCAL, RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL,
                    RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, RKDPUOp.MISH, RKDPUOp.MISH_LOCAL, RKDPUOp.LOGSIGMOID,
                    RKDPUOp.LOGSIGMOID_TAIL, RKDPUOp.SOFTPLUS1, RKDPUOp.SOFTPLUS1_TAIL, RKDPUOp.SOFTPLUS3,
-                   RKDPUOp.SOFTPLUS3_TAIL, RKDPUOp.SOFTPLUS13):
+                   RKDPUOp.SOFTPLUS3_TAIL, RKDPUOp.SOFTPLUS13, RKDPUOp.SINH, RKDPUOp.SINH_LOCAL, RKDPUOp.COSH):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:
