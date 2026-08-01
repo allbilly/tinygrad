@@ -78,19 +78,20 @@ smoke/contract tests, not a replacement for this census.
 
 ## Clean branch current exact census
 
-Latest complete uncached census after the natural Exp milestone:
+Latest complete uncached census after the CELU milestone:
 
 | Status | Methods |
 |---|---:|
-| PASS | 127 |
-| FAIL | 285 |
+| PASS | 128 |
+| FAIL | 284 |
 | SKIP | 13 |
 | Collected | 425 |
 
-Pytest reports `411 failed` because 126 failing unittest subtests are counted
-in addition to their failed parent methods. Runtime was 244.71 seconds. This
+Pytest reports `410 failed` because 126 failing unittest subtests are counted
+in addition to their failed parent methods. Runtime was 254.23 seconds. This
 exact run includes EXP2 special values, sigmoid/SiLU/Swish, QuickGELU, both
-GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt, and natural Exp.
+GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt,
+natural Exp, and CELU α=1–4.
 
 ## Focused verified matrix
 
@@ -114,10 +115,11 @@ GELU forms, Erf, ELU/SELU, Mish, LogSigmoid, Softplus, Sinh/Cosh, Sqrt, RSqrt, a
 | Refined Sqrt | typed 25-stage plan plus declared FP32 ABI input | official normal/zero/scalar cases, dense sweep, and IEEE specials | PASS |
 | Refined RSqrt | typed 42-stage plan plus declared FP32 ABI input | official normal/zero/scalar cases, geometric sweep, and IEEE specials | PASS |
 | Natural Exp | typed 36-stage broad/local plan | official normal/scalar/IEEE cases and dense sweep | PASS |
+| CELU α=1–4 | typed 35/30-stage final-output plans | all official tensor/scalar cases and dense sweeps | PASS |
 | Direct affine CMAC matmul | included in compiler suite | 1 | PASS |
 | Constant-backed CMAC row sum | included in compiler suite | 1 | PASS |
 | Explicit-layout PPU global max | included in compiler suite | 1 | PASS |
-| Clean image/compiler suite total | 44 | 24 (plus 6 subtests) | PASS |
+| Clean image/compiler suite total | 45 | 25 (plus 6 subtests) | PASS |
 
 The host total is the collected total across `test/null/test_native_program.py`, `test/unit/test_rockchip_image.py`, and `test/unit/test_rockchip_compiler.py`. The device total is `test/device/test_rockchip.py`, run serially.
 
@@ -133,6 +135,7 @@ The host total is the collected total across `test/null/test_native_program.py`,
 - Sqrt uses one generated seed LUT, three NPU Newton refinements, and device special-value masks;
 - RSqrt uses exact range scaling, one generated seed LUT, an NPU Newton refinement, and device special-value masks;
 - natural Exp uses generated broad/local LUTs and device special-value masks;
+- CELU α=1–4 uses ELU1 or direct final-output broad/local tables plus near-zero correction;
 - CMAC K=32 with directly legal memory, no host gather or pack;
 - CMAC output width in the proven 4–16 range used by current tests/recognizer;
 - PPU global max only for explicit `(K,8)` HWC-compatible storage and legal kernel split.

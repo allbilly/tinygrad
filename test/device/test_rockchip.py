@@ -166,4 +166,11 @@ class TestRockchip(unittest.TestCase):
     special = np.array([np.inf, -np.inf, np.nan], dtype=np.float16)
     np.testing.assert_equal(Tensor(special, device="ROCKCHIP").exp().numpy(), np.array([np.inf, 0, np.nan], dtype=np.float16))
 
+  def test_generated_celu_luts(self):
+    data = np.linspace(-4, 4, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    for alpha in range(1,5):
+      expected = np.where(fp32 > 0, fp32, alpha*np.expm1(fp32/alpha)).astype(np.float16)
+      np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").celu(alpha).numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()

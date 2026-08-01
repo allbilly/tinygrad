@@ -14,12 +14,12 @@ Current master collects 425 methods (it adds `test_softmin` relative to the
 424-method oracle inventory). The first uncached clean-branch census with the
 ported forward contract was 79 passed, 333 failed, and 13 skipped. After the
 typed extrema, WHERE mask, division, ABS, copy, scalar-fill, and native wide-fill
-milestones through the refined Sqrt LUT, the 2026-08-01 census is
-**127 passed, 285 failed, and 13 skipped**. Pytest prints `411 failed` because
+milestones through the direct CELU LUTs, the 2026-08-01 census is
+**128 passed, 284 failed, and 13 skipped**. Pytest prints `410 failed` because
 it separately counts 126 failing subtests.
 
 The clean branch must preserve its `<5000` handwritten-line target
-while recovering the remaining native forward coverage. Focused 44-host/24-NPU
+while recovering the remaining native forward coverage. Focused 45-host/25-NPU
 tests prove only the implemented compiler contracts and must not be described
 as full TestOps completion.
 
@@ -29,7 +29,7 @@ as full TestOps completion.
 - Frozen oracle tag: `rockchip-2607-frozen-20260801`
 - Frozen oracle commit: `51b4f919e`
 - Clean branch: `rockchip-2608`
-- Clean worktree: `/tmp/rk_2608`
+- Clean worktree: `/home/orangepi/rk_2608`
 - Clean base: `277433259eb71b5fc3d6d5cc33c5a1be1458e9fa` (`master` and `upstream/master` when the branch was created)
 - Python environment: `. /home/orangepi/tinygrad/.venv/bin/activate`
 - Required test context: `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF`
@@ -76,7 +76,9 @@ The old branch is an oracle only. No old Rockchip WIP was deleted or rewritten. 
 | `5d0a9360a` | Exact 124-pass TestOps census | `0192-rockchip-record-124-pass-TestOps-census.patch` |
 | `705877b63` | Refined Sqrt LUT and bounded FP32 input ABI | `0193-rockchip-add-refined-Sqrt-LUT.patch` |
 | `a1c8090c4` | Range-scaled refined RSqrt LUT | `0194-rockchip-add-refined-RSqrt-LUT.patch` |
-| current milestone | Broad/local natural Exp LUTs | `0195-rockchip-add-natural-Exp-LUTs.patch` |
+| `41ba2345c` | Broad/local natural Exp LUTs | `0195-rockchip-add-natural-Exp-LUTs.patch` |
+| `ddb9d0733` | Rejected int fill probe retained for reference | `0196-rockchip-record-rejected-int-fill-probe.patch` |
+| current milestone | Direct final-output CELU LUTs | `0197-rockchip-add-CELU-LUTs.patch` |
 
 ## Architecture now implemented
 
@@ -125,6 +127,7 @@ Implemented forward-only subset:
 - bounded FP32 Sqrt/RSqrt inputs narrowed to FP16 only at the runtime ABI boundary, with all function semantics remaining in the NPU program;
 - RSqrt using exact power-of-16 input scaling, a dedicated Q13 seed, one NPU Newton step, output rescaling, and IEEE masks;
 - natural Exp using asymmetric broad and direct local tables plus device-generated IEEE special values;
+- CELU α=1–4 using ELU1 or direct final-output broad/local tables and a near-zero polynomial;
 - directly legal `A @ packed_B.T`, currently `A=(1,32)` and `packed_B=(N,32)` for proven output widths;
 - row sum for `(N,32)`, implemented as the same CMAC contract with an image-owned FP16 ones vector;
 - global MAX over explicitly HWC-compatible `(K,8)` input layouts supported by the PPU kernel constraints.
@@ -136,12 +139,12 @@ Implemented forward-only subset:
 `python sz.py` reports:
 
 ```text
-tinygrad/renderer/rockchip.py  1128
+tinygrad/renderer/rockchip.py  1166
 tinygrad/runtime/ops_rockchip.py  85
-handwritten Rockchip total  1213
+handwritten Rockchip total  1251
 ```
 
-This meets the requested `<5000` backend goal with 3,787 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
+This meets the requested `<5000` backend goal with 3,749 lines of headroom. The generated register and LUT modules are mechanically generated and are excluded by `sz.py`.
 
 Compared with the frozen implementation, the dominant 77.5% task/graph-lowering catalog was replaced by three bounded recognizers and one primitive DAG scheduler. Approximate physical source distribution is now:
 

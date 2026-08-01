@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 15 |
+| Schema | 16 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -112,6 +112,8 @@ Sqrt uses `SQRT = 34`, a Q14 seed table over `[0,4]` with index scale 4090. Thre
 Reciprocal Sqrt uses `RSQRT = 35`, a Q13 seed clamped to `[0.5,4]` over the same `[0,4]` address domain. Positive inputs below `1/16` and `1/256` are multiplied by exact powers of 16 before lookup; the result is multiplied by the corresponding powers of four. One NPU inverse-square-root Newton step, `y=y*(1.5-0.5*x*y*y)`, removes interpolation error without the extra FP16 rounding of `1/sqrt(x)`. Device masks restore positive-zero/infinity/negative/NaN semantics. The 42-stage, six-scratch program passes the official method and a dense geometric sweep from `2^-8` to 4. DPU division currently normalizes `-0`, and general finite inputs above 4 still need high-range reduction.
 
 Natural Exp uses `EXP = 36`, an asymmetric Q15 broad table over `[-2,2]`: negative knots store `exp(x)` directly while positive knots store `exp(x)/8`, restored by an NPU mask. `EXP_LOCAL = 37` stores direct Q14 Exp over `[-0.25,0.25]` to avoid the broad table's zero-side scale discontinuity. Device masks synthesize positive infinity, zero, and NaN for nonfinite inputs. The 36-stage, four-scratch program passes every official subcase and a dense `[-2,2]` sweep.
+
+CELU α=2/3/4 uses direct final-output broad/local pairs `CELU2 = 38/39`, `CELU3 = 40/41`, and `CELU4 = 42/43`. Broad tables cover `[-4,0]` in Q14 for α=2 and Q13 for α=3/4; Q15 local tables cover `[-0.5,0]`. A second-order `x+x²/(2α)` replaces the LUT inside `[-0.03,0]`, avoiding cancellation after `exp(x/α)-1`. α=1 reuses the ELU1 tables. The 35/30-stage plans pass all official tensor/scalar cases and dense per-α sweeps.
 
 ## Current command contract
 
