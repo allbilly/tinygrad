@@ -81,6 +81,21 @@ timeouts:
 Pytest reports 426 failures including the 126 failing subtests. Runtime was
 204.28 seconds. The two new method passes are `test_exp2` and `test_exp`.
 
+At `9db9a4d33`, after two-level sigmoid, IEEE infinite-numerator division,
+refined SQRT/RSQRT, native subtraction, and range-normalized LOG2/LOG10, the
+uncached 2026-08-02 census completed without NPU timeouts:
+
+| Status | Methods |
+|---|---:|
+| PASS | 120 |
+| FAIL | 292 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 418 failures including the 126 failing subtests. Runtime was
+229.50 seconds. This is an exact eight-method gain from the preceding census;
+the FP32-only `test_log` remains an intentional unsupported-dtype rejection.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
@@ -94,11 +109,11 @@ Pytest reports 426 failures including the 126 failing subtests. Runtime was
 | Integral rounding composed from the roundoff LUT | `test_trunc`, `test_floor`, `test_ceil` | Yes (`6ddda80b0`) |
 | IEEE special-value wrapper around EXP2 LUT | `test_exp2` | Yes (`015e735b1`) |
 | Generated two-level EXP LUT with signed-factor recognition | `test_exp` | Yes (`015e735b1`) |
-| Generated two-level sigmoid reused by generic MUL | `test_sigmoid`, `test_silu`, `test_swish` | No |
-| Mask-composed sign preservation for infinite division numerators | `test_div_naninf` | No |
-| Generated SQRT seed with three generic Newton refinements | `test_sqrt` | No |
-| Range-scaled generated RSQRT seed with generic Newton correction | `test_rsqrt` | No |
-| Range-normalized generated logarithm tables | `test_log2`, `test_log10` | No |
+| Generated two-level sigmoid reused by generic MUL | `test_sigmoid`, `test_silu`, `test_swish` | Yes (`9db9a4d33`) |
+| Mask-composed sign preservation for infinite division numerators | `test_div_naninf` | Yes (`9db9a4d33`) |
+| Generated SQRT seed with three generic Newton refinements | `test_sqrt` | Yes (`9db9a4d33`) |
+| Range-scaled generated RSQRT seed with generic Newton correction | `test_rsqrt` | Yes (`9db9a4d33`) |
+| Range-normalized generated logarithm tables | `test_log2`, `test_log10` | Yes (`9db9a4d33`) |
 
 The wide-fill milestone writes the requested dtype directly through DPU WDMA;
 there is no runtime narrowing or host semantic work. It also upgrades RKImage
