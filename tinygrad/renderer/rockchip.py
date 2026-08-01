@@ -56,6 +56,8 @@ class RKDPUOp(IntEnum):
   SELU_LOCAL = 27
   MISH = 28
   MISH_LOCAL = 29
+  LOGSIGMOID = 30
+  LOGSIGMOID_TAIL = 31
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -258,6 +260,19 @@ def _mish_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
     (_DPUExpr(RKDPUOp.MUL, (broad, broad_scale)), broad_mask)), _DPUExpr(RKDPUOp.MUL, (local, local_mask)))), polynomial))
   fallback = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (source, 0.0)), range_outside))
   return _DPUExpr(RKDPUOp.ADD, (inner, fallback))
+
+def _logsigmoid_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  correction, tail = _DPUExpr(RKDPUOp.LOGSIGMOID, (source,)), _DPUExpr(RKDPUOp.LOGSIGMOID_TAIL, (source,))
+  positive_source = _DPUExpr(RKDPUOp.MAX, (source, 0.0))
+  minimum = _DPUExpr(RKDPUOp.SUB, (source, positive_source))
+  tail_mask = positive(source, 3.5)
+  broad_mask = _DPUExpr(RKDPUOp.SUB, (1.0, tail_mask))
+  selected = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (correction, broad_mask)),
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (tail, 1/32)), tail_mask))))
+  raw = _DPUExpr(RKDPUOp.ADD, (minimum, selected))
+  return _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (_DPUExpr(RKDPUOp.MUL, (raw, -1.0)), 0.0)), -1.0))
 
 def _slot_mask(slots:tuple[int, ...]) -> int:
   if any(x < 0 or x >= 64 for x in slots): raise ValueError("RKImage supports argument slots 0..63")
@@ -469,6 +484,14 @@ def _canonical_mish(u:UOp) -> UOp|None:
     sum(x.op is Ops.EXP2 for x in nodes) == 3 and sum(x.op is Ops.LOG2 for x in nodes) == 1 and \
     sum(x.op is Ops.MAX for x in nodes) == 1 and sum(x.op is Ops.RECIPROCAL for x in nodes) == 1 else None
 
+def _canonical_logsigmoid(u:UOp) -> UOp|None:
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  return indexes[0] if len(indexes) == 1 and indexes[0].dtype is dtypes.half and sum(x.op is Ops.EXP2 for x in nodes) == 2 and \
+    sum(x.op is Ops.LOG2 for x in nodes) == 1 and sum(x.op is Ops.MAX for x in nodes) == 1 and \
+    any(math.isclose(x, -math.log(2)) for x in constants) else None
+
 def _canonical_silu(u:UOp) -> tuple[UOp,UOp]|None:
   u = _unwrap_same_cast(u)
   if u.op is not Ops.MUL: return None
@@ -553,6 +576,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(mish, output_index, memo)
     if source is None: return None
     ret = _mish_expr(source)
+  elif (logsigmoid:=_canonical_logsigmoid(u)) is not None:
+    source = _parse_dpu_expr(logsigmoid, output_index, memo)
+    if source is None: return None
+    ret = _logsigmoid_expr(source)
   elif (silu:=_canonical_silu(u)) is not None:
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in silu)
     if any(x is None for x in operands): return None
@@ -827,7 +854,8 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
     **{op:(getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_BN_MUL"), getattr(rklut, f"RK_LUT_{name}_MINUS_EXP"))
        for op,name in ((RKDPUOp.ELU1,"ELU1"),(RKDPUOp.ELU1_LOCAL,"ELU1_LOCAL"),(RKDPUOp.ELU01,"ELU01"),
                        (RKDPUOp.ELU01_LOCAL,"ELU01_LOCAL"),(RKDPUOp.SELU,"SELU"),(RKDPUOp.SELU_LOCAL,"SELU_LOCAL"),
-                       (RKDPUOp.MISH,"MISH"),(RKDPUOp.MISH_LOCAL,"MISH_LOCAL"))}}[plan.op]
+                       (RKDPUOp.MISH,"MISH"),(RKDPUOp.MISH_LOCAL,"MISH_LOCAL"),(RKDPUOp.LOGSIGMOID,"LOGSIGMOID"),
+                       (RKDPUOp.LOGSIGMOID_TAIL,"LOGSIGMOID_TAIL"))}}[plan.op]
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
@@ -913,7 +941,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
                    RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL,
                    RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL, RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL,
                    RKDPUOp.ERF, RKDPUOp.ERF_LOCAL, RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL,
-                   RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, RKDPUOp.MISH, RKDPUOp.MISH_LOCAL):
+                   RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, RKDPUOp.MISH, RKDPUOp.MISH_LOCAL, RKDPUOp.LOGSIGMOID,
+                   RKDPUOp.LOGSIGMOID_TAIL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:

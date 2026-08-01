@@ -119,4 +119,10 @@ class TestRockchip(unittest.TestCase):
     expected = (fp32*np.tanh(np.log1p(np.exp(fp32)))).astype(np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").mish().numpy(), expected, rtol=1e-2, atol=1e-6)
 
+  def test_two_level_logsigmoid_lut(self):
+    data = np.linspace(-12, 12, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    expected = (-np.logaddexp(0, -fp32)).astype(np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").logsigmoid().numpy(), expected, rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()
