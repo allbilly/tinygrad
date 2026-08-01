@@ -220,6 +220,19 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
     self.assertFalse(contains_uop(plan))
 
+  def test_elu_variants_use_generated_two_level_luts(self):
+    variants = ((lambda x:x.elu(), RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL),
+                (lambda x:x.elu(.1), RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL),
+                (lambda x:x.selu(), RKDPUOp.SELU, RKDPUOp.SELU_LOCAL))
+    for function, broad, local in variants:
+      plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))
+      self.assertEqual((len(plan.stages), len(plan.scratch)), (35, 6))
+      self.assertEqual((sum(x.op is broad for x in plan.stages), sum(x.op is local for x in plan.stages)), (1, 1))
+      self.assertFalse(contains_uop(plan))
+    for name in ("ELU1", "ELU1_LOCAL", "ELU01", "ELU01_LOCAL", "SELU", "SELU_LOCAL"):
+      table, digest = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_SHA256")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+
   def test_reciprocal_lowers_to_typed_division(self):
     x, y = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     plan = lower_dpu(sink(x.reciprocal()))

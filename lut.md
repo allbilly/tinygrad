@@ -21,7 +21,7 @@ This keeps generated numerical bulk out of handwritten `sz.py` lines and keeps r
 | Field | Value |
 |---|---|
 | Identifier | `RKLUT.EXP2 = 1` |
-| Schema | 7 |
+| Schema | 8 |
 | Domain | `[-2.0, 2.0]` |
 | Tables | LE and LO, 513 signed int16 entries each |
 | Knot spacing | `1/256` input units |
@@ -96,6 +96,8 @@ GELU has separate immutable artifacts because the tanh approximation and exact-e
 Each variant lowers to 51 stages and six scratch buffers. Both official normal forms and all four `[-400,-300]`/`[300,400]` extreme subcases pass at the strict TestOps tolerance. The supplemental exact-erf dense sweep allows `atol=2e-4` because the declared negative tail intentionally saturates to zero while ideal erf remains a sub-`1.3e-4` negative value near the boundary.
 
 Standalone Erf uses `RKLUT.ERF = 14`, a direct Q15 table over `[-4,4]`, and `RKLUT.ERF_LOCAL = 15`, Q15 `3*erf(x)` over `[-0.25,0.25]` addressed by `z=16*x`. The local result is divided by three on device, while `2*x/sqrt(pi)` replaces both LUTs inside `[-0.04,0.04]`. Device masks select exact `-1/+1` tails outside the broad domain. The 44-stage typed plan passes the official normal, scalar, positive-extreme, and negative-extreme subcases plus a strict 2,049-point `[-8,8]` sweep.
+
+ELU/SELU use three generated broad/local pairs: `ELU1 = 16/17`, `ELU01 = 18/19`, and `SELU = 20/21`. Broad tables cover the negative branch on `[-8,0]`; local tables address `x in [-0.5,0]` through `z=4*x`. Gains use available Q15 precision (1/2 for alpha 1, 8/16 for alpha 0.1, and 0.5/1 for SELU) and are inverted by device MUL stages. A second-order `scale*(x+x^2/2)` handles `[-0.03,0]`, exact negative saturation handles `x<-8`, and ordinary MAX/MUL handles the positive branch. All three share one 35-stage, six-scratch lowering recipe and pass their official methods plus dense `[-10,10]` sweeps.
 
 ## Current command contract
 

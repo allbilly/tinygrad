@@ -48,6 +48,12 @@ class RKDPUOp(IntEnum):
   GELU_EXACT_LOCAL = 19
   ERF = 20
   ERF_LOCAL = 21
+  ELU1 = 22
+  ELU1_LOCAL = 23
+  ELU01 = 24
+  ELU01_LOCAL = 25
+  SELU = 26
+  SELU_LOCAL = 27
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -210,6 +216,28 @@ def _erf_expr(source:_DPUExpr|RKArg|float) -> _DPUExpr:
     _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (local, 1/3)), local_mask)))), _DPUExpr(RKDPUOp.MUL, (identity, near_inside))))
   tail = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.SUB, (high, low)), outside))
   return _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (interior, inside)), tail))
+
+def _elu_expr(source:_DPUExpr|RKArg|float, negative_scale:float, positive_scale:float) -> _DPUExpr:
+  def positive(lhs:_DPUExpr|RKArg|float, rhs:_DPUExpr|RKArg|float) -> _DPUExpr:
+    return _DPUExpr(RKDPUOp.MASK, (_DPUExpr(RKDPUOp.SUB, (lhs, rhs)),))
+  if negative_scale < 0.2: broad_op, local_op, broad_gain, local_gain = RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL, 8.0, 16.0
+  elif negative_scale > 1.5: broad_op, local_op, broad_gain, local_gain = RKDPUOp.SELU, RKDPUOp.SELU_LOCAL, 0.5, 1.0
+  else: broad_op, local_op, broad_gain, local_gain = RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, 1.0, 2.0
+  broad_input = _DPUExpr(RKDPUOp.MAX, (source, -8.0))
+  local_input = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (source, -0.5)), 4.0))
+  broad, local = _DPUExpr(broad_op, (broad_input,)), _DPUExpr(local_op, (local_input,))
+  below, local_below, poly_below, negative = (positive(x, source) for x in (-8.0, -0.5, -0.03, 0.0))
+  broad_mask, local_mask = _DPUExpr(RKDPUOp.SUB, (local_below, below)), _DPUExpr(RKDPUOp.SUB, (poly_below, local_below))
+  poly_mask, positive_mask = _DPUExpr(RKDPUOp.SUB, (negative, poly_below)), _DPUExpr(RKDPUOp.SUB, (1.0, negative))
+  poly_input = _DPUExpr(RKDPUOp.MAX, (source, -0.03))
+  polynomial = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL, (poly_input, negative_scale)),
+    _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (poly_input, poly_input)), negative_scale/2))))
+  negative_sum = _DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.ADD, (_DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (broad, 1/broad_gain)), broad_mask)), _DPUExpr(RKDPUOp.MUL,
+    (_DPUExpr(RKDPUOp.MUL, (local, 1/local_gain)), local_mask)))), _DPUExpr(RKDPUOp.MUL, (polynomial, poly_mask))))
+  tails = _DPUExpr(RKDPUOp.ADD, (negative_sum, _DPUExpr(RKDPUOp.MUL, (-negative_scale, below))))
+  positive_result = _DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MUL, (_DPUExpr(RKDPUOp.MAX, (source, 0.0)), positive_scale)), positive_mask))
+  return _DPUExpr(RKDPUOp.ADD, (tails, positive_result))
 
 def _slot_mask(slots:tuple[int, ...]) -> int:
   if any(x < 0 or x >= 64 for x in slots): raise ValueError("RKImage supports argument slots 0..63")
@@ -404,6 +432,16 @@ def _canonical_erf(u:UOp) -> UOp|None:
   return indexes[0] if len(indexes) == 1 and indexes[0].dtype is dtypes.half and sum(x.op is Ops.EXP2 for x in nodes) == 1 and \
     sum(x.op is Ops.WHERE for x in nodes) == 2 and any(math.isclose(x, 0.3275911) for x in constants) else None
 
+def _canonical_elu(u:UOp) -> tuple[UOp,float,float]|None:
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = list(dict.fromkeys(x for x in nodes if x.op is Ops.INDEX))
+  if len(indexes) != 1 or indexes[0].dtype is not dtypes.half or sum(x.op is Ops.EXP2 for x in nodes) != 1: return None
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  wheres = sum(x.op is Ops.WHERE for x in nodes)
+  if u.op is Ops.ADD and wheres == 2: return indexes[0], (0.1 if any(math.isclose(abs(x), .1) for x in constants) else 1.0), 1.0
+  if u.op is Ops.MUL and wheres == 1 and any(math.isclose(x, 1.0507) for x in constants): return indexes[0], 1.0507*1.67326, 1.0507
+  return None
+
 def _canonical_silu(u:UOp) -> tuple[UOp,UOp]|None:
   u = _unwrap_same_cast(u)
   if u.op is not Ops.MUL: return None
@@ -480,6 +518,10 @@ def _parse_dpu_expr(u:UOp, output_index:UOp, memo:dict[UOp, _DPUExpr|RKArg|float
     source = _parse_dpu_expr(erf, output_index, memo)
     if source is None: return None
     ret = _erf_expr(source)
+  elif (elu:=_canonical_elu(u)) is not None:
+    source = _parse_dpu_expr(elu[0], output_index, memo)
+    if source is None: return None
+    ret = _elu_expr(source, elu[1], elu[2])
   elif (silu:=_canonical_silu(u)) is not None:
     operands = tuple(_parse_dpu_expr(x, output_index, memo) for x in silu)
     if any(x is None for x in operands): return None
@@ -750,7 +792,10 @@ def _emit_lut(stage_idx:int, plan:RKDPUStage, src:RKArg) -> RKStage:
     RKDPUOp.GELU_EXACT_LOCAL:(rklut.RK_LUT_GELU_EXACT_LOCAL, rklut.RK_LUT_GELU_EXACT_LOCAL_BN_MUL,
                              rklut.RK_LUT_GELU_EXACT_LOCAL_MINUS_EXP),
     RKDPUOp.ERF:(rklut.RK_LUT_ERF, rklut.RK_LUT_ERF_BN_MUL, rklut.RK_LUT_ERF_MINUS_EXP),
-    RKDPUOp.ERF_LOCAL:(rklut.RK_LUT_ERF_LOCAL, rklut.RK_LUT_ERF_LOCAL_BN_MUL, rklut.RK_LUT_ERF_LOCAL_MINUS_EXP)}[plan.op]
+    RKDPUOp.ERF_LOCAL:(rklut.RK_LUT_ERF_LOCAL, rklut.RK_LUT_ERF_LOCAL_BN_MUL, rklut.RK_LUT_ERF_LOCAL_MINUS_EXP),
+    **{op:(getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_BN_MUL"), getattr(rklut, f"RK_LUT_{name}_MINUS_EXP"))
+       for op,name in ((RKDPUOp.ELU1,"ELU1"),(RKDPUOp.ELU1_LOCAL,"ELU1_LOCAL"),(RKDPUOp.ELU01,"ELU01"),
+                       (RKDPUOp.ELU01_LOCAL,"ELU01_LOCAL"),(RKDPUOp.SELU,"SELU"),(RKDPUOp.SELU_LOCAL,"SELU_LOCAL"))}}[plan.op]
   cmds = []
   for table_id in range(2):
     cmds.append(_command(_TARGET_DPU, rk.REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table_id << 16)))
@@ -835,7 +880,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     if plan.op in (RKDPUOp.EXP2, RKDPUOp.HARDSWISH, RKDPUOp.HARDSWISH_LOCAL, RKDPUOp.TANH, RKDPUOp.TANH_LOCAL,
                    RKDPUOp.SIGMOID, RKDPUOp.SIGMOID_LOCAL, RKDPUOp.QUICK_GELU, RKDPUOp.QUICK_GELU_LOCAL,
                    RKDPUOp.GELU_TANH, RKDPUOp.GELU_TANH_LOCAL, RKDPUOp.GELU_EXACT, RKDPUOp.GELU_EXACT_LOCAL,
-                   RKDPUOp.ERF, RKDPUOp.ERF_LOCAL):
+                   RKDPUOp.ERF, RKDPUOp.ERF_LOCAL, RKDPUOp.ELU1, RKDPUOp.ELU1_LOCAL, RKDPUOp.ELU01, RKDPUOp.ELU01_LOCAL,
+                   RKDPUOp.SELU, RKDPUOp.SELU_LOCAL):
       stages.append(_emit_lut(stage_idx, plan, lhs))
       continue
     if plan.op is RKDPUOp.MASK:

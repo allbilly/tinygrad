@@ -104,4 +104,13 @@ class TestRockchip(unittest.TestCase):
     expected = np.array([math.erf(float(x)) for x in data], dtype=np.float16)
     np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").erf().numpy(), expected, rtol=1e-3, atol=1e-6)
 
+  def test_two_level_elu_luts(self):
+    data = np.linspace(-10, 10, 2049, dtype=np.float16)
+    fp32 = data.astype(np.float32)
+    variants = ((lambda x:x.elu(), np.where(fp32 > 0, fp32, np.expm1(fp32))),
+                (lambda x:x.elu(.1), np.where(fp32 > 0, fp32, .1*np.expm1(fp32))),
+                (lambda x:x.selu(), 1.0507*np.where(fp32 > 0, fp32, 1.67326*np.expm1(fp32))))
+    for function, expected in variants:
+      np.testing.assert_allclose(function(Tensor(data, device="ROCKCHIP")).numpy(), expected.astype(np.float16), rtol=1e-3, atol=1e-6)
+
 if __name__ == "__main__": unittest.main()
