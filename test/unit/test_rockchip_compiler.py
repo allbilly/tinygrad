@@ -5,7 +5,7 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer,
-  decode_image, emit_contract, emit_dpu, lower_contract, lower_dpu)
+  decode_image, emit_contract, emit_dpu, encode_image, lower_contract, lower_dpu)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -46,9 +46,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(tuple((r.word, r.kind, r.index) for r in image.stages[0].relocs),
                      ((27, RKBufferKind.ARG, 0), (28, RKBufferKind.ARG, 1), (29, RKBufferKind.ARG, 2)))
 
-  def test_non_fp16_fills_reject_before_emission(self):
-    for dtype in (dtypes.int, dtypes.float):
-      self.assertIsNone(lower_dpu(sink(Tensor.full((16,), 4, dtype=dtype))))
+  def test_wide_fills_tile_native_wdma_limits(self):
+    for dtype, count, tile in ((dtypes.int, 2925, 64), (dtypes.float, 6, 4)):
+      plan = lower_dpu(sink(Tensor.full((count,), 4, dtype=dtype)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual(len(plan.stages), (count+tile-1)//tile)
+      self.assertTrue(all(isinstance(stage, RKALUStage) and stage.count <= tile and stage.out_dtype is dtype for stage in plan.stages))
+      self.assertEqual(tuple(stage.dst.addend for stage in plan.stages if isinstance(stage, RKALUStage)),
+                       tuple(range(0, count*4, tile*4)))
+      image = emit_dpu(plan)
+      self.assertEqual(decode_image(encode_image(image)), image)
+    self.assertIsNone(lower_dpu(sink(Tensor.full((257,), 4, dtype=dtypes.float))))
 
   def test_plan_is_uop_free_and_reuses_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))
