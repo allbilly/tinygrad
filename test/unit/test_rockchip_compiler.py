@@ -60,6 +60,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(plan.scratch), 2)
     self.assertFalse(contains_uop(plan))
 
+  def test_scalar_multiaxis_max_uses_affine_ppu_plan(self):
+    plan = lower_affine_max_result(sink(Tensor.empty(1,1,2,3,dtype=dtypes.half).max_pool2d((2,2)))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    self.assertEqual([stage.engine for stage in emit_program(plan).stages],
+                     [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC,RKEngine.CMAC,RKEngine.PPU])
+    self.assertFalse(contains_uop(plan))
+    dense = lower_native(sink(Tensor.empty(135,dtype=dtypes.half).max())).plan
+    self.assertIsInstance(dense, RKProgram)
+    assert isinstance(dense, RKProgram)
+    self.assertEqual([stage.engine for stage in emit_program(dense).stages],
+                     [RKEngine.DPU]*9+[RKEngine.CMAC]*4+[RKEngine.PPU,RKEngine.DPU])
+
   def test_affine_movements_use_aligned_npu_atom_copies(self):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)
     plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in

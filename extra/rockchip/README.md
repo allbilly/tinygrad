@@ -68,8 +68,8 @@ are eligible to be ported as native capabilities.
   vector and the same CMAC contract;
 - dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane
   reformat, and PPU spatial reduction, including a direct scalar scale;
-- small static affine FP16 MAX reductions batched as eight PPU channels after
-  cost-bounded CMAC reformatting;
+- small static affine FP16 MAX reductions, including scalar multi-axis output,
+  batched as eight PPU channels after cost-bounded CMAC reformatting;
 - one static affine FP16 input reformat/broadcast materialized by cost-bounded
   CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
@@ -93,8 +93,8 @@ Native arithmetic is FP16. Int32 and FP32 are currently admitted only for
 operation-specific constant fills; this does not claim general arithmetic for
 either dtype. User-visible bool outputs, noncontiguous elementwise layouts,
 reductions outside the proven static affine bounds, general contractions,
-fused CMAC epilogues, convolution, pooling, and gradients remain outside the
-native contract. A fused CMAC epilogue is rejected rather than silently
+fused CMAC epilogues, general convolution/pooling, and gradients remain outside
+the native contract. A fused CMAC epilogue is rejected rather than silently
 dropped.
 
 ## EXP2 generation and characterization
@@ -147,6 +147,13 @@ boolean-output subcases remain honest dtype rejections.
 Tiled contraction legality is checked before coordinate enumeration: K,
 source extents, and at most 65,536 affine output/reduction visits bound compiler
 work. Oversized graphs reject before NPU submission.
+
+The latest focused gain after that census is `test_max_pool2d_simple`: its
+scalar multi-axis affine MAX is packed by bounded CMAC selector tasks and
+reduced by PPU, with no operation-name path or host semantic work. Dense
+single-axis global MAX remains on the proven padded DPU tree. The strict
+hardware suite passes 56 tests plus 37 subtests at this head; the focused gain
+has not yet been folded into the complete census.
 
 ## Current upstream blocker
 

@@ -895,6 +895,7 @@ failures.
 | Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_simple`, `test_sum_full`, `test_mean`, `test_sum_relu` | Yes (`da09c1fd9`) |
 | Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Yes (`da09c1fd9`) |
 | Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | Yes (`7cf01ac95`) |
+| Scalar multi-axis affine MAX through CMAC/PPU | `test_max_pool2d_simple` | Not yet |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
@@ -1121,3 +1122,16 @@ correctness fallbacks: 364 stages/0.85 MiB/38.9 seconds for
 (SHA-256 `f2dc9a3c75da906fbd1365ab835b1161fdc1009455c37b6f6fffae10e2cd66b3`);
 JUnit XML SHA-256 is
 `429581e362977ac1983c07f328ce4757f9d4736d4edb13f3997c05bf1886cafe`.
+
+Static affine MAX can now produce one scalar output when the graph has more
+than one reduction axis. The compiler enumerates the bounded affine selector,
+packs the selected values into NPU scratch with CMAC, and uses PPU spatial MAX;
+it does not recognize pooling by name. Complete `test_max_pool2d_simple` passes
+natively at its unchanged exact comparison. A single-axis scalar MAX remains
+on the established padded DPU-tree path, preventing sparse-CMAC interception
+of dense global reductions; count 135 is covered by the full hardware suite.
+Ruff and mypy pass, as do all 75 host compiler/image/telemetry/fallback tests
+and the strict RK3588 suite (56 tests plus 37 subtests) in 448.91 seconds with
+`ROCKCHIP_FALLBACK=0`. This focused complete-method gain is not yet folded into
+the 122-pass census. Counted source remains 27,664 lines, including 2,531 in
+the Rockchip renderer/compiler.

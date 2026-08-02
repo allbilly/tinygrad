@@ -79,6 +79,11 @@ class TestRockchip(unittest.TestCase):
         actual = Tensor(data, device="ROCKCHIP").realize().max(axis=(0,1)).realize().numpy()
         np.testing.assert_equal(actual, data.max(axis=(0,1)))
 
+  def test_scalar_multiaxis_max_native_cmac_ppu(self):
+    data = np.array([[[[-2,3,1], [4,-1,2]]]],dtype=np.float16)
+    actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((2,2)).realize().numpy()
+    np.testing.assert_equal(actual, np.array([[[[4]]]],dtype=np.float16))
+
   def test_dense_fp16_global_extrema_native_dpu(self):
     for count in (2, 8, 9, 135):
       with self.subTest(count=count):

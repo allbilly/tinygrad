@@ -773,10 +773,10 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
   out_axes = tuple(sorted(out_aff[0]))
   output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
-  if len(red_axes) != len(reduce.src)-1 or not out_axes or set(out_axes) & set(red_axes) or \
+  if len(red_axes) != len(reduce.src)-1 or not out_axes and len(red_axes) == 1 or set(out_axes) & set(red_axes) or \
      set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine PPU MAX axes do not form a static output/reduction partition", Ops.RANGE)
-  if not 2 <= output_count <= 128 or not 2 <= input_count <= 512:
+  if not 1 <= output_count <= 128 or not 2 <= input_count <= 512:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX surface is {output_count}x{input_count}", reduce.op)
   reduction_count = math.prod(ranges[axis] for axis in red_axes)
   pool_extent = next((extent for extent in range(max(4, reduction_count), 257) if _pool_hw_shape(extent) is not None), None)
