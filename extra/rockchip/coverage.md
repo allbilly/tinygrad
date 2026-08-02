@@ -1469,3 +1469,22 @@ native total is 142 after the current 137-pass census, pending the next complete
 run. The research tree has 28,108 counted lines. Pre-change sources are
 preserved under
 `~/rk2608_backups/scalar-product-before-fe251d06d-20260803`.
+
+Affine FP16 MUL reductions now transpose the reduction into a small number of
+full logical term surfaces. Each reduction coordinate is materialized through
+the generic selector planner, then ordinary vector DPU MUL stages fold those
+surfaces in source order. Work therefore scales with the short reduction width
+rather than gathering every output scalar independently. The same affine
+partition, source-bound, 65,536-visit, 400-stage, and 2 MiB proofs remain in
+force.
+
+Complete `test_prod` passes natively, including scalar input, axis 1, axis 3,
+and keepdim cases; `test_prod_dtype_arg` remains green. The `(3,4,5,6)` axis-1
+plan uses 29 stages, 82,016 constant bytes, and 1,344 scratch bytes; axis 3 uses
+41 stages, 74,064 constant bytes, and 2,624 scratch bytes. All 91 host tests,
+repository-wide Ruff, and mypy over 225 tinygrad modules pass; the strict
+hardware suite passes 70 tests plus 52 subtests in 632.61 seconds with
+`ROCKCHIP_FALLBACK=0`. The inferred native total is 143 after the current
+137-pass census, pending the next complete run. The research tree has 28,178
+counted lines. Pre-change sources are preserved under
+`~/rk2608_backups/affine-product-before-1887a2fff-20260803`.

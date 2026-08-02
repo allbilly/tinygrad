@@ -687,6 +687,77 @@ def lower_scalar_mul_reduce_result(sink:UOp) -> RKLowerResult:
       f"scalar MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
   return _native(completed)
 
+def lower_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
+  """Materialize each coordinate of a short affine FP16 MUL reduction, then fold full output surfaces on DPU."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1 or reductions[0].arg[0] is not Ops.MUL: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if _strip_casts(store.src[1]).key != reduce.key:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine MUL does not yet accept an epilogue", store.src[1].op)
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine MUL requires an FP16 output surface", store.src[0].op)
+  value = _strip_casts(reduce.src[0])
+  if not reduce.src[1:] or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in reduce.src[1:]) or \
+     value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL requires one direct FP16 input surface", reduce.op)
+  out_map, source_map = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_map is None or source_map is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL indexes are not static affine maps", Ops.INDEX)
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  red_axes, out_axes = tuple(u.arg[0] for u in reduce.src[1:]), tuple(sorted(out_map[0]))
+  source_axes = set(source_map[0])
+  if set(out_axes) & set(red_axes) or source_axes - set(out_axes) - set(red_axes) or \
+     any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine MUL axes do not form one output/reduction partition", Ops.RANGE)
+  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
+  reduction_count = math.prod(ranges[axis] for axis in red_axes)
+  if not 1 <= output_count <= 8192 or not 2 <= reduction_count <= 32 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"affine MUL surface is {output_count} outputs by {reduction_count} terms", reduce.op)
+  selectors:list[list[list[int]]] = [[[] for _ in range(output_count)] for _ in range(reduction_count)]
+  seen:set[int] = set()
+  for out_point in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes, out_point))
+    output_index = out_map[1]+sum(out_map[0][axis]*point[axis] for axis in out_axes)
+    if not 0 <= output_index < output_count or output_index in seen:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL output is not dense", store.src[0].op)
+    seen.add(output_index)
+    for term,red_point in enumerate(product(*(range(ranges[axis]) for axis in red_axes))):
+      point.update(zip(red_axes, red_point))
+      source_index = source_map[1]+sum(source_map[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes))
+      if not 0 <= source_index < input_count:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL input index is out of bounds", value.op)
+      selectors[term][output_index] = [source_index]
+  if seen != set(range(output_count)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL output has holes", store.src[0].op)
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  scratch:tuple[RKScratch, ...] = ()
+  operands:list[RKArg] = []
+  source = RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  for rows in selectors:
+    operand = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+    materialized = _selector_program(operand, source, input_count, rows, scratch)
+    if materialized is None:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine MUL operand selector exceeds plan limits", reduce.op)
+    steps.extend(materialized.steps)
+    scratch = materialized.scratch
+    operands.append(operand)
+  output, accumulator = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), operands[0]
+  multiplies:list[RKDPUStage] = []
+  for index,operand in enumerate(operands[1:], 1):
+    final = index == len(operands)-1
+    destination = output if final else RKArg(RKBufferKind.SCRATCH, len(scratch))
+    if not final: scratch += (RKScratch(((output_count+7)//8)*16),)
+    multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, output_count))
+    accumulator = destination
+  completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
+  cost = _plan_cost(completed)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"affine MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
+  return _native(completed)
+
 def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output_index:UOp, output:RKArg, reduced:RKArg,
                                output_count:int, out_axes:tuple[int, ...], ranges:dict[int, int]) -> RKLowerResult:
   """Materialize static pointwise operands and execute a reduction epilogue entirely on NPU engines."""
@@ -1288,6 +1359,7 @@ _LOWERERS = (
   RKLowerer("nested_sum", lambda nodes:_has_reduction(nodes, Ops.ADD) and sum(u.op is Ops.REDUCE for u in nodes) > 1,
             lower_nested_add_reduce_result),
   RKLowerer("scalar_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_scalar_mul_reduce_result),
+  RKLowerer("affine_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_affine_mul_reduce_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
