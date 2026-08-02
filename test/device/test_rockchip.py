@@ -38,6 +38,22 @@ class TestRockchip(unittest.TestCase):
     expected = np.maximum(data.astype(np.float32), 0).sum().astype(np.float16).item()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_affine_fp16_reductions_native_cmac(self):
+    np.random.seed(0)
+    data = np.random.uniform(-2, 2, (3,4,5,6)).astype(np.float16)
+    tensor = Tensor(data, device="ROCKCHIP").realize()
+    for axes in (3, (1,3), (0,2), (1,2), 1):
+      with self.subTest(axes=axes):
+        actual = tensor.sum(axis=axes).realize().numpy()
+        expected = data.astype(np.float32).sum(axis=axes).astype(np.float16)
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    actual = tensor.mean(axis=(1,2)).realize().numpy()
+    expected = (data.astype(np.float32).sum(axis=(1,2))*np.float32(1/20)).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    tiny = np.random.uniform(-2, 2, (4,2,2)).astype(np.float16)
+    actual = Tensor(tiny, device="ROCKCHIP").realize().sum(axis=(0,2)).realize().numpy()
+    np.testing.assert_allclose(actual, tiny.astype(np.float32).sum(axis=(0,2)).astype(np.float16), rtol=1e-3, atol=1e-6)
+
   def test_global_max_hwc8_native_ppu(self):
     for height,width in ((2,2), (4,4), (16,16)):
       with self.subTest(shape=(height,width,8)):

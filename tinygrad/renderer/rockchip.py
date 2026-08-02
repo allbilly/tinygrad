@@ -109,6 +109,7 @@ class RKSumProgram:
   prefix: tuple[RKContract, ...]
   dpu: RKDPUProgram
   contract: RKContract
+  suffix: tuple[RKContract, ...] = ()
 
 @dataclass(frozen=True)
 class RKReduce:
@@ -125,7 +126,7 @@ def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferK
   return RKTensorRef(RKArg(kind, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtypes.half))
 
 def _cmac_weight_ref(slot:int, logical_n:int, k:int, kind:RKBufferKind=RKBufferKind.ARG, physical_n:int|None=None) -> RKTensorRef:
-  physical_n = logical_n if physical_n is None else physical_n
+  physical_n = max(32, (logical_n+31)&-32) if physical_n is None else physical_n
   return RKTensorRef(RKArg(kind, slot), RKLayout((logical_n,k), (physical_n,k), (k*2,2), dtypes.half, kind=RKLayoutKind.CMAC_WEIGHT))
 
 def _cmac_mask_payload(count:int, align_in:int, outputs:int=4, scale:float=1.0) -> bytes:
@@ -134,6 +135,14 @@ def _cmac_mask_payload(count:int, align_in:int, outputs:int=4, scale:float=1.0) 
   for out in range(outputs):
     for k in range(count): values[(((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)] = active
   return struct.pack(f"<{len(values)}H", *values)
+
+def _cmac_selection_payload(rows:list[list[int]], align_in:int, align_out:int, scale:float) -> bytes:
+  values = [0.0] * (align_out*align_in)
+  for out,indexes in enumerate(rows):
+    for k in indexes:
+      packed = (((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)
+      values[packed] += scale
+  return b"".join(struct.pack("<e", value) for value in values)
 
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
@@ -1756,6 +1765,71 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
                         _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
   return _native(RKSumProgram(tuple(prefix), RKDPUProgram(tuple(stages), tuple(scratch)), contract))
 
+def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
+  """Lower a small affine FP16 ADD reduction as generated sparse CMAC tiles."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC requires one store and one reduction", Ops.REDUCE)
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.ADD or not reduce.src[1:]:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"affine CMAC reduction operation {reduce.arg[0].name}", reduce.op)
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine CMAC requires an FP16 output", store.src[0].op)
+  stored, scale = _strip_casts(store.src[1]), 1.0
+  if stored.key != reduce.key:
+    if stored.op is not Ops.MUL:
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC only accepts a constant scale", stored.op)
+    const, reduced = (stored.src[0], stored.src[1]) if stored.src[0].op is Ops.CONST else (stored.src[1], stored.src[0])
+    if const.op is not Ops.CONST or _strip_casts(reduced).key != reduce.key:
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC scale is not direct", stored.op)
+    scale = float(const.arg)
+  value = _strip_casts(reduce.src[0])
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC input is not one FP16 surface", reduce.op)
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or src_aff is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC indexes are not affine", Ops.INDEX)
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
+  out_axes = tuple(sorted(out_aff[0]))
+  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
+  if len(red_axes) != len(reduce.src)-1 or not out_axes or set(out_axes) & set(red_axes) or \
+     set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine CMAC axes do not form one static output/reduction partition", Ops.RANGE)
+  if not 2 <= output_count <= 128 or not 2 <= input_count <= 512:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine CMAC surface is {output_count}x{input_count}", reduce.op)
+  selectors:list[list[int]] = [[] for _ in range(output_count)]
+  seen:set[int] = set()
+  for out_values in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes, out_values))
+    out_index = out_aff[1] + sum(out_aff[0][axis]*point[axis] for axis in out_axes)
+    if not 0 <= out_index < output_count or out_index in seen:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output is not dense", Ops.INDEX)
+    seen.add(out_index)
+    for red_values in product(*(range(ranges[axis]) for axis in red_axes)):
+      point.update(zip(red_axes, red_values))
+      src_index = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes))
+      if not 0 <= src_index < input_count:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC input index is out of bounds", Ops.INDEX)
+      selectors[out_index].append(src_index)
+  if seen != set(range(output_count)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
+  align_in = (input_count+31)&-32
+  packed = RKArg(RKBufferKind.SCRATCH, 0)
+  dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, value.src[0].arg.slot), 0.0, input_count),),
+                     (RKScratch(align_in*2),))
+  lhs_layout = RKLayout((1,input_count), (1,align_in), (align_in*2,2), dtypes.half,
+                        padding=((0,0),(0,align_in-input_count)))
+  contracts:list[RKContract] = []
+  for start in range(0, output_count, 16):
+    count = min(16, output_count-start)
+    out_layout = RKLayout((1,count), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-count)))
+    contracts.append(RKContract(
+      RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, start*2), out_layout),
+      RKTensorRef(packed, lhs_layout), _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), red_axes[0],
+      _cmac_selection_payload(selectors[start:start+count], align_in, 32, scale)))
+  return _native(RKSumProgram((), dpu, contracts[0], tuple(contracts[1:])))
+
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -1859,8 +1933,9 @@ def lower_reduce_result(sink:UOp) -> RKLowerResult:
 
 def lower_native(sink:UOp) -> RKLowerResult:
   if any(u.op is Ops.REDUCE for u in sink.toposort()):
-    add, pool, contract = lower_add_reduce_result(sink), lower_reduce_result(sink), lower_contract_result(sink)
-    result = add if add.reject is None else pool if pool.reject is None or contract.reject is not None and any(
+    add, affine = lower_add_reduce_result(sink), lower_affine_reduce_result(sink)
+    pool, contract = lower_reduce_result(sink), lower_contract_result(sink)
+    result = add if add.reject is None else affine if affine.reject is None else pool if pool.reject is None or contract.reject is not None and any(
       u.op is Ops.REDUCE and u.arg[0] is Ops.MAX for u in sink.toposort()) else contract
   else:
     result = lower_dpu_result(sink)
@@ -2043,11 +2118,13 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit one direct FP16 CMAC task; all surfaces are already hardware-legal."""
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   if plan.rhs.layout.kind is not RKLayoutKind.CMAC_WEIGHT: raise ValueError("CMAC RHS is not in weight layout")
-  e, align_out, align_in = _command, 32, plan.lhs.layout.physical_shape[-1]
+  e, align_out, align_in = _command, plan.rhs.layout.physical_shape[0], plan.lhs.layout.physical_shape[-1]
   if align_in < 32 or align_in % 32: raise ValueError("CMAC K must be aligned to 32")
+  if align_out != 32: raise ValueError("proven CMAC output tile is 32 physical channels")
   input_row_bytes = align_in*2
   feature_grains = max(80, (((2*256*128+input_row_bytes-1)//input_row_bytes)+1)&-2)
   line_stride = 4*min(align_in//32, 13)
+  notch = 8*min(align_out//32, 13)-1
   commands = (
     e(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), e(_TARGET_CNA, rk.REG_CNA_CONV_CON1, 0x20000120),
     e(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4), e(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
@@ -2065,8 +2142,8 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_CORE, rk.REG_CORE_RESERVED_3030, 0), e(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e4),
     e(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), e(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
     e(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, 0x10), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0),
-    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0x70007),
-    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x1f001f), e(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
+    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch<<16)|notch),
+    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((align_out-1)<<16)|(align_out-1)), e(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 0x126), e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1),
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, 0), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
@@ -2076,8 +2153,9 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),), constants=plan.constants)
 
 def emit_sum(plan:RKSumProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
-  """Compose aligned DPU partial sums and one masked K32 CMAC tail into a sequential image."""
-  images = (*(emit_contract(prefix, target) for prefix in plan.prefix), emit_dpu(plan.dpu, target), emit_contract(plan.contract, target))
+  """Compose CMAC prefixes, DPU transforms, and one or more sequential CMAC output tiles."""
+  images = (*(emit_contract(prefix, target) for prefix in plan.prefix), emit_dpu(plan.dpu, target),
+            emit_contract(plan.contract, target), *(emit_contract(suffix, target) for suffix in plan.suffix))
   stages:list[RKStage] = []
   constants = bytearray()
   for image in images:

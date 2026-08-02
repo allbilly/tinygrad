@@ -51,15 +51,19 @@ are eligible to be ported as native capabilities.
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
   hardware-packed weights and a single FP32 accumulation;
 - global ReLU-sum through a DPU MAX-zero prepass and the same direct CMAC;
+- static affine FP16 ADD reductions with at most 512 input and 128 output
+  elements, using one aligned DPU copy and sequential sparse CMAC tiles of at
+  most 16 logical outputs; constant mean scaling is folded into the weights;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
 Native arithmetic is FP16. Int32 and FP32 are currently admitted only for
 operation-specific constant fills; this does not claim general arithmetic for
 either dtype. User-visible bool outputs, noncontiguous elementwise layouts,
-general reductions and contractions, fused CMAC epilogues, convolution, pooling, and gradients
-remain outside the native contract. A fused CMAC epilogue is rejected rather
-than silently dropped.
+reductions outside the proven static affine bounds, general contractions,
+fused CMAC epilogues, convolution, pooling, and gradients remain outside the
+native contract. A fused CMAC epilogue is rejected rather than silently
+dropped.
 
 ## EXP2 generation and characterization
 
@@ -101,10 +105,12 @@ and has no skip on an RK3588 host.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 26,435, so `MAX_LINE_COUNT=25000 python sz.py` fails by 1,435 lines. The
-handwritten backend is 1,462 counted lines (1,389 renderer/compiler and 73
-runtime). The code must not be hidden under `runtime/autogen` or moved out of
-tree to evade this limit. The generic native-program hook is an independent
-five-line counted change and can be reviewed separately; the backend needs
-real upstream line budget or an independently useful in-tree reduction before
-it can be submitted.
+contains 27,189, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,189 lines.
+The exact 2,221-line delta is 2,216 counted Rockchip backend lines (2,056
+renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
+telemetry support) plus the five-line generic native-program hook. Generated
+register definitions, LUT payloads, and reproducible command data belong under
+`runtime/autogen`; handwritten legality, layout, scheduling, and emission logic
+remain counted. The generic hook can be reviewed separately, while the backend
+needs real upstream line budget or independently useful in-tree reductions
+before submission.

@@ -6,7 +6,7 @@ from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKReduce, RKRejectKind, RKLUTStage,
   RKMaskStage, RKSumProgram, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_reduce, emit_sum, encode_image, lower_contract,
-  lower_dpu, lower_native, lower_add_reduce_result, lower_reduce_result, lower_reformat_result, rk_fingerprint)
+  lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result, lower_reformat_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -568,6 +568,22 @@ class TestDPUCompiler(unittest.TestCase):
     assert isinstance(plan, RKSumProgram)
     self.assertEqual([stage.op for stage in plan.dpu.stages], [Ops.MAX,Ops.ADD])
     self.assertEqual([stage.engine for stage in emit_sum(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
+
+  def test_affine_reductions_generate_sparse_cmac_weights(self):
+    expressions = (Tensor.empty(3,4,5,6,dtype=dtypes.half).sum(axis=3),
+                   Tensor.empty(4,2,2,dtype=dtypes.half).sum(axis=(0,2)),
+                   Tensor.empty(3,4,5,6,dtype=dtypes.half).mean(axis=(1,2)))
+    plans = [lower_affine_reduce_result(sink(expression)).plan for expression in expressions]
+    self.assertTrue(all(isinstance(plan, RKSumProgram) for plan in plans))
+    first = plans[0]
+    assert isinstance(first, RKSumProgram)
+    contracts = (first.contract, *first.suffix)
+    self.assertEqual([contract.out.layout.logical_shape for contract in contracts], [(1,16),(1,16),(1,16),(1,12)])
+    self.assertTrue(all(contract.out.layout.physical_shape == (1,32) for contract in contracts))
+    self.assertEqual([contract.out.buffer.addend for contract in contracts], [0,32,64,96])
+    self.assertTrue(all((contract.lhs.layout.physical_shape, len(contract.constants)) == ((1,384),24576) for contract in contracts))
+    self.assertEqual([stage.engine for stage in emit_sum(first).stages], [RKEngine.DPU]+[RKEngine.CMAC]*4)
+    self.assertEqual(decode_image(encode_image(emit_sum(first))), emit_sum(first))
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

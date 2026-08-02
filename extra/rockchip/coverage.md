@@ -61,10 +61,12 @@ ordinary tensor buffer views that start at an offset are a different ABI case.
 The committed planner consequently never emits such a relocation. Strict
 hardware tests cover lengths 2, 16, 60, 135, 720, and 16,384. With the actual
 TestOps selector (`DEV=ROCKCHIP`) and persistent compilation disabled
-(`CACHELEVEL=0`), `test_sum_full` passes. The first 135-element subcase of
-`test_sum` now passes, then its length-six row reduction rejects because a
-native padded-row layout is not implemented. `test_sum_simple` has an explicit
-FP32 input, while multi-output reductions and nested sums remain unsupported.
+(`CACHELEVEL=0`), `test_sum_full` passes. Static affine multi-output ADD
+reductions now enumerate their source selector matrix at compile time, copy
+the input once into an aligned NPU scratch surface, and execute sparse CMAC
+weight tiles. This completes every subcase of `test_sum`, `test_sum_tiny`, and
+`test_mean_axis`; `test_sum_simple` still has an explicit FP32 input and nested
+sums remain unsupported.
 Global `test_sum_relu` now passes through a DPU MAX-zero prepass and the direct
 K64 CMAC; the final ReLU is removed only after proving all reduced lanes are
 nonnegative. Global `test_mean` also passes: its compile-time reciprocal is
@@ -72,8 +74,20 @@ folded into generated K384 CMAC weights, preserving one FP32 accumulation and
 one final FP16 conversion. Earlier claims for other methods came from mistakenly
 using `DEVICE=ROCKCHIP`, which left TestOps on the default CPU backend; they
 are superseded here. No tolerance or skip was changed.
-The full explicit-device suite passes 42 tests plus 17 subtests in 324.56
-seconds with `CACHELEVEL=0` after adding scaled K384 mean.
+
+A first attempt issued one CMAC task with 32–128 physical output channels.
+Hardware returned valid results only for logical channels 0–15; channel 16
+was the exact failure boundary across output sizes 18, 24, 60, and 90. The
+failed experiment is preserved as
+`wip-affine-cmac-wide-channel-boundary.patch` with SHA-256
+`31bfecbb7cd9c80c957eb03de8aac9b1fa72962a720830afa61aaf70b4a100b9`.
+The committed planner keeps the proven 32-channel physical CMAC command but
+tiles at most 16 logical outputs per task. Tasks write sequentially at
+16-element-aligned output offsets, so each later task overwrites only padding
+from its predecessor. A strict `(3,4,5,6)` hardware matrix covers axes `3`,
+`(1,3)`, `(0,2)`, `(1,2)`, and `1`, plus mean and a `(4,2,2)` tiny reduction.
+The full explicit-device suite passes 44 tests plus 22 subtests in 328.63
+seconds with `CACHELEVEL=0` after this milestone.
 
 The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,
@@ -678,6 +692,8 @@ failures.
 |---|---:|---|
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
 | Native tiled int32/FP32 constant fills (research-only, restored) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Current (`52c6657e2`) |
+| Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_full`, `test_mean`, `test_sum_relu` | Focused only; census pending |
+| Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Focused only; census pending |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
