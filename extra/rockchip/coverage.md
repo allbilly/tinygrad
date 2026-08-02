@@ -365,6 +365,13 @@ ported into the thin runtime. The current direct CMAC contract therefore stays
 limited to already legal packed surfaces until device-native layout conversion
 exists.
 
+The following diagnostic-only milestone keeps the 140/272/13 tally unchanged
+but splits every pre-submission rejection into `unsupported_dtype`,
+`unsupported_layout`, `unsupported_contraction`, or `unsupported_op`. Focused
+compiler tests cover all four classes. This makes the informational census
+useful without treating honest hardware exclusions as numerical or device
+failures.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
