@@ -406,6 +406,18 @@ of selector constants reject explicitly. All 67 host tests, Ruff, and mypy are
 clean; the expanded strict hardware suite passes 48 tests plus 31 subtests in
 370.77 seconds. This generic capability adds 73 counted compiler lines.
 
+One static affine FP16 input can now be materialized before a generic DPU
+expression. The lowerer proves a dense output map, enumerates the differing
+input map, rejects plans above 4,096 outputs, 512 source elements, or 8 MiB of
+selector constants, then emits DPU packing, CMAC selector tiles, and the normal
+ALU/LUT/mask schedule. It is not test-name-specific and also covers one
+permuted operand. The full `test_broadcasted_add`, `test_broadcasted_add_2`,
+and `test_broadcast_simple` methods pass natively on their 45x65 shapes in
+61.45 seconds, establishing at least 105 native methods before the next full
+census. All 68 host tests, Ruff, and mypy are clean; the strict hardware suite
+passes 49 tests plus 31 subtests in 371.75 seconds. The capability adds 88
+counted compiler lines.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);

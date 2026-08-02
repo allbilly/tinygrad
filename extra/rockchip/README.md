@@ -70,6 +70,8 @@ are eligible to be ported as native capabilities.
   reformat, and PPU spatial reduction, including a direct scalar scale;
 - small static affine FP16 MAX reductions batched as eight PPU channels after
   cost-bounded CMAC reformatting;
+- one static affine FP16 input reformat/broadcast materialized by cost-bounded
+  CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
   32-term aligned DPU/CMAC plan;
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
@@ -142,8 +144,8 @@ now execute natively before the typed affine-layout and integer-dtype rejects.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,402, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,402 lines.
-The exact 2,434-line delta is 2,429 counted Rockchip backend lines (2,269
+contains 27,490, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,490 lines.
+The exact 2,522-line delta is 2,517 counted Rockchip backend lines (2,357
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

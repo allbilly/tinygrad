@@ -86,6 +86,13 @@ class TestRockchip(unittest.TestCase):
     expanded = Tensor(data[:,:1], device="ROCKCHIP").realize().expand(2,3,8).contiguous().realize().numpy()
     np.testing.assert_equal(expanded, np.broadcast_to(data[:,:1], (2,3,8)))
 
+  def test_affine_fp16_broadcast_alu_native_cmac_dpu(self):
+    lhs = np.linspace(1, 3, 27, dtype=np.float16).reshape(3,9)
+    rhs = np.array([[1], [2], [4]], dtype=np.float16)
+    x, y = Tensor(lhs, device="ROCKCHIP").realize(), Tensor(rhs, device="ROCKCHIP").realize()
+    np.testing.assert_equal((x+y).realize().numpy(), lhs+rhs)
+    np.testing.assert_allclose((x/y).realize().numpy(), lhs/rhs, rtol=1e-3, atol=1e-6)
+
   def test_sparse_affine_movements_native_cmac(self):
     cases = (
       (np.arange(9, dtype=np.float16).reshape(3,3), lambda x:x.T, lambda x:x.T),
