@@ -684,6 +684,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.stages), 50)
     self.assertFalse(contains_uop(plan))
 
+  def test_tiled_contraction_materializes_pointwise_bias_epilogue(self):
+    x, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((1,4,9,9),(4,4,3,3),(4,)))
+    plan = lower_tiled_contract_result(sink(x.conv2d(weight,bias))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertEqual(image.stages[-1].engine, RKEngine.DPU)
+    self.assertLessEqual(len(image.stages), 400)
+    self.assertLessEqual(len(image.constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_multiaxis_tall_contraction_stays_inside_plan_cost_ceiling(self):
     x, weight = Tensor.empty(1,1,5,7,dtype=dtypes.half), Tensor.empty(6,1,2,1,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x.conv2d(weight))).plan

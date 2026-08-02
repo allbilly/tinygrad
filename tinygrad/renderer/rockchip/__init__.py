@@ -586,6 +586,46 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
                         _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
   return _native(RKProgram((*prefix, RKDPUProgram(tuple(stages)), contract), tuple(scratch)))
 
+def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output_index:UOp, output:RKArg, reduced:RKArg,
+                               output_count:int, out_axes:tuple[int, ...], ranges:dict[int, int]) -> RKLowerResult:
+  """Materialize static pointwise operands and execute a reduction epilogue entirely on NPU engines."""
+  reduction_nodes = set(reduce.toposort())
+  indexes = list(dict.fromkeys(u for u in stored.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and
+                               u not in reduction_nodes and u.src[1].key != output_index.key))
+  memo:dict[UOp, _Expr|RKArg|float] = {reduce:reduced}
+  steps = list(program.steps)
+  scratch = program.scratch
+  for index in indexes:
+    if index.dtype is not dtypes.half:
+      return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, "reduction epilogue input must be FP16", index.op)
+    src_count, mapping = int(index.src[0].src[0].arg), [-1]*output_count
+    for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
+      point = dict(zip(out_axes, coordinates))
+      dst, src = (_static_scalar(node, point) for node in (output_index,index.src[1]))
+      if not isinstance(dst, int) or isinstance(dst, bool) or not 0 <= dst < output_count or mapping[dst] != -1 or \
+         not isinstance(src, int) or isinstance(src, bool) or not 0 <= src < src_count:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reduction epilogue is not one static output surface", index.op)
+      mapping[dst] = src
+    expanded = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+    packed = _selector_program(expanded, RKArg(RKBufferKind.ARG, index.src[0].arg.slot), src_count,
+                               [[src] for src in mapping], scratch)
+    if packed is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "reduction epilogue selector exceeds plan limits", index.op)
+    steps.extend(packed.steps)
+    scratch = packed.scratch
+    memo[index] = expanded
+  root = _parse_alu(stored, output_index, memo)
+  if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "reduction epilogue is not legal DPU arithmetic", stored.op)
+  scheduled = _schedule_expr(root, output, output_count, scratch)
+  if scheduled is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "reduction epilogue is not materializable", stored.op)
+  completed = _finish_program([*steps, scheduled], scheduled.scratch)
+  cost = _plan_cost(completed)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"reduction epilogue needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", stored.op)
+  return _native(completed)
+
 def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a small affine FP16 ADD reduction as generated sparse CMAC tiles."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -594,14 +634,13 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if reduce.arg[0] is not Ops.ADD or not reduce.src[1:]: return _not_applicable()
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine CMAC requires an FP16 output", store.src[0].op)
-  stored, scale = _strip_casts(store.src[1]), 1.0
+  stored, scale, epilogue = _strip_casts(store.src[1]), 1.0, False
   if stored.key != reduce.key:
-    if stored.op is not Ops.MUL:
-      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC only accepts a constant scale", stored.op)
-    const, reduced = (stored.src[0], stored.src[1]) if stored.src[0].op is Ops.CONST else (stored.src[1], stored.src[0])
-    if const.op is not Ops.CONST or _strip_casts(reduced).key != reduce.key:
-      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC scale is not direct", stored.op)
-    scale = float(const.arg)
+    if stored.op is Ops.MUL:
+      const, reduced_term = (stored.src[0], stored.src[1]) if stored.src[0].op is Ops.CONST else (stored.src[1], stored.src[0])
+      if const.op is Ops.CONST and _strip_casts(reduced_term).key == reduce.key: scale = float(const.arg)
+      else: epilogue = True
+    else: epilogue = True
   value, prepare = _strip_casts(reduce.src[0]), None
   indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   if value.op is Ops.INDEX and value.src[0].op is Ops.PARAM and value.dtype is dtypes.half:
@@ -648,12 +687,18 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   initial_scratch = () if prepare is None else prepare.scratch
-  program = _sparse_cmac_pipeline(output, source, input_count, selectors, scale, initial_scratch) if \
+  reduced = output
+  if epilogue:
+    reduced = RKArg(RKBufferKind.SCRATCH, len(initial_scratch))
+    initial_scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+  program = _sparse_cmac_pipeline(reduced, source, input_count, selectors, scale, initial_scratch) if \
     input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(
-      output, source, selectors, scale, initial_scratch, direct_count=input_count)
+      reduced, source, selectors, scale, initial_scratch, direct_count=input_count)
   if program is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine CMAC output tiles exceed the source-window or constant budget", reduce.op)
   if prepare is not None: program = RKProgram((RKDPUProgram(prepare.stages, program.scratch), *program.steps), program.scratch)
+  if epilogue: return _finish_reduction_epilogue(program, stored, reduce, store.src[0].src[1], output, reduced,
+                                                  output_count, out_axes, ranges)
   return _native(program)
 
 def lower_contract_result(sink:UOp) -> RKLowerResult:
@@ -718,8 +763,10 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
   if reduce.arg[0] is not Ops.ADD or len(reduce.src) < 2 or store.src[0].op is not Ops.INDEX or \
-     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or _strip_casts(store.src[1]).key != reduce.key:
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _not_applicable()
+  stored = _strip_casts(store.src[1])
+  epilogue = stored.key != reduce.key
   body, red_ranges = _strip_casts(reduce.src[0]), reduce.src[1:]
   if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in red_ranges): return _not_applicable()
   lhs_value, rhs_value = (_strip_casts(x) for x in body.src)
@@ -742,7 +789,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
   for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
     point = dict(zip(out_axes, coordinates))
-    output = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in out_axes)
+    out_offset = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in out_axes)
     lhs_row, rhs_column = [], []
     for red_coordinates in product(*(range(ranges[axis]) for axis in red_axes)):
       point.update(zip(red_axes, red_coordinates))
@@ -763,7 +810,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
         return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction index is out of bounds", Ops.INDEX)
       lhs_row.append(indexes[0])
       rhs_column.append(indexes[1])
-    records.append((output, tuple(lhs_row), tuple(rhs_column)))
+    records.append((out_offset, tuple(lhs_row), tuple(rhs_column)))
   lhs_rows = list(dict.fromkeys(row for _,row,_ in records))
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
   m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
@@ -804,8 +851,13 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     steps.append(RKContract(RKTensorRef(RKArg(cmac_out.kind, cmac_out.index, row_start*128), out_layout),
       RKTensorRef(RKArg(a_arg.kind, a_arg.index, row_start*align_in*2), lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0]))
   unpack:list[list[int]] = [[] for _ in range(output_count)]
-  for output,row,rhs_key in records: unpack[output] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
-  dense = _selector_program(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch)
+  for out_index,row,rhs_key in records: unpack[out_index] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
+  output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
+  reduced = output
+  if epilogue:
+    reduced = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+  dense = _selector_program(reduced, cmac_out, m*64, unpack, scratch)
   if dense is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC output selector exceeds plan limits", reduce.op)
   steps.extend(dense.steps)
   scratch = dense.scratch
@@ -814,7 +866,10 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   if stage_count > RK_MAX_PROGRAM_STAGES or constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC plan needs {stage_count} stages and {constant_bytes} constant bytes", reduce.op)
-  return _native(_finish_program(steps, scratch))
+  program = _finish_program(steps, scratch)
+  if epilogue: return _finish_reduction_epilogue(program, stored, reduce, store.src[0].src[1], output, reduced,
+                                                  output_count, out_axes, ranges)
+  return _native(program)
 
 def lower_contract(sink:UOp) -> RKContract|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""

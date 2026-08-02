@@ -1379,3 +1379,21 @@ contract investigations. The durable JSON is
 (SHA-256 `010527a2a5af8efc43ecc09a8b160978677c3299c46ca2a7866d57f086375cb4`);
 the JUnit XML SHA-256 is
 `85b082338e041c16c4243eafeaaf127830dccfcd7721e71b146e6cbb7a3043c0`.
+
+Reduction epilogues now compose through generic ordered target plans. A tiled
+contraction writes its dense result to padded NPU scratch; every non-output
+affine FP16 operand is expanded through the existing selector planner, and the
+parsed pointwise expression is scheduled as a final DPU program. Completed
+program cost remains subject to the shared 400-stage and 2 MiB ceilings, and
+no UOp reaches the target plan or emitter.
+
+Complete `test_simple_conv2d_bias` passes natively in 29.52 seconds at
+unchanged tolerance. Its plan has 258 stages (44 DPU and 214 CMAC), 347,696
+constant bytes, and 18,592 scratch bytes. `test_bias_conv_transpose2d`,
+`test_nested_conv2d`, and `test_output_padded_conv_transpose2d` now progress
+past epilogue legality and reject on the existing surface/K/selector resource
+bounds rather than pretending support. All 82 host compiler/image tests, Ruff,
+and mypy pass; the strict hardware suite passes 65 tests plus 44 subtests in
+615.29 seconds with `ROCKCHIP_FALLBACK=0`. The inferred native method total is
+138 after the current 137-pass census, pending the next complete run. The
+research tree has 27,985 counted lines.
