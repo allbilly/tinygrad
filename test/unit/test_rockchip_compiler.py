@@ -5,8 +5,8 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKReduce, RKRejectKind, RKLUTStage,
-  RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_reduce, encode_image, lower_contract, lower_dpu, lower_native,
-  lower_reduce_result, lower_reformat_result, rk_fingerprint)
+  RKMaskStage, RKSumProgram, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_reduce, emit_sum, encode_image, lower_contract,
+  lower_dpu, lower_native, lower_add_reduce_result, lower_reduce_result, lower_reformat_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -531,6 +531,20 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(image.constants), 64)
     self.assertIs(image.stages[0].relocs[0].kind, RKBufferKind.CONSTANT)
     self.assertEqual(decode_image(encode_image(image)), image)
+
+  def test_power_of_two_global_sum_is_dpu_tree(self):
+    result = lower_add_reduce_result(sink(Tensor.empty(16384,dtype=dtypes.half).sum()))
+    self.assertIsInstance(result.plan, RKSumProgram)
+    plan = result.plan
+    assert isinstance(plan, RKSumProgram)
+    self.assertEqual((len(plan.dpu.stages), len(plan.dpu.scratch)), (12,12))
+    self.assertEqual([stage.count for stage in plan.dpu.stages], [8192,4096,2048,1024,512,256,128,64,32,16,8,8])
+    self.assertFalse(contains_uop(plan))
+    image = emit_sum(plan)
+    self.assertEqual((len(image.stages), {stage.engine for stage in image.stages}), (13, {RKEngine.DPU,RKEngine.CMAC}))
+    self.assertEqual(decode_image(encode_image(image)), image)
+    rejected = lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum()))
+    self.assertIs(rejected.reject.kind, RKRejectKind.UNSUPPORTED_REDUCTION)
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

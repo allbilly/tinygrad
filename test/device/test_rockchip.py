@@ -10,6 +10,15 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
     np.testing.assert_equal(actual, data.astype(np.float32).sum(axis=1).astype(np.float16))
 
+  def test_power_of_two_fp16_sum_native_dpu(self):
+    rng = np.random.default_rng(4)
+    for count in (2, 16, 16384):
+      with self.subTest(count=count):
+        data = rng.uniform(-0.5, 0.5, count).astype(np.float16)
+        actual = Tensor(data, device="ROCKCHIP").realize().sum().realize().item()
+        expected = data.astype(np.float32).sum().astype(np.float16).item()
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_global_max_hwc8_native_ppu(self):
     for height,width in ((2,2), (4,4), (16,16)):
       with self.subTest(shape=(height,width,8)):

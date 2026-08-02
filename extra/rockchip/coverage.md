@@ -40,6 +40,22 @@ as an immutable constant, while the user input remains a directly addressed
 rounded to FP16. Neither compilation nor execution performs host packing or
 host arithmetic; unsupported row widths continue to reject.
 
+Contiguous power-of-two FP16 global sums now use a typed `RKSumProgram`. DPU
+pairwise stages reduce only while the second half begins at a 16-byte address;
+the remaining 1–8 lanes are copied into an aligned scratch atom and a masked
+K32 CMAC produces the scalar. The four repeated CMAC weight rows are immutable
+`[1...1,0...0]` image constants, so no invocation-time packing occurs.
+
+The initial all-DPU tree was an important rejected probe: both values of a
+two-element input were read from lane zero, producing `2*x[0]`. Disabling both
+disk and schedule caches reproduced the result. It proves that DPU
+`EW_BASE_ADDR` cannot select a sub-16-byte lane through a relocation addend;
+ordinary tensor buffer views that start at an offset are a different ABI case.
+The committed planner consequently never emits such a relocation. Strict
+hardware tests cover lengths 2, 16, and 16,384, and the complete device suite
+passes 41 tests plus 14 subtests. The unchanged official `test_sum_simple` and
+`test_sum_full` methods both pass with `ROCKCHIP_FALLBACK=0`.
+
 The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,
 coalesces adjacent aligned atoms, and emits ordinary DPU ADD-zero copy tasks;

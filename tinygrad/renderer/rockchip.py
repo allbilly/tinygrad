@@ -98,6 +98,12 @@ class RKContract:
   lhs: RKTensorRef
   rhs: RKTensorRef
   reduce_axis: int
+  constants: bytes = b""
+
+@dataclass(frozen=True)
+class RKSumProgram:
+  dpu: RKDPUProgram
+  contract: RKContract
 
 @dataclass(frozen=True)
 class RKReduce:
@@ -137,12 +143,12 @@ class RKReject:
 
 @dataclass(frozen=True)
 class RKLowerResult:
-  plan: RKDPUProgram|RKContract|RKReduce|None = None
+  plan: RKDPUProgram|RKContract|RKReduce|RKSumProgram|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     if (self.plan is None) == (self.reject is None): raise ValueError("RK lowering result must contain exactly one plan or reject")
 
-def _native(plan:RKDPUProgram|RKContract|RKReduce) -> RKLowerResult: return RKLowerResult(plan=plan)
+def _native(plan:RKDPUProgram|RKContract|RKReduce|RKSumProgram) -> RKLowerResult: return RKLowerResult(plan=plan)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
   return RKLowerResult(reject=RKReject(kind, detail, node_op))
 
@@ -1627,6 +1633,48 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
     dst += length
   return _native(RKDPUProgram(tuple(stages)))
 
+def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
+  """Lower a dense power-of-two FP16 global sum through aligned DPU stages and one CMAC tail."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum requires one store and one reduction", Ops.REDUCE)
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"DPU reduction operation {reduce.arg[0].name}", reduce.op)
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU sum requires an FP16 output surface", store.src[0].op)
+  if store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one scalar output", store.src[0].op)
+  if _strip_casts(store.src[1]).key != reduce.key:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum does not accept a fused epilogue", store.src[1].op)
+  value, red = _strip_casts(reduce.src[0]), reduce.src[1]
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half or red.op is not Ops.RANGE:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "DPU sum input is not one direct FP16 surface", reduce.op)
+  count, src_aff = int(red.src[0].arg), _affine(value.src[1])
+  if count < 2 or count > 65536 or count & (count-1):
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"DPU sum requires a power-of-two extent, got {count}", red.op)
+  if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one dense reduction axis", value.op)
+  output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  stages:list[RKDPUStage] = []
+  scratch:list[RKScratch] = []
+  while count > 8:
+    half = count//2
+    rhs = RKArg(source.kind, source.index, source.addend+half*2)
+    dst = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    stages.append(RKALUStage(Ops.ADD, dst, source, rhs, half))
+    scratch.append(RKScratch(((half+7)//8)*16))
+    source, count = dst, half
+  packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  stages.append(RKALUStage(Ops.ADD, packed, source, 0.0, count))
+  scratch.append(RKScratch(64))
+  mask = struct.pack("<e", 1.0)*count + struct.pack("<e", 0.0)*(32-count)
+  constants = mask*4
+  out_ref = RKTensorRef(output, RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31))))
+  contract = RKContract(out_ref, _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH),
+                        _dense_half_ref(0, (4,32), RKBufferKind.CONSTANT), red.arg[0], constants)
+  return _native(RKSumProgram(RKDPUProgram(tuple(stages), tuple(scratch)), contract))
+
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -1657,8 +1705,9 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
       return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "CMAC row sum requires dense N-by-32 input", body.op)
     if int(body.src[0].src[0].arg) != n*32:
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "CMAC row-sum input extent does not match N-by-32 surface", body.op)
+    ones = struct.pack("<e", 1.0)*32
     return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(0, (1,32), RKBufferKind.CONSTANT),
-                              _dense_half_ref(body.src[0].arg.slot, (n,32)), red_axis))
+                              _dense_half_ref(body.src[0].arg.slot, (n,32)), red_axis, ones))
   if body.op is not Ops.MUL: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "reduction body is not multiply", body.op)
   if red.op is not Ops.RANGE: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "reduction axis is not a range", red.op)
   if int(red.src[0].arg) != 32:
@@ -1729,8 +1778,8 @@ def lower_reduce_result(sink:UOp) -> RKLowerResult:
 
 def lower_native(sink:UOp) -> RKLowerResult:
   if any(u.op is Ops.REDUCE for u in sink.toposort()):
-    pool, contract = lower_reduce_result(sink), lower_contract_result(sink)
-    result = pool if pool.reject is None or contract.reject is not None and any(
+    add, pool, contract = lower_add_reduce_result(sink), lower_reduce_result(sink), lower_contract_result(sink)
+    result = add if add.reject is None else pool if pool.reject is None or contract.reject is not None and any(
       u.op is Ops.REDUCE and u.arg[0] is Ops.MAX for u in sink.toposort()) else contract
   else:
     result = lower_dpu_result(sink)
@@ -1938,8 +1987,18 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
   relocs = tuple(RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
                  for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out)))
-  constants = struct.pack("<e", 1.0)*32 if plan.lhs.buffer.kind is RKBufferKind.CONSTANT else b""
-  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),), constants=constants)
+  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),), constants=plan.constants)
+
+def emit_sum(plan:RKSumProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
+  """Compose aligned DPU partial sums and one masked K32 CMAC tail into a sequential image."""
+  dpu, contract = emit_dpu(plan.dpu, target), emit_contract(plan.contract, target)
+  constant_base, stage_base = len(dpu.constants), len(dpu.stages)
+  tail = contract.stages[0]
+  relocs = tuple(RKReloc(reloc.stage+stage_base, reloc.word, reloc.kind,
+    reloc.index+(constant_base if reloc.kind is RKBufferKind.CONSTANT else 0), reloc.addend, reloc.shift, reloc.mask, reloc.field_shift)
+    for reloc in tail.relocs)
+  return RKImage(target, dpu.stages+(RKStage(tail.engine, tail.commands, relocs, tail.flags),), dpu.scratch,
+                 dpu.constants+contract.constants)
 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""
@@ -1993,6 +2052,7 @@ class RockchipRenderer(Renderer):
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
+    elif isinstance(result.plan, RKSumProgram): image = emit_sum(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))
     return UOp(Ops.PROGRAM, src=(ast, linear, UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
