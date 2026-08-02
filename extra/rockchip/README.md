@@ -83,7 +83,7 @@ are eligible to be ported as native capabilities.
   the weights;
 - static affine FP16 movements with at most 512 source and 4,096 output
   elements: aligned runs use DPU atom copies, while arbitrary selector maps up
-  to an 8 MiB generated-weight budget use the same sparse CMAC pipeline;
+  to a 2 MiB generated-weight budget use the same sparse CMAC pipeline;
 - sub-atom FP16 DPU stages program their logical channel count, so NPU-zeroed
   physical padding remains defined when a scalar or short tail feeds CMAC;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
@@ -142,11 +142,16 @@ through bounded zero-masked affine materialization and generic DPU arithmetic.
 Static conditional FP16 `tril`/`triu` subcases are also native, while their
 explicit boolean-output subcases remain honest dtype rejections.
 
+The subsequent focused multi-axis contraction milestone passes all six
+`test_conv2d_bs_1_cin_1` subcases natively. It is not yet folded into the
+117-pass census; larger contraction packs remain typed plan-limit rejects when
+their generated constant BO would exceed the proven 2 MiB allocation ceiling.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,639, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,639 lines.
-The exact 2,671-line delta is 2,666 counted Rockchip backend lines (2,506
+contains 27,641, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,641 lines.
+The exact 2,673-line delta is 2,668 counted Rockchip backend lines (2,508
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

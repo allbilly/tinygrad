@@ -19,6 +19,8 @@ from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, 
 from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint as rk_fingerprint
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 
+RK_MAX_CONSTANT_BYTES = 2*1024*1024
+
 def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
   for extent in reversed(shape):
@@ -226,7 +228,7 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   if atom_reject is None: return _native(RKDPUProgram(tuple(stages)))
   align_in = max(32, (src_count+31)&-32)
   constant_bytes = ((count+15)//16)*32*align_in*2
-  if 0 < src_count <= 512 and 0 < count <= 4096 and constant_bytes <= 8*1024*1024:
+  if 0 < src_count <= 512 and 0 < count <= 4096 and constant_bytes <= RK_MAX_CONSTANT_BYTES:
     return _native(_sparse_cmac_pipeline(output, source, src_count, [[src] if src >= 0 else [] for src in mapping]))
   return atom_reject
 
@@ -299,7 +301,7 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
     if end-base > 512: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast tile source span is {end-base}", Ops.INDEX)
     chunks.append((base, end, [(start, rows)]))
   constant_bytes = sum(len(chunk)*32*max(32, (end-base+31)&-32)*2 for base,end,chunk in chunks)
-  if constant_bytes > 8*1024*1024:
+  if constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast selectors require {constant_bytes} bytes", Ops.INDEX)
 
   packed = RKArg(RKBufferKind.SCRATCH, 1)
@@ -547,31 +549,32 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
-  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2 or store.src[0].op is not Ops.INDEX or \
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) < 2 or store.src[0].op is not Ops.INDEX or \
      store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or _strip_casts(store.src[1]).key != reduce.key:
     return _not_applicable()
-  body, red = _strip_casts(reduce.src[0]), reduce.src[1]
-  if body.op is not Ops.MUL or red.op is not Ops.RANGE: return _not_applicable()
+  body, red_ranges = _strip_casts(reduce.src[0]), reduce.src[1:]
+  if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in red_ranges): return _not_applicable()
   lhs, rhs = (_strip_casts(x) for x in body.src)
   if any(x.op is not Ops.INDEX or x.src[0].op is not Ops.PARAM or x.dtype is not dtypes.half for x in (lhs,rhs)):
     return _not_applicable()
   out_aff, lhs_aff, rhs_aff = _affine(store.src[0].src[1]), _affine(lhs.src[1]), _affine(rhs.src[1])
   if out_aff is None or lhs_aff is None or rhs_aff is None: return _not_applicable()
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
-  out_axes, red_axis = tuple(sorted(out_aff[0])), red.arg[0]
-  if red_axis not in ranges or set(lhs_aff[0]) - set(out_axes) - {red_axis} or set(rhs_aff[0]) - set(out_axes) - {red_axis} or \
+  out_axes, red_axes = tuple(sorted(out_aff[0])), tuple(red.arg[0] for red in red_ranges)
+  if any(axis not in ranges for axis in red_axes) or set(lhs_aff[0]) - set(out_axes) - set(red_axes) or \
+     set(rhs_aff[0]) - set(out_axes) - set(red_axes) or \
      any(axis not in ranges for axis in out_axes): return _not_applicable()
-  k = ranges[red_axis]
+  k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
   for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
     point = dict(zip(out_axes, coordinates))
     output = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in out_axes)
     lhs_row, rhs_column = [], []
-    for reduction in range(k):
-      point[red_axis] = reduction
-      lhs_row.append(lhs_aff[1] + sum(lhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,red_axis)))
-      rhs_column.append(rhs_aff[1] + sum(rhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,red_axis)))
+    for red_coordinates in product(*(range(ranges[axis]) for axis in red_axes)):
+      point.update(zip(red_axes, red_coordinates))
+      lhs_row.append(lhs_aff[1] + sum(lhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes)))
+      rhs_column.append(rhs_aff[1] + sum(rhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes)))
     records.append((output, tuple(lhs_row), tuple(rhs_column)))
   lhs_rows = list(dict.fromkeys(row for _,row,_ in records))
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
@@ -579,7 +582,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   pairs = {(lhs_rows.index(row), rhs_columns.index(column)) for _,row,column in records}
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)) or \
      pairs != set(product(range(m), range(n))): return _not_applicable()
-  if not 1 <= m <= 16 or not 1 <= n <= 16 or not 1 <= k <= 64 or lhs_count > 512 or rhs_count > 512 or m*align_in > 512:
+  if not 1 <= m <= 64 or not 1 <= n <= 16 or not 1 <= k <= 64 or lhs_count > 512 or rhs_count > 512 or m*align_in > 4096:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   a_selector = [entry for row in lhs_rows for entry in ([[source] for source in row] + [[] for _ in range(align_in-k)])]
   b_selector:list[list[int]] = []
@@ -587,11 +590,11 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     for in_block in range(align_in//32):
       for out_lane in range(16):
         for in_lane in range(32):
-          out_channel, reduction = out_block*16+out_lane, in_block*32+in_lane
-          b_selector.append([rhs_columns[out_channel][reduction]] if out_channel < n and reduction < k else [])
+          out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
+          b_selector.append([rhs_columns[out_channel][reduction_index]] if out_channel < n and reduction_index < k else [])
   constant_bytes = sum(((count+15)//16)*32*max(32,(source_count+31)&-32)*2 for count,source_count in
                        ((len(a_selector),lhs_count),(len(b_selector),rhs_count),(output_count,m*64)))
-  if constant_bytes > 8*1024*1024:
+  if constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC selectors need {constant_bytes} bytes", reduce.op)
 
   steps:list[RKDPUProgram|RKContract|RKReduce] = []
@@ -611,7 +614,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   rhs_layout = RKLayout((n,k), (32,align_in), (align_in*2,2), dtypes.half,
                         padding=((0,32-n),(0,align_in-k)), kind=RKLayoutKind.CMAC_WEIGHT)
   out_layout = RKLayout((m,n), (m,64), (128,2), dtypes.half, padding=((0,0),(0,64-n)))
-  steps.append(RKContract(RKTensorRef(cmac_out, out_layout), RKTensorRef(a_arg, lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axis))
+  steps.append(RKContract(RKTensorRef(cmac_out, out_layout), RKTensorRef(a_arg, lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0]))
   unpack:list[list[int]] = [[] for _ in range(output_count)]
   for output,row,rhs_key in records: unpack[output] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
   dense = _sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch=scratch)
@@ -778,7 +781,7 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
 
   align_in, surface_count = max(32, (input_count+31)&-32), pool_extent*8
   constant_bytes = ((output_count+7)//8)*((surface_count+15)//16)*32*align_in*2
-  if constant_bytes > 8*1024*1024:
+  if constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX needs {constant_bytes} constant bytes", reduce.op)
   packed, hwc = RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1)
   hwc_elements = ((surface_count-1)//16)*16+32

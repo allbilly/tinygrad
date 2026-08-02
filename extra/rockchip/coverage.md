@@ -1059,3 +1059,18 @@ whose affine CMAC input is not one FP16 pointwise surface. The durable JSON is
 `abf844358296731eee23b9aae1cea6eba7f1497ecca327de68a19c369caea78c`);
 JUnit XML SHA-256 is
 `c10b1b60eebf6564f1e8c8c87f843eb65b449eb6bde957c841b15f46e26b1c74`.
+
+Affine contractions now flatten any number of static reduction axes into K,
+and the proven CMAC row path accepts bounded taller M surfaces. This is generic
+contraction analysis: a 2D convolution becomes M output positions, N output
+channels, and K as the product of input-channel and kernel axes. All six
+subcases of `test_conv2d_bs_1_cin_1` pass natively at unchanged tolerances in
+76.68 seconds. An attempted 4-channel 3x3 case exposed that an 8.34 MiB single
+constant BO cannot be mapped on this RK3588 runtime; it now rejects before
+submission. The shared sparse-plan ceiling is therefore 2 MiB, consistent
+with `conv_grok`'s bounded GEMM buffers and above the largest previously proven
+native image (about 1.0 MiB). Ruff and mypy pass, as do all 71 host tests and
+the strict RK3588 suite (54 tests plus 37 subtests) in 431.79 seconds with
+`ROCKCHIP_FALLBACK=0`. This focused complete-method gain is not yet folded into
+the 117-pass census. The research tree now has 27,641 counted lines, including
+2,508 in the Rockchip renderer/compiler.

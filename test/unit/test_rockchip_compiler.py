@@ -609,6 +609,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC)), (6,85))
     self.assertFalse(contains_uop(plan))
 
+  def test_multiaxis_tall_contraction_stays_inside_plan_cost_ceiling(self):
+    x, weight = Tensor.empty(1,1,5,7,dtype=dtypes.half), Tensor.empty(6,1,2,1,dtype=dtypes.half)
+    plan = lower_tiled_contract_result(sink(x.conv2d(weight))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+    oversized = lower_tiled_contract_result(sink(Tensor.empty(1,4,9,9,dtype=dtypes.half).conv2d(
+      Tensor.empty(4,4,3,3,dtype=dtypes.half))))
+    self.assertIs(oversized.reject.kind if oversized.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
+
   def test_global_sum_is_aligned_dpu_cmac_tree(self):
     result = lower_add_reduce_result(sink(Tensor.empty(16384,dtype=dtypes.half).sum()))
     self.assertIsInstance(result.plan, RKProgram)

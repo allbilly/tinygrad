@@ -123,6 +123,13 @@ class TestRockchip(unittest.TestCase):
     actual = (Tensor(lhs,device="ROCKCHIP").realize()+Tensor(rhs,device="ROCKCHIP").realize().pad((1,1,1,1))).realize().numpy()
     np.testing.assert_equal(actual, lhs+np.pad(rhs, ((1,1),(1,1))))
 
+  def test_multiaxis_tall_affine_contraction_native_cmac(self):
+    data = np.linspace(-1,1,50,dtype=np.float16).reshape(1,2,5,5)
+    weight = np.linspace(-.5,.5,36,dtype=np.float16).reshape(2,2,3,3)
+    expected = Tensor(data).conv2d(Tensor(weight)).numpy()
+    actual = Tensor(data,device="ROCKCHIP").realize().conv2d(Tensor(weight,device="ROCKCHIP").realize()).realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_sparse_affine_movements_native_cmac(self):
     cases = (
       (np.arange(9, dtype=np.float16).reshape(3,3), lambda x:x.T, lambda x:x.T),
