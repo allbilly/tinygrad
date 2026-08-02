@@ -621,6 +621,14 @@ class TestDPUCompiler(unittest.TestCase):
       Tensor.empty(4,4,3,3,dtype=dtypes.half))))
     self.assertIs(oversized.reject.kind if oversized.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
 
+  def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
+    x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
+    plan = lower_tiled_contract_result(sink(x.conv2d(weight, padding=(0,1)))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    self.assertLessEqual(len(emit_program(plan).constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_global_sum_is_aligned_dpu_cmac_tree(self):
     result = lower_add_reduce_result(sink(Tensor.empty(16384,dtype=dtypes.half).sum()))
     self.assertIsInstance(result.plan, RKProgram)

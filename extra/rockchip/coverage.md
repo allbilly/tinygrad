@@ -1074,3 +1074,17 @@ the strict RK3588 suite (54 tests plus 37 subtests) in 431.79 seconds with
 `ROCKCHIP_FALLBACK=0`. This focused complete-method gain is not yet folded into
 the 117-pass census. The research tree now has 27,641 counted lines, including
 2,508 in the Rockchip renderer/compiler.
+
+Zero-masked affine contraction operands now use the same compile-time
+coordinate proof as masked movement: an out-of-bounds point becomes an empty
+hardware selector row, while every selected point must resolve to a valid GEM
+buffer index. This is not a convolution recognizer and no tensor value is read
+by the compiler or runtime. Complete `test_asymmetric_padding_conv1d` passes
+natively, including all three official padding subtests, in 55.42 seconds at
+unchanged tolerances. The larger `test_simple_padding_conv1d` graph remains a
+typed plan-limit reject because its selectors would require 6.01 MiB, above
+the proven 2 MiB constant-BO ceiling. Ruff and mypy pass, as do all 72 host
+tests and the strict RK3588 suite (55 tests plus 37 subtests) in 448.19 seconds
+with `ROCKCHIP_FALLBACK=0`. This focused complete-method gain is not yet folded
+into the 117-pass census. The research tree now has 27,660 counted lines,
+including 2,527 in the Rockchip renderer/compiler.

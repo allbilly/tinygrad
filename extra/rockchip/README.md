@@ -146,12 +146,15 @@ The subsequent focused multi-axis contraction milestone passes all six
 `test_conv2d_bs_1_cin_1` subcases natively. It is not yet folded into the
 117-pass census; larger contraction packs remain typed plan-limit rejects when
 their generated constant BO would exceed the proven 2 MiB allocation ceiling.
+Static zero-masked contraction inputs subsequently add complete native
+`test_asymmetric_padding_conv1d` coverage; that gain is also pending the next
+full census.
 
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,641, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,641 lines.
-The exact 2,673-line delta is 2,668 counted Rockchip backend lines (2,508
+contains 27,660, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,660 lines.
+The exact 2,692-line delta is 2,687 counted Rockchip backend lines (2,527
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

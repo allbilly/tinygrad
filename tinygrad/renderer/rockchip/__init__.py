@@ -554,15 +554,17 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     return _not_applicable()
   body, red_ranges = _strip_casts(reduce.src[0]), reduce.src[1:]
   if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in red_ranges): return _not_applicable()
-  lhs, rhs = (_strip_casts(x) for x in body.src)
-  if any(x.op is not Ops.INDEX or x.src[0].op is not Ops.PARAM or x.dtype is not dtypes.half for x in (lhs,rhs)):
-    return _not_applicable()
-  out_aff, lhs_aff, rhs_aff = _affine(store.src[0].src[1]), _affine(lhs.src[1]), _affine(rhs.src[1])
-  if out_aff is None or lhs_aff is None or rhs_aff is None: return _not_applicable()
+  lhs_value, rhs_value = (_strip_casts(x) for x in body.src)
+  lhs_parsed, rhs_parsed = _conditional_index(lhs_value), _conditional_index(rhs_value)
+  if lhs_parsed is None or rhs_parsed is None: return _not_applicable()
+  lhs, rhs = lhs_parsed[0], rhs_parsed[0]
+  if lhs.dtype is not dtypes.half or rhs.dtype is not dtypes.half: return _not_applicable()
+  out_aff = _affine(store.src[0].src[1])
+  if out_aff is None: return _not_applicable()
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   out_axes, red_axes = tuple(sorted(out_aff[0])), tuple(red.arg[0] for red in red_ranges)
-  if any(axis not in ranges for axis in red_axes) or set(lhs_aff[0]) - set(out_axes) - set(red_axes) or \
-     set(rhs_aff[0]) - set(out_axes) - set(red_axes) or \
+  operand_axes = {u.arg[0] for value in (lhs_value,rhs_value) for u in value.toposort() if u.op is Ops.RANGE}
+  if any(axis not in ranges for axis in red_axes) or operand_axes - set(out_axes) - set(red_axes) or \
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
@@ -573,8 +575,23 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     lhs_row, rhs_column = [], []
     for red_coordinates in product(*(range(ranges[axis]) for axis in red_axes)):
       point.update(zip(red_axes, red_coordinates))
-      lhs_row.append(lhs_aff[1] + sum(lhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes)))
-      rhs_column.append(rhs_aff[1] + sum(rhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes)))
+      indexes:list[int] = []
+      for index,condition,select_true in (lhs_parsed,rhs_parsed):
+        predicate = True if condition is None else _static_scalar(condition, point)
+        if predicate is None:
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction predicate is not static",
+                              condition.op if condition is not None else Ops.WHERE)
+        if bool(predicate) is not select_true:
+          indexes.append(-1)
+          continue
+        source = _static_scalar(index.src[1], point)
+        if not isinstance(source, int) or isinstance(source, bool):
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction index is not static", index.op)
+        indexes.append(source)
+      if indexes[0] >= lhs_count or indexes[1] >= rhs_count or min(indexes) < -1:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction index is out of bounds", Ops.INDEX)
+      lhs_row.append(indexes[0])
+      rhs_column.append(indexes[1])
     records.append((output, tuple(lhs_row), tuple(rhs_column)))
   lhs_rows = list(dict.fromkeys(row for _,row,_ in records))
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
@@ -584,14 +601,16 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      pairs != set(product(range(m), range(n))): return _not_applicable()
   if not 1 <= m <= 64 or not 1 <= n <= 16 or not 1 <= k <= 64 or lhs_count > 512 or rhs_count > 512 or m*align_in > 4096:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
-  a_selector = [entry for row in lhs_rows for entry in ([[source] for source in row] + [[] for _ in range(align_in-k)])]
+  a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
+                [[] for _ in range(align_in-k)])]
   b_selector:list[list[int]] = []
   for out_block in range(2):
     for in_block in range(align_in//32):
       for out_lane in range(16):
         for in_lane in range(32):
           out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
-          b_selector.append([rhs_columns[out_channel][reduction_index]] if out_channel < n and reduction_index < k else [])
+          source = rhs_columns[out_channel][reduction_index] if out_channel < n and reduction_index < k else -1
+          b_selector.append([source] if source >= 0 else [])
   constant_bytes = sum(((count+15)//16)*32*max(32,(source_count+31)&-32)*2 for count,source_count in
                        ((len(a_selector),lhs_count),(len(b_selector),rhs_count),(output_count,m*64)))
   if constant_bytes > RK_MAX_CONSTANT_BYTES:
