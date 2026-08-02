@@ -380,6 +380,21 @@ host compiler/image/fallback/telemetry tests pass, Ruff and mypy are clean, and
 the expanded strict hardware suite passes 47 tests plus 31 subtests in 366.90
 seconds. The capability adds 62 counted compiler lines.
 
+The complete uncached census at `a27a52212` confirms 102 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 270 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods;
+pytest reports the same 163 passed, 375 failed, and 13 skipped method/subtest
+mix in 565.90 seconds. Method totals do not change because later subcases still
+reject, but `test_max` now records three passing native mixed-engine kernels
+(two 135-element global/scaled reductions and one four-element reduction), and
+`test_min` records its three FP16 global/scaled kernels before reaching the
+integer-dtype case. There are no device timeouts. The 244 method-level reject
+events are 67 layout, 63 reformat, 58 output dtype, 24 ALU, 21 input dtype, 7
+plan-stage limit, and 4 reduction rejects. The durable JSON is
+`~/rk2608_backups/census-extrema-a27a52212/test_ops_coverage.json` (SHA-256
+`aa3e39c0d8f17139dccbf3f8cfc8f1a22c398cb33b52ef2663a3d6a9dc5473a5`);
+JUnit XML SHA-256 is
+`35b6f55181155b7172c50db687c39b3275586084670cc8e5840cd20950b980e7`.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);
