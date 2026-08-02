@@ -206,6 +206,15 @@ fixes an exact-page RHS selector timeout. All seven `test_conv2d` subtests pass
 natively, and the strict suite passes 61 tests plus 39 subtests. The inferred
 native total is 131 pending the next complete census.
 
+The selector cost milestone compares full sparse and bounded windowed CMAC
+plans by typed stage, unique-constant, and scratch costs. Empty tiles become one
+NPU zero-fill, and every direct window boundary is destination-atom aligned.
+When direct selection cannot satisfy both the K512 and atom constraints, a
+generic two-level NPU plan gathers into padded source-local scratch and then
+compacts into dense output. This makes `test_simple_padding_conv1d` native with
+a 395-stage/856,464-byte plan and keeps the full strict suite green at 62 tests
+plus 39 subtests. The inferred native total is 132 pending the next census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -216,8 +225,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,818, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,818 lines.
-The exact 2,850-line delta is 2,845 counted Rockchip backend lines (2,685
+contains 27,871, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,871 lines.
+The exact 2,903-line delta is 2,898 counted Rockchip backend lines (2,738
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

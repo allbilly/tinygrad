@@ -12,7 +12,8 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKArg,
   RKALUStage, RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKContract, RKReduce, RKProgram, RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKContract, RKReduce, RKProgram, RKPlanCost,
+  RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
   patch_image as patch_image, validate_image as validate_image)
@@ -82,14 +83,20 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
   while start < len(rows):
     tile:list[list[int]] = []
     for candidate in rows[start:start+16]:
-      selected = [index for row in (*tile,candidate) for index in row]
-      if not selected: return None
+      tile.append(candidate)
+      selected = [index for row in tile for index in row]
+      if not selected: continue
       base, end = min(selected)&-8, max(selected)+1
       span, align_in = end-base, max(32, (end-base+31)&-32)
-      if align_in > 512: break
-      tile.append(candidate)
+      if align_in > 512:
+        tile.pop()
+        while len(tile)%8: tile.pop()
+        break
     if not tile: return None
     selected = [index for row in tile for index in row]
+    if not selected:
+      start += len(tile)
+      continue
     base, end = min(selected)&-8, max(selected)+1
     span, align_in = end-base, max(32, (end-base+31)&-32)
     payload = _cmac_selection_payload([[index-base for index in row] for row in tile], align_in, 32, scale)
@@ -100,7 +107,8 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
   max_align = max((len(payload)//64 for *_,payload in chunks), default=32)
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(max_align*2),)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
+                                                  if any(not row for row in rows) else [])
   for start,base,end,tile,payload in chunks:
     span, align_in = end-base, len(payload)//64
     steps.append(RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
@@ -111,6 +119,46 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
       _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
       _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload))
   return RKProgram(tuple(steps), scratch)
+
+def _plan_cost(plan:RKProgram) -> RKPlanCost:
+  return RKPlanCost(sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in plan.steps),
+                    sum(map(len, {step.constants for step in plan.steps if isinstance(step, RKContract)})),
+                    sum(resource.size for resource in plan.scratch))
+
+def _two_level_selector_program(output:RKArg, source:RKArg, rows:list[list[int]],
+                                scratch:tuple[RKScratch, ...]) -> RKProgram|None:
+  groups:list[list[list[int]]] = []
+  for row in rows:
+    selected = list(row)
+    if selected and max(32, (max(selected)+1-(min(selected)&-8)+31)&-32) > 512: return None
+    trial = [index for candidate in (*groups[-1],row) for index in candidate] if groups else selected
+    if groups and (not trial or max(32, (max(trial)+1-(min(trial)&-8)+31)&-32) <= 512): groups[-1].append(row)
+    else: groups.append([row])
+  intermediate_rows:list[list[int]] = []
+  compact_rows:list[list[int]] = []
+  for group in groups:
+    base = len(intermediate_rows)
+    intermediate_rows.extend(group)
+    compact_rows.extend([[base+index] for index in range(len(group))])
+    intermediate_rows.extend([[] for _ in range((-len(group))%8)])
+  intermediate = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch += (RKScratch(_cmac_tiled_output_bytes(len(intermediate_rows))),)
+  first = _windowed_cmac_pipeline(intermediate, source, intermediate_rows, scratch=scratch)
+  if first is None: return None
+  second = _windowed_cmac_pipeline(output, intermediate, compact_rows, scratch=first.scratch)
+  return None if second is None else _finish_program([*first.steps,*second.steps], second.scratch)
+
+def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
+                      scratch:tuple[RKScratch, ...]) -> RKProgram|None:
+  candidates = (_sparse_cmac_pipeline(output, source, input_count, rows, scratch=scratch),
+                _windowed_cmac_pipeline(output, source, rows, scratch=scratch))
+  legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=_plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
+                cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)
+  if legal:
+    return min(legal, key=lambda item:(item[0].stage_count, item[0].constant_bytes, item[0].scratch_bytes))[1]
+  two_level = _two_level_selector_program(output, source, rows, scratch)
+  return two_level if two_level is not None and _plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
+    _plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
 def _finish_program(steps:list[RKDPUProgram|RKContract|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
   """Give every ordered DPU step the program's final resource table."""
@@ -676,12 +724,14 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   steps:list[RKDPUProgram|RKContract|RKReduce] = []
   scratch:tuple[RKScratch, ...] = (RKScratch(_cmac_tiled_output_bytes(len(a_selector))),)
   a_arg = RKArg(RKBufferKind.SCRATCH, 0)
-  packed_a = _sparse_cmac_pipeline(a_arg, RKArg(RKBufferKind.ARG, lhs.src[0].arg.slot), lhs_count, a_selector, scratch=scratch)
+  packed_a = _selector_program(a_arg, RKArg(RKBufferKind.ARG, lhs.src[0].arg.slot), lhs_count, a_selector, scratch)
+  if packed_a is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC lhs selector exceeds plan limits", reduce.op)
   steps.extend(packed_a.steps)
   scratch = packed_a.scratch
   b_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(_cmac_tiled_output_bytes(len(b_selector))),)
-  packed_b = _sparse_cmac_pipeline(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch=scratch)
+  packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch)
+  if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
   steps.extend(packed_b.steps)
   scratch = packed_b.scratch
   cmac_out = RKArg(RKBufferKind.SCRATCH, len(scratch))
@@ -693,7 +743,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   steps.append(RKContract(RKTensorRef(cmac_out, out_layout), RKTensorRef(a_arg, lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0]))
   unpack:list[list[int]] = [[] for _ in range(output_count)]
   for output,row,rhs_key in records: unpack[output] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
-  dense = _sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch=scratch)
+  dense = _selector_program(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch)
+  if dense is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC output selector exceeds plan limits", reduce.op)
   steps.extend(dense.steps)
   scratch = dense.scratch
   stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)

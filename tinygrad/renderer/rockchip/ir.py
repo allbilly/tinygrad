@@ -113,6 +113,12 @@ class RKProgram:
     if any(isinstance(step, RKDPUProgram) and step.scratch and step.scratch != self.scratch for step in self.steps):
       raise ValueError("Rockchip step scratch does not match program resources")
 
+@dataclass(frozen=True)
+class RKPlanCost:
+  stage_count: int
+  constant_bytes: int
+  scratch_bytes: int
+
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
   UNSUPPORTED_OUTPUT_DTYPE = "unsupported_output_dtype"

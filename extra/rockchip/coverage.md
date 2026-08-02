@@ -1276,3 +1276,27 @@ as does the strict hardware suite (61 tests plus 39 subtests) in 532.62 seconds
 with `ROCKCHIP_FALLBACK=0`. The inferred native total is 131 after the current
 128-pass census. The research tree now has 27,818 counted lines, including
 2,685 in the Rockchip renderer/compiler.
+
+Selector planning now compares typed stage, unique-constant, and scratch costs
+for full sparse CMAC and bounded source-window candidates. Fully empty static
+selector tiles are represented by one NPU zero-fill and skipped rather than
+consuming CMAC payloads. Nonfinal window boundaries must end on an eight-FP16
+destination atom; the first hardware candidate violated this rule at output
+element eight and shifted the remainder of the channel, so it was rejected.
+
+When no direct candidate fits, a generic two-level selector first gathers
+source-local groups into padded atom-aligned NPU scratch, then compacts that
+scratch into dense destination order with a second set of windowed CMAC tasks.
+There is no CPU packing or tensor-semantic path. This turns
+`test_simple_padding_conv1d` native: its plan contains 395 stages, 856,464
+constant bytes, and 15,072 scratch bytes, versus the former 5,236,736-byte
+reject. The same planner reduces the large `test_conv2d` regression from 175
+stages/729,792 bytes to 100 stages/407,344 bytes; all seven official subtests
+pass in 72.17 seconds.
+
+All 81 host tests, Ruff, and mypy pass, as does the strict hardware suite (62
+tests plus 39 subtests) in 522.05 seconds with `ROCKCHIP_FALLBACK=0`. The
+inferred native total is 132 after the current 128-pass census. The research
+tree now has 27,871 counted lines, including 2,738 in the Rockchip
+renderer/compiler. The pre-change compiler and tests are preserved under
+`~/rk2608_backups/windowed-empty-selectors-before-16a2cbb7e-20260803-012547`.

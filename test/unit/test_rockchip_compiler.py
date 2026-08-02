@@ -677,8 +677,9 @@ class TestDPUCompiler(unittest.TestCase):
     plan = lower_tiled_contract_result(sink(x@y)).plan
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
-    engines = [stage.engine for stage in emit_program(plan).stages]
-    self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC)), (6,85))
+    image = emit_program(plan)
+    self.assertEqual({stage.engine for stage in image.stages}, {RKEngine.DPU,RKEngine.CMAC})
+    self.assertLessEqual(len(image.stages), 50)
     self.assertFalse(contains_uop(plan))
 
   def test_multiaxis_tall_contraction_stays_inside_plan_cost_ceiling(self):
@@ -708,6 +709,17 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(image.constants), 2*1024*1024)
       if groups == 1: self.assertEqual(plan.scratch[2].size, 4128)  # 2048 logical lanes plus the final physical CMAC tail.
       self.assertFalse(contains_uop(plan))
+
+  def test_zero_aware_windowed_selector_wins_constant_cost_ceiling(self):
+    x, weight = Tensor.empty(6,2,11,dtype=dtypes.half), Tensor.empty(6,2,5,dtype=dtypes.half)
+    plan = lower_tiled_contract_result(sink(x.conv2d(weight,padding=(1,1)))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.stages), 400)
+    self.assertLessEqual(len(image.constants), 1024*1024)
+    self.assertTrue(all(not isinstance(step, RKContract) or step.out.buffer.addend%16 == 0 for step in plan.steps))
+    self.assertFalse(contains_uop(plan))
 
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
