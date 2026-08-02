@@ -1566,3 +1566,26 @@ modules pass; the strict hardware suite passes 74 tests plus 52 subtests in
 after the current 146-pass census, pending the next complete run. The research
 tree has 28,349 counted lines. Pre-change sources are preserved under
 `~/rk2608_backups/multi-source-sum-before-a0546884d-20260803`.
+
+The first current-head census attempt exposed a numerical-contract regression
+in the new two-level selector. `test_avg_pool2d_padding` exceeded its 300-second
+method watchdog and was aborted while issuing a stage reset. Isolating the
+method with a 900-second diagnostic watchdog showed that the driver was not
+wedged: all nine subcases completed in 358.49 seconds. The three K2 cases
+passed, while every K3 case returned the unscaled sum—exactly 9x or 6x the
+reference. The fallback two-level planner had omitted `scale` and therefore
+encoded one in its second-level compaction weights.
+
+Two-level selection now applies the reduction scale in the second CMAC level.
+An exactly representable 0.25 scale passes the wide nonconstant RK3588 test;
+scales such as 1/9 and 1/6 that the current FP16 weight contract cannot encode
+exactly return `NUMERICAL_CONTRACT` before image execution instead of silently
+becoming one. With
+the original 300-second watchdog, `test_avg_pool2d_padding` now completes in
+124.75 seconds with three native subcase passes and six typed plan rejects.
+All 96 host tests, repository-wide Ruff, and mypy over 225 modules pass; the
+strict hardware suite passes 74 tests plus 54 subtests in 709.02 seconds. No
+new complete-method pass is claimed, and the authoritative census remains the
+146-pass artifact until a new uninterrupted run finishes. Counted source is
+28,351 lines. Pre-change sources are preserved under
+`~/rk2608_backups/two-level-scale-before-862202e58-20260803`.

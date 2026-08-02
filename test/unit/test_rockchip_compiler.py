@@ -149,6 +149,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.stages), 160)
     self.assertLessEqual(len(image.constants), 64*1024)
     self.assertFalse(contains_uop(plan))
+    scaled = lower_affine_reduce_result(sink(source.sum(axis=1)*0.25)).plan
+    self.assertIsInstance(scaled, RKProgram)
+    assert isinstance(scaled, RKProgram)
+    self.assertIn(struct.pack("<e", 0.25), emit_program(scaled).constants)
+    self.assertFalse(contains_uop(scaled))
+
+  def test_two_level_affine_sum_rejects_unrepresentable_scale(self):
+    source = Tensor.empty(32,2,11,28,dtype=dtypes.half).realize()
+    result = lower_affine_reduce_result(sink(source.avg_pool2d(kernel_size=(3,3), padding=1)))
+    self.assertIsNone(result.plan)
+    self.assertEqual(result.reject.kind if result.reject is not None else None, RKRejectKind.NUMERICAL_CONTRACT)
 
   def test_multi_source_affine_sum_composes_source_local_selectors(self):
     lhs = Tensor.empty(256,256,dtype=dtypes.half).realize()

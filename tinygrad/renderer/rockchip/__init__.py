@@ -130,7 +130,7 @@ def _plan_cost(plan:RKProgram) -> RKPlanCost:
                     sum(resource.size for resource in plan.scratch))
 
 def _two_level_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
-                                scratch:tuple[RKScratch, ...]) -> RKProgram|None:
+                                scratch:tuple[RKScratch, ...], scale:float=1.0) -> RKProgram|None:
   groups:list[list[list[int]]] = []
   for row in rows:
     selected = list(row)
@@ -150,7 +150,7 @@ def _two_level_selector_program(output:RKArg, source:RKArg, input_count:int, row
   first = _windowed_cmac_pipeline(intermediate, source, intermediate_rows, scratch=scratch, direct_count=input_count)
   if first is None: return None
   second = _windowed_cmac_pipeline(output, intermediate, compact_rows, scratch=first.scratch,
-                                   direct_count=_cmac_tiled_output_bytes(len(intermediate_rows))//2)
+                                   direct_count=_cmac_tiled_output_bytes(len(intermediate_rows))//2, scale=scale)
   return None if second is None else _finish_program([*first.steps,*second.steps], second.scratch)
 
 def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
@@ -1048,7 +1048,9 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   program = _sparse_cmac_pipeline(reduced, source, input_count, selectors, scale, initial_scratch) if \
     input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(
       reduced, source, selectors, scale, initial_scratch, direct_count=input_count)
-  if program is None: program = _two_level_selector_program(reduced, source, input_count, selectors, initial_scratch)
+  if program is None and struct.unpack("<e", struct.pack("<e", scale))[0] != scale:
+    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"two-level affine scale {scale} is not exactly FP16", stored.op)
+  if program is None: program = _two_level_selector_program(reduced, source, input_count, selectors, initial_scratch, scale)
   if program is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine CMAC output tiles exceed the source-window or constant budget", reduce.op)
   if prepare is not None: program = RKProgram((RKDPUProgram(prepare.stages, program.scratch), *program.steps), program.scratch)

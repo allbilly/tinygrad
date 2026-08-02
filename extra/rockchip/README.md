@@ -331,6 +331,16 @@ and combine the partial surfaces with DPU ADD. Complete
 strict suite expands to 74 tests plus 52 subtests, and the inferred native total
 is 148 after the current 146-pass census.
 
+The next census exposed that two-level scaled reductions had silently dropped
+their scale in the compaction level. K3 average-pooling outputs were therefore
+the raw sum, exactly 9x or 6x too large, and nine long subcases exceeded the
+method-level watchdog. The second CMAC level now carries exactly representable
+scales; unrepresentable FP16 weight scales return a typed numerical-contract
+reject before submission. A 0.25
+wide scaled reduction passes hardware, the pooling method completes under its
+original watchdog, and the strict suite passes 74 tests plus 54 subtests. This
+is a correctness/reliability milestone, not a new complete-method pass.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -341,8 +351,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,349, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,349 lines.
-The exact 3,381-line delta is 3,376 counted Rockchip backend lines (3,216
+contains 28,351, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,351 lines.
+The exact 3,383-line delta is 3,378 counted Rockchip backend lines (3,218
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

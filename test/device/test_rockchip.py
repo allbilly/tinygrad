@@ -101,9 +101,12 @@ class TestRockchip(unittest.TestCase):
 
   def test_wide_dense_row_sum_native_two_level_cmac(self):
     data = np.linspace(-.25,.25,256*256,dtype=np.float16).reshape(256,256)
-    actual = Tensor(data,device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
-    expected = data.astype(np.float32).sum(axis=1).astype(np.float16)
-    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    tensor = Tensor(data,device="ROCKCHIP").realize()
+    for scale in (1.0, 0.25):
+      with self.subTest(scale=scale):
+        actual = (tensor.sum(axis=1)*scale).realize().numpy()
+        expected = (data.astype(np.float32).sum(axis=1)*scale).astype(np.float16)
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
   def test_multi_source_affine_sum_native_cmac_dpu(self):
     lhs = np.linspace(-.125,.125,256*256,dtype=np.float16).reshape(256,256)
