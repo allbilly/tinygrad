@@ -142,45 +142,45 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
-The current committed strict census at `ff4a13dd7` contains 122 native passes,
-40 frontend-only passes, 250 failures, and 13 upstream skips across exactly 425
+The current committed strict census at `6133442c2` contains 128 native passes,
+40 frontend-only passes, 244 failures, and 13 upstream skips across exactly 425
 methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
-regressed. The latest five complete-method gains are asymmetric-padding 1D and
-2D convolution, `conv2d_bs_1_cin_1`, negative-padding 2D convolution, and
-padded small GEMM. Larger contraction packs remain typed plan-limit rejects
-when they exceed the 2 MiB constant allocation or affine-analysis budgets.
-Static conditional FP16 `tril`/`triu` subcases are native, while their explicit
-boolean-output subcases remain honest dtype rejections.
+regressed and there were no NPU timeouts, reset failures, invalid submissions,
+or process aborts. First-reject counts are 64 unsupported-output-dtype, 49
+plan-limit, 41 unsupported-layout, 32 requires-reformat, 25 unsupported-ALU,
+22 unsupported-input-dtype, and 4 unsupported-reduction. Larger contraction
+packs remain typed plan-limit rejects when they exceed the 2 MiB constant
+allocation or affine-analysis budgets. Static conditional FP16 `tril`/`triu`
+subcases are native, while their explicit boolean-output subcases remain honest
+dtype rejections.
 
 Tiled contraction legality is checked before coordinate enumeration: K,
 source extents, and at most 65,536 affine output/reduction visits bound compiler
 work. Oversized graphs reject before NPU submission.
 
-The focused gains after that census are `test_max_pool2d_simple`,
+The first three MAX gains folded into that census are `test_max_pool2d_simple`,
 `test_max_pool2d_ceil_mode`, and
 `test_max_pool2d_ceil_mode_output_size_reduce_by_one`. Their static affine MAX
 selectors are packed by bounded CMAC tasks and reduced by PPU; ceil-mode
 padding is an NPU-filled negative-infinity sentinel selected by compile-time
 coordinate predicates. There is no operation-name path or host semantic work.
 Dense single-axis global MAX remains on the proven padded DPU tree. The strict
-hardware suite passes 58 tests plus 37 subtests at this head. The inferred
-native method count is 125, but these focused gains have not yet been folded
-into a complete census.
+hardware suite passed 58 tests plus 37 subtests at that milestone.
 
 Windowed affine MAX subsequently makes `test_max_pool2d_bigger_stride` and
 `test_max_pool2d_bigger_stride_dilation` native, including all nine subtests.
 Each PPU output batch copies only its bounded source span and the compiler
 accounts for actual hardware stages and unique constant payloads before
 acceptance. The strict hardware suite passes 59 tests plus 37 subtests; the
-inferred native total is 127 pending a new full census.
+gains are folded into the current `6133442c2` census.
 
 The next cost milestone coalesces consecutive output batches that share a
 bounded source span. Complete `test_max_pool2d_padding` passes all nine
 subtests with 246–336 stages per plan. A rejected 128-lane configuration left
 one plan at 400 stages and eventually aborted in the driver's reset ioctl; the
 accepted 192-lane target passes both the full method in one process and the
-later strict hardware suite. The inferred native total is 128 pending a new
-full census.
+later strict hardware suite. This gain is folded into the current 128-pass
+census.
 
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,

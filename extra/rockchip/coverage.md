@@ -895,7 +895,8 @@ failures.
 | Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_simple`, `test_sum_full`, `test_mean`, `test_sum_relu` | Yes (`da09c1fd9`) |
 | Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Yes (`da09c1fd9`) |
 | Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | Yes (`7cf01ac95`) |
-| Scalar multi-axis affine MAX through CMAC/PPU | `test_max_pool2d_simple` | Not yet |
+| Scalar multi-axis affine MAX through CMAC/PPU | `test_max_pool2d_simple` | Yes (`6133442c2`) |
+| Masked/windowed affine MAX through CMAC/PPU | ceil-mode, bigger-stride, dilation, and padding pool methods | Yes (`6133442c2`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
@@ -1202,3 +1203,25 @@ method in one process in 288.25 seconds, then passes the strict hardware suite
 The inferred native method total is 128 after the last 122-pass census, pending
 a new complete census. The research tree now has 27,760 counted lines,
 including 2,627 in the Rockchip renderer/compiler.
+
+The complete uncached census at `6133442c2` confirms 128 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 244 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods.
+The six focused MAX gains are the only method transitions from `ff4a13dd7`:
+`test_max_pool2d_simple`, both ceil-mode methods, bigger-stride,
+bigger-stride+dilation, and padding; no prior native method regresses. Pytest's
+raw accounting is 182 passed, 299 failed, 13 skipped, and 57 passing subtests
+in 1,963.04 seconds. There are no NPU timeouts, reset failures, invalid
+submissions, or process aborts.
+
+First-reject classifications for the 244 failed methods are 64 unsupported-
+output-dtype, 49 plan-limit, 41 unsupported-layout, 32 requires-reformat, 25
+unsupported-ALU, 22 unsupported-input-dtype, and 4 unsupported-reduction. The
+seven failures without a native reject are numerical or frontend failures:
+binary-crossentropy reductions, exact copysign, lerp, maximum, zero-stride
+mulacc, constant power, and sum-collapse. The largest passing MAX plans are
+336 stages/1.38 MiB/35.87 seconds for padding and 244 stages/0.99 MiB/26.07
+seconds for bigger-stride. The durable JSON is
+`~/rk2608_backups/census-affine-max-6133442c2/test_ops_coverage.json`
+(SHA-256 `b06e60965a0851c89788e187c18845f53a0bce5650d9a81535a02bdfaf69abae`);
+JUnit XML SHA-256 is
+`eab5ba761799359a29202220355545cf81da5201bdb5b14364b2267e67e22caa`.
