@@ -324,6 +324,14 @@ class TestRockchip(unittest.TestCase):
       with np.errstate(all="ignore"): expected = np.power(np.float32(5.5), values.astype(np.float32)).astype(np.float16)
       np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_negative_base_pow55_native_parity(self):
+    encodings = np.arange(1 << 16, dtype=np.uint16)
+    all_half = encodings.view(np.float16)
+    data = all_half[np.isfinite(all_half) & (all_half >= -2) & (all_half <= 2)]
+    actual = ((-5.5)**Tensor(data, device="ROCKCHIP").realize()).realize().numpy()
+    with np.errstate(all="ignore"): expected = np.power(np.float32(-5.5), data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_linear_sigmoid_workload(self):
     rng = np.random.default_rng(2)
     a_np = rng.uniform(-0.25, 0.25, (1,32)).astype(np.float16)

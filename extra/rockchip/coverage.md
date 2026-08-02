@@ -99,6 +99,15 @@ counted lines in the renderer and 26,914 repository lines overall; the 154
 new generated payload lines under `autogen` are excluded, while the 11-line
 net compiler growth remains counted.
 
+Negative-base `(-5.5)**x` now derives truncation, integer validity, and parity
+with two native roundoff-LUT tasks plus generic DPU masks and arithmetic. An
+exhaustive strict-hardware sweep passes all 32,770 finite FP16 exponents in
+`[-2,2]`. The official chained test passes this subcase and reaches the
+independent `8.0**x` numerical mismatch (1,975/2,925 lanes, maximum relative
+error 15 in the generic path). The method remains `FAIL`; no census gain is
+claimed. `sz.py` reports 1,807 counted renderer lines and 26,940 repository
+lines overall at this milestone.
+
 Run the census serially on RK3588:
 
 ```sh
@@ -616,6 +625,7 @@ failures.
 | Generated multirange positive POW5.5 | `test_pow_const` positive-5.5 subcase; method still fails at negative 5.5 | Not yet |
 | Shifted multirange negative POW5.5 | `test_pow_const` negative-5.5 subcase; method still fails at constant-base 5.5 | Not yet |
 | Split-range constant-base POW5.5 | `test_pow_const` constant-base 5.5 subcase; method still fails at negative base | Not yet |
+| Native roundoff parity for negative-base POW5.5 | `test_pow_const` negative-base 5.5 subcase; method still fails at constant-base 8 | Not yet |
 
 The historical wide-fill milestone wrote the requested dtype directly through
 DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage

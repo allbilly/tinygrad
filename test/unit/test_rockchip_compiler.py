@@ -478,6 +478,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
     self.assertFalse(contains_uop(plan))
 
+  def test_negative_base_pow55_uses_native_roundoff_parity(self):
+    plan = lower_dpu(sink((-5.5)**Tensor.empty(128,dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.POW_BASE55_LOW, rklut.RKLUTId.POW_BASE55_HIGH, rklut.RKLUTId.EXP2, rklut.RKLUTId.ROUNDOFF})
+    self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.ROUNDOFF for stage in plan.stages), 2)
+    self.assertGreater(len(plan.stages), 32)
+    self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
+    self.assertFalse(contains_uop(plan))
+
   def test_trunc_floor_ceil_compose_roundoff_lut(self):
     for function in (lambda x:x.trunc(), lambda x:x.floor(), lambda x:x.ceil()):
       plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))

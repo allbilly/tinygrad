@@ -830,6 +830,18 @@ def _pow_base55_expr(source:_Expr|RKArg) -> _Expr:
   fallback = _exp2_expr(_ALUExpr(Ops.MUL, (source, math.log2(5.5))))
   return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (corrected, inside)), _ALUExpr(Ops.MUL, (fallback, _sub(1.0, inside)))))
 
+def _pow_negative_base55_expr(source:_Expr|RKArg) -> _Expr:
+  """Evaluate (-5.5)**x with native roundoff-LUT truncation, integer validity, and parity."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  truncated = _trunc_expr(source)
+  half_truncated = _trunc_expr(_ALUExpr(Ops.MUL, (truncated, .5)))
+  remainder = _sub(truncated, _ALUExpr(Ops.MUL, (half_truncated, 2.0)))
+  odd = _ALUExpr(Ops.MAX, (remainder, _ALUExpr(Ops.MUL, (remainder, -1.0))))
+  sign = _sub(1.0, _ALUExpr(Ops.MUL, (odd, 2.0)))
+  noninteger = _ALUExpr(Ops.MAX, (positive(source, truncated), positive(truncated, source)))
+  valid = _sub(1.0, noninteger)
+  return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (_pow_base55_expr(source), sign)), _ALUExpr(Ops.FDIV, (valid, valid))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -1145,6 +1157,20 @@ def _canonical_round(u:UOp) -> UOp|None:
   required = {Ops.TRUNC:4, Ops.ADD:4, Ops.MUL:1, Ops.CMPLT:3, Ops.CMPNE:3, Ops.WHERE:3}
   return source if counts == required and all(any(math.isclose(x, value) for x in constants) for value in (-1,-.5,0,.5,1)) else None
 
+def _canonical_negative_base55(u:UOp) -> UOp|None:
+  """Recognize tinygrad's integer-validity/parity expansion for (-5.5)**x."""
+  u, nodes = _unwrap_same_cast(u), _unwrap_same_cast(u).toposort()
+  indexes = [x for x in nodes if x.op is Ops.INDEX and x.dtype is dtypes.half]
+  exponentials = [x for x in nodes if x.op is Ops.EXP2]
+  if u.op is not Ops.WHERE or len(indexes) != 1 or len(exponentials) != 1 or sum(x.op is Ops.WHERE for x in nodes) != 3: return None
+  source, exponential = indexes[0], exponentials[0]
+  product = _unwrap_same_cast(exponential.src[0])
+  factors = [float(x.arg) for x in product.src if x.op is Ops.CONST and isinstance(x.arg, (int, float))] if product.op is Ops.MUL else []
+  condition = _unwrap_same_cast(u.src[0])
+  constants = [float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int, float))]
+  return source if len(factors) == 1 and math.isclose(factors[0], math.log2(5.5), rel_tol=1e-3) and source in product.toposort() and \
+    condition.op is Ops.CMPNE and source in condition.toposort() and any(math.isnan(x) for x in constants) and -1.0 in constants else None
+
 def _canonical_relu_difference(u:UOp) -> UOp|None:
   """Recognize relu(x+0.5)-relu(x-0.5), the stable clip(x+0.5, 0, 1) form."""
   u = _unwrap_same_cast(u)
@@ -1198,6 +1224,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (negative_base55_input:=_canonical_negative_base55(u)) is not None:
+    operand = _parse_alu(negative_base55_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _pow_negative_base55_expr(operand)
   elif (pow8_input:=_canonical_mul_power(u, 8)) is not None:
     operand = _parse_alu(pow8_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None

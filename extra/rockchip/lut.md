@@ -490,3 +490,24 @@ The complete typed plan is 28 sequential stages and uses two generated LUT
 identities plus the generic EXP2 fallback identity. The 2,052 immutable table
 entries and their metadata are generated under `autogen`; only the compact
 recognizer and target-stage recipe remain counted by `sz.py`.
+
+## Negative base 5.5 parity
+
+Tinygrad expands `(-5.5)**x` into integer-validity and parity WHERE trees
+around the same `EXP2(x*log2(5.5))` magnitude. The mixed integer casts and
+modulo are frontend semantics, not extra NPU instructions. A strict graph
+recognizer replaces them with the existing native roundoff table and generic
+FP16 DPU arithmetic.
+
+Native truncation first rounds `abs(x)` to nearest-even, subtracts a one-unit
+overshoot when needed, and restores the sign. Applying it to both `x` and
+`trunc(x)/2` yields `remainder = trunc(x)-2*trunc(trunc(x)/2)`. Its absolute
+value is the odd mask, so `1-2*odd` selects the result sign. Two directional
+comparisons detect a fractional exponent; `valid/valid` remains one for
+integers and synthesizes NaN for fractions entirely in DPU arithmetic.
+
+All 32,770 finite FP16 encodings in `[-2,2]` pass exhaustive RK3588 comparison
+against float32 power rounded to FP16 at `rtol=1e-3, atol=1e-6`. The 98-stage
+typed plan reuses nine scratch surfaces and contains the two constant-base LUT
+tasks, generic EXP2 fallback, and two roundoff-LUT tasks. There is no host
+cast, modulo, parity computation, or semantic fallback.
