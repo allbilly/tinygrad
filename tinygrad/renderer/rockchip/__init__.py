@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, struct
+import math, os, struct
 from dataclasses import dataclass
 from itertools import product
 from typing import Callable, cast
@@ -446,6 +446,75 @@ def lower_reduce_result(sink:UOp) -> RKLowerResult:
                     RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
   return _native(RKReduce(out, src, Ops.MAX, red_axis))
 
+def lower_global_max_result(sink:UOp) -> RKLowerResult:
+  """Lower one dense FP16 global MAX through a padded pairwise DPU tree."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) != 2: return _not_applicable()
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU global MAX requires an FP16 output", store.src[0].op)
+  if store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU global MAX requires one scalar output", store.src[0].op)
+
+  stored, output_scale = _strip_casts(store.src[1]), 1.0
+  if stored.key != reduce.key:
+    if stored.op is not Ops.MUL: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU global MAX epilogue is not a scale", stored.op)
+    const, reduced = (stored.src[0], stored.src[1]) if stored.src[0].op is Ops.CONST else (stored.src[1], stored.src[0])
+    if const.op is not Ops.CONST or _strip_casts(reduced).key != reduce.key:
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU global MAX scale is not direct", stored.op)
+    output_scale = float(const.arg)
+
+  value, red, input_scale = _strip_casts(reduce.src[0]), reduce.src[1], 1.0
+  if value.op is Ops.MUL:
+    const, candidate = (value.src[0], value.src[1]) if value.src[0].op is Ops.CONST else (value.src[1], value.src[0])
+    if const.op is Ops.CONST:
+      value, input_scale = _strip_casts(candidate), float(const.arg)
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half or red.op is not Ops.RANGE:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "DPU global MAX input is not one FP16 surface", reduce.op)
+  count, src_aff = int(red.src[0].arg), _affine(value.src[1])
+  if not 2 <= count <= 65536:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"DPU global MAX extent {count} is outside 2..65536", red.op)
+  if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU global MAX requires one dense reduction axis", value.op)
+
+  output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  extent, stages, scratch = max(8, 1 << (count-1).bit_length()), [], []
+  padded = RKArg(RKBufferKind.SCRATCH, 0)
+  scratch.append(RKScratch(extent*2))
+  stages.append(RKALUStage(Ops.ADD, padded, 0.0, -math.inf, extent))
+  stages.append(RKALUStage(Ops.ADD if input_scale == 1.0 else Ops.MUL, padded, source, 0.0 if input_scale == 1.0 else input_scale, count))
+  source, active = padded, extent
+  while active > 8:
+    half = active//2
+    dst = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch.append(RKScratch(((half+7)//8)*16))
+    # Stop before either source address would fall inside one 16-byte atom.
+    stages.append(RKALUStage(Ops.MAX, dst, RKArg(source.kind, source.index, source.addend+half*2), source, half))
+    source, active = dst, half
+
+  # DPU elementwise addresses are atom-aligned, so reduce the final eight lanes by placing them in PPU channel 0 over an 8-pixel surface.
+  packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch.append(RKScratch(64))
+  stages.extend((RKALUStage(Ops.ADD, packed, 0.0, 0.0, 32), RKALUStage(Ops.ADD, packed, source, 0.0, 8)))
+  hwc = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch.append(RKScratch(160))  # final 16-output CMAC tile writes one padded 32-lane surface
+  rows = [[index//8] if index%8 == 0 else [] for index in range(64)]
+  contracts:list[RKContract] = []
+  for start in range(0, 64, 16):
+    out_layout = RKLayout((1,16), (1,32), (64,2), dtypes.half, padding=((0,0),(0,16)))
+    contracts.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
+      _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH), _cmac_weight_ref(0, 16, 32, RKBufferKind.CONSTANT, 32),
+      red.arg[0], _cmac_selection_payload(rows[start:start+16], 32, 32, 1.0)))
+  pooled = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch.append(RKScratch(16))
+  scratch_tuple = tuple(scratch)
+  reduce_plan = RKReduce(RKTensorRef(pooled, RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half)),
+    RKTensorRef(hwc, RKLayout((2,4,8), (2,4,8), (64,16,2), dtypes.half)), Ops.MAX, red.arg[0])
+  final = RKDPUProgram((RKALUStage(Ops.ADD if output_scale == 1.0 else Ops.MUL, output, pooled,
+                                   0.0 if output_scale == 1.0 else output_scale, 1),), scratch_tuple)
+  return _native(RKProgram((RKDPUProgram(tuple(stages), scratch_tuple), *contracts, reduce_plan, final), scratch_tuple))
+
 @dataclass(frozen=True)
 class RKLowerer:
   name: str
@@ -462,6 +531,7 @@ _LOWERERS = (
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
+  RKLowerer("global_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_global_max_result),
   RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),
 )
 

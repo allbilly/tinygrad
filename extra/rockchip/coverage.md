@@ -365,6 +365,21 @@ remains 46 tests plus 27 subtests in 358.21 seconds. `sz.py` counts 2,134
 compiler lines and 27,267 repository lines after the readability refactor; the
 38-line increase is explicit module interfaces, not new hardware behavior.
 
+Dense FP16 global extrema now use one generic ordered plan. DPU MAX reduces
+atom-aligned blocks to eight lane maxima, four small CMAC selector tasks place
+those lanes in PPU channel zero over a 2x4 surface, and PPU produces the scalar
+maximum; input/output sign scales also cover the standard MIN decomposition.
+The first hardware experiment tried to finish the tree with sub-atom DPU EW
+addresses and returned lane zero (`128` instead of `134` for an increasing
+135-element input). Width sweeps proved that EW_BASE_ADDR ignores low atom bits,
+so that rejected design was not retained. Hardware boundary cases 2, 8, 9,
+and 135 plus scaled MAX and MIN pass with no host semantics. The official FP16
+global and scaled extrema subcases advance natively; their parent methods remain
+failed until the later int/bool subcases have honest device support. All 66
+host compiler/image/fallback/telemetry tests pass, Ruff and mypy are clean, and
+the expanded strict hardware suite passes 47 tests plus 31 subtests in 366.90
+seconds. The capability adds 62 counted compiler lines.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);

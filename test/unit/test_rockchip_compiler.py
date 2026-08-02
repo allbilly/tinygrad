@@ -7,7 +7,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKLowerKind, RKProgram, RKReduce,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
-  lower_reformat_result, rk_fingerprint)
+  lower_global_max_result, lower_reformat_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -38,6 +38,18 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_reduce(plan)
     self.assertEqual(image.stages[0].engine, RKEngine.PPU)
     self.assertEqual(tuple((reloc.word, reloc.index) for reloc in image.stages[0].relocs), ((18,0), (19,1)))
+
+  def test_dense_global_max_uses_padded_dpu_tree(self):
+    plan = lower_global_max_result(sink(Tensor.empty(135,dtype=dtypes.half).max())).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    prep = plan.steps[0]
+    self.assertIsInstance(prep, RKDPUProgram)
+    assert isinstance(prep, RKDPUProgram)
+    self.assertEqual(([stage.op for stage in prep.stages[:3]], len(prep.stages), len(plan.scratch)),
+                     ([Ops.ADD,Ops.ADD,Ops.MAX], 9, 9))
+    self.assertEqual([stage.engine for stage in emit_program(plan).stages], [RKEngine.DPU]*9+[RKEngine.CMAC]*4+[RKEngine.PPU,RKEngine.DPU])
+    self.assertFalse(contains_uop(plan))
 
   def test_affine_movements_use_aligned_npu_atom_copies(self):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)

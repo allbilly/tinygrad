@@ -66,6 +66,8 @@ are eligible to be ported as native capabilities.
   input is already stored as `(N, 32)`;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
+- dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane
+  reformat, and PPU spatial reduction, including a direct scalar scale;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
   32-term aligned DPU/CMAC plan;
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
@@ -137,8 +139,8 @@ sub-atom DPU preparation followed by sparse CMAC.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,267, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,267 lines.
-The exact 2,299-line delta is 2,294 counted Rockchip backend lines (2,134
+contains 27,329, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,329 lines.
+The exact 2,361-line delta is 2,356 counted Rockchip backend lines (2,196
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
