@@ -87,6 +87,13 @@ class TestRockchip(unittest.TestCase):
       actual = Tensor(scalar, device="ROCKCHIP").realize().expand(4,3,2,6).contiguous().realize().numpy()
       np.testing.assert_equal(actual, np.broadcast_to(scalar, (4,3,2,6)))
 
+  def test_input_dma_atom_padding_survives_lut_then_cmac(self):
+    zero, negative = Tensor([0], dtype=dtypes.half, device="ROCKCHIP"), Tensor([-.7], dtype=dtypes.half, device="ROCKCHIP")
+    np.testing.assert_equal((zero.log2()*negative).realize().numpy(), np.array([np.inf], dtype=np.float16))
+    scalar = np.array([[[[0.1953125]]]], dtype=np.float16)
+    actual = Tensor(scalar, device="ROCKCHIP").realize().expand(4,3,2,6).contiguous().realize().numpy()
+    np.testing.assert_equal(actual, np.broadcast_to(scalar, (4,3,2,6)))
+
   def test_unaligned_contiguous_slice_native_dpu(self):
     data = np.arange(24, dtype=np.float16)
     tensor = Tensor(data, device="ROCKCHIP").realize()

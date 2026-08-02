@@ -296,14 +296,32 @@ Typed rejects fall from 256 to 244 events, and noncontiguous-output rejects
 fall from 46 to 37 methods.
 
 That census also exposed an execution-order bug not seen in focused testing:
-the one-element subcase of `test_expand` sometimes accumulated stale scratch
-padding after hundreds of prior tasks. The generated selector used zero
-weights for padding, but the aligned scratch surface itself was not defined.
-The pipeline now zeroes the entire aligned surface with one NPU task before
-copying the logical input with a second NPU task. Eight repeated scalar
-expands pass, and a single long-order process passes the complete 45-test
-device file followed by official `test_expand`: 46 tests plus 27 subtests in
-361.81 seconds. No CPU initialization or semantic fallback is involved.
+the one-element subcase of `test_expand` sometimes failed after a long LUT
+program. Zeroing the aligned scratch surface on the NPU was a necessary layout
+invariant, but it did not fix the ordered failure. The strict census at
+`1d6d2781d` remained 101 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 271 `FAIL`, and 13
+`SKIP_UPSTREAM` in 552.52 seconds. Its JSON is
+`~/rk2608_backups/census-zero-padded-sparse-1d6d2781d/test_ops_coverage.json`
+(SHA-256 `56796ba75080fb30791316222dca7db9b6f06fd764df365f5102ba2e8bb932d1`);
+the JUnit XML has SHA-256
+`ac080cab53659dfc2b58060dfe73656cca900e6d2527370b6ca2052c8e9d19ee`.
+
+The minimal reproducer is `test_exp2_log2_zero_times_negative` immediately
+followed by `test_expand`. A read-only scratch trace showed that the NPU zero
+task correctly wrote the complete 32-lane scratch tile, but the following
+one-element DPU copy overwrote its first atom with `0x3240` followed by seven
+stale `0x7c01` NaNs. The generic DPU emitter had hardcoded eight input and
+output channels even for a one-element stage. CMAC zero weights cannot suppress
+those lanes because IEEE multiplication preserves `0 * NaN` as NaN.
+
+The native fix programs the logical channel count for FP16 stages smaller than
+one eight-lane atom. The DPU then copies only the scalar into the NPU-zeroed
+scratch surface, leaving its padding defined. The exact two-method reproducer
+passes, and the complete strict hardware suite passes 46 tests plus 27 subtests
+in 358.10 seconds with `ROCKCHIP_FALLBACK=0`. No host initialization or semantic
+fallback is involved. The rejected register-reset experiment and scratch trace
+are preserved in `rockchip-upstream-patches/wip-cmac-register-reset-scratch-trace.patch`
+(SHA-256 `15d2882943eb0ed7c2193fa626f7202b172a3165fffb1e88ca4939e602f355b2`).
 
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
@@ -768,7 +786,7 @@ failures.
 | Native tiled int32/FP32 constant fills (research-only, restored) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Current (`52c6657e2`) |
 | Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_simple`, `test_sum_full`, `test_mean`, `test_sum_relu` | Yes (`da09c1fd9`) |
 | Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Yes (`da09c1fd9`) |
-| Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | Focused only; census pending |
+| Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | 101-native census; sub-atom fix re-census pending |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |

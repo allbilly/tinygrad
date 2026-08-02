@@ -4,10 +4,10 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKPipeline, RKReduce, RKRejectKind,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKPipeline, RKReduce, RKRejectKind,
   RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_pipeline, emit_reduce, encode_image, lower_contract,
   lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result, lower_reformat_result, rk_fingerprint)
-from tinygrad.runtime.autogen import rockchip_lut as rklut
+from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
 class CaptureRenderer(Renderer):
@@ -75,6 +75,12 @@ class TestDPUCompiler(unittest.TestCase):
       0x2001000000005018, 0x2001000000005038, 0x2001000178495044, 0x0081000000180008))
     self.assertEqual(tuple((r.word, r.kind, r.index) for r in image.stages[0].relocs),
                      ((27, RKBufferKind.ARG, 0), (28, RKBufferKind.ARG, 1), (29, RKBufferKind.ARG, 2)))
+
+  def test_subatom_dpu_stage_reads_and_writes_only_logical_lanes(self):
+    image = emit_dpu(RKDPUProgram((RKALUStage(Ops.ADD, RKArg(RKBufferKind.ARG, 0), RKArg(RKBufferKind.ARG, 1), 0.0, 1),)))
+    regs = {(command>>48, command&0xffff):(command>>16)&0xffffffff for command in image.stages[0].commands}
+    self.assertEqual((regs[(0x1001, rk.REG_DPU_DATA_CUBE_CHANNEL)], regs[(0x1001, rk.REG_DPU_WDMA_SIZE_0)],
+                      regs[(0x2001, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL)]), (0, 0, 0))
 
   def test_wide_fills_tile_native_wdma_limits(self):
     for dtype, count, tile in ((dtypes.int, 2925, 64), (dtypes.float, 6, 4)):
