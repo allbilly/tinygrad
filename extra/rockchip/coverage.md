@@ -1356,3 +1356,26 @@ current 128-pass census. The research tree now has 27,932 counted lines,
 including 2,799 in the Rockchip renderer/compiler. The pre-change compiler and
 tests are preserved under
 `~/rk2608_backups/tiled-cmac-m-before-04b9585b3-20260803-022155`.
+
+The complete uncached strict census at `bc5c4353a` confirms 137
+`PASS_NATIVE`, 40 `PASS_FRONTEND`, 235 `FAIL`, and 13 `SKIP_UPSTREAM` across
+exactly 425 methods. The run used `ROCKCHIP_FALLBACK=0` and completed in
+2,234.48 seconds without an NPU timeout, reset failure, invalid submission, or
+process abort. No method that was native in the `6133442c2` census regressed.
+
+Nine methods transition from `FAIL` to `PASS_NATIVE`: `test_conv1d`,
+`test_conv2d`, `test_copysign`, `test_max_pool2d_dilation`,
+`test_max_pool2d_smaller_stride`, `test_medium_grouped_conv2d`,
+`test_simple_conv2d`, `test_simple_conv2d_1x1`, and
+`test_simple_padding_conv1d`. The two unanticipated transitions confirm that
+the layout/contraction work generalizes beyond its focused probes.
+
+The 235 failed methods first reject as 64 unsupported-output-dtype, 48
+plan-stage-limit, 35 unsupported-layout, 30 requires-reformat, 25
+unsupported-ALU, 23 unsupported-input-dtype, and 4 unsupported-reduction.
+Six failures have no native reject and therefore remain numerical or frontend
+contract investigations. The durable JSON is
+`~/rk2608_backups/census-conv-bc5c4353a-20260803/test_ops_coverage.json`
+(SHA-256 `010527a2a5af8efc43ecc09a8b160978677c3299c46ca2a7866d57f086375cb4`);
+the JUnit XML SHA-256 is
+`85b082338e041c16c4243eafeaaf127830dccfcd7721e71b146e6cbb7a3043c0`.

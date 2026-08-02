@@ -145,17 +145,25 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
-The current committed strict census at `6133442c2` contains 128 native passes,
-40 frontend-only passes, 244 failures, and 13 upstream skips across exactly 425
+The current committed strict census at `bc5c4353a` contains 137 native passes,
+40 frontend-only passes, 235 failures, and 13 upstream skips across exactly 425
 methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
 regressed and there were no NPU timeouts, reset failures, invalid submissions,
-or process aborts. First-reject counts are 64 unsupported-output-dtype, 49
-plan-limit, 41 unsupported-layout, 32 requires-reformat, 25 unsupported-ALU,
-22 unsupported-input-dtype, and 4 unsupported-reduction. Larger contraction
+or process aborts. First-reject counts are 64 unsupported-output-dtype, 48
+plan-limit, 35 unsupported-layout, 30 requires-reformat, 25 unsupported-ALU,
+23 unsupported-input-dtype, and 4 unsupported-reduction; six failures execute
+natively but miss the numerical or frontend contract. Larger contraction
 packs remain typed plan-limit rejects when they exceed the 2 MiB constant
 allocation or affine-analysis budgets. Static conditional FP16 `tril`/`triu`
 subcases are native, while their explicit boolean-output subcases remain honest
 dtype rejections.
+
+The nine exact transitions from the preceding 128-pass census are `conv1d`,
+`conv2d`, `copysign`, both remaining MAX-pool dilation/smaller-stride families,
+`medium_grouped_conv2d`, both simple Conv2D families, and padded Conv1D. This
+also confirms two generic gains that were not claimed from focused testing.
+The durable telemetry JSON and JUnit XML are stored under
+`~/rk2608_backups/census-conv-bc5c4353a-20260803/`.
 
 Tiled contraction legality is checked before coordinate enumeration: K,
 source extents, and at most 65,536 affine output/reduction visits bound compiler
