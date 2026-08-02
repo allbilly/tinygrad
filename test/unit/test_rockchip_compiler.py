@@ -76,7 +76,10 @@ class TestDPUCompiler(unittest.TestCase):
                        tuple(range(0, count*4, tile*4)))
       image = emit_dpu(plan)
       self.assertEqual(decode_image(encode_image(image)), image)
-    self.assertIsNone(lower_dpu(sink(Tensor.full((257,), 4, dtype=dtypes.float))))
+    wide = lower_dpu(sink(Tensor.full((257,), 4, dtype=dtypes.float)))
+    self.assertIsInstance(wide, RKDPUProgram)
+    self.assertEqual(len(wide.stages), 65)
+    self.assertEqual(decode_image(encode_image(emit_dpu(wide))), emit_dpu(wide))
 
   def test_plan_is_uop_free_and_reuses_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))

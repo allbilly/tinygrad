@@ -11,8 +11,10 @@ the 425-green `rockchip-2607` result cannot be treated as all-NPU proof because
 that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
-64-stage limit. The runtime already executes stages serially, so the image now
-encodes that actual contract directly. A subsequent contiguous FP16 global-MAX
+64-stage image limit. The runtime already executes stages serially, so the
+image now encodes that actual contract directly. The stale matching planner
+fence is also gone; a 65-stage FP32 fill round-trips through the image codec
+and passes strict RK3588 execution. A subsequent contiguous FP16 global-MAX
 tree was rejected after hardware characterization: DPU source addresses are
 effectively 16-byte atom aligned, so sub-atom relocation addends are ignored.
 An extent sweep passed only 9/17/33/65 by accidentally copying an aligned odd

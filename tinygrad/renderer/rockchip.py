@@ -1330,7 +1330,6 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       tile = 64 if store.src[0].dtype is dtypes.int else 4
       fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, root, min(tile, count-start),
                                      store.src[0].dtype) for start in range(0, count, tile))
-      if len(fill_stages) > 64: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"constant fill needs {len(fill_stages)} stages")
       return _native(RKDPUProgram(fill_stages))
     return _native(RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),)))
   if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2:
@@ -1368,7 +1367,6 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
         arg = values[source]
         if uses[source] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
   size = ((count+7)//8)*16
-  if len(stages) > 64: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"expression needs {len(stages)} stages")
   return _native(RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count))))
 
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
