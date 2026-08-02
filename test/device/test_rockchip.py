@@ -91,6 +91,16 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((2,2)).realize().numpy()
     np.testing.assert_equal(actual, np.array([[[[4]]]],dtype=np.float16))
 
+  def test_padded_ceil_max_pool_native_cmac_ppu(self):
+    data = np.array([[[[-8,-7,-6,-5,-4,-3], [-2,-1,0,1,2,3], [4,5,6,7,8,9],
+                       [10,11,12,13,14,15], [16,17,18,19,20,21], [22,23,24,25,26,27]]]], dtype=np.float16)
+    actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((3,3),stride=3,padding=1,ceil_mode=True).realize().numpy()
+    padded = np.pad(data, ((0,0),(0,0),(1,2),(1,2)), constant_values=-np.inf)
+    expected = np.empty((1,1,3,3), dtype=np.float16)
+    for y in range(3):
+      for x in range(3): expected[:,:,y,x] = padded[:,:,y*3:y*3+3,x*3:x*3+3].max(axis=(2,3))
+    np.testing.assert_equal(actual, expected)
+
   def test_dense_fp16_global_extrema_native_dpu(self):
     for count in (2, 8, 9, 135):
       with self.subTest(count=count):

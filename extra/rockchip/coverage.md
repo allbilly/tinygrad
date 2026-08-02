@@ -1159,3 +1159,17 @@ out; reset-per-stage remains required. The exact experiments are preserved as
 `wip-dynamic-k320-row-cmac-timeout.patch` in the persistent patch archive.
 The research tree now has 27,709 counted lines, including 2,576 in the
 Rockchip renderer/compiler.
+
+Static affine MAX now follows compile-time `WHERE` predicates around one FP16
+input surface. Coordinates that select padding are represented by an NPU-filled
+negative-infinity sentinel lane; selected coordinates must still resolve to a
+valid affine GEM index. This is a generic masked-reduction rule, not a pooling
+name or shape recognizer. Complete `test_max_pool2d_ceil_mode` and
+`test_max_pool2d_ceil_mode_output_size_reduce_by_one` pass natively, including
+all three official kernel-size subtests, at exact comparison and unchanged
+tolerances. The strict hardware suite passes 58 tests plus 37 subtests in
+457.09 seconds with `ROCKCHIP_FALLBACK=0`. Together with the earlier focused
+`test_max_pool2d_simple` gain, the inferred native method total is 125 after
+the last 122-pass census; these three methods still require a complete census
+before becoming an authoritative total. The research tree now has 27,731
+counted lines, including 2,598 in the Rockchip renderer/compiler.

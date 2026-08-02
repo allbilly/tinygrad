@@ -3,7 +3,7 @@ import math, os, struct
 from dataclasses import dataclass
 from itertools import product
 from typing import Callable, cast
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, Invalid
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId as RKLUTId
@@ -195,6 +195,16 @@ def _conditional_index(u:UOp) -> tuple[UOp, UOp|None, bool]|None:
   if negative.op is Ops.INDEX and negative.src[0].op is Ops.PARAM and positive.op is Ops.CONST and float(positive.arg) == 0:
     return negative, condition, False
   return None
+
+def _static_index_selected(u:UOp, index:UOp, ranges:dict[int, int]) -> bool|None:
+  """Follow static WHERE branches and report whether one coordinate selects `index`."""
+  value = _strip_casts(u)
+  if value.key == index.key: return True
+  if value.op is Ops.CONST: return False
+  if value.op is not Ops.WHERE: return None
+  predicate = _static_scalar(value.src[0], ranges)
+  if predicate is None: return None
+  return _static_index_selected(value.src[1] if predicate else value.src[2], index, ranges)
 
 def _relu_source(u:UOp) -> UOp|None:
   if u.op is not Ops.WHERE or len(u.src) != 3: return None
@@ -809,15 +819,20 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine PPU MAX requires an FP16 output", store.src[0].op)
   value = _strip_casts(reduce.src[0])
-  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+  indexes = tuple(u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.dtype is dtypes.half)
+  if len(indexes) != 1:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX input is not one FP16 surface", reduce.op)
-  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  value_index = indexes[0]
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value_index.src[1])
+  if src_aff is None and value_index.src[1].op is Ops.WHERE:
+    affine_branches = tuple(x for branch in value_index.src[1].src[1:] if branch.arg is not Invalid and (x:=_affine(branch)) is not None)
+    if len(affine_branches) == 1: src_aff = affine_branches[0]
   if out_aff is None or src_aff is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX indexes are not affine", Ops.INDEX)
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
   out_axes = tuple(sorted(out_aff[0]))
-  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
+  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value_index.src[0].src[0].arg)
   if len(red_axes) != len(reduce.src)-1 or not out_axes and len(red_axes) == 1 or set(out_axes) & set(red_axes) or \
      set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine PPU MAX axes do not form a static output/reduction partition", Ops.RANGE)
@@ -840,29 +855,38 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
     seen.add(out_index)
     for red_values in product(*(range(ranges[axis]) for axis in red_axes)):
       point.update(zip(red_axes, red_values))
-      src_index = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes))
-      if not 0 <= src_index < input_count:
+      selected = True if value.key == value_index.key else _static_index_selected(value, value_index, point)
+      if selected is None:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX predicate is not static", Ops.WHERE)
+      src_index = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes)) if selected else -1
+      if selected and not 0 <= src_index < input_count:
         return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX input index is out of bounds", Ops.INDEX)
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)) or any(len(row) != reduction_count for row in selectors):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX output has holes", Ops.INDEX)
 
   align_in, surface_count = max(32, (input_count+31)&-32), pool_extent*8
+  masked, sentinel = any(index < 0 for row in selectors for index in row), align_in
+  if masked: align_in += 32
+  if align_in > 512:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX padded input needs {align_in} lanes", reduce.op)
   constant_bytes = ((output_count+7)//8)*((surface_count+15)//16)*32*align_in*2
   if constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX needs {constant_bytes} constant bytes", reduce.op)
   packed, hwc = RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1)
   hwc_elements = ((surface_count-1)//16)*16+32
   scratch = (RKScratch(align_in*2), RKScratch(hwc_elements*2))
-  source = RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
-  steps:list = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
-                              RKALUStage(Ops.ADD, packed, source, 0.0, input_count)), scratch)]
+  source = RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot)
+  prepare = [RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in), RKALUStage(Ops.ADD, packed, source, 0.0, input_count)]
+  if masked: prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
+  steps:list = [RKDPUProgram(tuple(prepare), scratch)]
   height, width = pool_shape
   for group_start in range(0, output_count, 8):
     channels = min(8, output_count-group_start)
     rows = [[selectors[group_start+min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
             for spatial in range(pool_extent)]
-    flat_rows = [rows[spatial][channel] for spatial in range(pool_extent) for channel in range(8)]
+    flat_rows = [sentinel if rows[spatial][channel] < 0 else rows[spatial][channel]
+                 for spatial in range(pool_extent) for channel in range(8)]
     for start in range(0, surface_count, 16):
       out_layout = RKLayout((1,min(16, surface_count-start)), (1,32), (64,2), dtypes.half,
                             padding=((0,0),(0,32-min(16, surface_count-start))))

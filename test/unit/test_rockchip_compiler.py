@@ -73,6 +73,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual([stage.engine for stage in emit_program(dense).stages],
                      [RKEngine.DPU]*9+[RKEngine.CMAC]*4+[RKEngine.PPU,RKEngine.DPU])
 
+  def test_padded_max_pool_uses_negative_infinity_sentinel(self):
+    plan = lower_affine_max_result(sink(Tensor.empty(1,1,6,6,dtype=dtypes.half).max_pool2d(
+      (3,3), stride=3, padding=1, ceil_mode=True))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    engines = [stage.engine for stage in image.stages]
+    self.assertEqual(engines.count(RKEngine.DPU), 3)
+    self.assertLessEqual(engines.count(RKEngine.CMAC), 10)
+    self.assertLessEqual(engines.count(RKEngine.PPU), 2)
+    self.assertLessEqual(len(image.constants), 64*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_large_affine_reductions_use_bounded_source_windows(self):
     plan = lower_affine_reduce_result(sink(Tensor.empty(2,2,11,28,dtype=dtypes.half).avg_pool2d(2))).plan
     self.assertIsInstance(plan, RKProgram)

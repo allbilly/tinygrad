@@ -70,6 +70,8 @@ are eligible to be ported as native capabilities.
   reformat, and PPU spatial reduction, including a direct scalar scale;
 - small static affine FP16 MAX reductions, including scalar multi-axis output,
   batched as eight PPU channels after cost-bounded CMAC reformatting;
+- statically masked affine FP16 MAX reductions, with invalid coordinates mapped
+  to an NPU-filled negative-infinity sentinel before CMAC/PPU reduction;
 - one static affine FP16 input reformat/broadcast materialized by cost-bounded
   CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
@@ -151,12 +153,16 @@ Tiled contraction legality is checked before coordinate enumeration: K,
 source extents, and at most 65,536 affine output/reduction visits bound compiler
 work. Oversized graphs reject before NPU submission.
 
-The latest focused gain after that census is `test_max_pool2d_simple`: its
-scalar multi-axis affine MAX is packed by bounded CMAC selector tasks and
-reduced by PPU, with no operation-name path or host semantic work. Dense
-single-axis global MAX remains on the proven padded DPU tree. The strict
-hardware suite passes 56 tests plus 37 subtests at this head; the focused gain
-has not yet been folded into the complete census.
+The focused gains after that census are `test_max_pool2d_simple`,
+`test_max_pool2d_ceil_mode`, and
+`test_max_pool2d_ceil_mode_output_size_reduce_by_one`. Their static affine MAX
+selectors are packed by bounded CMAC tasks and reduced by PPU; ceil-mode
+padding is an NPU-filled negative-infinity sentinel selected by compile-time
+coordinate predicates. There is no operation-name path or host semantic work.
+Dense single-axis global MAX remains on the proven padded DPU tree. The strict
+hardware suite passes 58 tests plus 37 subtests at this head. The inferred
+native method count is 125, but these focused gains have not yet been folded
+into a complete census.
 
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
@@ -168,8 +174,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,709, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,709 lines.
-The exact 2,741-line delta is 2,736 counted Rockchip backend lines (2,576
+contains 27,731, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,731 lines.
+The exact 2,763-line delta is 2,758 counted Rockchip backend lines (2,598
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
