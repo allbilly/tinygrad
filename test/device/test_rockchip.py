@@ -82,6 +82,10 @@ class TestRockchip(unittest.TestCase):
       with self.subTest(shape=data.shape):
         actual = tensor_op(Tensor(data, device="ROCKCHIP").realize()).contiguous().realize().numpy()
         np.testing.assert_equal(actual, numpy_op(data))
+    scalar = np.array([[[[0.1953125]]]], dtype=np.float16)
+    for _ in range(8):
+      actual = Tensor(scalar, device="ROCKCHIP").realize().expand(4,3,2,6).contiguous().realize().numpy()
+      np.testing.assert_equal(actual, np.broadcast_to(scalar, (4,3,2,6)))
 
   def test_unaligned_contiguous_slice_native_dpu(self):
     data = np.arange(24, dtype=np.float16)

@@ -54,7 +54,7 @@ class TestDPUCompiler(unittest.TestCase):
     first = plans[0]
     assert isinstance(first, RKPipeline)
     self.assertEqual((len(first.suffix), [stage.engine for stage in emit_pipeline(first).stages]),
-                     (3, [RKEngine.DPU]+[RKEngine.CMAC]*4))
+                     (3, [RKEngine.DPU]*2+[RKEngine.CMAC]*4))
     last = plans[-1]
     assert isinstance(last, RKPipeline)
     self.assertEqual(len(last.suffix), 26)
@@ -593,7 +593,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(all(contract.out.layout.physical_shape == (1,32) for contract in contracts))
     self.assertEqual([contract.out.buffer.addend for contract in contracts], [0,32,64,96])
     self.assertTrue(all((contract.lhs.layout.physical_shape, len(contract.constants)) == ((1,384),24576) for contract in contracts))
-    self.assertEqual([stage.engine for stage in emit_pipeline(first).stages], [RKEngine.DPU]+[RKEngine.CMAC]*4)
+    self.assertEqual([stage.engine for stage in emit_pipeline(first).stages], [RKEngine.DPU]*2+[RKEngine.CMAC]*4)
     self.assertEqual(decode_image(encode_image(emit_pipeline(first))), emit_pipeline(first))
 
   def test_renderer_produces_decodable_machine_image(self):

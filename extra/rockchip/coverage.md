@@ -94,10 +94,12 @@ The native reformat path handles static affine movements without host gather.
 The compiler enumerates the complete static selector map. Contiguous aligned
 runs still coalesce into ordinary DPU ADD-zero atom copies. A map that breaks
 those atoms now reuses the generated sparse-CMAC `RKPipeline`: one DPU task
-copies at most 512 source values into an aligned surface, then sequential CMAC
-tasks select at most 16 logical outputs each. The planner accepts at most 4,096
-outputs and an 8 MiB generated-weight budget. It does not recognize transpose,
-permute, flip, expand, slice, or unfold by name.
+zeroes the complete aligned scratch surface, a second copies the logical input,
+then sequential CMAC tasks select at most 16 logical outputs each. Making the
+padding explicit avoids order-dependent accumulation from stale scratch bits.
+The planner accepts at most 4,096 outputs and an 8 MiB generated-weight budget.
+It does not recognize transpose, permute, flip, expand, slice, or unfold by
+name.
 
 Strict hardware cases cover 9- and 27-element transposes, a 360-element
 permute, a 432-element multi-axis flip, and an 864-element expand. All match
@@ -106,8 +108,7 @@ exactly with `ROCKCHIP_FALLBACK=0`. Focused official methods now pass for
 `test_stack_slice`, `test_unfold`, `test_slice_stride_gt_one`,
 `test_double_slice`, and `test_diagonal`. The complete explicit-device suite
 passes 45 tests plus 27 subtests in 340.26 seconds with `CACHELEVEL=0`.
-The full 425-method census has not yet been rerun, so these nine focused gains
-are not folded into the 90-pass baseline below.
+The strict census and padding stabilization are recorded below.
 
 Earlier slice tests appeared to show that DPU `SRC_BASE_ADDR` honors FP16
 sub-atom relocation addends. The reduction probe separates two cases: a GEM
@@ -284,6 +285,31 @@ and non-direct contraction epilogues (19). The durable JSON is
 (SHA-256 `58541b3554192fd8550809bd546d2e00396489876a9893cf841acaa95cc71c09`);
 the matching JUnit XML has SHA-256
 `d44a26ac3cdf6887c3f2ca16d6cf19ea95a94d67c7743d776381152e4cd0b393`.
+
+At `52f34b131`, the next strict census reaches 101 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 271 `FAIL`, and 13 `SKIP_UPSTREAM` in 544.95 seconds. The 11
+exact gains are `test_diagonal`, `test_double_slice`, `test_flip`,
+`test_meshgrid`, `test_permute`, `test_slice_ellipsis`,
+`test_slice_one_endpoint_out_of_bounds`, `test_slice_stride_gt_one`,
+`test_stack_slice`, `test_transpose`, and `test_unfold`; no prior pass regressed.
+Typed rejects fall from 256 to 244 events, and noncontiguous-output rejects
+fall from 46 to 37 methods.
+
+That census also exposed an execution-order bug not seen in focused testing:
+the one-element subcase of `test_expand` sometimes accumulated stale scratch
+padding after hundreds of prior tasks. The generated selector used zero
+weights for padding, but the aligned scratch surface itself was not defined.
+The pipeline now zeroes the entire aligned surface with one NPU task before
+copying the logical input with a second NPU task. Eight repeated scalar
+expands pass, and a single long-order process passes the complete 45-test
+device file followed by official `test_expand`: 46 tests plus 27 subtests in
+361.81 seconds. No CPU initialization or semantic fallback is involved.
+
+The pre-fix census JSON is
+`~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
+(SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);
+its JUnit XML has SHA-256
+`2548cbbb7c90ef9afda5541307f4266a2186d36a927e893ac271585ed20abc0e`.
 
 ## Current exact method baseline
 

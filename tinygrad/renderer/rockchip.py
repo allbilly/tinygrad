@@ -148,7 +148,8 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
   """Materialize one static selector matrix as sequential, proven-width CMAC tasks."""
   align_in = max(32, (input_count+31)&-32)
   packed = RKArg(RKBufferKind.SCRATCH, 0)
-  dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, source, 0.0, input_count),), (RKScratch(align_in*2),))
+  dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
+                      RKALUStage(Ops.ADD, packed, source, 0.0, input_count)), (RKScratch(align_in*2),))
   lhs_layout = RKLayout((1,input_count), (1,align_in), (align_in*2,2), dtypes.half,
                         padding=((0,0),(0,align_in-input_count)))
   contracts:list[RKContract] = []
