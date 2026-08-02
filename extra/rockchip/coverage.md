@@ -31,6 +31,14 @@ fallback lane participates. The PPU task descriptor uses the independently
 verified `(op_idx=1, enable_mask=0x60, int_mask=0xc00)` contract. Shapes that
 are not already dense HWC8 still reject until a native reformat stage exists.
 
+The first native reformat path handles static affine movements at the proven
+16-byte DPU atom granularity. The compiler enumerates only static index maps,
+coalesces adjacent aligned atoms, and emits ordinary DPU ADD-zero copy tasks;
+runtime tensor values never visit the CPU. Strict hardware tests cover HWC8
+permute, expand, and flip. A movement rejects when any output atom maps to
+strided or unaligned source elements (for example an 8x8 scalar transpose),
+rather than silently using host gather.
+
 Run the census serially on RK3588:
 
 ```sh

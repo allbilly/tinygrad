@@ -2,6 +2,7 @@ from __future__ import annotations
 import hashlib, math, os, struct
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from itertools import product
 from typing import Callable, cast
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import Target
@@ -1390,6 +1391,50 @@ def rk_fingerprint(sink:UOp) -> tuple:
   return (("graph", digest[sink]), ("ops", op_counts), ("params", params), ("constants", constants),
           ("indexes", tuple(sorted(indexes, key=repr))), ("reductions", tuple(sorted(reductions, key=repr))))
 
+def lower_reformat_result(sink:UOp) -> RKLowerResult:
+  """Lower a static affine movement whose source remains contiguous inside every 16-byte NPU atom."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat requires one store", Ops.STORE)
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output is not an indexed parameter", store.src[0].op)
+  value = _strip_casts(store.src[1])
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat value is not a direct indexed parameter", value.op)
+  if store.src[0].dtype is not dtypes.half or value.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires FP16 input and output", store.src[0].op)
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or src_aff is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat indexes are not affine", Ops.INDEX)
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  axes = tuple(sorted(out_aff[0].keys() | src_aff[0].keys()))
+  if any(axis not in ranges for axis in axes): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "dynamic reformat range", Ops.RANGE)
+  count, src_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
+  mapping = [-1] * count
+  for coordinates in product(*(range(ranges[axis]) for axis in axes)):
+    point = dict(zip(axes, coordinates))
+    dst = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in axes)
+    src = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in axes)
+    if not 0 <= dst < count or mapping[dst] != -1 or not 0 <= src < src_count:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat does not cover one dense output", Ops.INDEX)
+    mapping[dst] = src
+  if any(source < 0 for source in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output has holes", Ops.INDEX)
+  output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  stages:list[RKDPUStage] = []
+  dst = 0
+  while dst < count:
+    valid, src = min(8, count-dst), mapping[dst]
+    if src % 8 or mapping[dst:dst+valid] != list(range(src, src+valid)):
+      return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement breaks FP16 atom at output element {dst}", Ops.INDEX)
+    length = valid
+    while dst+length < count:
+      following = min(8, count-dst-length)
+      if mapping[dst+length] != src+length or mapping[dst+length:dst+length+following] != list(range(src+length, src+length+following)): break
+      length += following
+    stages.append(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, dst*2), RKArg(source.kind, source.index, src*2), 0.0, length))
+    dst += length
+  return _native(RKDPUProgram(tuple(stages)))
+
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize the directly legal M=1, K=32 FP16 CMAC surface."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -1480,7 +1525,11 @@ def lower_native(sink:UOp) -> RKLowerResult:
     pool, contract = lower_reduce_result(sink), lower_contract_result(sink)
     result = pool if pool.reject is None or contract.reject is not None and any(
       u.op is Ops.REDUCE and u.arg[0] is Ops.MAX for u in sink.toposort()) else contract
-  else: result = lower_dpu_result(sink)
+  else:
+    result = lower_dpu_result(sink)
+    if result.reject is not None:
+      reformat = lower_reformat_result(sink)
+      if reformat.reject is None: result = reformat
   if result.reject is None: return result
   reject = result.reject
   return RKLowerResult(reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))

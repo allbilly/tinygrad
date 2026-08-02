@@ -6,7 +6,7 @@ from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKReduce, RKRejectKind, RKLUTStage,
   RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_reduce, encode_image, lower_contract, lower_dpu, lower_native,
-  lower_reduce_result, rk_fingerprint)
+  lower_reduce_result, lower_reformat_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -37,6 +37,15 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_reduce(plan)
     self.assertEqual(image.stages[0].engine, RKEngine.PPU)
     self.assertEqual(tuple((reloc.word, reloc.index) for reloc in image.stages[0].relocs), ((18,0), (19,1)))
+
+  def test_affine_movements_use_aligned_npu_atom_copies(self):
+    x = Tensor.empty(2,3,8,dtype=dtypes.half)
+    plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in
+                  (x.permute(1,0,2), Tensor.empty(2,1,8,dtype=dtypes.half).expand(2,3,8), x.flip(0)))
+    self.assertTrue(all(isinstance(plan, RKDPUProgram) for plan in plans))
+    self.assertEqual(tuple(len(plan.stages) for plan in plans), (6, 5, 2))
+    self.assertTrue(all(stage.count % 8 == 0 for plan in plans for stage in plan.stages))
+    self.assertIsNotNone(lower_reformat_result(sink(Tensor.empty(8,8,dtype=dtypes.half).T.contiguous())).reject)
 
   def test_add_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)

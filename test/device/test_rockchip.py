@@ -12,6 +12,15 @@ class TestRockchip(unittest.TestCase):
         actual = Tensor(data, device="ROCKCHIP").realize().max(axis=(0,1)).realize().numpy()
         np.testing.assert_equal(actual, data.max(axis=(0,1)))
 
+  def test_affine_hwc8_movements_native_dpu(self):
+    data = np.arange(2*3*8, dtype=np.float16).reshape(2,3,8)
+    tensor = Tensor(data, device="ROCKCHIP").realize()
+    for actual,expected in ((tensor.permute(1,0,2).contiguous(), data.transpose(1,0,2)),
+                            (tensor.flip(0).contiguous(), data[::-1])):
+      np.testing.assert_equal(actual.realize().numpy(), expected)
+    expanded = Tensor(data[:,:1], device="ROCKCHIP").realize().expand(2,3,8).contiguous().realize().numpy()
+    np.testing.assert_equal(expanded, np.broadcast_to(data[:,:1], (2,3,8)))
+
   def test_python_fallback_mapped_buffer_coherence(self):
     old_fallback, old_telemetry = os.environ.get("ROCKCHIP_FALLBACK"), os.environ.get("ROCKCHIP_TELEMETRY")
     os.environ["ROCKCHIP_FALLBACK"], os.environ["ROCKCHIP_TELEMETRY"] = "PYTHON", "memory"
