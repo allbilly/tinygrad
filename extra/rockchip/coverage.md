@@ -962,3 +962,21 @@ was hidden with a tolerance or fallback. Ruff, mypy, all 69 host tests, and the
 strict RK3588 suite (50 tests plus 31 subtests) pass, the latter in 372.76
 seconds. This capability adds 16 counted compiler lines (27,489 total; 2,356
 in the Rockchip renderer/compiler) before the next full census.
+
+The complete uncached census at `181dfc75a` confirms 109 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 263 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods.
+The four exact deltas from `7c11a8f32` are `test_binary_crossentropy`,
+`test_einsum_trace`, `test_simple_grouped_conv2d`, and
+`test_sum_collapse_neg` moving from failure to native pass; no prior native
+method regresses. Pytest reports 170 passed, 356 failed, 13 skipped, and 12
+passing subtests in 850.41 seconds. There are no device timeouts or invalid
+submissions. Of the 263 remaining failed methods, 257 have a typed native
+reject: 68 layout, 60 output-dtype, 59 reformat, 24 ALU, 22 input-dtype, 20
+plan-limit, and 4 reduction classifications. The six numerical/frontend
+failures without a reject are BCE reductions, exact copysign, lerp, maximum,
+zero-stride multiply-accumulate, and `pow_const`; they remain failures at the
+official tolerances. The durable JSON is
+`~/rk2608_backups/census-pointwise-181dfc75a/test_ops_coverage.json` (SHA-256
+`31afa3697c726182bc7759b02051357e7701a8b88226a96086f3163f146446d5`);
+JUnit XML SHA-256 is
+`e66904bf774118f5e783fbc02a2adb937f44c8d9ad884475ae0430120de0b3f9`.
