@@ -4,8 +4,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKLUTStage, RKMaskStage, RockchipRenderer,
-  decode_image, emit_contract, emit_dpu, encode_image, lower_contract, lower_dpu)
+from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKRejectKind, RKLUTStage, RKMaskStage,
+  RockchipRenderer, decode_image, emit_contract, emit_dpu, encode_image, lower_contract, lower_dpu, lower_native, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -438,11 +438,20 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_renderer_classifies_rejections(self):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
-    cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_dtype"),
+    cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
              (Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half), "unsupported_layout"),
-             (Tensor.empty(8,8,dtype=dtypes.half)@Tensor.empty(8,8,dtype=dtypes.half), "unsupported_contraction"),
-             (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_op"))
+             (Tensor.empty(8,8,dtype=dtypes.half)@Tensor.empty(8,8,dtype=dtypes.half), "requires_reformat"),
+             (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
+
+  def test_typed_reject_has_stable_slot_independent_fingerprint(self):
+    expressions = [Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half) for _ in range(2)]
+    sinks = [sink(expression) for expression in expressions]
+    results = [lower_native(graph) for graph in sinks]
+    self.assertTrue(all(result.plan is None and result.reject is not None for result in results))
+    self.assertTrue(all(result.reject.kind is RKRejectKind.UNSUPPORTED_LAYOUT for result in results if result.reject is not None))
+    self.assertEqual(results[0].reject.fingerprint, results[1].reject.fingerprint)
+    self.assertEqual(results[0].reject.fingerprint, rk_fingerprint(sinks[0]))
 
 if __name__ == "__main__": unittest.main()

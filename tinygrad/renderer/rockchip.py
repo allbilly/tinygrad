@@ -1,7 +1,7 @@
 from __future__ import annotations
-import math, struct
+import hashlib, math, struct
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Callable, cast
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import Target
@@ -79,6 +79,39 @@ class RKContract:
   lhs: RKView
   rhs: RKView
   reduce_axis: int
+
+class RKRejectKind(Enum):
+  UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
+  UNSUPPORTED_OUTPUT_DTYPE = "unsupported_output_dtype"
+  UNSUPPORTED_ALU = "unsupported_alu"
+  UNSUPPORTED_LAYOUT = "unsupported_layout"
+  UNALIGNED_ROW = "unaligned_row"
+  REQUIRES_REFORMAT = "requires_reformat"
+  UNSUPPORTED_BROADCAST = "unsupported_broadcast"
+  UNSUPPORTED_REDUCTION = "unsupported_reduction"
+  UNSUPPORTED_CONTRACTION = "unsupported_contraction"
+  UNSUPPORTED_DYNAMIC_PACK = "unsupported_dynamic_pack"
+  PLAN_STAGE_LIMIT = "plan_stage_limit"
+  LUT_DOMAIN_UNPROVEN = "lut_domain_unproven"
+  NUMERICAL_CONTRACT = "numerical_contract"
+
+@dataclass(frozen=True)
+class RKReject:
+  kind: RKRejectKind
+  detail: str
+  node_op: Ops|None = None
+  fingerprint: tuple = ()
+
+@dataclass(frozen=True)
+class RKLowerResult:
+  plan: RKDPUProgram|RKContract|None = None
+  reject: RKReject|None = None
+  def __post_init__(self):
+    if (self.plan is None) == (self.reject is None): raise ValueError("RK lowering result must contain exactly one plan or reject")
+
+def _native(plan:RKDPUProgram|RKContract) -> RKLowerResult: return RKLowerResult(plan=plan)
+def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
+  return RKLowerResult(reject=RKReject(kind, detail, node_op))
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -1205,27 +1238,39 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   memo[u] = ret
   return ret
 
-def lower_dpu(sink:UOp) -> RKDPUProgram|None:
-  """Lower one contiguous FP16 expression or native wide constant fill to a UOp-free primitive DPU plan."""
+def lower_dpu_result(sink:UOp) -> RKLowerResult:
+  """Lower one contiguous expression or native wide constant fill to a typed DPU result."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
-  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or \
-     store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float): return None
+  if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, f"expected one store, found {len(stores)}", Ops.STORE)
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "output is not an indexed surface", store.src[0].op)
+  if store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"output dtype {store.src[0].dtype.name}", store.src[0].op)
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
-  if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST: return None
+  if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "output surface is not contiguous", out_index.op)
   count = int(out_param.src[0].arg)
   if not 0 < count <= 65536 or (out_index.op is Ops.RANGE and int(out_index.src[0].arg) != count) or \
-     (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)): return None
+     (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, f"unsupported contiguous output extent {count}", out_index.op)
+  input_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if (bad_dtype:=next((u.dtype for u in input_indexes if u.dtype is not dtypes.half), None)) is not None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, f"input dtype {bad_dtype.name}", Ops.INDEX)
+  if any(u.src[1].key != out_index.key for u in input_indexes):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "input index map differs from output surface", Ops.INDEX)
   root = _parse_alu(store.src[1], out_index, {})
-  if root is None: return None
-  if store.src[0].dtype is not dtypes.half and not isinstance(root, float): return None
+  if root is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "expression is not legal DPU arithmetic", _unwrap_same_cast(store.src[1]).op)
+  if store.src[0].dtype is not dtypes.half and not isinstance(root, float):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"non-constant {store.src[0].dtype.name} arithmetic", store.src[1].op)
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
     if store.src[0].dtype in (dtypes.int, dtypes.float):
       tile = 64 if store.src[0].dtype is dtypes.int else 4
       fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, root, min(tile, count-start),
                                      store.src[0].dtype) for start in range(0, count, tile))
-      return RKDPUProgram(fill_stages) if len(fill_stages) <= 64 else None
-    return RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),))
+      if len(fill_stages) > 64: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"constant fill needs {len(fill_stages)} stages")
+      return _native(RKDPUProgram(fill_stages))
+    return _native(RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),)))
   if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2:
     exp_source, base = root.src[0], root
     positive_inf = _MaskExpr((_sub(exp_source, 65504.0),))
@@ -1253,7 +1298,7 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
     if isinstance(expr, _ALUExpr): stages.append(RKALUStage(expr.op, dst, src[0], src[1], count))
     elif isinstance(expr, _LUTExpr) and isinstance(src[0], RKArg): stages.append(RKLUTStage(expr.lut, dst, src[0], count))
     elif isinstance(src[0], RKArg): stages.append(RKMaskStage(dst, src[0], count))
-    else: return None
+    else: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "stage source is not materializable")
     values[expr] = dst
     for source in expr.src:
       if isinstance(source, (_ALUExpr, _MaskExpr, _LUTExpr)):
@@ -1261,7 +1306,12 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
         arg = values[source]
         if uses[source] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
   size = ((count+7)//8)*16
-  return RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count)))
+  if len(stages) > 64: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"expression needs {len(stages)} stages")
+  return _native(RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count))))
+
+def lower_dpu(sink:UOp) -> RKDPUProgram|None:
+  """Compatibility helper for compiler probes; production lowering consumes `lower_dpu_result`."""
+  return cast(RKDPUProgram|None, lower_dpu_result(sink).plan)
 
 def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
@@ -1280,29 +1330,97 @@ def _affine(u:UOp) -> tuple[dict[int, int], int]|None:
     return ({k:v*int(const.arg) for k,v in aff[0].items()}, aff[1]*int(const.arg))
   return None
 
-def lower_contract(sink:UOp) -> RKContract|None:
+def _const_category(value) -> str:
+  if isinstance(value, float) and math.isnan(value): return "NAN"
+  if isinstance(value, float) and math.isinf(value): return "POS_INF" if value > 0 else "NEG_INF"
+  if value == 0: return "ZERO"
+  if value == 1: return "ONE"
+  if value == -1: return "NEG_ONE"
+  if isinstance(value, int) or isinstance(value, float) and value.is_integer(): return "POS_INT" if value > 0 else "NEG_INT"
+  if isinstance(value, (int, float)): return "POS_FRAC" if value > 0 else "NEG_FRAC"
+  return type(value).__name__.upper()
+
+def rk_fingerprint(sink:UOp) -> tuple:
+  """Stable graph-family identity that omits buffer slots and exact constant values."""
+  nodes = sink.toposort()
+  axis_ids = {axis:i for i,axis in enumerate(sorted({u.arg[0] for u in nodes if u.op is Ops.RANGE}))}
+  digest:dict[UOp, str] = {}
+  indexes:list[tuple] = []
+  reductions:list[tuple] = []
+  for u in nodes:
+    shape = tuple(x if isinstance(x, int) else str(x) for x in u._shape) if u._shape is not None else ()
+    arg:tuple|None = None
+    if u.op is Ops.PARAM: arg = (u.addrspace.name,)
+    elif u.op is Ops.CONST: arg = (_const_category(u.arg),)
+    elif u.op is Ops.RANGE: arg = (axis_ids[u.arg[0]], u.arg[-1].name, int(u.src[0].arg) if u.src[0].op is Ops.CONST else "dynamic")
+    elif u.op is Ops.REDUCE:
+      arg = (u.arg[0].name, u.arg[1])
+      reductions.append(arg)
+    elif u.op is Ops.INDEX:
+      affine = _affine(u.src[1])
+      index:tuple = ("nonaffine",) if affine is None else (tuple(sorted((axis_ids.get(k, -1), v) for k,v in affine[0].items())), affine[1])
+      indexes.append((u.dtype.name, index))
+      arg = index
+    payload = (u.op.name, u.dtype.name, shape, arg, tuple(digest[x] for x in u.src))
+    digest[u] = hashlib.sha256(repr(payload).encode()).hexdigest()[:16]
+  op_counts = tuple((op.name, sum(u.op is op for u in nodes)) for op in sorted({u.op for u in nodes}, key=lambda x:x.name))
+  params = tuple(sorted(((u.dtype.name, tuple(x if isinstance(x, int) else str(x) for x in u.shape), u.addrspace.name)
+                         for u in nodes if u.op is Ops.PARAM), key=repr))
+  constants = tuple(sorted(_const_category(u.arg) for u in nodes if u.op is Ops.CONST))
+  return (("graph", digest[sink]), ("ops", op_counts), ("params", params), ("constants", constants),
+          ("indexes", tuple(sorted(indexes, key=repr))), ("reductions", tuple(sorted(reductions, key=repr))))
+
+def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize the directly legal M=1, K=32 FP16 CMAC surface."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if len(stores) != 1 or len(reductions) != 1: return None
+  if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, f"expected one store, found {len(stores)}", Ops.STORE)
+  if len(reductions) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"expected one reduction, found {len(reductions)}", Ops.REDUCE)
   store, reduce = stores[0], reductions[0]
-  if store.src[0].op is not Ops.INDEX or store.src[0].dtype is not dtypes.half or reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2: return None
-  if _strip_casts(store.src[1]).key != reduce.key: return None
+  if store.src[0].op is not Ops.INDEX: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction output is not indexed", store.src[0].op)
+  if store.src[0].dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"contraction output dtype {store.src[0].dtype.name}", store.src[0].op)
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"reduction operation {reduce.arg[0].name}", reduce.op)
+  if _strip_casts(store.src[1]).key != reduce.key:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "store epilogue is not a direct reduction", store.src[1].op)
   body, red = _strip_casts(reduce.src[0]), reduce.src[1]
   out_param, out_aff = store.src[0].src[0], _affine(store.src[0].src[1])
-  if out_param.op is not Ops.PARAM or out_aff is None or out_aff[1] or len(out_aff[0]) != 1 or body.op is not Ops.MUL: return None
-  if red.op is not Ops.RANGE or int(red.src[0].arg) != 32: return None
+  if out_param.op is not Ops.PARAM or out_aff is None or out_aff[1] or len(out_aff[0]) != 1:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "contraction output map is not direct affine", store.src[0].op)
+  if body.op is not Ops.MUL: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "reduction body is not multiply", body.op)
+  if red.op is not Ops.RANGE: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "reduction axis is not a range", red.op)
+  if int(red.src[0].arg) != 32:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, f"direct CMAC requires K=32, got {int(red.src[0].arg)}", red.op)
   lhs, rhs = (_strip_casts(x) for x in body.src)
-  if any(x.op is not Ops.INDEX or x.dtype is not dtypes.half or x.src[0].op is not Ops.PARAM for x in (lhs, rhs)): return None
+  if any(x.op is not Ops.INDEX or x.src[0].op is not Ops.PARAM for x in (lhs, rhs)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction operands are not indexed parameter surfaces", body.op)
+  if any(x.dtype is not dtypes.half for x in (lhs, rhs)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, "CMAC operands must be half", Ops.INDEX)
   lhs_aff, rhs_aff = _affine(lhs.src[1]), _affine(rhs.src[1])
-  if lhs_aff is None or rhs_aff is None or lhs_aff[1] or rhs_aff[1]: return None
+  if lhs_aff is None or rhs_aff is None or lhs_aff[1] or rhs_aff[1]:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "CMAC operands need affine zero-based surfaces", Ops.INDEX)
   red_axis, out_axes = red.arg[0], tuple(out_aff[0])
-  if len(out_axes) != 1 or out_aff[0][out_axes[0]] != 1 or lhs_aff[0] != {red_axis:1}: return None
+  if len(out_axes) != 1 or out_aff[0][out_axes[0]] != 1 or lhs_aff[0] != {red_axis:1}:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "CMAC output or lhs strides need reformatting", Ops.INDEX)
   n_axis = out_axes[0]
   n = next(int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.arg[0] == n_axis)
-  if not 4 <= n <= 16 or rhs_aff[0] != {n_axis:32, red_axis:1}: return None
-  if int(out_param.src[0].arg) != n or int(lhs.src[0].src[0].arg) != 32 or int(rhs.src[0].src[0].arg) != n*32: return None
-  return RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), RKView(lhs.src[0].arg.slot, (1,32), (32,1)),
-                    RKView(rhs.src[0].arg.slot, (n,32), (32,1)), red_axis)
+  if not 4 <= n <= 16: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, f"direct CMAC requires 4<=N<=16, got {n}", red.op)
+  if rhs_aff[0] != {n_axis:32, red_axis:1}:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "rhs is not a packed N-by-K surface", Ops.INDEX)
+  if int(out_param.src[0].arg) != n or int(lhs.src[0].src[0].arg) != 32 or int(rhs.src[0].src[0].arg) != n*32:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "CMAC buffer extents do not match M=1,N,K=32", Ops.INDEX)
+  return _native(RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), RKView(lhs.src[0].arg.slot, (1,32), (32,1)),
+                            RKView(rhs.src[0].arg.slot, (n,32), (32,1)), red_axis))
+
+def lower_contract(sink:UOp) -> RKContract|None:
+  """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""
+  return cast(RKContract|None, lower_contract_result(sink).plan)
+
+def lower_native(sink:UOp) -> RKLowerResult:
+  result = lower_contract_result(sink) if any(u.op is Ops.REDUCE for u in sink.toposort()) else lower_dpu_result(sink)
+  if result.reject is None: return result
+  reject = result.reject
+  return RKLowerResult(reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
@@ -1505,17 +1623,6 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
             RKReloc(0, 31, RKBufferKind.ARG, plan.out.slot))
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, (plan.lhs.slot,plan.rhs.slot), (plan.out.slot,), flags=RK_STAGE_RESET),))
 
-def _reject_reason(ast:UOp) -> str:
-  nodes = ast.toposort()
-  if any(u.op is Ops.PARAM and u.dtype is not dtypes.half for u in nodes): return "unsupported_dtype"
-  if any(u.op is Ops.REDUCE for u in nodes): return "unsupported_contraction"
-  stores = [u for u in nodes if u.op is Ops.STORE]
-  if len(stores) == 1 and stores[0].src[0].op is Ops.INDEX:
-    output_index = stores[0].src[0].src[1]
-    if output_index.op not in (Ops.RANGE, Ops.CONST) or any(u.op is Ops.INDEX and u.dtype is dtypes.half and
-      u.src[1].key != output_index.key for u in stores[0].src[1].toposort()): return "unsupported_layout"
-  return "unsupported_op"
-
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
@@ -1523,14 +1630,18 @@ class RockchipRenderer(Renderer):
   def native_program(self, ast:UOp) -> UOp|None:
     info = ProgramInfo.from_sink(ast, self.target)
     params = tuple(sorted((u for u in ast.toposort() if u.op is Ops.PARAM and u.arg.slot >= 0), key=lambda u:u.arg.slot))
-    if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
-    elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)
-    else:
-      reason = _reject_reason(ast)
-      record_telemetry("reject", lane="REJECT", program=info.name, reject_kind=reason,
+    result = lower_native(ast)
+    if result.reject is not None:
+      reject = result.reject
+      record_telemetry("reject", lane="REJECT", program=info.name, reject_kind=reject.kind.value, detail=reject.detail,
+        node_op=reject.node_op.name if reject.node_op is not None else None, fingerprint=reject.fingerprint,
+        fingerprint_digest=dict(reject.fingerprint)["graph"],
         signature=[{"slot": u.arg.slot, "dtype": u.dtype.name,
                     "shape": [x if isinstance(x, int) else str(x) for x in u.shape]} for u in params])
-      raise RuntimeError(f"RKPLAN_REJECT:{reason}")
+      raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
+    if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
+    elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
+    else: raise RuntimeError("invalid Rockchip lowering result")
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))
     return UOp(Ops.PROGRAM, src=(ast, linear, UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
                arg=info)
