@@ -64,9 +64,10 @@ TestOps selector (`DEV=ROCKCHIP`) and persistent compilation disabled
 (`CACHELEVEL=0`), `test_sum_full` passes. Static affine multi-output ADD
 reductions now enumerate their source selector matrix at compile time, copy
 the input once into an aligned NPU scratch surface, and execute sparse CMAC
-weight tiles. This completes every subcase of `test_sum`, `test_sum_tiny`, and
-`test_mean_axis`; `test_sum_simple` still has an explicit FP32 input and nested
-sums remain unsupported.
+weight tiles. Together with the global path, this completes `test_sum_simple`,
+`test_sum_full`, `test_sum_relu`, `test_sum_tiny`, `test_sum`, `test_mean`, and
+`test_mean_axis`; nested sums and explicit FP32 accumulation remain
+unsupported.
 Global `test_sum_relu` now passes through a DPU MAX-zero prepass and the direct
 K64 CMAC; the final ReLU is removed only after proving all reduced lanes are
 nonnegative. Global `test_mean` also passes: its compile-time reciprocal is
@@ -236,6 +237,39 @@ Typed rejects include the exact legality detail, offending op, and a normalized
 UOp fingerprint containing graph structure, dtype/shape families, constant
 categories, affine index maps, and reduction descriptors while omitting buffer
 slots.
+
+At `da09c1fd9`, the strict uncached census records exactly 425 methods:
+
+| Coverage outcome | Methods |
+|---|---:|
+| `PASS_NATIVE` | 90 |
+| `PASS_FRONTEND` | 40 |
+| `FAIL` | 282 |
+| `SKIP_UPSTREAM` | 13 |
+
+This is a seven-method native gain from the 83/289 baseline: `test_sum_simple`,
+`test_sum_full`, `test_sum_relu`, `test_sum_tiny`, `test_sum`, `test_mean`, and
+`test_mean_axis`. Pytest's mixed parent/subtest summary is `151 passed, 387
+failed, 13 skipped` in 498.79 seconds; it is not the method census. The run had
+no NPU timeout or reset failure. Its 256 typed reject events are:
+
+| Typed reject kind | Events |
+|---|---:|
+| `unsupported_layout` | 63 |
+| `unsupported_output_dtype` | 52 |
+| `unsupported_reduction` | 46 |
+| `requires_reformat` | 36 |
+| `unsupported_contraction` | 27 |
+| `unsupported_input_dtype` | 25 |
+| `unsupported_alu` | 7 |
+
+The largest remaining exact detail families are noncontiguous outputs (46
+methods), unsupported ADD reductions (28), contraction output reformat (20),
+and non-direct contraction epilogues (19). The durable JSON is
+`~/rk2608_backups/census-affine-reduce-da09c1fd9/test_ops_coverage.json`
+(SHA-256 `58541b3554192fd8550809bd546d2e00396489876a9893cf841acaa95cc71c09`);
+the matching JUnit XML has SHA-256
+`d44a26ac3cdf6887c3f2ca16d6cf19ea95a94d67c7743d776381152e4cd0b393`.
 
 ## Current exact method baseline
 
@@ -692,8 +726,8 @@ failures.
 |---|---:|---|
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
 | Native tiled int32/FP32 constant fills (research-only, restored) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Current (`52c6657e2`) |
-| Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_full`, `test_mean`, `test_sum_relu` | Focused only; census pending |
-| Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Focused only; census pending |
+| Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_simple`, `test_sum_full`, `test_mean`, `test_sum_relu` | Yes (`da09c1fd9`) |
+| Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Yes (`da09c1fd9`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
