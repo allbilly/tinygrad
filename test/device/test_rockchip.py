@@ -5,6 +5,13 @@ from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_global_max_hwc8_native_ppu(self):
+    for height,width in ((2,2), (4,4), (16,16)):
+      with self.subTest(shape=(height,width,8)):
+        data = np.linspace(-8, 8, height*width*8, dtype=np.float16).reshape(height,width,8)
+        actual = Tensor(data, device="ROCKCHIP").realize().max(axis=(0,1)).realize().numpy()
+        np.testing.assert_equal(actual, data.max(axis=(0,1)))
+
   def test_python_fallback_mapped_buffer_coherence(self):
     old_fallback, old_telemetry = os.environ.get("ROCKCHIP_FALLBACK"), os.environ.get("ROCKCHIP_TELEMETRY")
     os.environ["ROCKCHIP_FALLBACK"], os.environ["ROCKCHIP_TELEMETRY"] = "PYTHON", "memory"

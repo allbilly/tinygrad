@@ -19,6 +19,7 @@ class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum):
   DPU = 1
   CMAC = 2
+  PPU = 3
 class RKBufferKind(IntEnum):
   ARG = 0
   SCRATCH = 1
@@ -97,6 +98,13 @@ class RKContract:
   rhs: RKTensorRef
   reduce_axis: int
 
+@dataclass(frozen=True)
+class RKReduce:
+  out: RKTensorRef
+  src: RKTensorRef
+  op: Ops
+  reduce_axis: int
+
 def _dense_half_ref(slot:int, shape:tuple[int, ...]) -> RKTensorRef:
   stride, strides = 2, []
   for extent in reversed(shape):
@@ -128,12 +136,12 @@ class RKReject:
 
 @dataclass(frozen=True)
 class RKLowerResult:
-  plan: RKDPUProgram|RKContract|None = None
+  plan: RKDPUProgram|RKContract|RKReduce|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     if (self.plan is None) == (self.reject is None): raise ValueError("RK lowering result must contain exactly one plan or reject")
 
-def _native(plan:RKDPUProgram|RKContract) -> RKLowerResult: return RKLowerResult(plan=plan)
+def _native(plan:RKDPUProgram|RKContract|RKReduce) -> RKLowerResult: return RKLowerResult(plan=plan)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
   return RKLowerResult(reject=RKReject(kind, detail, node_op))
 
@@ -1428,14 +1436,58 @@ def lower_contract(sink:UOp) -> RKContract|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""
   return cast(RKContract|None, lower_contract_result(sink).plan)
 
+def _pool_hw_shape(extent:int) -> tuple[int, int]|None:
+  """Return a proven PPU global-pool surface: both dimensions fit its four-bit fields."""
+  return min(((height, extent//height) for height in range(2, min(16, extent)+1)
+              if extent % height == 0 and 2 <= extent//height <= 16), key=lambda shape:abs(shape[0]-shape[1]), default=None)
+
+def lower_reduce_result(sink:UOp) -> RKLowerResult:
+  """Recognize global FP16 MAX over the spatial dimensions of a dense HWC8 surface."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "PPU reduction requires one store and one reduction", Ops.REDUCE)
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) != 2:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"PPU reduction operation {reduce.arg[0].name}", reduce.op)
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU output is not an indexed parameter surface", store.src[0].op)
+  if store.src[0].dtype is not dtypes.half or reduce.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "PPU reduction requires FP16 input and output", reduce.op)
+  value, red = _strip_casts(reduce.src[0]), reduce.src[1]
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half or red.op is not Ops.RANGE:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU reduction input is not a direct FP16 surface", reduce.op)
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or src_aff is None or out_aff[1] or src_aff[1] or len(out_aff[0]) != 1:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "PPU reduction needs zero-based affine HWC8 surfaces", Ops.INDEX)
+  out_axis, red_axis = next(iter(out_aff[0])), red.arg[0]
+  channels, extent = int(store.src[0].src[0].src[0].arg), int(red.src[0].arg)
+  hw_shape = _pool_hw_shape(extent)
+  if channels != 8 or out_aff[0] != {out_axis:1} or src_aff[0] != {red_axis:8, out_axis:1}:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "PPU global MAX requires dense HWC8 indexing", Ops.INDEX)
+  if hw_shape is None:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"PPU global MAX spatial extent {extent} needs tiling or reformat", reduce.op)
+  if int(value.src[0].src[0].arg) != extent*channels:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU input buffer extent does not match HWC8 surface", Ops.INDEX)
+  height, width = hw_shape
+  out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot),
+                    RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
+  src = RKTensorRef(RKArg(RKBufferKind.ARG, value.src[0].arg.slot),
+                    RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+  return _native(RKReduce(out, src, Ops.MAX, red_axis))
+
 def lower_native(sink:UOp) -> RKLowerResult:
-  result = lower_contract_result(sink) if any(u.op is Ops.REDUCE for u in sink.toposort()) else lower_dpu_result(sink)
+  if any(u.op is Ops.REDUCE for u in sink.toposort()):
+    pool, contract = lower_reduce_result(sink), lower_contract_result(sink)
+    result = pool if pool.reject is None or contract.reject is not None and any(
+      u.op is Ops.REDUCE and u.arg[0] is Ops.MAX for u in sink.toposort()) else contract
+  else: result = lower_dpu_result(sink)
   if result.reject is None: return result
   reject = result.reject
   return RKLowerResult(reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
+_TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
 _EW_BASE = 0x108002c0
 _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8), Ops.MAX:_EW_BASE,
            Ops.SUB:_EW_BASE | (4 << 16), Ops.FDIV:_EW_BASE | (3 << 16) | (1 << 8)}
@@ -1626,6 +1678,34 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
                  for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out)))
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),))
 
+def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
+  """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""
+  if target is not RKTarget.RK3588 or plan.op is not Ops.MAX: raise ValueError("unsupported Rockchip PPU reduction")
+  height, width, channels = plan.src.layout.logical_shape
+  if channels != 8 or not 2 <= height <= 16 or not 2 <= width <= 16: raise ValueError("PPU global MAX requires 2..16 x 2..16 x 8")
+  h, w, c = height-1, width-1, channels-1
+  regs = (
+    (_TARGET_PPU, rk.REG_PPU_S_POINTER, 0xe), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_S_POINTER, 0xe),
+    (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_WIDTH, w), (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_HEIGHT, h),
+    (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_CHANNEL, c), (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_CHANNEL, c),
+    (_TARGET_PPU, rk.REG_PPU_OPERATION_MODE_CFG, 0x11),
+    (_TARGET_PPU, rk.REG_PPU_POOLING_KERNEL_CFG, (h<<20)|(w<<16)|(h<<8)|w),
+    (_TARGET_PPU, rk.REG_PPU_DST_SURF_STRIDE, 1), (_TARGET_PPU, rk.REG_PPU_DATA_FORMAT, 0x10002),
+    (_TARGET_PPU, rk.REG_PPU_MISC_CTRL, 3), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_WIDTH, w),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_HEIGHT, h), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_CHANNEL, c),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_SRC_LINE_STRIDE, plan.src.layout.strides_bytes[0]),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_SRC_SURF_STRIDE, height*plan.src.layout.strides_bytes[0]),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_DATA_FORMAT, 2), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_OPERATION_ENABLE, 1))
+  commands = [_command(*x) for x in regs]
+  dst_word = len(commands)
+  commands.append(_command(_TARGET_PPU, rk.REG_PPU_DST_BASE_ADDR, 0))
+  src_word = len(commands)
+  commands.append(_command(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_SRC_BASE_ADDR, 0))
+  commands.append(_command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x60))
+  relocs = (RKReloc(0, dst_word, plan.out.buffer.kind, plan.out.buffer.index, plan.out.buffer.addend+plan.out.layout.base_offset),
+            RKReloc(0, src_word, plan.src.buffer.kind, plan.src.buffer.index, plan.src.buffer.addend+plan.src.layout.base_offset))
+  return RKImage(target, (RKStage(RKEngine.PPU, tuple(commands), relocs, RK_STAGE_RESET),))
+
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
@@ -1649,6 +1729,7 @@ class RockchipRenderer(Renderer):
       raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
+    elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))
     return UOp(Ops.PROGRAM, src=(ast, linear, UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),

@@ -4,8 +4,9 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKRejectKind, RKLUTStage, RKMaskStage,
-  RockchipRenderer, decode_image, emit_contract, emit_dpu, encode_image, lower_contract, lower_dpu, lower_native, rk_fingerprint)
+from tinygrad.renderer.rockchip import (RKALUStage, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKReduce, RKRejectKind, RKLUTStage,
+  RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_reduce, encode_image, lower_contract, lower_dpu, lower_native,
+  lower_reduce_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -29,6 +30,14 @@ def contains_uop(obj) -> bool:
   return False
 
 class TestDPUCompiler(unittest.TestCase):
+  def test_global_max_hwc8_uses_typed_ppu_reduction(self):
+    plan = lower_reduce_result(sink(Tensor.empty(4,4,8,dtype=dtypes.half).max(axis=(0,1)))).plan
+    self.assertIsInstance(plan, RKReduce)
+    self.assertEqual((plan.op, plan.src.layout.logical_shape, plan.out.layout.logical_shape), (Ops.MAX, (4,4,8), (1,1,8)))
+    image = emit_reduce(plan)
+    self.assertEqual(image.stages[0].engine, RKEngine.PPU)
+    self.assertEqual(tuple((reloc.word, reloc.index) for reloc in image.stages[0].relocs), ((18,0), (19,1)))
+
   def test_add_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
     plan = lower_dpu(sink(a+b))

@@ -22,6 +22,15 @@ with SHA-256 `a1142aa6bb21b0e1e534ebd0044567a2e1a7089f05e2a28afd11757988950333`.
 This confirms that reductions require a native physical reformat/layout stage
 or a directly legal PPU surface; relocation offsets are not a valid gather.
 
+The first directly legal reduction surface is now proven without host packing:
+a dense FP16 HWC8 tensor with 4–256 spatial positions lowers to one typed
+`RKReduce`, then one PPU global-MAX task. Hardware boundary tests cover
+2x2x8, 4x4x8, and 16x16x8 with `ROCKCHIP_FALLBACK=0`. Input and output are
+ordinary mapped Rockchip GEM buffers; no NumPy runner, gather, reformat, or
+fallback lane participates. The PPU task descriptor uses the independently
+verified `(op_idx=1, enable_mask=0x60, int_mask=0xc00)` contract. Shapes that
+are not already dense HWC8 still reject until a native reformat stage exists.
+
 Run the census serially on RK3588:
 
 ```sh
