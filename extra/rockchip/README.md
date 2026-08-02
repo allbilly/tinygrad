@@ -44,13 +44,15 @@ are eligible to be ported as native capabilities.
   trigonometric, and inverse-hyperbolic LUT assets with declared domains;
 - direct FP16 CMAC for `M=1`, `K=32`, and `4 <= N <= 16` when the right-hand
   input is already stored as `(N, 32)`;
+- direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
+  vector and the same CMAC contract;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
 Native arithmetic is FP16. Int32 and FP32 are currently admitted only for
 operation-specific constant fills; this does not claim general arithmetic for
 either dtype. User-visible bool outputs, noncontiguous elementwise layouts,
-general contractions, fused CMAC epilogues, convolution, pooling, and gradients
+general reductions and contractions, fused CMAC epilogues, convolution, pooling, and gradients
 remain outside the native contract. A fused CMAC epilogue is rejected rather
 than silently dropped.
 

@@ -5,6 +5,11 @@ from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_dense_fp16_row_sum_native_cmac(self):
+    data = np.linspace(-2, 2, 8*32, dtype=np.float16).reshape(8,32)
+    actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
+    np.testing.assert_equal(actual, data.astype(np.float32).sum(axis=1).astype(np.float16))
+
   def test_global_max_hwc8_native_ppu(self):
     for height,width in ((2,2), (4,4), (16,16)):
       with self.subTest(shape=(height,width,8)):

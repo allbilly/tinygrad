@@ -33,6 +33,13 @@ fallback lane participates. The PPU task descriptor uses the independently
 verified `(op_idx=1, enable_mask=0x60, int_mask=0xc00)` contract. Shapes that
 are not already dense HWC8 still reject until a native reformat stage exists.
 
+Dense FP16 row sums with 4–16 rows and exactly 32 values per row now lower to
+the existing typed `RKContract`. The image embeds one 64-byte FP16 ones vector
+as an immutable constant, while the user input remains a directly addressed
+`(N,32)` GEM surface. A strict 8x32 RK3588 test matches FP32 accumulation
+rounded to FP16. Neither compilation nor execution performs host packing or
+host arithmetic; unsupported row widths continue to reject.
+
 The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,
 coalesces adjacent aligned atoms, and emits ordinary DPU ADD-zero copy tasks;

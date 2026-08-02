@@ -521,6 +521,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsNone(lower_contract(sink(a@Tensor.empty(32,8,dtype=dtypes.half))))
     self.assertIsNone(lower_contract(sink((a@packed_b.T).sigmoid())))
 
+  def test_row_sum_is_constant_backed_contract(self):
+    plan = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
+    self.assertIsInstance(plan, RKContract)
+    self.assertFalse(contains_uop(plan))
+    self.assertIs(plan.lhs.buffer.kind, RKBufferKind.CONSTANT)
+    self.assertEqual(plan.rhs.layout.logical_shape, (8,32))
+    image = emit_contract(plan)
+    self.assertEqual(len(image.constants), 64)
+    self.assertIs(image.stages[0].relocs[0].kind, RKBufferKind.CONSTANT)
+    self.assertEqual(decode_image(encode_image(image)), image)
+
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(a.maximum(b)))

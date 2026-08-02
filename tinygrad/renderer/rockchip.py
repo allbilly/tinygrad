@@ -106,12 +106,12 @@ class RKReduce:
   op: Ops
   reduce_axis: int
 
-def _dense_half_ref(slot:int, shape:tuple[int, ...]) -> RKTensorRef:
+def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
   for extent in reversed(shape):
     strides.append(stride)
     stride *= extent
-  return RKTensorRef(RKArg(RKBufferKind.ARG, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtypes.half))
+  return RKTensorRef(RKArg(kind, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtypes.half))
 
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
@@ -1628,7 +1628,7 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   return _native(RKDPUProgram(tuple(stages)))
 
 def lower_contract_result(sink:UOp) -> RKLowerResult:
-  """Recognize the directly legal M=1, K=32 FP16 CMAC surface."""
+  """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, f"expected one store, found {len(stores)}", Ops.STORE)
   if len(reductions) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"expected one reduction, found {len(reductions)}", Ops.REDUCE)
@@ -1644,6 +1644,21 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
   out_param, out_aff = store.src[0].src[0], _affine(store.src[0].src[1])
   if out_param.op is not Ops.PARAM or out_aff is None or out_aff[1] or len(out_aff[0]) != 1:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "contraction output map is not direct affine", store.src[0].op)
+  if body.op is Ops.INDEX:
+    inp_aff = _affine(body.src[1])
+    out_axis, red_axis, n = next(iter(out_aff[0])), red.arg[0], int(out_param.src[0].arg)
+    if body.src[0].op is not Ops.PARAM or body.dtype is not dtypes.half:
+      return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, "CMAC row-sum input must be half", body.op)
+    if red.op is not Ops.RANGE or int(red.src[0].arg) != 32:
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "direct CMAC row sum requires K=32", red.op)
+    if not 4 <= n <= 16:
+      return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, f"direct CMAC row sum requires 4<=N<=16, got {n}", red.op)
+    if out_aff[0] != {out_axis:1} or inp_aff != ({out_axis:32, red_axis:1}, 0):
+      return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "CMAC row sum requires dense N-by-32 input", body.op)
+    if int(body.src[0].src[0].arg) != n*32:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "CMAC row-sum input extent does not match N-by-32 surface", body.op)
+    return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(0, (1,32), RKBufferKind.CONSTANT),
+                              _dense_half_ref(body.src[0].arg.slot, (n,32)), red_axis))
   if body.op is not Ops.MUL: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "reduction body is not multiply", body.op)
   if red.op is not Ops.RANGE: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "reduction axis is not a range", red.op)
   if int(red.src[0].arg) != 32:
@@ -1923,7 +1938,8 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
   relocs = tuple(RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
                  for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out)))
-  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),))
+  constants = struct.pack("<e", 1.0)*32 if plan.lhs.buffer.kind is RKBufferKind.CONSTANT else b""
+  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),), constants=constants)
 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""
