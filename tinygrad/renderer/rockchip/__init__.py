@@ -11,12 +11,13 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKArg,
-  RKALUStage, RKMaskStage, RKLUTStage, RKDPUStage,
+  RKALUStage, RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKContract, RKReduce, RKProgram, RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
   patch_image as patch_image, validate_image as validate_image)
 from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint as rk_fingerprint
+from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 
 def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
@@ -102,37 +103,9 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
                                      store.src[0].dtype) for start in range(0, count, tile))
       return _native(RKDPUProgram(fill_stages))
     return _native(RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),)))
-  order:list[_Expr] = []
-  def visit(expr:_Expr) -> None:
-    for src in expr.src:
-      if isinstance(src, (_ALUExpr, _MaskExpr, _LUTExpr)) and src not in order: visit(src)
-    if expr not in order: order.append(expr)
-  visit(root)
-  uses = {expr:sum(src == expr for node in order for src in node.src) for expr in order}
-  values:dict[_Expr, RKArg] = {}
-  free:list[int] = []
-  scratch_count, stages = 0, cast(list[RKDPUStage], [])
-  for expr in order:
-    src = tuple(values[x] if isinstance(x, (_ALUExpr, _MaskExpr, _LUTExpr)) else x for x in expr.src)
-    if expr is root: dst = output
-    elif isinstance(expr, _ALUExpr) and (reuse:=next((values[x] for x in expr.src if isinstance(x, (_ALUExpr, _MaskExpr, _LUTExpr)) and
-                                                     uses[x] == 1 and values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
-    else:
-      slot = free.pop() if free else scratch_count
-      if slot == scratch_count: scratch_count += 1
-      dst = RKArg(RKBufferKind.SCRATCH, slot)
-    if isinstance(expr, _ALUExpr): stages.append(RKALUStage(expr.op, dst, src[0], src[1], count))
-    elif isinstance(expr, _LUTExpr) and isinstance(src[0], RKArg): stages.append(RKLUTStage(expr.lut, dst, src[0], count))
-    elif isinstance(src[0], RKArg): stages.append(RKMaskStage(dst, src[0], count))
-    else: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "stage source is not materializable")
-    values[expr] = dst
-    for source in expr.src:
-      if isinstance(source, (_ALUExpr, _MaskExpr, _LUTExpr)):
-        uses[source] -= 1
-        arg = values[source]
-        if uses[source] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
-  size = ((count+7)//8)*16
-  return _native(RKDPUProgram(tuple(stages), tuple(RKScratch(size) for _ in range(scratch_count))))
+  if (program:=_schedule_expr(root, output, count)) is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "stage source is not materializable")
+  return _native(program)
 
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_dpu_result`."""
@@ -263,38 +236,13 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
       _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0,
       _cmac_selection_payload([[index] for index in mapping[start:start+16]], align_in, 32, 1.0)))
 
-  order:list[_Expr] = []
-  def visit(expr:_Expr) -> None:
-    for src in expr.src:
-      if isinstance(src, (_ALUExpr, _MaskExpr, _LUTExpr)) and src not in order: visit(src)
-    if expr not in order: order.append(expr)
-  visit(root)
-  uses = {expr:sum(src == expr for node in order for src in node.src) for expr in order}
-  values:dict[_Expr, RKArg] = {}
-  free:list[int] = []
-  stages:list[RKDPUStage] = []
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
-  for expr in order:
-    stage_src = tuple(values[x] if isinstance(x, (_ALUExpr, _MaskExpr, _LUTExpr)) else x for x in expr.src)
-    if expr is root: dst = output
-    else:
-      slot = free.pop() if free else len(scratch)
-      if slot == len(scratch): scratch.append(RKScratch(((count+7)//8)*16))
-      dst = RKArg(RKBufferKind.SCRATCH, slot)
-    if isinstance(expr, _ALUExpr): stages.append(RKALUStage(expr.op, dst, stage_src[0], stage_src[1], count))
-    elif isinstance(expr, _LUTExpr) and isinstance(stage_src[0], RKArg): stages.append(RKLUTStage(expr.lut, dst, stage_src[0], count))
-    elif isinstance(stage_src[0], RKArg): stages.append(RKMaskStage(dst, stage_src[0], count))
-    else: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast stage source is not materializable", stored.op)
-    values[expr] = dst
-    for source in expr.src:
-      if isinstance(source, (_ALUExpr, _MaskExpr, _LUTExpr)):
-        uses[source] -= 1
-        arg = values[source]
-        if uses[source] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
-  scratch_tuple = tuple(scratch)
+  if (scheduled:=_schedule_expr(root, output, count, tuple(scratch))) is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast stage source is not materializable", stored.op)
+  scratch_tuple = scheduled.scratch
   prepare = RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
                           RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot), 0.0, src_count)), scratch_tuple)
-  return _native(RKProgram((prepare, *contracts, RKDPUProgram(tuple(stages), scratch_tuple)), scratch_tuple))
+  return _native(RKProgram((prepare, *contracts, scheduled), scratch_tuple))
 
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""

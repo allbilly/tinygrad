@@ -939,3 +939,12 @@ The DPU MAX operation is not yet claimed IEEE-exact for all NaN operand
 orders. Hardware testing showed that finite extrema are correct and FP16
 absolute value preserves the expected infinity, signed-zero, and NaN results;
 special-value MAX behavior remains outside this milestone.
+
+The canonical DPU expression scheduler is now shared by contiguous and affine-
+broadcast lowering. Topological ordering, use counts, scratch liveness, and
+in-place reuse live behind one typed, UOp-free scheduling boundary rather than
+two lowering-specific copies. This refactor removes 17 counted lines (27,473
+total; 2,340 in the Rockchip renderer/compiler), with no coverage claim or
+semantic change. Ruff, mypy, all 68 host compiler/image/telemetry tests, and
+the strict RK3588 suite (49 tests plus 31 subtests) pass; the hardware suite
+completed in 372.01 seconds with `ROCKCHIP_FALLBACK=0`.
