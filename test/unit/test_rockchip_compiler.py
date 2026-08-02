@@ -648,6 +648,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual([stage.engine for stage in emit_program(first).stages], [RKEngine.DPU]*2+[RKEngine.CMAC]*4)
     self.assertEqual(decode_image(encode_image(emit_program(first))), emit_program(first))
 
+  def test_affine_reduction_materializes_pointwise_dpu_expression(self):
+    x, y = Tensor.empty(3,4,5,dtype=dtypes.half), Tensor.empty(3,4,5,dtype=dtypes.half)
+    plan = lower_affine_reduce_result(sink(((x+y)*x).sum(axis=1))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    engines = [stage.engine for stage in emit_program(plan).stages]
+    self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC)), (4,1))
+    self.assertFalse(contains_uop(plan))
+
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(a.maximum(b)))

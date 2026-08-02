@@ -45,12 +45,14 @@ def _cmac_selection_payload(rows:list[list[int]], align_in:int, align_out:int, s
       values[packed] += scale
   return b"".join(struct.pack("<e", value) for value in values)
 
-def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]], scale:float=1.0) -> RKProgram:
+def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]], scale:float=1.0,
+                          scratch:tuple[RKScratch, ...]=()) -> RKProgram:
   """Materialize one static selector matrix as sequential, proven-width CMAC tasks."""
   align_in = max(32, (input_count+31)&-32)
-  packed = RKArg(RKBufferKind.SCRATCH, 0)
+  packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch += (RKScratch(align_in*2),)
   dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
-                      RKALUStage(Ops.ADD, packed, source, 0.0, input_count)), (RKScratch(align_in*2),))
+                      RKALUStage(Ops.ADD, packed, source, 0.0, input_count)), scratch)
   lhs_layout = RKLayout((1,input_count), (1,align_in), (align_in*2,2), dtypes.half,
                         padding=((0,0),(0,align_in-input_count)))
   contracts:list[RKContract] = []
@@ -60,7 +62,7 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
     contracts.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
       RKTensorRef(packed, lhs_layout), _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), 0,
       _cmac_selection_payload(rows[start:start+count], align_in, 32, scale)))
-  return RKProgram((dpu, *contracts), dpu.scratch)
+  return RKProgram((dpu, *contracts), scratch)
 
 def _native(plan:RKDPUProgram|RKContract|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
@@ -355,20 +357,32 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
     if const.op is not Ops.CONST or _strip_casts(reduced).key != reduce.key:
       return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC scale is not direct", stored.op)
     scale = float(const.arg)
-  value = _strip_casts(reduce.src[0])
-  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
-    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC input is not one FP16 surface", reduce.op)
-  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  value, prepare = _strip_casts(reduce.src[0]), None
+  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if value.op is Ops.INDEX and value.src[0].op is Ops.PARAM and value.dtype is dtypes.half:
+    value_index, source = value, RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  elif indexes and all(u.dtype is dtypes.half for u in indexes) and len({u.src[1].key for u in indexes}) == 1 and \
+       len({int(u.src[0].src[0].arg) for u in indexes}) == 1:
+    value_index = indexes[0]
+    root = _parse_alu(value, value_index.src[1], {})
+    if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
+      return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "affine reduction expression is not legal DPU arithmetic", value.op)
+    input_count = int(value_index.src[0].src[0].arg)
+    source = RKArg(RKBufferKind.SCRATCH, 0)
+    prepare = _schedule_expr(root, source, input_count, (RKScratch(((input_count+7)//8)*16),))
+    if prepare is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "affine reduction expression is not materializable", value.op)
+  else: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC input is not one FP16 pointwise surface", reduce.op)
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value_index.src[1])
   if out_aff is None or src_aff is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC indexes are not affine", Ops.INDEX)
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
   out_axes = tuple(sorted(out_aff[0]))
-  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
-  if len(red_axes) != len(reduce.src)-1 or not out_axes or set(out_axes) & set(red_axes) or \
+  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value_index.src[0].src[0].arg)
+  if len(red_axes) != len(reduce.src)-1 or set(out_axes) & set(red_axes) or \
      set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine CMAC axes do not form one static output/reduction partition", Ops.RANGE)
-  if not 2 <= output_count <= 128 or not 2 <= input_count <= 512:
+  if not 1 <= output_count <= 128 or not 2 <= input_count <= 512:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine CMAC surface is {output_count}x{input_count}", reduce.op)
   selectors:list[list[int]] = [[] for _ in range(output_count)]
   seen:set[int] = set()
@@ -386,8 +400,10 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
-  return _native(_sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot),
-    RKArg(RKBufferKind.ARG, value.src[0].arg.slot), input_count, selectors, scale))
+  program = _sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), source, input_count, selectors, scale,
+                                  () if prepare is None else prepare.scratch)
+  if prepare is not None: program = RKProgram((RKDPUProgram(prepare.stages, program.scratch), *program.steps), program.scratch)
+  return _native(program)
 
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""

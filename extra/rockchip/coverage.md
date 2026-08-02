@@ -948,3 +948,17 @@ total; 2,340 in the Rockchip renderer/compiler), with no coverage claim or
 semantic change. Ruff, mypy, all 68 host compiler/image/telemetry tests, and
 the strict RK3588 suite (49 tests plus 31 subtests) pass; the hardware suite
 completed in 372.01 seconds with `ROCKCHIP_FALLBACK=0`.
+
+Static pointwise FP16 expressions can now feed affine ADD reductions without a
+host materialization. The shared DPU scheduler writes the expression to NPU
+scratch, and the existing cost-bounded sparse CMAC selector reduces that
+surface, including scalar outputs. Every input must have the same proven
+affine map and extent; convolution's differently indexed operands therefore
+continue to reject for the contraction lowerer. The complete four-subcase
+`test_binary_crossentropy` method passes natively at its unchanged tolerance.
+The `reduction="none"` BCE form still fails its existing LUT accuracy contract,
+and positional weights still require a separate broadcast capability; neither
+was hidden with a tolerance or fallback. Ruff, mypy, all 69 host tests, and the
+strict RK3588 suite (50 tests plus 31 subtests) pass, the latter in 372.76
+seconds. This capability adds 16 counted compiler lines (27,489 total; 2,356
+in the Rockchip renderer/compiler) before the next full census.

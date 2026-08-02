@@ -54,6 +54,15 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(tiny, device="ROCKCHIP").realize().sum(axis=(0,2)).realize().numpy()
     np.testing.assert_allclose(actual, tiny.astype(np.float32).sum(axis=(0,2)).astype(np.float16), rtol=1e-3, atol=1e-6)
 
+  def test_pointwise_fp16_expression_before_affine_reduction(self):
+    rng = np.random.default_rng(17)
+    x = rng.uniform(-1, 1, (3,4,5)).astype(np.float16)
+    y = rng.uniform(-1, 1, (3,4,5)).astype(np.float16)
+    tx, ty = Tensor(x, device="ROCKCHIP").realize(), Tensor(y, device="ROCKCHIP").realize()
+    actual = ((tx+ty)*tx).sum(axis=1).realize().numpy()
+    expected = ((x+y)*x).astype(np.float32).sum(axis=1).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_global_max_hwc8_native_ppu(self):
     for height,width in ((2,2), (4,4), (16,16)):
       with self.subTest(shape=(height,width,8)):

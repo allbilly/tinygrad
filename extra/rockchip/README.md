@@ -143,8 +143,8 @@ regressed. `test_broadcast_simple`, `test_broadcasted_add`, and
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,473, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,473 lines.
-The exact 2,505-line delta is 2,500 counted Rockchip backend lines (2,340
+contains 27,489, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,489 lines.
+The exact 2,521-line delta is 2,516 counted Rockchip backend lines (2,356
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
