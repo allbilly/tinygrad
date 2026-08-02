@@ -471,6 +471,17 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
             RKReloc(0, 31, RKBufferKind.ARG, plan.out.slot))
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, (plan.lhs.slot,plan.rhs.slot), (plan.out.slot,), flags=RK_STAGE_RESET),))
 
+def _reject_reason(ast:UOp) -> str:
+  nodes = ast.toposort()
+  if any(u.op is Ops.PARAM and u.dtype is not dtypes.half for u in nodes): return "unsupported_dtype"
+  if any(u.op is Ops.REDUCE for u in nodes): return "unsupported_contraction"
+  stores = [u for u in nodes if u.op is Ops.STORE]
+  if len(stores) == 1 and stores[0].src[0].op is Ops.INDEX:
+    output_index = stores[0].src[0].src[1]
+    if output_index.op not in (Ops.RANGE, Ops.CONST) or any(u.op is Ops.INDEX and u.dtype is dtypes.half and
+      u.src[1].key != output_index.key for u in stores[0].src[1].toposort()): return "unsupported_layout"
+  return "unsupported_op"
+
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
@@ -478,6 +489,6 @@ class RockchipRenderer(Renderer):
   def native_program(self, ast:UOp) -> UOp|None:
     if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
     elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)
-    else: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+    else: raise RuntimeError(f"RKPLAN_REJECT:{_reject_reason(ast)}")
     return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR), UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
                arg=ProgramInfo.from_sink(ast, self.target))

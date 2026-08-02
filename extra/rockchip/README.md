@@ -20,7 +20,8 @@ post-early_simplify UOps
 
 The runtime does not import NumPy, narrow FP32 buffers, execute tensor
 semantics on the host, or provide a CPU fallback. Unsupported graphs reject
-before submission with `RKPLAN_REJECT:unsupported_graph`.
+before submission with a classified `RKPLAN_REJECT:unsupported_dtype`,
+`unsupported_layout`, `unsupported_contraction`, or `unsupported_op` reason.
 
 RKImage v2 uses 64-bit dependency masks and 32-bit constant relocation
 offsets. Its encoder validates serialized field bounds so oversized or

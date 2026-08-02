@@ -107,4 +107,13 @@ class TestDPUCompiler(unittest.TestCase):
     x, y = Tensor.empty(16,dtype=dtypes.float), Tensor.empty(16,dtype=dtypes.float)
     self.assertIsNone(lower_dpu(sink(x+y)))
 
+  def test_renderer_classifies_rejections(self):
+    renderer = RockchipRenderer(Target("ROCKCHIP"))
+    cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_dtype"),
+             (Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half), "unsupported_layout"),
+             (Tensor.empty(8,8,dtype=dtypes.half)@Tensor.empty(8,8,dtype=dtypes.half), "unsupported_contraction"),
+             (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_op"))
+    for expression, reason in cases:
+      with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
+
 if __name__ == "__main__": unittest.main()
