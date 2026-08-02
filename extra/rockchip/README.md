@@ -1,8 +1,8 @@
 # RK3588 fixed-function NPU backend
 
-This is the active coverage/research branch. It first targets a clean complete
-forward `test_ops.py` inventory with native and generic fallback coverage kept
-explicit, then replaces fallback families with reusable hardware capabilities.
+This is the active coverage/research branch. It targets the complete forward
+`test_ops.py` inventory through RK3588 engine tasks, with frontend-only methods
+reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
@@ -23,9 +23,17 @@ post-early_simplify UOps
 The native runtime does not import NumPy, narrow FP32 buffers, or execute tensor
 semantics on the host. Native lowering returns a typed plan or a typed reject
 at the legality decision, including detail, offending op, and a normalized
-slot-independent graph fingerprint. `ROCKCHIP_FALLBACK=0` remains the strict
-native-only mode. The planned hybrid mode will use one isolated generic UOps
-fallback rather than a catalog of named host operations.
+slot-independent graph fingerprint. `ROCKCHIP_FALLBACK=0` is the authoritative
+mode for coverage and development. The explicit `RKPY` experiment is retained
+only as a historical/debugging reference: it executes generic UOps on the CPU
+and must never contribute to Rockchip pass totals.
+
+The frozen `rockchip-2607` branch is a behavioral and register oracle, not
+evidence that all of its 425 passing methods ran on the NPU. Its later runtime
+contains NumPy-backed `_run_host_*` implementations for generic elementwise and
+reductions, variance, interpolation, losses, tangent, and large einsum. Only
+paths that reach `DRM_IOCTL_RKNPU_SUBMIT` without host semantic preprocessing
+are eligible to be ported as native capabilities.
 
 ## Declared contract
 

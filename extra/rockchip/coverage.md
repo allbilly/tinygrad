@@ -4,6 +4,24 @@ The completion target is every non-skipped forward case in the 425-method
 `test/backend/test_ops.py` inventory. Focused tests are recorded as milestone
 evidence but do not replace a complete uncached census.
 
+All authoritative runs use `ROCKCHIP_FALLBACK=0`. The optional `RKPY` research
+envelope invokes tinygrad's Python UOps emulator over mapped GEM buffers and is
+therefore CPU semantic execution; it is excluded from pass counts. Likewise,
+the 425-green `rockchip-2607` result cannot be treated as all-NPU proof because
+that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
+
+RKImage v3 removed the unused dependency/read/write masks and the artificial
+64-stage limit. The runtime already executes stages serially, so the image now
+encodes that actual contract directly. A subsequent contiguous FP16 global-MAX
+tree was rejected after hardware characterization: DPU source addresses are
+effectively 16-byte atom aligned, so sub-atom relocation addends are ignored.
+An extent sweep passed only 9/17/33/65 by accidentally copying an aligned odd
+tail; 2/3/4/5/7/8/15/16/31/32/63/64/127/128/135 were wrong. The exact failed
+experiment is archived as `0058-WIP-global-max-DPU-tree-unaligned-atom-failure.patch`
+with SHA-256 `a1142aa6bb21b0e1e534ebd0044567a2e1a7089f05e2a28afd11757988950333`.
+This confirms that reductions require a native physical reformat/layout stage
+or a directly legal PPU surface; relocation offsets are not a valid gather.
+
 Run the census serially on RK3588:
 
 ```sh
