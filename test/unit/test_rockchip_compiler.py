@@ -751,6 +751,20 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertTrue(any(isinstance(step, RKContract) and step.lhs.buffer.kind is RKBufferKind.ARG for step in plan.steps))
       self.assertFalse(contains_uop(plan))
 
+  def test_multi_broadcast_and_tiled_m_contractions_stay_native(self):
+    pointwise = lower_native(sink(Tensor.empty(1,1,11,dtype=dtypes.half).conv2d(Tensor.empty(6,1,1,dtype=dtypes.half)))).plan
+    tiled = lower_tiled_contract_result(sink(Tensor.empty(8,3,11,dtype=dtypes.half).conv2d(
+      Tensor.empty(6,1,5,dtype=dtypes.half),groups=3))).plan
+    for plan in (pointwise,tiled):
+      self.assertIsInstance(plan, RKProgram)
+      assert isinstance(plan, RKProgram)
+      image = emit_program(plan)
+      self.assertLessEqual(len(image.stages), 400)
+      self.assertLessEqual(len(image.constants), 2*1024*1024)
+      self.assertFalse(contains_uop(plan))
+    assert isinstance(tiled, RKProgram)
+    self.assertGreaterEqual(sum(isinstance(step, RKContract) and not step.constants for step in tiled.steps), 2)
+
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x.conv2d(weight, padding=(0,1)))).plan
@@ -848,7 +862,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_renderer_classifies_rejections(self):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
-             (Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half).T, "unsupported_layout"),
+               (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
              (Tensor.empty(17,17,dtype=dtypes.half)@Tensor.empty(17,17,dtype=dtypes.half), "plan_stage_limit"),
              (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
     for expression, reason in cases:
@@ -859,7 +873,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((result.kind, result.plan, result.reject), (RKLowerKind.NOT_APPLICABLE, None, None))
 
   def test_typed_reject_has_stable_slot_independent_fingerprint(self):
-    expressions = [Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half).T for _ in range(2)]
+    expressions = [Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)) for _ in range(2)]
     sinks = [sink(expression) for expression in expressions]
     results = [lower_native(graph) for graph in sinks]
     self.assertTrue(all(result.plan is None and result.reject is not None for result in results))

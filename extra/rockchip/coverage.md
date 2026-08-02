@@ -1337,3 +1337,22 @@ inferred native total is 134 after the current 128-pass census. The research
 tree now has 27,877 counted lines, including 2,744 in the Rockchip
 renderer/compiler. The pre-change compiler and tests are preserved under
 `~/rk2608_backups/direct-cmac-windows-before-880171ff4-20260803-020414`.
+
+Affine contraction compute now tiles M into ordered tasks satisfying
+`tile_M*aligned_K<=4096`; packed A and physical Mx64 output scratch remain one
+typed program resource. Separately, pointwise graphs with two or more static
+affine FP16 broadcasts materialize each surface through the generic selector
+planner and then schedule the ordinary DPU expression. This covers the K=1
+form where early simplification removes the reduction, without a convolution
+recognizer or host work.
+
+The formerly rejected grouped M168/K5/N6 plan uses two compute tiles and totals
+260 stages/625,328 constant bytes. K=1/cin=1 batch-1 and batch-8 plans use 15
+and 71 stages. Together these complete all 14 `test_conv1d` subtests natively
+in 180.73 seconds at unchanged tolerance. All 84 host tests, Ruff, and mypy
+pass, as does the strict hardware suite (65 tests plus 44 subtests) in 616.00
+seconds with `ROCKCHIP_FALLBACK=0`. The inferred native total is 135 after the
+current 128-pass census. The research tree now has 27,932 counted lines,
+including 2,799 in the Rockchip renderer/compiler. The pre-change compiler and
+tests are preserved under
+`~/rk2608_backups/tiled-cmac-m-before-04b9585b3-20260803-022155`.

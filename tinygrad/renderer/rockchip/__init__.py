@@ -438,6 +438,59 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   scratch_tuple = scheduled.scratch
   return _native(_finish_program([*steps, scheduled], scratch_tuple))
 
+def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
+  """Materialize multiple static affine FP16 broadcasts, then schedule one generic DPU expression."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return _not_applicable()
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  output_index, stored = store.src[0].src[1], _strip_casts(store.src[1])
+  out_aff = _affine(output_index)
+  if out_aff is None: return _not_applicable()
+  broadcasts = list(dict.fromkeys(u for u in stored.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and
+                                  u.src[1].key != output_index.key))
+  if len(broadcasts) < 2 or any(u.dtype is not dtypes.half for u in broadcasts): return _not_applicable()
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  axes, count = tuple(sorted(out_aff[0])), int(store.src[0].src[0].src[0].arg)
+  if not axes or any(axis not in ranges for axis in axes) or not 0 < count <= 4096:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"multi-broadcast output has {count} elements", Ops.RANGE)
+  substitutions:dict[UOp,UOp] = {}
+  remaps:dict[RKArg,RKArg] = {}
+  scratch:tuple[RKScratch, ...] = ()
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  for source_index in broadcasts:
+    src_count = int(source_index.src[0].src[0].arg)
+    mapping = [-1]*count
+    for coordinates in product(*(range(ranges[axis]) for axis in axes)):
+      point = dict(zip(axes, coordinates))
+      dst, src = (_static_scalar(index, point) for index in (output_index,source_index.src[1]))
+      if not isinstance(dst, int) or isinstance(dst, bool) or not 0 <= dst < count or mapping[dst] != -1 or \
+         not isinstance(src, int) or isinstance(src, bool) or not 0 <= src < src_count:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-broadcast does not cover one dense output", Ops.INDEX)
+      mapping[dst] = src
+    expanded = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(count)),)
+    packed = _selector_program(expanded, RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot), src_count,
+                               [[source] for source in mapping], scratch)
+    if packed is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "multi-broadcast selector exceeds plan limits", Ops.INDEX)
+    steps.extend(packed.steps)
+    scratch = packed.scratch
+    substitutions[source_index] = source_index.replace(src=(source_index.src[0], output_index))
+    remaps[RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)] = expanded
+  root = _parse_alu(stored.substitute(substitutions), output_index, {})
+  def remap(value:_Value) -> _Value:
+    if isinstance(value, RKArg): return remaps.get(value, value)
+    if isinstance(value, _ALUExpr): return _ALUExpr(value.op, (remap(value.src[0]), remap(value.src[1])))
+    if isinstance(value, _MaskExpr): return _MaskExpr((cast(_Expr|RKArg, remap(value.src[0])),))
+    if isinstance(value, _LUTExpr): return _LUTExpr(value.lut, (cast(_Expr|RKArg, remap(value.src[0])),))
+    return value
+  if not isinstance(root, (_ALUExpr,_MaskExpr,_LUTExpr)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "multi-broadcast expression is not legal DPU arithmetic", stored.op)
+  scheduled = _schedule_expr(cast(_Expr, remap(root)), RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), count, scratch)
+  return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "multi-broadcast expression is not materializable", stored.op) if scheduled is None else \
+    _native(_finish_program([*steps,scheduled], scheduled.scratch))
+
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -715,7 +768,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
   m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)): return _not_applicable()
-  if not 1 <= m <= 128 or not 1 <= n <= 16 or m*align_in > 4096:
+  if not 1 <= m <= 512 or not 1 <= n <= 16:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
                 [[] for _ in range(align_in-k)])]
@@ -742,11 +795,14 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   scratch = packed_b.scratch
   cmac_out = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(m*128),)
-  lhs_layout = RKLayout((m,k), (m,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-k)))
   rhs_layout = RKLayout((n,k), (32,align_in), (align_in*2,2), dtypes.half,
                         padding=((0,32-n),(0,align_in-k)), kind=RKLayoutKind.CMAC_WEIGHT)
-  out_layout = RKLayout((m,n), (m,64), (128,2), dtypes.half, padding=((0,0),(0,64-n)))
-  steps.append(RKContract(RKTensorRef(cmac_out, out_layout), RKTensorRef(a_arg, lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0]))
+  for row_start in range(0, m, 4096//align_in):
+    tile_m = min(4096//align_in, m-row_start)
+    lhs_layout = RKLayout((tile_m,k), (tile_m,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-k)))
+    out_layout = RKLayout((tile_m,n), (tile_m,64), (128,2), dtypes.half, padding=((0,0),(0,64-n)))
+    steps.append(RKContract(RKTensorRef(RKArg(cmac_out.kind, cmac_out.index, row_start*128), out_layout),
+      RKTensorRef(RKArg(a_arg.kind, a_arg.index, row_start*align_in*2), lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0]))
   unpack:list[list[int]] = [[] for _ in range(output_count)]
   for output,row,rhs_key in records: unpack[output] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
   dense = _selector_program(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch)
@@ -1060,6 +1116,7 @@ def _has_reduction(nodes:tuple[UOp, ...], op:Ops|None=None) -> bool:
 
 _LOWERERS = (
   RKLowerer("dpu", lambda nodes:not _has_reduction(nodes), lower_dpu_result),
+  RKLowerer("multi_broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_multi_broadcast_alu_result),
   RKLowerer("broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_broadcast_alu_result),
   RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),

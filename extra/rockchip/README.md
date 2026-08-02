@@ -230,6 +230,13 @@ per safe window for contraction and affine-reduction plans. Complete
 strict suite passes 64 tests plus 42 subtests, and the inferred native total is
 134 pending the next census.
 
+Contraction compute subsequently tiles tall M surfaces into ordered tasks that
+each satisfy `tile_M*aligned_K<=4096`. A generic multi-broadcast lowerer also
+materializes every static affine FP16 source before ordinary DPU arithmetic,
+covering K=1 graphs whose reduction simplifies away. All 14 `test_conv1d`
+subtests become native, the strict suite passes 65 tests plus 44 subtests, and
+the inferred native total is 135 pending the next census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -240,8 +247,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,877, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,877 lines.
-The exact 2,909-line delta is 2,904 counted Rockchip backend lines (2,744
+contains 27,932, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,932 lines.
+The exact 2,964-line delta is 2,959 counted Rockchip backend lines (2,799
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
