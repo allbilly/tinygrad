@@ -304,6 +304,16 @@ class TestRockchip(unittest.TestCase):
       with np.errstate(all="ignore"): expected = np.power(values.astype(np.float32), np.float32(5.5)).astype(np.float16)
       np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_generated_negative_pow55_shifted_multirange_luts(self):
+    encodings = np.arange(1 << 16, dtype=np.uint16)
+    all_half = encodings.view(np.float16)
+    data = all_half[np.isfinite(all_half) & (all_half >= 0) & (all_half <= 8)]
+    special = np.array([-2, -1, -np.inf, np.inf, np.nan, -0.0, .133056640625, .1331787109375], dtype=np.float16)
+    for values in (data, special):
+      actual = (Tensor(values, device="ROCKCHIP").realize()**-5.5).realize().numpy()
+      with np.errstate(all="ignore"): expected = np.power(values.astype(np.float32), np.float32(-5.5)).astype(np.float16)
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_linear_sigmoid_workload(self):
     rng = np.random.default_rng(2)
     a_np = rng.uniform(-0.25, 0.25, (1,32)).astype(np.float16)

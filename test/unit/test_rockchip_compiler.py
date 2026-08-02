@@ -454,6 +454,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
     self.assertFalse(contains_uop(plan))
 
+  def test_negative_pow55_uses_shifted_generated_multirange_luts(self):
+    for name in ("POW_NEG55_LOW", "POW_NEG55_HIGH", "POW_NEG55_FAR"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half)**-5.5))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.POW_NEG55_LOW, rklut.RKLUTId.POW_NEG55_HIGH, rklut.RKLUTId.POW_NEG55_FAR, rklut.RKLUTId.SQRT})
+    self.assertGreater(len(plan.stages), 64)
+    self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
+    self.assertFalse(contains_uop(plan))
+
   def test_trunc_floor_ceil_compose_roundoff_lut(self):
     for function in (lambda x:x.trunc(), lambda x:x.floor(), lambda x:x.ceil()):
       plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))

@@ -431,3 +431,37 @@ Finite negative inputs recover NaN through a DPU-generated invalid-domain
 factor. There is no POW55 opcode, host arithmetic, runtime packing, or relaxed
 TestOps tolerance. The official method now passes positive `x**5.5` and
 advances to the distinct negative-exponent implementation.
+
+## Negative scalar exponent 5.5 shifted ranges
+
+Tinygrad decomposes `x**-5.5` as a positive 5.5 power of `reciprocal(x)`.
+Materializing that reciprocal first loses accuracy around every later power
+boundary. The strict matcher therefore recognizes the intact tree but plans
+the result directly from the original input magnitude.
+
+Five binary bands normalize `0.125 < abs(x) < 8` using multipliers
+`(4,2,1,0.5,0.25)` and final factors
+`(2^11,2^5.5,1,2^-5.5,2^-11)`. The Q10 low table covers normalized values
+through one. Above one, the table coordinate is shifted to `z=u-1`, and an
+index multiplier of 16,384 maps `[0,1]` onto all 512 positive knots. A Q15
+middle table returns `u^-5.5`; above normalized 1.375, a Q15 far table stores
+`4*u^-5.5` and generic DPU arithmetic decodes it by `0.25`.
+
+The far range replaces the old four sparse tie-knot corrections. Exhaustive
+hardware testing showed seven misses in the two-table version because Q15 raw
+values approach 1,024 near normalized two. Scaling that range by four gives
+four times the effective precision and passes all 18,434 positive FP16 bases
+in `[0,8]` at `rtol=1e-3, atol=1e-6`.
+
+The overflow transition is explicit: `0.133056640625` produces infinity,
+while the adjacent first finite base `0.1331787109375` produces 65,408. The
+Q10 interpolation cannot represent that discontinuity, so DPU division
+synthesizes infinity below it and a one-lane mask supplies the first finite
+value. The generated low-table characterization begins at the following FP16
+base because the boundary itself is handled by this arithmetic policy.
+
+The final plan contains 112 typed stages and twelve reusable scratch surfaces.
+Finite negative bases receive NaN through a DPU-generated invalid-domain
+factor; the generic reciprocal/SQRT expression remains only as the bounded
+full-domain fallback. The official test passes `x**-5.5` and advances to the
+separate constant-base `5.5**x` family, with no CPU semantic path.

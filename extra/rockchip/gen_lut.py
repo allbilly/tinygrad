@@ -199,6 +199,14 @@ pow55_local = [max(-32768, min(32767, round((min(abs(signed_sample(table, i, POW
                for table in range(2) for i in range(SIZE)]
 pow55_high = [max(-32768, min(32767, round((min(abs(signed_sample(table, i, POW8_STEP)), 2.0)*.5)**5.5*32768)+1))
               for table in range(2) for i in range(SIZE)]
+POW_NEG55_SCALE, POW_NEG55_STEP = 16384.0, 32.0/16384.0
+POW_NEG55_LOW_MIN = .13330078125*4
+pow_neg55_low = [max(-32768, min(32767, round(max(.5, min(1.0, abs(signed_sample(table, i, POW_NEG55_STEP))))**-5.5*1024)))
+                 for table in range(2) for i in range(SIZE)]
+pow_neg55_high = [max(-32768, min(32767, round((1+min(1.0, abs(signed_sample(table, i, POW_NEG55_STEP))))**-5.5*32768)))
+                  for table in range(2) for i in range(SIZE)]
+pow_neg55_far = [max(-32768, min(32767, round(min(1.0, 4*(1+min(1.0,
+  abs(signed_sample(table, i, POW_NEG55_STEP))))**-5.5)*32768))) for table in range(2) for i in range(SIZE)]
 def digest(values:list[int]) -> str: return hashlib.sha256(struct.pack(f"<{len(values)}h", *values)).hexdigest()
 def half(value:float) -> float: return struct.unpack("<e", struct.pack("<e", value))[0]
 errors = []
@@ -334,6 +342,19 @@ for bits in range(1 << 16):
   if POW55_SPLIT_HALF <= x <= 2:
     got, reference = half(interpolate(pow55_high, POW8_STEP, 32768, x)*2**5.5), x**5.5
     pow55_high_errors.append((abs(got-reference), abs(got-reference)/reference))
+pow_neg55_low_errors, pow_neg55_high_errors, pow_neg55_far_errors = [], [], []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x): continue
+  if POW_NEG55_LOW_MIN <= x <= 1:
+    got, reference = interpolate(pow_neg55_low, POW_NEG55_STEP, 1024, x), x**-5.5
+    pow_neg55_low_errors.append((abs(got-reference), abs(got-reference)/reference))
+  if 0 <= x <= 1:
+    got, reference = interpolate(pow_neg55_high, POW_NEG55_STEP, 32768, x), (1+x)**-5.5
+    pow_neg55_high_errors.append((abs(got-reference), abs(got-reference)/reference))
+  if .375 <= x <= 1:
+    got, reference = half(interpolate(pow_neg55_far, POW_NEG55_STEP, 32768, x)*.25), (1+x)**-5.5
+    pow_neg55_far_errors.append((abs(got-reference), abs(got-reference)/reference))
 asinh_errors, acosh_errors = [], []
 for bits in range(1 << 16):
   x = struct.unpack("<e", struct.pack("<H", bits))[0]
@@ -546,7 +567,10 @@ class RKLUTId(IntEnum):
   POW55 = 61
   POW55_HIGH = 62
   POW55_LOCAL = 63
-RK_LUT_SCHEMA = 52
+  POW_NEG55_LOW = 64
+  POW_NEG55_HIGH = 65
+  POW_NEG55_FAR = 66
+RK_LUT_SCHEMA = 54
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -966,5 +990,32 @@ RK_LUT_POW55_HIGH_MINUS_EXP = 15
 RK_LUT_POW55_HIGH_VERIFIED_INPUTS = {len(pow55_high_errors)}
 RK_LUT_POW55_HIGH_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow55_high_errors)!r}
 RK_LUT_POW55_HIGH_SIM_MAX_REL_ERROR = {max(x[1] for x in pow55_high_errors)!r}
-RK_LUT_POW55_HIGH = (\n{rows(pow55_high)}\n)\n'''
+RK_LUT_POW55_HIGH = (\n{rows(pow55_high)}\n)
+RK_LUT_POW_NEG55_LOW_SHA256 = "{digest(pow_neg55_low)}"
+RK_LUT_POW_NEG55_LOW_DOMAIN = ({POW_NEG55_LOW_MIN!r}, 1.0)
+RK_LUT_POW_NEG55_LOW_ENTRIES = {SIZE}
+RK_LUT_POW_NEG55_LOW_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW_NEG55_SCALE))[0]}
+RK_LUT_POW_NEG55_LOW_MINUS_EXP = 10
+RK_LUT_POW_NEG55_LOW_VERIFIED_INPUTS = {len(pow_neg55_low_errors)}
+RK_LUT_POW_NEG55_LOW_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow_neg55_low_errors)!r}
+RK_LUT_POW_NEG55_LOW_SIM_MAX_REL_ERROR = {max(x[1] for x in pow_neg55_low_errors)!r}
+RK_LUT_POW_NEG55_LOW = (\n{rows(pow_neg55_low)}\n)
+RK_LUT_POW_NEG55_HIGH_SHA256 = "{digest(pow_neg55_high)}"
+RK_LUT_POW_NEG55_HIGH_DOMAIN = (0.0, 1.0)
+RK_LUT_POW_NEG55_HIGH_ENTRIES = {SIZE}
+RK_LUT_POW_NEG55_HIGH_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW_NEG55_SCALE))[0]}
+RK_LUT_POW_NEG55_HIGH_MINUS_EXP = 15
+RK_LUT_POW_NEG55_HIGH_VERIFIED_INPUTS = {len(pow_neg55_high_errors)}
+RK_LUT_POW_NEG55_HIGH_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow_neg55_high_errors)!r}
+RK_LUT_POW_NEG55_HIGH_SIM_MAX_REL_ERROR = {max(x[1] for x in pow_neg55_high_errors)!r}
+RK_LUT_POW_NEG55_HIGH = (\n{rows(pow_neg55_high)}\n)
+RK_LUT_POW_NEG55_FAR_SHA256 = "{digest(pow_neg55_far)}"
+RK_LUT_POW_NEG55_FAR_DOMAIN = (0.375, 1.0)
+RK_LUT_POW_NEG55_FAR_ENTRIES = {SIZE}
+RK_LUT_POW_NEG55_FAR_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW_NEG55_SCALE))[0]}
+RK_LUT_POW_NEG55_FAR_MINUS_EXP = 15
+RK_LUT_POW_NEG55_FAR_VERIFIED_INPUTS = {len(pow_neg55_far_errors)}
+RK_LUT_POW_NEG55_FAR_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow_neg55_far_errors)!r}
+RK_LUT_POW_NEG55_FAR_SIM_MAX_REL_ERROR = {max(x[1] for x in pow_neg55_far_errors)!r}
+RK_LUT_POW_NEG55_FAR = (\n{rows(pow_neg55_far)}\n)\n'''
 pathlib.Path(__file__).parents[2].joinpath("tinygrad/runtime/autogen/rockchip_lut.py").write_text(output)

@@ -771,6 +771,48 @@ def _pow55_expr(source:_Expr|RKArg) -> _Expr:
   invalid_denom = _sub(1.0, _sub(negative, negative_inf))
   return _ALUExpr(Ops.MUL, (selected, _ALUExpr(Ops.FDIV, (invalid_denom, invalid_denom))))
 
+def _pow_neg55_expr(source:_Expr|RKArg) -> _Expr:
+  """Evaluate x**-5.5 from x directly, avoiding the rounded reciprocal used by the generic decomposition."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  reciprocal = _ALUExpr(Ops.FDIV, (1.0, source))
+  square = _ALUExpr(Ops.MUL, (reciprocal, reciprocal))
+  fourth = _ALUExpr(Ops.MUL, (square, square))
+  fallback = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (fourth, reciprocal)), _sqrt_expr(reciprocal)))
+  magnitude = _ALUExpr(Ops.MAX, (source, _ALUExpr(Ops.MUL, (source, -1.0))))
+  above_half, above_one = positive(magnitude, .5), positive(magnitude, 1.0)
+  above_two, above_four = positive(magnitude, 2.0), positive(magnitude, 4.0)
+  bands:tuple[_Value,_Value,_Value,_Value,_Value] = (_sub(1.0, above_half), _sub(above_half, above_one),
+    _sub(above_one, above_two), _sub(above_two, above_four), above_four)
+  def weighted(weights:tuple[float,float,float,float,float]) -> _Expr:
+    terms = tuple(_ALUExpr(Ops.MUL, (band, weight)) for band,weight in zip(bands, weights))
+    return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (terms[0], terms[1])),
+      _ALUExpr(Ops.ADD, (terms[2], terms[3])))), terms[4]))
+  normalized = _ALUExpr(Ops.MUL, (magnitude, weighted((4.0, 2.0, 1.0, .5, .25))))
+  factor = weighted((2.0**11, 2.0**5.5, 1.0, 2.0**-5.5, 2.0**-11))
+  low = _LUTExpr(RKLUTId.POW_NEG55_LOW, (normalized,))
+  shifted = _sub(normalized, 1.0)
+  high, far = _LUTExpr(RKLUTId.POW_NEG55_HIGH, (shifted,)), _LUTExpr(RKLUTId.POW_NEG55_FAR, (shifted,))
+  far_mask = positive(normalized, 1.375)
+  high_range = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (high, _sub(1.0, far_mask))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (far, .25)), far_mask))))
+  high_mask = positive(normalized, 1.0)
+  normalized_power = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (low, _sub(1.0, high_mask))), _ALUExpr(Ops.MUL, (high_range, high_mask))))
+  scaled = _ALUExpr(Ops.MUL, (normalized_power, factor))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (scaled, -1.0)), -65504.0)), -1.0))
+  above_finite, below_eight = positive(magnitude, _fp16(.133056640625)), positive(8.0, magnitude)
+  valid = _ALUExpr(Ops.MUL, (above_finite, below_eight))
+  fallback_bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (fallback, -1.0)), -65504.0)), -1.0))
+  combined = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (bounded, valid)), _ALUExpr(Ops.MUL, (fallback_bounded, _sub(1.0, valid)))))
+  overflow = _sub(1.0, above_finite)
+  overflow_result = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.ADD, (combined, overflow)), above_finite))
+  above_first_finite = positive(magnitude, _fp16(.1331787109375))
+  first_finite = _sub(above_finite, above_first_finite)
+  rounded = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (overflow_result, _sub(1.0, first_finite))),
+    _ALUExpr(Ops.MUL, (first_finite, 65408.0))))
+  negative, negative_inf = positive(0.0, source), positive(-65472.0, source)
+  invalid_denom = _sub(1.0, _sub(negative, negative_inf))
+  return _ALUExpr(Ops.MUL, (rounded, _ALUExpr(Ops.FDIV, (invalid_denom, invalid_denom))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -779,16 +821,21 @@ def _unwrap_fp_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype in (dtypes.half, dtypes.float) and u.src[0].dtype in (dtypes.half, dtypes.float): u = u.src[0]
   return _unwrap_same_cast(u)
 
-def _canonical_mul_power(u:UOp, power:float) -> UOp|None:
+def _canonical_mul_power(u:UOp, power:float, reciprocal:bool=False) -> UOp|None:
   """Recognize a multiplication tree containing exactly `power` copies of one FP16 indexed value."""
   u = _unwrap_fp_cast(u)
   indexes = [x for x in u.toposort() if x.op is Ops.INDEX and x.dtype is dtypes.half]
   if len(indexes) != 1: return None
   source = indexes[0]
+  if reciprocal:
+    reciprocals = [x for x in u.toposort() if x.op is Ops.RECIPROCAL and len(x.src) == 1 and _unwrap_fp_cast(x.src[0]).key == source.key]
+    if len(reciprocals) != 1: return None
+    base = reciprocals[0]
+  else: base = source
   def exponent(node:UOp) -> float|None:
     node = _unwrap_fp_cast(node)
-    if node.key == source.key: return 1.0
-    if node.op is Ops.SQRT and len(node.src) == 1 and _unwrap_fp_cast(node.src[0]).key == source.key: return .5
+    if node.key == base.key: return 1.0
+    if node.op is Ops.SQRT and len(node.src) == 1 and _unwrap_fp_cast(node.src[0]).key == base.key: return .5
     if node.op is not Ops.MUL or len(node.src) != 2: return None
     lhs, rhs = exponent(node.src[0]), exponent(node.src[1])
     return None if lhs is None or rhs is None else lhs+rhs
@@ -1142,6 +1189,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(pow55_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _pow55_expr(operand)
+  elif (pow_neg55_input:=_canonical_mul_power(u, 5.5, reciprocal=True)) is not None:
+    operand = _parse_alu(pow_neg55_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _pow_neg55_expr(operand)
   elif (hyperbolic:=_canonical_hyperbolic(u)) is not None:
     operand = _parse_alu(hyperbolic[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -1690,7 +1741,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.GELU_TANH_LOCAL, RKLUTId.GELU_EXACT, RKLUTId.GELU_EXACT_LOCAL, RKLUTId.ELU1,
                       RKLUTId.ELU1_LOCAL, RKLUTId.ELU01, RKLUTId.ELU01_LOCAL, RKLUTId.SELU, RKLUTId.SELU_LOCAL,
                       RKLUTId.CELU2, RKLUTId.CELU2_LOCAL, RKLUTId.CELU3, RKLUTId.CELU3_LOCAL, RKLUTId.CELU4, RKLUTId.CELU4_LOCAL,
-                      RKLUTId.POW8, RKLUTId.POW8_HIGH, RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH):
+                      RKLUTId.POW8, RKLUTId.POW8_HIGH, RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH,
+                      RKLUTId.POW_NEG55_LOW, RKLUTId.POW_NEG55_HIGH, RKLUTId.POW_NEG55_FAR):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

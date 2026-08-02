@@ -79,6 +79,15 @@ counted Rockchip-renderer lines and 26,853 repository lines overall; generated
 payload rows remain excluded, while their generator and compiler recipes are
 counted.
 
+Negative scalar `x**-5.5` now bypasses the rounded reciprocal through shifted
+Q10/Q15/Q15 generated ranges and explicit overflow-boundary arithmetic. All
+18,434 positive FP16 bases in `[0,8]` pass exhaustive RK3588 comparison, and
+invalid finite negative bases remain NaN. The official method now passes both
+scalar exponents `+5.5` and `-5.5`, then reaches the independent constant-base
+`5.5**x` failure (1,756/2,925 lanes in the current generic path). The method
+remains `FAIL`; no census gain is claimed. `sz.py` reports 1,770 counted lines
+in the renderer and 26,903 repository lines overall at this milestone.
+
 Run the census serially on RK3588:
 
 ```sh
@@ -594,6 +603,7 @@ failures.
 | Parameterized generated CELU alpha 1–4 ranges | `test_celu` | Yes (research branch only) |
 | Generated two-level POW8 range reduction | `test_pow_const` exponent-8 subcase; method still fails at exponent 5.5 | Not yet |
 | Generated multirange positive POW5.5 | `test_pow_const` positive-5.5 subcase; method still fails at negative 5.5 | Not yet |
+| Shifted multirange negative POW5.5 | `test_pow_const` negative-5.5 subcase; method still fails at constant-base 5.5 | Not yet |
 
 The historical wide-fill milestone wrote the requested dtype directly through
 DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage
