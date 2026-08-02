@@ -395,6 +395,17 @@ plan-stage limit, and 4 reduction rejects. The durable JSON is
 JUnit XML SHA-256 is
 `35b6f55181155b7172c50db687c39b3275586084670cc8e5840cd20950b980e7`.
 
+Static affine FP16 MAX now batches up to eight logical outputs into PPU
+channels. One DPU preparation packs the source, cost-bounded CMAC selector
+tasks materialize a reusable HWC8 surface, and one PPU task per batch reduces
+the spatial axes. Padding repeats a real reduction element, so it cannot alter
+the maximum. The `(3,4,5,6).max(axis=1)` TestOps graph produces 90 outputs as
+12 batches (2 DPU, 24 CMAC, and 12 PPU tasks total) and matches RK3588 hardware
+exactly. Plans above 128 outputs, 512 inputs, 256 reduction elements, or 8 MiB
+of selector constants reject explicitly. All 67 host tests, Ruff, and mypy are
+clean; the expanded strict hardware suite passes 48 tests plus 31 subtests in
+370.77 seconds. This generic capability adds 73 counted compiler lines.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);

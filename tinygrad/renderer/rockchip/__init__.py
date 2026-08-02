@@ -515,6 +515,82 @@ def lower_global_max_result(sink:UOp) -> RKLowerResult:
                                    0.0 if output_scale == 1.0 else output_scale, 1),), scratch_tuple)
   return _native(RKProgram((RKDPUProgram(tuple(stages), scratch_tuple), *contracts, reduce_plan, final), scratch_tuple))
 
+def lower_affine_max_result(sink:UOp) -> RKLowerResult:
+  """Lower a static affine FP16 MAX by reformatting eight outputs into PPU channels per batch."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) < 2 or _strip_casts(store.src[1]).key != reduce.key: return _not_applicable()
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine PPU MAX requires an FP16 output", store.src[0].op)
+  value = _strip_casts(reduce.src[0])
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX input is not one FP16 surface", reduce.op)
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or src_aff is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX indexes are not affine", Ops.INDEX)
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
+  out_axes = tuple(sorted(out_aff[0]))
+  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
+  if len(red_axes) != len(reduce.src)-1 or not out_axes or set(out_axes) & set(red_axes) or \
+     set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine PPU MAX axes do not form a static output/reduction partition", Ops.RANGE)
+  if not 2 <= output_count <= 128 or not 2 <= input_count <= 512:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX surface is {output_count}x{input_count}", reduce.op)
+  reduction_count = math.prod(ranges[axis] for axis in red_axes)
+  pool_extent = next((extent for extent in range(max(4, reduction_count), 257) if _pool_hw_shape(extent) is not None), None)
+  if pool_extent is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX reduction extent is {reduction_count}", reduce.op)
+  pool_shape = _pool_hw_shape(pool_extent)
+  assert pool_shape is not None
+
+  selectors:list[list[int]] = [[] for _ in range(output_count)]
+  seen:set[int] = set()
+  for out_values in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes, out_values))
+    out_index = out_aff[1] + sum(out_aff[0][axis]*point[axis] for axis in out_axes)
+    if not 0 <= out_index < output_count or out_index in seen:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX output is not dense", Ops.INDEX)
+    seen.add(out_index)
+    for red_values in product(*(range(ranges[axis]) for axis in red_axes)):
+      point.update(zip(red_axes, red_values))
+      src_index = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes))
+      if not 0 <= src_index < input_count:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX input index is out of bounds", Ops.INDEX)
+      selectors[out_index].append(src_index)
+  if seen != set(range(output_count)) or any(len(row) != reduction_count for row in selectors):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX output has holes", Ops.INDEX)
+
+  align_in, surface_count = max(32, (input_count+31)&-32), pool_extent*8
+  constant_bytes = ((output_count+7)//8)*((surface_count+15)//16)*32*align_in*2
+  if constant_bytes > 8*1024*1024:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX needs {constant_bytes} constant bytes", reduce.op)
+  packed, hwc = RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1)
+  hwc_elements = ((surface_count-1)//16)*16+32
+  scratch = (RKScratch(align_in*2), RKScratch(hwc_elements*2))
+  source = RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  steps:list = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
+                              RKALUStage(Ops.ADD, packed, source, 0.0, input_count)), scratch)]
+  height, width = pool_shape
+  for group_start in range(0, output_count, 8):
+    channels = min(8, output_count-group_start)
+    rows = [[selectors[group_start+min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
+            for spatial in range(pool_extent)]
+    flat_rows = [rows[spatial][channel] for spatial in range(pool_extent) for channel in range(8)]
+    for start in range(0, surface_count, 16):
+      out_layout = RKLayout((1,min(16, surface_count-start)), (1,32), (64,2), dtypes.half,
+                            padding=((0,0),(0,32-min(16, surface_count-start))))
+      steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
+        _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
+        _cmac_weight_ref(0, min(16, surface_count-start), align_in, RKBufferKind.CONSTANT, 32), reduce.arg[0],
+        _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], align_in, 32, 1.0)))
+    out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
+                      RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
+    src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+    steps.append(RKReduce(out, src, Ops.MAX, red_axes[0]))
+  return _native(RKProgram(tuple(steps), scratch))
+
 @dataclass(frozen=True)
 class RKLowerer:
   name: str
@@ -531,6 +607,7 @@ _LOWERERS = (
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
+  RKLowerer("affine_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_affine_max_result),
   RKLowerer("global_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_global_max_result),
   RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),
 )

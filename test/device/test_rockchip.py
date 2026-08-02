@@ -72,6 +72,11 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal((tensor.max()*0.5).realize().item(), (data.max()*np.float16(0.5)).item())
     np.testing.assert_equal(tensor.min().realize().item(), data.min().item())
 
+  def test_affine_fp16_max_native_ppu_batches(self):
+    data = np.linspace(-8, 8, 3*4*5*6, dtype=np.float16).reshape(3,4,5,6)
+    actual = Tensor(data, device="ROCKCHIP").realize().max(axis=1).realize().numpy()
+    np.testing.assert_equal(actual, data.max(axis=1))
+
   def test_affine_hwc8_movements_native_dpu(self):
     data = np.arange(2*3*8, dtype=np.float16).reshape(2,3,8)
     tensor = Tensor(data, device="ROCKCHIP").realize()
