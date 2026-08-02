@@ -64,12 +64,14 @@ TestOps selector (`DEV=ROCKCHIP`) and persistent compilation disabled
 (`CACHELEVEL=0`), `test_sum_full` passes. The first 135-element subcase of
 `test_sum` now passes, then its length-six row reduction rejects because a
 native padded-row layout is not implemented. `test_sum_simple` has an explicit
-FP32 input, while fused ReLU/mean, multi-output reductions, and nested sums
-remain unsupported. Earlier claims for those methods came from mistakenly
+FP32 input, while fused ReLU, multi-output reductions, and nested sums remain
+unsupported. Global `test_mean` now passes: its compile-time reciprocal is
+folded into generated K384 CMAC weights, preserving one FP32 accumulation and
+one final FP16 conversion. Earlier claims for other methods came from mistakenly
 using `DEVICE=ROCKCHIP`, which left TestOps on the default CPU backend; they
 are superseded here. No tolerance or skip was changed.
-The full explicit-device suite passes 41 tests plus 17 subtests in 324.80
-seconds with `CACHELEVEL=0` after the variable-K emitter change.
+The full explicit-device suite passes 42 tests plus 17 subtests in 324.56
+seconds with `CACHELEVEL=0` after adding scaled K384 mean.
 
 The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,

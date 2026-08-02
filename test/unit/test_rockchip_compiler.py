@@ -549,7 +549,17 @@ class TestDPUCompiler(unittest.TestCase):
     long_image = emit_sum(long_plan)
     self.assertEqual(([stage.engine for stage in long_image.stages], len(long_image.constants)), ([RKEngine.DPU,RKEngine.CMAC], 10512))
     rejected = lower_add_reduce_result(sink(Tensor.empty(511,dtype=dtypes.half).sum()))
-    self.assertIs(rejected.reject.kind, RKRejectKind.PLAN_STAGE_LIMIT)
+    self.assertIsInstance(rejected.plan, RKSumProgram)
+
+  def test_global_mean_folds_scale_into_cmac_weights(self):
+    result = lower_add_reduce_result(sink(Tensor.empty(360,dtype=dtypes.half).mean()))
+    self.assertIsInstance(result.plan, RKSumProgram)
+    plan = result.plan
+    assert isinstance(plan, RKSumProgram)
+    self.assertEqual(plan.contract.lhs.layout.physical_shape, (1,384))
+    active = struct.unpack_from("<e", plan.contract.constants, 0)[0]
+    self.assertEqual(active, struct.unpack("<e", struct.pack("<e", 1/360))[0])
+    self.assertEqual(decode_image(encode_image(emit_sum(plan))), emit_sum(plan))
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

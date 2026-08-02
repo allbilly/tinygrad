@@ -128,10 +128,11 @@ def _cmac_weight_ref(slot:int, logical_n:int, k:int, kind:RKBufferKind=RKBufferK
   physical_n = logical_n if physical_n is None else physical_n
   return RKTensorRef(RKArg(kind, slot), RKLayout((logical_n,k), (physical_n,k), (k*2,2), dtypes.half, kind=RKLayoutKind.CMAC_WEIGHT))
 
-def _cmac_mask_payload(count:int, align_in:int, outputs:int=4) -> bytes:
+def _cmac_mask_payload(count:int, align_in:int, outputs:int=4, scale:float=1.0) -> bytes:
   values = [0] * (32*align_in)
+  active = struct.unpack("<H", struct.pack("<e", scale))[0]
   for out in range(outputs):
-    for k in range(count): values[(((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)] = 0x3c00
+    for k in range(count): values[(((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)] = active
   return struct.pack(f"<{len(values)}H", *values)
 
 class RKRejectKind(Enum):
@@ -1662,8 +1663,14 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU sum requires an FP16 output surface", store.src[0].op)
   if store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one scalar output", store.src[0].op)
-  if _strip_casts(store.src[1]).key != reduce.key:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum does not accept a fused epilogue", store.src[1].op)
+  stored, scale = _strip_casts(store.src[1]), 1.0
+  if stored.key != reduce.key:
+    if stored.op is not Ops.MUL:
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum only accepts a constant scale epilogue", stored.op)
+    const, reduced = (stored.src[0], stored.src[1]) if stored.src[0].op is Ops.CONST else (stored.src[1], stored.src[0])
+    if const.op is not Ops.CONST or _strip_casts(reduced).key != reduce.key:
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum scale is not a direct constant", stored.op)
+    scale = float(const.arg)
   value, red = _strip_casts(reduce.src[0]), reduce.src[1]
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half or red.op is not Ops.RANGE:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "DPU sum input is not one direct FP16 surface", reduce.op)
@@ -1673,14 +1680,14 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one dense reduction axis", value.op)
   output, input_arg = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
-  if 32 < count <= 256:
+  if 32 < count <= 512:
     align_in = (count+31)&-32
     packed = RKArg(RKBufferKind.SCRATCH, 0)
     dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, input_arg, 0.0, count),), (RKScratch(align_in*2),))
     out_layout = RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31)))
     lhs_layout = RKLayout((1,count), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-count)))
     contract = RKContract(RKTensorRef(output, out_layout), RKTensorRef(packed, lhs_layout),
-      _cmac_weight_ref(0, 4, align_in, RKBufferKind.CONSTANT, 32), red.arg[0], _cmac_mask_payload(count, align_in))
+      _cmac_weight_ref(0, 4, align_in, RKBufferKind.CONSTANT, 32), red.arg[0], _cmac_mask_payload(count, align_in, scale=scale))
     return _native(RKSumProgram((), dpu, contract))
   stages:list[RKDPUStage] = []
   scratch:list[RKScratch] = []
@@ -1719,7 +1726,7 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
     if term_offset+run_count > 32:
       return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "DPU sum needs more than 32 aligned CMAC terms", red.op)
     stages.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, term_offset*2), source, 0.0, run_count))
-    mask_values[term_offset:term_offset+run_count] = [1.0]*run_count
+    mask_values[term_offset:term_offset+run_count] = [scale]*run_count
     term_offset += run_count
   mask = b"".join(struct.pack("<e", x) for x in mask_values)
   constants = mask*4

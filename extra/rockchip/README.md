@@ -48,8 +48,8 @@ are eligible to be ported as native capabilities.
   vector and the same CMAC contract;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
   32-term aligned DPU/CMAC plan;
-- direct aligned K64–K256 CMAC sums with generated hardware-packed mask
-  weights and a single FP32 accumulation;
+- direct aligned K64–K512 CMAC sums or scaled sums with generated
+  hardware-packed weights and a single FP32 accumulation;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
