@@ -1193,10 +1193,23 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     compared = tuple(_parse_alu(x, output_index, memo) for x in (lhs_u, rhs_u))
     if any(x is None for x in compared): return None
     lhs, rhs = cast(tuple[_Value, _Value], compared)
+    infinite_threshold_select = cond.op is Ops.CMPLT and true_u.op is Ops.CONST and math.isinf(float(true_u.arg)) and \
+      ((false_u.key == lhs_u.key and isinstance(rhs, float) and math.isfinite(rhs)) or
+       (false_u.key == rhs_u.key and isinstance(lhs, float) and math.isfinite(lhs)))
     threshold_select = cond.op is Ops.CMPLT and isinstance(rhs, float) and \
       ((true_u.key == lhs_u.key and false_u.op is Ops.CONST and math.isfinite(float(false_u.arg)) and float(false_u.arg) != rhs) or
        (false_u.key == lhs_u.key and true_u.op is Ops.CONST and math.isfinite(float(true_u.arg)) and float(true_u.arg) != rhs))
-    if threshold_select:
+    if infinite_threshold_select:
+      mask = _parse_mask_expr(cond, output_index, memo)
+      if mask is None: return None
+      inactive = _sub(1.0, mask)
+      if false_u.key == lhs_u.key: base = _ALUExpr(Ops.MAX, (lhs, rhs))
+      else:
+        assert isinstance(lhs, float)
+        base = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (rhs, -1.0)), -lhs)), -1.0))
+      infinity = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.MUL, (mask, math.copysign(1.0, float(true_u.arg)))), inactive))
+      ret = _ALUExpr(Ops.ADD, (base, infinity))
+    elif threshold_select:
       mask = _parse_mask_expr(cond, output_index, memo)
       if mask is None: return None
       threshold = cast(float, rhs)

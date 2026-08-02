@@ -197,6 +197,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((regs[(0x1001, rk.REG_DPU_DATA_CUBE_CHANNEL)], regs[(0x1001, rk.REG_DPU_WDMA_SIZE_0)],
                       regs[(0x2001, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL)]), (0, 0, 0))
 
+  def test_infinite_threshold_select_avoids_zero_times_infinity(self):
+    x = Tensor.empty(16,dtype=dtypes.half)
+    for condition in (x>0.1, x<0.1):
+      plan = lower_dpu(sink(x.masked_fill(condition.detach(), -float("inf"))))
+      self.assertIsInstance(plan, RKDPUProgram)
+      assert isinstance(plan, RKDPUProgram)
+      self.assertLessEqual(len(plan.stages), 10)
+      self.assertFalse(contains_uop(plan))
+
   def test_ordered_program_composes_engine_steps_and_resources(self):
     dpu = RKDPUProgram((RKALUStage(Ops.ADD, RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.ARG, 0), 0.0, 8),))
     contract = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))

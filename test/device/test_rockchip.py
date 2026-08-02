@@ -311,6 +311,15 @@ class TestRockchip(unittest.TestCase):
     ts = Tensor(special, device="ROCKCHIP").realize()
     np.testing.assert_equal((ts<0).where(ts, 1).realize().numpy(), np.where(special<0, special, 1))
 
+  def test_infinite_threshold_masked_fill_native_dpu(self):
+    data = np.array([-np.inf,-2,0,.2,np.inf,np.nan], dtype=np.float16)
+    for greater in (True,False):
+      tensor = Tensor(data, device="ROCKCHIP").realize()
+      condition = tensor>0.1 if greater else tensor<0.1
+      actual = tensor.masked_fill(condition.detach(), -float("inf")).realize().numpy()
+      expected = np.where(data>0.1 if greater else data<0.1, -np.inf, data)
+      np.testing.assert_equal(actual, expected)
+
   def test_fp16_abs_specials_and_finite_extrema(self):
     data = np.array([-2, -0., 0., 2., np.inf, -np.inf, np.nan, -np.nan], dtype=np.float16)
     x = Tensor(data, device="ROCKCHIP").realize()

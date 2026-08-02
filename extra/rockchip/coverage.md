@@ -1413,3 +1413,20 @@ tests, Ruff, and mypy pass; the expanded strict hardware suite passes 66 tests
 plus 44 subtests in 617.39 seconds with `ROCKCHIP_FALLBACK=0`. The inferred
 native total is 139 after the current 137-pass census, pending the next complete
 run. The research tree has 27,995 counted lines.
+
+Infinite threshold selection now has a dedicated generic expression recipe.
+For `WHERE(x<threshold, +/-inf, x)` and its reversed comparison, the finite
+branch is first clamped to a finite threshold. The active comparison mask then
+forms signed infinity through `sign*mask/(1-mask)`, which is zero on the finite
+branch and infinite on the selected branch. This avoids both `infinity*0` and
+`infinity-infinity`, while hardware probes cover positive/negative infinity,
+NaN, and both comparison directions.
+
+Complete `test_masked_fill` passes natively at unchanged tolerance. All 84 host
+tests, Ruff, and mypy pass; the expanded strict hardware suite passes 67 tests
+plus 44 subtests in 618.87 seconds with `ROCKCHIP_FALLBACK=0`. The inferred
+native total is 140 after the current 137-pass census, pending the next complete
+run. The research tree has 28,008 counted lines. The unsuccessful attempt to
+admit 648-element contraction sources without a more efficient pack engine is
+preserved as `wip-wide-source-contraction-still-stage-limited.patch` (SHA-256
+`04eef8eaa739e249c4ee8f5bb93d7005dce8812639e276d2400a35c2aa7dc605`).
