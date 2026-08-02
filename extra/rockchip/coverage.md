@@ -88,6 +88,17 @@ scalar exponents `+5.5` and `-5.5`, then reaches the independent constant-base
 remains `FAIL`; no census gain is claimed. `sz.py` reports 1,770 counted lines
 in the renderer and 26,903 repository lines overall at this milestone.
 
+Constant-base `5.5**x` now uses two generated Q15 ranges selected by generic
+DPU masks, with the ordinary native EXP2 recipe outside `[-2,2]`. All 32,770
+finite FP16 encodings in that interval plus infinities and NaN pass exhaustive
+RK3588 comparison at the official tolerance with `ROCKCHIP_FALLBACK=0`. The
+official `test_pow_const` invocation passes this subcase and reaches the
+independent negative-base `(-5.5)**x` compiler rejection. The method therefore
+remains `FAIL`; no method-level census gain is claimed. `sz.py` reports 1,781
+counted lines in the renderer and 26,914 repository lines overall; the 154
+new generated payload lines under `autogen` are excluded, while the 11-line
+net compiler growth remains counted.
+
 Run the census serially on RK3588:
 
 ```sh
@@ -604,6 +615,7 @@ failures.
 | Generated two-level POW8 range reduction | `test_pow_const` exponent-8 subcase; method still fails at exponent 5.5 | Not yet |
 | Generated multirange positive POW5.5 | `test_pow_const` positive-5.5 subcase; method still fails at negative 5.5 | Not yet |
 | Shifted multirange negative POW5.5 | `test_pow_const` negative-5.5 subcase; method still fails at constant-base 5.5 | Not yet |
+| Split-range constant-base POW5.5 | `test_pow_const` constant-base 5.5 subcase; method still fails at negative base | Not yet |
 
 The historical wide-fill milestone wrote the requested dtype directly through
 DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage

@@ -465,3 +465,28 @@ Finite negative bases receive NaN through a DPU-generated invalid-domain
 factor; the generic reciprocal/SQRT expression remains only as the bounded
 full-domain fallback. The official test passes `x**-5.5` and advances to the
 separate constant-base `5.5**x` family, with no CPU semantic path.
+
+## Constant base 5.5 split ranges
+
+Tinygrad lowers `5.5**x` to `EXP2(x*log2(5.5))`. Sending that scaled input
+through the generic Q13 EXP2 table loses relative precision because the
+result spans roughly `[1/30.25, 30.25]` over the TestOps interval `[-2,2]`.
+The compiler recognizes the constant scale and keeps the original exponent as
+the address coordinate for two Q15 tables.
+
+`POW_BASE55_LOW` stores `5.5**min(x,0)` directly. `POW_BASE55_HIGH` stores
+`5.5**max(x,0)/32`, and one generic DPU multiply restores the positive range.
+A generic mask selects at zero. Inputs outside `[-2,2]` retain the ordinary
+NPU EXP2 path, including its DPU-only infinity repair; no host fallback or
+runtime value inspection is involved.
+
+The generated simulator exhaustively characterizes 16,386 non-positive and
+16,384 positive finite FP16 encodings. Maximum simulated relative errors are
+0.0007843018205184168 and 0.000839043524809068 respectively. The permanent
+RK3588 test then verifies all 32,770 finite FP16 encodings in `[-2,2]`, plus
+both infinities and NaN, at the official `rtol=1e-3, atol=1e-6` contract.
+
+The complete typed plan is 28 sequential stages and uses two generated LUT
+identities plus the generic EXP2 fallback identity. The 2,052 immutable table
+entries and their metadata are generated under `autogen`; only the compact
+recognizer and target-stage recipe remain counted by `sz.py`.

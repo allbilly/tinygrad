@@ -813,6 +813,23 @@ def _pow_neg55_expr(source:_Expr|RKArg) -> _Expr:
   invalid_denom = _sub(1.0, _sub(negative, negative_inf))
   return _ALUExpr(Ops.MUL, (rounded, _ALUExpr(Ops.FDIV, (invalid_denom, invalid_denom))))
 
+def _exp2_expr(source:_Expr|RKArg) -> _Expr:
+  """Preserve IEEE infinity behavior around the finite-domain hardware EXP2 LUT."""
+  base = _LUTExpr(RKLUTId.EXP2, (source,))
+  positive_inf, negative_inf = _MaskExpr((_sub(source, 65504.0),)), _MaskExpr((_sub(-65504.0, source),))
+  return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
+
+def _pow_base55_expr(source:_Expr|RKArg) -> _Expr:
+  """Evaluate 5.5**x with two Q15 ranges and the generic NPU EXP2 path outside [-2,2]."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  low, high = _LUTExpr(RKLUTId.POW_BASE55_LOW, (source,)), _LUTExpr(RKLUTId.POW_BASE55_HIGH, (source,))
+  high_mask = positive(source, 0.0)
+  corrected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (low, _sub(1.0, high_mask))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (high, 32.0)), high_mask))))
+  inside = _ALUExpr(Ops.MUL, (positive(source, -2.001953125), positive(2.001953125, source)))
+  fallback = _exp2_expr(_ALUExpr(Ops.MUL, (source, math.log2(5.5))))
+  return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (corrected, inside)), _ALUExpr(Ops.MUL, (fallback, _sub(1.0, inside)))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -1341,10 +1358,12 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     exp_source = next((x for x in exp_operand.src if x is not exp_factor), None) if exp_factor is not None else None
     exp_scale = float(exp_factor.arg) if exp_factor is not None else None
     is_exp = exp_scale is not None and math.isclose(abs(exp_scale), math.log2(math.e))
-    operand = _parse_alu(exp_source if is_exp and exp_source is not None else u.src[0], output_index, memo)
+    is_pow_base55 = exp_scale is not None and math.isclose(exp_scale, math.log2(5.5), rel_tol=1e-3)
+    operand = _parse_alu(exp_source if (is_exp or is_pow_base55) and exp_source is not None else u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     if is_exp: ret = _exp_expr(_ALUExpr(Ops.MUL, (operand, -1.0))) if cast(float, exp_scale) < 0 else _exp_expr(operand)
-    else: ret = _LUTExpr(RKLUTId.EXP2, (operand,))
+    elif is_pow_base55: ret = _pow_base55_expr(operand)
+    else: ret = _exp2_expr(operand)
   elif u.op is Ops.WHERE:
     cond = _unwrap_same_cast(u.src[0])
     true_u, false_u = (_unwrap_same_cast(x) for x in u.src[1:])
@@ -1422,11 +1441,6 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
                                      store.src[0].dtype) for start in range(0, count, tile))
       return _native(RKDPUProgram(fill_stages))
     return _native(RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),)))
-  if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2:
-    exp_source, base = root.src[0], root
-    positive_inf = _MaskExpr((_sub(exp_source, 65504.0),))
-    negative_inf = _MaskExpr((_sub(-65504.0, exp_source),))
-    root = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
   order:list[_Expr] = []
   def visit(expr:_Expr) -> None:
     for src in expr.src:
@@ -1742,7 +1756,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.ELU1_LOCAL, RKLUTId.ELU01, RKLUTId.ELU01_LOCAL, RKLUTId.SELU, RKLUTId.SELU_LOCAL,
                       RKLUTId.CELU2, RKLUTId.CELU2_LOCAL, RKLUTId.CELU3, RKLUTId.CELU3_LOCAL, RKLUTId.CELU4, RKLUTId.CELU4_LOCAL,
                       RKLUTId.POW8, RKLUTId.POW8_HIGH, RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH,
-                      RKLUTId.POW_NEG55_LOW, RKLUTId.POW_NEG55_HIGH, RKLUTId.POW_NEG55_FAR):
+                      RKLUTId.POW_NEG55_LOW, RKLUTId.POW_NEG55_HIGH, RKLUTId.POW_NEG55_FAR,
+                      RKLUTId.POW_BASE55_LOW, RKLUTId.POW_BASE55_HIGH):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")
