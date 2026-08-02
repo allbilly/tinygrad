@@ -14,11 +14,16 @@ class TestRKImage(unittest.TestCase):
   def test_roundtrip_is_deterministic(self):
     image = RKImage(RKTarget.RK3588, (
       RKStage(RKEngine.DPU, (0x1001000012340040, 0x0081000000180008),
-              (RKReloc(0, 0, RKBufferKind.ARG, 1, addend=64, shift=4, mask=0xfffffff0),), (1,), (0,)),),
+              (RKReloc(0, 0, RKBufferKind.ARG, 1, addend=64, shift=4, mask=0xfffffff0),)),),
       (RKScratch(8192, 4096),), b"constant payload")
     blob = encode_image(image)
     self.assertEqual(decode_image(blob), image)
     self.assertEqual(encode_image(decode_image(blob)), blob)
+
+  def test_sequential_image_has_no_64_stage_cliff(self):
+    stages = tuple(RKStage(RKEngine.DPU, (index,)) for index in range(129))
+    image = RKImage(RKTarget.RK3588, stages)
+    self.assertEqual(decode_image(encode_image(image)), image)
 
   def test_relocation_patches_only_value_field(self):
     command = 0x1001a5a5a5a50040
@@ -30,7 +35,8 @@ class TestRKImage(unittest.TestCase):
     self.assertEqual((patched >> 16) & 0x00fffff0, ((((0x12345000+0x40) >> 4) << 0) & 0x00fffff0))
 
   def test_rejects_malformed_images(self):
-    with self.assertRaises(ValueError): encode_image(RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (1,), dependencies=1),)))
+    bad_reloc = RKReloc(1, 0, RKBufferKind.ARG, 0)
+    with self.assertRaises(ValueError): encode_image(RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, (1,), (bad_reloc,)),)))
     valid = encode_image(RKImage(RKTarget.RK3588, ()))
     for blob in (valid[:-1], valid+b"x", b"NOPE"+valid[4:]):
       with self.assertRaises(ValueError): decode_image(blob)

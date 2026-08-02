@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, mmap, os, time
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
-from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
+from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RKImage, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.rockchip_fallback import RKPY_MAGIC, RKPythonProgram, decode_rkpy
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
@@ -21,8 +21,10 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name = dev, obj.name
-    self.image, self.fallback = None, None
-    self.scratch, self.constants = (), None
+    self.image:RKImage|None = None
+    self.fallback:RKPythonProgram|None = None
+    self.scratch:tuple[HCQBuffer, ...] = ()
+    self.constants:HCQBuffer|None = None
     signature = [{"name": name, "slot": slot, "dtype": dtype.name,
                   "shape": [x if isinstance(x, int) else str(x) for x in shape]} for name,slot,dtype,shape in obj.signature]
     if obj.lib[:4] == RKPY_MAGIC:
@@ -61,6 +63,7 @@ class RockchipProgram(Program['RockchipDevice']):
       record_telemetry("kernel", **self.telemetry, outcome="PASS", duration_ms=elapsed*1e3)
       return elapsed if wait else None
     assert self.image is not None
+    image = self.image
     del global_size, local_size, vals, kwargs
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
@@ -69,12 +72,12 @@ class RockchipProgram(Program['RockchipDevice']):
       if kind is RKBufferKind.SCRATCH:
         if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
         return self._dma(self.scratch[index])
-      if self.constants is None or index >= len(self.image.constants): raise RuntimeError(f"RKImage constant offset {index} is invalid")
+      if self.constants is None or index >= len(image.constants): raise RuntimeError(f"RKImage constant offset {index} is invalid")
       return self._dma(self.constants) + index
 
     start = time.perf_counter()
     try:
-      for stage, commands in zip(self.image.stages, patch_image(self.image, address)):
+      for stage, commands in zip(image.stages, patch_image(image, address)):
         if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
         cmd = self.dev._gpu_alloc(len(commands)*8)
         task = self.dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
