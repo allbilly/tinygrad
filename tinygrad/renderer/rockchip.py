@@ -187,16 +187,26 @@ class RKReject:
   node_op: Ops|None = None
   fingerprint: tuple = ()
 
+class RKLowerKind(Enum):
+  NATIVE = "native"
+  NOT_APPLICABLE = "not_applicable"
+  UNSUPPORTED = "unsupported"
+
 @dataclass(frozen=True)
 class RKLowerResult:
+  kind: RKLowerKind
   plan: RKDPUProgram|RKContract|RKReduce|RKProgram|None = None
   reject: RKReject|None = None
   def __post_init__(self):
-    if (self.plan is None) == (self.reject is None): raise ValueError("RK lowering result must contain exactly one plan or reject")
+    valid = {RKLowerKind.NATIVE:self.plan is not None and self.reject is None,
+             RKLowerKind.NOT_APPLICABLE:self.plan is None and self.reject is None,
+             RKLowerKind.UNSUPPORTED:self.plan is None and self.reject is not None}
+    if not valid[self.kind]: raise ValueError(f"invalid {self.kind.value} Rockchip lowering result")
 
-def _native(plan:RKDPUProgram|RKContract|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(plan=plan)
+def _native(plan:RKDPUProgram|RKContract|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
+def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
-  return RKLowerResult(reject=RKReject(kind, detail, node_op))
+  return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -1646,13 +1656,13 @@ def rk_fingerprint(sink:UOp) -> tuple:
 def lower_reformat_result(sink:UOp) -> RKLowerResult:
   """Lower a static affine movement through atom copies or a sparse CMAC selector."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
-  if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat requires one store", Ops.STORE)
+  if len(stores) != 1: return _not_applicable()
   store = stores[0]
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM:
-    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output is not an indexed parameter", store.src[0].op)
+    return _not_applicable()
   value = _strip_casts(store.src[1])
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2:
-    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat value is not a direct indexed parameter", value.op)
+    return _not_applicable()
   if store.src[0].dtype is not dtypes.half or value.dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires FP16 input and output", store.src[0].op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
@@ -1700,11 +1710,9 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if len(stores) != 1 or len(reductions) != 1:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum requires one store and one reduction", Ops.REDUCE)
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
-  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"DPU reduction operation {reduce.arg[0].name}", reduce.op)
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2: return _not_applicable()
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU sum requires an FP16 output surface", store.src[0].op)
   if store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
@@ -1797,11 +1805,9 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
 def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a small affine FP16 ADD reduction as generated sparse CMAC tiles."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if len(stores) != 1 or len(reductions) != 1:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "affine CMAC requires one store and one reduction", Ops.REDUCE)
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
-  if reduce.arg[0] is not Ops.ADD or not reduce.src[1:]:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"affine CMAC reduction operation {reduce.arg[0].name}", reduce.op)
+  if reduce.arg[0] is not Ops.ADD or not reduce.src[1:]: return _not_applicable()
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine CMAC requires an FP16 output", store.src[0].op)
   stored, scale = _strip_casts(store.src[1]), 1.0
@@ -1849,14 +1855,12 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, f"expected one store, found {len(stores)}", Ops.STORE)
-  if len(reductions) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"expected one reduction, found {len(reductions)}", Ops.REDUCE)
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
   if store.src[0].op is not Ops.INDEX: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "contraction output is not indexed", store.src[0].op)
   if store.src[0].dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"contraction output dtype {store.src[0].dtype.name}", store.src[0].op)
-  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"reduction operation {reduce.arg[0].name}", reduce.op)
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2: return _not_applicable()
   if _strip_casts(store.src[1]).key != reduce.key:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "store epilogue is not a direct reduction", store.src[1].op)
   body, red = _strip_casts(reduce.src[0]), reduce.src[1]
@@ -1916,11 +1920,9 @@ def _pool_hw_shape(extent:int) -> tuple[int, int]|None:
 def lower_reduce_result(sink:UOp) -> RKLowerResult:
   """Recognize global FP16 MAX over the spatial dimensions of a dense HWC8 surface."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
-  if len(stores) != 1 or len(reductions) != 1:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "PPU reduction requires one store and one reduction", Ops.REDUCE)
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
-  if reduce.arg[0] is not Ops.MAX or len(reduce.src) != 2:
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"PPU reduction operation {reduce.arg[0].name}", reduce.op)
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) != 2: return _not_applicable()
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU output is not an indexed parameter surface", store.src[0].op)
   if store.src[0].dtype is not dtypes.half or reduce.dtype is not dtypes.half:
@@ -1947,20 +1949,44 @@ def lower_reduce_result(sink:UOp) -> RKLowerResult:
                     RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
   return _native(RKReduce(out, src, Ops.MAX, red_axis))
 
+@dataclass(frozen=True)
+class RKLowerer:
+  name: str
+  applies: Callable[[tuple[UOp, ...]], bool]
+  lower: Callable[[UOp], RKLowerResult]
+
+def _has_reduction(nodes:tuple[UOp, ...], op:Ops|None=None) -> bool:
+  reductions = tuple(u for u in nodes if u.op is Ops.REDUCE)
+  return bool(reductions) and (op is None or all(u.arg[0] is op for u in reductions))
+
+_LOWERERS = (
+  RKLowerer("dpu", lambda nodes:not _has_reduction(nodes), lower_dpu_result),
+  RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),
+  RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
+  RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
+  RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
+  RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),
+)
+
+_REJECT_PRIORITY = {
+  RKRejectKind.NUMERICAL_CONTRACT:90, RKRejectKind.LUT_DOMAIN_UNPROVEN:85, RKRejectKind.PLAN_STAGE_LIMIT:80,
+  RKRejectKind.UNSUPPORTED_INPUT_DTYPE:70, RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE:70,
+  RKRejectKind.UNALIGNED_ROW:60, RKRejectKind.REQUIRES_REFORMAT:60, RKRejectKind.UNSUPPORTED_DYNAMIC_PACK:60,
+  RKRejectKind.UNSUPPORTED_LAYOUT:50, RKRejectKind.UNSUPPORTED_BROADCAST:50,
+  RKRejectKind.UNSUPPORTED_REDUCTION:40, RKRejectKind.UNSUPPORTED_CONTRACTION:40, RKRejectKind.UNSUPPORTED_ALU:30,
+}
+
 def lower_native(sink:UOp) -> RKLowerResult:
-  if any(u.op is Ops.REDUCE for u in sink.toposort()):
-    add, affine = lower_add_reduce_result(sink), lower_affine_reduce_result(sink)
-    pool, contract = lower_reduce_result(sink), lower_contract_result(sink)
-    result = add if add.reject is None else affine if affine.reject is None else pool if pool.reject is None or contract.reject is not None and any(
-      u.op is Ops.REDUCE and u.arg[0] is Ops.MAX for u in sink.toposort()) else contract
-  else:
-    result = lower_dpu_result(sink)
-    if result.reject is not None:
-      reformat = lower_reformat_result(sink)
-      if reformat.reject is None: result = reformat
-  if result.reject is None: return result
-  reject = result.reject
-  return RKLowerResult(reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
+  nodes, rejects = tuple(sink.toposort()), []
+  for lowerer in _LOWERERS:
+    result = lowerer.lower(sink) if lowerer.applies(nodes) else _not_applicable()
+    if result.kind is RKLowerKind.NATIVE: return result
+    if result.kind is RKLowerKind.UNSUPPORTED:
+      assert result.reject is not None
+      rejects.append(result.reject)
+  if not rejects: rejects.append(RKReject(RKRejectKind.UNSUPPORTED_ALU, "no Rockchip lowerer applies", sink.op))
+  reject = max(enumerate(rejects), key=lambda item:(_REJECT_PRIORITY[item[1].kind], item[0]))[1]
+  return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801

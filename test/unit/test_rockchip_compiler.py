@@ -4,7 +4,7 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKProgram, RKReduce,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKLowerKind, RKProgram, RKReduce,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
   lower_reformat_result, rk_fingerprint)
@@ -638,6 +638,10 @@ class TestDPUCompiler(unittest.TestCase):
              (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
+
+  def test_unrelated_lowerer_returns_not_applicable(self):
+    result = lower_reformat_result(sink(Tensor.empty(16,dtype=dtypes.half).sin()))
+    self.assertEqual((result.kind, result.plan, result.reject), (RKLowerKind.NOT_APPLICABLE, None, None))
 
   def test_typed_reject_has_stable_slot_independent_fingerprint(self):
     expressions = [Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half) for _ in range(2)]

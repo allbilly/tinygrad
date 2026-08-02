@@ -34,6 +34,12 @@ declared once at program scope, and each typed DPU, CMAC, or PPU step is emitted
 in order with constants and relocations remapped centrally. The former fixed
 CMAC-prefix/DPU/main-CMAC/CMAC-suffix pipeline no longer constrains composition.
 
+Lowering uses six named ordered passes for DPU arithmetic, affine reformat,
+global sum, affine reduction, PPU reduction, and contraction. Every pass returns
+exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
+cannot overwrite a useful reject, while applicable failures are ranked by
+specificity before telemetry is emitted.
+
 The frozen `rockchip-2607` branch is a behavioral and register oracle, not
 evidence that all of its 425 passing methods ran on the NPU. Its later runtime
 contains NumPy-backed `_run_host_*` implementations for generic elementwise and
@@ -123,8 +129,8 @@ sub-atom DPU preparation followed by sparse CMAC.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,208, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,208 lines.
-The exact 2,240-line delta is 2,235 counted Rockchip backend lines (2,075
+contains 27,229, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,229 lines.
+The exact 2,261-line delta is 2,256 counted Rockchip backend lines (2,096
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

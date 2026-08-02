@@ -344,6 +344,16 @@ pass, Ruff and mypy are clean, and the complete strict hardware suite remains
 46 tests plus 27 subtests in 358.01 seconds. No lowering capability or command
 semantics changed in this representation milestone.
 
+The next compiler milestone replaces the nested lowering-selection expression
+with six named ordered passes. `RKLowerResult` now has explicit `NATIVE`,
+`NOT_APPLICABLE`, and `UNSUPPORTED` states. A pass returns not-applicable when
+the graph is outside its family—for example, affine reformat no longer claims
+a SIN expression merely because its value is not a direct index. Applicable
+rejects use a declared specificity order before fingerprinted telemetry is
+recorded. Sixty-three compiler/image/native-program tests pass, Ruff and mypy
+are clean, and the complete strict hardware suite remains 46 tests plus 27
+subtests in 358.94 seconds. This clarity costs 21 counted compiler lines.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);
