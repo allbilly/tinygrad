@@ -72,6 +72,25 @@ The exact XML is preserved at
 The restored wide fills are a fill-only capability and do not claim general
 FP32 or integer arithmetic support.
 
+At `e133b0a5b`, the first complete version-1 telemetry census reproduced the
+same raw pytest result in 441.61 seconds and classified all 425 methods:
+
+| Coverage outcome | Methods |
+|---|---:|
+| `PASS_NATIVE` | 83 |
+| `PASS_FRONTEND` | 40 |
+| `FAIL` | 289 |
+| `SKIP_UPSTREAM` | 13 |
+
+All 126 explicitly reported unittest subcases currently fail. The run executed
+225 kernels, all successfully through `RK_DPU`, and observed 389 compiler
+rejects: 213 contraction, 97 dtype, 72 layout, and 7 operation rejects. The
+maximum native image has 64 stages. The durable report is
+`~/rk2608_backups/research-full-telemetry-fixed-20260802-101118/test_ops_coverage.json`
+(SHA-256 `ca5e3517a10065929d9dd174b680fcdfea2abef8fff2b129278ba0849c560d04`);
+the matching JUnit XML has SHA-256
+`fb40a6ed08aa4a29d78bad38f9c8b1f3fa284e67a1565448572765679b1e55f8`.
+
 ## Historical pytest-summary censuses
 
 The older tables below predate method-aware JUnit parsing. They are preserved
