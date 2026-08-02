@@ -165,12 +165,12 @@ def temp(x:str, append_user:bool=False) -> str:
 def stderr_log(msg:str): print(msg, end='', file=sys.stderr, flush=True)
 
 class Context(contextlib.ContextDecorator):
-  def __init__(self, **kwargs): self.kwargs = kwargs
+  def __init__(self, **kwargs): self.kwargs, self._old_contexts = kwargs, []
   def __enter__(self):
-    self.old_context:dict[str, Any] = {k: ContextVar._cache[k].value for k in self.kwargs}
+    self._old_contexts.append({k: ContextVar._cache[k].value for k in self.kwargs})
     for k,v in self.kwargs.items(): ContextVar._cache[k].value = v
   def __exit__(self, *args):
-    for k,v in self.old_context.items(): ContextVar._cache[k].value = v
+    for k,v in self._old_contexts.pop().items(): ContextVar._cache[k].value = v
 
 class ContextVar(Generic[T]):
   _cache: ClassVar[dict[str, ContextVar]] = {}

@@ -78,6 +78,16 @@ class TestContextVars(unittest.TestCase):
     test()
     self.assertEqual(VARIABLE.value, 0)
 
+  def test_recursive_decorator(self):
+    decorator = Context(VARIABLE=1)
+    @decorator
+    def recursive(depth):
+      self.assertEqual(VARIABLE.value, 1)
+      if depth: recursive(depth-1)
+      self.assertEqual(VARIABLE.value, 1)
+    recursive(2)
+    self.assertEqual(VARIABLE.value, 0)
+
   def test_context_exit_reverts_updated_values(self):
     D = ContextVar("D", 1)
     D.value = 2
