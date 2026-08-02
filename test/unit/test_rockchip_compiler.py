@@ -825,6 +825,17 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertGreaterEqual(sum(isinstance(step, RKContract) for step in result.plan.steps), 2)
       self.assertFalse(contains_uop(result.plan))
 
+  def test_short_scalar_product_gathers_lanes_into_aligned_atoms(self):
+    product_input = Tensor.empty(9,dtype=dtypes.half).realize()
+    result = lower_native(sink(product_input.prod()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    image = emit_program(result.plan)
+    self.assertEqual(sum(stage.engine is RKEngine.CMAC for stage in image.stages), 9)
+    self.assertLessEqual(sum(stage.engine is RKEngine.DPU for stage in image.stages), 12)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_masked_affine_prefix_sum_uses_empty_selector_entries(self):
     plan = lower_affine_reduce_result(sink(Tensor.empty(10,dtype=dtypes.half).cumsum(0))).plan
     self.assertIsInstance(plan, RKProgram)

@@ -1449,3 +1449,23 @@ inferred native total is 141 after the current 137-pass census, pending the next
 complete run. The research tree has 28,064 counted lines. Pre-change sources
 are preserved under
 `~/rk2608_backups/nested-sum-before-2d2c0410c-20260803`.
+
+Short scalar FP16 MUL reductions now use explicit physical lane
+materialization. The source is padded once in NPU scratch; each logical lane
+is selected by CMAC into a separate addressable atom, and DPU MUL stages fold
+those atoms in source order. This avoids the disproven assumption that a
+sub-16-byte relocation addend can select a lane. Extents 2–32 are admitted;
+larger or non-dense products remain typed rejects until a logarithmic native
+scan/reformat plan is available.
+
+Complete `test_const_reduce` now passes natively: its fill, SUM, MUL, and MAX
+kernels all execute through RKImage tasks. The nine-lane product plan contains
+21 stages (9 CMAC and 12 DPU), 16,560 constant bytes, and 816 scratch bytes.
+Focused hardware coverage also checks three- and nine-lane products, including
+a nonconstant finite sequence. All 90 host tests, repository-wide Ruff, and
+mypy over 225 tinygrad modules pass; the strict hardware suite passes 69 tests
+plus 50 subtests in 625.15 seconds with `ROCKCHIP_FALLBACK=0`. The inferred
+native total is 142 after the current 137-pass census, pending the next complete
+run. The research tree has 28,108 counted lines. Pre-change sources are
+preserved under
+`~/rk2608_backups/scalar-product-before-fe251d06d-20260803`.

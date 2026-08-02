@@ -85,6 +85,8 @@ are eligible to be ported as native capabilities.
 - two-level scalar ADD reductions whose affine axes form a proven dense input
   bijection, executed as ordered CMAC plans with the intermediate FP16 rounding
   boundary preserved in NPU scratch;
+- dense scalar FP16 MUL reductions of 2–32 values, with every logical lane
+  materialized into an addressable NPU atom before source-order DPU folding;
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
   hardware-packed weights and a single FP32 accumulation;
 - global ReLU-sum through a DPU MAX-zero prepass and the same direct CMAC;
@@ -282,6 +284,12 @@ rounding and makes all three `test_sum_twice` variants native. The strict suite
 expands to 68 tests plus 47 subtests, and the inferred native total is 141 after
 the current 137-pass census.
 
+Short scalar products subsequently use CMAC lane selection to obey the DPU's
+16-byte source-address granularity, followed by source-order DPU MUL stages.
+No host gather or arithmetic participates. Complete `test_const_reduce` is
+native, the strict suite expands to 69 tests plus 50 subtests, and the inferred
+native total is 142 after the current 137-pass census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -292,8 +300,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,064, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,064 lines.
-The exact 3,096-line delta is 3,091 counted Rockchip backend lines (2,931
+contains 28,108, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,108 lines.
+The exact 3,140-line delta is 3,135 counted Rockchip backend lines (2,975
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

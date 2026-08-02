@@ -642,6 +642,51 @@ def lower_nested_add_reduce_result(sink:UOp) -> RKLowerResult:
       f"nested ADD needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", outer.op)
   return _native(completed)
 
+def lower_scalar_mul_reduce_result(sink:UOp) -> RKLowerResult:
+  """Reduce one short dense FP16 surface by gathering each lane into an addressable NPU atom, then multiplying in source order."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1 or reductions[0].arg[0] is not Ops.MUL: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
+     store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "scalar MUL reduction requires one FP16 output", store.src[0].op)
+  value = _strip_casts(reduce.src[0])
+  if len(reduce.src) != 2 or reduce.src[1].op is not Ops.RANGE or reduce.src[1].src[0].op is not Ops.CONST or \
+     value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "scalar MUL reduction requires one direct FP16 surface", reduce.op)
+  count, source_map = int(reduce.src[1].src[0].arg), _affine(value.src[1])
+  if not 2 <= count <= 32:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"scalar MUL extent {count} is outside 2..32", reduce.op)
+  if int(value.src[0].src[0].arg) != count or source_map != ({reduce.src[1].arg[0]:1}, 0):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "scalar MUL source is not one dense reduction axis", value.op)
+  packed = RKArg(RKBufferKind.SCRATCH, 0)
+  scratch:tuple[RKScratch, ...] = (RKScratch(64),)
+  steps:list[RKDPUProgram|RKContract|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, 32),
+    RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, value.src[0].arg.slot), 0.0, count)), scratch)]
+  operands:list[RKArg] = []
+  for index in range(count):
+    operand = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(64),)
+    gathered = _windowed_cmac_pipeline(operand, packed, [[index]], scratch=scratch, direct_count=32)
+    if gathered is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "scalar MUL lane gather exceeds plan limits", reduce.op)
+    steps.extend(gathered.steps)
+    scratch = gathered.scratch
+    operands.append(operand)
+  output, accumulator = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), operands[0]
+  multiplies:list[RKDPUStage] = []
+  for index,operand in enumerate(operands[1:], 1):
+    final = index == len(operands)-1
+    destination = output if final else RKArg(RKBufferKind.SCRATCH, len(scratch))
+    if not final: scratch += (RKScratch(16),)
+    multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, 1))
+    accumulator = destination
+  completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
+  cost = _plan_cost(completed)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"scalar MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
+  return _native(completed)
+
 def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output_index:UOp, output:RKArg, reduced:RKArg,
                                output_count:int, out_axes:tuple[int, ...], ranges:dict[int, int]) -> RKLowerResult:
   """Materialize static pointwise operands and execute a reduction epilogue entirely on NPU engines."""
@@ -1242,6 +1287,7 @@ _LOWERERS = (
   RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),
   RKLowerer("nested_sum", lambda nodes:_has_reduction(nodes, Ops.ADD) and sum(u.op is Ops.REDUCE for u in nodes) > 1,
             lower_nested_add_reduce_result),
+  RKLowerer("scalar_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_scalar_mul_reduce_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
