@@ -10,9 +10,9 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
     np.testing.assert_equal(actual, data.astype(np.float32).sum(axis=1).astype(np.float16))
 
-  def test_power_of_two_fp16_sum_native_dpu(self):
+  def test_contiguous_fp16_sum_native_dpu_cmac(self):
     rng = np.random.default_rng(4)
-    for count in (2, 16, 16384):
+    for count in (2, 16, 60, 135, 720, 16384):
       with self.subTest(count=count):
         data = rng.uniform(-0.5, 0.5, count).astype(np.float16)
         actual = Tensor(data, device="ROCKCHIP").realize().sum().realize().item()

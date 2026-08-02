@@ -40,11 +40,13 @@ as an immutable constant, while the user input remains a directly addressed
 rounded to FP16. Neither compilation nor execution performs host packing or
 host arithmetic; unsupported row widths continue to reject.
 
-Contiguous power-of-two FP16 global sums now use a typed `RKSumProgram`. DPU
-pairwise stages reduce only while the second half begins at a 16-byte address;
-the remaining 1–8 lanes are copied into an aligned scratch atom and a masked
-K32 CMAC produces the scalar. The four repeated CMAC weight rows are immutable
-`[1...1,0...0]` image constants, so no invocation-time packing occurs.
+Contiguous FP16 global sums now use a typed `RKSumProgram`. The compiler splits
+an arbitrary extent into descending power-of-two blocks. DPU pairwise stages
+reduce each block only while the second half begins at a 16-byte address; the
+remaining aligned runs are copied into one scratch surface and a masked K32
+CMAC produces the scalar. The four repeated CMAC weight rows are immutable
+`[1...1,0...0]` image constants, so no invocation-time packing occurs. Plans
+whose block decomposition needs more than 32 final terms reject explicitly.
 
 The initial all-DPU tree was an important rejected probe: both values of a
 two-element input were read from lane zero, producing `2*x[0]`. Disabling both
@@ -52,9 +54,14 @@ disk and schedule caches reproduced the result. It proves that DPU
 `EW_BASE_ADDR` cannot select a sub-16-byte lane through a relocation addend;
 ordinary tensor buffer views that start at an offset are a different ABI case.
 The committed planner consequently never emits such a relocation. Strict
-hardware tests cover lengths 2, 16, and 16,384, and the complete device suite
-passes 41 tests plus 14 subtests. The unchanged official `test_sum_simple` and
-`test_sum_full` methods both pass with `ROCKCHIP_FALLBACK=0`.
+hardware tests cover lengths 2, 16, 60, 135, 720, and 16,384. The unchanged
+official `test_sum_simple`, `test_sum_full`, `test_sum`, `test_sum_relu`,
+`test_sum_tiny`, `test_mean`, and `test_mean_axis` methods pass with
+`ROCKCHIP_FALLBACK=0`. `test_sum_twice` reaches native execution but remains a
+numerical failure: its first subcase differs from Torch by one FP16 ULP near
+0.194, outside the default relative tolerance. No tolerance was changed.
+The uncached strict device suite passes 41 tests plus 17 subtests after this
+generalization.
 
 The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,
@@ -64,13 +71,14 @@ permute, expand, and flip. A movement rejects when an output atom maps to
 strided source elements or crosses a source-run boundary (for example an 8x8
 scalar transpose), rather than silently using host gather.
 
-Hardware isolation subsequently showed that DPU `SRC_BASE_ADDR` honors FP16
-sub-atom offsets with the normal ERDMA configuration; offsets 1 through 7 and
-a three-element tail pass strict device tests. The reformat planner therefore
-accepts a contiguous source run beginning at any FP16 lane, while each output
-task must still begin at an aligned destination atom. Enabling the separate
-`ERDMA_NONALIGN` bit was rejected: it caused ordinary two-input DPU arithmetic
-to time out and is not part of the committed path.
+Earlier slice tests appeared to show that DPU `SRC_BASE_ADDR` honors FP16
+sub-atom relocation addends. The reduction probe separates two cases: a GEM
+buffer view bound at an offset works, while adding two bytes to an already
+bound DMA address reads lane zero. The reformat planner now requires aligned
+source and destination atoms and rejects the latter representation. Real
+offset buffer views still pass lengths 1, 2, 3, and 8 on hardware. Enabling the
+separate `ERDMA_NONALIGN` bit was also rejected: it caused ordinary two-input
+DPU arithmetic to time out and is not part of the committed path.
 
 An independent unaligned-destination probe also timed out on the first
 official flip shape. Its exact planner diff and failure are preserved as

@@ -46,8 +46,8 @@ are eligible to be ported as native capabilities.
   input is already stored as `(N, 32)`;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
-- contiguous power-of-two FP16 global sums through aligned DPU partials and a
-  masked K32 CMAC tail;
+- contiguous FP16 global sums whose power-of-two block decomposition fits a
+  32-term aligned DPU/CMAC plan;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 

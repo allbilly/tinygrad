@@ -45,9 +45,8 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(all(isinstance(plan, RKDPUProgram) for plan in plans))
     self.assertEqual(tuple(len(plan.stages) for plan in plans), (6, 5, 2))
     self.assertIsNotNone(lower_reformat_result(sink(Tensor.empty(8,8,dtype=dtypes.half).T.contiguous())).reject)
-    sliced = lower_reformat_result(sink(Tensor.empty(24,dtype=dtypes.half)[1:17].clone())).plan
-    self.assertIsInstance(sliced, RKDPUProgram)
-    self.assertEqual((len(sliced.stages), sliced.stages[0].lhs.addend, sliced.stages[0].count), (1, 2, 16))
+    sliced = lower_reformat_result(sink(Tensor.empty(24,dtype=dtypes.half)[1:17].clone()))
+    self.assertIs(sliced.reject.kind, RKRejectKind.UNALIGNED_ROW)
 
   def test_add_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
@@ -532,7 +531,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(image.stages[0].relocs[0].kind, RKBufferKind.CONSTANT)
     self.assertEqual(decode_image(encode_image(image)), image)
 
-  def test_power_of_two_global_sum_is_dpu_tree(self):
+  def test_global_sum_is_aligned_dpu_cmac_tree(self):
     result = lower_add_reduce_result(sink(Tensor.empty(16384,dtype=dtypes.half).sum()))
     self.assertIsInstance(result.plan, RKSumProgram)
     plan = result.plan
@@ -543,8 +542,9 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_sum(plan)
     self.assertEqual((len(image.stages), {stage.engine for stage in image.stages}), (13, {RKEngine.DPU,RKEngine.CMAC}))
     self.assertEqual(decode_image(encode_image(image)), image)
-    rejected = lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum()))
-    self.assertIs(rejected.reject.kind, RKRejectKind.UNSUPPORTED_REDUCTION)
+    self.assertIsInstance(lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum())).plan, RKSumProgram)
+    rejected = lower_add_reduce_result(sink(Tensor.empty(255,dtype=dtypes.half).sum()))
+    self.assertIs(rejected.reject.kind, RKRejectKind.PLAN_STAGE_LIMIT)
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)

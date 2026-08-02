@@ -1622,6 +1622,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   dst = 0
   while dst < count:
     valid, src = min(8, count-dst), mapping[dst]
+    if src % 8:
+      return _unsupported(RKRejectKind.UNALIGNED_ROW, f"movement source atom begins at element {src}", Ops.INDEX)
     if mapping[dst:dst+valid] != list(range(src, src+valid)):
       return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement breaks FP16 destination atom at element {dst}", Ops.INDEX)
     length = valid
@@ -1634,7 +1636,7 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   return _native(RKDPUProgram(tuple(stages)))
 
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
-  """Lower a dense power-of-two FP16 global sum through aligned DPU stages and one CMAC tail."""
+  """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1:
     return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum requires one store and one reduction", Ops.REDUCE)
@@ -1651,24 +1653,39 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half or red.op is not Ops.RANGE:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "DPU sum input is not one direct FP16 surface", reduce.op)
   count, src_aff = int(red.src[0].arg), _affine(value.src[1])
-  if count < 2 or count > 65536 or count & (count-1):
-    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"DPU sum requires a power-of-two extent, got {count}", red.op)
+  if not 2 <= count <= 65536:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, f"DPU sum extent {count} is outside 2..65536", red.op)
   if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one dense reduction axis", value.op)
-  output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  output, input_arg = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  blocks:list[tuple[int, int]] = []
+  remaining, start = count, 0
+  while remaining:
+    block = 1 << (remaining.bit_length()-1)
+    blocks.append((start, block))
+    start, remaining = start+block, remaining-block
+  term_count = sum(min(block, 8) for _,block in blocks)
+  if term_count > 32:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"DPU sum needs {term_count} aligned CMAC terms", red.op)
   stages:list[RKDPUStage] = []
   scratch:list[RKScratch] = []
-  while count > 8:
-    half = count//2
-    rhs = RKArg(source.kind, source.index, source.addend+half*2)
-    dst = RKArg(RKBufferKind.SCRATCH, len(scratch))
-    stages.append(RKALUStage(Ops.ADD, dst, source, rhs, half))
-    scratch.append(RKScratch(((half+7)//8)*16))
-    source, count = dst, half
+  runs:list[tuple[RKArg, int]] = []
+  for start,block in blocks:
+    source, block_count = RKArg(input_arg.kind, input_arg.index, start*2), block
+    while block_count > 8:
+      half = block_count//2
+      dst = RKArg(RKBufferKind.SCRATCH, len(scratch))
+      stages.append(RKALUStage(Ops.ADD, dst, source, RKArg(source.kind, source.index, source.addend+half*2), half))
+      scratch.append(RKScratch(((half+7)//8)*16))
+      source, block_count = dst, half
+    runs.append((source, block_count))
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
-  stages.append(RKALUStage(Ops.ADD, packed, source, 0.0, count))
   scratch.append(RKScratch(64))
-  mask = struct.pack("<e", 1.0)*count + struct.pack("<e", 0.0)*(32-count)
+  term_offset = 0
+  for source,run_count in runs:
+    stages.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, term_offset*2), source, 0.0, run_count))
+    term_offset += run_count
+  mask = struct.pack("<e", 1.0)*term_count + struct.pack("<e", 0.0)*(32-term_count)
   constants = mask*4
   out_ref = RKTensorRef(output, RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31))))
   contract = RKContract(out_ref, _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH),
