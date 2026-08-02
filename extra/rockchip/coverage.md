@@ -1100,3 +1100,24 @@ Ruff and mypy pass, as do all 72 host tests and the strict RK3588 suite (55
 tests plus 37 subtests) in 448.85 seconds with `ROCKCHIP_FALLBACK=0`. The
 research tree now has 27,664 counted lines, including 2,531 in the Rockchip
 renderer/compiler. A complete census must be restarted from this bounded head.
+
+The complete uncached census at `ff4a13dd7` confirms 122 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 250 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods.
+Five methods move from failure to native pass: `test_asymmetric_padding_conv1d`,
+`test_asymmetric_padding_conv2d`, `test_conv2d_bs_1_cin_1`,
+`test_negative_padding_conv2d`, and `test_small_gemm_padded`; no prior native
+method regresses. Pytest reports 180 passed, 324 failed, 13 skipped, and 34
+passing subtests in 1,374.25 seconds. There are no device timeouts, allocation
+failures, or invalid submissions. The former 44-instance exact reject
+`affine CMAC input is not one FP16 pointwise surface` falls to four. First-
+reject classifications for failed methods are now 62 unsupported-output-dtype,
+51 plan-limit, 44 unsupported-layout, 37 requires-reformat, 24 unsupported-ALU,
+22 unsupported-input-dtype, 4 unsupported-reduction, and 6 numerical/frontend
+failures without a native reject. The most expensive passing kernels remain
+correctness fallbacks: 364 stages/0.85 MiB/38.9 seconds for
+`test_broadcasted_add_2` and 362 stages/1.00 MiB/38.7 seconds for
+`test_padding_add`. The durable JSON is
+`~/rk2608_backups/census-contract-bounded-ff4a13dd7/test_ops_coverage.json`
+(SHA-256 `f2dc9a3c75da906fbd1365ab835b1161fdc1009455c37b6f6fffae10e2cd66b3`);
+JUnit XML SHA-256 is
+`429581e362977ac1983c07f328ce4757f9d4736d4edb13f3997c05bf1886cafe`.

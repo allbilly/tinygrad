@@ -134,21 +134,15 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
-The current committed strict census at `d2af3b3d9` contains 117 native passes,
-40 frontend-only passes, 255 failures, and 13 upstream skips across exactly 425
+The current committed strict census at `ff4a13dd7` contains 122 native passes,
+40 frontend-only passes, 250 failures, and 13 upstream skips across exactly 425
 methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
-regressed. The latest complete-method gain is `test_padding_add`, implemented
-through bounded zero-masked affine materialization and generic DPU arithmetic.
-Static conditional FP16 `tril`/`triu` subcases are also native, while their
-explicit boolean-output subcases remain honest dtype rejections.
-
-The subsequent focused multi-axis contraction milestone passes all six
-`test_conv2d_bs_1_cin_1` subcases natively. It is not yet folded into the
-117-pass census; larger contraction packs remain typed plan-limit rejects when
-their generated constant BO would exceed the proven 2 MiB allocation ceiling.
-Static zero-masked contraction inputs subsequently add complete native
-`test_asymmetric_padding_conv1d` coverage; that gain is also pending the next
-full census.
+regressed. The latest five complete-method gains are asymmetric-padding 1D and
+2D convolution, `conv2d_bs_1_cin_1`, negative-padding 2D convolution, and
+padded small GEMM. Larger contraction packs remain typed plan-limit rejects
+when they exceed the 2 MiB constant allocation or affine-analysis budgets.
+Static conditional FP16 `tril`/`triu` subcases are native, while their explicit
+boolean-output subcases remain honest dtype rejections.
 
 Tiled contraction legality is checked before coordinate enumeration: K,
 source extents, and at most 65,536 affine output/reduction visits bound compiler
