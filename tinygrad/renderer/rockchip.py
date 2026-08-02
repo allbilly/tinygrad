@@ -842,6 +842,21 @@ def _pow_negative_base55_expr(source:_Expr|RKArg) -> _Expr:
   valid = _sub(1.0, noninteger)
   return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (_pow_base55_expr(source), sign)), _ALUExpr(Ops.FDIV, (valid, valid))))
 
+def _pow_base8_expr(source:_Expr|RKArg) -> _Expr:
+  """Evaluate 8**x with four Q15 output-scale bands and native EXP2 outside [-2,2]."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  above_negative_one, above_zero, above_one = positive(source, -1.0), positive(source, 0.0), positive(source, 1.0)
+  bands:tuple[_Value,_Value,_Value,_Value] = (_sub(1.0, above_negative_one), _sub(above_negative_one, above_zero),
+    _sub(above_zero, above_one), above_one)
+  tables = tuple(_LUTExpr(lut, (source,)) for lut in
+    (RKLUTId.POW_BASE8_FAR_LOW, RKLUTId.POW_BASE8_LOW, RKLUTId.POW_BASE8_HIGH, RKLUTId.POW_BASE8_FAR_HIGH))
+  terms = tuple(_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (table, decode)), band)) for table,decode,band in
+    zip(tables, (.125, 1.0, 8.0, 64.0), bands))
+  corrected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (terms[0], terms[1])), _ALUExpr(Ops.ADD, (terms[2], terms[3]))))
+  inside = _ALUExpr(Ops.MUL, (positive(source, -2.001953125), positive(2.001953125, source)))
+  fallback = _exp2_expr(_ALUExpr(Ops.MUL, (source, 3.0)))
+  return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (corrected, inside)), _ALUExpr(Ops.MUL, (fallback, _sub(1.0, inside)))))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -1389,10 +1404,12 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     exp_scale = float(exp_factor.arg) if exp_factor is not None else None
     is_exp = exp_scale is not None and math.isclose(abs(exp_scale), math.log2(math.e))
     is_pow_base55 = exp_scale is not None and math.isclose(exp_scale, math.log2(5.5), rel_tol=1e-3)
-    operand = _parse_alu(exp_source if (is_exp or is_pow_base55) and exp_source is not None else u.src[0], output_index, memo)
+    is_pow_base8 = exp_scale is not None and math.isclose(exp_scale, 3.0, rel_tol=1e-3)
+    operand = _parse_alu(exp_source if (is_exp or is_pow_base55 or is_pow_base8) and exp_source is not None else u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
     if is_exp: ret = _exp_expr(_ALUExpr(Ops.MUL, (operand, -1.0))) if cast(float, exp_scale) < 0 else _exp_expr(operand)
     elif is_pow_base55: ret = _pow_base55_expr(operand)
+    elif is_pow_base8: ret = _pow_base8_expr(operand)
     else: ret = _exp2_expr(operand)
   elif u.op is Ops.WHERE:
     cond = _unwrap_same_cast(u.src[0])
@@ -1787,7 +1804,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.CELU2, RKLUTId.CELU2_LOCAL, RKLUTId.CELU3, RKLUTId.CELU3_LOCAL, RKLUTId.CELU4, RKLUTId.CELU4_LOCAL,
                       RKLUTId.POW8, RKLUTId.POW8_HIGH, RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH,
                       RKLUTId.POW_NEG55_LOW, RKLUTId.POW_NEG55_HIGH, RKLUTId.POW_NEG55_FAR,
-                      RKLUTId.POW_BASE55_LOW, RKLUTId.POW_BASE55_HIGH):
+                      RKLUTId.POW_BASE55_LOW, RKLUTId.POW_BASE55_HIGH, RKLUTId.POW_BASE8_FAR_LOW,
+                      RKLUTId.POW_BASE8_LOW, RKLUTId.POW_BASE8_HIGH, RKLUTId.POW_BASE8_FAR_HIGH):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

@@ -332,6 +332,16 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(all="ignore"): expected = np.power(np.float32(-5.5), data.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_constant_base_pow8_four_generated_bands(self):
+    encodings = np.arange(1 << 16, dtype=np.uint16)
+    all_half = encodings.view(np.float16)
+    data = all_half[np.isfinite(all_half) & (all_half >= -2) & (all_half <= 2)]
+    special = np.array([-np.inf, np.inf, np.nan], dtype=np.float16)
+    for values in (data, special):
+      actual = (8.0**Tensor(values, device="ROCKCHIP").realize()).realize().numpy()
+      with np.errstate(all="ignore"): expected = np.power(np.float32(8.0), values.astype(np.float32)).astype(np.float16)
+      np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_linear_sigmoid_workload(self):
     rng = np.random.default_rng(2)
     a_np = rng.uniform(-0.25, 0.25, (1,32)).astype(np.float16)

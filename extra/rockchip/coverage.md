@@ -108,6 +108,15 @@ error 15 in the generic path). The method remains `FAIL`; no census gain is
 claimed. `sz.py` reports 1,807 counted renderer lines and 26,940 repository
 lines overall at this milestone.
 
+Constant-base `8.0**x` now uses four generated Q15 output-scale bands and a
+generic native EXP2 fallback. All 32,770 finite FP16 encodings in `[-2,2]`
+plus infinities and NaN pass exhaustive RK3588 comparison. The official
+method passes this subcase and every following square/base-two tensor and
+scalar case, then reaches only the final `0**x` float-input special case. The
+method remains `FAIL`; no census gain is claimed. `sz.py` reports 1,823
+counted renderer lines and 26,956 repository lines overall. The 306 new
+autogen payload lines are excluded; net counted compiler growth is 16 lines.
+
 Run the census serially on RK3588:
 
 ```sh
@@ -626,6 +635,7 @@ failures.
 | Shifted multirange negative POW5.5 | `test_pow_const` negative-5.5 subcase; method still fails at constant-base 5.5 | Not yet |
 | Split-range constant-base POW5.5 | `test_pow_const` constant-base 5.5 subcase; method still fails at negative base | Not yet |
 | Native roundoff parity for negative-base POW5.5 | `test_pow_const` negative-base 5.5 subcase; method still fails at constant-base 8 | Not yet |
+| Four generated Q15 bands for constant-base POW8 | `test_pow_const` constant-base 8 subcase; method still fails at zero-base float semantics | Not yet |
 
 The historical wide-fill milestone wrote the requested dtype directly through
 DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage

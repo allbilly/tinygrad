@@ -212,6 +212,12 @@ pow_base55_low = [max(-32768, min(32767, round(5.5**min(signed_sample(table, i, 
                   for table in range(2) for i in range(SIZE)]
 pow_base55_high = [max(-32768, min(32767, round(5.5**max(signed_sample(table, i, POW_BASE55_STEP), 0.0)/32*32768)))
                    for table in range(2) for i in range(SIZE)]
+POW_BASE8_SCALE, POW_BASE8_STEP = 8192.0, 32.0/8192.0
+POW_BASE8_BANDS = ((-2.0,-1.0,8.0), (-1.0,0.0,1.0), (0.0,1.0,1/8), (1.0,2.0,1/64))
+def pow_base8_table(low:float, high:float, encode:float) -> list[int]:
+  return [max(-32768, min(32767, round(8.0**max(low, min(high, signed_sample(table, i, POW_BASE8_STEP)))*encode*32768)))
+          for table in range(2) for i in range(SIZE)]
+pow_base8_far_low, pow_base8_low, pow_base8_high, pow_base8_far_high = (pow_base8_table(*band) for band in POW_BASE8_BANDS)
 def digest(values:list[int]) -> str: return hashlib.sha256(struct.pack(f"<{len(values)}h", *values)).hexdigest()
 def half(value:float) -> float: return struct.unpack("<e", struct.pack("<e", value))[0]
 errors = []
@@ -371,6 +377,15 @@ for bits in range(1 << 16):
   else:
     got = half(interpolate(pow_base55_high, POW_BASE55_STEP, 32768, x)*32)
     pow_base55_high_errors.append((abs(got-reference), abs(got-reference)/reference))
+pow_base8_errors:list[list[tuple[float,float]]] = [[] for _ in POW_BASE8_BANDS]
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x) or not -2 <= x <= 2: continue
+  band = min(3, max(0, math.floor(x)+2))
+  decode = (1/8, 1, 8, 64)[band]
+  got = half(interpolate((pow_base8_far_low, pow_base8_low, pow_base8_high, pow_base8_far_high)[band], POW_BASE8_STEP, 32768, x)*decode)
+  reference = 8.0**x
+  pow_base8_errors[band].append((abs(got-reference), abs(got-reference)/reference))
 asinh_errors, acosh_errors = [], []
 for bits in range(1 << 16):
   x = struct.unpack("<e", struct.pack("<H", bits))[0]
@@ -588,7 +603,11 @@ class RKLUTId(IntEnum):
   POW_NEG55_FAR = 66
   POW_BASE55_LOW = 67
   POW_BASE55_HIGH = 68
-RK_LUT_SCHEMA = 55
+  POW_BASE8_FAR_LOW = 69
+  POW_BASE8_LOW = 70
+  POW_BASE8_HIGH = 71
+  POW_BASE8_FAR_HIGH = 72
+RK_LUT_SCHEMA = 56
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -1053,5 +1072,16 @@ RK_LUT_POW_BASE55_HIGH_MINUS_EXP = 15
 RK_LUT_POW_BASE55_HIGH_VERIFIED_INPUTS = {len(pow_base55_high_errors)}
 RK_LUT_POW_BASE55_HIGH_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow_base55_high_errors)!r}
 RK_LUT_POW_BASE55_HIGH_SIM_MAX_REL_ERROR = {max(x[1] for x in pow_base55_high_errors)!r}
-RK_LUT_POW_BASE55_HIGH = (\n{rows(pow_base55_high)}\n)\n'''
+RK_LUT_POW_BASE55_HIGH = (\n{rows(pow_base55_high)}\n)
+{''.join(f'''RK_LUT_POW_BASE8_{name}_SHA256 = "{digest(table)}"
+RK_LUT_POW_BASE8_{name}_DOMAIN = ({low!r}, {high!r})
+RK_LUT_POW_BASE8_{name}_ENTRIES = {SIZE}
+RK_LUT_POW_BASE8_{name}_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW_BASE8_SCALE))[0]}
+RK_LUT_POW_BASE8_{name}_MINUS_EXP = 15
+RK_LUT_POW_BASE8_{name}_VERIFIED_INPUTS = {len(pow_base8_errors[index])}
+RK_LUT_POW_BASE8_{name}_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow_base8_errors[index])!r}
+RK_LUT_POW_BASE8_{name}_SIM_MAX_REL_ERROR = {max(x[1] for x in pow_base8_errors[index])!r}
+RK_LUT_POW_BASE8_{name} = (\n{rows(table)}\n)
+''' for index,(name,table,(low,high,_)) in enumerate(zip(("FAR_LOW","LOW","HIGH","FAR_HIGH"),
+  (pow_base8_far_low,pow_base8_low,pow_base8_high,pow_base8_far_high), POW_BASE8_BANDS)))}'''
 pathlib.Path(__file__).parents[2].joinpath("tinygrad/runtime/autogen/rockchip_lut.py").write_text(output)

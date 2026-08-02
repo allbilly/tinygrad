@@ -511,3 +511,29 @@ against float32 power rounded to FP16 at `rtol=1e-3, atol=1e-6`. The 98-stage
 typed plan reuses nine scratch surfaces and contains the two constant-base LUT
 tasks, generic EXP2 fallback, and two roundoff-LUT tasks. There is no host
 cast, modulo, parity computation, or semantic fallback.
+
+## Constant base eight four-band LUT
+
+A two-range Q15 design for `8**x` spans 64:1 on each side of zero. Its lower
+endpoint has only 512 raw units, so exact knots look correct while hardware
+interpolation misses off-grid values. The native recipe instead splits at
+integer exponents, where every adjacent boundary agrees exactly:
+
+| Exponent | Stored Q15 function | Decode |
+|---:|---|---:|
+| `[-2,-1]` | `8**x * 8` | `* 1/8` |
+| `[-1,0]` | `8**x` | direct |
+| `[0,1]` | `8**x / 8` | `* 8` |
+| `[1,2]` | `8**x / 64` | `* 64` |
+
+Every stored band spans only 8:1 and therefore retains at least 4,096 Q15 raw
+units at its lower endpoint. Generic DPU masks select the band, and the native
+EXP2 recipe remains the full-domain and special-value fallback.
+
+Generated exhaustive simulation records maximum relative errors from
+0.0005334682185082914 to 0.0005784838926603192 across the four ranges. The
+permanent RK3588 test verifies all 32,770 finite FP16 encodings in `[-2,2]`
+plus both infinities and NaN at `rtol=1e-3, atol=1e-6`. The result is a
+43-stage typed plan with six reusable scratch surfaces and five generic LUT
+tasks; none of the 4,104 generated table entries are handwritten compiler
+logic or runtime CPU work.
