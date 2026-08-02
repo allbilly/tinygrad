@@ -696,6 +696,19 @@ class TestDPUCompiler(unittest.TestCase):
       Tensor.empty(4,4,3,3,dtype=dtypes.half))))
     self.assertIs(huge_surface.reject.kind if huge_surface.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
 
+  def test_sparse_pair_and_deduplicated_contractions_stay_inside_cost_ceiling(self):
+    cases = ((Tensor.empty(1,3,5,7,dtype=dtypes.half), Tensor.empty(6,1,3,3,dtype=dtypes.half), 3),
+             (Tensor.empty(1,3,5,7,dtype=dtypes.half), Tensor.empty(6,3,3,5,dtype=dtypes.half), 1))
+    for x,weight,groups in cases:
+      plan = lower_tiled_contract_result(sink(x.conv2d(weight,groups=groups))).plan
+      self.assertIsInstance(plan, RKProgram)
+      assert isinstance(plan, RKProgram)
+      image = emit_program(plan)
+      self.assertLessEqual(len(image.stages), 200)
+      self.assertLessEqual(len(image.constants), 2*1024*1024)
+      if groups == 1: self.assertEqual(plan.scratch[2].size, 4128)  # 2048 logical lanes plus the final physical CMAC tail.
+      self.assertFalse(contains_uop(plan))
+
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x.conv2d(weight, padding=(0,1)))).plan

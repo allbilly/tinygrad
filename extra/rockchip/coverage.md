@@ -1252,3 +1252,27 @@ tests, Ruff, and mypy pass, as does the strict hardware suite (60 tests plus
 37 subtests) in 494.88 seconds with `ROCKCHIP_FALLBACK=0`. The inferred native
 total is 130 after the current 128-pass census. The research tree now has
 27,817 counted lines, including 2,684 in the Rockchip renderer/compiler.
+
+Sparse affine contractions now accept block-diagonal output/input pair sets and
+charge the completed target program for actual deduplicated constant payloads,
+rather than rejecting against a theoretical non-deduplicated Cartesian cost.
+The NPU may calculate the harmless Cartesian superset, while the final static
+selector materializes only outputs proved by the affine graph. This makes all
+seven `test_conv2d` subtests native without a convolution-name path or CPU
+packing. The grouped plan uses 167 NPU stages, 1,517,904 constant bytes, and
+16,896 scratch bytes; the larger dense plan uses 175 stages, 729,792 constant
+bytes, and 8,448 scratch bytes.
+
+The first dense hardware probe timed out near stage 166 while packing the RHS
+selector. Its 2,048 logical FP16 lanes had allocated exactly 4,096 bytes, but
+each 16-lane logical CMAC tile physically writes 32 lanes. The final tile
+therefore needs one additional 16-lane tail. Explicitly allocating 4,128 bytes
+fixes the timeout; the compiler test records this physical requirement. The
+temporary per-stage runtime diagnostic is preserved as
+`rockchip-upstream-patches/wip-stage-trace-20260803-010650.patch` (SHA-256
+`99489edee4309361f3427b1f70ca290db4dc3a527a0f749260c283451fd6a93e`) and is
+not present in the production runtime. All 80 host tests, Ruff, and mypy pass,
+as does the strict hardware suite (61 tests plus 39 subtests) in 532.62 seconds
+with `ROCKCHIP_FALLBACK=0`. The inferred native total is 131 after the current
+128-pass census. The research tree now has 27,818 counted lines, including
+2,685 in the Rockchip renderer/compiler.

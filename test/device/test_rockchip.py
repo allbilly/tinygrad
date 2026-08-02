@@ -170,6 +170,16 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data,device="ROCKCHIP").realize().conv2d(Tensor(weight,device="ROCKCHIP").realize()).realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_sparse_pair_affine_contraction_native_cmac(self):
+    data = np.linspace(-1,1,3*5*7,dtype=np.float16).reshape(1,3,5,7)
+    for weight,groups in ((np.linspace(-.5,.5,6*3*3,dtype=np.float16).reshape(6,1,3,3),3),
+                          (np.linspace(-.5,.5,6*3*3*5,dtype=np.float16).reshape(6,3,3,5),1)):
+      with self.subTest(groups=groups):
+        expected = Tensor(data,device="CPU").conv2d(Tensor(weight,device="CPU"),groups=groups).numpy()
+        actual = Tensor(data,device="ROCKCHIP").realize().conv2d(
+          Tensor(weight,device="ROCKCHIP").realize(),groups=groups).realize().numpy()
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_zero_masked_affine_contraction_native_cmac(self):
     data, weight = np.arange(3,dtype=np.float16).reshape(1,1,3), np.array([[[1,-1]]],dtype=np.float16)
     expected = Tensor(data).conv2d(Tensor(weight),padding=(0,1)).numpy()

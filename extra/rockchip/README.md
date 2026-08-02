@@ -197,6 +197,15 @@ DPU/CMAC/PPU, then the generic sparse-CMAC reformatter gathers dense output.
 The strict suite passes 60 tests plus 37 subtests; the inferred native total is
 130 pending the next complete census.
 
+Sparse affine contraction subsequently admits block-diagonal output/input pair
+sets and applies the 2 MiB ceiling to the emitted program's deduplicated
+constants. The NPU computes a legal Cartesian superset and a static CMAC
+selector writes only graph-proved outputs. Explicit physical tail allocation
+accounts for every CMAC task writing 32 lanes at a 16-logical-lane stride; this
+fixes an exact-page RHS selector timeout. All seven `test_conv2d` subtests pass
+natively, and the strict suite passes 61 tests plus 39 subtests. The inferred
+native total is 131 pending the next complete census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -207,8 +216,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,817, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,817 lines.
-The exact 2,849-line delta is 2,844 counted Rockchip backend lines (2,684
+contains 27,818, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,818 lines.
+The exact 2,850-line delta is 2,845 counted Rockchip backend lines (2,685
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

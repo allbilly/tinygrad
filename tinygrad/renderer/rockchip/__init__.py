@@ -24,6 +24,10 @@ RK_MAX_AFFINE_VISITS = 65536
 RK_MAX_PROGRAM_STAGES = 400
 RK_MAX_AFFINE_WINDOW = 192
 
+def _cmac_tiled_output_bytes(count:int) -> int:
+  # Each logical 16-lane tile is a physical 32-lane write, including the final tile's tail.
+  return (((count+15)&-16)+16)*2
+
 def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
   for extent in reversed(shape):
@@ -656,9 +660,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   lhs_rows = list(dict.fromkeys(row for _,row,_ in records))
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
   m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
-  pairs = {(lhs_rows.index(row), rhs_columns.index(column)) for _,row,column in records}
-  if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)) or \
-     pairs != set(product(range(m), range(n))): return _not_applicable()
+  if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)): return _not_applicable()
   if not 1 <= m <= 64 or not 1 <= n <= 16 or m*align_in > 4096:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
@@ -671,19 +673,14 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
           out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
           source = rhs_columns[out_channel][reduction_index] if out_channel < n and reduction_index < k else -1
           b_selector.append([source] if source >= 0 else [])
-  constant_bytes = sum(((count+15)//16)*32*max(32,(source_count+31)&-32)*2 for count,source_count in
-                       ((len(a_selector),lhs_count),(len(b_selector),rhs_count),(output_count,m*64)))
-  if constant_bytes > RK_MAX_CONSTANT_BYTES:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC selectors need {constant_bytes} bytes", reduce.op)
-
   steps:list[RKDPUProgram|RKContract|RKReduce] = []
-  scratch:tuple[RKScratch, ...] = (RKScratch(len(a_selector)*2),)
+  scratch:tuple[RKScratch, ...] = (RKScratch(_cmac_tiled_output_bytes(len(a_selector))),)
   a_arg = RKArg(RKBufferKind.SCRATCH, 0)
   packed_a = _sparse_cmac_pipeline(a_arg, RKArg(RKBufferKind.ARG, lhs.src[0].arg.slot), lhs_count, a_selector, scratch=scratch)
   steps.extend(packed_a.steps)
   scratch = packed_a.scratch
   b_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
-  scratch += (RKScratch(len(b_selector)*2),)
+  scratch += (RKScratch(_cmac_tiled_output_bytes(len(b_selector))),)
   packed_b = _sparse_cmac_pipeline(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch=scratch)
   steps.extend(packed_b.steps)
   scratch = packed_b.scratch
@@ -699,6 +696,11 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   dense = _sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch=scratch)
   steps.extend(dense.steps)
   scratch = dense.scratch
+  stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)
+  constant_bytes = sum(map(len, {step.constants for step in steps if isinstance(step, RKContract)}))
+  if stage_count > RK_MAX_PROGRAM_STAGES or constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"tiled CMAC plan needs {stage_count} stages and {constant_bytes} constant bytes", reduce.op)
   return _native(_finish_program(steps, scratch))
 
 def lower_contract(sink:UOp) -> RKContract|None:
