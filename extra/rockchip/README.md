@@ -6,6 +6,12 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
+The current authoritative uncached strict census at `c94d0d24c` is 146 native,
+40 frontend-only, 226 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed without an NPU timeout, reset failure,
+invalid submission, or process abort. Coverage details and durable artifact
+hashes are recorded in `coverage.md`.
+
 The compiler boundary is:
 
 ```text
