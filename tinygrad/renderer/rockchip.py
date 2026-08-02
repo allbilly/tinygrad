@@ -1739,6 +1739,7 @@ def _command(target:int, reg:int, value:int) -> int:
 
 def _emit_mask(stage_idx:int, plan:RKMaskStage) -> RKStage:
   width = (plan.count+7)//8-1
+  # Rejected WIP: setting out_precision=int8 for a final public bool mask timed out on RK3588; exact probe is archived separately.
   regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (rk.REG_DPU_DATA_FORMAT, 0x48000002),
     (rk.REG_DPU_DATA_CUBE_WIDTH, width), (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0),
     (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53),

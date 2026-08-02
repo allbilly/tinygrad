@@ -133,6 +133,23 @@ Therefore `0**x`, `0.7**x`, and `(-2)**x` with explicit FP32 input remain
 honest native rejections until another RK3588 engine or a native reformat path
 is proven; CPU narrowing will not be used to make this method green.
 
+The uncached strict census at `05dbc7570` confirms 425 methods with 83
+`PASS_NATIVE`, 40 `PASS_FRONTEND`, 289 `FAIL`, and 13 `SKIP_UPSTREAM` in
+492.27 seconds. The three power milestones advance successive subcases inside
+`test_pow_const` but do not complete its explicit-FP32 tail, so they correctly
+claim no method-level gain. The machine-readable report is preserved at
+`~/rk2608_backups/census-20260802-131000/test_ops_coverage.json`.
+
+The same hardware boundary appears at public bool output. 2607 wrote an
+atom-padded FP16 mask and used NumPy after submission to pack it into byte-bool.
+A strict replacement probe configured only the final mask stage for DPU int8
+WDMA output; submission timed out with `Errno 110`. Normal FP16 DPU execution
+recovered after restoring the proven format. The exact failed probe is archived
+as `wip-native-int8-bool-wdma-timeout.patch` with SHA-256
+`4b671b65e46c984305dc4751e54c456c21ecf2686cbd778fa03966fda9444e49`.
+Comparison masks remain native when consumed inside FP16 arithmetic, but public
+byte-bool output remains an honest rejection without CPU packing.
+
 Run the census serially on RK3588:
 
 ```sh
