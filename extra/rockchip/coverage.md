@@ -324,12 +324,53 @@ matrix and scalar subcases for integer alpha 1 through 4. Alpha 1 reuses ELU;
 alpha 2 through 4 share one generic typed recipe selected by six generated
 payload identities.
 
+At the FP16-contract cleanup milestone, the uncached 2026-08-02 census was:
+
+| Status | Methods |
+|---|---:|
+| PASS | 140 |
+| FAIL | 272 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest reports 398 failures including the same 126 failing subtests. Runtime
+was 435.19 seconds, with no NPU timeout. Removing int32 and FP32 constant-fill
+claims deliberately gives back `test_full`, `test_full_like`, `test_ones_like`,
+and `test_zeros_like`; those methods mix dtypes outside the declared FP16
+contract. `RKALUStage.out_dtype`, wide WDMA emission, and the extra advertised
+dtypes are gone. The full census remains informational rather than the
+hardware contract.
+
+Two post-CELU probes were rejected without being committed:
+
+- FP16 SIN/COS LUTs pass a focused half-precision sweep, but the official
+  methods include FP32 inputs or scalar dtype checks. They provide no honest
+  method gain without the prohibited runtime FP32 narrowing ABI. The exact WIP
+  is preserved under `~/tinygrad/rockchip-upstream-patches/` as
+  `wip-fp16-sin-cos-no-census-gain.patch` with SHA-256
+  `ebd8016663393810c3dc87d804cc9d5d366303f2596be806489893f4a6522908`.
+- Replaying a suffix vector with relocation addends makes the first 64 values
+  of a 65-value row correct, then fails because DPU WDMA writes 16-byte atoms:
+  65 FP16 lanes occupy a 72-lane physical write and the next 130-byte row base
+  is unaligned. Native broadcast therefore needs an explicitly padded device
+  layout or another engine, not host expansion. The exact WIP is preserved in
+  the same directory as `wip-affine-suffix-broadcast-alignment-failure.patch`
+  with SHA-256
+  `12c2532b4ff92d16e71cef4c4e86b817a31d27f42be3c8dddc21f6679dab48ce`.
+
+The general-GEMM reference in `allbilly/rk3588/conv_grok/gemm_npu.py` also
+confirms that ordinary row-major operands must be packed and padded before the
+CMAC task. Its NumPy host packers are useful as a layout oracle but cannot be
+ported into the thin runtime. The current direct CMAC contract therefore stays
+limited to already legal packed surfaces until device-native layout conversion
+exists.
+
 ## Milestones after the baseline
 
 | Capability | Focused official gain | Full census folded in? |
 |---|---:|---|
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
-| Native tiled int32/FP32 constant fills | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Yes (`40c74406c`) |
+| Native tiled int32/FP32 constant fills (research-only, now retracted) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Historical (`40c74406c`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
@@ -359,11 +400,10 @@ payload identities.
 | Parameterized generated ELU/SELU ranges | `test_elu`, `test_selu` | Yes (research branch only) |
 | Parameterized generated CELU alpha 1–4 ranges | `test_celu` | Yes (research branch only) |
 
-The wide-fill milestone writes the requested dtype directly through DPU WDMA;
-there is no runtime narrowing or host semantic work. It also upgrades RKImage
-dependencies to 64 bits and relocation indices to 32 bits, removing the image
-serialization limits exposed by tiled fills and large constant payloads. These
-focused passes are included in the 96-pass census above.
+The historical wide-fill milestone wrote the requested dtype directly through
+DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage
+dependency and relocation-width fixes remain useful, while the dtype-specific
+fill path is no longer part of the declared backend contract.
 
 The DPU MAX operation is not yet claimed IEEE-exact for all NaN operand
 orders. Hardware testing showed that finite extrema are correct and FP16

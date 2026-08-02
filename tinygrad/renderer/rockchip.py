@@ -3,7 +3,7 @@ import math, struct
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable, cast
-from tinygrad.dtype import dtypes, DType
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
@@ -37,7 +37,6 @@ class RKALUStage:
   lhs: RKArg|float
   rhs: RKArg|float
   count: int
-  out_dtype: DType = dtypes.half
   def __post_init__(self):
     if self.op not in _RK_ALU_OPS: raise ValueError(f"unsupported RK DPU ALU operation {self.op}")
 
@@ -1205,10 +1204,9 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   return ret
 
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
-  """Lower one contiguous FP16 expression or native wide constant fill to a UOp-free primitive DPU plan."""
+  """Lower one contiguous FP16 expression to a UOp-free primitive DPU plan."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
-  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or \
-     store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float): return None
+  if len(stores) != 1 or (store:=stores[0]).src[0].op is not Ops.INDEX or store.src[0].dtype is not dtypes.half: return None
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
   if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST: return None
   count = int(out_param.src[0].arg)
@@ -1216,14 +1214,8 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
      (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)): return None
   root = _parse_alu(store.src[1], out_index, {})
   if root is None: return None
-  if store.src[0].dtype is not dtypes.half and not isinstance(root, float): return None
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
-    if store.src[0].dtype in (dtypes.int, dtypes.float):
-      tile = 64 if store.src[0].dtype is dtypes.int else 4
-      fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, root, min(tile, count-start),
-                                     store.src[0].dtype) for start in range(0, count, tile))
-      return RKDPUProgram(fill_stages) if len(fill_stages) <= 64 else None
     return RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),))
   if isinstance(root, _LUTExpr) and root.lut is RKLUTId.EXP2:
     exp_source, base = root.src[0], root
@@ -1441,20 +1433,17 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       stages.append(_emit_mask(stage_idx, plan))
       continue
     if not isinstance(plan, RKALUStage): raise ValueError(f"unimplemented Rockchip stage {type(plan).__name__}")
-    material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
-    lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count)
-    width = ((plan.count*2 if plan.out_dtype is dtypes.int else plan.count)+7)//8-1
-    wide_out = plan.out_dtype in (dtypes.int, dtypes.float)
-    out_precision = 4 if plan.out_dtype is dtypes.int else (5 if plan.out_dtype is dtypes.float else 2)
+    lhs, rhs = materialize(plan.lhs, plan.count), materialize(plan.rhs, plan.count)
+    width = (plan.count+7)//8-1
     dpu_regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),
-      (rk.REG_DPU_DATA_FORMAT, (out_precision<<29)|(2<<26)|2), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
+      (rk.REG_DPU_DATA_FORMAT, 0x48000002), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0), (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007),
       (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0),
-      (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if wide_out else 7), (rk.REG_DPU_WDMA_SIZE_1, width),
+      (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 7), (rk.REG_DPU_WDMA_SIZE_1, width),
       (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0), (rk.REG_DPU_EW_CFG, _EW_CFG[plan.op]),
       (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1), (rk.REG_DPU_OUT_CVT_OFFSET, 0),
-      (rk.REG_DPU_OUT_CVT_SCALE, 0 if plan.out_dtype is dtypes.float else (1 if plan.op is Ops.FDIV or
-       plan.out_dtype is dtypes.int else 0x10001)), (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
+      (rk.REG_DPU_OUT_CVT_SCALE, 1 if plan.op is Ops.FDIV else 0x10001),
+      (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
     rdma_regs = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
       (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008))
@@ -1507,7 +1496,7 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   def __init__(self, target:Target): super().__init__(target)
-  def supported_dtypes(self): return {dtypes.half, dtypes.int, dtypes.float}
+  def supported_dtypes(self): return {dtypes.half}
   def native_program(self, ast:UOp) -> UOp|None:
     if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
     elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)
