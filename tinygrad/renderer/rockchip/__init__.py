@@ -140,6 +140,19 @@ def _static_scalar(u:UOp, ranges:dict[int, int]) -> int|float|bool|None:
   if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
   return None
 
+def _conditional_index(u:UOp) -> tuple[UOp, UOp|None, bool]|None:
+  """Return the indexed tensor and an optional static zero-mask around it."""
+  value = _strip_casts(u)
+  if value.op is Ops.INDEX and value.src[0].op is Ops.PARAM: return value, None, True
+  if value.op is not Ops.WHERE: return None
+  condition, positive, negative = value.src
+  positive, negative = _strip_casts(positive), _strip_casts(negative)
+  if positive.op is Ops.INDEX and positive.src[0].op is Ops.PARAM and negative.op is Ops.CONST and float(negative.arg) == 0:
+    return positive, condition, True
+  if negative.op is Ops.INDEX and negative.src[0].op is Ops.PARAM and positive.op is Ops.CONST and float(positive.arg) == 0:
+    return negative, condition, False
+  return None
+
 def _relu_source(u:UOp) -> UOp|None:
   if u.op is not Ops.WHERE or len(u.src) != 3: return None
   cond, positive, zero = u.src
@@ -218,7 +231,7 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   return atom_reject
 
 def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
-  """Materialize one static affine FP16 broadcast with CMAC, then schedule the generic DPU expression."""
+  """Materialize one static affine or zero-masked FP16 surface, then schedule generic DPU arithmetic."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
   if len(stores) != 1: return _not_applicable()
   store = stores[0]
@@ -231,29 +244,34 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   broadcast = [u for u in indexes if u.src[1].key != output_index.key]
   if len(broadcast) != 1 or any(u.dtype is not dtypes.half for u in indexes): return _not_applicable()
   source_index = broadcast[0]
-  src_aff = _affine(source_index.src[1])
-  if src_aff is None: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast input index is not affine", Ops.INDEX)
+  surfaces = [(u, parsed) for u in stored.toposort() if (parsed:=_conditional_index(u)) is not None and parsed[0].key == source_index.key]
+  if not surfaces: return _not_applicable()
+  surface, (_, condition, select_true) = surfaces[-1]
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   axes = tuple(sorted(out_aff[0]))
-  if not axes or any(axis not in ranges for axis in axes) or set(src_aff[0])-set(axes):
+  surface_axes = {u.arg[0] for u in surface.toposort() if u.op is Ops.RANGE}
+  if not axes or any(axis not in ranges for axis in axes) or surface_axes-set(axes):
     return _unsupported(RKRejectKind.UNSUPPORTED_BROADCAST, "broadcast axes are not one static affine output", Ops.RANGE)
   count, src_count = int(store.src[0].src[0].src[0].arg), int(source_index.src[0].src[0].arg)
-  mapping = [-1]*count
+  mapping = [-2]*count
   for coordinates in product(*(range(ranges[axis]) for axis in axes)):
     point = dict(zip(axes, coordinates))
     dest_offset = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in axes)
-    source_offset = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in axes)
-    if not 0 <= dest_offset < count or mapping[dest_offset] != -1 or not 0 <= source_offset < src_count:
+    predicate = True if condition is None else _static_scalar(condition, point)
+    if predicate is None:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast predicate is not static", condition.op if condition is not None else Ops.WHERE)
+    selected = bool(predicate) is select_true
+    source_offset = _static_scalar(source_index.src[1], point) if selected else -1
+    if not 0 <= dest_offset < count or mapping[dest_offset] != -2 or selected and \
+       (not isinstance(source_offset, int) or isinstance(source_offset, bool) or not 0 <= source_offset < src_count):
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast does not cover one dense output", Ops.INDEX)
-    mapping[dest_offset] = source_offset
-  if any(index < 0 for index in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast output has holes", Ops.INDEX)
-  align_in = max(32, (src_count+31)&-32)
-  constant_bytes = ((count+15)//16)*32*align_in*2
-  if not 0 < count <= 4096 or not 0 < src_count <= 512 or constant_bytes > 8*1024*1024:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast selector is {count}x{src_count} ({constant_bytes} bytes)", Ops.INDEX)
+    mapping[dest_offset] = cast(int, source_offset)
+  if any(index == -2 for index in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast output has holes", Ops.INDEX)
+  if not 0 < count <= 4096 or not 0 < src_count:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast surface is {count} from {src_count}", Ops.INDEX)
 
   canonical = source_index.replace(src=(source_index.src[0], output_index))
-  root = _parse_alu(stored.substitute({source_index:canonical}), output_index, {})
+  root = _parse_alu(stored.substitute({surface:canonical}), output_index, {})
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast expression is not legal DPU arithmetic", stored.op)
   old_arg, expanded = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot), RKArg(RKBufferKind.SCRATCH, 0)
@@ -265,24 +283,49 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
     return value
   root = cast(_Expr, remap(root))
 
+  # Group 16-output CMAC tiles while their source window remains small. This keeps a padded
+  # row at 64 inputs instead of constructing one output_count x source_count selector.
+  blocks = [(start, mapping[start:start+16]) for start in range(0, count, 16) if any(x >= 0 for x in mapping[start:start+16])]
+  chunks:list[tuple[int, int, list[tuple[int, list[int]]]]] = []
+  for start, rows in blocks:
+    selected_indexes = [x for x in rows if x >= 0]
+    base, end = min(selected_indexes)&-8, max(selected_indexes)+1
+    if chunks:
+      old_base, old_end, old_blocks = chunks[-1]
+      merged_base, merged_end = min(old_base, base), max(old_end, end)
+      if merged_end-merged_base <= 64:
+        chunks[-1] = merged_base, merged_end, [*old_blocks, (start, rows)]
+        continue
+    if end-base > 512: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast tile source span is {end-base}", Ops.INDEX)
+    chunks.append((base, end, [(start, rows)]))
+  constant_bytes = sum(len(chunk)*32*max(32, (end-base+31)&-32)*2 for base,end,chunk in chunks)
+  if constant_bytes > 8*1024*1024:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast selectors require {constant_bytes} bytes", Ops.INDEX)
+
   packed = RKArg(RKBufferKind.SCRATCH, 1)
-  scratch:list[RKScratch] = [RKScratch((((count+31)&-32)+16)*2), RKScratch(align_in*2)]
-  contracts:list[RKContract] = []
-  for start in range(0, count, 16):
-    valid = min(16, count-start)
-    out_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
-    contracts.append(RKContract(RKTensorRef(RKArg(expanded.kind, expanded.index, start*2), out_layout),
-      _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
-      _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0,
-      _cmac_selection_payload([[index] for index in mapping[start:start+16]], align_in, 32, 1.0)))
+  max_align = max((max(32, (end-base+31)&-32) for base,end,_ in chunks), default=32)
+  scratch:list[RKScratch] = [RKScratch((((count+31)&-32)+16)*2), RKScratch(max_align*2)]
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  if any(all(x < 0 for x in mapping[start:start+16]) for start in range(0, count, 16)):
+    steps.append(RKDPUProgram((RKALUStage(Ops.ADD, expanded, 0.0, 0.0, count),)))
+  source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
+  for base,end,blocks in chunks:
+    span, align_in = end-base, max(32, (end-base+31)&-32)
+    steps.append(RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
+                               RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, base*2), 0.0, span))))
+    for start,rows in blocks:
+      valid = len(rows)
+      out_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
+      steps.append(RKContract(RKTensorRef(RKArg(expanded.kind, expanded.index, start*2), out_layout),
+        _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
+        _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0,
+        _cmac_selection_payload([[index-base] if index >= 0 else [] for index in rows], align_in, 32, 1.0)))
 
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   if (scheduled:=_schedule_expr(root, output, count, tuple(scratch))) is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast stage source is not materializable", stored.op)
   scratch_tuple = scheduled.scratch
-  prepare = RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
-                          RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot), 0.0, src_count)), scratch_tuple)
-  return _native(RKProgram((prepare, *contracts, scheduled), scratch_tuple))
+  return _native(_finish_program([*steps, scheduled], scratch_tuple))
 
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""

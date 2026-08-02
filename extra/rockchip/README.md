@@ -141,11 +141,15 @@ regressed. The bounded affine-contraction milestone adds seven complete native
 methods: 9×9 and small GEMM, simple and both batched matmul forms, plus simple
 strided 1D and 2D convolutions.
 
+The later focused native milestones also cover static conditional FP16
+reformats and the complete `test_padding_add` method. Those gains are verified
+by the strict device suite but are not yet included in the 116-pass census.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,601, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,601 lines.
-The exact 2,633-line delta is 2,628 counted Rockchip backend lines (2,468
+contains 27,639, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,639 lines.
+The exact 2,671-line delta is 2,666 counted Rockchip backend lines (2,506
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

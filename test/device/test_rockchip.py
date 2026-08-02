@@ -118,6 +118,11 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal((x+y).realize().numpy(), lhs+rhs)
     np.testing.assert_allclose((x/y).realize().numpy(), lhs/rhs, rtol=1e-3, atol=1e-6)
 
+  def test_zero_masked_affine_surface_native_cmac_dpu(self):
+    lhs, rhs = np.arange(64,dtype=np.float16).reshape(8,8), np.arange(36,dtype=np.float16).reshape(6,6)
+    actual = (Tensor(lhs,device="ROCKCHIP").realize()+Tensor(rhs,device="ROCKCHIP").realize().pad((1,1,1,1))).realize().numpy()
+    np.testing.assert_equal(actual, lhs+np.pad(rhs, ((1,1),(1,1))))
+
   def test_sparse_affine_movements_native_cmac(self):
     cases = (
       (np.arange(9, dtype=np.float16).reshape(3,3), lambda x:x.T, lambda x:x.T),

@@ -1030,3 +1030,17 @@ new method-level census claim. Ruff and mypy pass, as do all 71 host tests and
 the strict RK3588 suite (52 tests plus 37 subtests) in 411.96 seconds with
 `ROCKCHIP_FALLBACK=0`. The change brings the research tree to 27,601 counted
 lines, including 2,468 lines in the Rockchip renderer/compiler.
+
+Zero-masked affine FP16 input surfaces can now be materialized before generic
+DPU arithmetic. The lowerer enumerates only proven static coordinate maps,
+groups 16-output selector tiles into bounded source windows, initializes NPU
+scratch, and emits ordered DPU/CMAC tasks; it does not recognize padding by
+name or evaluate tensor data on the host. Complete `test_padding_add` passes
+natively at its unchanged tolerance in 41.74 seconds. Its 64x64 correctness
+plan uses 362 NPU tasks, 1,002,752 constant bytes, and 8,352 scratch bytes, so
+it remains an explicit cost-model target for a future CNA/DMA reformat path.
+Ruff and mypy pass, as do all 70 host compiler/image/telemetry tests and the
+strict RK3588 suite (53 tests plus 37 subtests) in 411.41 seconds with
+`ROCKCHIP_FALLBACK=0`. This focused result has not yet been folded into the
+full 425-method census. The research tree now has 27,639 counted lines,
+including 2,506 in the Rockchip renderer/compiler.

@@ -76,6 +76,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC)), (3,2))
     self.assertFalse(contains_uop(plan))
 
+  def test_zero_masked_affine_surface_uses_bounded_selector_tiles(self):
+    lhs, rhs = Tensor.empty(64,64,dtype=dtypes.half), Tensor.empty(60,60,dtype=dtypes.half)
+    plan = lower_broadcast_alu_result(sink(lhs+rhs.pad((2,2,2,2)))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertEqual(sum(stage.engine is RKEngine.CMAC for stage in image.stages), 240)
+    self.assertLessEqual(len(image.constants), 1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_small_affine_gathers_use_sparse_cmac_pipeline(self):
     expressions = (Tensor.empty(8,8,dtype=dtypes.half).T.contiguous(),
                    Tensor.empty(24,dtype=dtypes.half)[1:17].clone(),
