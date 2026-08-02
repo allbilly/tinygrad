@@ -323,6 +323,18 @@ fallback is involved. The rejected register-reset experiment and scratch trace
 are preserved in `rockchip-upstream-patches/wip-cmac-register-reset-scratch-trace.patch`
 (SHA-256 `15d2882943eb0ed7c2193fa626f7202b172a3165fffb1e88ca4939e602f355b2`).
 
+At committed head `7cf01ac95`, the complete uncached strict census reaches 102
+`PASS_NATIVE`, 40 `PASS_FRONTEND`, 270 `FAIL`, and 13 `SKIP_UPSTREAM` in 557.23
+seconds. Pytest's mixed method/subtest summary is 163 passed, 375 failed, and 13
+skipped. The only method-level delta from `1d6d2781d` is `test_expand` moving
+from `FAIL` to `PASS_NATIVE`; no prior pass regressed. The 244 typed reject
+events remain distributed as 52 output dtype, 50 layout, 46 reduction, 37
+reformat, 27 contraction, 25 input dtype, and 7 ALU rejects. The durable JSON is
+`~/rk2608_backups/census-subatom-7cf01ac95/test_ops_coverage.json` (SHA-256
+`1b02b4206d6a12690cb7e937d58c6a86ad02f8492fda2dc68d902c162c7eb2c3`);
+the JUnit XML has SHA-256
+`c83baff01bd3e96c6e1b6ce8cff4376f066058f349d41ad6b8db3970a9d7d421`.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);
@@ -786,7 +798,7 @@ failures.
 | Native tiled int32/FP32 constant fills (research-only, restored) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Current (`52c6657e2`) |
 | Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_simple`, `test_sum_full`, `test_mean`, `test_sum_relu` | Yes (`da09c1fd9`) |
 | Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Yes (`da09c1fd9`) |
-| Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | 101-native census; sub-atom fix re-census pending |
+| Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | Yes (`7cf01ac95`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |

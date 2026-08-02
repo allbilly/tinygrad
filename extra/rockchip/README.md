@@ -108,6 +108,12 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
+The current committed strict census at `7cf01ac95` contains 102 native passes,
+40 frontend-only passes, 270 failures, and 13 upstream skips across exactly 425
+methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
+regressed, and the latest gain is the scalar `test_expand` subcase through
+sub-atom DPU preparation followed by sparse CMAC.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
