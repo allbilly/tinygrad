@@ -1,9 +1,29 @@
 import math, os, unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
+from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_python_fallback_mapped_buffer_coherence(self):
+    old_fallback, old_telemetry = os.environ.get("ROCKCHIP_FALLBACK"), os.environ.get("ROCKCHIP_TELEMETRY")
+    os.environ["ROCKCHIP_FALLBACK"], os.environ["ROCKCHIP_TELEMETRY"] = "PYTHON", "memory"
+    try:
+      clear()
+      data = np.linspace(-1, 1, 17, dtype=np.float16)
+      x = Tensor(data, device="ROCKCHIP").realize()
+      native_before = (x+0.25).realize()
+      fallback = native_before.sin().realize()
+      actual = (fallback*2).realize().numpy()
+      np.testing.assert_allclose(actual, (np.sin(data+0.25)*2).astype(np.float16), rtol=2e-3, atol=2e-3)
+      lanes = [event["lane"] for event in drain() if event["kind"] == "kernel"]
+      self.assertEqual(lanes[-3:], ["RK_DPU", "PYTHON", "RK_DPU"])
+    finally:
+      if old_fallback is None: os.environ.pop("ROCKCHIP_FALLBACK", None)
+      else: os.environ["ROCKCHIP_FALLBACK"] = old_fallback
+      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY", None)
+      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+
   def test_dpu_binary_and_multistage(self):
     rng = np.random.default_rng(1)
     values = [rng.uniform(-2, 2, 16).astype(np.float16) for _ in range(4)]

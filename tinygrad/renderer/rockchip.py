@@ -1,5 +1,5 @@
 from __future__ import annotations
-import hashlib, math, struct
+import hashlib, math, os, struct
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Callable, cast
@@ -1638,6 +1638,11 @@ class RockchipRenderer(Renderer):
         fingerprint_digest=dict(reject.fingerprint)["graph"],
         signature=[{"slot": u.arg.slot, "dtype": u.dtype.name,
                     "shape": [x if isinstance(x, int) else str(x) for x in u.shape]} for u in params])
+      fallback = os.getenv("ROCKCHIP_FALLBACK", "0").upper()
+      if fallback == "PYTHON":
+        from tinygrad.runtime.rockchip_fallback import build_rkpy_program
+        return build_rkpy_program(ast, self.target)
+      if fallback not in ("", "0"): raise RuntimeError(f"invalid ROCKCHIP_FALLBACK={fallback!r}")
       raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)

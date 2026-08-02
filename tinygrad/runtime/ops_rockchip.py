@@ -4,6 +4,7 @@ from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
 from tinygrad.runtime.autogen import rockchip as rk
+from tinygrad.runtime.rockchip_fallback import RKPY_MAGIC, RKPythonProgram, decode_rkpy
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 from tinygrad.runtime.support.rockchip_telemetry import record as record_telemetry
 
@@ -19,11 +20,20 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
-    self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
+    self.dev, self.name = dev, obj.name
+    self.image, self.fallback = None, None
+    self.scratch, self.constants = (), None
+    signature = [{"name": name, "slot": slot, "dtype": dtype.name,
+                  "shape": [x if isinstance(x, int) else str(x) for x in shape]} for name,slot,dtype,shape in obj.signature]
+    if obj.lib[:4] == RKPY_MAGIC:
+      self.fallback = RKPythonProgram(dev, obj, decode_rkpy(obj.lib))
+      self.telemetry = {"lane": "PYTHON", "program": self.name, "signature": signature,
+                        "uop_count": self.fallback.uop_count}
+      return
+    self.image = decode_image(obj.lib)
     engines = {stage.engine.name for stage in self.image.stages}
     self.telemetry = {"lane": f"RK_{next(iter(engines))}" if len(engines) == 1 else "RK_MIXED", "program": self.name,
-      "signature": [{"name": name, "slot": slot, "dtype": dtype.name,
-                     "shape": [x if isinstance(x, int) else str(x) for x in shape]} for name,slot,dtype,shape in obj.signature],
+      "signature": signature,
       "engine_counts": {engine: sum(stage.engine.name == engine for stage in self.image.stages) for engine in sorted(engines)},
       "stage_count": len(self.image.stages), "scratch_bytes": sum(x.size for x in self.image.scratch),
       "constant_bytes": len(self.image.constants), "image_version": self.image.version}
@@ -41,6 +51,16 @@ class RockchipProgram(Program['RockchipDevice']):
     return int(buf.meta.dma_addr) + int(buf.va_addr) - int(buf.base.va_addr)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
+    if self.fallback is not None:
+      start = time.perf_counter()
+      try: elapsed = self.fallback(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=True, **kwargs)
+      except Exception as exc:
+        record_telemetry("kernel", **self.telemetry, outcome="FAIL", duration_ms=(time.perf_counter()-start)*1e3,
+                         error_class=type(exc).__name__, error=str(exc))
+        raise
+      record_telemetry("kernel", **self.telemetry, outcome="PASS", duration_ms=elapsed*1e3)
+      return elapsed if wait else None
+    assert self.image is not None
     del global_size, local_size, vals, kwargs
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
