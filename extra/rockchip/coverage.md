@@ -52,6 +52,21 @@ official flip shape. Its exact planner diff and failure are preserved as
 `0063-WIP-unaligned-DPU-destination-timeout.patch`; the active compiler keeps
 the destination-atom legality check.
 
+The next numerical milestone ports 2607's genuine NPU-only POW8 algorithm into
+the typed expression planner. The generated two-level LUT recipe passes 513
+points over `[-4.1, 4.1]` plus both infinities and NaN on RK3588 with
+`ROCKCHIP_FALLBACK=0`. The exact official `test_pow_const` invocation now
+passes its `x**8.0` subcase and advances to the independent `x**5.5` mismatch
+(117/2,925 lanes, maximum relative error 0.001953). The method is therefore
+still `FAIL` and no method-level census gain is claimed yet.
+
+`python sz.py` at this milestone reports 1,686 counted lines in the Rockchip
+renderer and 26,819 repository lines overall. The two immutable generated LUT
+payloads add 154 physical lines under `autogen`, which `sz.py` correctly
+excludes; their auditable source is the 40-line generator change. The 44-line
+typed compiler recipe remains counted rather than being hidden as generated
+code.
+
 Run the census serially on RK3588:
 
 ```sh
@@ -565,6 +580,7 @@ failures.
 | Generated tanh-approximate and exact GELU ranges | `test_gelu`, `test_gelu_extreme` | Yes (research branch only) |
 | Parameterized generated ELU/SELU ranges | `test_elu`, `test_selu` | Yes (research branch only) |
 | Parameterized generated CELU alpha 1–4 ranges | `test_celu` | Yes (research branch only) |
+| Generated two-level POW8 range reduction | `test_pow_const` exponent-8 subcase; method still fails at exponent 5.5 | Not yet |
 
 The historical wide-fill milestone wrote the requested dtype directly through
 DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage

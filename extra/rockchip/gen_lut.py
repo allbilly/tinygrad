@@ -184,6 +184,12 @@ for table in range(2):
       raw = max(-32768, min(32767, round(value*32768)))
       output.append(1 if raw == 0 else raw)
 roundoff = [0 if i % 2 == 0 else 1 << 14 for i in range(SIZE)] * 2
+POW8_SCALE, POW8_STEP = 8192.0, 32.0/8192.0
+POW8_SPLIT = struct.unpack("<e", struct.pack("<e", math.sqrt(2.0)))[0]
+pow8 = [max(-32768, min(32767, round(min(abs(signed_sample(table, i, POW8_STEP)), math.sqrt(2.0))**8*2048)))
+        for table in range(2) for i in range(SIZE)]
+pow8_high = [max(-32768, min(32767, round((min(abs(signed_sample(table, i, POW8_STEP)), 2.0)*.5)**8*32768)))
+             for table in range(2) for i in range(SIZE)]
 def digest(values:list[int]) -> str: return hashlib.sha256(struct.pack(f"<{len(values)}h", *values)).hexdigest()
 def half(value:float) -> float: return struct.unpack("<e", struct.pack("<e", value))[0]
 errors = []
@@ -296,6 +302,16 @@ def interpolate(table:list[int], step:float, scale:float, x:float) -> float:
   position, base = (x/step+512, 0) if x < 0 else (x/step, SIZE)
   index = min(511, max(0, math.floor(position)))
   return half(((1-(position-index))*table[base+index] + (position-index)*table[base+index+1]) / scale)
+pow8_errors, pow8_high_errors = [], []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x): continue
+  if 1 <= x <= POW8_SPLIT:
+    got, reference = interpolate(pow8, POW8_STEP, 2048, x), x**8
+    pow8_errors.append((abs(got-reference), abs(got-reference)/reference))
+  if POW8_SPLIT <= x <= 2:
+    got, reference = half(interpolate(pow8_high, POW8_STEP, 32768, x)*256), x**8
+    pow8_high_errors.append((abs(got-reference), abs(got-reference)/reference))
 asinh_errors, acosh_errors = [], []
 for bits in range(1 << 16):
   x = struct.unpack("<e", struct.pack("<H", bits))[0]
@@ -503,7 +519,9 @@ class RKLUTId(IntEnum):
   CELU3_LOCAL = 56
   CELU4 = 57
   CELU4_LOCAL = 58
-RK_LUT_SCHEMA = 49
+  POW8 = 59
+  POW8_HIGH = 60
+RK_LUT_SCHEMA = 50
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -878,5 +896,23 @@ RK_LUT_LOG10_LOCAL_DOMAIN = (-2.0, 2.0)
 RK_LUT_LOG10_LOCAL_ENTRIES = {SIZE}
 RK_LUT_LOG10_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', INDEX_SCALE))[0]}
 RK_LUT_LOG10_LOCAL_MINUS_EXP = 15
-RK_LUT_LOG10_LOCAL = (\n{rows(log10_local)}\n)\n'''
+RK_LUT_LOG10_LOCAL = (\n{rows(log10_local)}\n)
+RK_LUT_POW8_SHA256 = "{digest(pow8)}"
+RK_LUT_POW8_DOMAIN = (1.0, {POW8_SPLIT!r})
+RK_LUT_POW8_ENTRIES = {SIZE}
+RK_LUT_POW8_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW8_SCALE))[0]}
+RK_LUT_POW8_MINUS_EXP = 11
+RK_LUT_POW8_VERIFIED_INPUTS = {len(pow8_errors)}
+RK_LUT_POW8_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow8_errors)!r}
+RK_LUT_POW8_SIM_MAX_REL_ERROR = {max(x[1] for x in pow8_errors)!r}
+RK_LUT_POW8 = (\n{rows(pow8)}\n)
+RK_LUT_POW8_HIGH_SHA256 = "{digest(pow8_high)}"
+RK_LUT_POW8_HIGH_DOMAIN = ({POW8_SPLIT!r}, 2.0)
+RK_LUT_POW8_HIGH_ENTRIES = {SIZE}
+RK_LUT_POW8_HIGH_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW8_SCALE))[0]}
+RK_LUT_POW8_HIGH_MINUS_EXP = 15
+RK_LUT_POW8_HIGH_VERIFIED_INPUTS = {len(pow8_high_errors)}
+RK_LUT_POW8_HIGH_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow8_high_errors)!r}
+RK_LUT_POW8_HIGH_SIM_MAX_REL_ERROR = {max(x[1] for x in pow8_high_errors)!r}
+RK_LUT_POW8_HIGH = (\n{rows(pow8_high)}\n)\n'''
 pathlib.Path(__file__).parents[2].joinpath("tinygrad/runtime/autogen/rockchip_lut.py").write_text(output)

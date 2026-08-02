@@ -427,6 +427,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.ROUNDOFF for stage in plan.stages), 1)
     self.assertFalse(contains_uop(plan))
 
+  def test_pow8_uses_generated_two_level_lut(self):
+    for name in ("POW8", "POW8_HIGH"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+      self.assertLess(getattr(rklut, f"RK_LUT_{name}_SIM_MAX_REL_ERROR"), 1e-3)
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half)**8.0))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.POW8, rklut.RKLUTId.POW8_HIGH})
+    self.assertLessEqual(len(plan.stages), 64)
+    self.assertFalse(contains_uop(plan))
+
   def test_trunc_floor_ceil_compose_roundoff_lut(self):
     for function in (lambda x:x.trunc(), lambda x:x.floor(), lambda x:x.ceil()):
       plan = lower_dpu(sink(function(Tensor.empty(16,dtype=dtypes.half))))

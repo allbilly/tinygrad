@@ -371,3 +371,34 @@ were 0.0005126327182432, 0.001013749418772747, and 0.001036372608194558. The
 dense 8,193-point RK3588 sweep and every official matrix/scalar subcase pass
 with `rtol=1e-3, atol=1e-6`. CELU identity remains generated data consumed by
 the generic LUT stage; there is no CELU hardware opcode or host semantic work.
+
+## Integer POW8 two-level range reduction
+
+Three sequential FP16 squarings round after every DPU task, while Torch's
+half-input `x**8` reference evaluates the power in float32 and rounds once.
+The resulting repeated-square path misses the official tolerance in 617 of
+2,925 lanes, with maximum relative error 0.002876.
+
+The native recipe keeps the repeated-square chain only as a full-domain
+fallback and normalizes `0.25 < abs(x) < 4` into `[1, 2]` using exact binary
+factors. Four magnitude bands use input multipliers `(4, 2, 1, 0.5)` and final
+factors `(2^-16, 2^-8, 1, 256)`. A Q11 table stores `u**8` through the FP16
+encoding of `sqrt(2)`. A second Q15 table stores `(u/2)**8` above that split,
+and a generic DPU multiply by 256 restores its range. Splitting the output
+range this way preserves relative precision that one Q7 table cannot provide.
+
+The generated simulator exhaustively checks all positive FP16 encodings in
+each active normalized interval: 425 low-range inputs and 601 high-range
+inputs. Their maximum simulated relative errors are recorded as
+`RK_LUT_POW8_SIM_MAX_REL_ERROR` and
+`RK_LUT_POW8_HIGH_SIM_MAX_REL_ERROR`; both are below `1e-3`. The full recipe
+contains 50 typed stages, two generic `RKLUTStage` instances, and nine reusable
+scratch surfaces. A 513-point `[-4.1, 4.1]` RK3588 sweep plus infinities and
+NaN passes the official `rtol=1e-3, atol=1e-6` contract with fallback disabled.
+No runtime packing, CPU semantic work, or POW8 hardware opcode is involved.
+
+The old experiment that stored a Q7 base and a same-grid Q15 residual is not
+used. Hardware interpolates integer entries before its output shift, so a
+smooth residual on the identical address grid cannot reconstruct the lost
+fractional interpolation phase. Two LUT tasks help here because they use
+different fixed-point output ranges, not merely because there are two tables.

@@ -286,6 +286,13 @@ class TestRockchip(unittest.TestCase):
     for function, reference in ((lambda x:x.trunc(), np.trunc), (lambda x:x.floor(), np.floor), (lambda x:x.ceil(), np.ceil)):
       np.testing.assert_equal(function(Tensor(data, device="ROCKCHIP")).realize().numpy(), reference(data))
 
+  def test_generated_pow8_two_level_lut(self):
+    data = np.concatenate((np.linspace(-4.1, 4.1, 513, dtype=np.float32).astype(np.float16),
+                           np.array([np.inf, -np.inf, np.nan], dtype=np.float16)))
+    actual = (Tensor(data, device="ROCKCHIP").realize()**8).realize().numpy()
+    with np.errstate(all="ignore"): expected = np.power(data.astype(np.float32), 8).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_linear_sigmoid_workload(self):
     rng = np.random.default_rng(2)
     a_np = rng.uniform(-0.25, 0.25, (1,32)).astype(np.float16)
