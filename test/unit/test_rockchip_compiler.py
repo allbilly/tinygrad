@@ -620,6 +620,9 @@ class TestDPUCompiler(unittest.TestCase):
     oversized = lower_tiled_contract_result(sink(Tensor.empty(1,4,9,9,dtype=dtypes.half).conv2d(
       Tensor.empty(4,4,3,3,dtype=dtypes.half))))
     self.assertIs(oversized.reject.kind if oversized.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
+    huge_surface = lower_tiled_contract_result(sink(Tensor.empty(1,4,32,32,dtype=dtypes.half).conv2d(
+      Tensor.empty(4,4,3,3,dtype=dtypes.half))))
+    self.assertIs(huge_surface.reject.kind if huge_surface.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
 
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)

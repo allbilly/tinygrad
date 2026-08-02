@@ -150,11 +150,15 @@ Static zero-masked contraction inputs subsequently add complete native
 `test_asymmetric_padding_conv1d` coverage; that gain is also pending the next
 full census.
 
+Tiled contraction legality is checked before coordinate enumeration: K,
+source extents, and at most 65,536 affine output/reduction visits bound compiler
+work. Oversized graphs reject before NPU submission.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,660, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,660 lines.
-The exact 2,692-line delta is 2,687 counted Rockchip backend lines (2,527
+contains 27,664, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,664 lines.
+The exact 2,696-line delta is 2,691 counted Rockchip backend lines (2,531
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

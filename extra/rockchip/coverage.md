@@ -1088,3 +1088,15 @@ tests and the strict RK3588 suite (55 tests plus 37 subtests) in 448.19 seconds
 with `ROCKCHIP_FALLBACK=0`. This focused complete-method gain is not yet folded
 into the 117-pass census. The research tree now has 27,660 counted lines,
 including 2,527 in the Rockchip renderer/compiler.
+
+The first post-contraction census attempt exposed an unbounded compiler-cost
+path and is intentionally not recorded as coverage: `test_large_input_conv2d`
+spent the 300-second watchdog enumerating affine coordinates before reaching
+existing surface limits, aborting pytest at 29%. Tiled contraction now checks
+K, source extents, and a 65,536-point affine-visit budget before enumeration.
+The same graph rejects precisely (`out=90720,lhs=262144,rhs=960,K=160`) in
+3.67 seconds without submitting a device task. Accepted plans are unchanged.
+Ruff and mypy pass, as do all 72 host tests and the strict RK3588 suite (55
+tests plus 37 subtests) in 448.85 seconds with `ROCKCHIP_FALLBACK=0`. The
+research tree now has 27,664 counted lines, including 2,531 in the Rockchip
+renderer/compiler. A complete census must be restarted from this bounded head.

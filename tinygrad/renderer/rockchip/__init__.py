@@ -20,6 +20,7 @@ from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint 
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 
 RK_MAX_CONSTANT_BYTES = 2*1024*1024
+RK_MAX_AFFINE_VISITS = 65536
 
 def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
@@ -568,6 +569,9 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
+  if not 1 <= k <= 64 or lhs_count > 512 or rhs_count > 512 or output_count*k > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
   for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
     point = dict(zip(out_axes, coordinates))
@@ -599,7 +603,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   pairs = {(lhs_rows.index(row), rhs_columns.index(column)) for _,row,column in records}
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)) or \
      pairs != set(product(range(m), range(n))): return _not_applicable()
-  if not 1 <= m <= 64 or not 1 <= n <= 16 or not 1 <= k <= 64 or lhs_count > 512 or rhs_count > 512 or m*align_in > 4096:
+  if not 1 <= m <= 64 or not 1 <= n <= 16 or m*align_in > 4096:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
                 [[] for _ in range(align_in-k)])]
