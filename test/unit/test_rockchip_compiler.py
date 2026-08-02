@@ -7,7 +7,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKLowerKind, RKProgram, RKReduce,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
-  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, rk_fingerprint)
+  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_tiled_contract_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -590,6 +590,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(image.stages[0].relocs[0].kind, RKBufferKind.CONSTANT)
     self.assertEqual(decode_image(encode_image(image)), image)
 
+  def test_tiled_affine_contraction_has_native_pack_compute_unpack(self):
+    x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)
+    plan = lower_tiled_contract_result(sink(x@y)).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    engines = [stage.engine for stage in emit_program(plan).stages]
+    self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC)), (6,85))
+    self.assertFalse(contains_uop(plan))
+
   def test_global_sum_is_aligned_dpu_cmac_tree(self):
     result = lower_add_reduce_result(sink(Tensor.empty(16384,dtype=dtypes.half).sum()))
     self.assertIsInstance(result.plan, RKProgram)
@@ -673,7 +682,7 @@ class TestDPUCompiler(unittest.TestCase):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
              (Tensor.empty(4,4,dtype=dtypes.half).T+Tensor.empty(4,4,dtype=dtypes.half).T, "unsupported_layout"),
-             (Tensor.empty(8,8,dtype=dtypes.half)@Tensor.empty(8,8,dtype=dtypes.half), "requires_reformat"),
+             (Tensor.empty(17,17,dtype=dtypes.half)@Tensor.empty(17,17,dtype=dtypes.half), "plan_stage_limit"),
              (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))

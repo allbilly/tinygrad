@@ -185,33 +185,36 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   if plan.rhs.layout.kind is not RKLayoutKind.CMAC_WEIGHT: raise ValueError("CMAC RHS is not in weight layout")
   e, align_out, align_in = _command, plan.rhs.layout.physical_shape[0], plan.lhs.layout.physical_shape[-1]
+  m = plan.lhs.layout.physical_shape[0]
   if align_in < 32 or align_in % 32: raise ValueError("CMAC K must be aligned to 32")
   if align_out != 32: raise ValueError("proven CMAC output tile is 32 physical channels")
   input_row_bytes = align_in*2
   feature_grains = max(80, (((2*256*128+input_row_bytes-1)//input_row_bytes)+1)&-2)
+  data_banks = min(11, max(1, (m*input_row_bytes+32767)//32768))
   line_stride = 4*min(align_in//32, 13)
   notch = 8*min(align_out//32, 13)-1
   commands = (
     e(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), e(_TARGET_CNA, rk.REG_CNA_CONV_CON1, 0x20000120),
     e(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4), e(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
-    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((align_in-1)<<16)|align_in),
-    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, 1), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE3, 1),
+    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, (1<<16)|m), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((align_in-1)<<16)|align_in),
+    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, 1), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE3, m),
     e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes*align_out), e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes),
-    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, 0x1010000|align_out), e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, 0xb1),
+    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, 0x1010000|align_out),
+    e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, ((12-data_banks)<<4)|data_banks),
     e(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, align_in//32), e(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
     *(e(_TARGET_CNA, reg, 0x10000) for reg in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4)),
     e(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0), e(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),
     e(_TARGET_CNA, rk.REG_CNA_DMA_CON1, line_stride), e(_TARGET_CNA, rk.REG_CNA_DMA_CON2, 0),
-    e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_in),
+    e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, (1<<16)|m), e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_in),
     e(_TARGET_CNA, rk.REG_CNA_DCOMP_ADDR0, 0), e(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x201),
-    e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, 0), e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out-1),
+    e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, (m-1)<<16), e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out-1),
     e(_TARGET_CORE, rk.REG_CORE_RESERVED_3030, 0), e(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e4),
     e(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), e(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
     e(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, 0x10), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0),
-    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch<<16)|notch),
+    e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, m-1), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (notch<<16)|notch),
     e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((align_out-1)<<16)|(align_out-1)), e(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 0x126), e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1),
-    e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, 0), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
+    e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, (m-1)<<16), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
   relocs = tuple(RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
@@ -265,4 +268,3 @@ def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   relocs = (RKReloc(0, dst_word, plan.out.buffer.kind, plan.out.buffer.index, plan.out.buffer.addend+plan.out.layout.base_offset),
             RKReloc(0, src_word, plan.src.buffer.kind, plan.src.buffer.index, plan.src.buffer.addend+plan.src.layout.base_offset))
   return RKImage(target, (RKStage(RKEngine.PPU, tuple(commands), relocs, RK_STAGE_RESET),))
-

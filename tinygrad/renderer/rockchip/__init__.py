@@ -64,6 +64,10 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
       _cmac_selection_payload(rows[start:start+count], align_in, 32, scale)))
   return RKProgram((dpu, *contracts), scratch)
 
+def _finish_program(steps:list[RKDPUProgram|RKContract|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
+  """Give every ordered DPU step the program's final resource table."""
+  return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
+
 def _native(plan:RKDPUProgram|RKContract|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
@@ -461,6 +465,83 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
   return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(lhs.src[0].arg.slot, (1,32)),
                             _cmac_weight_ref(rhs.src[0].arg.slot, n, 32), red_axis))
 
+def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
+  """Pack, execute, and unpack one bounded affine FP16 MxNxK contraction entirely on the NPU."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2 or store.src[0].op is not Ops.INDEX or \
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or _strip_casts(store.src[1]).key != reduce.key:
+    return _not_applicable()
+  body, red = _strip_casts(reduce.src[0]), reduce.src[1]
+  if body.op is not Ops.MUL or red.op is not Ops.RANGE: return _not_applicable()
+  lhs, rhs = (_strip_casts(x) for x in body.src)
+  if any(x.op is not Ops.INDEX or x.src[0].op is not Ops.PARAM or x.dtype is not dtypes.half for x in (lhs,rhs)):
+    return _not_applicable()
+  out_aff, lhs_aff, rhs_aff = _affine(store.src[0].src[1]), _affine(lhs.src[1]), _affine(rhs.src[1])
+  if out_aff is None or lhs_aff is None or rhs_aff is None: return _not_applicable()
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  out_axes, red_axis = tuple(sorted(out_aff[0])), red.arg[0]
+  if red_axis not in ranges or set(lhs_aff[0]) - set(out_axes) - {red_axis} or set(rhs_aff[0]) - set(out_axes) - {red_axis} or \
+     any(axis not in ranges for axis in out_axes): return _not_applicable()
+  k = ranges[red_axis]
+  lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
+  records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
+  for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes, coordinates))
+    output = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in out_axes)
+    lhs_row, rhs_column = [], []
+    for reduction in range(k):
+      point[red_axis] = reduction
+      lhs_row.append(lhs_aff[1] + sum(lhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,red_axis)))
+      rhs_column.append(rhs_aff[1] + sum(rhs_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,red_axis)))
+    records.append((output, tuple(lhs_row), tuple(rhs_column)))
+  lhs_rows = list(dict.fromkeys(row for _,row,_ in records))
+  rhs_columns = list(dict.fromkeys(column for _,_,column in records))
+  m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
+  pairs = {(lhs_rows.index(row), rhs_columns.index(column)) for _,row,column in records}
+  if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)) or \
+     pairs != set(product(range(m), range(n))): return _not_applicable()
+  if not 1 <= m <= 16 or not 1 <= n <= 16 or not 1 <= k <= 64 or lhs_count > 512 or rhs_count > 512 or m*align_in > 512:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
+  a_selector = [entry for row in lhs_rows for entry in ([[source] for source in row] + [[] for _ in range(align_in-k)])]
+  b_selector:list[list[int]] = []
+  for out_block in range(2):
+    for in_block in range(align_in//32):
+      for out_lane in range(16):
+        for in_lane in range(32):
+          out_channel, reduction = out_block*16+out_lane, in_block*32+in_lane
+          b_selector.append([rhs_columns[out_channel][reduction]] if out_channel < n and reduction < k else [])
+  constant_bytes = sum(((count+15)//16)*32*max(32,(source_count+31)&-32)*2 for count,source_count in
+                       ((len(a_selector),lhs_count),(len(b_selector),rhs_count),(output_count,m*64)))
+  if constant_bytes > 8*1024*1024:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC selectors need {constant_bytes} bytes", reduce.op)
+
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  scratch:tuple[RKScratch, ...] = (RKScratch(len(a_selector)*2),)
+  a_arg = RKArg(RKBufferKind.SCRATCH, 0)
+  packed_a = _sparse_cmac_pipeline(a_arg, RKArg(RKBufferKind.ARG, lhs.src[0].arg.slot), lhs_count, a_selector, scratch=scratch)
+  steps.extend(packed_a.steps)
+  scratch = packed_a.scratch
+  b_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch += (RKScratch(len(b_selector)*2),)
+  packed_b = _sparse_cmac_pipeline(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch=scratch)
+  steps.extend(packed_b.steps)
+  scratch = packed_b.scratch
+  cmac_out = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch += (RKScratch(m*128),)
+  lhs_layout = RKLayout((m,k), (m,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-k)))
+  rhs_layout = RKLayout((n,k), (32,align_in), (align_in*2,2), dtypes.half,
+                        padding=((0,32-n),(0,align_in-k)), kind=RKLayoutKind.CMAC_WEIGHT)
+  out_layout = RKLayout((m,n), (m,64), (128,2), dtypes.half, padding=((0,0),(0,64-n)))
+  steps.append(RKContract(RKTensorRef(cmac_out, out_layout), RKTensorRef(a_arg, lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axis))
+  unpack:list[list[int]] = [[] for _ in range(output_count)]
+  for output,row,rhs_key in records: unpack[output] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
+  dense = _sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), cmac_out, m*64, unpack, scratch=scratch)
+  steps.extend(dense.steps)
+  scratch = dense.scratch
+  return _native(_finish_program(steps, scratch))
+
 def lower_contract(sink:UOp) -> RKContract|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""
   return cast(RKContract|None, lower_contract_result(sink).plan)
@@ -666,6 +747,7 @@ _LOWERERS = (
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
   RKLowerer("affine_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_affine_max_result),
   RKLowerer("global_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_global_max_result),
+  RKLowerer("tiled_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_tiled_contract_result),
   RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),
 )
 

@@ -10,6 +10,15 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
     np.testing.assert_equal(actual, data.astype(np.float32).sum(axis=1).astype(np.float16))
 
+  def test_small_dynamic_fp16_gemm_native_pack_compute_unpack(self):
+    rng = np.random.default_rng(19)
+    for size in (4,8,9):
+      with self.subTest(size=size):
+        x, y = (rng.uniform(-.25, .25, (size,size)).astype(np.float16) for _ in range(2))
+        actual = (Tensor(x, device="ROCKCHIP").realize()@Tensor(y, device="ROCKCHIP").realize()).realize().numpy()
+        expected = (x.astype(np.float32)@y.astype(np.float32)).astype(np.float16)
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_contiguous_fp16_sum_native_dpu_cmac(self):
     rng = np.random.default_rng(4)
     for count in (2, 16, 60, 135, 720, 16384):

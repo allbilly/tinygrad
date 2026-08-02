@@ -980,3 +980,22 @@ official tolerances. The durable JSON is
 `31afa3697c726182bc7759b02051357e7701a8b88226a96086f3163f146446d5`);
 JUnit XML SHA-256 is
 `e66904bf774118f5e783fbc02a2adb937f44c8d9ad884475ae0430120de0b3f9`.
+
+Bounded affine FP16 contractions now have a fully native dynamic pack/compute/
+unpack path. Static selector CMAC tasks pack both argument surfaces into padded
+activation and CMAC-weight layouts, a generalized multi-row CMAC task computes
+M×N×K, and selector tasks compact its physical output into the graph's affine
+destination. The implementation groups affine operand sequences into matrix
+rows and columns rather than matching matmul test names. It currently accepts
+M,N≤16, K≤64, source surfaces≤512 elements, and at most 8 MiB of generated
+selector constants. Hardware established that useful FP16 CMAC rows retain a
+128-byte physical stride (`align_out*4`), matching `conv_grok`; this is encoded
+in the target layout and scratch allocation. Dynamic 4×4, 8×8, and 9×9 probes
+pass at unchanged tolerances, as do complete `test_small_gemm`, `test_9_gemm`,
+and `test_matmul_simple` methods. An 8×8 plan is intentionally a correctness
+fallback—91 NPU tasks, 460,032 constant bytes, and 4,864 scratch bytes—so a
+future cost model can prefer direct CNA/DMA packing without changing the
+affine contraction IR. Ruff, mypy, all 70 host tests, and the strict RK3588
+suite (51 tests plus 34 subtests) pass; the latter completed in 410.15 seconds.
+The capability adds 80 counted compiler lines (27,569 total; 2,436 in the
+Rockchip renderer/compiler) before the next full census.
