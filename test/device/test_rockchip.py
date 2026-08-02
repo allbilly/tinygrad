@@ -70,6 +70,19 @@ class TestRockchip(unittest.TestCase):
     expanded = Tensor(data[:,:1], device="ROCKCHIP").realize().expand(2,3,8).contiguous().realize().numpy()
     np.testing.assert_equal(expanded, np.broadcast_to(data[:,:1], (2,3,8)))
 
+  def test_sparse_affine_movements_native_cmac(self):
+    cases = (
+      (np.arange(9, dtype=np.float16).reshape(3,3), lambda x:x.T, lambda x:x.T),
+      (np.arange(27, dtype=np.float16).reshape(3,3,3), lambda x:x.transpose(0,2), lambda x:x.transpose(2,1,0)),
+      (np.arange(360, dtype=np.float16).reshape(3,4,5,6), lambda x:x.permute(3,2,1,0), lambda x:x.transpose(3,2,1,0)),
+      (np.arange(432, dtype=np.float16).reshape(4,3,6,6), lambda x:x.flip((0,1,3)), lambda x:x[::-1,::-1,:,::-1]),
+      (np.arange(72, dtype=np.float16).reshape(4,3,1,6), lambda x:x.expand(6,1,4,3,2,6),
+       lambda x:np.broadcast_to(x, (6,1,4,3,2,6))))
+    for data,tensor_op,numpy_op in cases:
+      with self.subTest(shape=data.shape):
+        actual = tensor_op(Tensor(data, device="ROCKCHIP").realize()).contiguous().realize().numpy()
+        np.testing.assert_equal(actual, numpy_op(data))
+
   def test_unaligned_contiguous_slice_native_dpu(self):
     data = np.arange(24, dtype=np.float16)
     tensor = Tensor(data, device="ROCKCHIP").realize()

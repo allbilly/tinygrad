@@ -40,7 +40,7 @@ as an immutable constant, while the user input remains a directly addressed
 rounded to FP16. Neither compilation nor execution performs host packing or
 host arithmetic; unsupported row widths continue to reject.
 
-Contiguous FP16 global sums now use a typed `RKSumProgram`. The compiler splits
+Contiguous FP16 global sums now use a typed `RKPipeline`. The compiler splits
 an arbitrary extent into descending power-of-two blocks. DPU pairwise stages
 reduce each block only while the second half begins at a 16-byte address; the
 remaining aligned runs are copied into one scratch surface and a masked K32
@@ -90,27 +90,41 @@ from its predecessor. A strict `(3,4,5,6)` hardware matrix covers axes `3`,
 The full explicit-device suite passes 44 tests plus 22 subtests in 328.63
 seconds with `CACHELEVEL=0` after this milestone.
 
-The first native reformat path handles static affine movements at the proven
-16-byte DPU atom granularity. The compiler enumerates only static index maps,
-coalesces adjacent aligned atoms, and emits ordinary DPU ADD-zero copy tasks;
-runtime tensor values never visit the CPU. Strict hardware tests cover HWC8
-permute, expand, and flip. A movement rejects when an output atom maps to
-strided source elements or crosses a source-run boundary (for example an 8x8
-scalar transpose), rather than silently using host gather.
+The native reformat path handles static affine movements without host gather.
+The compiler enumerates the complete static selector map. Contiguous aligned
+runs still coalesce into ordinary DPU ADD-zero atom copies. A map that breaks
+those atoms now reuses the generated sparse-CMAC `RKPipeline`: one DPU task
+copies at most 512 source values into an aligned surface, then sequential CMAC
+tasks select at most 16 logical outputs each. The planner accepts at most 4,096
+outputs and an 8 MiB generated-weight budget. It does not recognize transpose,
+permute, flip, expand, slice, or unfold by name.
+
+Strict hardware cases cover 9- and 27-element transposes, a 360-element
+permute, a 432-element multi-axis flip, and an 864-element expand. All match
+exactly with `ROCKCHIP_FALLBACK=0`. Focused official methods now pass for
+`test_transpose`, `test_permute`, `test_flip`, `test_expand`,
+`test_stack_slice`, `test_unfold`, `test_slice_stride_gt_one`,
+`test_double_slice`, and `test_diagonal`. The complete explicit-device suite
+passes 45 tests plus 27 subtests in 340.26 seconds with `CACHELEVEL=0`.
+The full 425-method census has not yet been rerun, so these nine focused gains
+are not folded into the 90-pass baseline below.
 
 Earlier slice tests appeared to show that DPU `SRC_BASE_ADDR` honors FP16
 sub-atom relocation addends. The reduction probe separates two cases: a GEM
 buffer view bound at an offset works, while adding two bytes to an already
-bound DMA address reads lane zero. The reformat planner now requires aligned
-source and destination atoms and rejects the latter representation. Real
-offset buffer views still pass lengths 1, 2, 3, and 8 on hardware. Enabling the
-separate `ERDMA_NONALIGN` bit was also rejected: it caused ordinary two-input
-DPU arithmetic to time out and is not part of the committed path.
+bound DMA address reads lane zero. The DPU atom-copy planner therefore still
+requires aligned task addresses; the sparse-CMAC fallback handles small
+unaligned selector maps after one aligned full-surface copy instead of emitting
+an illegal addend. Real offset buffer views still pass lengths 1, 2, 3, and 8
+on hardware. Enabling the separate `ERDMA_NONALIGN` bit was also rejected: it
+caused ordinary two-input DPU arithmetic to time out and is not part of the
+committed path.
 
 An independent unaligned-destination probe also timed out on the first
 official flip shape. Its exact planner diff and failure are preserved as
-`0063-WIP-unaligned-DPU-destination-timeout.patch`; the active compiler keeps
-the destination-atom legality check.
+`0063-WIP-unaligned-DPU-destination-timeout.patch`; the active compiler never
+restores that register path. Sparse CMAC outputs start on proven 16-element
+tile boundaries and later tiles overwrite only the preceding tile's padding.
 
 The next numerical milestone ports 2607's genuine NPU-only POW8 algorithm into
 the typed expression planner. The generated two-level LUT recipe passes 513
@@ -728,6 +742,7 @@ failures.
 | Native tiled int32/FP32 constant fills (research-only, restored) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Current (`52c6657e2`) |
 | Global FP16 CMAC sums, scaled mean, and ReLU-sum | `test_sum_simple`, `test_sum_full`, `test_mean`, `test_sum_relu` | Yes (`da09c1fd9`) |
 | Tiled sparse-CMAC affine FP16 reductions | `test_sum`, `test_sum_tiny`, `test_mean_axis` | Yes (`da09c1fd9`) |
+| Static affine DPU/CMAC selector reformat | transpose, permute, flip, expand, stack-slice, unfold, strided/double slice, diagonal | Focused only; census pending |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |

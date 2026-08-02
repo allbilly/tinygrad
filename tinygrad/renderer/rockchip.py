@@ -105,7 +105,7 @@ class RKContract:
   constants: bytes = b""
 
 @dataclass(frozen=True)
-class RKSumProgram:
+class RKPipeline:
   prefix: tuple[RKContract, ...]
   dpu: RKDPUProgram
   contract: RKContract
@@ -144,6 +144,22 @@ def _cmac_selection_payload(rows:list[list[int]], align_in:int, align_out:int, s
       values[packed] += scale
   return b"".join(struct.pack("<e", value) for value in values)
 
+def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]], scale:float=1.0) -> RKPipeline:
+  """Materialize one static selector matrix as sequential, proven-width CMAC tasks."""
+  align_in = max(32, (input_count+31)&-32)
+  packed = RKArg(RKBufferKind.SCRATCH, 0)
+  dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, source, 0.0, input_count),), (RKScratch(align_in*2),))
+  lhs_layout = RKLayout((1,input_count), (1,align_in), (align_in*2,2), dtypes.half,
+                        padding=((0,0),(0,align_in-input_count)))
+  contracts:list[RKContract] = []
+  for start in range(0, len(rows), 16):
+    count = min(16, len(rows)-start)
+    out_layout = RKLayout((1,count), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-count)))
+    contracts.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
+      RKTensorRef(packed, lhs_layout), _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), 0,
+      _cmac_selection_payload(rows[start:start+count], align_in, 32, scale)))
+  return RKPipeline((), dpu, contracts[0], tuple(contracts[1:]))
+
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
   UNSUPPORTED_OUTPUT_DTYPE = "unsupported_output_dtype"
@@ -168,12 +184,12 @@ class RKReject:
 
 @dataclass(frozen=True)
 class RKLowerResult:
-  plan: RKDPUProgram|RKContract|RKReduce|RKSumProgram|None = None
+  plan: RKDPUProgram|RKContract|RKReduce|RKPipeline|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     if (self.plan is None) == (self.reject is None): raise ValueError("RK lowering result must contain exactly one plan or reject")
 
-def _native(plan:RKDPUProgram|RKContract|RKReduce|RKSumProgram) -> RKLowerResult: return RKLowerResult(plan=plan)
+def _native(plan:RKDPUProgram|RKContract|RKReduce|RKPipeline) -> RKLowerResult: return RKLowerResult(plan=plan)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
   return RKLowerResult(reject=RKReject(kind, detail, node_op))
 
@@ -1623,7 +1639,7 @@ def rk_fingerprint(sink:UOp) -> tuple:
           ("indexes", tuple(sorted(indexes, key=repr))), ("reductions", tuple(sorted(reductions, key=repr))))
 
 def lower_reformat_result(sink:UOp) -> RKLowerResult:
-  """Lower a static affine movement whose source remains contiguous inside every 16-byte NPU atom."""
+  """Lower a static affine movement through atom copies or a sparse CMAC selector."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
   if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat requires one store", Ops.STORE)
   store = stores[0]
@@ -1652,13 +1668,16 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   if any(source < 0 for source in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output has holes", Ops.INDEX)
   output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
   stages:list[RKDPUStage] = []
+  atom_reject:RKLowerResult|None = None
   dst = 0
   while dst < count:
     valid, src = min(8, count-dst), mapping[dst]
     if src % 8:
-      return _unsupported(RKRejectKind.UNALIGNED_ROW, f"movement source atom begins at element {src}", Ops.INDEX)
+      atom_reject = _unsupported(RKRejectKind.UNALIGNED_ROW, f"movement source atom begins at element {src}", Ops.INDEX)
+      break
     if mapping[dst:dst+valid] != list(range(src, src+valid)):
-      return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement breaks FP16 destination atom at element {dst}", Ops.INDEX)
+      atom_reject = _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement breaks FP16 destination atom at element {dst}", Ops.INDEX)
+      break
     length = valid
     while dst+length < count:
       following = min(8, count-dst-length)
@@ -1666,7 +1685,12 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       length += following
     stages.append(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, dst*2), RKArg(source.kind, source.index, src*2), 0.0, length))
     dst += length
-  return _native(RKDPUProgram(tuple(stages)))
+  if atom_reject is None: return _native(RKDPUProgram(tuple(stages)))
+  align_in = max(32, (src_count+31)&-32)
+  constant_bytes = ((count+15)//16)*32*align_in*2
+  if 0 < src_count <= 512 and 0 < count <= 4096 and constant_bytes <= 8*1024*1024:
+    return _native(_sparse_cmac_pipeline(output, source, src_count, [[src] for src in mapping]))
+  return atom_reject
 
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""
@@ -1720,7 +1744,7 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
     lhs_layout = RKLayout((1,count), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-count)))
     contract = RKContract(RKTensorRef(output, out_layout), RKTensorRef(packed, lhs_layout),
       _cmac_weight_ref(0, 4, align_in, RKBufferKind.CONSTANT, 32), red.arg[0], _cmac_mask_payload(count, align_in, scale=scale))
-    return _native(RKSumProgram((), dpu, contract))
+    return _native(RKPipeline((), dpu, contract))
   runs:list[tuple[RKArg, int]] = []
   prefix:list[RKContract] = []
   rows, tail = divmod(count, 32)
@@ -1763,7 +1787,7 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   out_ref = RKTensorRef(output, RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31))))
   contract = RKContract(out_ref, _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH),
                         _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
-  return _native(RKSumProgram(tuple(prefix), RKDPUProgram(tuple(stages), tuple(scratch)), contract))
+  return _native(RKPipeline(tuple(prefix), RKDPUProgram(tuple(stages), tuple(scratch)), contract))
 
 def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a small affine FP16 ADD reduction as generated sparse CMAC tiles."""
@@ -1814,21 +1838,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
-  align_in = (input_count+31)&-32
-  packed = RKArg(RKBufferKind.SCRATCH, 0)
-  dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, value.src[0].arg.slot), 0.0, input_count),),
-                     (RKScratch(align_in*2),))
-  lhs_layout = RKLayout((1,input_count), (1,align_in), (align_in*2,2), dtypes.half,
-                        padding=((0,0),(0,align_in-input_count)))
-  contracts:list[RKContract] = []
-  for start in range(0, output_count, 16):
-    count = min(16, output_count-start)
-    out_layout = RKLayout((1,count), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-count)))
-    contracts.append(RKContract(
-      RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, start*2), out_layout),
-      RKTensorRef(packed, lhs_layout), _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), red_axes[0],
-      _cmac_selection_payload(selectors[start:start+count], align_in, 32, scale)))
-  return _native(RKSumProgram((), dpu, contracts[0], tuple(contracts[1:])))
+  return _native(_sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot),
+    RKArg(RKBufferKind.ARG, value.src[0].arg.slot), input_count, selectors, scale))
 
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""
@@ -2152,7 +2163,7 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
                  for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out)))
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),), constants=plan.constants)
 
-def emit_sum(plan:RKSumProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
+def emit_pipeline(plan:RKPipeline, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Compose CMAC prefixes, DPU transforms, and one or more sequential CMAC output tiles."""
   images = (*(emit_contract(prefix, target) for prefix in plan.prefix), emit_dpu(plan.dpu, target),
             emit_contract(plan.contract, target), *(emit_contract(suffix, target) for suffix in plan.suffix))
@@ -2220,7 +2231,7 @@ class RockchipRenderer(Renderer):
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
-    elif isinstance(result.plan, RKSumProgram): image = emit_sum(result.plan)
+    elif isinstance(result.plan, RKPipeline): image = emit_pipeline(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))
     return UOp(Ops.PROGRAM, src=(ast, linear, UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),

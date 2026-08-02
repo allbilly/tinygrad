@@ -54,6 +54,9 @@ are eligible to be ported as native capabilities.
 - static affine FP16 ADD reductions with at most 512 input and 128 output
   elements, using one aligned DPU copy and sequential sparse CMAC tiles of at
   most 16 logical outputs; constant mean scaling is folded into the weights;
+- static affine FP16 movements with at most 512 source and 4,096 output
+  elements: aligned runs use DPU atom copies, while arbitrary selector maps up
+  to an 8 MiB generated-weight budget use the same sparse CMAC pipeline;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
@@ -105,8 +108,8 @@ and has no skip on an RK3588 host.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,189, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,189 lines.
-The exact 2,221-line delta is 2,216 counted Rockchip backend lines (2,056
+contains 27,198, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,198 lines.
+The exact 2,230-line delta is 2,225 counted Rockchip backend lines (2,065
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
