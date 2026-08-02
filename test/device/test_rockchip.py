@@ -95,6 +95,13 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().max(axis=1).realize().numpy()
     np.testing.assert_equal(actual, data.max(axis=1))
 
+  def test_static_conditional_fp16_reformat_native_cmac(self):
+    data = np.arange(20, dtype=np.float16).reshape(4,5)
+    tensor = Tensor(data, device="ROCKCHIP").realize()
+    for diagonal in (-2,0,2):
+      with self.subTest(diagonal=diagonal):
+        np.testing.assert_equal(tensor.tril(diagonal).realize().numpy(), np.tril(data, diagonal))
+
   def test_affine_hwc8_movements_native_dpu(self):
     data = np.arange(2*3*8, dtype=np.float16).reshape(2,3,8)
     tensor = Tensor(data, device="ROCKCHIP").realize()

@@ -1017,3 +1017,16 @@ durable JSON is
 `8e60df220935360a3755299cda4deff69c39dbe35c88fcad854eb7e0ad60ef54`);
 JUnit XML SHA-256 is
 `a0e133efd99abee2a2cd2768e999e6d8942f009ed3b8b592857d7286bbbfab65`.
+
+Static coordinate predicates in affine FP16 reformats now lower to the same
+bounded sparse-CMAC selector used by generic movement. The compiler evaluates
+only a strict whitelist of scalar coordinate operations over known `RANGE`
+values; it never evaluates tensor loads. False selector rows become native
+zero rows, which covers the FP16 subcases of `tril` and `triu` for arbitrary
+tested diagonals without a named-operation path. Explicit boolean inputs still
+reject on their unsupported dtype, and `padding_add` still requires a separate
+two-source affine composition capability, so this focused milestone makes no
+new method-level census claim. Ruff and mypy pass, as do all 71 host tests and
+the strict RK3588 suite (52 tests plus 37 subtests) in 411.96 seconds with
+`ROCKCHIP_FALLBACK=0`. The change brings the research tree to 27,601 counted
+lines, including 2,468 lines in the Rockchip renderer/compiler.

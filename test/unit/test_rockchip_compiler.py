@@ -657,6 +657,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual([stage.engine for stage in emit_program(first).stages], [RKEngine.DPU]*2+[RKEngine.CMAC]*4)
     self.assertEqual(decode_image(encode_image(emit_program(first))), emit_program(first))
 
+  def test_static_conditional_reformat_generates_zero_selector_rows(self):
+    plan = lower_reformat_result(sink(Tensor.empty(3,3,dtype=dtypes.half).tril())).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    self.assertEqual([stage.engine for stage in emit_program(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
+    self.assertFalse(contains_uop(plan))
+
   def test_affine_reduction_materializes_pointwise_dpu_expression(self):
     x, y = Tensor.empty(3,4,5,dtype=dtypes.half), Tensor.empty(3,4,5,dtype=dtypes.half)
     plan = lower_affine_reduce_result(sink(((x+y)*x).sum(axis=1))).plan

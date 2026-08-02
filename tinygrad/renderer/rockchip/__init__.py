@@ -121,6 +121,25 @@ def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
   return u
 
+def _static_scalar(u:UOp, ranges:dict[int, int]) -> int|float|bool|None:
+  """Evaluate one compile-time coordinate predicate; tensor loads are never accepted."""
+  if u.op is Ops.CAST: return _static_scalar(u.src[0], ranges)
+  if u.op is Ops.CONST: return u.arg
+  if u.op is Ops.RANGE: return ranges.get(u.arg[0])
+  values = tuple(_static_scalar(x, ranges) for x in u.src)
+  if any(x is None for x in values): return None
+  if u.op is Ops.ADD: return values[0]+values[1]  # type: ignore[operator]
+  if u.op is Ops.MUL: return values[0]*values[1]  # type: ignore[operator]
+  if u.op is Ops.MAX: return max(values)  # type: ignore[type-var]
+  if u.op is Ops.FLOORDIV: return int(cast(int|float|bool, values[0]))//int(cast(int|float|bool, values[1]))
+  if u.op is Ops.FLOORMOD: return int(cast(int|float|bool, values[0]))%int(cast(int|float|bool, values[1]))
+  if u.op is Ops.CMPLT: return values[0] < values[1]  # type: ignore[operator]
+  if u.op is Ops.CMPNE: return values[0] != values[1]
+  if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
+  if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
+  if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
+  return None
+
 def _relu_source(u:UOp) -> UOp|None:
   if u.op is not Ops.WHERE or len(u.src) != 3: return None
   cond, positive, zero = u.src
@@ -136,9 +155,16 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   store = stores[0]
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM:
     return _not_applicable()
-  value = _strip_casts(store.src[1])
-  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2:
-    return _not_applicable()
+  value, condition, select_true = _strip_casts(store.src[1]), None, True
+  if value.op is Ops.WHERE:
+    cond, positive, negative = value.src
+    positive, negative = _strip_casts(positive), _strip_casts(negative)
+    if positive.op is Ops.INDEX and negative.op is Ops.CONST and float(negative.arg) == 0:
+      value, condition = positive, cond
+    elif negative.op is Ops.INDEX and positive.op is Ops.CONST and float(positive.arg) == 0:
+      value, condition, select_true = negative, cond, False
+    else: return _not_applicable()
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2: return _not_applicable()
   if store.src[0].dtype is not dtypes.half or value.dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires FP16 input and output", store.src[0].op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
@@ -148,21 +174,29 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   axes = tuple(sorted(out_aff[0].keys() | src_aff[0].keys()))
   if any(axis not in ranges for axis in axes): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "dynamic reformat range", Ops.RANGE)
   count, src_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
-  mapping = [-1] * count
+  mapping = [-2] * count
   for coordinates in product(*(range(ranges[axis]) for axis in axes)):
     point = dict(zip(axes, coordinates))
     dst = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in axes)
     src = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in axes)
-    if not 0 <= dst < count or mapping[dst] != -1 or not 0 <= src < src_count:
+    selected = True
+    if condition is not None:
+      if (predicate:=_static_scalar(condition, point)) is None:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat predicate is not static", condition.op)
+      selected = bool(predicate) is select_true
+    if not 0 <= dst < count or mapping[dst] != -2 or selected and not 0 <= src < src_count:
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat does not cover one dense output", Ops.INDEX)
-    mapping[dst] = src
-  if any(source < 0 for source in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output has holes", Ops.INDEX)
+    mapping[dst] = src if selected else -1
+  if any(source == -2 for source in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output has holes", Ops.INDEX)
   output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
   stages:list[RKDPUStage] = []
   atom_reject:RKLowerResult|None = None
   dst = 0
   while dst < count:
     valid, src = min(8, count-dst), mapping[dst]
+    if src < 0:
+      atom_reject = _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement output atom {dst} includes a static zero", Ops.WHERE)
+      break
     if src % 8:
       atom_reject = _unsupported(RKRejectKind.UNALIGNED_ROW, f"movement source atom begins at element {src}", Ops.INDEX)
       break
@@ -180,7 +214,7 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   align_in = max(32, (src_count+31)&-32)
   constant_bytes = ((count+15)//16)*32*align_in*2
   if 0 < src_count <= 512 and 0 < count <= 4096 and constant_bytes <= 8*1024*1024:
-    return _native(_sparse_cmac_pipeline(output, source, src_count, [[src] for src in mapping]))
+    return _native(_sparse_cmac_pipeline(output, source, src_count, [[src] if src >= 0 else [] for src in mapping]))
   return atom_reject
 
 def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
