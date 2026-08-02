@@ -76,6 +76,8 @@ are eligible to be ported as native capabilities.
   windows shared greedily across consecutive PPU batches under the global
   stage/constant budgets; masked windows use a 192-lane cost target, while
   unmasked CMAC groups use compact atom-aligned subviews of a shared pack;
+- affine MAX atoms that span more than K512 reduce each logical output into an
+  aligned PPU scratch atom, then gather lane zero through sparse CMAC;
 - one static affine FP16 input reformat/broadcast materialized by cost-bounded
   CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
@@ -189,6 +191,12 @@ inside the existing 400-stage and 2 MiB limits without changing either bound.
 The strict hardware suite remains 59 tests plus 37 subtests, and the inferred
 native total is 129 pending the next complete census.
 
+Wide affine-MAX output atoms subsequently make `test_max_pool2d_dilation`
+native. Each logical result is reduced into an aligned scratch atom entirely on
+DPU/CMAC/PPU, then the generic sparse-CMAC reformatter gathers dense output.
+The strict suite passes 60 tests plus 37 subtests; the inferred native total is
+130 pending the next complete census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -199,8 +207,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,765, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,765 lines.
-The exact 2,797-line delta is 2,792 counted Rockchip backend lines (2,632
+contains 27,817, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,817 lines.
+The exact 2,849-line delta is 2,844 counted Rockchip backend lines (2,684
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

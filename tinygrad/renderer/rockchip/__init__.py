@@ -811,6 +811,52 @@ def lower_global_max_result(sink:UOp) -> RKLowerResult:
                                    0.0 if output_scale == 1.0 else output_scale, 1),), scratch_tuple)
   return _native(RKProgram((RKDPUProgram(tuple(stages), scratch_tuple), *contracts, reduce_plan, final), scratch_tuple))
 
+def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[int]], pool_extent:int,
+                               pool_shape:tuple[int, int], reduce_axis:int) -> RKProgram|None:
+  """Reduce source-local scalar windows, then gather their aligned PPU atoms into dense output."""
+  specs:list[tuple[int, int, int, int|None, list[int]]] = []
+  for row in selectors:
+    selected = [index for index in row if index >= 0]
+    if not selected: return None
+    base, end = min(selected)&-8, max(selected)+1
+    span, align_in = end-base, max(32, (end-base+31)&-32)
+    sentinel = align_in if any(index < 0 for index in row) else None
+    if sentinel is not None: align_in += 32
+    if align_in > 512: return None
+    specs.append((base, span, align_in, sentinel, [index-base if index >= 0 else -1 for index in row]))
+  surface_count, hwc_elements = pool_extent*8, ((pool_extent*8-1)//16)*16+32
+  packed, hwc, atoms = (RKArg(RKBufferKind.SCRATCH, index) for index in range(3))
+  scratch:tuple[RKScratch, ...] = (RKScratch(max(spec[2] for spec in specs)*2), RKScratch(hwc_elements*2), RKScratch(len(selectors)*16))
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  payloads:set[bytes] = set()
+  height, width = pool_shape
+  for output_index,(base,span,align_in,sentinel,row) in enumerate(specs):
+    prepare = [RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
+               RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span)]
+    if sentinel is not None:
+      prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
+    steps.append(RKDPUProgram(tuple(prepare), scratch))
+    flat = [sentinel if row[min(spatial,len(row)-1)] < 0 else row[min(spatial,len(row)-1)]
+            for spatial in range(pool_extent) for _ in range(8)]
+    for start in range(0, surface_count, 16):
+      count = min(16, surface_count-start)
+      payload = _cmac_selection_payload([[cast(int,index)] for index in flat[start:start+count]], align_in, 32, 1.0)
+      payloads.add(payload)
+      out_layout = RKLayout((1,count), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-count)))
+      steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
+        _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
+        _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), reduce_axis, payload))
+    out = RKTensorRef(RKArg(atoms.kind, atoms.index, output_index*16), RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
+    src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+    steps.append(RKReduce(out, src, Ops.MAX, reduce_axis))
+  gather = _sparse_cmac_pipeline(output, atoms, len(selectors)*8, [[index*8] for index in range(len(selectors))], scratch=scratch)
+  steps.extend(gather.steps)
+  scratch = gather.scratch
+  payloads.update(step.constants for step in gather.steps if isinstance(step, RKContract))
+  stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)
+  if stage_count > RK_MAX_PROGRAM_STAGES or sum(map(len,payloads)) > RK_MAX_CONSTANT_BYTES: return None
+  return _finish_program(steps, scratch)
+
 def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   """Lower a static affine FP16 MAX by reformatting eight outputs into PPU channels per batch."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -869,6 +915,14 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
 
   surface_count, whole_surface = pool_extent*8, input_count <= 512 and output_count <= 128
   raw_groups = [(start, selectors[start:start+8]) for start in range(0, output_count, 8)]
+  if any(max(32, (max(index for row in rows for index in row if index >= 0)+1-
+                      (min(index for row in rows for index in row if index >= 0)&-8)+31)&-32) +
+         (32 if any(index < 0 for row in rows for index in row) else 0) > 512 for _,rows in raw_groups):
+    scalar = _scalar_affine_max_program(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot),
+      RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot), selectors, pool_extent, pool_shape, red_axes[0])
+    if scalar is None:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine PPU MAX scalar windows exceed plan limits", reduce.op)
+    return _native(scalar)
   windows:list[tuple[int, int, int, int|None, list[tuple[int, list[list[int]]]]]] = []
   next_group = 0
   while next_group < len(raw_groups):

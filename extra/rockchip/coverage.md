@@ -1239,3 +1239,16 @@ plus 37 subtests) in 472.86 seconds with `ROCKCHIP_FALLBACK=0`. The inferred
 native total is 129 after the current 128-pass census, pending the next full
 census. The research tree now has 27,765 counted lines, including 2,632 in the
 Rockchip renderer/compiler.
+
+An affine-MAX output atom whose eight logical results span more than the proven
+K512 source window now lowers through scalar PPU atoms. Each logical result is
+packed and reduced independently on DPU/CMAC/PPU, stored in one aligned scratch
+atom, then the established sparse-CMAC reformatter gathers lane zero from all
+atoms into dense output. This is a generic target-plan fallback for wide
+source topology; it does not inspect dilation or pooling names. Complete
+`test_max_pool2d_dilation` passes natively at exact comparison. Its four plans
+contain 48–195 stages and at most 1.0 MiB of unique constants. All 81 host
+tests, Ruff, and mypy pass, as does the strict hardware suite (60 tests plus
+37 subtests) in 494.88 seconds with `ROCKCHIP_FALLBACK=0`. The inferred native
+total is 130 after the current 128-pass census. The research tree now has
+27,817 counted lines, including 2,684 in the Rockchip renderer/compiler.

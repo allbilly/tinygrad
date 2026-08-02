@@ -108,6 +108,19 @@ class TestDPUCompiler(unittest.TestCase):
       plans.append(plan)
     self.assertTrue(any(isinstance(step, RKContract) and step.lhs.buffer.addend for plan in plans for step in plan.steps))
 
+  def test_wide_affine_max_atoms_reduce_scalars_then_gather(self):
+    plans = []
+    for dilation in ((2,3),(3,2),2,3):
+      plan = lower_affine_max_result(sink(Tensor.empty(3,2,17,14,dtype=dtypes.half).max_pool2d((5,5),dilation=dilation))).plan
+      self.assertIsInstance(plan, RKProgram)
+      assert isinstance(plan, RKProgram)
+      image = emit_program(plan)
+      self.assertLessEqual(len(image.stages), 400)
+      self.assertLessEqual(len(image.constants), 2*1024*1024)
+      self.assertFalse(contains_uop(plan))
+      plans.append(plan)
+    self.assertTrue(any(len(plan.scratch) == 4 for plan in plans))
+
   def test_large_affine_reductions_use_bounded_source_windows(self):
     plan = lower_affine_reduce_result(sink(Tensor.empty(2,2,11,28,dtype=dtypes.half).avg_pool2d(2))).plan
     self.assertIsInstance(plan, RKProgram)
