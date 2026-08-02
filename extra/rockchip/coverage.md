@@ -1316,3 +1316,24 @@ changes one counted condition only, so the research tree remains at 27,871
 counted lines with 2,738 in the Rockchip renderer/compiler. The pre-change
 compiler and tests are preserved under
 `~/rk2608_backups/tall-cmac-m128-before-cc1348718-20260803-014900`.
+
+Windowed selectors now read an atom-aligned typed source subview directly when
+its complete aligned K span is inside the declared source extent. Selector
+weights are zero for unused physical lanes, so no scratch zero/copy is needed;
+unsafe tail windows retain the established NPU pack path. This is a layout
+legality decision shared by contractions and affine reductions, not a shape or
+operation-name shortcut.
+
+The formerly rejected batch-8 K2 convolution plans fall from 540 stages to 263
+and 219 stages. Existing padded Conv1D falls from 395 to 174 stages, M81/K4
+Conv2D from 374 to 180 stages, and the large affine-average compiler plan from
+54 stages to 18 direct CMAC windows. Complete `test_simple_conv2d`, whose old
+selector estimate was 8.34 MiB, now uses 242 stages, 331,312 constant bytes,
+and 17,632 scratch bytes and passes natively in 29.87 seconds.
+
+All 83 host tests, Ruff, and mypy pass, as does the strict hardware suite (64
+tests plus 42 subtests) in 583.71 seconds with `ROCKCHIP_FALLBACK=0`. The
+inferred native total is 134 after the current 128-pass census. The research
+tree now has 27,877 counted lines, including 2,744 in the Rockchip
+renderer/compiler. The pre-change compiler and tests are preserved under
+`~/rk2608_backups/direct-cmac-windows-before-880171ff4-20260803-020414`.

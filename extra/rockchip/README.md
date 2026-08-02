@@ -222,6 +222,14 @@ admitting oversized M128 work. Complete `test_simple_conv2d_1x1` passes
 natively, the strict suite passes 63 tests plus 39 subtests, and the inferred
 native total is 133 pending the next census.
 
+Aligned windowed selectors subsequently address typed source subviews directly
+when the complete physical K span is inside the declared allocation; unsafe
+tail windows still use NPU scratch packing. This removes two DPU copy stages
+per safe window for contraction and affine-reduction plans. Complete
+`test_simple_conv2d` becomes native with a 242-stage/331,312-byte plan, the
+strict suite passes 64 tests plus 42 subtests, and the inferred native total is
+134 pending the next census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -232,8 +240,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,871, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,871 lines.
-The exact 2,903-line delta is 2,898 counted Rockchip backend lines (2,738
+contains 27,877, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,877 lines.
+The exact 2,909-line delta is 2,904 counted Rockchip backend lines (2,744
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

@@ -75,7 +75,7 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
   return RKProgram((dpu, *contracts), scratch)
 
 def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
-                            scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
+                            scratch:tuple[RKScratch, ...]=(), direct_count:int=0) -> RKProgram|None:
   """Reduce consecutive output tiles from bounded, atom-aligned source windows."""
   if struct.unpack("<e", struct.pack("<e", scale))[0] != scale: return None
   chunks:list[tuple[int, int, int, list[list[int]], bytes]] = []
@@ -102,22 +102,26 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
     payload = _cmac_selection_payload([[index-base for index in row] for row in tile], align_in, 32, scale)
     chunks.append((start, base, end, tile, payload))
     start += len(tile)
+  direct = tuple(base+len(payload)//64 <= direct_count for _,base,_,_,payload in chunks)
   if sum(map(len, set(chunk[-1] for chunk in chunks))) > RK_MAX_CONSTANT_BYTES or \
-     len(chunks)*3 > RK_MAX_PROGRAM_STAGES: return None
-  max_align = max((len(payload)//64 for *_,payload in chunks), default=32)
+     (1 if any(not row for row in rows) else 0)+sum(1 if safe else 3 for safe in direct) > RK_MAX_PROGRAM_STAGES: return None
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
-  scratch += (RKScratch(max_align*2),)
+  if not all(direct): scratch += (RKScratch(max((len(chunk[-1])//64 for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
   steps:list[RKDPUProgram|RKContract|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
                                                   if any(not row for row in rows) else [])
-  for start,base,end,tile,payload in chunks:
+  for (start,base,end,tile,payload),safe in zip(chunks,direct):
     span, align_in = end-base, len(payload)//64
-    steps.append(RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
-      RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span)), scratch))
+    if safe:
+      lhs = RKTensorRef(RKArg(source.kind, source.index, source.addend+base*2),
+        RKLayout((1,span), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-span))))
+    else:
+      steps.append(RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
+        RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span)), scratch))
+      lhs = _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH)
     valid = len(tile)
     out_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
     steps.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
-      _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
-      _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload))
+      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload))
   return RKProgram(tuple(steps), scratch)
 
 def _plan_cost(plan:RKProgram) -> RKPlanCost:
@@ -125,7 +129,7 @@ def _plan_cost(plan:RKProgram) -> RKPlanCost:
                     sum(map(len, {step.constants for step in plan.steps if isinstance(step, RKContract)})),
                     sum(resource.size for resource in plan.scratch))
 
-def _two_level_selector_program(output:RKArg, source:RKArg, rows:list[list[int]],
+def _two_level_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
                                 scratch:tuple[RKScratch, ...]) -> RKProgram|None:
   groups:list[list[list[int]]] = []
   for row in rows:
@@ -143,20 +147,21 @@ def _two_level_selector_program(output:RKArg, source:RKArg, rows:list[list[int]]
     intermediate_rows.extend([[] for _ in range((-len(group))%8)])
   intermediate = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(_cmac_tiled_output_bytes(len(intermediate_rows))),)
-  first = _windowed_cmac_pipeline(intermediate, source, intermediate_rows, scratch=scratch)
+  first = _windowed_cmac_pipeline(intermediate, source, intermediate_rows, scratch=scratch, direct_count=input_count)
   if first is None: return None
-  second = _windowed_cmac_pipeline(output, intermediate, compact_rows, scratch=first.scratch)
+  second = _windowed_cmac_pipeline(output, intermediate, compact_rows, scratch=first.scratch,
+                                   direct_count=_cmac_tiled_output_bytes(len(intermediate_rows))//2)
   return None if second is None else _finish_program([*first.steps,*second.steps], second.scratch)
 
 def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
                       scratch:tuple[RKScratch, ...]) -> RKProgram|None:
   candidates = (_sparse_cmac_pipeline(output, source, input_count, rows, scratch=scratch),
-                _windowed_cmac_pipeline(output, source, rows, scratch=scratch))
+                _windowed_cmac_pipeline(output, source, rows, scratch=scratch, direct_count=input_count))
   legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=_plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
                 cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)
   if legal:
     return min(legal, key=lambda item:(item[0].stage_count, item[0].constant_bytes, item[0].scratch_bytes))[1]
-  two_level = _two_level_selector_program(output, source, rows, scratch)
+  two_level = _two_level_selector_program(output, source, input_count, rows, scratch)
   return two_level if two_level is not None and _plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
     _plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
@@ -591,7 +596,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   initial_scratch = () if prepare is None else prepare.scratch
   program = _sparse_cmac_pipeline(output, source, input_count, selectors, scale, initial_scratch) if \
-    input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(output, source, selectors, scale, initial_scratch)
+    input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(
+      output, source, selectors, scale, initial_scratch, direct_count=input_count)
   if program is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine CMAC output tiles exceed the source-window or constant budget", reduce.op)
   if prepare is not None: program = RKProgram((RKDPUProgram(prepare.stages, program.scratch), *program.steps), program.scratch)

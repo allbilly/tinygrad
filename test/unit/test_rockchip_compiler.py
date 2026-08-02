@@ -127,8 +127,10 @@ class TestDPUCompiler(unittest.TestCase):
     assert isinstance(plan, RKProgram)
     image = emit_program(plan)
     dpu_count, cmac_count = (sum(stage.engine is engine for stage in image.stages) for engine in (RKEngine.DPU,RKEngine.CMAC))
-    self.assertEqual(dpu_count, 2*cmac_count)
-    self.assertLessEqual(cmac_count, 18)
+    # Before legal direct source subviews, every CMAC window required exactly two DPU copy stages.
+    self.assertGreater(cmac_count, 0)
+    self.assertLessEqual(dpu_count, 2*cmac_count)
+    self.assertLessEqual(len(image.stages), 54)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
     self.assertFalse(contains_uop(plan))
 
@@ -690,9 +692,14 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_program(plan)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
     self.assertFalse(contains_uop(plan))
-    oversized = lower_tiled_contract_result(sink(Tensor.empty(1,4,9,9,dtype=dtypes.half).conv2d(
-      Tensor.empty(4,4,3,3,dtype=dtypes.half))))
-    self.assertIs(oversized.reject.kind if oversized.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
+    # This 4-channel 3x3 surface was the old 8.34 MiB selector reject before direct source windows.
+    formerly_oversized = lower_tiled_contract_result(sink(Tensor.empty(1,4,9,9,dtype=dtypes.half).conv2d(
+      Tensor.empty(4,4,3,3,dtype=dtypes.half)))).plan
+    self.assertIsInstance(formerly_oversized, RKProgram)
+    assert isinstance(formerly_oversized, RKProgram)
+    formerly_oversized_image = emit_program(formerly_oversized)
+    self.assertLessEqual(len(formerly_oversized_image.stages), 400)
+    self.assertLessEqual(len(formerly_oversized_image.constants), 2*1024*1024)
     huge_surface = lower_tiled_contract_result(sink(Tensor.empty(1,4,32,32,dtype=dtypes.half).conv2d(
       Tensor.empty(4,4,3,3,dtype=dtypes.half))))
     self.assertIs(huge_surface.reject.kind if huge_surface.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
@@ -730,6 +737,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.stages), 400)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
     self.assertFalse(contains_uop(plan))
+
+  def test_aligned_cmac_windows_read_typed_source_subviews_directly(self):
+    cases = ((Tensor.empty(1,4,9,9,dtype=dtypes.half), Tensor.empty(4,4,3,3,dtype=dtypes.half)),
+             (Tensor.empty(8,3,11,dtype=dtypes.half), Tensor.empty(6,3,2,dtype=dtypes.half)))
+    for x,weight in cases:
+      plan = lower_tiled_contract_result(sink(x.conv2d(weight))).plan
+      self.assertIsInstance(plan, RKProgram)
+      assert isinstance(plan, RKProgram)
+      image = emit_program(plan)
+      self.assertLessEqual(len(image.stages), 400)
+      self.assertLessEqual(len(image.constants), 2*1024*1024)
+      self.assertTrue(any(isinstance(step, RKContract) and step.lhs.buffer.kind is RKBufferKind.ARG for step in plan.steps))
+      self.assertFalse(contains_uop(plan))
 
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
