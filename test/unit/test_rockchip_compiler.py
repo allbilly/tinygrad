@@ -542,8 +542,13 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_sum(plan)
     self.assertEqual((len(image.stages), {stage.engine for stage in image.stages}), (13, {RKEngine.DPU,RKEngine.CMAC}))
     self.assertEqual(decode_image(encode_image(image)), image)
-    self.assertIsInstance(lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum())).plan, RKSumProgram)
-    rejected = lower_add_reduce_result(sink(Tensor.empty(255,dtype=dtypes.half).sum()))
+    long_plan = lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum())).plan
+    self.assertIsInstance(long_plan, RKSumProgram)
+    assert isinstance(long_plan, RKSumProgram)
+    self.assertEqual((long_plan.contract.lhs.layout.physical_shape, len(long_plan.contract.constants)), ((1,160), 10240))
+    long_image = emit_sum(long_plan)
+    self.assertEqual(([stage.engine for stage in long_image.stages], len(long_image.constants)), ([RKEngine.DPU,RKEngine.CMAC], 10512))
+    rejected = lower_add_reduce_result(sink(Tensor.empty(511,dtype=dtypes.half).sum()))
     self.assertIs(rejected.reject.kind, RKRejectKind.PLAN_STAGE_LIMIT)
 
   def test_renderer_produces_decodable_machine_image(self):

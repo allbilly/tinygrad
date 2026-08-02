@@ -25,6 +25,9 @@ class RKBufferKind(IntEnum):
   ARG = 0
   SCRATCH = 1
   CONSTANT = 2
+class RKLayoutKind(Enum):
+  LINEAR = "linear"
+  CMAC_WEIGHT = "cmac_weight"
 @dataclass(frozen=True)
 class RKArg:
   kind: RKBufferKind
@@ -79,6 +82,7 @@ class RKLayout:
   row_alignment: int = 16
   channel_alignment: int = 8
   padding: tuple[tuple[int, int], ...] = ()
+  kind: RKLayoutKind = RKLayoutKind.LINEAR
   def __post_init__(self):
     rank = len(self.logical_shape)
     if len(self.physical_shape) != rank or len(self.strides_bytes) != rank or self.padding and len(self.padding) != rank:
@@ -102,6 +106,7 @@ class RKContract:
 
 @dataclass(frozen=True)
 class RKSumProgram:
+  prefix: tuple[RKContract, ...]
   dpu: RKDPUProgram
   contract: RKContract
 
@@ -118,6 +123,16 @@ def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferK
     strides.append(stride)
     stride *= extent
   return RKTensorRef(RKArg(kind, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtypes.half))
+
+def _cmac_weight_ref(slot:int, logical_n:int, k:int, kind:RKBufferKind=RKBufferKind.ARG, physical_n:int|None=None) -> RKTensorRef:
+  physical_n = logical_n if physical_n is None else physical_n
+  return RKTensorRef(RKArg(kind, slot), RKLayout((logical_n,k), (physical_n,k), (k*2,2), dtypes.half, kind=RKLayoutKind.CMAC_WEIGHT))
+
+def _cmac_mask_payload(count:int, align_in:int, outputs:int=4) -> bytes:
+  values = [0] * (32*align_in)
+  for out in range(outputs):
+    for k in range(count): values[(((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)] = 0x3c00
+  return struct.pack(f"<{len(values)}H", *values)
 
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
@@ -1658,39 +1673,60 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one dense reduction axis", value.op)
   output, input_arg = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
-  blocks:list[tuple[int, int]] = []
-  remaining, start = count, 0
-  while remaining:
-    block = 1 << (remaining.bit_length()-1)
-    blocks.append((start, block))
-    start, remaining = start+block, remaining-block
-  term_count = sum(min(block, 8) for _,block in blocks)
-  if term_count > 32:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"DPU sum needs {term_count} aligned CMAC terms", red.op)
+  if 32 < count <= 256:
+    align_in = (count+31)&-32
+    packed = RKArg(RKBufferKind.SCRATCH, 0)
+    dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, input_arg, 0.0, count),), (RKScratch(align_in*2),))
+    out_layout = RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31)))
+    lhs_layout = RKLayout((1,count), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-count)))
+    contract = RKContract(RKTensorRef(output, out_layout), RKTensorRef(packed, lhs_layout),
+      _cmac_weight_ref(0, 4, align_in, RKBufferKind.CONSTANT, 32), red.arg[0], _cmac_mask_payload(count, align_in))
+    return _native(RKSumProgram((), dpu, contract))
   stages:list[RKDPUStage] = []
   scratch:list[RKScratch] = []
   runs:list[tuple[RKArg, int]] = []
-  for start,block in blocks:
-    source, block_count = RKArg(input_arg.kind, input_arg.index, start*2), block
-    while block_count > 8:
-      half = block_count//2
-      dst = RKArg(RKBufferKind.SCRATCH, len(scratch))
-      stages.append(RKALUStage(Ops.ADD, dst, source, RKArg(source.kind, source.index, source.addend+half*2), half))
-      scratch.append(RKScratch(((half+7)//8)*16))
-      source, block_count = dst, half
-    runs.append((source, block_count))
+  prefix:list[RKContract] = []
+  rows, tail = divmod(count, 32)
+  if 4 <= rows <= 16 and tail <= 24:
+    prefix_out = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch.append(RKScratch(64))
+    out_layout = RKLayout((1,rows), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-rows)))
+    prefix.append(RKContract(RKTensorRef(prefix_out, out_layout), _dense_half_ref(0, (1,32), RKBufferKind.CONSTANT),
+      _cmac_weight_ref(input_arg.index, rows, 32), red.arg[0], struct.pack("<e", 1.0)*32))
+    runs.append((prefix_out, rows))
+    if tail: runs.append((RKArg(input_arg.kind, input_arg.index, rows*64), tail))
+  else:
+    blocks:list[tuple[int, int]] = []
+    remaining, start = count, 0
+    while remaining:
+      block = 1 << (remaining.bit_length()-1)
+      blocks.append((start, block))
+      start, remaining = start+block, remaining-block
+    for start,block in blocks:
+      source, block_count = RKArg(input_arg.kind, input_arg.index, start*2), block
+      while block_count > 8:
+        half = block_count//2
+        dst = RKArg(RKBufferKind.SCRATCH, len(scratch))
+        stages.append(RKALUStage(Ops.ADD, dst, source, RKArg(source.kind, source.index, source.addend+half*2), half))
+        scratch.append(RKScratch(((half+7)//8)*16))
+        source, block_count = dst, half
+      runs.append((source, block_count))
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch.append(RKScratch(64))
-  term_offset = 0
+  term_offset, mask_values = 0, [0.0]*32
   for source,run_count in runs:
+    term_offset = (term_offset+7)&-8
+    if term_offset+run_count > 32:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "DPU sum needs more than 32 aligned CMAC terms", red.op)
     stages.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, term_offset*2), source, 0.0, run_count))
+    mask_values[term_offset:term_offset+run_count] = [1.0]*run_count
     term_offset += run_count
-  mask = struct.pack("<e", 1.0)*term_count + struct.pack("<e", 0.0)*(32-term_count)
+  mask = b"".join(struct.pack("<e", x) for x in mask_values)
   constants = mask*4
   out_ref = RKTensorRef(output, RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31))))
   contract = RKContract(out_ref, _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH),
-                        _dense_half_ref(0, (4,32), RKBufferKind.CONSTANT), red.arg[0], constants)
-  return _native(RKSumProgram(RKDPUProgram(tuple(stages), tuple(scratch)), contract))
+                        _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
+  return _native(RKSumProgram(tuple(prefix), RKDPUProgram(tuple(stages), tuple(scratch)), contract))
 
 def lower_contract_result(sink:UOp) -> RKLowerResult:
   """Recognize directly legal M=1, K=32 FP16 CMAC contractions and dense row sums."""
@@ -1724,7 +1760,7 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "CMAC row-sum input extent does not match N-by-32 surface", body.op)
     ones = struct.pack("<e", 1.0)*32
     return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(0, (1,32), RKBufferKind.CONSTANT),
-                              _dense_half_ref(body.src[0].arg.slot, (n,32)), red_axis, ones))
+                              _cmac_weight_ref(body.src[0].arg.slot, n, 32), red_axis, ones))
   if body.op is not Ops.MUL: return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "reduction body is not multiply", body.op)
   if red.op is not Ops.RANGE: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "reduction axis is not a range", red.op)
   if int(red.src[0].arg) != 32:
@@ -1748,7 +1784,7 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
   if int(out_param.src[0].arg) != n or int(lhs.src[0].src[0].arg) != 32 or int(rhs.src[0].src[0].arg) != n*32:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "CMAC buffer extents do not match M=1,N,K=32", Ops.INDEX)
   return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(lhs.src[0].arg.slot, (1,32)),
-                            _dense_half_ref(rhs.src[0].arg.slot, (n,32)), red_axis))
+                            _cmac_weight_ref(rhs.src[0].arg.slot, n, 32), red_axis))
 
 def lower_contract(sink:UOp) -> RKContract|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""
@@ -1978,27 +2014,32 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit one direct FP16 CMAC task; all surfaces are already hardware-legal."""
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
-  e, align = _command, 32
+  if plan.rhs.layout.kind is not RKLayoutKind.CMAC_WEIGHT: raise ValueError("CMAC RHS is not in weight layout")
+  e, align_out, align_in = _command, 32, plan.lhs.layout.physical_shape[-1]
+  if align_in < 32 or align_in % 32: raise ValueError("CMAC K must be aligned to 32")
+  input_row_bytes = align_in*2
+  feature_grains = max(80, (((2*256*128+input_row_bytes-1)//input_row_bytes)+1)&-2)
+  line_stride = 4*min(align_in//32, 13)
   commands = (
     e(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0x0e), e(_TARGET_CNA, rk.REG_CNA_CONV_CON1, 0x20000120),
-    e(_TARGET_CNA, rk.REG_CNA_CONV_CON2, 0x4000), e(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
-    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, 0x1f0020),
+    e(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4), e(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
+    e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((align_in-1)<<16)|align_in),
     e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, 1), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE3, 1),
-    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE0, 0x800), e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE1, 0x40),
-    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, 0x1010020), e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, 0xb1),
-    e(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, 1), e(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
+    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes*align_out), e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes),
+    e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, 0x1010000|align_out), e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, 0xb1),
+    e(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, align_in//32), e(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
     *(e(_TARGET_CNA, reg, 0x10000) for reg in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4)),
     e(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0), e(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),
-    e(_TARGET_CNA, rk.REG_CNA_DMA_CON1, 4), e(_TARGET_CNA, rk.REG_CNA_DMA_CON2, 0),
-    e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align),
+    e(_TARGET_CNA, rk.REG_CNA_DMA_CON1, line_stride), e(_TARGET_CNA, rk.REG_CNA_DMA_CON2, 0),
+    e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, 0x10001), e(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_in),
     e(_TARGET_CNA, rk.REG_CNA_DCOMP_ADDR0, 0), e(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x201),
-    e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, 0), e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align-1),
+    e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, 0), e(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_out-1),
     e(_TARGET_CORE, rk.REG_CORE_RESERVED_3030, 0), e(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e4),
     e(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002), e(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
     e(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, 0x10), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0),
     e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0), e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0x70007),
     e(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, 0x1f001f), e(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
-    e(_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 0x126), e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align-1),
+    e(_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 0x126), e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1),
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, 0), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
@@ -2008,14 +2049,18 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
 
 def emit_sum(plan:RKSumProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Compose aligned DPU partial sums and one masked K32 CMAC tail into a sequential image."""
-  dpu, contract = emit_dpu(plan.dpu, target), emit_contract(plan.contract, target)
-  constant_base, stage_base = len(dpu.constants), len(dpu.stages)
-  tail = contract.stages[0]
-  relocs = tuple(RKReloc(reloc.stage+stage_base, reloc.word, reloc.kind,
-    reloc.index+(constant_base if reloc.kind is RKBufferKind.CONSTANT else 0), reloc.addend, reloc.shift, reloc.mask, reloc.field_shift)
-    for reloc in tail.relocs)
-  return RKImage(target, dpu.stages+(RKStage(tail.engine, tail.commands, relocs, tail.flags),), dpu.scratch,
-                 dpu.constants+contract.constants)
+  images = (*(emit_contract(prefix, target) for prefix in plan.prefix), emit_dpu(plan.dpu, target), emit_contract(plan.contract, target))
+  stages:list[RKStage] = []
+  constants = bytearray()
+  for image in images:
+    constant_base = len(constants)
+    for stage in image.stages:
+      relocs = tuple(RKReloc(len(stages), reloc.word, reloc.kind,
+        reloc.index+(constant_base if reloc.kind is RKBufferKind.CONSTANT else 0), reloc.addend, reloc.shift, reloc.mask, reloc.field_shift)
+        for reloc in stage.relocs)
+      stages.append(RKStage(stage.engine, stage.commands, relocs, stage.flags))
+    constants.extend(image.constants)
+  return RKImage(target, tuple(stages), plan.dpu.scratch, bytes(constants))
 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""

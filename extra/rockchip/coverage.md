@@ -47,6 +47,11 @@ remaining aligned runs are copied into one scratch surface and a masked K32
 CMAC produces the scalar. The four repeated CMAC weight rows are immutable
 `[1...1,0...0]` image constants, so no invocation-time packing occurs. Plans
 whose block decomposition needs more than 32 final terms reject explicitly.
+For extents 33–256, a stronger path pads the feature surface to K32 alignment
+with one DPU copy and emits one variable-K CMAC. Its generated weights are
+swizzled for the hardware layout and contain ones only for logical lanes, so
+the accumulation remains FP32 until the final FP16 store. The permanent
+seed-zero 135-element case matches the TestOps input distribution.
 
 The initial all-DPU tree was an important rejected probe: both values of a
 two-element input were read from lane zero, producing `2*x[0]`. Disabling both
@@ -54,14 +59,17 @@ disk and schedule caches reproduced the result. It proves that DPU
 `EW_BASE_ADDR` cannot select a sub-16-byte lane through a relocation addend;
 ordinary tensor buffer views that start at an offset are a different ABI case.
 The committed planner consequently never emits such a relocation. Strict
-hardware tests cover lengths 2, 16, 60, 135, 720, and 16,384. The unchanged
-official `test_sum_simple`, `test_sum_full`, `test_sum`, `test_sum_relu`,
-`test_sum_tiny`, `test_mean`, and `test_mean_axis` methods pass with
-`ROCKCHIP_FALLBACK=0`. `test_sum_twice` reaches native execution but remains a
-numerical failure: its first subcase differs from Torch by one FP16 ULP near
-0.194, outside the default relative tolerance. No tolerance was changed.
-The uncached strict device suite passes 41 tests plus 17 subtests after this
-generalization.
+hardware tests cover lengths 2, 16, 60, 135, 720, and 16,384. With the actual
+TestOps selector (`DEV=ROCKCHIP`) and persistent compilation disabled
+(`CACHELEVEL=0`), `test_sum_full` passes. The first 135-element subcase of
+`test_sum` now passes, then its length-six row reduction rejects because a
+native padded-row layout is not implemented. `test_sum_simple` has an explicit
+FP32 input, while fused ReLU/mean, multi-output reductions, and nested sums
+remain unsupported. Earlier claims for those methods came from mistakenly
+using `DEVICE=ROCKCHIP`, which left TestOps on the default CPU backend; they
+are superseded here. No tolerance or skip was changed.
+The full explicit-device suite passes 41 tests plus 17 subtests in 324.80
+seconds with `CACHELEVEL=0` after the variable-K emitter change.
 
 The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,

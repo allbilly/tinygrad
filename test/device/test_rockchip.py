@@ -18,6 +18,11 @@ class TestRockchip(unittest.TestCase):
         actual = Tensor(data, device="ROCKCHIP").realize().sum().realize().item()
         expected = data.astype(np.float32).sum().astype(np.float16).item()
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+    np.random.seed(0)
+    official = np.random.uniform(-2, 2, (45,3)).astype(np.float16)
+    actual = Tensor(official, device="ROCKCHIP").realize().sum().realize().item()
+    expected = official.astype(np.float32).sum().astype(np.float16).item()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
   def test_global_max_hwc8_native_ppu(self):
     for height,width in ((2,2), (4,4), (16,16)):
