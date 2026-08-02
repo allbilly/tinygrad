@@ -260,6 +260,11 @@ _Value = _Expr|RKArg|float
 def _sub(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _ALUExpr:
   return _ALUExpr(Ops.SUB, (lhs, rhs))
 
+def _fp16(value:float) -> float: return struct.unpack("<e", struct.pack("<e", value))[0]
+def _fp16_previous(value:float) -> float:
+  bits = struct.unpack("<H", struct.pack("<e", value))[0]
+  return struct.unpack("<e", struct.pack("<H", bits-1))[0]
+
 def _nonzero_lut(lut:RKLUTId, source:_Expr|RKArg) -> _Expr:
   nonzero = _ALUExpr(Ops.MAX, (_MaskExpr((_sub(source, 0.0),)), _MaskExpr((_sub(0.0, source),))))
   return _ALUExpr(Ops.MUL, (_LUTExpr(lut, (source,)), nonzero))
@@ -729,13 +734,42 @@ def _pow8_expr(source:_Expr|RKArg) -> _Expr:
   normalized = _ALUExpr(Ops.MUL, (magnitude, weighted((4.0, 2.0, 1.0, .5))))
   factor = weighted((2.0**-16, 2.0**-8, 1.0, 256.0))
   low, high = _LUTExpr(RKLUTId.POW8, (normalized,)), _LUTExpr(RKLUTId.POW8_HIGH, (normalized,))
-  high_mask = positive(normalized, struct.unpack("<e", struct.pack("<e", math.sqrt(2.0)))[0])
+  high_mask = positive(normalized, _fp16(math.sqrt(2.0)))
   normalized_power = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (low, _sub(1.0, high_mask))),
     _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (high, 256.0)), high_mask))))
   scaled = _ALUExpr(Ops.MUL, (normalized_power, factor))
   bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (scaled, -1.0)), -65504.0)), -1.0))
   valid = _ALUExpr(Ops.MUL, (positive(magnitude, .25), positive(4.0, magnitude)))
   return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (bounded, valid)), _ALUExpr(Ops.MUL, (repeated, _sub(1.0, valid)))))
+
+def _pow55_expr(source:_Expr|RKArg) -> _Expr:
+  """Evaluate x**5.5 with normalized Q11/Q15 LUT ranges and preserve the generic full-domain result."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  square = _ALUExpr(Ops.MUL, (source, source))
+  fourth = _ALUExpr(Ops.MUL, (square, square))
+  fallback = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (fourth, source)), _sqrt_expr(source)))
+  magnitude = _ALUExpr(Ops.MAX, (source, _ALUExpr(Ops.MUL, (source, -1.0))))
+  above_half, above_one, above_two = positive(magnitude, .5), positive(magnitude, 1.0), positive(magnitude, 2.0)
+  bands:tuple[_Value,_Value,_Value,_Value] = (_sub(1.0, above_half), _sub(above_half, above_one), _sub(above_one, above_two), above_two)
+  def weighted(weights:tuple[float,float,float,float]) -> _Expr:
+    terms = tuple(_ALUExpr(Ops.MUL, (band, weight)) for band,weight in zip(bands, weights))
+    return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (terms[0], terms[1])), _ALUExpr(Ops.ADD, (terms[2], terms[3]))))
+  normalized = _ALUExpr(Ops.MUL, (magnitude, weighted((4.0, 2.0, 1.0, .5))))
+  factor = weighted((2.0**-11, 2.0**-5.5, 1.0, 2.0**5.5))
+  low, local, high = (_LUTExpr(lut, (normalized,)) for lut in (RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH))
+  local_mask = positive(1.125, normalized)
+  low_range = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (local, 2.0)), local_mask)),
+    _ALUExpr(Ops.MUL, (low, _sub(1.0, local_mask)))))
+  high_mask = positive(normalized, _fp16_previous(_fp16_previous(16.0**(1.0/5.5))))
+  normalized_power = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (low_range, _sub(1.0, high_mask))),
+    _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (high, 2.0**5.5)), high_mask))))
+  scaled = _ALUExpr(Ops.MUL, (normalized_power, factor))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (scaled, -1.0)), -65504.0)), -1.0))
+  valid = _ALUExpr(Ops.MUL, (positive(magnitude, .25), positive(4.0, magnitude)))
+  selected = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (bounded, valid)), _ALUExpr(Ops.MUL, (fallback, _sub(1.0, valid)))))
+  negative, negative_inf = positive(0.0, source), positive(-65472.0, source)
+  invalid_denom = _sub(1.0, _sub(negative, negative_inf))
+  return _ALUExpr(Ops.MUL, (selected, _ALUExpr(Ops.FDIV, (invalid_denom, invalid_denom))))
 
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
@@ -745,15 +779,16 @@ def _unwrap_fp_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype in (dtypes.half, dtypes.float) and u.src[0].dtype in (dtypes.half, dtypes.float): u = u.src[0]
   return _unwrap_same_cast(u)
 
-def _canonical_mul_power(u:UOp, power:int) -> UOp|None:
+def _canonical_mul_power(u:UOp, power:float) -> UOp|None:
   """Recognize a multiplication tree containing exactly `power` copies of one FP16 indexed value."""
   u = _unwrap_fp_cast(u)
   indexes = [x for x in u.toposort() if x.op is Ops.INDEX and x.dtype is dtypes.half]
   if len(indexes) != 1: return None
   source = indexes[0]
-  def exponent(node:UOp) -> int|None:
+  def exponent(node:UOp) -> float|None:
     node = _unwrap_fp_cast(node)
-    if node.key == source.key: return 1
+    if node.key == source.key: return 1.0
+    if node.op is Ops.SQRT and len(node.src) == 1 and _unwrap_fp_cast(node.src[0]).key == source.key: return .5
     if node.op is not Ops.MUL or len(node.src) != 2: return None
     lhs, rhs = exponent(node.src[0]), exponent(node.src[1])
     return None if lhs is None or rhs is None else lhs+rhs
@@ -1103,6 +1138,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(pow8_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _pow8_expr(operand)
+  elif (pow55_input:=_canonical_mul_power(u, 5.5)) is not None:
+    operand = _parse_alu(pow55_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _pow55_expr(operand)
   elif (hyperbolic:=_canonical_hyperbolic(u)) is not None:
     operand = _parse_alu(hyperbolic[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None
@@ -1651,7 +1690,7 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.GELU_TANH_LOCAL, RKLUTId.GELU_EXACT, RKLUTId.GELU_EXACT_LOCAL, RKLUTId.ELU1,
                       RKLUTId.ELU1_LOCAL, RKLUTId.ELU01, RKLUTId.ELU01_LOCAL, RKLUTId.SELU, RKLUTId.SELU_LOCAL,
                       RKLUTId.CELU2, RKLUTId.CELU2_LOCAL, RKLUTId.CELU3, RKLUTId.CELU3_LOCAL, RKLUTId.CELU4, RKLUTId.CELU4_LOCAL,
-                      RKLUTId.POW8, RKLUTId.POW8_HIGH):
+                      RKLUTId.POW8, RKLUTId.POW8_HIGH, RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

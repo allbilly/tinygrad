@@ -190,6 +190,15 @@ pow8 = [max(-32768, min(32767, round(min(abs(signed_sample(table, i, POW8_STEP))
         for table in range(2) for i in range(SIZE)]
 pow8_high = [max(-32768, min(32767, round((min(abs(signed_sample(table, i, POW8_STEP)), 2.0)*.5)**8*32768)))
              for table in range(2) for i in range(SIZE)]
+POW55_SPLIT = 16.0**(1.0/5.5)
+POW55_SPLIT_HALF = struct.unpack("<e", struct.pack("<e", POW55_SPLIT))[0]
+POW55_SPLIT_PREV = struct.unpack("<e", struct.pack("<H", struct.unpack("<H", struct.pack("<e", POW55_SPLIT_HALF))[0]-1))[0]
+pow55 = [max(-32768, min(32767, round(min(abs(signed_sample(table, i, POW8_STEP)), POW55_SPLIT)**5.5*2048)))
+         for table in range(2) for i in range(SIZE)]
+pow55_local = [max(-32768, min(32767, round((min(abs(signed_sample(table, i, POW8_STEP)), 1.125)**5.5/2)*32768)))
+               for table in range(2) for i in range(SIZE)]
+pow55_high = [max(-32768, min(32767, round((min(abs(signed_sample(table, i, POW8_STEP)), 2.0)*.5)**5.5*32768)+1))
+              for table in range(2) for i in range(SIZE)]
 def digest(values:list[int]) -> str: return hashlib.sha256(struct.pack(f"<{len(values)}h", *values)).hexdigest()
 def half(value:float) -> float: return struct.unpack("<e", struct.pack("<e", value))[0]
 errors = []
@@ -312,6 +321,19 @@ for bits in range(1 << 16):
   if POW8_SPLIT <= x <= 2:
     got, reference = half(interpolate(pow8_high, POW8_STEP, 32768, x)*256), x**8
     pow8_high_errors.append((abs(got-reference), abs(got-reference)/reference))
+pow55_errors, pow55_local_errors, pow55_high_errors = [], [], []
+for bits in range(1 << 16):
+  x = struct.unpack("<e", struct.pack("<H", bits))[0]
+  if not math.isfinite(x): continue
+  if 1 <= x <= POW55_SPLIT_PREV:
+    got, reference = interpolate(pow55, POW8_STEP, 2048, x), x**5.5
+    pow55_errors.append((abs(got-reference), abs(got-reference)/reference))
+  if 1 <= x < 1.125:
+    got, reference = half(interpolate(pow55_local, POW8_STEP, 32768, x)*2), x**5.5
+    pow55_local_errors.append((abs(got-reference), abs(got-reference)/reference))
+  if POW55_SPLIT_HALF <= x <= 2:
+    got, reference = half(interpolate(pow55_high, POW8_STEP, 32768, x)*2**5.5), x**5.5
+    pow55_high_errors.append((abs(got-reference), abs(got-reference)/reference))
 asinh_errors, acosh_errors = [], []
 for bits in range(1 << 16):
   x = struct.unpack("<e", struct.pack("<H", bits))[0]
@@ -521,7 +543,10 @@ class RKLUTId(IntEnum):
   CELU4_LOCAL = 58
   POW8 = 59
   POW8_HIGH = 60
-RK_LUT_SCHEMA = 50
+  POW55 = 61
+  POW55_HIGH = 62
+  POW55_LOCAL = 63
+RK_LUT_SCHEMA = 52
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -914,5 +939,32 @@ RK_LUT_POW8_HIGH_MINUS_EXP = 15
 RK_LUT_POW8_HIGH_VERIFIED_INPUTS = {len(pow8_high_errors)}
 RK_LUT_POW8_HIGH_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow8_high_errors)!r}
 RK_LUT_POW8_HIGH_SIM_MAX_REL_ERROR = {max(x[1] for x in pow8_high_errors)!r}
-RK_LUT_POW8_HIGH = (\n{rows(pow8_high)}\n)\n'''
+RK_LUT_POW8_HIGH = (\n{rows(pow8_high)}\n)
+RK_LUT_POW55_SHA256 = "{digest(pow55)}"
+RK_LUT_POW55_DOMAIN = (1.0, {POW55_SPLIT_PREV!r})
+RK_LUT_POW55_ENTRIES = {SIZE}
+RK_LUT_POW55_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW8_SCALE))[0]}
+RK_LUT_POW55_MINUS_EXP = 11
+RK_LUT_POW55_VERIFIED_INPUTS = {len(pow55_errors)}
+RK_LUT_POW55_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow55_errors)!r}
+RK_LUT_POW55_SIM_MAX_REL_ERROR = {max(x[1] for x in pow55_errors)!r}
+RK_LUT_POW55 = (\n{rows(pow55)}\n)
+RK_LUT_POW55_LOCAL_SHA256 = "{digest(pow55_local)}"
+RK_LUT_POW55_LOCAL_DOMAIN = (1.0, 1.125)
+RK_LUT_POW55_LOCAL_ENTRIES = {SIZE}
+RK_LUT_POW55_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW8_SCALE))[0]}
+RK_LUT_POW55_LOCAL_MINUS_EXP = 15
+RK_LUT_POW55_LOCAL_VERIFIED_INPUTS = {len(pow55_local_errors)}
+RK_LUT_POW55_LOCAL_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow55_local_errors)!r}
+RK_LUT_POW55_LOCAL_SIM_MAX_REL_ERROR = {max(x[1] for x in pow55_local_errors)!r}
+RK_LUT_POW55_LOCAL = (\n{rows(pow55_local)}\n)
+RK_LUT_POW55_HIGH_SHA256 = "{digest(pow55_high)}"
+RK_LUT_POW55_HIGH_DOMAIN = ({POW55_SPLIT_HALF!r}, 2.0)
+RK_LUT_POW55_HIGH_ENTRIES = {SIZE}
+RK_LUT_POW55_HIGH_BN_MUL = {struct.unpack('<H', struct.pack('<e', POW8_SCALE))[0]}
+RK_LUT_POW55_HIGH_MINUS_EXP = 15
+RK_LUT_POW55_HIGH_VERIFIED_INPUTS = {len(pow55_high_errors)}
+RK_LUT_POW55_HIGH_SIM_MAX_ABS_ERROR = {max(x[0] for x in pow55_high_errors)!r}
+RK_LUT_POW55_HIGH_SIM_MAX_REL_ERROR = {max(x[1] for x in pow55_high_errors)!r}
+RK_LUT_POW55_HIGH = (\n{rows(pow55_high)}\n)\n'''
 pathlib.Path(__file__).parents[2].joinpath("tinygrad/runtime/autogen/rockchip_lut.py").write_text(output)

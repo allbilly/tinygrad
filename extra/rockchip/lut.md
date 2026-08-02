@@ -402,3 +402,32 @@ used. Hardware interpolates integer entries before its output shift, so a
 smooth residual on the identical address grid cannot reconstruct the lost
 fractional interpolation phase. Two LUT tasks help here because they use
 different fixed-point output ranges, not merely because there are two tables.
+
+## Positive scalar exponent 5.5 multirange LUT
+
+The generic decomposition computes `x**5.5` as `x**5 * sqrt(x)`, introducing
+several FP16 task boundaries. The official positive-exponent subcase initially
+missed 117 of 2,925 lanes with maximum relative error 0.001953. As with POW8,
+exact binary factors normalize `0.25 < abs(x) < 4` into `[1,2]`; the final
+factors are `(2^-11, 2^-5.5, 1, 2^5.5)`.
+
+Three generated fixed-point ranges are used. `POW55_LOCAL` stores `u**5.5/2`
+in Q15 for `[1,1.125)`. `POW55` stores `u**5.5` in Q11 through the middle
+range. `POW55_HIGH` stores `(u/2)**5.5` in Q15 near the upper range and is
+decoded by `2**5.5`. The upper selector moves to Q15 one FP16 coordinate
+before the Q11 saturation endpoint.
+
+This local range was added after exhaustive hardware characterization. The
+coarse two-table design missed eight of all 17,410 finite positive FP16 inputs
+in `[0,4]`. Sparse one-count corrections could reduce the failures but merely
+moved an error between exact, half-grid, and three-quarter-grid interpolation
+phases. Giving the low-output region a different Q15 range removes the lost
+phase instead: the permanent exhaustive RK3588 sweep now has zero failures at
+`rtol=1e-3, atol=1e-6`, with fallback disabled.
+
+The 90-stage typed plan has nine reusable scratch surfaces and retains the
+original `x**5 * sqrt(x)` graph outside the corrected magnitude interval.
+Finite negative inputs recover NaN through a DPU-generated invalid-domain
+factor. There is no POW55 opcode, host arithmetic, runtime packing, or relaxed
+TestOps tolerance. The official method now passes positive `x**5.5` and
+advances to the distinct negative-exponent implementation.

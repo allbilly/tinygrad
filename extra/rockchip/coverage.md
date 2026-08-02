@@ -69,6 +69,16 @@ excludes; their auditable source is the 40-line generator change. The 44-line
 typed compiler recipe remains counted rather than being hidden as generated
 code.
 
+Positive scalar `x**5.5` now uses three generated fixed-point ranges inside a
+90-stage typed plan. An exhaustive strict-hardware sweep passes all 17,410
+finite positive FP16 encodings in `[0,4]`, plus invalid-domain and special
+values. The official method passes this subcase and advances to `x**-5.5`,
+which still misses 379/2,925 lanes (maximum relative error 0.003021). No
+method-level census gain is claimed. At this milestone `sz.py` reports 1,720
+counted Rockchip-renderer lines and 26,853 repository lines overall; generated
+payload rows remain excluded, while their generator and compiler recipes are
+counted.
+
 Run the census serially on RK3588:
 
 ```sh
@@ -583,6 +593,7 @@ failures.
 | Parameterized generated ELU/SELU ranges | `test_elu`, `test_selu` | Yes (research branch only) |
 | Parameterized generated CELU alpha 1–4 ranges | `test_celu` | Yes (research branch only) |
 | Generated two-level POW8 range reduction | `test_pow_const` exponent-8 subcase; method still fails at exponent 5.5 | Not yet |
+| Generated multirange positive POW5.5 | `test_pow_const` positive-5.5 subcase; method still fails at negative 5.5 | Not yet |
 
 The historical wide-fill milestone wrote the requested dtype directly through
 DPU WDMA; it did not use runtime narrowing or host semantic work. Its RKImage
