@@ -1187,3 +1187,18 @@ subtests at exact comparison. The strict hardware suite passes 59 tests plus
 method total is 127 after the last 122-pass census, pending a new complete
 census. The research tree now has 27,748 counted lines, including 2,615 in the
 Rockchip renderer/compiler.
+
+Consecutive affine-MAX output batches now greedily share one source pack while
+their combined physical span stays within a 192-lane cost target; a single
+batch may still use the proven 512-lane hardware ceiling. This trades a modest
+increase in immutable selector size for far fewer DPU zero/copy tasks. All nine
+`test_max_pool2d_padding` combinations become native: accepted plans contain
+246–336 stages and 0.39–1.44 MiB of unique constants. The first 128-lane
+configuration left one plan at 400 stages; running the complete method aborted
+inside the driver's reset ioctl after several long submissions. That
+configuration was rejected. The 192-lane configuration passes the complete
+method in one process in 288.25 seconds, then passes the strict hardware suite
+(59 tests plus 37 subtests) in 473.36 seconds without a timeout or reset error.
+The inferred native method total is 128 after the last 122-pass census, pending
+a new complete census. The research tree now has 27,760 counted lines,
+including 2,627 in the Rockchip renderer/compiler.

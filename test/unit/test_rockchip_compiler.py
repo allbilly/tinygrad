@@ -91,7 +91,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
     image = emit_program(plan)
-    self.assertLessEqual(len(image.stages), 400)
+    self.assertLessEqual(len(image.stages), 256)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
     self.assertFalse(contains_uop(plan))
 

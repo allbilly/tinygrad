@@ -22,6 +22,7 @@ from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 RK_MAX_CONSTANT_BYTES = 2*1024*1024
 RK_MAX_AFFINE_VISITS = 65536
 RK_MAX_PROGRAM_STAGES = 400
+RK_MAX_AFFINE_WINDOW = 192
 
 def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
@@ -867,51 +868,62 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX output has holes", Ops.INDEX)
 
   surface_count, whole_surface = pool_extent*8, input_count <= 512 and output_count <= 128
-  groups:list[tuple[int, int, int, int, int|None, list[list[int]]]] = []
-  for group_start in range(0, output_count, 8):
-    group_rows = selectors[group_start:group_start+8]
-    selected_indices = [index for row in group_rows for index in row if index >= 0]
-    base, end = (0, input_count) if whole_surface else ((min(selected_indices)&-8, max(selected_indices)+1) if selected_indices else (0,0))
+  raw_groups = [(start, selectors[start:start+8]) for start in range(0, output_count, 8)]
+  windows:list[tuple[int, int, int, int|None, list[tuple[int, list[list[int]]]]]] = []
+  next_group = 0
+  while next_group < len(raw_groups):
+    window_groups:list[tuple[int, list[list[int]]]] = []
+    for candidate in raw_groups[next_group:]:
+      trial_rows = [row for _,rows in (*window_groups,candidate) for row in rows]
+      selected_indices = [index for row in trial_rows for index in row if index >= 0]
+      base, end = (0,input_count) if whole_surface else ((min(selected_indices)&-8,max(selected_indices)+1) if selected_indices else (0,0))
+      align_in = max(32, (end-base+31)&-32) + (32 if any(index < 0 for row in trial_rows for index in row) else 0)
+      if align_in > 512 or not whole_surface and align_in > RK_MAX_AFFINE_WINDOW and window_groups: break
+      window_groups.append(candidate)
+      if whole_surface: continue
+    if not window_groups:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX window exceeds the {RK_MAX_AFFINE_WINDOW}-lane cost target", reduce.op)
+    trial_rows = [row for _,rows in window_groups for row in rows]
+    selected_indices = [index for row in trial_rows for index in row if index >= 0]
+    base, end = (0,input_count) if whole_surface else ((min(selected_indices)&-8,max(selected_indices)+1) if selected_indices else (0,0))
     span, align_in = end-base, max(32, (end-base+31)&-32)
-    sentinel = align_in if any(index < 0 for row in group_rows for index in row) else None
+    sentinel = align_in if any(index < 0 for row in trial_rows for index in row) else None
     if sentinel is not None: align_in += 32
-    if align_in > 512:
-      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX window needs {align_in} lanes", reduce.op)
-    groups.append((group_start, base, span, align_in, sentinel,
-                   [[index-base if index >= 0 else -1 for index in row] for row in group_rows]))
+    windows.append((base, span, align_in, sentinel, window_groups))
+    next_group += len(window_groups)
 
   packed, hwc = RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1)
   hwc_elements = ((surface_count-1)//16)*16+32
-  scratch = (RKScratch(max(group[3] for group in groups)*2), RKScratch(hwc_elements*2))
+  scratch = (RKScratch(max(window[2] for window in windows)*2), RKScratch(hwc_elements*2))
   source = RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot)
   steps:list[RKDPUProgram|RKContract|RKReduce] = []
   payloads:set[bytes] = set()
   height, width = pool_shape
-  for group_index,(group_start,base,span,align_in,sentinel,group_rows) in enumerate(groups):
-    if not whole_surface or group_index == 0:
-      prepare = [RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in)]
-      if span: prepare.append(RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span))
-      if sentinel is not None:
-        prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
-      steps.append(RKDPUProgram(tuple(prepare), scratch))
-    channels = min(8, output_count-group_start)
-    rows = [[group_rows[min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
-            for spatial in range(pool_extent)]
-    flat_rows = [cast(int, sentinel) if rows[spatial][channel] < 0 else rows[spatial][channel]
-                 for spatial in range(pool_extent) for channel in range(8)]
-    for start in range(0, surface_count, 16):
-      out_layout = RKLayout((1,min(16, surface_count-start)), (1,32), (64,2), dtypes.half,
-                            padding=((0,0),(0,32-min(16, surface_count-start))))
-      payload = _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], align_in, 32, 1.0)
-      payloads.add(payload)
-      steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
-        _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
-        _cmac_weight_ref(0, min(16, surface_count-start), align_in, RKBufferKind.CONSTANT, 32), reduce.arg[0],
-        payload))
-    out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
-                      RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
-    src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
-    steps.append(RKReduce(out, src, Ops.MAX, red_axes[0]))
+  for base,span,align_in,sentinel,window_groups in windows:
+    prepare = [RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in)]
+    if span: prepare.append(RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span))
+    if sentinel is not None:
+      prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
+    steps.append(RKDPUProgram(tuple(prepare), scratch))
+    for group_start,group_rows in window_groups:
+      local_rows = [[index-base if index >= 0 else -1 for index in row] for row in group_rows]
+      channels = min(8, output_count-group_start)
+      rows = [[local_rows[min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
+              for spatial in range(pool_extent)]
+      flat_rows = [cast(int, sentinel) if rows[spatial][channel] < 0 else rows[spatial][channel]
+                   for spatial in range(pool_extent) for channel in range(8)]
+      for start in range(0, surface_count, 16):
+        out_layout = RKLayout((1,min(16, surface_count-start)), (1,32), (64,2), dtypes.half,
+                              padding=((0,0),(0,32-min(16, surface_count-start))))
+        payload = _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], align_in, 32, 1.0)
+        payloads.add(payload)
+        steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
+          _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
+          _cmac_weight_ref(0, min(16, surface_count-start), align_in, RKBufferKind.CONSTANT, 32), reduce.arg[0], payload))
+      out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
+                        RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
+      src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+      steps.append(RKReduce(out, src, Ops.MAX, red_axes[0]))
   stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)
   if stage_count > RK_MAX_PROGRAM_STAGES or sum(map(len, payloads)) > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,

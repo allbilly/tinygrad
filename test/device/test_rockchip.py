@@ -106,6 +106,10 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((2,2),stride=2).realize().numpy()
     expected = data[:,:,:10,:].reshape(2,1,5,2,14,2).max(axis=(3,5))
     np.testing.assert_equal(actual, expected)
+    actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((2,2),padding=1).realize().numpy()
+    padded = np.pad(data, ((0,0),(0,0),(1,1),(1,1)), constant_values=-np.inf)
+    expected = padded[:,:,:12,:].reshape(2,1,6,2,15,2).max(axis=(3,5))
+    np.testing.assert_equal(actual, expected)
 
   def test_dense_fp16_global_extrema_native_dpu(self):
     for count in (2, 8, 9, 135):

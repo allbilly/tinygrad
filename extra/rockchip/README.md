@@ -73,7 +73,8 @@ are eligible to be ported as native capabilities.
 - statically masked affine FP16 MAX reductions, with invalid coordinates mapped
   to an NPU-filled negative-infinity sentinel before CMAC/PPU reduction;
 - larger affine FP16 MAX surfaces split into bounded, atom-aligned source
-  windows per eight-output PPU batch under the global stage/constant budgets;
+  windows shared greedily across consecutive PPU batches under the global
+  stage/constant budgets and a 192-lane cost target;
 - one static affine FP16 input reformat/broadcast materialized by cost-bounded
   CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
@@ -173,6 +174,14 @@ accounts for actual hardware stages and unique constant payloads before
 acceptance. The strict hardware suite passes 59 tests plus 37 subtests; the
 inferred native total is 127 pending a new full census.
 
+The next cost milestone coalesces consecutive output batches that share a
+bounded source span. Complete `test_max_pool2d_padding` passes all nine
+subtests with 246–336 stages per plan. A rejected 128-lane configuration left
+one plan at 400 stages and eventually aborted in the driver's reset ioctl; the
+accepted 192-lane target passes both the full method in one process and the
+later strict hardware suite. The inferred native total is 128 pending a new
+full census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -183,8 +192,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,748, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,748 lines.
-The exact 2,780-line delta is 2,775 counted Rockchip backend lines (2,615
+contains 27,760, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,760 lines.
+The exact 2,792-line delta is 2,787 counted Rockchip backend lines (2,627
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
