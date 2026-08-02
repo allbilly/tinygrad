@@ -354,6 +354,17 @@ recorded. Sixty-three compiler/image/native-program tests pass, Ruff and mypy
 are clean, and the complete strict hardware suite remains 46 tests plus 27
 subtests in 358.94 seconds. This clarity costs 21 counted compiler lines.
 
+The following mechanical milestone replaces the 2,275-physical-line renderer
+module with a package organized around enforceable compiler boundaries. The
+entry/lowering module is 519 physical lines; typed IR, expression recipes,
+affine analysis, UOp-free register emission, and the image codec live in
+separate modules. The emitter imports only typed Rockchip plans and generic
+`Ops`, never UOps. Frozen command-image tests and all 60 compiler/image tests
+remain green, Ruff and mypy are clean, and the complete strict hardware suite
+remains 46 tests plus 27 subtests in 358.21 seconds. `sz.py` counts 2,134
+compiler lines and 27,267 repository lines after the readability refactor; the
+38-line increase is explicit module interfaces, not new hardware behavior.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);

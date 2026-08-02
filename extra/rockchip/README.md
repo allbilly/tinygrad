@@ -40,6 +40,14 @@ exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
 cannot overwrite a useful reject, while applicable failures are ranked by
 specificity before telemetry is emitted.
 
+The compiler is split by responsibility under `renderer/rockchip/`:
+`ir.py` owns the typed UOp-free plans, `expr.py` owns math recipes and UOp
+canonicalization, `affine.py` owns affine maps and reject fingerprints,
+`emit.py` owns DPU/CMAC/PPU register emission, and `image.py` owns the versioned
+image codec and relocations. The package entry contains resource planning,
+ordered legalization, and renderer integration. Register emission imports no
+UOp definitions and cannot recover source-graph semantics.
+
 The frozen `rockchip-2607` branch is a behavioral and register oracle, not
 evidence that all of its 425 passing methods ran on the NPU. Its later runtime
 contains NumPy-backed `_run_host_*` implementations for generic elementwise and
@@ -129,8 +137,8 @@ sub-atom DPU preparation followed by sparse CMAC.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,229, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,229 lines.
-The exact 2,261-line delta is 2,256 counted Rockchip backend lines (2,096
+contains 27,267, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,267 lines.
+The exact 2,299-line delta is 2,294 counted Rockchip backend lines (2,134
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
