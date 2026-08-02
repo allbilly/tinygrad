@@ -134,12 +134,12 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
-The current committed strict census at `181dfc75a` contains 109 native passes,
-40 frontend-only passes, 263 failures, and 13 upstream skips across exactly 425
+The current committed strict census at `e18ce14c2` contains 116 native passes,
+40 frontend-only passes, 256 failures, and 13 upstream skips across exactly 425
 methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
-regressed. The pointwise-affine reduction milestone adds exactly
-`test_binary_crossentropy`, `test_einsum_trace`, `test_simple_grouped_conv2d`,
-and `test_sum_collapse_neg` at method level.
+regressed. The bounded affine-contraction milestone adds seven complete native
+methods: 9×9 and small GEMM, simple and both batched matmul forms, plus simple
+strided 1D and 2D convolutions.
 
 ## Current upstream blocker
 

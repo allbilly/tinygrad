@@ -999,3 +999,21 @@ affine contraction IR. Ruff, mypy, all 70 host tests, and the strict RK3588
 suite (51 tests plus 34 subtests) pass; the latter completed in 410.15 seconds.
 The capability adds 80 counted compiler lines (27,569 total; 2,436 in the
 Rockchip renderer/compiler) before the next full census.
+
+The complete uncached census at `e18ce14c2` confirms 116 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 256 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods.
+The seven exact deltas from `181dfc75a` are `test_9_gemm`,
+`test_matmul_batched`, `test_matmul_batched_vector`, `test_matmul_simple`,
+`test_small_gemm`, `test_strided_conv1d_simple`, and
+`test_strided_conv2d_simple` moving from failure to native pass. The latter two
+are generic affine-contraction matches; there is no convolution test-name
+logic. No prior native method regresses. Pytest reports 177 passed, 346 failed,
+13 skipped, and 15 passing subtests in 1,024.16 seconds. There are no device
+timeouts or invalid submissions. Of the 256 remaining failed methods, 250
+have a typed native reject: 69 layout, 60 output-dtype, 41 reformat, 30
+plan-limit, 24 ALU, 22 input-dtype, and 4 reduction classifications. The
+durable JSON is
+`~/rk2608_backups/census-contract-e18ce14c2/test_ops_coverage.json` (SHA-256
+`8e60df220935360a3755299cda4deff69c39dbe35c88fcad854eb7e0ad60ef54`);
+JUnit XML SHA-256 is
+`a0e133efd99abee2a2cd2768e999e6d8942f009ed3b8b592857d7286bbbfab65`.
