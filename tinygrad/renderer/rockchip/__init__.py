@@ -642,9 +642,13 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       else: epilogue = True
     else: epilogue = True
   value, prepare = _strip_casts(reduce.src[0]), None
+  condition, select_true = None, True
   indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   if value.op is Ops.INDEX and value.src[0].op is Ops.PARAM and value.dtype is dtypes.half:
     value_index, source = value, RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  elif (conditional:=_conditional_index(value)) is not None and conditional[0].dtype is dtypes.half:
+    value_index, condition, select_true = conditional
+    source = RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot)
   elif indexes and all(u.dtype is dtypes.half for u in indexes) and len({u.src[1].key for u in indexes}) == 1 and \
        len({int(u.src[0].src[0].arg) for u in indexes}) == 1:
     value_index = indexes[0]
@@ -657,14 +661,15 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
     if prepare is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "affine reduction expression is not materializable", value.op)
   else: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC input is not one FP16 pointwise surface", reduce.op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value_index.src[1])
-  if out_aff is None or src_aff is None:
+  if out_aff is None or (src_aff is None and condition is None):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC indexes are not affine", Ops.INDEX)
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
   out_axes = tuple(sorted(out_aff[0]))
   output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value_index.src[0].src[0].arg)
+  src_axes = set(src_aff[0]) if src_aff is not None else {u.arg[0] for u in value_index.src[1].toposort() if u.op is Ops.RANGE}
   if len(red_axes) != len(reduce.src)-1 or set(out_axes) & set(red_axes) or \
-     set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
+     src_axes - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine CMAC axes do not form one static output/reduction partition", Ops.RANGE)
   reduction_count = math.prod(ranges[axis] for axis in red_axes)
   if not 1 <= output_count <= 8192 or not 2 <= input_count <= 65536 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
@@ -679,8 +684,13 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
     seen.add(out_index)
     for red_values in product(*(range(ranges[axis]) for axis in red_axes)):
       point.update(zip(red_axes, red_values))
-      src_index = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes))
-      if not 0 <= src_index < input_count:
+      predicate = True if condition is None else _static_scalar(condition, point)
+      if predicate is None:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC predicate is not static", cast(UOp, condition).op)
+      if bool(predicate) is not select_true: continue
+      src_index = _static_scalar(value_index.src[1], point) if src_aff is None else \
+        src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in (*out_axes,*red_axes))
+      if not isinstance(src_index, int) or isinstance(src_index, bool) or not 0 <= src_index < input_count:
         return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC input index is out of bounds", Ops.INDEX)
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)):

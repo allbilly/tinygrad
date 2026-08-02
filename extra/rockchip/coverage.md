@@ -1397,3 +1397,19 @@ and mypy pass; the strict hardware suite passes 65 tests plus 44 subtests in
 615.29 seconds with `ROCKCHIP_FALLBACK=0`. The inferred native method total is
 138 after the current 137-pass census, pending the next complete run. The
 research tree has 27,985 counted lines.
+
+Conditional affine ADD reductions now recognize a single FP16 indexed surface
+guarded by a compile-time coordinate predicate. Rejected predicate points are
+represented by absent CMAC selector weights, so masking is performed by the
+NPU's generated immutable matrix rather than host materialization or a named
+prefix-sum path. The same static-affine and input-bound proofs apply before any
+selector is emitted.
+
+Complete `test_small_cumsum` passes natively. Its plan contains two DPU stages,
+one CMAC task, 2,144 constant bytes, and 64 scratch bytes. The larger 2D prefix
+surface remains a typed plan-cost rejection, and the 512/1022-element frontend
+uses FP32 accumulation outside the current native dtype contract. All 83 host
+tests, Ruff, and mypy pass; the expanded strict hardware suite passes 66 tests
+plus 44 subtests in 617.39 seconds with `ROCKCHIP_FALLBACK=0`. The inferred
+native total is 139 after the current 137-pass census, pending the next complete
+run. The research tree has 27,995 counted lines.

@@ -255,6 +255,14 @@ rejected on epilogue legality now reach their honest contraction resource
 bounds. The strict suite remains 65 tests plus 44 subtests, and the inferred
 native total is 138 after the current 137-pass census.
 
+Static predicates inside affine SUM bodies now become empty selector entries
+instead of an attempted DPU expression. This is the generic masked-reduction
+form used by short prefix sums and zero-padded windows. Complete
+`test_small_cumsum` passes natively with two DPU pack stages and one CMAC task;
+large quadratic selector surfaces and FP32 accumulation remain bounded rejects.
+The strict suite expands to 66 tests plus 44 subtests, and the inferred native
+total is 139 after the current 137-pass census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -265,7 +273,7 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,985, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,985 lines.
+contains 27,995, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,995 lines.
 The exact 2,964-line delta is 2,959 counted Rockchip backend lines (2,799
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated

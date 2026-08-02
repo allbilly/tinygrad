@@ -793,6 +793,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((len(dpu.stages), len(plan.scratch)), (12,12))
     self.assertEqual([stage.count for stage in dpu.stages], [8192,4096,2048,1024,512,256,128,64,32,16,8,8])
     self.assertFalse(contains_uop(plan))
+
     image = emit_program(plan)
     self.assertEqual((len(image.stages), {stage.engine for stage in image.stages}), (13, {RKEngine.DPU,RKEngine.CMAC}))
     self.assertEqual(decode_image(encode_image(image)), image)
@@ -805,6 +806,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(([stage.engine for stage in long_image.stages], len(long_image.constants)), ([RKEngine.DPU,RKEngine.CMAC], 10512))
     rejected = lower_add_reduce_result(sink(Tensor.empty(511,dtype=dtypes.half).sum()))
     self.assertIsInstance(rejected.plan, RKProgram)
+
+  def test_masked_affine_prefix_sum_uses_empty_selector_entries(self):
+    plan = lower_affine_reduce_result(sink(Tensor.empty(10,dtype=dtypes.half).cumsum(0))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.stages), 16)
+    self.assertLessEqual(len(image.constants), 4096)
+    self.assertFalse(contains_uop(plan))
 
   def test_global_mean_folds_scale_into_cmac_weights(self):
     result = lower_add_reduce_result(sink(Tensor.empty(360,dtype=dtypes.half).mean()))
