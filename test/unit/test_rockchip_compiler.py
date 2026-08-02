@@ -65,6 +65,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(plan))
     self.assertEqual((len(plan.stages), len(plan.scratch), len(emit_dpu(plan).stages)), (3, 1, 3))
 
+  def test_native_program_preserves_buffer_signature_metadata(self):
+    a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
+    program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(a+b))
+    self.assertIsNotNone(program)
+    signature = program.to_elf().signature
+    self.assertEqual(tuple((slot, dtype, shape) for _,slot,dtype,shape in signature),
+                     ((0, dtypes.half, (16,)), (1, dtypes.half, (16,)), (2, dtypes.half, (16,))))
+
   def test_scalar_fill_uses_const_zero_index(self):
     plan = lower_dpu(sink(Tensor.ones((), dtype=dtypes.half)))
     self.assertIsInstance(plan, RKDPUProgram)

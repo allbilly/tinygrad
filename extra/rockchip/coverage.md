@@ -13,6 +13,25 @@ CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
 python -m pytest test/backend/test_ops.py -p conftest_rockchip -q --tb=no
 ```
 
+Add a persistent machine-readable report without changing execution behavior:
+
+```sh
+ROCKCHIP_TELEMETRY=~/rk2608_backups/test_ops_coverage.json \
+PYTHONPATH=/home/orangepi/rk_2608/test/rockchip:/home/orangepi/rk_upstream \
+CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
+python -m pytest test/backend/test_ops.py -p conftest_rockchip -q --tb=no
+```
+
+The version-1 JSON records the commit, environment, RK3588/driver identity,
+method result, exact unittest subcase parameters and result, every executed
+kernel lane, physical compiler signature, engine counts, RKImage version,
+stage count, scratch bytes, constants bytes, duration, and every native reject.
+The method summary uses `PASS_FRONTEND`, `PASS_NATIVE`, `PASS_MIXED`,
+`PASS_FALLBACK`, `SKIP_UPSTREAM`, and `FAIL`. `PASS_NATIVE` is assigned only
+when every realized kernel in every subcase executed through an RK engine.
+Normalized UOp fingerprints and typed legalization details are added by the
+next compiler-diagnostics milestone.
+
 ## Current exact method baseline
 
 At `0946a6da1`, after restoring operation-specific int32/FP32 wide constant

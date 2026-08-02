@@ -8,7 +8,8 @@ from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
-from tinygrad.uop.ops import Ops, ProgramInfo, UOp
+from tinygrad.runtime.support.rockchip_telemetry import record as record_telemetry
+from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 2, 1
 _HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHQIIIIQQ")
@@ -1520,8 +1521,16 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int, dtypes.float}
   def native_program(self, ast:UOp) -> UOp|None:
+    info = ProgramInfo.from_sink(ast, self.target)
+    params = tuple(sorted((u for u in ast.toposort() if u.op is Ops.PARAM and u.arg.slot >= 0), key=lambda u:u.arg.slot))
     if (dpu:=lower_dpu(ast)) is not None: image = emit_dpu(dpu)
     elif (contract:=lower_contract(ast)) is not None: image = emit_contract(contract)
-    else: raise RuntimeError(f"RKPLAN_REJECT:{_reject_reason(ast)}")
-    return UOp(Ops.PROGRAM, src=(ast, UOp(Ops.LINEAR), UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
-               arg=ProgramInfo.from_sink(ast, self.target))
+    else:
+      reason = _reject_reason(ast)
+      record_telemetry("reject", lane="REJECT", program=info.name, reject_kind=reason,
+        signature=[{"slot": u.arg.slot, "dtype": u.dtype.name,
+                    "shape": [x if isinstance(x, int) else str(x) for x in u.shape]} for u in params])
+      raise RuntimeError(f"RKPLAN_REJECT:{reason}")
+    linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))
+    return UOp(Ops.PROGRAM, src=(ast, linear, UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
+               arg=info)
