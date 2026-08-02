@@ -56,10 +56,17 @@ def pytest_configure(config):
     clear()
     _rockchip_methods.clear()
 
+def _new_method(item) -> dict:
+  return {"nodeid": item.nodeid, "class": item.cls.__name__ if item.cls else None, "test": item.name,
+    "outcome": None, "phase_outcomes": {}, "kernels": [], "rejects": [], "subcases": []}
+
+def pytest_collection_modifyitems(items):
+  if _telemetry_path() is not None:
+    for item in items: _rockchip_methods[item.nodeid] = _new_method(item)
+
 def pytest_runtest_setup(item):
   if _telemetry_path() is None: return
-  _rockchip_methods[item.nodeid] = {"nodeid": item.nodeid, "class": item.cls.__name__ if item.cls else None, "test": item.name,
-    "outcome": None, "phase_outcomes": {}, "kernels": [], "rejects": [], "subcases": []}
+  _rockchip_methods.setdefault(item.nodeid, _new_method(item))
 
 def pytest_runtest_logreport(report):
   if _telemetry_path() is None or report.nodeid not in _rockchip_methods: return
