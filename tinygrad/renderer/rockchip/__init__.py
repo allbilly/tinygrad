@@ -209,7 +209,8 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, root, min(tile, count-start),
                                      store.src[0].dtype) for start in range(0, count, tile))
       return _native(RKDPUProgram(fill_stages))
-    return _native(RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, root, count),)))
+    return _native(RKDPUProgram(tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*2), 0.0, root,
+      min(32768, count-start)) for start in range(0, count, 32768))))
   if (program:=_schedule_expr(root, output, count)) is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "stage source is not materializable")
   return _native(program)
@@ -966,6 +967,7 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   program = _sparse_cmac_pipeline(reduced, source, input_count, selectors, scale, initial_scratch) if \
     input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(
       reduced, source, selectors, scale, initial_scratch, direct_count=input_count)
+  if program is None: program = _two_level_selector_program(reduced, source, input_count, selectors, initial_scratch)
   if program is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine CMAC output tiles exceed the source-window or constant budget", reduce.op)
   if prepare is not None: program = RKProgram((RKDPUProgram(prepare.stages, program.scratch), *program.steps), program.scratch)

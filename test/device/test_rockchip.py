@@ -5,6 +5,10 @@ from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_wide_fp16_fill_native_dpu_tiles(self):
+    actual = Tensor.ones(65536,dtype=dtypes.half,device="ROCKCHIP").realize().numpy()
+    np.testing.assert_equal(actual, np.ones(65536,dtype=np.float16))
+
   def test_dense_fp16_row_sum_native_cmac(self):
     data = np.linspace(-2, 2, 8*32, dtype=np.float16).reshape(8,32)
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
@@ -94,6 +98,12 @@ class TestRockchip(unittest.TestCase):
     tiny = np.random.uniform(-2, 2, (4,2,2)).astype(np.float16)
     actual = Tensor(tiny, device="ROCKCHIP").realize().sum(axis=(0,2)).realize().numpy()
     np.testing.assert_allclose(actual, tiny.astype(np.float32).sum(axis=(0,2)).astype(np.float16), rtol=1e-3, atol=1e-6)
+
+  def test_wide_dense_row_sum_native_two_level_cmac(self):
+    data = np.linspace(-.25,.25,256*256,dtype=np.float16).reshape(256,256)
+    actual = Tensor(data,device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
+    expected = data.astype(np.float32).sum(axis=1).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
   def test_masked_affine_prefix_sum_native_cmac(self):
     data = np.array([1,-2,3,-4,5,-6,7,-8,9,-10], dtype=np.float16)

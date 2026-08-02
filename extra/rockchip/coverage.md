@@ -1528,3 +1528,22 @@ inferred native total is 144 after the current 137-pass census, pending the next
 complete run. The research tree has 28,267 counted lines. Pre-change sources
 are preserved under
 `~/rk2608_backups/masked-product-before-35f390287-20260803`.
+
+Wide dense affine SUM now uses the existing two-level selector when one
+windowed CMAC cannot keep both source width and destination alignment legal.
+For a 256x256 surface, the first level reduces two K256 rows per aligned
+intermediate group and the second compacts padded scalar atoms into the dense
+output. The plan has 145 stages, 36,864 unique constant bytes, and 2,080
+scratch bytes, remaining below all shared limits.
+
+Hardware validation exposed a separate producer boundary: one 32,768-element
+FP16 constant fill succeeds, while an untiled 65,528-element probe timed out.
+FP16 fills now tile at the proven 32,768-lane DPU width; a 65,536-element fill
+uses two address-aligned tasks and writes every value. Complete
+`test_sum_collapse` consequently passes natively in 16.98 seconds. All 94 host
+tests, repository-wide Ruff, and mypy over 225 tinygrad modules pass; the
+strict hardware suite passes 73 tests plus 52 subtests in 659.40 seconds with
+`ROCKCHIP_FALLBACK=0`. The inferred native total is 147 after the current
+146-pass census, pending the next complete run. The research tree has 28,269
+counted lines. Pre-change sources are preserved under
+`~/rk2608_backups/two-level-affine-sum-before-6f7872696-20260803`.

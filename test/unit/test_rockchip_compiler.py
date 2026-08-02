@@ -31,6 +31,12 @@ def contains_uop(obj) -> bool:
   return False
 
 class TestDPUCompiler(unittest.TestCase):
+  def test_wide_fp16_fill_tiles_at_proven_dpu_width(self):
+    plan = lower_dpu(sink(Tensor.full((65536,), 1, dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    assert isinstance(plan, RKDPUProgram)
+    self.assertEqual([(stage.count,stage.dst.addend) for stage in plan.stages], [(32768,0),(32768,65536)])
+
   def test_global_max_hwc8_uses_typed_ppu_reduction(self):
     plan = lower_reduce_result(sink(Tensor.empty(4,4,8,dtype=dtypes.half).max(axis=(0,1)))).plan
     self.assertIsInstance(plan, RKReduce)
@@ -132,6 +138,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(dpu_count, 2*cmac_count)
     self.assertLessEqual(len(image.stages), 54)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
+  def test_wide_dense_rows_use_two_level_affine_sum(self):
+    source = Tensor.empty(256,256,dtype=dtypes.half).realize()
+    plan = lower_affine_reduce_result(sink(source.sum(axis=1))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.stages), 160)
+    self.assertLessEqual(len(image.constants), 64*1024)
     self.assertFalse(contains_uop(plan))
 
   def test_affine_movements_use_aligned_npu_atom_copies(self):

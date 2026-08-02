@@ -107,6 +107,8 @@ are eligible to be ported as native capabilities.
 - larger static affine FP16 ADD reductions split into atom-aligned source
   windows, provided the scale is exactly FP16, the plan has at most 400 stages,
   and affine visits and unique constants remain within declared budgets;
+- wide dense affine FP16 ADD reductions whose single-level windows are illegal,
+  reduced into padded scalar atoms and compacted by a second CMAC level;
 - static affine FP16 movements with at most 512 source and 4,096 output
   elements: aligned runs use DPU atom copies, while arbitrary selector maps up
   to a 2 MiB generated-weight budget use the same sparse CMAC pipeline;
@@ -312,6 +314,13 @@ indexed input or an NPU-generated identity-one surface. Complete
 subtests, and the inferred native total is 144 after the current 137-pass
 census.
 
+Wide dense row sums subsequently invoke the generic two-level selector rather
+than stopping after one-level window rejection. FP16 constant fills also tile
+at the hardware-proven 32,768-lane width; an untiled 65,528-lane probe timed
+out, while two tiles fill 65,536 lanes exactly. Complete `test_sum_collapse` is
+native, the strict suite expands to 73 tests plus 52 subtests, and the inferred
+native total is 147 after the current 146-pass census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -322,8 +331,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,267, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,267 lines.
-The exact 3,299-line delta is 3,294 counted Rockchip backend lines (3,134
+contains 28,269, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,269 lines.
+The exact 3,301-line delta is 3,296 counted Rockchip backend lines (3,136
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
