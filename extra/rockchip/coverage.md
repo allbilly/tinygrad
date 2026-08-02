@@ -117,6 +117,22 @@ method remains `FAIL`; no census gain is claimed. `sz.py` reports 1,823
 counted renderer lines and 26,956 repository lines overall. The 306 new
 autogen payload lines are excluded; net counted compiler growth is 16 lines.
 
+The final zero-base subcase currently supplies an explicit FP32 input despite
+`DEFAULT_FLOAT=HALF`. The 2607 runtime did not execute that input natively: it
+serialized `fp32_inputs` metadata and used NumPy in `ops_rockchip.py` to narrow
+the buffer to FP16 before NPU submission. That path is prohibited here.
+
+A direct hardware probe tested the apparent alternative from the RK3588
+register enum: set DPU `DATA_FORMAT.in_precision` to `precision_float32` and
+perform FP32-to-FP16 ADD-zero entirely in the submitted task. The submission
+timed out with `Errno 110`; restoring FP16 input precision recovered normal
+execution. The exact failed typed-stage/emitter probe is preserved as
+`wip-native-fp32-dpu-input-timeout.patch` with SHA-256
+`d40b01ca5cd11e247ed295c3257f15d2fa11ac8756481ceda8799f3a4810ea25`.
+Therefore `0**x`, `0.7**x`, and `(-2)**x` with explicit FP32 input remain
+honest native rejections until another RK3588 engine or a native reformat path
+is proven; CPU narrowing will not be used to make this method green.
+
 Run the census serially on RK3588:
 
 ```sh
