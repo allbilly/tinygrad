@@ -134,12 +134,11 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
-The current committed strict census at `a27a52212` contains 102 native passes,
-40 frontend-only passes, 270 failures, and 13 upstream skips across exactly 425
+The current committed strict census at `7c11a8f32` contains 105 native passes,
+40 frontend-only passes, 267 failures, and 13 upstream skips across exactly 425
 methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
-regressed. Method totals are unchanged because `test_max` and `test_min` still
-contain unsupported later cases, but their FP16 global/scaled extrema kernels
-now execute natively before the typed affine-layout and integer-dtype rejects.
+regressed. `test_broadcast_simple`, `test_broadcasted_add`, and
+`test_broadcasted_add_2` are the exact three method-level gains.
 
 ## Current upstream blocker
 

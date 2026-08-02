@@ -418,6 +418,19 @@ census. All 68 host tests, Ruff, and mypy are clean; the strict hardware suite
 passes 49 tests plus 31 subtests in 371.75 seconds. The capability adds 88
 counted compiler lines.
 
+The complete uncached census at `7c11a8f32` confirms 105 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 267 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods.
+The only method deltas from `a27a52212` are `test_broadcast_simple`,
+`test_broadcasted_add`, and `test_broadcasted_add_2` moving from failure to
+native pass; no prior native method regresses. Pytest reports 166 passed, 360
+failed, 13 skipped, and 12 passing subtests in 751.59 seconds. The 241 remaining
+method-level reject events are 64 layout, 60 output dtype, 60 reformat, 22 input
+dtype, 17 ALU, 14 plan-stage limit, and 4 reduction rejects. The durable JSON is
+`~/rk2608_backups/census-broadcast-7c11a8f32/test_ops_coverage.json` (SHA-256
+`415f41a98db200a4723ea8fdeff69453325f7ad67d8b78ab25ed5ff9bb2e66fb`);
+JUnit XML SHA-256 is
+`45bddd5fdf96f640f066bd06ae82575a89948f8d597db5ef21393cef1fe9d7c6`.
+
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`
 (SHA-256 `636e8c745dc5044bba7e055ce23ab5a7764585a9858e4a8a747831a548a789a7`);
