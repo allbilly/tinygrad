@@ -73,6 +73,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual([stage.engine for stage in emit_program(dense).stages],
                      [RKEngine.DPU]*9+[RKEngine.CMAC]*4+[RKEngine.PPU,RKEngine.DPU])
 
+  def test_large_affine_reductions_use_bounded_source_windows(self):
+    plan = lower_affine_reduce_result(sink(Tensor.empty(2,2,11,28,dtype=dtypes.half).avg_pool2d(2))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    dpu_count, cmac_count = (sum(stage.engine is engine for stage in image.stages) for engine in (RKEngine.DPU,RKEngine.CMAC))
+    self.assertEqual(dpu_count, 2*cmac_count)
+    self.assertLessEqual(cmac_count, 18)
+    self.assertLessEqual(len(image.constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_affine_movements_use_aligned_npu_atom_copies(self):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)
     plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in

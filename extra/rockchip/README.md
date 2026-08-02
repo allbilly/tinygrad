@@ -81,6 +81,9 @@ are eligible to be ported as native capabilities.
   elements, using NPU zero-fill/copy preparation and sequential sparse CMAC
   tiles of at most 16 logical outputs; constant mean scaling is folded into
   the weights;
+- larger static affine FP16 ADD reductions split into atom-aligned source
+  windows, provided the scale is exactly FP16, the plan has at most 400 stages,
+  and affine visits and unique constants remain within declared budgets;
 - static affine FP16 movements with at most 512 source and 4,096 output
   elements: aligned runs use DPU atom copies, while arbitrary selector maps up
   to a 2 MiB generated-weight budget use the same sparse CMAC pipeline;
@@ -155,11 +158,18 @@ single-axis global MAX remains on the proven padded DPU tree. The strict
 hardware suite passes 56 tests plus 37 subtests at this head; the focused gain
 has not yet been folded into the complete census.
 
+The subsequent windowed-reduction milestone does not claim another complete
+method: it proves exact 2x2 affine average windows over a 1,232-element input,
+while non-exact reciprocals reject. Ordered image composition deduplicates
+identical constant payloads. Reset-per-program, a two-term approximate
+reciprocal, and K=640 dynamic CMAC were tested and rejected; the full hardware
+suite remains green with per-stage reset and the K<=512/400-stage bounds.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,664, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,664 lines.
-The exact 2,696-line delta is 2,691 counted Rockchip backend lines (2,531
+contains 27,709, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,709 lines.
+The exact 2,741-line delta is 2,736 counted Rockchip backend lines (2,576
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

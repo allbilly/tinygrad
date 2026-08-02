@@ -230,15 +230,17 @@ def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     elif isinstance(step, RKReduce): images.append(emit_reduce(step, target))
     else: raise TypeError(f"unsupported Rockchip program step {type(step).__name__}")
   stages:list[RKStage] = []
-  constants = bytearray()
+  constants, constant_offsets = bytearray(), {}
   for image in images:
-    constant_base = len(constants)
+    if image.constants not in constant_offsets:
+      constant_offsets[image.constants] = len(constants)
+      constants.extend(image.constants)
+    constant_base = constant_offsets[image.constants]
     for stage in image.stages:
       relocs = tuple(RKReloc(len(stages), reloc.word, reloc.kind,
         reloc.index+(constant_base if reloc.kind is RKBufferKind.CONSTANT else 0), reloc.addend, reloc.shift, reloc.mask, reloc.field_shift)
         for reloc in stage.relocs)
       stages.append(RKStage(stage.engine, stage.commands, relocs, stage.flags))
-    constants.extend(image.constants)
   return RKImage(target, tuple(stages), plan.scratch, bytes(constants))
 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:

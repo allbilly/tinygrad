@@ -21,6 +21,7 @@ from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 
 RK_MAX_CONSTANT_BYTES = 2*1024*1024
 RK_MAX_AFFINE_VISITS = 65536
+RK_MAX_PROGRAM_STAGES = 400
 
 def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
   stride, strides = 2, []
@@ -66,6 +67,45 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
       RKTensorRef(packed, lhs_layout), _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), 0,
       _cmac_selection_payload(rows[start:start+count], align_in, 32, scale)))
   return RKProgram((dpu, *contracts), scratch)
+
+def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
+                            scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
+  """Reduce consecutive output tiles from bounded, atom-aligned source windows."""
+  if struct.unpack("<e", struct.pack("<e", scale))[0] != scale: return None
+  chunks:list[tuple[int, int, int, list[list[int]], bytes]] = []
+  start = 0
+  while start < len(rows):
+    tile:list[list[int]] = []
+    for candidate in rows[start:start+16]:
+      selected = [index for row in (*tile,candidate) for index in row]
+      if not selected: return None
+      base, end = min(selected)&-8, max(selected)+1
+      span, align_in = end-base, max(32, (end-base+31)&-32)
+      if align_in > 512: break
+      tile.append(candidate)
+    if not tile: return None
+    selected = [index for row in tile for index in row]
+    base, end = min(selected)&-8, max(selected)+1
+    span, align_in = end-base, max(32, (end-base+31)&-32)
+    payload = _cmac_selection_payload([[index-base for index in row] for row in tile], align_in, 32, scale)
+    chunks.append((start, base, end, tile, payload))
+    start += len(tile)
+  if sum(map(len, set(chunk[-1] for chunk in chunks))) > RK_MAX_CONSTANT_BYTES or \
+     len(chunks)*3 > RK_MAX_PROGRAM_STAGES: return None
+  max_align = max((len(payload)//64 for *_,payload in chunks), default=32)
+  packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
+  scratch += (RKScratch(max_align*2),)
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  for start,base,end,tile,payload in chunks:
+    span, align_in = end-base, len(payload)//64
+    steps.append(RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
+      RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span)), scratch))
+    valid = len(tile)
+    out_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
+    steps.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
+      _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
+      _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload))
+  return RKProgram(tuple(steps), scratch)
 
 def _finish_program(steps:list[RKDPUProgram|RKContract|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
   """Give every ordered DPU step the program's final resource table."""
@@ -466,7 +506,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if len(red_axes) != len(reduce.src)-1 or set(out_axes) & set(red_axes) or \
      set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine CMAC axes do not form one static output/reduction partition", Ops.RANGE)
-  if not 1 <= output_count <= 128 or not 2 <= input_count <= 512:
+  reduction_count = math.prod(ranges[axis] for axis in red_axes)
+  if not 1 <= output_count <= 8192 or not 2 <= input_count <= 65536 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine CMAC surface is {output_count}x{input_count}", reduce.op)
   selectors:list[list[int]] = [[] for _ in range(output_count)]
   seen:set[int] = set()
@@ -484,8 +525,12 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
-  program = _sparse_cmac_pipeline(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), source, input_count, selectors, scale,
-                                  () if prepare is None else prepare.scratch)
+  output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
+  initial_scratch = () if prepare is None else prepare.scratch
+  program = _sparse_cmac_pipeline(output, source, input_count, selectors, scale, initial_scratch) if \
+    input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(output, source, selectors, scale, initial_scratch)
+  if program is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "affine CMAC output tiles exceed the source-window or constant budget", reduce.op)
   if prepare is not None: program = RKProgram((RKDPUProgram(prepare.stages, program.scratch), *program.steps), program.scratch)
   return _native(program)
 

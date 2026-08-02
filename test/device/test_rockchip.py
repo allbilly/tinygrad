@@ -56,12 +56,19 @@ class TestRockchip(unittest.TestCase):
         actual = tensor.sum(axis=axes).realize().numpy()
         expected = data.astype(np.float32).sum(axis=axes).astype(np.float16)
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
     actual = tensor.mean(axis=(1,2)).realize().numpy()
     expected = (data.astype(np.float32).sum(axis=(1,2))*np.float32(1/20)).astype(np.float16)
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
     tiny = np.random.uniform(-2, 2, (4,2,2)).astype(np.float16)
     actual = Tensor(tiny, device="ROCKCHIP").realize().sum(axis=(0,2)).realize().numpy()
     np.testing.assert_allclose(actual, tiny.astype(np.float32).sum(axis=(0,2)).astype(np.float16), rtol=1e-3, atol=1e-6)
+
+  def test_windowed_affine_average_native_cmac(self):
+    data = np.linspace(-1,1,2*2*11*28,dtype=np.float16).reshape(2,2,11,28)
+    actual = Tensor(data,device="ROCKCHIP").realize().avg_pool2d(2).realize().numpy()
+    expected = data[:,:,:10,:].astype(np.float32).reshape(2,2,5,2,14,2).mean(axis=(3,5)).astype(np.float16)
+    np.testing.assert_equal(actual, expected)
 
   def test_pointwise_fp16_expression_before_affine_reduction(self):
     rng = np.random.default_rng(17)

@@ -1135,3 +1135,27 @@ and the strict RK3588 suite (56 tests plus 37 subtests) in 448.91 seconds with
 `ROCKCHIP_FALLBACK=0`. This focused complete-method gain is not yet folded into
 the 122-pass census. Counted source remains 27,664 lines, including 2,531 in
 the Rockchip renderer/compiler.
+
+Large affine ADD reductions can now be split into greedy, atom-aligned source
+windows instead of generating one dense selector over the complete input.
+Each window spans at most 512 FP16 values, produces at most 16 outputs, and is
+materialized by NPU zero/copy plus CMAC. Identical immutable CMAC payloads are
+deduplicated when ordered images are composed. The planner accepts only scales
+that are exactly representable in FP16, at most 65,536 affine visits, 2 MiB of
+unique constants, and 400 hardware stages. A 2x2 average over a 1,232-element
+surface is hardware-conformant with 54 tasks and exact FP16 output; this is a
+generic reduction capability but does not yet make a new complete TestOps
+method pass. Ruff and mypy pass, as do all 76 host tests and the strict RK3588
+suite (57 tests plus 37 subtests) in 455.32 seconds.
+
+Three rejected probes define the current boundary. A two-term FP16 expansion
+for 1/6 reduced average-pool mismatches from roughly 35% to 7.7%, but CMAC
+accumulation order still differed by one ULP, so non-exact scales reject. A
+direct K=640 CMAC global-average plan wrote only its first output and is outside
+the proven K<=512 contract. Resetting once per ordered program made ordinary
+DPU/CMAC/PPU probes pass but caused the sensitive LUT-to-CMAC sequence to time
+out; reset-per-stage remains required. The exact experiments are preserved as
+`wip-two-term-cmac-average-one-ulp.patch` and
+`wip-dynamic-k320-row-cmac-timeout.patch` in the persistent patch archive.
+The research tree now has 27,709 counted lines, including 2,576 in the
+Rockchip renderer/compiler.
