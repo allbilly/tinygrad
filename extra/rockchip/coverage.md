@@ -64,8 +64,10 @@ TestOps selector (`DEV=ROCKCHIP`) and persistent compilation disabled
 (`CACHELEVEL=0`), `test_sum_full` passes. The first 135-element subcase of
 `test_sum` now passes, then its length-six row reduction rejects because a
 native padded-row layout is not implemented. `test_sum_simple` has an explicit
-FP32 input, while fused ReLU, multi-output reductions, and nested sums remain
-unsupported. Global `test_mean` now passes: its compile-time reciprocal is
+FP32 input, while multi-output reductions and nested sums remain unsupported.
+Global `test_sum_relu` now passes through a DPU MAX-zero prepass and the direct
+K64 CMAC; the final ReLU is removed only after proving all reduced lanes are
+nonnegative. Global `test_mean` also passes: its compile-time reciprocal is
 folded into generated K384 CMAC weights, preserving one FP32 accumulation and
 one final FP16 conversion. Earlier claims for other methods came from mistakenly
 using `DEVICE=ROCKCHIP`, which left TestOps on the default CPU backend; they

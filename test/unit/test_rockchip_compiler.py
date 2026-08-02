@@ -561,6 +561,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(active, struct.unpack("<e", struct.pack("<e", 1/360))[0])
     self.assertEqual(decode_image(encode_image(emit_sum(plan))), emit_sum(plan))
 
+  def test_global_relu_sum_uses_dpu_prepass(self):
+    result = lower_add_reduce_result(sink(Tensor.empty(3,4,5,dtype=dtypes.half).relu().sum().relu()))
+    self.assertIsInstance(result.plan, RKSumProgram)
+    plan = result.plan
+    assert isinstance(plan, RKSumProgram)
+    self.assertEqual([stage.op for stage in plan.dpu.stages], [Ops.MAX,Ops.ADD])
+    self.assertEqual([stage.engine for stage in emit_sum(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
+
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
     program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(a.maximum(b)))

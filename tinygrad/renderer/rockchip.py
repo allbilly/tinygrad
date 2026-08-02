@@ -1552,6 +1552,14 @@ def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
   return u
 
+def _relu_source(u:UOp) -> UOp|None:
+  if u.op is not Ops.WHERE or len(u.src) != 3: return None
+  cond, positive, zero = u.src
+  if cond.op is not Ops.CMPLT or len(cond.src) != 2 or cond.src[0].op is not Ops.CONST or float(cond.src[0].arg) != 0 or \
+     zero.op is not Ops.CONST or float(zero.arg) != 0: return None
+  source = _strip_casts(cond.src[1])
+  return source if _strip_casts(positive).key == source.key else None
+
 def _affine(u:UOp) -> tuple[dict[int, int], int]|None:
   if u.op is Ops.RANGE: return ({u.arg[0]:1}, 0)
   if u.op is Ops.CONST: return ({}, int(u.arg))
@@ -1663,7 +1671,9 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU sum requires an FP16 output surface", store.src[0].op)
   if store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one scalar output", store.src[0].op)
-  stored, scale = _strip_casts(store.src[1]), 1.0
+  stored, scale, final_relu = _strip_casts(store.src[1]), 1.0, False
+  if (relu_source:=_relu_source(stored)) is not None and relu_source.key == reduce.key:
+    stored, final_relu = relu_source, True
   if stored.key != reduce.key:
     if stored.op is not Ops.MUL:
       return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum only accepts a constant scale epilogue", stored.op)
@@ -1672,6 +1682,10 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
       return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum scale is not a direct constant", stored.op)
     scale = float(const.arg)
   value, red = _strip_casts(reduce.src[0]), reduce.src[1]
+  pre_relu = (relu_source:=_relu_source(value)) is not None
+  if relu_source is not None: value = relu_source
+  if final_relu and not pre_relu:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "DPU sum cannot drop an unproven final ReLU", stored.op)
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half or red.op is not Ops.RANGE:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "DPU sum input is not one direct FP16 surface", reduce.op)
   count, src_aff = int(red.src[0].arg), _affine(value.src[1])
@@ -1680,17 +1694,24 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one dense reduction axis", value.op)
   output, input_arg = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  stages:list[RKDPUStage] = []
+  scratch:list[RKScratch] = []
+  if pre_relu:
+    relu_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    stages.append(RKALUStage(Ops.MAX, relu_arg, input_arg, 0.0, count))
+    scratch.append(RKScratch(((count+31)&-32)*2))
+    input_arg = relu_arg
   if 32 < count <= 512:
     align_in = (count+31)&-32
-    packed = RKArg(RKBufferKind.SCRATCH, 0)
-    dpu = RKDPUProgram((RKALUStage(Ops.ADD, packed, input_arg, 0.0, count),), (RKScratch(align_in*2),))
+    packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    stages.append(RKALUStage(Ops.ADD, packed, input_arg, 0.0, count))
+    scratch.append(RKScratch(align_in*2))
+    dpu = RKDPUProgram(tuple(stages), tuple(scratch))
     out_layout = RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31)))
     lhs_layout = RKLayout((1,count), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-count)))
     contract = RKContract(RKTensorRef(output, out_layout), RKTensorRef(packed, lhs_layout),
       _cmac_weight_ref(0, 4, align_in, RKBufferKind.CONSTANT, 32), red.arg[0], _cmac_mask_payload(count, align_in, scale=scale))
     return _native(RKSumProgram((), dpu, contract))
-  stages:list[RKDPUStage] = []
-  scratch:list[RKScratch] = []
   runs:list[tuple[RKArg, int]] = []
   prefix:list[RKContract] = []
   rows, tail = divmod(count, 32)

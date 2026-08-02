@@ -31,6 +31,13 @@ class TestRockchip(unittest.TestCase):
     expected = (data.astype(np.float32).sum()*np.float32(1/data.size)).astype(np.float16).item()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_contiguous_fp16_relu_sum_native_dpu_cmac(self):
+    np.random.seed(0)
+    data = np.random.uniform(-2, 2, (3,4,5)).astype(np.float16)
+    actual = Tensor(data, device="ROCKCHIP").realize().relu().sum().relu().realize().item()
+    expected = np.maximum(data.astype(np.float32), 0).sum().astype(np.float16).item()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_global_max_hwc8_native_ppu(self):
     for height,width in ((2,2), (4,4), (16,16)):
       with self.subTest(shape=(height,width,8)):

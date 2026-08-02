@@ -50,6 +50,7 @@ are eligible to be ported as native capabilities.
   32-term aligned DPU/CMAC plan;
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
   hardware-packed weights and a single FP32 accumulation;
+- global ReLU-sum through a DPU MAX-zero prepass and the same direct CMAC;
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
