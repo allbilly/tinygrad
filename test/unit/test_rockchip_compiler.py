@@ -848,6 +848,16 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(image.constants), 256*1024)
       self.assertFalse(contains_uop(result.plan))
 
+  def test_masked_affine_product_materializes_multiplicative_identity(self):
+    result = lower_native(sink(Tensor.empty(10,dtype=dtypes.half).cumprod(0)))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    image = emit_program(result.plan)
+    self.assertLessEqual(len(image.stages), 96)
+    self.assertLessEqual(len(image.constants), 128*1024)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_masked_affine_prefix_sum_uses_empty_selector_entries(self):
     plan = lower_affine_reduce_result(sink(Tensor.empty(10,dtype=dtypes.half).cumsum(0))).plan
     self.assertIsInstance(plan, RKProgram)

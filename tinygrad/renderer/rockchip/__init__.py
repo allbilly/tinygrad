@@ -758,6 +758,96 @@ def lower_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
       f"affine MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
   return _native(completed)
 
+def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
+  """Lower a small affine MUL scan by materializing selected values and multiplicative identities on NPU engines."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1 or reductions[0].arg[0] is not Ops.MUL: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if _strip_casts(store.src[1]).key != reduce.key or store.src[0].op is not Ops.INDEX or \
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  value = _strip_casts(reduce.src[0])
+  indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  if len(indexes) != 1 or indexes[0].dtype is not dtypes.half or not reduce.src[1:] or \
+     any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in reduce.src[1:]):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL requires one FP16 indexed source", reduce.op)
+  source_index, out_map = indexes[0], _affine(store.src[0].src[1])
+  if out_map is None: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL output is not affine", store.src[0].op)
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  red_axes, out_axes = tuple(u.arg[0] for u in reduce.src[1:]), tuple(sorted(out_map[0]))
+  source_axes = {u.arg[0] for u in source_index.src[1].toposort() if u.op is Ops.RANGE}
+  if set(out_axes) & set(red_axes) or source_axes - set(out_axes) - set(red_axes) or \
+     any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "masked affine MUL axes do not form one static partition", Ops.RANGE)
+  output_count, input_count = int(store.src[0].src[0].src[0].arg), int(source_index.src[0].src[0].arg)
+  reduction_count = math.prod(ranges[axis] for axis in red_axes)
+  if not 1 <= output_count <= 128 or not 2 <= reduction_count <= 32 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"masked affine MUL surface is {output_count} outputs by {reduction_count} terms", reduce.op)
+  selected:list[list[list[int]]] = [[[] for _ in range(output_count)] for _ in range(reduction_count)]
+  identities:list[list[list[int]]] = [[[] for _ in range(output_count)] for _ in range(reduction_count)]
+  zero_source = value.substitute({source_index:UOp.const(0, source_index.dtype)})
+  seen:set[int] = set()
+  for out_point in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes, out_point))
+    output_index = out_map[1]+sum(out_map[0][axis]*point[axis] for axis in out_axes)
+    if not 0 <= output_index < output_count or output_index in seen:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL output is not dense", store.src[0].op)
+    seen.add(output_index)
+    for term,red_point in enumerate(product(*(range(ranges[axis]) for axis in red_axes))):
+      point.update(zip(red_axes, red_point))
+      active = _static_index_selected(value, source_index, point)
+      if active is None:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL predicate is not static", value.op)
+      if active:
+        source_offset = _static_scalar(source_index.src[1], point)
+        if not isinstance(source_offset, int) or isinstance(source_offset, bool) or not 0 <= source_offset < input_count:
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL input index is out of bounds", source_index.op)
+        selected[term][output_index] = [source_offset]
+      else:
+        inactive = _static_scalar(zero_source, point)
+        if not isinstance(inactive, (int,float)) or float(inactive) != 1.0:
+          return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "masked affine MUL inactive value is not one", value.op)
+        identities[term][output_index] = [0]
+  if seen != set(range(output_count)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL output has holes", store.src[0].op)
+  one = RKArg(RKBufferKind.SCRATCH, 0)
+  scratch:tuple[RKScratch, ...] = (RKScratch(64),)
+  steps:list[RKDPUProgram|RKContract|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, one, 0.0, 1.0, 32),), scratch)]
+  operands:list[RKArg] = []
+  source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
+  for value_rows,identity_rows in zip(selected, identities):
+    selected_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+    value_plan = _selector_program(selected_arg, source, input_count, value_rows, scratch)
+    if value_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "masked MUL value selector exceeds limits", reduce.op)
+    steps.extend(value_plan.steps)
+    scratch = value_plan.scratch
+    identity_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+    identity_plan = _selector_program(identity_arg, one, 32, identity_rows, scratch)
+    if identity_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "masked MUL identity selector exceeds limits", reduce.op)
+    steps.extend(identity_plan.steps)
+    scratch = identity_plan.scratch
+    operand = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(((output_count+7)//8)*16),)
+    steps.append(RKDPUProgram((RKALUStage(Ops.ADD, operand, selected_arg, identity_arg, output_count),), scratch))
+    operands.append(operand)
+  output, accumulator = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), operands[0]
+  multiplies:list[RKDPUStage] = []
+  for index,operand in enumerate(operands[1:], 1):
+    final = index == len(operands)-1
+    destination = output if final else RKArg(RKBufferKind.SCRATCH, len(scratch))
+    if not final: scratch += (RKScratch(((output_count+7)//8)*16),)
+    multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, output_count))
+    accumulator = destination
+  completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
+  cost = _plan_cost(completed)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"masked affine MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
+  return _native(completed)
+
 def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output_index:UOp, output:RKArg, reduced:RKArg,
                                output_count:int, out_axes:tuple[int, ...], ranges:dict[int, int]) -> RKLowerResult:
   """Materialize static pointwise operands and execute a reduction epilogue entirely on NPU engines."""
@@ -1359,6 +1449,7 @@ _LOWERERS = (
   RKLowerer("nested_sum", lambda nodes:_has_reduction(nodes, Ops.ADD) and sum(u.op is Ops.REDUCE for u in nodes) > 1,
             lower_nested_add_reduce_result),
   RKLowerer("scalar_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_scalar_mul_reduce_result),
+  RKLowerer("masked_affine_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_masked_affine_mul_reduce_result),
   RKLowerer("affine_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_affine_mul_reduce_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),

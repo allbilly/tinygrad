@@ -89,6 +89,8 @@ are eligible to be ported as native capabilities.
   materialized into an addressable NPU atom before source-order DPU folding;
 - affine FP16 MUL reductions with 2–32 terms, materialized as one full NPU
   surface per reduction coordinate and folded by vector DPU stages;
+- statically masked affine FP16 MUL reductions with multiplicative-identity
+  surfaces selected from an NPU-filled ones atom;
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
   hardware-packed weights and a single FP32 accumulation;
 - global ReLU-sum through a DPU MAX-zero prepass and the same direct CMAC;
@@ -298,6 +300,12 @@ MUL stages. Complete `test_prod` is native, the strict suite expands to 70
 tests plus 52 subtests, and the inferred native total is 143 after the current
 137-pass census.
 
+Static predicates in short affine products subsequently select either the
+indexed input or an NPU-generated identity-one surface. Complete
+`test_small_cumprod` is native, the strict suite expands to 71 tests plus 52
+subtests, and the inferred native total is 144 after the current 137-pass
+census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -308,8 +316,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,178, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,178 lines.
-The exact 3,210-line delta is 3,205 counted Rockchip backend lines (3,045
+contains 28,267, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,267 lines.
+The exact 3,299-line delta is 3,294 counted Rockchip backend lines (3,134
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

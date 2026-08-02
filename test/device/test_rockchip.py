@@ -59,6 +59,11 @@ class TestRockchip(unittest.TestCase):
         expected = np.multiply.accumulate(data,axis=axis,dtype=np.float16).take(-1,axis=axis)
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_masked_affine_fp16_cumprod_native_cmac_dpu(self):
+    data = np.linspace(.8,1.2,10,dtype=np.float16)
+    actual = Tensor(data,device="ROCKCHIP").realize().cumprod(0).realize().numpy()
+    np.testing.assert_allclose(actual, np.cumprod(data,dtype=np.float16), rtol=1e-3, atol=1e-6)
+
   def test_contiguous_fp16_mean_native_cmac(self):
     np.random.seed(0)
     data = np.random.uniform(-2, 2, (3,4,5,6)).astype(np.float16)

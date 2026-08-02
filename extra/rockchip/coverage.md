@@ -1488,3 +1488,20 @@ hardware suite passes 70 tests plus 52 subtests in 632.61 seconds with
 137-pass census, pending the next complete run. The research tree has 28,178
 counted lines. Pre-change sources are preserved under
 `~/rk2608_backups/affine-product-before-1887a2fff-20260803`.
+
+Masked affine MUL reductions now materialize multiplicative identity without
+host data synthesis. The compiler follows each static WHERE branch at every
+affine coordinate. Active points select the indexed FP16 value; inactive
+points select lane zero from an NPU-filled ones atom. DPU ADD combines those
+two disjoint surfaces, then the established vector product fold executes in
+source order. Dynamic predicates and non-one inactive arms reject.
+
+Complete `test_small_cumprod` passes natively at unchanged tolerance. Its
+ten-element prefix plan has 69 stages, 39,168 constant bytes, 2,560 scratch
+bytes, and no UOps after target lowering. All 92 host tests, repository-wide
+Ruff, and mypy over 225 tinygrad modules pass; the strict hardware suite passes
+71 tests plus 52 subtests in 643.21 seconds with `ROCKCHIP_FALLBACK=0`. The
+inferred native total is 144 after the current 137-pass census, pending the next
+complete run. The research tree has 28,267 counted lines. Pre-change sources
+are preserved under
+`~/rk2608_backups/masked-product-before-35f390287-20260803`.
