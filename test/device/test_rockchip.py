@@ -21,6 +21,14 @@ class TestRockchip(unittest.TestCase):
     expanded = Tensor(data[:,:1], device="ROCKCHIP").realize().expand(2,3,8).contiguous().realize().numpy()
     np.testing.assert_equal(expanded, np.broadcast_to(data[:,:1], (2,3,8)))
 
+  def test_unaligned_contiguous_slice_native_dpu(self):
+    data = np.arange(24, dtype=np.float16)
+    tensor = Tensor(data, device="ROCKCHIP").realize()
+    for offset,length in (*((offset,16) for offset in range(1,8)), (3,3)):
+      with self.subTest(offset=offset, length=length):
+        actual = tensor[offset:offset+length].contiguous().realize().numpy()
+        np.testing.assert_equal(actual, data[offset:offset+length])
+
   def test_python_fallback_mapped_buffer_coherence(self):
     old_fallback, old_telemetry = os.environ.get("ROCKCHIP_FALLBACK"), os.environ.get("ROCKCHIP_TELEMETRY")
     os.environ["ROCKCHIP_FALLBACK"], os.environ["ROCKCHIP_TELEMETRY"] = "PYTHON", "memory"

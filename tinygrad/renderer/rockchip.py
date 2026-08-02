@@ -1424,8 +1424,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   dst = 0
   while dst < count:
     valid, src = min(8, count-dst), mapping[dst]
-    if src % 8 or mapping[dst:dst+valid] != list(range(src, src+valid)):
-      return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement breaks FP16 atom at output element {dst}", Ops.INDEX)
+    if mapping[dst:dst+valid] != list(range(src, src+valid)):
+      return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"movement breaks FP16 destination atom at element {dst}", Ops.INDEX)
     length = valid
     while dst+length < count:
       following = min(8, count-dst-length)
@@ -1538,6 +1538,7 @@ _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
 _TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
 _EW_BASE = 0x108002c0
+_ERDMA_FP16 = 0x40000008
 _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8), Ops.MAX:_EW_BASE,
            Ops.SUB:_EW_BASE | (4 << 16), Ops.FDIV:_EW_BASE | (3 << 16) | (1 << 8)}
 
@@ -1559,7 +1560,7 @@ def _emit_mask(stage_idx:int, plan:RKMaskStage) -> RKStage:
   cmds = [_command(_TARGET_DPU, reg, value) for reg,value in regs]
   cmds += [_command(_TARGET_DPU_RDMA, reg, value) for reg,value in ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe),
     (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
-    (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7), (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008))]
+    (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7), (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, _ERDMA_FP16))]
   relocs = []
   for target_id, reg, arg in ((_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, plan.dst),
                               (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, plan.src),
@@ -1683,7 +1684,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
        plan.out_dtype is dtypes.int else 0x10001)), (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
     rdma_regs = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
-      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 0x40000008))
+      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, _ERDMA_FP16))
     cmds = [_command(_TARGET_DPU, *x) for x in dpu_regs] + [_command(_TARGET_DPU_RDMA, *x) for x in rdma_regs]
     relocs = []
     for target_id, reg, arg in ((_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, plan.dst),

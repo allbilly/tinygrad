@@ -35,9 +35,22 @@ The first native reformat path handles static affine movements at the proven
 16-byte DPU atom granularity. The compiler enumerates only static index maps,
 coalesces adjacent aligned atoms, and emits ordinary DPU ADD-zero copy tasks;
 runtime tensor values never visit the CPU. Strict hardware tests cover HWC8
-permute, expand, and flip. A movement rejects when any output atom maps to
-strided or unaligned source elements (for example an 8x8 scalar transpose),
-rather than silently using host gather.
+permute, expand, and flip. A movement rejects when an output atom maps to
+strided source elements or crosses a source-run boundary (for example an 8x8
+scalar transpose), rather than silently using host gather.
+
+Hardware isolation subsequently showed that DPU `SRC_BASE_ADDR` honors FP16
+sub-atom offsets with the normal ERDMA configuration; offsets 1 through 7 and
+a three-element tail pass strict device tests. The reformat planner therefore
+accepts a contiguous source run beginning at any FP16 lane, while each output
+task must still begin at an aligned destination atom. Enabling the separate
+`ERDMA_NONALIGN` bit was rejected: it caused ordinary two-input DPU arithmetic
+to time out and is not part of the committed path.
+
+An independent unaligned-destination probe also timed out on the first
+official flip shape. Its exact planner diff and failure are preserved as
+`0063-WIP-unaligned-DPU-destination-timeout.patch`; the active compiler keeps
+the destination-atom legality check.
 
 Run the census serially on RK3588:
 

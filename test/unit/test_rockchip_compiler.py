@@ -44,8 +44,10 @@ class TestDPUCompiler(unittest.TestCase):
                   (x.permute(1,0,2), Tensor.empty(2,1,8,dtype=dtypes.half).expand(2,3,8), x.flip(0)))
     self.assertTrue(all(isinstance(plan, RKDPUProgram) for plan in plans))
     self.assertEqual(tuple(len(plan.stages) for plan in plans), (6, 5, 2))
-    self.assertTrue(all(stage.count % 8 == 0 for plan in plans for stage in plan.stages))
     self.assertIsNotNone(lower_reformat_result(sink(Tensor.empty(8,8,dtype=dtypes.half).T.contiguous())).reject)
+    sliced = lower_reformat_result(sink(Tensor.empty(24,dtype=dtypes.half)[1:17].clone())).plan
+    self.assertIsInstance(sliced, RKDPUProgram)
+    self.assertEqual((len(sliced.stages), sliced.stages[0].lhs.addend, sliced.stages[0].count), (1, 2, 16))
 
   def test_add_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
