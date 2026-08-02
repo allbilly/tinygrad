@@ -1300,3 +1300,19 @@ inferred native total is 132 after the current 128-pass census. The research
 tree now has 27,871 counted lines, including 2,738 in the Rockchip
 renderer/compiler. The pre-change compiler and tests are preserved under
 `~/rk2608_backups/windowed-empty-selectors-before-16a2cbb7e-20260803-012547`.
+
+The affine contraction M bound now follows the existing physical resource
+contract: `M<=128` and `M*aligned_K<=4096`, instead of an independent M64
+software cap. The unchanged 400-stage and 2 MiB completed-plan limits remain
+authoritative, so an M128 probe still rejects on cost while M129 rejects on
+surface size. The M81/K4/N4 plan is legal at 374 stages, 2,005,248 constant
+bytes, and 20,192 scratch bytes. Complete `test_simple_conv2d_1x1` passes
+natively in 44.43 seconds at unchanged tolerance.
+
+All 82 host tests, Ruff, and mypy pass, as does the strict hardware suite (63
+tests plus 39 subtests) in 565.46 seconds with `ROCKCHIP_FALLBACK=0`. The
+inferred native total is 133 after the current 128-pass census. This capability
+changes one counted condition only, so the research tree remains at 27,871
+counted lines with 2,738 in the Rockchip renderer/compiler. The pre-change
+compiler and tests are preserved under
+`~/rk2608_backups/tall-cmac-m128-before-cc1348718-20260803-014900`.

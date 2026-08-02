@@ -721,6 +721,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(all(not isinstance(step, RKContract) or step.out.buffer.addend%16 == 0 for step in plan.steps))
     self.assertFalse(contains_uop(plan))
 
+  def test_tall_k4_contraction_uses_resource_bound_instead_of_m64_cap(self):
+    x, weight = Tensor.empty(1,4,9,9,dtype=dtypes.half), Tensor.empty(4,4,1,1,dtype=dtypes.half)
+    plan = lower_tiled_contract_result(sink(x.conv2d(weight))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.stages), 400)
+    self.assertLessEqual(len(image.constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x.conv2d(weight, padding=(0,1)))).plan

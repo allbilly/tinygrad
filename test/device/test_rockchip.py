@@ -188,6 +188,13 @@ class TestRockchip(unittest.TestCase):
       Tensor(weight,device="ROCKCHIP").realize(),padding=(1,1)).realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_tall_k4_contraction_native_cmac(self):
+    data = np.linspace(-1,1,4*9*9,dtype=np.float16).reshape(1,4,9,9)
+    weight = np.linspace(-.5,.5,4*4,dtype=np.float16).reshape(4,4,1,1)
+    expected = Tensor(data,device="CPU").conv2d(Tensor(weight,device="CPU")).numpy()
+    actual = Tensor(data,device="ROCKCHIP").realize().conv2d(Tensor(weight,device="ROCKCHIP").realize()).realize().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_zero_masked_affine_contraction_native_cmac(self):
     data, weight = np.arange(3,dtype=np.float16).reshape(1,1,3), np.array([[[1,-1]]],dtype=np.float16)
     expected = Tensor(data).conv2d(Tensor(weight),padding=(0,1)).numpy()

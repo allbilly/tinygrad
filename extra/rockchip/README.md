@@ -215,6 +215,13 @@ compacts into dense output. This makes `test_simple_padding_conv1d` native with
 a 395-stage/856,464-byte plan and keeps the full strict suite green at 62 tests
 plus 39 subtests. The inferred native total is 132 pending the next census.
 
+The contraction M ceiling subsequently becomes resource-derived: `M<=128`
+while `M*aligned_K<=4096`, with the completed plan still limited to 400 stages
+and 2 MiB. This admits the bounded M81/K4/N4 1x1-convolution plan without
+admitting oversized M128 work. Complete `test_simple_conv2d_1x1` passes
+natively, the strict suite passes 63 tests plus 39 subtests, and the inferred
+native total is 133 pending the next census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates

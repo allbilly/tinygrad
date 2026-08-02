@@ -709,7 +709,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
   m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)): return _not_applicable()
-  if not 1 <= m <= 64 or not 1 <= n <= 16 or m*align_in > 4096:
+  if not 1 <= m <= 128 or not 1 <= n <= 16 or m*align_in > 4096:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
                 [[] for _ in range(align_in-k)])]
