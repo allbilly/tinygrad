@@ -134,16 +134,13 @@ python extra/rockchip/gen_lut.py
 The hardware suite is serial. Anything included in it is a promised capability
 and has no skip on an RK3588 host.
 
-The current committed strict census at `e18ce14c2` contains 116 native passes,
-40 frontend-only passes, 256 failures, and 13 upstream skips across exactly 425
+The current committed strict census at `d2af3b3d9` contains 117 native passes,
+40 frontend-only passes, 255 failures, and 13 upstream skips across exactly 425
 methods. It ran uncached with `ROCKCHIP_FALLBACK=0`; no prior native pass
-regressed. The bounded affine-contraction milestone adds seven complete native
-methods: 9×9 and small GEMM, simple and both batched matmul forms, plus simple
-strided 1D and 2D convolutions.
-
-The later focused native milestones also cover static conditional FP16
-reformats and the complete `test_padding_add` method. Those gains are verified
-by the strict device suite but are not yet included in the 116-pass census.
+regressed. The latest complete-method gain is `test_padding_add`, implemented
+through bounded zero-masked affine materialization and generic DPU arithmetic.
+Static conditional FP16 `tril`/`triu` subcases are also native, while their
+explicit boolean-output subcases remain honest dtype rejections.
 
 ## Current upstream blocker
 

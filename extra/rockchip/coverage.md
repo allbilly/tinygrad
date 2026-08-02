@@ -1041,6 +1041,21 @@ plan uses 362 NPU tasks, 1,002,752 constant bytes, and 8,352 scratch bytes, so
 it remains an explicit cost-model target for a future CNA/DMA reformat path.
 Ruff and mypy pass, as do all 70 host compiler/image/telemetry tests and the
 strict RK3588 suite (53 tests plus 37 subtests) in 411.41 seconds with
-`ROCKCHIP_FALLBACK=0`. This focused result has not yet been folded into the
-full 425-method census. The research tree now has 27,639 counted lines,
+`ROCKCHIP_FALLBACK=0`. The research tree now has 27,639 counted lines,
 including 2,506 in the Rockchip renderer/compiler.
+
+The complete uncached census at `d2af3b3d9` confirms 117 `PASS_NATIVE`, 40
+`PASS_FRONTEND`, 255 `FAIL`, and 13 `SKIP_UPSTREAM` across exactly 425 methods.
+`test_padding_add` is the sole method transition from the `e18ce14c2` census;
+no prior native method regresses. Pytest reports 178 passed, 345 failed, 13
+skipped, and 15 passing subtests in 1,090.91 seconds. There are no device
+timeouts or invalid submissions. First-reject classifications for the 255
+failed methods are 66 unsupported-layout, 62 unsupported-output-dtype, 41
+requires-reformat, 30 plan-limit, 24 unsupported-ALU, 22 unsupported-input-
+dtype, 4 unsupported-reduction, and 6 numerical/frontend failures without a
+native reject. The largest exact family remains 44 convolution-like graphs
+whose affine CMAC input is not one FP16 pointwise surface. The durable JSON is
+`~/rk2608_backups/census-masked-d2af3b3d9/test_ops_coverage.json` (SHA-256
+`abf844358296731eee23b9aae1cea6eba7f1497ecca327de68a19c369caea78c`);
+JUnit XML SHA-256 is
+`c10b1b60eebf6564f1e8c8c87f843eb65b449eb6bde957c841b15f46e26b1c74`.
