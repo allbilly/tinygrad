@@ -586,6 +586,62 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
                         _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
   return _native(RKProgram((*prefix, RKDPUProgram(tuple(stages)), contract), tuple(scratch)))
 
+def lower_nested_add_reduce_result(sink:UOp) -> RKLowerResult:
+  """Compose two affine ADD reductions while preserving their intermediate FP16 rounding boundary."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 2 or any(u.arg[0] is not Ops.ADD or len(u.src) < 2 for u in reductions):
+    return _not_applicable()
+  store, outer = stores[0], _strip_casts(stores[0].src[1])
+  if outer.op is not Ops.REDUCE or store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or \
+     store.src[0].dtype is not dtypes.half or store.src[0].src[1].op is not Ops.CONST or \
+     int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "nested ADD reduction requires one FP16 scalar output", store.src[0].op)
+  chain:list[UOp] = []
+  range_groups:list[tuple[UOp, ...]] = []
+  value = outer
+  while value.op is Ops.REDUCE:
+    if value.arg[0] is not Ops.ADD or not value.src[1:] or any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in value.src[1:]):
+      return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "nested ADD reduction is not one reduction chain", value.op)
+    chain.append(value)
+    range_groups.append(value.src[1:])
+    value = _strip_casts(value.src[0])
+  if set(chain) != set(reductions) or value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "nested ADD source is not one direct FP16 surface", value.op)
+  input_count, index_map = int(value.src[0].src[0].arg), _affine(value.src[1])
+  ranges = tuple(u for group in range_groups for u in group)
+  axes, extents = tuple(u.arg[0] for u in ranges), tuple(int(u.src[0].arg) for u in ranges)
+  if input_count != math.prod(extents) or input_count > RK_MAX_AFFINE_VISITS or index_map is None or set(index_map[0]) != set(axes):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "nested ADD axes do not describe the complete input surface", value.op)
+  visited = {index_map[1]+sum(index_map[0][axis]*coord for axis,coord in zip(axes, point))
+             for point in product(*(range(extent) for extent in extents))}
+  if visited != set(range(input_count)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "nested ADD affine map is not a dense bijection", value.op)
+  outer_ranges, inner_ranges = range_groups
+  outer_axes, inner_axes = tuple(u.arg[0] for u in outer_ranges), tuple(u.arg[0] for u in inner_ranges)
+  range_extents = {u.arg[0]:int(u.src[0].arg) for u in ranges}
+  selectors:list[list[int]] = []
+  for outer_point in product(*(range(range_extents[axis]) for axis in outer_axes)):
+    point = dict(zip(outer_axes, outer_point))
+    row = []
+    for inner_point in product(*(range(range_extents[axis]) for axis in inner_axes)):
+      point.update(zip(inner_axes, inner_point))
+      row.append(index_map[1]+sum(index_map[0][axis]*point[axis] for axis in axes))
+    selectors.append(row)
+  intermediate_count = len(selectors)
+  intermediate = RKArg(RKBufferKind.SCRATCH, 0)
+  scratch = (RKScratch(_cmac_tiled_output_bytes(intermediate_count)),)
+  first = _selector_program(intermediate, RKArg(RKBufferKind.ARG, value.src[0].arg.slot), input_count, selectors, scratch)
+  if first is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "inner nested ADD selector exceeds plan limits", outer.op)
+  output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
+  second = _selector_program(output, intermediate, intermediate_count, [list(range(intermediate_count))], first.scratch)
+  if second is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "outer nested ADD selector exceeds plan limits", outer.op)
+  completed = _finish_program([*first.steps,*second.steps], second.scratch)
+  cost = _plan_cost(completed)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"nested ADD needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", outer.op)
+  return _native(completed)
+
 def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output_index:UOp, output:RKArg, reduced:RKArg,
                                output_count:int, out_axes:tuple[int, ...], ranges:dict[int, int]) -> RKLowerResult:
   """Materialize static pointwise operands and execute a reduction epilogue entirely on NPU engines."""
@@ -1184,6 +1240,8 @@ _LOWERERS = (
   RKLowerer("multi_broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_multi_broadcast_alu_result),
   RKLowerer("broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_broadcast_alu_result),
   RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),
+  RKLowerer("nested_sum", lambda nodes:_has_reduction(nodes, Ops.ADD) and sum(u.op is Ops.REDUCE for u in nodes) > 1,
+            lower_nested_add_reduce_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),

@@ -66,8 +66,9 @@ reductions now enumerate their source selector matrix at compile time, copy
 the input once into an aligned NPU scratch surface, and execute sparse CMAC
 weight tiles. Together with the global path, this completes `test_sum_simple`,
 `test_sum_full`, `test_sum_relu`, `test_sum_tiny`, `test_sum`, `test_mean`, and
-`test_mean_axis`; nested sums and explicit FP32 accumulation remain
-unsupported.
+`test_mean_axis`; at that milestone nested sums and explicit FP32 accumulation
+remained unsupported. The later ordered nested-reduction milestone below
+supersedes the nested-sum limitation without removing its rounding boundary.
 Global `test_sum_relu` now passes through a DPU MAX-zero prepass and the direct
 K64 CMAC; the final ReLU is removed only after proving all reduced lanes are
 nonnegative. Global `test_mean` also passes: its compile-time reciprocal is
@@ -1430,3 +1431,21 @@ run. The research tree has 28,008 counted lines. The unsuccessful attempt to
 admit 648-element contraction sources without a more efficient pack engine is
 preserved as `wip-wide-source-contraction-still-stage-limited.patch` (SHA-256
 `04eef8eaa739e249c4ee8f5bb93d7005dce8812639e276d2400a35c2aa7dc605`).
+
+Nested scalar ADD reductions now lower as two ordered native selector plans.
+The compiler first proves that the complete affine index map is a dense
+bijection over one FP16 input. It then reduces the innermost axes into padded
+FP16 NPU scratch and submits a second reduction over that materialized result.
+The intermediate store is semantically required: an initially tested
+single-reduction collapse was rejected after RK3588 showed the expected
+one-ULP difference from removing the intermediate FP16 rounding boundary.
+
+All three axis variants in complete `test_sum_twice` pass natively at unchanged
+tolerance. The focused hardware test also covers all three variants. All 89
+host compiler/image/telemetry/fallback tests, repository-wide Ruff, and mypy
+over 225 tinygrad modules pass; the expanded strict hardware suite passes 68
+tests plus 47 subtests in 619.03 seconds with `ROCKCHIP_FALLBACK=0`. The
+inferred native total is 141 after the current 137-pass census, pending the next
+complete run. The research tree has 28,064 counted lines. Pre-change sources
+are preserved under
+`~/rk2608_backups/nested-sum-before-2d2c0410c-20260803`.

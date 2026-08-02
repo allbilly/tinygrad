@@ -33,6 +33,15 @@ class TestRockchip(unittest.TestCase):
     expected = official.astype(np.float32).sum().astype(np.float16).item()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_nested_dense_fp16_sum_native_dpu_cmac(self):
+    data = np.linspace(-1,1,64,dtype=np.float16).reshape(4,4,4)
+    tensor = Tensor(data,device="ROCKCHIP").realize()
+    for axes in ((0,1), (0,2), (1,2)):
+      with self.subTest(axes=axes):
+        actual = tensor.sum(axes).sum().realize().item()
+        expected = data.astype(np.float32).sum(axis=axes).astype(np.float16).astype(np.float32).sum().astype(np.float16).item()
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_contiguous_fp16_mean_native_cmac(self):
     np.random.seed(0)
     data = np.random.uniform(-2, 2, (3,4,5,6)).astype(np.float16)

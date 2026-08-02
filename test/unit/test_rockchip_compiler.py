@@ -816,6 +816,15 @@ class TestDPUCompiler(unittest.TestCase):
     rejected = lower_add_reduce_result(sink(Tensor.empty(511,dtype=dtypes.half).sum()))
     self.assertIsInstance(rejected.plan, RKProgram)
 
+  def test_nested_dense_sum_preserves_intermediate_rounding_stage(self):
+    for axes in ((0,1), (0,2), (1,2)):
+      result = lower_native(sink(Tensor.empty(4,4,4,dtype=dtypes.half).sum(axes).sum()))
+      self.assertIs(result.kind, RKLowerKind.NATIVE)
+      self.assertIsInstance(result.plan, RKProgram)
+      assert isinstance(result.plan, RKProgram)
+      self.assertGreaterEqual(sum(isinstance(step, RKContract) for step in result.plan.steps), 2)
+      self.assertFalse(contains_uop(result.plan))
+
   def test_masked_affine_prefix_sum_uses_empty_selector_entries(self):
     plan = lower_affine_reduce_result(sink(Tensor.empty(10,dtype=dtypes.half).cumsum(0))).plan
     self.assertIsInstance(plan, RKProgram)

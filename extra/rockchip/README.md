@@ -82,6 +82,9 @@ are eligible to be ported as native capabilities.
   CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
   32-term aligned DPU/CMAC plan;
+- two-level scalar ADD reductions whose affine axes form a proven dense input
+  bijection, executed as ordered CMAC plans with the intermediate FP16 rounding
+  boundary preserved in NPU scratch;
 - direct aligned K64–K512 CMAC sums or scaled sums with generated
   hardware-packed weights and a single FP32 accumulation;
 - global ReLU-sum through a DPU MAX-zero prepass and the same direct CMAC;
@@ -271,6 +274,14 @@ opposite-infinity behavior on hardware. Complete `test_masked_fill` is native,
 the strict suite expands to 67 tests plus 44 subtests, and the inferred native
 total is 140 after the current 137-pass census.
 
+Nested scalar sums subsequently use the generic ordered `RKProgram` rather
+than an algebraic flattening. The compiler proves the combined affine source
+map, reduces the inner axes to FP16 scratch, then reduces that materialized
+surface into the scalar output. This preserves the source graph's intermediate
+rounding and makes all three `test_sum_twice` variants native. The strict suite
+expands to 68 tests plus 47 subtests, and the inferred native total is 141 after
+the current 137-pass census.
+
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,
 while non-exact reciprocals reject. Ordered image composition deduplicates
@@ -281,8 +292,8 @@ suite remains green with per-stage reset and the K<=512/400-stage bounds.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,008, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,008 lines.
-The exact 2,964-line delta is 2,959 counted Rockchip backend lines (2,799
+contains 28,064, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,064 lines.
+The exact 3,096-line delta is 3,091 counted Rockchip backend lines (2,931
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
