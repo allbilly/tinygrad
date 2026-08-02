@@ -1,13 +1,10 @@
 # RK3588 fixed-function NPU backend
 
-This branch is frozen as the coverage/research continuation. The merge-oriented
-branch stops after the minimal generic ALU, mask, EXP2, image, runtime, and
-direct-CMAC slice; activation and transcendental assets beyond EXP2 remain here
-for characterization and future model-driven changes.
-
-This branch is the merge-oriented reduction of the `rockchip-2608` research
-backend. It deliberately implements a small FP16 inference contract instead of
-using the full `test_ops.py` inventory as an operator catalog.
+This is the active coverage/research branch. It first targets a clean complete
+forward `test_ops.py` inventory with native and generic fallback coverage kept
+explicit, then replaces fallback families with reusable hardware capabilities.
+The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
+minimal, architectural, and behavioral/register-programming references.
 
 The compiler boundary is:
 
@@ -23,10 +20,12 @@ post-early_simplify UOps
   -> DRM allocation, patch, submit, and wait
 ```
 
-The runtime does not import NumPy, narrow FP32 buffers, execute tensor
-semantics on the host, or provide a CPU fallback. Unsupported graphs reject
-before submission with a classified `RKPLAN_REJECT:unsupported_dtype`,
-`unsupported_layout`, `unsupported_contraction`, or `unsupported_op` reason.
+The native runtime does not import NumPy, narrow FP32 buffers, or execute tensor
+semantics on the host. Native lowering returns a typed plan or a typed reject
+at the legality decision, including detail, offending op, and a normalized
+slot-independent graph fingerprint. `ROCKCHIP_FALLBACK=0` remains the strict
+native-only mode. The planned hybrid mode will use one isolated generic UOps
+fallback rather than a catalog of named host operations.
 
 ## Declared contract
 
@@ -40,10 +39,12 @@ before submission with a classified `RKPLAN_REJECT:unsupported_dtype`,
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
-The renderer advertises only `dtypes.half`. FP32, integer and user-visible bool
-outputs, noncontiguous elementwise layouts, general contractions, fused CMAC
-epilogues, convolution, pooling, and gradients are outside this contract. A
-fused CMAC epilogue is rejected rather than silently dropped.
+Native arithmetic is FP16. Int32 and FP32 are currently admitted only for
+operation-specific constant fills; this does not claim general arithmetic for
+either dtype. User-visible bool outputs, noncontiguous elementwise layouts,
+general contractions, fused CMAC epilogues, convolution, pooling, and gradients
+remain outside the native contract. A fused CMAC epilogue is rejected rather
+than silently dropped.
 
 ## EXP2 generation and characterization
 

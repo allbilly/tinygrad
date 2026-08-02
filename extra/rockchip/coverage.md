@@ -29,8 +29,10 @@ stage count, scratch bytes, constants bytes, duration, and every native reject.
 The method summary uses `PASS_FRONTEND`, `PASS_NATIVE`, `PASS_MIXED`,
 `PASS_FALLBACK`, `SKIP_UPSTREAM`, and `FAIL`. `PASS_NATIVE` is assigned only
 when every realized kernel in every subcase executed through an RK engine.
-Normalized UOp fingerprints and typed legalization details are added by the
-next compiler-diagnostics milestone.
+Typed rejects include the exact legality detail, offending op, and a normalized
+UOp fingerprint containing graph structure, dtype/shape families, constant
+categories, affine index maps, and reduction descriptors while omitting buffer
+slots.
 
 ## Current exact method baseline
 
@@ -90,6 +92,32 @@ maximum native image has 64 stages. The durable report is
 (SHA-256 `ca5e3517a10065929d9dd174b680fcdfea2abef8fff2b129278ba0849c560d04`);
 the matching JUnit XML has SHA-256
 `fb40a6ed08aa4a29d78bad38f9c8b1f3fa284e67a1565448572765679b1e55f8`.
+
+At `1002b1b02`, typed lowering and normalized fingerprints reproduced the same
+425-method result in 442.92 seconds. The 389 reject events split into:
+
+| Typed reject kind | Events |
+|---|---:|
+| `unsupported_reduction` | 149 |
+| `unsupported_layout` | 86 |
+| `unsupported_output_dtype` | 53 |
+| `unsupported_contraction` | 35 |
+| `requires_reformat` | 34 |
+| `unsupported_input_dtype` | 25 |
+| `unsupported_alu` | 7 |
+
+The largest detail families are output/layout legalization (49 methods), MAX
+reduction (39), ADD reduction (38), contraction output reformat (26), and
+non-direct reduction epilogues (22). There are 358 exact normalized graph
+digests; the leading digest covers six related cross-entropy/NLL MAX-reduction
+methods. This confirms the native implementation order after hybrid coverage:
+layout/reformat, generic reduction, then generalized contraction.
+
+The durable typed report is
+`~/rk2608_backups/research-typed-census-20260802-102720/test_ops_coverage.json`
+(SHA-256 `e0be6147127d0058ad7fc869b936521e68c3377a163f7b68c5fefbd1239cb528`);
+the matching JUnit XML has SHA-256
+`47e0f3d37cf8cc4d9954b8c4e95b3ed2ebda03f5b0bd8bbeb9737115a743eba9`.
 
 ## Historical pytest-summary censuses
 
