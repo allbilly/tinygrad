@@ -1547,3 +1547,22 @@ strict hardware suite passes 73 tests plus 52 subtests in 659.40 seconds with
 146-pass census, pending the next complete run. The research tree has 28,269
 counted lines. Pre-change sources are preserved under
 `~/rk2608_backups/two-level-affine-sum-before-6f7872696-20260803`.
+
+Static affine ADD reductions may now select from multiple FP16 input surfaces.
+The compiler evaluates every static `WHERE` branch at each affine coordinate,
+builds one selector plan per source, and combines the source-local partial
+sums with ordinary DPU ADD stages. Coordinates selecting no input must reduce
+to zero when all indexed leaves are replaced by zero; dynamic predicates and
+nonzero host-synthesized values remain typed rejects. The final composed plan
+continues to obey the shared 400-stage and 2 MiB constant limits.
+
+Complete `test_sum_cat_collapse` now passes natively at unchanged tolerance.
+Its `(256,256)` plus `(256,64)` concatenated row-sum plan contains 178 stages,
+71,680 unique constant bytes, and 3,168 scratch bytes. A focused nonconstant
+hardware test independently exercises the same CMAC-per-source plus DPU-combine
+path. All 95 host tests, repository-wide Ruff, and mypy over 225 tinygrad
+modules pass; the strict hardware suite passes 74 tests plus 52 subtests in
+691.56 seconds with `ROCKCHIP_FALLBACK=0`. The inferred native total is 148
+after the current 146-pass census, pending the next complete run. The research
+tree has 28,349 counted lines. Pre-change sources are preserved under
+`~/rk2608_backups/multi-source-sum-before-a0546884d-20260803`.

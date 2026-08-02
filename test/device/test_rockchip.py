@@ -105,6 +105,13 @@ class TestRockchip(unittest.TestCase):
     expected = data.astype(np.float32).sum(axis=1).astype(np.float16)
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_multi_source_affine_sum_native_cmac_dpu(self):
+    lhs = np.linspace(-.125,.125,256*256,dtype=np.float16).reshape(256,256)
+    rhs = np.linspace(.0625,-.0625,256*64,dtype=np.float16).reshape(256,64)
+    actual = Tensor.cat(Tensor(lhs,device="ROCKCHIP").realize(), Tensor(rhs,device="ROCKCHIP").realize(), dim=1).sum(axis=1).realize().numpy()
+    expected = np.concatenate((lhs,rhs),axis=1).astype(np.float32).sum(axis=1).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_masked_affine_prefix_sum_native_cmac(self):
     data = np.array([1,-2,3,-4,5,-6,7,-8,9,-10], dtype=np.float16)
     actual = Tensor(data, device="ROCKCHIP").realize().cumsum(0).realize().numpy()

@@ -150,6 +150,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 64*1024)
     self.assertFalse(contains_uop(plan))
 
+  def test_multi_source_affine_sum_composes_source_local_selectors(self):
+    lhs = Tensor.empty(256,256,dtype=dtypes.half).realize()
+    rhs = Tensor.empty(256,64,dtype=dtypes.half).realize()
+    plan = lower_native(sink(Tensor.cat(lhs,rhs,dim=1).sum(axis=1))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.stages), 192)
+    self.assertLessEqual(len(image.constants), 128*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_affine_movements_use_aligned_npu_atom_copies(self):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)
     plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in

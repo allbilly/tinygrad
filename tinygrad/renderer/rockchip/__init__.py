@@ -259,7 +259,7 @@ def _static_index_selected(u:UOp, index:UOp, ranges:dict[int, int]) -> bool|None
   """Follow static WHERE branches and report whether one coordinate selects `index`."""
   value = _strip_casts(u)
   if value.key == index.key: return True
-  if value.op is Ops.CONST: return False
+  if value.op in (Ops.CONST, Ops.INDEX): return False
   if value.op is not Ops.WHERE: return None
   predicate = _static_scalar(value.src[0], ranges)
   if predicate is None: return None
@@ -847,6 +847,87 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"masked affine MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
+  return _native(completed)
+
+def lower_multi_source_affine_reduce_result(sink:UOp) -> RKLowerResult:
+  """Reduce a static affine selection among FP16 inputs, then combine source-local partials entirely on NPU engines."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1 or reductions[0].arg[0] is not Ops.ADD: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if _strip_casts(store.src[1]).key != reduce.key or store.src[0].op is not Ops.INDEX or \
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  value = _strip_casts(reduce.src[0])
+  indexes = list(dict.fromkeys(u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM))
+  if not 2 <= len(indexes) <= 8 or any(index.dtype is not dtypes.half for index in indexes) or not reduce.src[1:] or \
+     any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in reduce.src[1:]):
+    return _not_applicable()
+  out_map = _affine(store.src[0].src[1])
+  if out_map is None: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM output is not affine", store.src[0].op)
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  red_axes, out_axes = tuple(u.arg[0] for u in reduce.src[1:]), tuple(sorted(out_map[0]))
+  value_axes = {u.arg[0] for u in value.toposort() if u.op is Ops.RANGE}
+  if set(out_axes) & set(red_axes) or value_axes - set(out_axes) - set(red_axes) or \
+     any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "multi-source SUM axes do not form one static partition", Ops.RANGE)
+  output_count, reduction_count = int(store.src[0].src[0].src[0].arg), math.prod(ranges[axis] for axis in red_axes)
+  if not 1 <= output_count <= 8192 or output_count*reduction_count > 2*RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"multi-source SUM surface is {output_count}x{reduction_count}", reduce.op)
+  selectors:dict[UOp, list[list[int]]] = {index:[[] for _ in range(output_count)] for index in indexes}
+  zero_value = value.substitute({index:UOp.const(0, index.dtype) for index in indexes})
+  seen:set[int] = set()
+  for out_point in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes, out_point))
+    output_index = out_map[1]+sum(out_map[0][axis]*point[axis] for axis in out_axes)
+    if not 0 <= output_index < output_count or output_index in seen:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM output is not dense", store.src[0].op)
+    seen.add(output_index)
+    for red_point in product(*(range(ranges[axis]) for axis in red_axes)):
+      point.update(zip(red_axes, red_point))
+      selected = [_static_index_selected(value, index, point) for index in indexes]
+      if any(active is None for active in selected) or sum(active is True for active in selected) > 1:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM selection is not one static branch", value.op)
+      if any(selected):
+        index = indexes[selected.index(True)]
+        source_offset = _static_scalar(index.src[1], point)
+        input_count = int(index.src[0].src[0].arg)
+        if not isinstance(source_offset, int) or isinstance(source_offset, bool) or not 0 <= source_offset < input_count:
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM input index is out of bounds", index.op)
+        selectors[index][output_index].append(source_offset)
+      else:
+        inactive = _static_scalar(zero_value, point)
+        if not isinstance(inactive, (int,float)) or float(inactive) != 0.0:
+          return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "multi-source SUM inactive value is not zero", value.op)
+  if seen != set(range(output_count)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM output has holes", store.src[0].op)
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  scratch:tuple[RKScratch, ...] = ()
+  partials:list[RKArg] = []
+  for index,rows in selectors.items():
+    if not any(rows): continue
+    partial = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+    plan = _selector_program(partial, RKArg(RKBufferKind.ARG, index.src[0].arg.slot), int(index.src[0].src[0].arg), rows, scratch)
+    if plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "multi-source SUM selector exceeds plan limits", reduce.op)
+    steps.extend(plan.steps)
+    scratch = plan.scratch
+    partials.append(partial)
+  if not partials: return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "multi-source SUM has no selected input", reduce.op)
+  output, accumulator = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), partials[0]
+  combines:list[RKDPUStage] = []
+  for combine_idx,partial in enumerate(partials[1:], 1):
+    final = combine_idx == len(partials)-1
+    destination = output if final else RKArg(RKBufferKind.SCRATCH, len(scratch))
+    if not final: scratch += (RKScratch(((output_count+7)//8)*16),)
+    combines.append(RKALUStage(Ops.ADD, destination, accumulator, partial, output_count))
+    accumulator = destination
+  if len(partials) == 1: combines.append(RKALUStage(Ops.ADD, output, accumulator, 0.0, output_count))
+  completed = _finish_program([*steps,RKDPUProgram(tuple(combines))], scratch)
+  cost = _plan_cost(completed)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"multi-source SUM needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
   return _native(completed)
 
 def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output_index:UOp, output:RKArg, reduced:RKArg,
@@ -1454,6 +1535,7 @@ _LOWERERS = (
   RKLowerer("masked_affine_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_masked_affine_mul_reduce_result),
   RKLowerer("affine_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_affine_mul_reduce_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
+  RKLowerer("multi_source_sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_multi_source_affine_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
   RKLowerer("affine_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_affine_max_result),
