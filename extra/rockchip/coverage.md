@@ -1173,3 +1173,17 @@ tolerances. The strict hardware suite passes 58 tests plus 37 subtests in
 the last 122-pass census; these three methods still require a complete census
 before becoming an authoritative total. The research tree now has 27,731
 counted lines, including 2,598 in the Rockchip renderer/compiler.
+
+Affine MAX surfaces larger than the direct 512-input/128-output pack now split
+each eight-output PPU batch into its own atom-aligned source window. Every
+window is independently NPU-zeroed and copied, uses at most 512 FP16 lanes,
+then feeds the same CMAC selector and PPU MAX stages. The compiler counts the
+emitted DPU/CMAC/PPU stages and unique immutable payloads before acceptance;
+the existing 400-stage, 65,536-visit, and 2 MiB limits remain hard rejects.
+Complete `test_max_pool2d_bigger_stride` and
+`test_max_pool2d_bigger_stride_dilation` pass natively with all nine official
+subtests at exact comparison. The strict hardware suite passes 59 tests plus
+37 subtests in 466.16 seconds with `ROCKCHIP_FALLBACK=0`. The inferred native
+method total is 127 after the last 122-pass census, pending a new complete
+census. The research tree now has 27,748 counted lines, including 2,615 in the
+Rockchip renderer/compiler.

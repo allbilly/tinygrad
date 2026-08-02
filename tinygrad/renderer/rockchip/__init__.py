@@ -836,9 +836,10 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   if len(red_axes) != len(reduce.src)-1 or not out_axes and len(red_axes) == 1 or set(out_axes) & set(red_axes) or \
      set(src_aff[0]) - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine PPU MAX axes do not form a static output/reduction partition", Ops.RANGE)
-  if not 1 <= output_count <= 128 or not 2 <= input_count <= 512:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX surface is {output_count}x{input_count}", reduce.op)
   reduction_count = math.prod(ranges[axis] for axis in red_axes)
+  if not 1 <= output_count <= 4096 or input_count < 2 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"affine PPU MAX surface is {output_count}x{input_count} with {output_count*reduction_count} visits", reduce.op)
   pool_extent = next((extent for extent in range(max(4, reduction_count), 257) if _pool_hw_shape(extent) is not None), None)
   if pool_extent is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX reduction extent is {reduction_count}", reduce.op)
@@ -865,39 +866,56 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   if seen != set(range(output_count)) or any(len(row) != reduction_count for row in selectors):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine PPU MAX output has holes", Ops.INDEX)
 
-  align_in, surface_count = max(32, (input_count+31)&-32), pool_extent*8
-  masked, sentinel = any(index < 0 for row in selectors for index in row), align_in
-  if masked: align_in += 32
-  if align_in > 512:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX padded input needs {align_in} lanes", reduce.op)
-  constant_bytes = ((output_count+7)//8)*((surface_count+15)//16)*32*align_in*2
-  if constant_bytes > RK_MAX_CONSTANT_BYTES:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX needs {constant_bytes} constant bytes", reduce.op)
+  surface_count, whole_surface = pool_extent*8, input_count <= 512 and output_count <= 128
+  groups:list[tuple[int, int, int, int, int|None, list[list[int]]]] = []
+  for group_start in range(0, output_count, 8):
+    group_rows = selectors[group_start:group_start+8]
+    selected_indices = [index for row in group_rows for index in row if index >= 0]
+    base, end = (0, input_count) if whole_surface else ((min(selected_indices)&-8, max(selected_indices)+1) if selected_indices else (0,0))
+    span, align_in = end-base, max(32, (end-base+31)&-32)
+    sentinel = align_in if any(index < 0 for row in group_rows for index in row) else None
+    if sentinel is not None: align_in += 32
+    if align_in > 512:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine PPU MAX window needs {align_in} lanes", reduce.op)
+    groups.append((group_start, base, span, align_in, sentinel,
+                   [[index-base if index >= 0 else -1 for index in row] for row in group_rows]))
+
   packed, hwc = RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1)
   hwc_elements = ((surface_count-1)//16)*16+32
-  scratch = (RKScratch(align_in*2), RKScratch(hwc_elements*2))
+  scratch = (RKScratch(max(group[3] for group in groups)*2), RKScratch(hwc_elements*2))
   source = RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot)
-  prepare = [RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in), RKALUStage(Ops.ADD, packed, source, 0.0, input_count)]
-  if masked: prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
-  steps:list = [RKDPUProgram(tuple(prepare), scratch)]
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  payloads:set[bytes] = set()
   height, width = pool_shape
-  for group_start in range(0, output_count, 8):
+  for group_index,(group_start,base,span,align_in,sentinel,group_rows) in enumerate(groups):
+    if not whole_surface or group_index == 0:
+      prepare = [RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in)]
+      if span: prepare.append(RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span))
+      if sentinel is not None:
+        prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
+      steps.append(RKDPUProgram(tuple(prepare), scratch))
     channels = min(8, output_count-group_start)
-    rows = [[selectors[group_start+min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
+    rows = [[group_rows[min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
             for spatial in range(pool_extent)]
-    flat_rows = [sentinel if rows[spatial][channel] < 0 else rows[spatial][channel]
+    flat_rows = [cast(int, sentinel) if rows[spatial][channel] < 0 else rows[spatial][channel]
                  for spatial in range(pool_extent) for channel in range(8)]
     for start in range(0, surface_count, 16):
       out_layout = RKLayout((1,min(16, surface_count-start)), (1,32), (64,2), dtypes.half,
                             padding=((0,0),(0,32-min(16, surface_count-start))))
+      payload = _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], align_in, 32, 1.0)
+      payloads.add(payload)
       steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
         _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
         _cmac_weight_ref(0, min(16, surface_count-start), align_in, RKBufferKind.CONSTANT, 32), reduce.arg[0],
-        _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], align_in, 32, 1.0)))
+        payload))
     out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
                       RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
     src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
     steps.append(RKReduce(out, src, Ops.MAX, red_axes[0]))
+  stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)
+  if stage_count > RK_MAX_PROGRAM_STAGES or sum(map(len, payloads)) > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"affine PPU MAX needs {stage_count} stages and {sum(map(len, payloads))} constant bytes", reduce.op)
   return _native(RKProgram(tuple(steps), scratch))
 
 @dataclass(frozen=True)

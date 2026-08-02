@@ -101,6 +101,12 @@ class TestRockchip(unittest.TestCase):
       for x in range(3): expected[:,:,y,x] = padded[:,:,y*3:y*3+3,x*3:x*3+3].max(axis=(2,3))
     np.testing.assert_equal(actual, expected)
 
+  def test_windowed_affine_max_pool_native_cmac_ppu(self):
+    data = np.linspace(-4,4,2*11*28,dtype=np.float16).reshape(2,1,11,28)
+    actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((2,2),stride=2).realize().numpy()
+    expected = data[:,:,:10,:].reshape(2,1,5,2,14,2).max(axis=(3,5))
+    np.testing.assert_equal(actual, expected)
+
   def test_dense_fp16_global_extrema_native_dpu(self):
     for count in (2, 8, 9, 135):
       with self.subTest(count=count):

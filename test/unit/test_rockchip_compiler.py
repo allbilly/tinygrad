@@ -86,6 +86,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 64*1024)
     self.assertFalse(contains_uop(plan))
 
+  def test_large_affine_max_uses_bounded_source_windows(self):
+    plan = lower_affine_max_result(sink(Tensor.empty(4,2,11,28,dtype=dtypes.half).max_pool2d((2,2),stride=2))).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image = emit_program(plan)
+    self.assertLessEqual(len(image.stages), 400)
+    self.assertLessEqual(len(image.constants), 2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_large_affine_reductions_use_bounded_source_windows(self):
     plan = lower_affine_reduce_result(sink(Tensor.empty(2,2,11,28,dtype=dtypes.half).avg_pool2d(2))).plan
     self.assertIsInstance(plan, RKProgram)
