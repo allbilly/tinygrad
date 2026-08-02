@@ -16,6 +16,7 @@ post-early_simplify UOps
        RKMaskStage
        RKLUTStage(lut: RKLUTId)
        RKContract
+       RKProgram(ordered typed steps)
   -> RKImage commands and relocations
   -> DRM allocation, patch, submit, and wait
 ```
@@ -27,6 +28,11 @@ slot-independent graph fingerprint. `ROCKCHIP_FALLBACK=0` is the authoritative
 mode for coverage and development. The explicit `RKPY` experiment is retained
 only as a historical/debugging reference: it executes generic UOps on the CPU
 and must never contribute to Rockchip pass totals.
+
+Mixed-engine work is represented by a generic ordered `RKProgram`. Scratch is
+declared once at program scope, and each typed DPU, CMAC, or PPU step is emitted
+in order with constants and relocations remapped centrally. The former fixed
+CMAC-prefix/DPU/main-CMAC/CMAC-suffix pipeline no longer constrains composition.
 
 The frozen `rockchip-2607` branch is a behavioral and register oracle, not
 evidence that all of its 425 passing methods ran on the NPU. Its later runtime
@@ -117,8 +123,8 @@ sub-atom DPU preparation followed by sparse CMAC.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 27,201, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,201 lines.
-The exact 2,233-line delta is 2,228 counted Rockchip backend lines (2,068
+contains 27,208, so `MAX_LINE_COUNT=25000 python sz.py` fails by 2,208 lines.
+The exact 2,240-line delta is 2,235 counted Rockchip backend lines (2,075
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

@@ -40,7 +40,7 @@ as an immutable constant, while the user input remains a directly addressed
 rounded to FP16. Neither compilation nor execution performs host packing or
 host arithmetic; unsupported row widths continue to reject.
 
-Contiguous FP16 global sums now use a typed `RKPipeline`. The compiler splits
+Contiguous FP16 global sums now use a typed ordered `RKProgram`. The compiler splits
 an arbitrary extent into descending power-of-two blocks. DPU pairwise stages
 reduce each block only while the second half begins at a 16-byte address; the
 remaining aligned runs are copied into one scratch surface and a masked K32
@@ -93,7 +93,7 @@ seconds with `CACHELEVEL=0` after this milestone.
 The native reformat path handles static affine movements without host gather.
 The compiler enumerates the complete static selector map. Contiguous aligned
 runs still coalesce into ordinary DPU ADD-zero atom copies. A map that breaks
-those atoms now reuses the generated sparse-CMAC `RKPipeline`: one DPU task
+those atoms now reuses the generated sparse-CMAC `RKProgram`: one DPU task
 zeroes the complete aligned scratch surface, a second copies the logical input,
 then sequential CMAC tasks select at most 16 logical outputs each. Making the
 padding explicit avoids order-dependent accumulation from stale scratch bits.
@@ -334,6 +334,15 @@ reformat, 27 contraction, 25 input dtype, and 7 ALU rejects. The durable JSON is
 `1b02b4206d6a12690cb7e937d58c6a86ad02f8492fda2dc68d902c162c7eb2c3`);
 the JUnit XML has SHA-256
 `c83baff01bd3e96c6e1b6ce8cff4376f066058f349d41ad6b8db3970a9d7d421`.
+
+The following architecture milestone replaces the fixed CMAC-prefix/DPU/main-
+CMAC/CMAC-suffix container with a generic ordered `RKProgram`. Program-scope
+scratch is validated once, while typed DPU, CMAC, and PPU steps contribute
+commands, constants, and relocations through one composition path. This costs
+seven counted compiler lines. Sixty-two compiler/image/native-program tests
+pass, Ruff and mypy are clean, and the complete strict hardware suite remains
+46 tests plus 27 subtests in 358.01 seconds. No lowering capability or command
+semantics changed in this representation milestone.
 
 The pre-fix census JSON is
 `~/rk2608_backups/census-affine-reformat-52f34b131/test_ops_coverage.json`

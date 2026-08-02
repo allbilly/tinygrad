@@ -4,9 +4,10 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKPipeline, RKReduce, RKRejectKind,
-  RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_pipeline, emit_reduce, encode_image, lower_contract,
-  lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result, lower_reformat_result, rk_fingerprint)
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKProgram, RKReduce,
+  RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
+  encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
+  lower_reformat_result, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -50,14 +51,14 @@ class TestDPUCompiler(unittest.TestCase):
                    Tensor.empty(24,dtype=dtypes.half)[1:17].clone(),
                    Tensor.empty(4,3,6,6,dtype=dtypes.half).flip(0).contiguous())
     plans = tuple(lower_reformat_result(sink(expression)).plan for expression in expressions)
-    self.assertTrue(all(isinstance(plan, RKPipeline) for plan in plans))
+    self.assertTrue(all(isinstance(plan, RKProgram) for plan in plans))
     first = plans[0]
-    assert isinstance(first, RKPipeline)
-    self.assertEqual((len(first.suffix), [stage.engine for stage in emit_pipeline(first).stages]),
+    assert isinstance(first, RKProgram)
+    self.assertEqual((sum(isinstance(step, RKContract) for step in first.steps)-1, [stage.engine for stage in emit_program(first).stages]),
                      (3, [RKEngine.DPU]*2+[RKEngine.CMAC]*4))
     last = plans[-1]
-    assert isinstance(last, RKPipeline)
-    self.assertEqual(len(last.suffix), 26)
+    assert isinstance(last, RKProgram)
+    self.assertEqual(sum(isinstance(step, RKContract) for step in last.steps)-1, 26)
 
   def test_add_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
@@ -81,6 +82,17 @@ class TestDPUCompiler(unittest.TestCase):
     regs = {(command>>48, command&0xffff):(command>>16)&0xffffffff for command in image.stages[0].commands}
     self.assertEqual((regs[(0x1001, rk.REG_DPU_DATA_CUBE_CHANNEL)], regs[(0x1001, rk.REG_DPU_WDMA_SIZE_0)],
                       regs[(0x2001, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL)]), (0, 0, 0))
+
+  def test_ordered_program_composes_engine_steps_and_resources(self):
+    dpu = RKDPUProgram((RKALUStage(Ops.ADD, RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.ARG, 0), 0.0, 8),))
+    contract = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
+    assert isinstance(contract, RKContract)
+    program = RKProgram((dpu, contract), (RKScratch(64),))
+    image = emit_program(program)
+    self.assertEqual(([stage.engine for stage in image.stages], image.scratch, len(image.constants)),
+                     ([RKEngine.DPU, RKEngine.CMAC], program.scratch, 80))
+    with self.assertRaisesRegex(ValueError, "scratch"):
+      RKProgram((RKDPUProgram(dpu.stages, (RKScratch(32),)), contract), program.scratch)
 
   def test_wide_fills_tile_native_wdma_limits(self):
     for dtype, count, tile in ((dtypes.int, 2925, 64), (dtypes.float, 6, 4)):
@@ -550,57 +562,61 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_global_sum_is_aligned_dpu_cmac_tree(self):
     result = lower_add_reduce_result(sink(Tensor.empty(16384,dtype=dtypes.half).sum()))
-    self.assertIsInstance(result.plan, RKPipeline)
+    self.assertIsInstance(result.plan, RKProgram)
     plan = result.plan
-    assert isinstance(plan, RKPipeline)
-    self.assertEqual((len(plan.dpu.stages), len(plan.dpu.scratch)), (12,12))
-    self.assertEqual([stage.count for stage in plan.dpu.stages], [8192,4096,2048,1024,512,256,128,64,32,16,8,8])
+    assert isinstance(plan, RKProgram)
+    dpu = next(step for step in plan.steps if isinstance(step, RKDPUProgram))
+    self.assertEqual((len(dpu.stages), len(plan.scratch)), (12,12))
+    self.assertEqual([stage.count for stage in dpu.stages], [8192,4096,2048,1024,512,256,128,64,32,16,8,8])
     self.assertFalse(contains_uop(plan))
-    image = emit_pipeline(plan)
+    image = emit_program(plan)
     self.assertEqual((len(image.stages), {stage.engine for stage in image.stages}), (13, {RKEngine.DPU,RKEngine.CMAC}))
     self.assertEqual(decode_image(encode_image(image)), image)
     long_plan = lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum())).plan
-    self.assertIsInstance(long_plan, RKPipeline)
-    assert isinstance(long_plan, RKPipeline)
-    self.assertEqual((long_plan.contract.lhs.layout.physical_shape, len(long_plan.contract.constants)), ((1,160), 10240))
-    long_image = emit_pipeline(long_plan)
+    self.assertIsInstance(long_plan, RKProgram)
+    assert isinstance(long_plan, RKProgram)
+    long_contract = next(step for step in long_plan.steps if isinstance(step, RKContract))
+    self.assertEqual((long_contract.lhs.layout.physical_shape, len(long_contract.constants)), ((1,160), 10240))
+    long_image = emit_program(long_plan)
     self.assertEqual(([stage.engine for stage in long_image.stages], len(long_image.constants)), ([RKEngine.DPU,RKEngine.CMAC], 10512))
     rejected = lower_add_reduce_result(sink(Tensor.empty(511,dtype=dtypes.half).sum()))
-    self.assertIsInstance(rejected.plan, RKPipeline)
+    self.assertIsInstance(rejected.plan, RKProgram)
 
   def test_global_mean_folds_scale_into_cmac_weights(self):
     result = lower_add_reduce_result(sink(Tensor.empty(360,dtype=dtypes.half).mean()))
-    self.assertIsInstance(result.plan, RKPipeline)
+    self.assertIsInstance(result.plan, RKProgram)
     plan = result.plan
-    assert isinstance(plan, RKPipeline)
-    self.assertEqual(plan.contract.lhs.layout.physical_shape, (1,384))
-    active = struct.unpack_from("<e", plan.contract.constants, 0)[0]
+    assert isinstance(plan, RKProgram)
+    contract = next(step for step in plan.steps if isinstance(step, RKContract))
+    self.assertEqual(contract.lhs.layout.physical_shape, (1,384))
+    active = struct.unpack_from("<e", contract.constants, 0)[0]
     self.assertEqual(active, struct.unpack("<e", struct.pack("<e", 1/360))[0])
-    self.assertEqual(decode_image(encode_image(emit_pipeline(plan))), emit_pipeline(plan))
+    self.assertEqual(decode_image(encode_image(emit_program(plan))), emit_program(plan))
 
   def test_global_relu_sum_uses_dpu_prepass(self):
     result = lower_add_reduce_result(sink(Tensor.empty(3,4,5,dtype=dtypes.half).relu().sum().relu()))
-    self.assertIsInstance(result.plan, RKPipeline)
+    self.assertIsInstance(result.plan, RKProgram)
     plan = result.plan
-    assert isinstance(plan, RKPipeline)
-    self.assertEqual([stage.op for stage in plan.dpu.stages], [Ops.MAX,Ops.ADD])
-    self.assertEqual([stage.engine for stage in emit_pipeline(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
+    assert isinstance(plan, RKProgram)
+    dpu = next(step for step in plan.steps if isinstance(step, RKDPUProgram))
+    self.assertEqual([stage.op for stage in dpu.stages], [Ops.MAX,Ops.ADD])
+    self.assertEqual([stage.engine for stage in emit_program(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
 
   def test_affine_reductions_generate_sparse_cmac_weights(self):
     expressions = (Tensor.empty(3,4,5,6,dtype=dtypes.half).sum(axis=3),
                    Tensor.empty(4,2,2,dtype=dtypes.half).sum(axis=(0,2)),
                    Tensor.empty(3,4,5,6,dtype=dtypes.half).mean(axis=(1,2)))
     plans = [lower_affine_reduce_result(sink(expression)).plan for expression in expressions]
-    self.assertTrue(all(isinstance(plan, RKPipeline) for plan in plans))
+    self.assertTrue(all(isinstance(plan, RKProgram) for plan in plans))
     first = plans[0]
-    assert isinstance(first, RKPipeline)
-    contracts = (first.contract, *first.suffix)
+    assert isinstance(first, RKProgram)
+    contracts = tuple(step for step in first.steps if isinstance(step, RKContract))
     self.assertEqual([contract.out.layout.logical_shape for contract in contracts], [(1,16),(1,16),(1,16),(1,12)])
     self.assertTrue(all(contract.out.layout.physical_shape == (1,32) for contract in contracts))
     self.assertEqual([contract.out.buffer.addend for contract in contracts], [0,32,64,96])
     self.assertTrue(all((contract.lhs.layout.physical_shape, len(contract.constants)) == ((1,384),24576) for contract in contracts))
-    self.assertEqual([stage.engine for stage in emit_pipeline(first).stages], [RKEngine.DPU]*2+[RKEngine.CMAC]*4)
-    self.assertEqual(decode_image(encode_image(emit_pipeline(first))), emit_pipeline(first))
+    self.assertEqual([stage.engine for stage in emit_program(first).stages], [RKEngine.DPU]*2+[RKEngine.CMAC]*4)
+    self.assertEqual(decode_image(encode_image(emit_program(first))), emit_program(first))
 
   def test_renderer_produces_decodable_machine_image(self):
     a, b = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
