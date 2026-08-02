@@ -1225,3 +1225,17 @@ seconds for bigger-stride. The durable JSON is
 (SHA-256 `b06e60965a0851c89788e187c18845f53a0bce5650d9a81535a02bdfaf69abae`);
 JUnit XML SHA-256 is
 `eab5ba761799359a29202220355545cf81da5201bdb5b14364b2267e67e22caa`.
+
+Unmasked affine-MAX CMAC groups now address atom-aligned subviews of a shared
+NPU-packed scratch window. Each selector therefore uses its compact local K
+span even when several output groups share one larger input copy; masked
+groups retain the established common negative-infinity sentinel layout. This
+is a target-plan address/layout optimization, not a pooling recognizer. All
+four `test_max_pool2d_smaller_stride` subtests pass natively at exact
+comparison. The two formerly rejected plans shrink from 292 stages/2.72 MiB
+and 402 stages/3.45 MiB to 274 stages/1.78 MiB and 386 stages/1.97 MiB. All 80
+host tests, Ruff, and mypy pass, as does the strict hardware suite (59 tests
+plus 37 subtests) in 472.86 seconds with `ROCKCHIP_FALLBACK=0`. The inferred
+native total is 129 after the current 128-pass census, pending the next full
+census. The research tree now has 27,765 counted lines, including 2,632 in the
+Rockchip renderer/compiler.

@@ -877,8 +877,9 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
       trial_rows = [row for _,rows in (*window_groups,candidate) for row in rows]
       selected_indices = [index for row in trial_rows for index in row if index >= 0]
       base, end = (0,input_count) if whole_surface else ((min(selected_indices)&-8,max(selected_indices)+1) if selected_indices else (0,0))
-      align_in = max(32, (end-base+31)&-32) + (32 if any(index < 0 for row in trial_rows for index in row) else 0)
-      if align_in > 512 or not whole_surface and align_in > RK_MAX_AFFINE_WINDOW and window_groups: break
+      masked = any(index < 0 for row in trial_rows for index in row)
+      align_in = max(32, (end-base+31)&-32) + (32 if masked else 0)
+      if align_in > 512 or not whole_surface and masked and align_in > RK_MAX_AFFINE_WINDOW and window_groups: break
       window_groups.append(candidate)
       if whole_surface: continue
     if not window_groups:
@@ -906,7 +907,10 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
       prepare.append(RKALUStage(Ops.ADD, RKArg(packed.kind, packed.index, sentinel*2), 0.0, -math.inf, 1))
     steps.append(RKDPUProgram(tuple(prepare), scratch))
     for group_start,group_rows in window_groups:
-      local_rows = [[index-base if index >= 0 else -1 for index in row] for row in group_rows]
+      group_indices = [index for row in group_rows for index in row if index >= 0]
+      group_base = base if sentinel is not None else min(group_indices)&-8
+      contract_align = align_in if sentinel is not None else max(32, (max(group_indices)+1-group_base+31)&-32)
+      local_rows = [[index-group_base if index >= 0 else -1 for index in row] for row in group_rows]
       channels = min(8, output_count-group_start)
       rows = [[local_rows[min(channel, channels-1)][min(spatial, reduction_count-1)] for channel in range(8)]
               for spatial in range(pool_extent)]
@@ -915,11 +919,12 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
       for start in range(0, surface_count, 16):
         out_layout = RKLayout((1,min(16, surface_count-start)), (1,32), (64,2), dtypes.half,
                               padding=((0,0),(0,32-min(16, surface_count-start))))
-        payload = _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], align_in, 32, 1.0)
+        payload = _cmac_selection_payload([[index] for index in flat_rows[start:start+16]], contract_align, 32, 1.0)
         payloads.add(payload)
+        lhs = _dense_half_ref(packed.index, (1,contract_align), RKBufferKind.SCRATCH)
+        lhs = RKTensorRef(RKArg(packed.kind, packed.index, (group_base-base)*2), lhs.layout)
         steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
-          _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
-          _cmac_weight_ref(0, min(16, surface_count-start), align_in, RKBufferKind.CONSTANT, 32), reduce.arg[0], payload))
+          lhs, _cmac_weight_ref(0, min(16, surface_count-start), contract_align, RKBufferKind.CONSTANT, 32), reduce.arg[0], payload))
       out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
                         RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
       src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
