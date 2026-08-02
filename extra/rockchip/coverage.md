@@ -13,7 +13,51 @@ CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
 python -m pytest test/backend/test_ops.py -p conftest_rockchip -q --tb=no
 ```
 
-## Exact censuses
+## Current exact method baseline
+
+At `0946a6da1`, after restoring operation-specific int32/FP32 wide constant
+fills and adding the global RK3588 test-session lock, the uncached 2026-08-02
+census completed without NPU timeouts or reset failures. Parsing the 425 JUnit
+method records, rather than subtracting pytest's subtest totals, gives:
+
+| Method status | Count |
+|---|---:|
+| Fully PASS | 123 |
+| At least one FAIL | 289 |
+| SKIP | 13 |
+| Total | 425 |
+
+Pytest's raw summary is `144 passed, 394 failed, 13 skipped` in 440.30 seconds.
+Those are 551 outcomes: 425 collected methods plus 126 additional unittest
+subtest outcomes. A method containing subtests contributes a base pass even
+when one of its subtests fails, so the raw 144/394 totals are not method
+coverage. The legacy JUnit format also does not retain enough subtest identity
+to split all 126 outcomes reliably; the kernel/subcase telemetry milestone
+will replace it with explicit records.
+
+Using the first failure record for each of the 289 failing methods, the current
+primary failure families are:
+
+| Primary failure | Methods |
+|---|---:|
+| `RKPLAN_REJECT:unsupported_contraction` | 137 |
+| `RKPLAN_REJECT:unsupported_dtype` | 97 |
+| `RKPLAN_REJECT:unsupported_layout` | 43 |
+| `RKPLAN_REJECT:unsupported_op` | 7 |
+| Numerical/frontend exception | 3 |
+| `OverflowError` | 1 |
+| Subprocess failure | 1 |
+
+The exact XML is preserved at
+`~/rk2608_backups/research-wide-fill-census-20260802-094110/test_ops.xml`.
+The restored wide fills are a fill-only capability and do not claim general
+FP32 or integer arithmetic support.
+
+## Historical pytest-summary censuses
+
+The older tables below predate method-aware JUnit parsing. They are preserved
+as milestone evidence, but their PASS/FAIL columns were derived from pytest's
+mixed method/subtest summary and must not be read as exact method coverage.
 
 At `aab408cec`, the uncached 2026-08-01 census completed without NPU timeouts:
 
@@ -365,7 +409,8 @@ ported into the thin runtime. The current direct CMAC contract therefore stays
 limited to already legal packed surfaces until device-native layout conversion
 exists.
 
-The following diagnostic-only milestone keeps the 140/272/13 tally unchanged
+The following diagnostic-only milestone keeps the legacy 140/272/13 pytest
+tally unchanged
 but splits every pre-submission rejection into `unsupported_dtype`,
 `unsupported_layout`, `unsupported_contraction`, or `unsupported_op`. Focused
 compiler tests cover all four classes. This makes the informational census
@@ -377,7 +422,7 @@ failures.
 | Capability | Focused official gain | Full census folded in? |
 |---|---:|---|
 | Rank-0 FP16 constant fills | `test_ones`, `test_zeros` | Yes (`40c74406c`) |
-| Native tiled int32/FP32 constant fills (research-only, now retracted) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Historical (`40c74406c`) |
+| Native tiled int32/FP32 constant fills (research-only, restored) | `test_full`, `test_full_like`, `test_ones_like`, `test_zeros_like` | Current (`52c6657e2`) |
 | FP16 absolute value and finite ordered extrema | `test_abs`, `test_abs_exact`, exact ReLU variants, `test_clip` | Yes (`fd317872f`) |
 | Composed FP16 predicates used inside arithmetic | `test_sign`, `test_sign_exact` | Yes (`fd317872f`) |
 | Infinity-safe ordered threshold selection | `test_inf_where` | Yes (`6ddda80b0`) |
