@@ -68,17 +68,41 @@ class RKDPUProgram:
   scratch: tuple[RKScratch, ...] = ()
 
 @dataclass(frozen=True)
-class RKView:
-  slot: int
-  shape: tuple[int, ...]
-  strides: tuple[int, ...]
+class RKLayout:
+  logical_shape: tuple[int, ...]
+  physical_shape: tuple[int, ...]
+  strides_bytes: tuple[int, ...]
+  dtype: DType
+  base_offset: int = 0
+  row_alignment: int = 16
+  channel_alignment: int = 8
+  padding: tuple[tuple[int, int], ...] = ()
+  def __post_init__(self):
+    rank = len(self.logical_shape)
+    if len(self.physical_shape) != rank or len(self.strides_bytes) != rank or self.padding and len(self.padding) != rank:
+      raise ValueError("RKLayout rank mismatch")
+    if any(logical < 0 or physical < logical for logical,physical in zip(self.logical_shape, self.physical_shape)):
+      raise ValueError("RKLayout physical shape does not contain its logical shape")
+    if self.base_offset < 0 or self.row_alignment <= 0 or self.channel_alignment <= 0: raise ValueError("invalid RKLayout alignment")
+
+@dataclass(frozen=True)
+class RKTensorRef:
+  buffer: RKArg
+  layout: RKLayout
 
 @dataclass(frozen=True)
 class RKContract:
-  out: RKView
-  lhs: RKView
-  rhs: RKView
+  out: RKTensorRef
+  lhs: RKTensorRef
+  rhs: RKTensorRef
   reduce_axis: int
+
+def _dense_half_ref(slot:int, shape:tuple[int, ...]) -> RKTensorRef:
+  stride, strides = 2, []
+  for extent in reversed(shape):
+    strides.append(stride)
+    stride *= extent
+  return RKTensorRef(RKArg(RKBufferKind.ARG, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtypes.half))
 
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"
@@ -1397,8 +1421,8 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "rhs is not a packed N-by-K surface", Ops.INDEX)
   if int(out_param.src[0].arg) != n or int(lhs.src[0].src[0].arg) != 32 or int(rhs.src[0].src[0].arg) != n*32:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "CMAC buffer extents do not match M=1,N,K=32", Ops.INDEX)
-  return _native(RKContract(RKView(out_param.arg.slot, (1,n), (n,1)), RKView(lhs.src[0].arg.slot, (1,32), (32,1)),
-                            RKView(rhs.src[0].arg.slot, (n,32), (32,1)), red_axis))
+  return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(lhs.src[0].arg.slot, (1,32)),
+                            _dense_half_ref(rhs.src[0].arg.slot, (n,32)), red_axis))
 
 def lower_contract(sink:UOp) -> RKContract|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""
@@ -1598,8 +1622,8 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, 0), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
-  relocs = (RKReloc(0, 18, RKBufferKind.ARG, plan.lhs.slot), RKReloc(0, 24, RKBufferKind.ARG, plan.rhs.slot),
-            RKReloc(0, 31, RKBufferKind.ARG, plan.out.slot))
+  relocs = tuple(RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
+                 for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out)))
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),))
 
 class RockchipRenderer(Renderer):
