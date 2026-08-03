@@ -2206,3 +2206,30 @@ reason. The WIP implementation is preserved under
 `~/rk2608_backups/wip-affine-mean-rounding-12875809d-20260803/`. Since this is
 a diagnostic/correctness milestone rather than new coverage, the authoritative
 complete census remains 162/40/210/13 until another full uncached run.
+
+## Periodic selector compaction
+
+The remaining `test_repeat` failure was not solved by increasing the task
+ceiling. Its first 6,912-output map compiled to 164 tasks after removing the
+redundant 4,096-output gate, while the later 20,736-output map correctly hit
+the unchanged 400-task cost contract. Both maps contain an aligned repeated
+period.
+
+The generic reformat planner now emits selector CMAC only for one exact period
+and then duplicates that materialized surface through direct aligned DPU
+copies. Focused schema-v2 telemetry records unchanged official `test_repeat`
+as `PASS_NATIVE` with four kernels:
+
+- 1,728 outputs: 23 tasks, 57,232 constant bytes;
+- 6,912 outputs: 29 tasks, 49,040 constant bytes;
+- 3,456 outputs: 30 tasks, 19,040 constant bytes;
+- 20,736 outputs: 78 tasks, 19,120 constant bytes.
+
+The largest plan is marked `CORRECTNESS_FALLBACK`; no task/constant limit,
+tolerance, dtype contract, runtime conversion, or fallback lane changed. The
+durable focused JSON is
+`~/rk2608_backups/focused-periodic-repeat-f41b6ceaf-20260803/test_ops_coverage.json`.
+All 121 host tests plus three subtests pass, and the complete strict RK3588
+suite passes 84 tests plus 58 subtests in 721.14 seconds. This focused result
+implies one method transition and 163 native methods, but the authoritative
+complete census remains 162/40/210/13 pending an uncached 425-method rerun.

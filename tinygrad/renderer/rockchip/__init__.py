@@ -227,6 +227,20 @@ def _finish_program(steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce], 
   """Give every ordered DPU step the program's final resource table."""
   return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
 
+def _periodic_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]]) -> RKProgram|None:
+  """Materialize one aligned repeated-map period, then duplicate it through direct DPU copies."""
+  count = len(rows)
+  period = next((candidate for candidate in range(8,min(count,32769),8) if count%candidate == 0 and
+                 all(rows[index] == rows[index%candidate] for index in range(candidate,count))), None)
+  if period is None: return None
+  prefix = _selector_program(output, source, input_count, rows[:period], ())
+  if prefix is None: return None
+  copies = RKDPUProgram(tuple(RKALUStage(Ops.ADD, RKArg(output.kind,output.index,start*2), output, 0.0, period)
+                               for start in range(period,count,period)))
+  completed = _finish_program([*prefix.steps,copies], prefix.scratch)
+  cost = plan_cost(completed)
+  return completed if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES else None
+
 def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKReformat|RKProgram) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
@@ -472,13 +486,12 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   out_ref, src_ref = _dense_half_ref(output.index, (count,)), _dense_half_ref(source.index, (src_count,))
   if atom_reject is None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.COALESCED_DPU, (RKDPUProgram(tuple(stages)),)))
-  if 0 < src_count and 0 < count <= 4096 and (implementation:=_selector_program(
-      output, source, src_count, [[src] if src >= 0 else [] for src in mapping], ())) is not None:
+  rows = [[src] if src >= 0 else [] for src in mapping]
+  implementation = (_periodic_selector_program(output,source,src_count,rows) or
+                    _selector_program(output,source,src_count,rows,())) if 0 < src_count and 0 < count else None
+  if implementation is not None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.SELECTOR_CMAC,
       cast(tuple[RKDPUProgram|RKContract, ...], implementation.steps), implementation.scratch))
-  if count > 4096:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
-      f"static reformat selector output {count} exceeds the proven 4096-element bound", Ops.INDEX)
   if 0 < src_count and 0 < count:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "static reformat selector exceeds the native cost contract", Ops.INDEX)
   return atom_reject

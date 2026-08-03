@@ -719,3 +719,29 @@ source SHA-256 is
 This milestone intentionally changes no pass count. A future native path must
 reproduce the source reduction's accumulation order/precision rather than
 relaxing the official tolerance.
+
+## Periodic large-output reformat
+
+Large static repeat maps no longer require one selector row for every logical
+output. When the exact output-to-input map has an aligned repeated period, the
+planner materializes one period through the existing bounded selector-CMAC
+path and duplicates that proven native surface with aligned DPU copies. The
+general 400-task and 2 MiB constant ceilings remain unchanged; nonperiodic maps
+still use the ordinary costed selector path or reject.
+
+Complete unchanged `test_repeat` passes with `ROCKCHIP_FALLBACK=0`. Its four
+realized FP16 kernels contain 23, 29, 30, and 78 tasks. The 6,912-output case
+drops from 164 tasks and 98,752 constant bytes to 29 tasks and 49,040 bytes;
+the formerly rejected 20,736-output case uses 78 tasks and 19,120 bytes. The
+last plan is deliberately classified `CORRECTNESS_FALLBACK`, while the other
+three remain `EFFICIENT`. Focused schema-v2 telemetry is stored under
+`~/rk2608_backups/focused-periodic-repeat-f41b6ceaf-20260803/`.
+
+Permanent compiler tests enforce both unchanged resource ceilings and a
+100-task ceiling for the largest periodic case. A serial mixed-engine RK3588
+regression checks its complete 20,736-element result. All 121 Rockchip host
+tests plus three subtests, mypy over 225 modules, and repository Ruff pass; the
+complete device contract passes 84 tests plus 58 subtests in 721.14 seconds
+without a timeout, invalid submission, reset failure, or process abort. The
+focused method result implies 163 native methods, pending the next complete
+uncached census; the authoritative total remains 162/40/210/13 until then.

@@ -384,6 +384,9 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(tensor.repeat(3,3,4).contiguous().realize().numpy(), np.tile(data,(3,3,4)))
     rolled = np.arange(32,dtype=np.float16).reshape(4,8)
     np.testing.assert_equal(Tensor(rolled,device="ROCKCHIP").realize().roll(1).contiguous().realize().numpy(), np.roll(rolled,1))
+    large = np.arange(72,dtype=np.float16).reshape(4,6,3)
+    repeated = Tensor(large,device="ROCKCHIP").realize().repeat(2,4,3,3,2,2).contiguous().realize().numpy()
+    np.testing.assert_equal(repeated, np.tile(large,(2,4,3,3,2,2)))
 
   def test_static_cast_nearest_reformat_native_cmac(self):
     data = np.arange(2*3*13,dtype=np.float16).reshape(2,3,13)

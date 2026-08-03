@@ -1138,6 +1138,29 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_large_split_range_reformat_uses_cost_limits(self):
+    source = Tensor.empty(4,6,3,dtype=dtypes.half).realize()
+    result = lower_reformat_result(sink(source.repeat(2,4,3,4).contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    self.assertEqual(Counter(result.plan.mapping), {index:96 for index in range(72)})
+    cost = plan_cost(RKProgram(result.plan.steps, result.plan.scratch))
+    self.assertLessEqual(cost.task_count, 400)
+    self.assertLessEqual(cost.constant_bytes, 2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_periodic_split_range_reformat_materializes_one_period(self):
+    source = Tensor.empty(4,6,3,dtype=dtypes.half).realize()
+    result = lower_reformat_result(sink(source.repeat(2,4,3,3,2,2).contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    cost = plan_cost(RKProgram(result.plan.steps, result.plan.scratch))
+    self.assertLessEqual(cost.task_count, 100)
+    self.assertLessEqual(cost.constant_bytes, 2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.roll(1).contiguous()))
