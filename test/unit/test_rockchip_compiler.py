@@ -12,7 +12,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_reduce_result,
   lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result,
-  lower_spatial_contract_result,
+  lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
   rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
@@ -922,7 +922,9 @@ class TestDPUCompiler(unittest.TestCase):
   def test_grouped_channel_tiles_use_direct_conv(self):
     source = Tensor.empty(4,15,5,5,dtype=dtypes.half)
     weight = Tensor.empty(35,3,3,3,dtype=dtypes.half)
-    result = lower_grouped_spatial_contract_result(sink(source.conv2d(weight,groups=5)))
+    graph = sink(source.conv2d(weight,groups=5))
+    self.assertIs(lower_nhwc_spatial_contract_result(graph).kind,RKLowerKind.NOT_APPLICABLE)
+    result = lower_grouped_spatial_contract_result(graph)
     self.assertIs(result.kind,RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan,RKProgram)
     assert isinstance(result.plan,RKProgram)
@@ -1258,6 +1260,20 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertEqual([(step.kernel_height,step.kernel_width,step.stride_y,step.stride_x) for step in convs],[(1,1,1,1)])
         self.assertLessEqual(plan_cost(result.plan).task_count,24)
         self.assertFalse(contains_uop(result.plan))
+
+  def test_nhwc_convolution_splits_output_channels_to_cbuf_tiles(self):
+    source = Tensor.empty(2,9,9,10,dtype=dtypes.half).realize()
+    weight = Tensor.empty(3,3,10,20,dtype=dtypes.half).realize()
+    result = lower_nhwc_spatial_contract_result(sink(source.permute(0,3,1,2).conv2d(weight.permute(3,2,0,1))))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    convs = [step for step in result.plan.steps if isinstance(step,RKSpatialConv)]
+    self.assertEqual([(step.in_channels,step.out_channels) for step in convs],[(10,16),(10,4)]*2)
+    cost = plan_cost(result.plan)
+    self.assertLessEqual(cost.task_count,200)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()

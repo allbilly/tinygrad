@@ -291,12 +291,12 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
   ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
     plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
   sy, sx = plan.stride_y, plan.stride_x
-  if ic not in (1,2,3,4,16) or not 1 <= oc <= 16 or not 1 <= kh <= 3 or not 1 <= kw <= 3 or \
+  if not 1 <= ic <= 16 or not 1 <= oc <= 16 or not 1 <= kh <= 3 or not 1 <= kw <= 3 or \
      oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or not 1 <= sy <= 7 or not 1 <= sx <= 7 or \
      not 1 <= ih <= 32 or not 1 <= iw <= 32:
     raise ValueError("unsupported direct spatial-convolution contract")
   align_ic, use_nhwc = (8,True) if ic <= 4 else (16,False)
-  input_shape = (ih,plan.input_width_stride,ic) if use_nhwc else (ic//8,ih,plan.input_width_stride,8)
+  input_shape = (ih,plan.input_width_stride,ic) if use_nhwc else ((ic+7)//8,ih,plan.input_width_stride,8)
   if plan.src.layout.physical_shape != input_shape or \
      plan.weight.layout.physical_shape != (kh,kw,oc,align_ic):
     raise ValueError("direct convolution has invalid packed input or weight layout")

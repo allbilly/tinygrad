@@ -1013,3 +1013,46 @@ modules, and Ruff is clean. The serialized device contract passes 91 tests plus
 58 subtests in 730.76 seconds without timeout, invalid submission, reset
 failure, or process abort. The previously passing smaller- and bigger-stride
 official methods also pass all eight subcases under the new lowerer order.
+
+## NHWC/HWIO convolution and CBUF pressure
+
+The TensorFlow-style affine form used by `test_simple_conv2d_nhwc` is now
+recognized from its coefficients rather than its test name: logical NHWC input
+and HWIO weight surfaces are selector-packed into the proven C16/CNA formats,
+CNA executes each batch/channel tile, and selector work restores logical NCHW
+output. Missing or nonpositive affine spatial coefficients make this lowerer
+`NOT_APPLICABLE`; a full device-suite regression caught and permanently tests
+that boundary so grouped convolution remains owned by its existing lowerer.
+
+`conv_grok` supplies the right general scheduling model: weight-bank pressure
+chooses the output-channel (K) step, then feature entries consume the banks
+remaining after that K tile and choose the Y step. Pressure in both dimensions
+requires the Cartesian `BY_YK` schedule, including input overlap and physical
+buffer offsets. The newly supported 2x9x9x10 / 3x3x10x20 case is only a `BY_K`
+case: its complete feature surface fits, while the proven physical CNA output
+contract divides 20 channels into 16+4, and every tile stays inside one weight
+CBUF bank. It must not be described as evidence that feature-bank/Y splitting
+is already implemented. Larger surfaces remain future typed Y/YK plan work.
+
+The unchanged official method passes at `atol=1e-5` with one native kernel:
+
+```text
+tasks / resets       160 / 160
+engine tasks         151 CMAC + 4 CONV + 5 DPU
+command words        7,298
+constant bytes       1,004,272
+scratch bytes        21,696
+native quality       CORRECTNESS_FALLBACK
+```
+
+No CPU tensor path, runtime packing, tolerance change, or resource-ceiling
+increase was added. Selector packing still dominates the plan and its
+17.08-second kernel time, so the next optimization is direct native layout
+conversion plus typed CBUF Y/K windows—not wider selector or task limits. The
+focused pass implies 169/40/203/13 pending a complete uncached census; the
+authoritative inventory remains 168/40/204/13 until that run completes.
+
+Regression gates pass: 130 host tests plus ten subtests, mypy over all 225
+tinygrad modules, Ruff, and 92 serialized RK3588 device tests plus 58 subtests
+in 749.63 seconds. The hardware run had no timeout, invalid submission, reset
+failure, or process abort.

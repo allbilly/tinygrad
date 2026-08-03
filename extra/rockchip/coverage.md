@@ -34,6 +34,27 @@ the JUnit XML SHA-256 is
 
 The grouped-CNA and sliding-MAX PPU transitions are both authoritative.
 
+Focused work after that census makes `TestOps.test_simple_conv2d_nhwc` pass
+natively without changing its `atol=1e-5`. The generic affine matcher derives
+NHWC input, HWIO weight, batch, channel, kernel, spatial, and stride roles and
+emits a CBUF-bounded 16+4 output-channel split for each of two batches. The
+plan has 160 tasks (151 CMAC, four CONV, five DPU), 7,298 command words,
+1,004,272 constant bytes, and 21,696 scratch bytes. It is correctly classified
+as `CORRECTNESS_FALLBACK`; selector packing, not CNA compute, accounts for
+almost all work. The focused telemetry and JUnit artifacts are under
+`~/rk2608_backups/nhwc-cbuf-focused-20260804/`; their SHA-256 values are
+`18a897bdc674f18c9ca3c6acc740f5bcade11bdfd9113a6a000bb67e0c6c31f1` and
+`416203e40b416c3874a1376142ba55bdc9e26662540aa194116184925a726db3`.
+
+This implies 169 native, 40 frontend, 203 failed, and 13 upstream-skipped
+methods, but it is not authoritative until a new complete census. The exact
+`conv_grok` lesson is retained: weight banks choose K, the feature banks left
+after that choice choose Y, and simultaneous pressure yields a Cartesian
+BY_YK schedule. This focused geometry needs only K/channel splitting; it does
+not yet prove typed Y-overlap tasks. Full regressions pass with 130 host tests
+plus ten subtests and 92 serialized device tests plus 58 subtests; mypy and
+Ruff are clean.
+
 The 508 successful native kernels contain 479 `EFFICIENT` and 29
 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 181 at
 2--8, 98 at 9--32, 80 at 33--64, 11 at 65--128, 13 at 129--256, and four at
