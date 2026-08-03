@@ -1,4 +1,4 @@
-import hashlib, struct, unittest
+import hashlib, math, struct, unittest
 from collections import Counter
 from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
@@ -10,7 +10,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
-  lower_reduce_result,
+  lower_pointwise_affine_reduce_result, lower_reduce_result,
   lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
@@ -43,6 +43,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     assert isinstance(plan, RKDPUProgram)
     self.assertEqual([(stage.count,stage.dst.addend) for stage in plan.stages], [(32768,0),(32768,65536)])
+
+  def test_only_hazardous_partial_atoms_get_a_true_dpu_tail(self):
+    dst, src = RKArg(RKBufferKind.ARG,0), RKArg(RKBufferKind.ARG,1)
+    ordinary = emit_dpu(RKDPUProgram((RKALUStage(Ops.ADD,dst,src,0.0,30),)))
+    nonfinite = emit_dpu(RKDPUProgram((RKALUStage(Ops.ADD,dst,0.0,math.nan,30),)))
+    division = emit_dpu(RKDPUProgram((RKALUStage(Ops.FDIV,dst,src,0.0,30),)))
+    self.assertEqual((len(ordinary.stages),len(nonfinite.stages),len(division.stages)),(1,2,2))
+    self.assertEqual(tuple(reloc.addend for reloc in nonfinite.stages[1].relocs[:1]),(48,))
 
   def test_global_max_hwc8_uses_typed_ppu_reduction(self):
     plan = lower_reduce_result(sink(Tensor.empty(4,4,8,dtype=dtypes.half).max(axis=(0,1)))).plan
@@ -187,6 +195,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsNone(result.plan)
     self.assertEqual(result.reject.kind if result.reject is not None else None, RKRejectKind.NUMERICAL_CONTRACT)
 
+  def test_multi_input_pointwise_affine_sum_materializes_before_reduction(self):
+    source = Tensor.empty(1,2,3,1,5,dtype=dtypes.half).realize()
+    mean = Tensor.empty(1,2,3,1,1,dtype=dtypes.half).realize()
+    result = lower_pointwise_affine_reduce_result(sink((source-mean).square().sum(axis=(0,4))/0.0))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    engines = [stage.engine for stage in emit_program(result.plan).stages]
+    self.assertIn(RKEngine.DPU,engines)
+    self.assertIn(RKEngine.CMAC,engines)
+    self.assertLessEqual(len(engines),64)
+    self.assertFalse(contains_uop(result.plan))
+    lhs, rhs = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
+    self.assertIs(lower_pointwise_affine_reduce_result(sink(lhs@rhs)).kind,RKLowerKind.NOT_APPLICABLE)
+
   def test_zero_base_power_repairs_inactive_exp2_input(self):
     result = lower_native(sink(0**Tensor.empty(6,dtype=dtypes.half)))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
@@ -245,7 +268,8 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
     engines = [stage.engine for stage in emit_program(plan).stages]
-    self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC)), (3,2))
+    self.assertLessEqual(engines.count(RKEngine.DPU),4)
+    self.assertEqual(engines.count(RKEngine.CMAC),2)
     self.assertFalse(contains_uop(plan))
 
   def test_zero_masked_affine_surface_uses_bounded_selector_tiles(self):

@@ -1,12 +1,12 @@
 from __future__ import annotations
-import struct
+import math, struct
 
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
-from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage,
+from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKDPUStage,
   RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
@@ -137,6 +137,20 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
 def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   constants, constant_offsets, stages = bytearray(), {}, []
+  def shifted(value:RKArg|float, count:int) -> RKArg|float:
+    return RKArg(value.kind,value.index,value.addend+count*2) if isinstance(value,RKArg) else value
+  plans:list[RKDPUStage] = []
+  for plan in program.stages:
+    if isinstance(plan,RKALUStage) and (plan.op is Ops.FDIV or
+       any(isinstance(value,float) and not math.isfinite(value) for value in (plan.lhs,plan.rhs))) and \
+       plan.out_dtype is dtypes.half and plan.count >= 8 and (tail:=plan.count%8):
+      prefix = plan.count-tail
+      tail_dst = RKArg(plan.dst.kind,plan.dst.index,plan.dst.addend+prefix*2)
+      plans.extend((RKALUStage(plan.op,plan.dst,plan.lhs,plan.rhs,prefix),
+        RKALUStage(plan.op,tail_dst,shifted(plan.lhs,prefix),shifted(plan.rhs,prefix),tail)))
+    else: plans.append(plan)
+  # Rejected WIP: splitting every non-atom ALU avoids all recycled padding reads, but inflated established plans by up to 12
+  # tasks. Only NaN/inf-producing stages need the state-safe true tail; ordinary uploads have their physical tail cleared.
   def materialize(value:RKArg|float, count:int) -> RKArg:
     if isinstance(value, RKArg): return value
     bits, key = struct.pack("<e", value), (value, count)
@@ -144,7 +158,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       constant_offsets[key] = len(constants)
       constants.extend(bits * (((count+7)//8)*8))
     return RKArg(RKBufferKind.CONSTANT, constant_offsets[key])
-  for stage_idx, plan in enumerate(program.stages):
+  for stage_idx, plan in enumerate(plans):
     if isinstance(plan, RKLUTStage):
       stages.append(_emit_lut(stage_idx, plan))
       continue

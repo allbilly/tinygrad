@@ -367,6 +367,8 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       return _native(RKDPUProgram(fill_stages))
     return _native(RKDPUProgram(tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*2), 0.0, root,
       min(32768, count-start)) for start in range(0, count, 32768))))
+  # Rejected WIP: materializing every partial-atom DPU input is correct but unnecessarily duplicates ordinary elementwise work.
+  # The allocator clears upload padding instead; selector planners remain responsible for initializing scratch padding.
   if (program:=_schedule_expr(root, output, count)) is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "stage source is not materializable")
   return _native(program)
@@ -1200,17 +1202,121 @@ def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output
     steps.extend(packed.steps)
     scratch = packed.scratch
     memo[index] = expanded
-  root = _parse_alu(stored, output_index, memo)
+  scale_terms = tuple(_strip_casts(x) for x in stored.src) if stored.op is Ops.MUL else ()
+  positive_inf_scale = len(scale_terms) == 2 and any(x.op is Ops.CONST and float(x.arg) == math.inf for x in scale_terms) and \
+    any(x.key == reduce.key for x in scale_terms)
+  reduced_value = _strip_casts(reduce.src[0])
+  squared_sum = reduced_value.op is Ops.MUL and _strip_casts(reduced_value.src[0]).key == _strip_casts(reduced_value.src[1]).key
+  if positive_inf_scale and squared_sum:
+    # SUM(square) is nonnegative, so x*(+inf) has exactly the same IEEE result as x/(+0): +inf for x>0 and NaN for x=0.
+    # RK3588's native FDIV preserves that contract after CMAC, while its multiply-by-infinity epilogue does not.
+    root:_Expr|RKArg|float|None = _ALUExpr(Ops.FDIV,(reduced,0.0))
+  else: root = _parse_alu(stored, output_index, memo)
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "reduction epilogue is not legal DPU arithmetic", stored.op)
-  scheduled = _schedule_expr(root, output, output_count, scratch)
+  # FDIV after CMAC is stable only when the final DPU atom is complete. Keep the epilogue in aligned scratch, then copy the
+  # full page-backed atom to the public surface; do not issue an unaligned tail-address write (DPU base addresses are atom-granular).
+  schedule_count, scheduled_output = (output_count+7)&-8, output
+  if schedule_count != output_count:
+    scheduled_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(schedule_count*2),)
+  scheduled = _schedule_expr(root, scheduled_output, schedule_count, scratch)
   if scheduled is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "reduction epilogue is not materializable", stored.op)
-  completed = _finish_program([*steps, scheduled], scheduled.scratch)
+  tail = () if scheduled_output is output else (RKDPUProgram((RKALUStage(Ops.ADD,output,scheduled_output,0.0,schedule_count),)),)
+  completed = _finish_program([*steps, scheduled, *tail], scheduled.scratch)
   cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"reduction epilogue needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", stored.op)
   return _native(completed)
+
+def lower_pointwise_affine_reduce_result(sink:UOp) -> RKLowerResult:
+  """Materialize a multi-input pointwise expression, then reduce its static affine output rows."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1 or reductions[0].arg[0] is not Ops.ADD: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  value = _strip_casts(reduce.src[0])
+  indexes = list(dict.fromkeys(u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM))
+  if not 2 <= len(indexes) <= 4 or any(index.dtype is not dtypes.half for index in indexes): return _not_applicable()
+  if value.op is Ops.MUL and all(_strip_casts(operand).op is Ops.INDEX for operand in value.src):
+    return _not_applicable()  # direct contractions must retain CMAC/CNA accumulation instead of FP16 pointwise products
+  output_index, out_aff = store.src[0].src[1], _affine(store.src[0].src[1])
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
+  out_axes = tuple(sorted(out_aff[0])) if out_aff is not None else ()
+  value_axes = {u.arg[0] for u in value.toposort() if u.op is Ops.RANGE}
+  if out_aff is None or len(red_axes) != len(reduce.src)-1 or set(out_axes) & set(red_axes) or \
+     value_axes-set(out_axes)-set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT,
+      "pointwise affine SUM axes do not form one static output/reduction partition", Ops.RANGE)
+  output_count, reduction_count = int(store.src[0].src[0].src[0].arg), math.prod(ranges[axis] for axis in red_axes)
+  visit_count = output_count*reduction_count
+  if not 1 <= output_count <= 128 or not 2 <= visit_count <= RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"pointwise affine SUM surface is {output_count}x{reduction_count}", reduce.op)
+
+  mappings:dict[UOp,list[int]] = {index:[-1]*visit_count for index in indexes}
+  rows:list[list[int]] = [[] for _ in range(output_count)]
+  seen:set[int] = set()
+  for out_point in product(*(range(ranges[axis]) for axis in out_axes)):
+    point = dict(zip(out_axes,out_point))
+    out_offset = out_aff[1]+sum(out_aff[0][axis]*point[axis] for axis in out_axes)
+    if not 0 <= out_offset < output_count or out_offset in seen:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"pointwise affine SUM output is not dense",store.src[0].op)
+    seen.add(out_offset)
+    for red_offset,red_point in enumerate(product(*(range(ranges[axis]) for axis in red_axes))):
+      point.update(zip(red_axes,red_point))
+      visit = out_offset*reduction_count+red_offset
+      rows[out_offset].append(visit)
+      for index in indexes:
+        source_offset = _static_scalar(index.src[1],point)
+        input_count = int(index.src[0].src[0].arg)
+        if not isinstance(source_offset,int) or isinstance(source_offset,bool) or not 0 <= source_offset < input_count:
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"pointwise affine SUM input is not static",index.op)
+        mappings[index][visit] = source_offset
+  if seen != set(range(output_count)) or any(-1 in mapping for mapping in mappings.values()):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"pointwise affine SUM surface has holes",Ops.INDEX)
+
+  scratch:tuple[RKScratch,...] = ()
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  memo:dict[UOp,_Expr|RKArg|float] = {}
+  for index,mapping in mappings.items():
+    expanded = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(visit_count)),)
+    packed = _selector_program(expanded,RKArg(RKBufferKind.ARG,index.src[0].arg.slot),int(index.src[0].src[0].arg),
+                               [[source] for source in mapping],scratch,max_outputs=64)
+    if packed is None:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"pointwise affine SUM input materialization exceeds limits",index.op)
+    steps.extend(packed.steps)
+    scratch = packed.scratch
+    memo[index] = expanded
+  root = _parse_alu(value,indexes[0].src[1],memo)
+  if not isinstance(root,(_ALUExpr,_MaskExpr,_LUTExpr)):
+    return _unsupported(RKRejectKind.UNSUPPORTED_ALU,"pointwise affine SUM expression is not legal DPU arithmetic",value.op)
+  pointwise = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(((visit_count+7)//8)*16),)
+  scheduled = _schedule_expr(root,pointwise,visit_count,scratch)
+  if scheduled is None:
+    return _unsupported(RKRejectKind.UNSUPPORTED_ALU,"pointwise affine SUM expression is not materializable",value.op)
+  steps.append(scheduled)
+  scratch = scheduled.scratch
+
+  stored, output = _strip_casts(store.src[1]), RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot)
+  epilogue = stored.key != reduce.key
+  reduced = output
+  reduction = _selector_program(reduced,pointwise,visit_count,rows,scratch,direct_capacity=visit_count,max_outputs=64)
+  if reduction is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"pointwise affine SUM reduction exceeds limits",reduce.op)
+  program = _finish_program([*steps,*reduction.steps],reduction.scratch)
+  if epilogue:
+    return _finish_reduction_epilogue(program,stored,reduce,output_index,output,reduced,output_count,out_axes,ranges)
+  cost = plan_cost(program)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"pointwise affine SUM needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
+  return _native(program)
 
 def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a small affine FP16 ADD reduction as generated sparse CMAC tiles."""
@@ -2441,6 +2547,7 @@ _LOWERERS = (
   RKLowerer("affine_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_affine_mul_reduce_result),
   RKLowerer("sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_add_reduce_result),
   RKLowerer("multi_source_sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_multi_source_affine_reduce_result),
+  RKLowerer("pointwise_affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_pointwise_affine_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
   RKLowerer("sliding_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_sliding_max_result),

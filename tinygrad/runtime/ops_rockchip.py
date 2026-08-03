@@ -13,7 +13,10 @@ _TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300), RKEngine
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
-  def _copyin(self, dest:HCQBuffer, src:memoryview): ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
+    # Rejected WIP: allocator-wide 16-byte tail clearing perturbed established CMAC/CONV rounding in seven device regressions.
+    # Hazardous non-finite DPU tails are split in the emitter without changing every uploaded physical surface.
   def _copyout(self, dest:memoryview, src:HCQBuffer): ctypes.memmove(from_mv(dest), int(src.va_addr), dest.nbytes)
   def _as_buffer(self, src:HCQBuffer): return to_mv(int(src.va_addr), src.size)
   def _offset(self, buf:HCQBuffer, size:int, offset:int): return buf.offset(offset, size)

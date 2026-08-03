@@ -2662,3 +2662,45 @@ The PyTorch outputs equal an FP32 mean rounded once to FP16, so this is a real
 PPU accumulation/reciprocal mismatch rather than a reference artifact. The
 compiler continues to use only the already proven exact CMAC average paths and
 rejects the remaining cases numerically. No tolerance or coverage count changed.
+
+## Pointwise variance/std reduction milestone
+
+The two singleton-axis variance families previously stopped at
+`requires_reformat:DPU sum requires one scalar output`. Their failing kernel
+has six outputs and five reduction visits, with two different affine inputs:
+the original 30-element tensor and its six-element broadcast mean. The new
+pointwise-affine reduction lowerer emits:
+
+```text
+selector CMAC: x and broadcast(mean) -> dense visit surfaces
+DPU:           subtract, square
+selector CMAC: five visits -> six reduced outputs
+DPU:           typed numerical epilogue
+```
+
+Direct multiplicative contractions are excluded from this lowerer. An initial
+overbroad version intercepted GEMM/CNA and rounded products through FP16 DPU;
+seven device regressions exposed that ownership error. After the exact
+`INDEX*INDEX` fence, all six affected tests plus seven subtests pass again and
+retain their original CMAC/CNA paths.
+
+For correction equal to the reduction extent, the nonnegative squared sum is
+scaled by positive infinity. RK3588's equivalent `FDIV(+0)` path produces
+`+inf` for positive input and NaN for zero, matching PyTorch without a host
+repair. Hazardous non-finite/FDIV partial atoms are emitted as an aligned prefix
+and a real short tail; ordinary ALU stages are not split. Permanent tests cover
+the lowerer ownership, image task split, a preceding 30-lane NaN workload, and
+the variance hardware result.
+
+Focused unchanged TestOps results:
+
+```text
+test_var_one_in_axis   PASS_NATIVE  9.18 s
+test_std_one_in_axis   PASS_NATIVE 17.20 s
+```
+
+Validation is 132 host tests plus 12 subtests, mypy over 225 modules, Ruff, and
+94 serialized RK3588 tests plus 60 subtests in 792.84 seconds. No timeout,
+invalid submission, reset failure, or process abort occurred. The expected
+census is 171 native / 40 frontend / 201 fail / 13 skip, but the authoritative
+count remains 169/40/203/13 until the complete uncached census is rerun.

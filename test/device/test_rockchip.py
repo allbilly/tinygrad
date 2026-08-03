@@ -318,6 +318,14 @@ class TestRockchip(unittest.TestCase):
     expected = data[:,:,:10,:].astype(np.float32).reshape(2,2,5,2,14,2).mean(axis=(3,5)).astype(np.float16)
     np.testing.assert_equal(actual, expected)
 
+  def test_pointwise_affine_variance_reduction_stays_native(self):
+    # A recycled 30-lane upload previously exposed stale NaNs from the last physical atom to selector CMAC padding.
+    self.assertTrue(np.isnan((Tensor.zeros(30,device="ROCKCHIP")/0).realize().numpy()).all())
+    rng = np.random.default_rng(35)
+    data = rng.uniform(-2,2,30).astype(np.float16).reshape(1,2,3,1,5)
+    actual = Tensor(data,device="ROCKCHIP").realize().var(axis=(0,4),correction=5).realize().numpy()
+    self.assertTrue(np.isposinf(actual).all())
+
   def test_pointwise_fp16_expression_before_affine_reduction(self):
     rng = np.random.default_rng(17)
     x = rng.uniform(-1, 1, (3,4,5)).astype(np.float16)

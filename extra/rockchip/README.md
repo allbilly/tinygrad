@@ -1097,3 +1097,35 @@ The engine is functional but does not satisfy TestOps' `rtol=1e-5`: 2x2, 3x3,
 FP32-accumulate-then-FP16 reference for the same inputs. Direct PPU AVG is
 therefore retained as a hardware characterization probe and is not selected by
 the compiler. This does not change the authoritative 169/40/203/13 census.
+
+## Multi-input pointwise affine reductions
+
+Variance exposes a reusable reduction shape that the earlier affine selector
+could not express: materialize two differently indexed FP16 surfaces, evaluate
+`(x-broadcast(mean))^2` pointwise on DPU, then reduce static output rows on
+CMAC. `lower_pointwise_affine_reduce_result` now builds exactly that typed NPU
+program for up to four inputs and 65,536 visits. Direct `INDEX*INDEX`
+contractions are explicitly not applicable, so GEMM and convolution retain
+their FP32 CMAC/CNA accumulation contract.
+
+The correction-equals-extent epilogue is also hardware-specific. Tinygrad
+canonicalizes the nonnegative squared sum divided by zero to `sum*+inf`;
+RK3588 multiplication by infinity after CMAC returns an invalid result, while
+native `sum/+0` has the identical IEEE contract: positive sums become `+inf`
+and an exactly zero sum becomes NaN. The compiler applies that equivalence only
+to a recognized sum of a square.
+
+A second RK3588 boundary appeared in the preceding singleton cases. Hazardous
+non-finite or FDIV operations over a partial final atom can leave state that
+changes a following CMAC program. The emitter splits only those stages into an
+aligned prefix and a true sub-eight-lane tail. A blanket split was rejected
+because it added up to twelve tasks to established plans; allocator-wide tail
+zeroing was likewise rejected after perturbing seven CMAC/CNA regressions.
+
+The unchanged `test_var_one_in_axis` and `test_std_one_in_axis` now pass in 9.18
+and 17.20 seconds in focused execution. The complete device gate passes 94
+tests plus 60 subtests in 792.84 seconds; host gates pass 132 tests plus 12
+subtests, mypy over 225 modules, and Ruff. No CPU semantic lane, tolerance
+change, or resource-ceiling increase was added. The full 425-method census has
+not yet been rerun, so 169/40/203/13 remains authoritative pending verification
+of the expected two-method transition.
