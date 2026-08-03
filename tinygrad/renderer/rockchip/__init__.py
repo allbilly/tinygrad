@@ -1897,7 +1897,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
-  if not 1 <= k <= 64 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_AFFINE_VISITS:
+  if not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_AFFINE_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []

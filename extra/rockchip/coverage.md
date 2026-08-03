@@ -2623,3 +2623,23 @@ tinygrad modules, Ruff, and 91 serialized device tests plus 58 subtests in
 abort occurred. The previously passing smaller- and bigger-stride official
 methods also pass all eight subcases under the new lowerer order in 93.34
 seconds.
+
+## K=65 contraction boundary
+
+The tiled-contraction legality fence now accepts logical K=65 as one physical
+K=96 CMAC tile. Direct RK3588 tests for `(65,) @ (65,45)` and
+`(45,65) @ (65,)` are exact against FP32 accumulation rounded to FP16. In
+focused `test_dot_1d` execution, three kernels pass: four tasks for the existing
+scalar dot, 138 tasks for vector-matrix K=65, and 152 tasks for matrix-vector
+K=65. The method then rejects the batched 360-output layout with
+`tiled CMAC surfaces are out=360,lhs=23400,rhs=65,K=65`.
+
+This produces no method-level census gain; 169/40/203/13 remains authoritative.
+The focused telemetry is
+`~/rk2608_backups/k96-dot1d-focused-20260804/telemetry.json` (SHA-256
+`1b64309e91903153e91da6f737e42ebba3fd44a2eb2175d098210f11ab485f52`);
+the JUnit SHA-256 is
+`3ebf65e994d1928a6f628008cd1fbe748e20cd9bf0fe8fc0bd2523e2a6d98a66`.
+Regression gates pass with 131 host tests plus 12 subtests, 93 device tests plus
+60 subtests, mypy, and Ruff. This moves a real hardware boundary while leaving
+large batched packing as a typed planner rejection.

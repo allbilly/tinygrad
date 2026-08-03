@@ -1061,3 +1061,25 @@ device-state error in 2,539.47 seconds. Its JSON SHA-256 is
 `7f8d1ee6f46ddf35136903c12f1d4b768b6f1fbd0a9c89555825f8f38828aa45` and
 its JUnit SHA-256 is
 `2c08cc8240e440c933f402819669323ea8c4e3be1368a2c9eb93bd7aa8fb92af`.
+
+## Logical K=65 in one K=96 CMAC tile
+
+The tiled contraction compiler previously rejected every logical K above 64,
+although the physical CMAC ABI already expresses K as 32-lane blocks. A direct
+RK3588 probe now proves logical K=65 with zero-padded lanes in one physical
+K=96 tile in both orientations: `(65,) @ (65,45)` and `(45,65) @ (65,)` match
+FP32 accumulation rounded to FP16 with zero sampled difference. The plans use
+138 and 152 NPU tasks respectively; most remain selector packing, so both are
+cost-visible `CORRECTNESS_FALLBACK` paths rather than efficient contractions.
+
+The unchanged `test_dot_1d` now executes its scalar case and those two K=65
+cases natively, then rejects the first batched `(8,45,65) @ (65,)` layout before
+submission. Its method-level status therefore remains `FAIL`; the current
+169/40/203/13 census is unchanged. The remaining blocker is physical row/batch
+packing, not K arithmetic or a reason to raise the 400-task limit.
+
+Permanent compiler tests require the main CMAC task to use physical K=96, and
+permanent device tests cover both orientations. Regression gates pass with 131
+host tests plus 12 subtests, 93 serialized RK3588 tests plus 60 subtests in
+782.89 seconds, full mypy, and Ruff. No CPU execution, tolerance change,
+timeout, reset error, invalid submission, or process abort occurred.

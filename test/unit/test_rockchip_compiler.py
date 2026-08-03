@@ -1275,6 +1275,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_k65_contractions_pad_one_cbuf_tile_to_k96(self):
+    cases = ((Tensor.empty(65,dtype=dtypes.half),Tensor.empty(65,45,dtype=dtypes.half)),
+             (Tensor.empty(45,65,dtype=dtypes.half),Tensor.empty(65,dtype=dtypes.half)))
+    for lhs,rhs in cases:
+      with self.subTest(lhs=lhs.shape,rhs=rhs.shape):
+        result = lower_tiled_contract_result(sink(lhs.matmul(rhs)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        contracts = [step for step in result.plan.steps if isinstance(step,RKContract)]
+        self.assertTrue(contracts)
+        self.assertIn(96,{step.lhs.layout.physical_shape[-1] for step in contracts})
+        self.assertLessEqual(plan_cost(result.plan).task_count,200)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.roll(1).contiguous()))

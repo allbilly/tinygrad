@@ -165,6 +165,16 @@ class TestRockchip(unittest.TestCase):
     kernels = [event for event in drain() if event["kind"] == "kernel"]
     self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 4 for event in kernels))
 
+  def test_k65_contractions_use_k96_cmac_tile(self):
+    rng = np.random.default_rng(33)
+    for lhs_shape,rhs_shape in (((65,),(65,45)),((45,65),(65,))):
+      with self.subTest(lhs=lhs_shape,rhs=rhs_shape):
+        lhs = rng.uniform(-.5,.5,lhs_shape).astype(np.float16)
+        rhs = rng.uniform(-.5,.5,rhs_shape).astype(np.float16)
+        actual = (Tensor(lhs,device="ROCKCHIP").realize()@Tensor(rhs,device="ROCKCHIP").realize()).realize().numpy()
+        expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
+        np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
+
   def test_rgb_strided_spatial_conv_uses_cna(self):
     rng = np.random.default_rng(21)
     x = rng.uniform(-1,1,(2,3,7,10)).astype(np.float16)
