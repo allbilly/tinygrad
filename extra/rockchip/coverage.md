@@ -2643,3 +2643,22 @@ the JUnit SHA-256 is
 Regression gates pass with 131 host tests plus 12 subtests, 93 device tests plus
 60 subtests, mypy, and Ruff. This moves a real hardware boundary while leaving
 large batched packing as a typed planner rejection.
+
+## Direct PPU AVG numerical rejection
+
+`extra/rockchip/probe_ppu_average.py` reuses the proven sliding-PPU surface and
+changes only pooling method plus the two FP17 reciprocal registers. On current
+RK3588 hardware, all tested valid geometries execute without a driver error but
+fail the unchanged official `rtol=1e-5` contract:
+
+| geometry | max absolute difference | differing FP16 outputs |
+|---|---:|---:|
+| 2x2 / stride 1 | 0.001953125 | 117 / 384 |
+| 3x3 / stride 1 | 0.0029296875 | 267 / 384 |
+| 3x2 / stride 2x1 | 0.001953125 | 161 / 320 |
+| 5x5 / stride 1 | 0.0009765625 | 152 / 200 |
+
+The PyTorch outputs equal an FP32 mean rounded once to FP16, so this is a real
+PPU accumulation/reciprocal mismatch rather than a reference artifact. The
+compiler continues to use only the already proven exact CMAC average paths and
+rejects the remaining cases numerically. No tolerance or coverage count changed.

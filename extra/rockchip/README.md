@@ -1083,3 +1083,17 @@ permanent device tests cover both orientations. Regression gates pass with 131
 host tests plus 12 subtests, 93 serialized RK3588 tests plus 60 subtests in
 782.89 seconds, full mypy, and Ruff. No CPU execution, tolerance change,
 timeout, reset error, invalid submission, or process abort occurred.
+
+## Rejected direct PPU average pooling
+
+NVDLA and the local RKNN command catalogue agree that PPU average mode is the
+sliding-pool task with method zero plus two FP17 reciprocal fields. The durable
+`probe_ppu_average.py` sweep executes those registers through the current DRM
+runtime using the documented 1/K encodings for K=1 through 8.
+
+The engine is functional but does not satisfy TestOps' `rtol=1e-5`: 2x2, 3x3,
+3x2, and 5x5 sweeps differ from PyTorch by up to 0.001953125, 0.0029296875,
+0.001953125, and 0.0009765625 respectively. PyTorch is bit-identical to the
+FP32-accumulate-then-FP16 reference for the same inputs. Direct PPU AVG is
+therefore retained as a hardware characterization probe and is not selected by
+the compiler. This does not change the authoritative 169/40/203/13 census.
