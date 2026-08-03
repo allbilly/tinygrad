@@ -1809,7 +1809,7 @@ plan-stage-limit, 34 unsupported-layout, 23 unsupported-input-dtype, 18
 requires-reformat, 10 unsupported-ALU, and 10 numerical-contract, with 15
 partial/front-end failures lacking one method-level first reject.
 
-## Direct spatial convolution milestone (pending full census)
+## Direct spatial convolution milestone
 
 `test_simple_conv2d_batched` was the closest stage-limit reject at 421 tasks,
 only 21 above the unchanged ceiling. Plan inspection showed that merely raising
@@ -1834,10 +1834,8 @@ The official strict method passes in 10.97 seconds at unchanged tolerance, and
 a randomized device test confirms both numerical parity and two telemetry-
 visible `CONV` tasks. The full serialized device suite passes 79 tests plus 56
 subtests in 728.68 seconds; 104 host tests plus three subtests, full tinygrad
-mypy, and touched-file Ruff also pass. This is one focused failure-to-native
-transition not yet folded into a complete 425-method census, so the
-authoritative count remains 150 native, 40 frontend-only, 222 failed, and 13
-upstream-skipped methods until that census is rerun.
+mypy, and touched-file Ruff also pass. The complete census below confirms this
+failure-to-native transition.
 
 ### Channel-16 direct layout
 
@@ -1855,6 +1853,41 @@ passes in 30.99 seconds, and a randomized device test confirms parity plus one
 telemetry-visible `CONV` task. The complete expanded hardware suite passes 81
 tests plus 56 subtests in 750.28 seconds; 105 host tests plus three subtests,
 mypy, and touched-file Ruff also pass. Together the two direct-convolution
-milestones account for two focused failure-to-native transitions pending the
-next complete census; the authoritative 425-method totals remain unchanged
-until that run completes.
+milestones account for the two failure-to-native transitions in the complete
+census.
+
+## Complete direct-convolution census
+
+The complete uncached strict run at `c65396da1` finishes in 2,498.83 seconds:
+
+```
+152  PASS_NATIVE
+ 40  PASS_FRONTEND
+220  FAIL
+ 13  SKIP_UPSTREAM
+425  total
+```
+
+Raw pytest reports 204 passed, 256 failed, 13 skipped, and 78 passing subtests.
+Relative to the `d1437ad58` census, exactly
+`TestOps.test_simple_conv2d_batched` and `TestOps.test_simple_conv2d_m4`
+transition from failure to native pass. No accepted method regresses. The run
+completes without an NPU timeout, invalid submission, reset failure, or process
+abort.
+
+The telemetry JSON and JUnit XML are stored under
+`~/rk2608_backups/census-direct-conv-c65396da1-20260803/`. Their SHA-256 hashes
+are `7dd09a9152e43af0fbc726ce71e4972d2bd3eff3a96c17d26c0d7d3f47a3a369`
+and `427a54dc6a4b9fac478b0ab8b548c80740a78b5483c14d121801ca602b758867`
+respectively.
+
+The reporter currently leaves failed subtest rejects under each subcase rather
+than promoting one to a method-level field. Reading both locations resolves 12
+of the 15 apparent method-level gaps. The aggregate first-reject Pareto is 65
+unsupported-output-dtype, 50 plan-stage-limit, 35 unsupported-layout, 23
+unsupported-input-dtype, 18 requires-reformat, 13 numerical-contract, 10
+unsupported-ALU, and three unsupported-reduction. Only `test_cumprod`,
+`test_maximum`, and `test_mulacc_with_zero_strides` have no compiler reject at
+any level; they require numerical/runtime/frontend failure classification, not
+a fabricated reject. This distinction is the input to the next telemetry
+milestone.

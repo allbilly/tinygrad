@@ -478,8 +478,7 @@ A separate randomized hardware regression verifies numerical parity and that
 telemetry records two `CONV` tasks. All 104 host tests plus three subtests pass,
 mypy is clean across 225 modules, touched-file Ruff is clean, and the complete
 serialized device suite passes 79 tests plus 56 subtests in 728.68 seconds.
-This focused failure-to-native transition is pending the next complete census,
-so the authoritative headline remains 150 native methods.
+The complete census below confirms this failure-to-native transition.
 
 The second direct-convolution milestone adds the independently proven
 16-input-channel layout. The exact affine matcher also accepts batch-one graphs
@@ -498,8 +497,26 @@ Strict `TestOps.test_simple_conv2d_m4` passes in 30.99 seconds, and a randomized
 hardware regression verifies numerical parity and one telemetry-visible
 `CONV` task. All 105 host tests plus three subtests pass, mypy and touched-file
 Ruff are clean, and the expanded serialized device suite passes 81 tests plus
-56 subtests in 750.28 seconds. This is a second focused failure-to-native gain
-pending the next complete census.
+56 subtests in 750.28 seconds. The complete census confirms this second
+failure-to-native transition as well.
+
+The complete uncached strict census at `c65396da1` finishes in 2,498.83 seconds
+with **152 native**, **40 frontend-only**, **220 failed**, and **13
+upstream-skipped** methods. Raw pytest reports 204 passed, 256 failed, 13
+skipped, and 78 passing subtests. Relative to `d1437ad58`, exactly
+`test_simple_conv2d_batched` and `test_simple_conv2d_m4` change from failure to
+native pass; no previously accepted method regresses. The run completes with
+no NPU timeout, invalid submission, reset failure, or process abort.
+
+The durable telemetry and JUnit artifacts are stored under
+`~/rk2608_backups/census-direct-conv-c65396da1-20260803/`. Their SHA-256 hashes
+are `7dd09a9152e43af0fbc726ce71e4972d2bd3eff3a96c17d26c0d7d3f47a3a369`
+and `427a54dc6a4b9fac478b0ab8b548c80740a78b5483c14d121801ca602b758867`.
+Aggregating rejects retained by failed subcases reduces the apparent 15
+missing method-level rejects to three true non-reject failures. The resulting
+first-reject Pareto is 65 unsupported-output-dtype, 50 plan-stage-limit, 35
+unsupported-layout, 23 unsupported-input-dtype, 18 requires-reformat, 13
+numerical-contract, 10 unsupported-ALU, and three unsupported-reduction.
 
 ## Current upstream blocker
 
