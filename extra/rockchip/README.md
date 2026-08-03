@@ -11,7 +11,10 @@ The current authoritative uncached strict census at `d6bb0b304` is 165 native,
 425-method inventory. It completed without an NPU timeout, reset failure,
 invalid submission, or process abort. Relative to `4e2bbe7ef`, depthwise and
 strided convolution are the only method transitions and there is no regression.
-Coverage details and durable artifact hashes are recorded in `coverage.md`.
+A later focused per-channel CNA milestone makes `test_fancy_conv2d` pass and
+implies 166 native methods, but that count remains provisional until the next
+complete uncached census. Coverage details and durable artifact hashes are
+recorded in `coverage.md`.
 
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor
@@ -871,3 +874,30 @@ All 125 host tests plus ten subtests pass, mypy checks all 225 modules, and
 Ruff is clean. The complete serialized device contract passes 88 tests plus 58
 subtests in 719.03 seconds without a timeout, invalid submission, reset failure,
 or process abort.
+
+### Per-channel depthwise CNA
+
+The full `allbilly/rk3588` history adds one portable convolution strategy beyond
+the raw register formulas: its hardware runner executes depthwise convolution
+as independent group-1 channel tasks. The clean compiler now recognizes the
+generic dense NCHW depthwise affine form, pads each physical task to the proven
+minimum two output channels, and emits one CNA task per batch/channel. It does
+not import the reference's NumPy packing, Python assembly, or loose tolerance.
+
+The initial one-output-channel physical task timed out. With the required
+two-channel tile, exactly half of the batch-2/channel-3 outputs were corrupt:
+the failing channel planes began at byte offsets congruent to eight modulo 16.
+The final plan therefore aligns every logical input plane to a 16-byte base
+through an NPU selector pack, pads the second physical weight kernel with zero,
+and compacts channel zero from each CNA output through another NPU selector.
+These are physical legality rules, not shape- or test-name predicates.
+
+The official `test_fancy_conv2d` passes at unchanged tolerance. Its complete
+plan has 108 tasks, 292,576 constant bytes, 53,088 scratch bytes, and six CNA
+tasks. This remains a `CORRECTNESS_FALLBACK` until direct layout conversion
+replaces selector packing, but it stays below every existing plan ceiling. The
+existing official depthwise method and all previous device regressions remain
+green. All 126 host tests plus ten subtests pass, mypy and Ruff are clean, and
+the complete serialized device contract passes 89 tests plus 58 subtests in
+730.57 seconds without a timeout, invalid submission, reset failure, or process
+abort. The focused result implies 166/40/206/13 pending a complete census.

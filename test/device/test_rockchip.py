@@ -68,6 +68,24 @@ class TestRockchip(unittest.TestCase):
     kernels = [event for event in drain() if event["kind"] == "kernel"]
     self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 2 for event in kernels))
 
+  def test_depthwise_channel_planes_use_cna(self):
+    rng = np.random.default_rng(29)
+    x = rng.uniform(-1,1,(2,3,11,28)).astype(np.float16)
+    weight = rng.uniform(-1,1,(3,1,3,3)).astype(np.float16)
+    old_telemetry = os.environ.get("ROCKCHIP_TELEMETRY")
+    os.environ["ROCKCHIP_TELEMETRY"] = "memory"
+    clear()
+    try: actual = Tensor(x,device="ROCKCHIP").conv2d(Tensor(weight,device="ROCKCHIP"),groups=3).realize().numpy()
+    finally:
+      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY",None)
+      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+    expected = np.zeros((2,3,9,26),dtype=np.float32)
+    for ky in range(3):
+      for kx in range(3): expected += x[:,:,ky:ky+9,kx:kx+26].astype(np.float32)*weight[:,0,ky,kx][None,:,None,None]
+    np.testing.assert_allclose(actual,expected.astype(np.float16),rtol=1e-3,atol=1e-6)
+    kernels = [event for event in drain() if event["kind"] == "kernel"]
+    self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 6 for event in kernels))
+
   def test_channel16_direct_spatial_conv_uses_cna(self):
     rng = np.random.default_rng(18)
     x = rng.uniform(-1,1,(1,16,9,9)).astype(np.float16)

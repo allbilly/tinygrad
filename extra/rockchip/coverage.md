@@ -31,6 +31,10 @@ is `~/rk2608_backups/census-pointwise-d6bb0b304-20260804/test_ops_coverage.json`
 the JUnit XML SHA-256 is
 `b02b396f7647ffaa69dd3d30f96934c7598e6deebef9a5e8054c80a4c5975991`.
 
+A later focused per-channel CNA milestone changes `test_fancy_conv2d` from
+`PLAN_STAGE_LIMIT` to native pass, implying 166/40/206/13. That transition is
+not authoritative until the next complete uncached 425-method census.
+
 The 504 successful native kernels contain 477 `EFFICIENT` and 27
 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 179 at
 2--8, 98 at 9--32, 79 at 33--64, ten at 65--128, 14 at 129--256, and three at
@@ -2403,3 +2407,39 @@ All 125 host tests plus ten subtests pass, mypy checks all 225 modules, and
 Ruff is clean. The complete serialized RK3588 device contract passes 88 tests
 plus 58 subtests in 719.03 seconds without a timeout, invalid submission, reset
 failure, or process abort.
+
+## Per-channel depthwise CNA from the full `allbilly/rk3588` audit
+
+After unshallowing `allbilly/rk3588`, its deeper history confirms a generic
+per-channel depthwise strategy: lower each depthwise channel to one group-1 CNA
+task and pad the physical output-channel tile to `MIN_HW_OC=2`. Its active
+runner still uses NumPy to pack weights and inputs, assembles channels in
+Python, and validates the 217-shape sweep with `atol=0.12, rtol=0.02`; none of
+those host or tolerance policies were imported.
+
+The clean compiler recognizes the affine relation directly:
+
+```text
+feature[b,c,oy*sy+ky,ox*sx+kx]
+  * weight[c,ky,kx]
+  -> output[b,c,oy,ox]
+```
+
+It emits an NPU-only sequence: aligned selector input pack, selector weight
+padding, one two-output-channel CNA task per `(batch,channel)`, then selector
+compaction of physical output channel zero. The first physical OC=1 experiment
+timed out at the first CONV stage. OC=2 executed, but without aligned channel
+planes 702 of 1,404 outputs were wrong: precisely the three planes whose source
+base was eight bytes past a 16-byte boundary. Padding each 308-value plane to
+312 FP16 values removed the corruption and establishes a reusable CNA base
+alignment rule.
+
+The official batch-2/channel-3 `test_fancy_conv2d` now passes at unchanged
+`rtol=1e-3, atol=1e-6`. The plan has 108 tasks, 4,714 command words, 108 resets,
+292,576 constant bytes, 53,088 scratch bytes, and six CONV tasks. It remains a
+cost-visible correctness fallback; no plan ceiling was raised. The existing
+official depthwise method also passes. All 126 host tests plus ten subtests,
+mypy, and Ruff pass, and the complete serialized device contract passes 89
+tests plus 58 subtests in 730.57 seconds with no timeout, invalid submission,
+reset failure, or process abort. A new full census is required before replacing
+the authoritative 165/40/207/13 count with the focused 166/40/206/13 result.

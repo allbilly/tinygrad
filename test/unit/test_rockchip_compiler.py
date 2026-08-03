@@ -12,7 +12,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_reduce_result,
   lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_spatial_contract_result,
-  lower_tiled_contract_result, plan_cost,
+  lower_depthwise_spatial_contract_result, lower_tiled_contract_result, plan_cost,
   rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
@@ -891,6 +891,20 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(cost.task_count,100)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
     self.assertFalse(contains_uop(plan))
+
+  def test_depthwise_channel_planes_use_direct_conv(self):
+    source = Tensor.empty(2,3,11,28,dtype=dtypes.half)
+    weight = Tensor.empty(3,1,3,3,dtype=dtypes.half)
+    result = lower_depthwise_spatial_contract_result(sink(source.conv2d(weight,groups=3)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    image, cost = emit_program(result.plan), plan_cost(result.plan)
+    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in result.plan.steps),6)
+    self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),6)
+    self.assertLessEqual(cost.task_count,128)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_channel16_spatial_contraction_uses_direct_conv(self):
     plan = lower_spatial_contract_result(sink(Tensor.empty(1,16,9,9,dtype=dtypes.half).conv2d(
