@@ -18,6 +18,14 @@ failure to native pass. Every remaining failure is now a typed native reject;
 there are no device or unclassified frontend failures in the authoritative
 inventory.
 
+The newer bounded static-reformat milestone is not yet part of that census.
+Focused strict telemetry moves `test_simple_repeat`, `test_repeat_interleave`,
+`test_roll`, and `test_pad_reshape` to native execution. The compiler preserves
+the identity of split RANGE subaxes and exactly enumerates bounded compile-time
+modulo/floor-divide maps before choosing the existing costed NPU selector.
+Dynamic tensor indexing is still rejected, and the authoritative totals remain
+154/40/218/13 until the next complete uncached run.
+
 The compiler boundary is:
 
 ```text
@@ -628,8 +636,8 @@ only method transition, producing the authoritative 154/40/218/13 result.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,957, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,957 lines.
-The exact 3,989-line delta is 3,980 counted Rockchip backend lines, the
+contains 28,982, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,982 lines.
+The exact 4,014-line delta is 4,005 counted Rockchip backend lines, the
 five-line generic native-program hook, and four generic correctness lines.
 Generated
 register definitions, LUT payloads, and reproducible command data belong under
@@ -637,3 +645,30 @@ register definitions, LUT payloads, and reproducible command data belong under
 remain counted. The generic hook can be reviewed separately, while the backend
 needs real upstream line budget or independently useful in-tree reductions
 before submission.
+
+## Bounded exact static reformat maps
+
+Late movement lowering can contain more than one RANGE with the same logical
+axis number after a dimension is split. The old affine dictionary keyed only
+by `RANGE.arg[0]`, so it collapsed distinct subaxes such as `(1,0)` and `(1,1)`
+and reported false holes or collisions. Non-affine but compile-time maps using
+floor division or modulo had the same limitation.
+
+The reformat lowerer now retains full RANGE UOp identity for the exact path and
+enumerates at most 65,536 coordinate visits. It accepts redundant writes only
+when they select the same source element, proves a dense destination, and then
+hands the immutable map to the existing coalesced-DPU/selector-CMAC cost
+choice. The proven selector contract remains bounded to 512 source and 4,096
+destination elements plus the unchanged 400-task and 2 MiB constant ceilings;
+larger valid maps return `PLAN_STAGE_LIMIT`. Dynamic gather/scatter indexes
+remain non-evaluable and reject.
+
+Focused strict TestOps telemetry records native passes for
+`test_simple_repeat`, `test_repeat_interleave`, `test_roll`, and
+`test_pad_reshape`; `test_repeat`, `test_pad`, and `test_pad_slice` still fail
+later independent subcases and are not claimed. Permanent compiler regressions
+cover split-axis repeat multiplicity and exact modulo-roll mapping. A serial
+RK3588 regression executes both maps exactly after mixed-engine work. All 115
+Rockchip host tests plus three subtests, mypy, and Ruff pass; the complete
+device suite passes 83 tests plus 56 subtests in 695.02 seconds without a
+timeout, invalid submission, reset failure, or process abort.

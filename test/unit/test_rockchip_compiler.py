@@ -1,4 +1,5 @@
 import hashlib, struct, unittest
+from collections import Counter
 from dataclasses import fields, is_dataclass
 from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
@@ -1117,6 +1118,26 @@ class TestDPUCompiler(unittest.TestCase):
     contracts = [step for step in result.plan.steps if isinstance(step, RKContract)]
     self.assertEqual([(step.out.layout.logical_shape,step.out.layout.physical_shape) for step in contracts], [((1,64),(1,64))])
     self.assertTrue(contracts[0].compact_output)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_split_range_reformat_preserves_subaxis_identity(self):
+    source = Tensor.empty(3,3,dtype=dtypes.half).realize()
+    result = lower_reformat_result(sink(source.repeat(3,3,4).contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    self.assertEqual(Counter(result.plan.mapping), {index:36 for index in range(9)})
+    self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
+    source = Tensor.empty(4,8,dtype=dtypes.half).realize()
+    result = lower_reformat_result(sink(source.roll(1).contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    self.assertEqual(result.plan.mapping, (31,*range(31)))
+    self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
 
   def test_affine_reduction_materializes_pointwise_dpu_expression(self):

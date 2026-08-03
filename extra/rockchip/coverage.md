@@ -2104,3 +2104,42 @@ passes 82 tests plus 56 subtests in 694.38 seconds with no timeout, invalid
 submission, reset failure, or process abort. The complete uncached census at
 `2bf8c337b` confirms that this is the only outcome transition and establishes
 the authoritative 154/40/218/13 totals.
+
+## Bounded exact split-range reformat
+
+The late UOp form for repeat and related movement operations can split one
+logical axis into multiple RANGE nodes that share `arg[0]` but differ in their
+full UOp identity. The previous affine coordinate dictionary collapsed those
+subaxes. This produced false output holes/collisions, while modulo-based rolls
+were rejected as non-affine even though every coordinate was compile-time
+bounded.
+
+Static reformat now keeps full RANGE identities whenever an axis is split or
+either index is non-affine. It evaluates only integer compile-time coordinate
+expressions, requires a dense destination, and permits duplicate visits only
+when they map that destination to the same source. Enumeration is capped at
+65,536 visits. The resulting immutable map still goes through the established
+NPU-only implementation hierarchy: coalesced aligned DPU atom copies first,
+then the costed selector-CMAC correctness path. The selector remains limited
+to 512 source elements, 4,096 outputs, 400 tasks, and 2 MiB of constants;
+exceeding that contract returns `PLAN_STAGE_LIMIT`. No dynamic tensor index,
+host gather, test-name match, or CPU fallback is introduced.
+
+Focused schema-v2 telemetry under
+`~/rk2608_backups/focused-static-reformat-4b958169f-20260803/` records four
+method transitions to `PASS_NATIVE`: `test_simple_repeat`,
+`test_repeat_interleave`, `test_roll`, and `test_pad_reshape`. The first uses
+one 18-task selector plan; repeat-interleave uses five three-task kernels, and
+the roll/pad-reshape families remain small native plans. Larger `test_repeat`
+and later pad/pad-slice subcases retain typed independent failures, so no
+additional method is claimed.
+
+Permanent compiler regressions prove that a `(3,3)` input repeated by
+`(3,3,4)` maps each of its nine sources exactly 36 times and that a 32-element
+roll produces `(31,0,...,30)`. A strict serialized RK3588 regression verifies
+both outputs after other engine activity. All 115 Rockchip host tests plus
+three subtests pass, mypy checks all 225 source files, and Ruff is clean. The
+complete device suite passes 83 tests plus 56 subtests in 695.02 seconds with
+no timeout, invalid submission, reset failure, or process abort. The
+authoritative method census intentionally remains 154/40/218/13 pending a
+complete uncached rerun.

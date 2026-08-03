@@ -322,11 +322,12 @@ def _strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
   return u
 
-def _static_scalar(u:UOp, ranges:dict[int, int]) -> int|float|bool|None:
+def _static_scalar(u:UOp, ranges:dict[int, int]|dict[UOp, int]) -> int|float|bool|None:
   """Evaluate one compile-time coordinate predicate; tensor loads are never accepted."""
   if u.op is Ops.CAST: return _static_scalar(u.src[0], ranges)
   if u.op is Ops.CONST: return u.arg
-  if u.op is Ops.RANGE: return ranges.get(u.arg[0])
+  if u.op is Ops.RANGE:
+    return cast(dict[UOp,int], ranges)[u] if u in ranges else cast(dict[int,int], ranges).get(u.arg[0])
   values = tuple(_static_scalar(x, ranges) for x in u.src)
   if any(x is None for x in values): return None
   if u.op is Ops.ADD: return values[0]+values[1]  # type: ignore[operator]
@@ -404,25 +405,44 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   if store.src[0].dtype is not dtypes.half or value.dtype is not dtypes.half:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires FP16 input and output", store.src[0].op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
-  if out_aff is None or src_aff is None:
-    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat indexes are not affine", Ops.INDEX)
-  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
-  axes = tuple(sorted(out_aff[0].keys() | src_aff[0].keys()))
-  if any(axis not in ranges for axis in axes): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "dynamic reformat range", Ops.RANGE)
   count, src_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
   mapping = [-2] * count
-  for coordinates in product(*(range(ranges[axis]) for axis in axes)):
-    point = dict(zip(axes, coordinates))
-    dst = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in axes)
-    src = src_aff[1] + sum(src_aff[0].get(axis, 0)*point[axis] for axis in axes)
-    selected = True
-    if condition is not None:
-      if (predicate:=_static_scalar(condition, point)) is None:
-        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat predicate is not static", condition.op)
-      selected = bool(predicate) is select_true
-    if not 0 <= dst < count or mapping[dst] != -2 or selected and not 0 <= src < src_count:
-      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat does not cover one dense output", Ops.INDEX)
-    mapping[dst] = src if selected else -1
+  range_uops = tuple(dict.fromkeys(u for root in (store.src[0].src[1], value.src[1], condition) if root is not None
+                                  for u in root.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST))
+  split_axes = len({u.arg[0] for u in range_uops}) != len(range_uops)
+  if out_aff is None or src_aff is None or split_axes:
+    visits = math.prod(int(u.src[0].arg) for u in range_uops)
+    if visits > RK_MAX_AFFINE_VISITS:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"static reformat needs {visits} coordinate visits", Ops.RANGE)
+    for coordinates in product(*(range(int(u.src[0].arg)) for u in range_uops)):
+      static_point = dict(zip(range_uops, coordinates))
+      dst = _static_scalar(store.src[0].src[1], static_point)
+      selected = True
+      if condition is not None:
+        if (predicate:=_static_scalar(condition, static_point)) is None:
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat predicate is not static", condition.op)
+        selected = bool(predicate) is select_true
+      src = _static_scalar(value.src[1], static_point) if selected else -1
+      if not isinstance(dst, int) or isinstance(dst, bool) or not isinstance(src, int) or isinstance(src, bool) or \
+         not 0 <= dst < count or selected and not 0 <= src < src_count or mapping[dst] not in (-2, src):
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat static indexes do not cover one output", Ops.INDEX)
+      mapping[dst] = src
+  else:
+    ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+    axes = tuple(sorted(out_aff[0].keys() | src_aff[0].keys()))
+    if any(axis not in ranges for axis in axes): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "dynamic reformat range", Ops.RANGE)
+    for coordinates in product(*(range(ranges[axis]) for axis in axes)):
+      affine_point = dict(zip(axes, coordinates))
+      dst = out_aff[1] + sum(out_aff[0].get(axis, 0)*affine_point[axis] for axis in axes)
+      src = src_aff[1] + sum(src_aff[0].get(axis, 0)*affine_point[axis] for axis in axes)
+      selected = True
+      if condition is not None:
+        if (predicate:=_static_scalar(condition, affine_point)) is None:
+          return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat predicate is not static", condition.op)
+        selected = bool(predicate) is select_true
+      if not 0 <= dst < count or mapping[dst] != -2 or selected and not 0 <= src < src_count:
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat does not cover one dense output", Ops.INDEX)
+      mapping[dst] = src if selected else -1
   if any(source == -2 for source in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output has holes", Ops.INDEX)
   output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
   stages:list[RKDPUStage] = []
@@ -453,6 +473,11 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       output, source, src_count, [[src] if src >= 0 else [] for src in mapping], ())) is not None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.SELECTOR_CMAC,
       cast(tuple[RKDPUProgram|RKContract, ...], implementation.steps), implementation.scratch))
+  if src_count > 512 or count > 4096:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"static reformat selector surface {src_count}->{count} exceeds the proven 512->4096 bound", Ops.INDEX)
+  if 0 < src_count and 0 < count:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "static reformat selector exceeds the native cost contract", Ops.INDEX)
   return atom_reject
 
 def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:

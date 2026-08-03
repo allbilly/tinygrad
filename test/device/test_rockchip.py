@@ -378,6 +378,13 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(square,device="ROCKCHIP").realize().T.contiguous().realize().numpy()
     np.testing.assert_equal(actual,square.T)
 
+  def test_static_split_and_modulo_movements_native_cmac(self):
+    data = np.arange(9,dtype=np.float16).reshape(3,3)
+    tensor = Tensor(data,device="ROCKCHIP").realize()
+    np.testing.assert_equal(tensor.repeat(3,3,4).contiguous().realize().numpy(), np.tile(data,(3,3,4)))
+    rolled = np.arange(32,dtype=np.float16).reshape(4,8)
+    np.testing.assert_equal(Tensor(rolled,device="ROCKCHIP").realize().roll(1).contiguous().realize().numpy(), np.roll(rolled,1))
+
   def test_input_dma_atom_padding_survives_lut_then_cmac(self):
     zero, negative = Tensor([0], dtype=dtypes.half, device="ROCKCHIP"), Tensor([-.7], dtype=dtypes.half, device="ROCKCHIP")
     np.testing.assert_equal((zero.log2()*negative).realize().numpy(), np.array([np.inf], dtype=np.float16))
