@@ -698,3 +698,24 @@ The complete uncached census confirms these as the only two method
 transitions, with no regression, and establishes the authoritative
 162/40/210/13 result. All 210 remaining failures are `NATIVE_REJECT`;
 unsupported-layout falls from 28 to 26 method-first rejects.
+
+## Affine-mean numerical contract
+
+Ceil-mode average pooling with `count_include_pad=False` reaches a ratio of two
+static sibling ADD reductions: a masked input sum divided by a masked count.
+Two NPU-only implementations were characterized. Materializing numerator and
+count surfaces before DPU division, including an explicit FP16 reciprocal
+boundary, differed from the official result by one FP16 ULP. Folding the
+per-output reciprocal into row-scaled CMAC selector weights reduced some errors
+but retained the same one-ULP violation. Neither implementation is accepted.
+
+The compiler now recognizes this generic reduction-ratio family and returns
+`NUMERICAL_CONTRACT` before submission, rather than letting the later nested
+sum lowerer report an imprecise unsupported-reduction reason or returning a
+wrong native result. The complete experimental source and test are preserved
+under `~/rk2608_backups/wip-affine-mean-rounding-12875809d-20260803/`; its
+source SHA-256 is
+`7394136e361afcf1880ba9fa08a1001cbeb8ad2050b7f92fd8f9f1774fee150b`.
+This milestone intentionally changes no pass count. A future native path must
+reproduce the source reduction's accumulation order/precision rather than
+relaxing the official tolerance.

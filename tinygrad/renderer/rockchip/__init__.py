@@ -728,6 +728,30 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
                         _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
   return _native(RKProgram((*prefix, RKDPUProgram(tuple(stages)), contract), tuple(scratch)))
 
+def lower_affine_mean_result(sink:UOp) -> RKLowerResult:
+  """Reject sibling ADD-reduction ratios until hardware can reproduce their FP16 accumulation contract."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 2 or any(u.arg[0] is not Ops.ADD or not u.src[1:] for u in reductions):
+    return _not_applicable()
+  stored = _strip_casts(stores[0].src[1])
+  if stored.op is not Ops.MUL: return _not_applicable()
+  pair = next((( _strip_casts(numerator), _strip_casts(reciprocal.src[0])) for numerator,reciprocal in
+    (stored.src, stored.src[::-1]) if reciprocal.op is Ops.RECIPROCAL and
+    _strip_casts(numerator).op is Ops.REDUCE and _strip_casts(reciprocal.src[0]).op is Ops.REDUCE), None)
+  if pair is None: return _not_applicable()
+  numerator, denominator = pair
+  if {numerator,denominator} != set(reductions): return _not_applicable()
+  numerator_value = _strip_casts(numerator.src[0])
+  if _conditional_index(numerator_value) is None: return _not_applicable()
+  denominator_value = _strip_casts(denominator.src[0])
+  if denominator_value.op is not Ops.WHERE: return _not_applicable()
+  arms = tuple(_strip_casts(x) for x in denominator_value.src[1:])
+  if not all(x.op is Ops.CONST for x in arms) or {float(x.arg) for x in arms} != {0.0,1.0}: return _not_applicable()
+  # Preserved hardware probes tried both materialized numerator/count division and row-scaled CMAC weights. Both differed from
+  # the official avg-pool result by one FP16 ULP because CMAC does not reproduce the source reduction's accumulation contract.
+  return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
+    "affine mean selector CMAC does not preserve the required FP16 accumulation rounding", stored.op)
+
 def lower_nested_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Compose two affine ADD reductions while preserving their intermediate FP16 rounding boundary."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -1861,6 +1885,8 @@ _LOWERERS = (
   RKLowerer("multi_broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_multi_broadcast_alu_result),
   RKLowerer("broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_broadcast_alu_result),
   RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),
+  RKLowerer("affine_mean", lambda nodes:_has_reduction(nodes, Ops.ADD) and sum(u.op is Ops.REDUCE for u in nodes) == 2,
+            lower_affine_mean_result),
   RKLowerer("nested_sum", lambda nodes:_has_reduction(nodes, Ops.ADD) and sum(u.op is Ops.REDUCE for u in nodes) > 1,
             lower_nested_add_reduce_result),
   RKLowerer("scalar_mul", lambda nodes:_has_reduction(nodes, Ops.MUL), lower_scalar_mul_reduce_result),

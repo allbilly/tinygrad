@@ -2187,3 +2187,22 @@ regression. It establishes the authoritative 162/40/210/13 result, with all
 210 failures classified as `NATIVE_REJECT`. Unsupported-layout falls from 28
 to 26 method-first rejects. Durable JSON and JUnit hashes are recorded in the
 current-census section above.
+
+## Affine-mean rounding guard
+
+The three remaining first-rejects previously classified as generic nested ADD
+reductions contain a masked numerator sum multiplied by the reciprocal of a
+sibling masked count sum. Focused hardware characterization tried both
+materialized numerator/count division and row-scaled selector-CMAC weights.
+Both missed unchanged official FP16 results by one ULP on accepted subcases;
+the row-scaled form still mismatched two of nine outputs for the `(3,3)`
+ceil-mode case. No tolerance was changed and no CPU fallback was enabled.
+
+The compiler now retains a structural recognizer solely to reject this family
+as `NUMERICAL_CONTRACT` before device submission. The focused rejection check
+confirms all three parameterized
+`test_avg_pool2d_ceil_mode_padding_not_counted` cases stop with that exact
+reason. The WIP implementation is preserved under
+`~/rk2608_backups/wip-affine-mean-rounding-12875809d-20260803/`. Since this is
+a diagnostic/correctness milestone rather than new coverage, the authoritative
+complete census remains 162/40/210/13 until another full uncached run.

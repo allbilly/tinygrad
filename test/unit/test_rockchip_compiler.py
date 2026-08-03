@@ -9,7 +9,8 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
-  encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
+  encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
+  lower_reduce_result,
   lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_spatial_contract_result,
   lower_tiled_contract_result, plan_cost,
   rk_fingerprint)
@@ -996,6 +997,13 @@ class TestDPUCompiler(unittest.TestCase):
       assert isinstance(result.plan, RKProgram)
       self.assertGreaterEqual(sum(isinstance(step, RKContract) for step in result.plan.steps), 2)
       self.assertFalse(contains_uop(result.plan))
+
+  def test_affine_mean_rejects_selector_rounding(self):
+    source = Tensor.empty(1,1,6,6,dtype=dtypes.half).realize()
+    result = lower_affine_mean_result(sink(source.avg_pool2d((3,3),padding=1,stride=3,ceil_mode=True,count_include_pad=False)))
+    self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
+    self.assertIsNotNone(result.reject)
+    self.assertIs(result.reject.kind, RKRejectKind.NUMERICAL_CONTRACT)
 
   def test_short_scalar_product_gathers_lanes_into_aligned_atoms(self):
     product_input = Tensor.empty(9,dtype=dtypes.half).realize()
