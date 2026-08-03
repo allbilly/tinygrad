@@ -6,10 +6,10 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `d237777da` is 152 native,
-40 frontend-only, 220 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. Raw pytest reports 204 passed, 256 failed, 13 skipped,
-and 78 passing subtests in 2,345.47 seconds. It completed without an NPU
+The current authoritative uncached strict census at `95c0cc501` is 153 native,
+40 frontend-only, 219 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. Raw pytest reports 205 passed, 256 failed, 13 skipped,
+and 77 passing subtests in 2,250.74 seconds. It completed without an NPU
 timeout, reset failure, invalid submission, or process abort. Coverage details
 and durable artifact hashes are recorded in `coverage.md`.
 
@@ -598,11 +598,11 @@ propagation. The result is a 56-task, seven-scratch NPU-only plan. The unchanged
 strict `TestOps.test_sin` passes in 19.67 seconds and a boundary/wide-magnitude
 hardware regression passes in 13.06 seconds. TAN is not enabled: the reference
 native experiments remained outside strict tolerance and rockchip-2607 used a
-NumPy host implementation. The authoritative method census remains 152 native
-pending a complete uncached run; the focused expected transition is one
-unsupported-ALU failure to native pass. The complete serialized device suite
-passes 82 tests plus 56 subtests in 693.48 seconds with no timeout, reset
-failure, invalid submission, or process abort.
+NumPy host implementation. The complete uncached census confirms that SIN is
+the sole method transition: the authoritative result is now 153 native, 40
+frontend-only, 219 failed, and 13 upstream-skipped. The complete serialized
+device suite passes 82 tests plus 56 subtests in 693.48 seconds with no timeout,
+reset failure, invalid submission, or process abort.
 
 ## Current upstream blocker
 

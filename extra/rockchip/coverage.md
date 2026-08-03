@@ -12,26 +12,28 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `d237777da` contains exactly 425 method records:
-152 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 220 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `95c0cc501` contains exactly 425 method records:
+153 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 219 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 256 failed methods/subtests, 204 passed, 78 passing subtests,
-and 13 skipped in 2,345.47 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 256 failed methods/subtests, 205 passed, 77 passing subtests,
+and 13 skipped in 2,250.74 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to the 152-pass `c65396da1` census, no method changes outcome. The
-32-output selector tile is therefore a cost milestone, not a coverage claim.
-The 220 failed methods first classify as 65 unsupported-output-dtype, 48
-plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
-requires-reformat, 16 numerical-contract, 10 unsupported-ALU, three
-unsupported-reduction, and two failures with no native reject. Schema version
-2 classifies 218 as `NATIVE_REJECT`; `test_cumsum` is a post-execution
-numerical failure and `test_mulacc_with_zero_strides` is a pre-device Clang
-failure. The durable telemetry is
-`~/rk2608_backups/census-wide-selector-d237777da-20260803/test_ops_coverage.json`
-(SHA-256 `cfc3dffab84ac7c1c84c2fede9213a631d3d205d3a757408bc828896afb36e64`);
+Relative to the `d237777da` census, only `test_sin` changes from failure to
+native pass. The 219 failed methods first classify as 65
+unsupported-output-dtype, 49 plan-stage-limit, 35 unsupported-layout, 23
+unsupported-input-dtype, 18
+requires-reformat, 16 numerical-contract, nine unsupported-ALU, and three
+unsupported-reduction. Schema version 2 classifies 218 as `NATIVE_REJECT`;
+only `test_mulacc_with_zero_strides` is a pre-device Clang failure without a
+native reject. The post-census cumsum guard now records its structural
+multi-tile numerical reject. `test_avg_pool2d_padding` reaches stage limit
+before its former numerical contract in this run; neither method changes
+outcome. The durable telemetry is
+`~/rk2608_backups/census-sin-95c0cc501-20260803/test_ops_coverage.json`
+(SHA-256 `0d6c92f01df86185e158077d6ce693253d1a947793b05250e736ec5015d9d57e`);
 the JUnit XML SHA-256 is
-`8b77a964e12230ffa3115633162051b17819e5bf74b16a9de78b7e3e0aa26f03`.
+`549009e30fa00aedca50fcfe3abcbee759271c83e9877441b0b7889857ec68a4`.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -2067,8 +2069,8 @@ still-unsupported TAN and independently proves DPU-to-Python-to-DPU mapped
 buffer coherence; the fallback remains disabled for every official coverage
 run. The clean rerun has no device or numerical failures.
 
-This is a focused expected transition from `unsupported_alu` to
-`PASS_NATIVE`; the authoritative complete census remains 152/40/220/13 until
-the next uncached 425-method run. COS is not claimed because the census plugin
-promotes its public method to FP32, and TAN remains rejected because the frozen
-native probes missed strict near-pole comparisons.
+The complete uncached census confirms this as the sole method transition from
+`unsupported_alu` to `PASS_NATIVE`, producing the authoritative
+153/40/219/13 result. COS is not claimed because the census plugin promotes
+its public method to FP32, and TAN remains rejected because the frozen native
+probes missed strict near-pole comparisons.
