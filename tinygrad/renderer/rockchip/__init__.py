@@ -13,7 +13,7 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
   RKALUStage, RKFusedALUStage as RKFusedALUStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKReformat, RKProgram, RKPlanCost,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformat, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
@@ -172,6 +172,10 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
       reads += nested.estimated_read_bytes
       writes += nested.estimated_write_bytes
       macs += nested.estimated_macs
+    elif isinstance(step, RKPool):
+      reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
+      writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
+      macs += math.prod(step.out.layout.logical_shape)*step.kernel_height*step.kernel_width
     elif isinstance(step, RKReduce):
       reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
       writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
@@ -2082,6 +2086,80 @@ def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[i
   if stage_count > RK_MAX_PROGRAM_STAGES or sum(map(len,payloads)) > RK_MAX_CONSTANT_BYTES: return None
   return _finish_program(steps, scratch)
 
+def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
+  """Pack dense planar valid-pool surfaces once, then run one sliding PPU task per HWC8 group."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) != 3 or _strip_casts(store.src[1]).key != reduce.key or \
+     store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  value = _strip_casts(reduce.src[0])
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half: return _not_applicable()
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or src_aff is None or out_aff[1] or src_aff[1] or len(out_aff[0]) != 3:
+    return _not_applicable()
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
+  if len(red_axes) != 2 or any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
+
+  match:tuple[int,int,int,int,int,int,int,int,int]|None = None
+  for plane_axis,out_y_axis,out_x_axis in permutations(out_axes):
+    planes, out_h, out_w = (ranges[x] for x in (plane_axis,out_y_axis,out_x_axis))
+    for kernel_y_axis,kernel_x_axis in permutations(red_axes):
+      kernel_h, kernel_w = ranges[kernel_y_axis], ranges[kernel_x_axis]
+      in_w = src_aff[0].get(kernel_y_axis,0)
+      if in_w <= 0 or src_aff[0].get(plane_axis,0)%in_w: continue
+      in_h = src_aff[0][plane_axis]//in_w
+      stride_y_coeff, stride_x = src_aff[0].get(out_y_axis,0), src_aff[0].get(out_x_axis,0)
+      if stride_y_coeff <= 0 or stride_y_coeff%in_w: continue
+      stride_y = stride_y_coeff//in_w
+      if out_aff[0] != {plane_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1} or \
+         src_aff[0] != {plane_axis:in_h*in_w,out_y_axis:stride_y*in_w,out_x_axis:stride_x,
+                        kernel_y_axis:in_w,kernel_x_axis:1}: continue
+      input_count, output_count = int(value.src[0].src[0].arg), int(store.src[0].src[0].src[0].arg)
+      if (input_count,output_count) != (planes*in_h*in_w,planes*out_h*out_w) or \
+         out_h != (in_h-kernel_h)//stride_y+1 or out_w != (in_w-kernel_w)//stride_x+1: continue
+      match = planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x
+      break
+    if match is not None: break
+  if match is None: return _not_applicable()
+  planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x = match
+  if not 1 <= planes <= 32 or not 2 <= max(kernel_h,kernel_w) <= 8 or min(kernel_h,kernel_w) < 2 or \
+     max(in_h,in_w) > 256 or max(stride_y,stride_x) > 8:
+    return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION,
+      f"sliding PPU MAX is C={planes},H={in_h},W={in_w},K={kernel_h}x{kernel_w},S={stride_y}x{stride_x}",reduce.op)
+
+  groups, input_tile_count, output_tile_count = (planes+7)//8, in_h*in_w*8, out_h*out_w*8
+  input_rows = [[(group*8+channel)*in_h*in_w+y*in_w+x] if group*8+channel < planes else []
+                for group in range(groups) for y in range(in_h) for x in range(in_w) for channel in range(8)]
+  output_rows = [[(plane//8)*output_tile_count+(y*out_w+x)*8+plane%8]
+                 for plane in range(planes) for y in range(out_h) for x in range(out_w)]
+  scratch:tuple[RKScratch, ...] = ()
+  packed_input = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(len(input_rows)*2),)
+  input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,value.src[0].arg.slot),planes*in_h*in_w,input_rows,scratch,
+    direct_capacity=((planes*in_h*in_w*2+4095)&-4096)//2,max_window=RK_MAX_CMAC_SELECTOR_WINDOW,max_outputs=128)
+  if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"sliding PPU input pack exceeds plan limits",Ops.INDEX)
+  scratch, steps = input_plan.scratch, list(input_plan.steps)
+  packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(groups*output_tile_count*2),)
+  input_layout = RKLayout((in_h,in_w,8),(in_h,in_w,8),(in_w*16,16,2),dtypes.half)
+  output_layout = RKLayout((out_h,out_w,8),(out_h,out_w,8),(out_w*16,16,2),dtypes.half)
+  for group in range(groups):
+    steps.append(RKPool(RKTensorRef(RKArg(packed_output.kind,packed_output.index,group*output_tile_count*2),output_layout),
+      RKTensorRef(RKArg(packed_input.kind,packed_input.index,group*input_tile_count*2),input_layout),Ops.MAX,red_axes[0],
+      kernel_h,kernel_w,stride_y,stride_x))
+  unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
+    groups*output_tile_count,output_rows,scratch,direct_capacity=groups*output_tile_count,max_outputs=128)
+  if unpack is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"sliding PPU output unpack exceeds plan limits",Ops.INDEX)
+  program = _finish_program([*steps,*unpack.steps],unpack.scratch)
+  cost = plan_cost(program)
+  if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"sliding PPU MAX needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
+  return _native(program)
+
 def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   """Lower a static affine FP16 MAX by reformatting eight outputs into PPU channels per batch."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -2240,6 +2318,7 @@ _LOWERERS = (
   RKLowerer("multi_source_sum", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_multi_source_affine_reduce_result),
   RKLowerer("affine_reduce", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
+  RKLowerer("sliding_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_sliding_max_result),
   RKLowerer("affine_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_affine_max_result),
   RKLowerer("global_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_global_max_result),
   RKLowerer("depthwise_spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_depthwise_spatial_contract_result),
@@ -2270,7 +2349,7 @@ def lower_native(sink:UOp) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
 
 from tinygrad.renderer.rockchip.emit import (emit_dpu as emit_dpu, emit_contract as emit_contract, emit_spatial_conv as emit_spatial_conv,
-  emit_program as emit_program, emit_reduce as emit_reduce, emit_reformat as emit_reformat)
+  emit_program as emit_program, emit_reduce as emit_reduce, emit_pool as emit_pool, emit_reformat as emit_reformat)
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
@@ -2296,6 +2375,7 @@ class RockchipRenderer(Renderer):
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
     elif isinstance(result.plan, RKSpatialConv): image = emit_spatial_conv(result.plan)
+    elif isinstance(result.plan, RKPool): image = emit_pool(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
     elif isinstance(result.plan, RKReformat): image = emit_reformat(result.plan)
     elif isinstance(result.plan, RKProgram): image = emit_program(result.plan)

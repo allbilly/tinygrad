@@ -151,6 +151,17 @@ class RKReduce:
   reduce_axis: int
 
 @dataclass(frozen=True)
+class RKPool(RKReduce):
+  """One proven FP16 sliding-pooling task over dense HWC8 surfaces."""
+  out: RKTensorRef
+  src: RKTensorRef
+  op: Ops
+  kernel_height: int
+  kernel_width: int
+  stride_y: int
+  stride_x: int
+
+@dataclass(frozen=True)
 class RKReformat:
   """One static physical-layout transform and its selected NPU implementation."""
   out: RKTensorRef

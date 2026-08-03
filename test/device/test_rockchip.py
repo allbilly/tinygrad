@@ -108,6 +108,23 @@ class TestRockchip(unittest.TestCase):
     kernels = [event for event in drain() if event["kind"] == "kernel"]
     self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 4 for event in kernels))
 
+  def test_valid_sliding_max_uses_ppu(self):
+    rng = np.random.default_rng(31)
+    x = rng.uniform(-8,8,(2,3,9,9)).astype(np.float16)
+    old_telemetry = os.environ.get("ROCKCHIP_TELEMETRY")
+    os.environ["ROCKCHIP_TELEMETRY"] = "memory"
+    clear()
+    try: actual = Tensor(x,device="ROCKCHIP").max_pool2d((5,5),stride=1).realize().numpy()
+    finally:
+      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY",None)
+      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+    expected = np.empty((2,3,5,5),dtype=np.float16)
+    for y in range(5):
+      for x0 in range(5): expected[:,:,y,x0] = np.max(x[:,:,y:y+5,x0:x0+5],axis=(2,3))
+    np.testing.assert_equal(actual,expected)
+    kernels = [event for event in drain() if event["kind"] == "kernel"]
+    self.assertTrue(any(event.get("engine_counts",{}).get("PPU") == 1 for event in kernels))
+
   def test_channel16_direct_spatial_conv_uses_cna(self):
     rng = np.random.default_rng(18)
     x = rng.uniform(-1,1,(1,16,9,9)).astype(np.float16)

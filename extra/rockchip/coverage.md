@@ -2545,3 +2545,60 @@ Regression gates pass: 127 host tests plus ten subtests, mypy over 225 modules,
 Ruff, the existing simple/medium grouped TestOps methods, and 90 serialized
 device tests plus 58 subtests in 731.94 seconds. The device run had no timeout,
 invalid submission, reset failure, or process abort.
+
+## Exact sliding-MAX PPU milestone
+
+The old affine-MAX compiler transformed every logical output window into an
+independent HWC8 global-pool surface. For `test_max_pool2d_unit_stride`, that
+required 1,380 tasks and was correctly rejected. The local RK3588 pool reference
+only documented exact 2x2/stride-1 MAX, so larger kernels were not assumed.
+
+A raw hardware sweep modifies the PPU output dimensions and
+`POOLING_KERNEL_CFG` fields over directly packed HWC8 buffers. Every checked
+case returns bit-identical FP16 MAX output:
+
+```text
+input   kernel  stride  mismatches
+8x8     2x2     1x1     0
+8x8     3x3     1x1     0
+9x9     5x5     1x1     0
+10x11   3x2     1x1     0
+10x11   3x3     2x2     0
+```
+
+`RKPool` is a distinct typed target plan carried inside `RKProgram`; the emitter
+sets PPU input/output cubes, kernel/stride-minus-one fields, HWC8 line/surface
+strides, destination index-add, and the proven PPU+RDMA task mask. Legalization
+matches the exact affine relation
+
+```text
+input[plane, oy*sy+ky, ox*sx+kx]
+  -> max(ky,kx)
+  -> output[plane,oy,ox]
+```
+
+and validates every logical extent before selector-packing channel planes into
+dense HWC8. The official 3x2x17x14, kernel-5/stride-1 method now passes in 7.44
+seconds with unchanged exact comparison:
+
+```text
+tasks / resets       55 / 55
+engine tasks         40 CMAC + 14 DPU + 1 PPU
+command words        2,311
+constant bytes       1,273,248
+scratch bytes        7,616
+native quality       CORRECTNESS_FALLBACK
+```
+
+The permanent 2x3x9x9 kernel-5 hardware regression also passes exactly and
+requires one PPU task. No CPU packing, tolerance change, or resource-ceiling
+increase was added. Together with grouped CNA, the focused estimate is now
+168/40/204/13 and the stage-limit Pareto is provisionally 43 pending a complete
+census.
+
+Regression gates pass: 128 host tests plus ten subtests, mypy over all 225
+tinygrad modules, Ruff, and 91 serialized device tests plus 58 subtests in
+730.76 seconds. No NPU timeout, invalid submission, reset failure, or process
+abort occurred. The previously passing smaller- and bigger-stride official
+methods also pass all eight subcases under the new lowerer order in 93.34
+seconds.

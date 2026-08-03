@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
 from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage,
-  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKReformat, RKProgram)
+  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
@@ -375,6 +375,7 @@ def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     if isinstance(step, RKDPUProgram): images.append(emit_dpu(step, target))
     elif isinstance(step, RKContract): images.append(emit_contract(step, target))
     elif isinstance(step, RKSpatialConv): images.append(emit_spatial_conv(step, target))
+    elif isinstance(step, RKPool): images.append(emit_pool(step, target))
     elif isinstance(step, RKReduce): images.append(emit_reduce(step, target))
     else: raise TypeError(f"unsupported Rockchip program step {type(step).__name__}")
   stages:list[RKStage] = []
@@ -421,4 +422,40 @@ def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   commands.append(_command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x60))
   relocs = (RKReloc(0, dst_word, plan.out.buffer.kind, plan.out.buffer.index, plan.out.buffer.addend+plan.out.layout.base_offset),
             RKReloc(0, src_word, plan.src.buffer.kind, plan.src.buffer.index, plan.src.buffer.addend+plan.src.layout.base_offset))
+  return RKImage(target, (RKStage(RKEngine.PPU, tuple(commands), relocs, RK_STAGE_RESET),))
+
+def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
+  """Emit one exact FP16 sliding-MAX PPU task over a dense HWC8 surface."""
+  if target is not RKTarget.RK3588 or plan.op is not Ops.MAX: raise ValueError("unsupported Rockchip PPU pool")
+  ih, iw, channels = plan.src.layout.logical_shape
+  oh, ow, out_channels = plan.out.layout.logical_shape
+  kh, kw, sy, sx = plan.kernel_height, plan.kernel_width, plan.stride_y, plan.stride_x
+  if channels != 8 or out_channels != 8 or not 2 <= ih <= 256 or not 2 <= iw <= 256 or \
+     not 2 <= kh <= 8 or not 2 <= kw <= 8 or not 1 <= sy <= 8 or not 1 <= sx <= 8 or \
+     oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or min(oh,ow) < 1:
+    raise ValueError("unsupported sliding-MAX PPU contract")
+  h, w, c, out_h, out_w = ih-1, iw-1, channels-1, oh-1, ow-1
+  output_index_add = iw*oh
+  regs = (
+    (_TARGET_PPU, rk.REG_PPU_S_POINTER, 0xe), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_S_POINTER, 0xe),
+    (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_WIDTH, w), (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_HEIGHT, h),
+    (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_IN_CHANNEL, c), (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_WIDTH, out_w),
+    (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_HEIGHT, out_h), (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_CHANNEL, c),
+    (_TARGET_PPU, rk.REG_PPU_OPERATION_MODE_CFG, 0x11),
+    (_TARGET_PPU, rk.REG_PPU_POOLING_KERNEL_CFG, ((sy-1)<<20)|((sx-1)<<16)|((kh-1)<<8)|(kw-1)),
+    (_TARGET_PPU, rk.REG_PPU_DST_SURF_STRIDE, output_index_add),
+    (_TARGET_PPU, rk.REG_PPU_DATA_FORMAT, (output_index_add<<16)|2), (_TARGET_PPU, rk.REG_PPU_MISC_CTRL, 3),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_WIDTH, w), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_HEIGHT, h),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_CHANNEL, c),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_SRC_LINE_STRIDE, plan.src.layout.strides_bytes[0]),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_SRC_SURF_STRIDE, ih*plan.src.layout.strides_bytes[0]),
+    (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_DATA_FORMAT, 2), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_OPERATION_ENABLE, 1))
+  commands = [_command(*x) for x in regs]
+  dst_word = len(commands)
+  commands.append(_command(_TARGET_PPU, rk.REG_PPU_DST_BASE_ADDR, 0))
+  src_word = len(commands)
+  commands.append(_command(_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_SRC_BASE_ADDR, 0))
+  commands.append(_command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x60))
+  relocs = (RKReloc(0,dst_word,plan.out.buffer.kind,plan.out.buffer.index,plan.out.buffer.addend+plan.out.layout.base_offset),
+            RKReloc(0,src_word,plan.src.buffer.kind,plan.src.buffer.index,plan.src.buffer.addend+plan.src.layout.base_offset))
   return RKImage(target, (RKStage(RKEngine.PPU, tuple(commands), relocs, RK_STAGE_RESET),))

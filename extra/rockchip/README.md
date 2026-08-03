@@ -31,6 +31,7 @@ post-early_simplify UOps
        RKLUTStage(lut: RKLUTId)
        RKContract
        RKSpatialConv
+       RKPool
        RKProgram(ordered typed steps)
   -> RKImage commands and relocations
   -> DRM allocation, patch, submit, and wait
@@ -59,7 +60,7 @@ honest native passes but are kept visible for replacement by direct engine paths
 The current serialized device contract passes 90 tests plus 58 subtests in
 731.94 seconds with fallback disabled.
 
-Lowering uses twenty named ordered strategies grouped into elementwise,
+Lowering uses twenty-one named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
 strategy returns exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
 cannot overwrite a useful reject, while applicable failures are ranked by
@@ -982,3 +983,34 @@ tinygrad modules, and Ruff is clean. The serialized RK3588 suite passes 90
 tests plus 58 subtests in 731.94 seconds without timeout, invalid submission,
 reset failure, or process abort. The existing simple and medium grouped
 TestOps methods also remain green.
+
+## Direct sliding-MAX PPU
+
+The local `experimental/pool.py` result was first treated only as proof for
+2x2/stride-1 MAX. A direct register probe now varies the PPU input/output cube,
+kernel, and stride fields while keeping dense FP16 HWC8 surfaces. It is bit
+exact for 2x2, 3x3, 5x5, rectangular 3x2, and 3x3/stride-2 cases. NVDLA's PDP
+split model remains useful for future tall surfaces, but these are direct
+RK3588 measurements and require no inference from NVDLA hardware.
+
+The compiler adds a typed `RKPool` plan rather than encoding sliding windows as
+hundreds of global reductions. The initial legality rule recognizes only dense
+valid FP16 MAX pooling with affine planar input/output, kernel dimensions 2--8,
+stride components 1--8, and bounded static surfaces. It selector-packs planar
+channels into HWC8 once, emits one PPU task per eight-channel group, and
+selector-unpacks the result. Padding, dilation, ceil mode, and oversized
+surfaces continue to use their existing proven paths or reject.
+
+The unchanged 3x2x17x14, 5x5/stride-1 official
+`test_max_pool2d_unit_stride` changes from a 1,380-stage reject to an exact
+native pass. Its plan has 55 tasks: 40 CMAC pack/unpack tasks, 14 DPU tasks, and
+one PPU task; it uses 2,311 command words, 1,273,248 constant bytes, and 7,616
+scratch bytes. It remains a cost-visible `CORRECTNESS_FALLBACK`, but neither
+the 400-task nor 2 MiB constant ceiling changed. Together with the preceding
+grouped-CNA gain this implies 168/40/204/13 pending the next full census.
+
+The full host suite passes 128 tests plus ten subtests, mypy checks all 225
+modules, and Ruff is clean. The serialized device contract passes 91 tests plus
+58 subtests in 730.76 seconds without timeout, invalid submission, reset
+failure, or process abort. The previously passing smaller- and bigger-stride
+official methods also pass all eight subcases under the new lowerer order.

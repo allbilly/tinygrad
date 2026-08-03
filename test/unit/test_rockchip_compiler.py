@@ -6,12 +6,13 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
-  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKReformat, RKReformatKind, RK_STAGE_RESET,
+  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_reduce_result,
-  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_spatial_contract_result,
+  lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result,
+  lower_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
   rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
@@ -113,6 +114,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.stages), 256)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
     self.assertFalse(contains_uop(plan))
+
+  def test_valid_unit_stride_max_pool_uses_one_sliding_ppu_task(self):
+    result = lower_sliding_max_result(sink(Tensor.empty(3,2,17,14,dtype=dtypes.half).max_pool2d((5,5),stride=1)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    image, cost = emit_program(result.plan), plan_cost(result.plan)
+    self.assertEqual(sum(isinstance(step,RKPool) for step in result.plan.steps),1)
+    self.assertEqual(sum(stage.engine is RKEngine.PPU for stage in image.stages),1)
+    self.assertLessEqual(cost.task_count,100)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_affine_max_uses_compact_cmac_scratch_subviews(self):
     plans = []
