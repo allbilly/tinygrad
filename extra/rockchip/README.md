@@ -355,6 +355,18 @@ identical constant payloads. Reset-per-program, a two-term approximate
 reciprocal, and K=640 dynamic CMAC were tested and rejected; the full hardware
 suite remains green with per-stage reset and the K<=512/400-stage bounds.
 
+The RK3588 BN multiplier was then characterized as a possible pre-rounding
+scale. Enabling BN with `BN_CFG=0x20040` and a register FP16 multiplier really
+does scale the FP32 CMAC accumulator before its final FP16 store. Factoring
+1/9 into two FP16 operands reduced the official 3x3 average-pool error to
+0.09--0.31% one-ULP mismatches, but did not eliminate it; 3x2 remained at
+2.15--2.57%. Clearing `fp32tofp16_en` and using the integer output-converter
+scale/shift produced zeros, while a combined CMAC plus EW-divider task timed
+out and recovered after reset. Strict non-exact-scale rejection therefore
+remains correct. The complete rejected implementation and probe results are
+preserved in `0134-WIP-fused-BN-two-factor-scale.patch` (SHA-256
+`a472dcbfb2a610e0aa0afe86f0318ad7e293d97417cf11067a6e94473054c22c`).
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently

@@ -1605,3 +1605,23 @@ under `~/rk2608_backups/census-scale-85eeab7f5-20260803/` with SHA-256
 `ad2acf33274bd9db8023931e65598f6e2e95c47205bb51b0dfcb28bfbd434605`
 and `1a1430b4a2a11e21aa31720f92afe6bd359d5e339adbc74f11a3e74aa263a908`
 respectively.
+
+The post-census non-exact-scale investigation proved that DPU BN can multiply
+the flying CMAC FP32 accumulator before output conversion. A closest-product
+two-FP16 factorization of 1/9 (`0.06744384765625 * 1.6474609375`) differs from
+the mathematical reciprocal by only `6.6227383022088304e-09`. It passed small
+ramp and random row-sum probes, but the complete official padded-pooling method
+still failed strict `rtol=1e-5`: 3x3 subcases mismatched 2--8 of 1,920--2,560
+outputs and 3x2 subcases mismatched 62--92 of 2,880--3,840 outputs, always by
+one FP16 ULP. A single FP16 BN reciprocal was substantially worse (890/2,560
+and 1,308/3,840 mismatches).
+
+Two follow-up register probes close misleading alternatives. Programming the
+output converter as integer `29127 >> 18` with FP32-to-FP16 conversion disabled
+returned all zeros, confirming that this mode is not a higher-precision FP16
+reciprocal. Enabling DPU RDMA and EW FDIV in the same CMAC task timed out after
+six seconds; the ordinary CMAC row-sum recovery test passed immediately after
+reset. No tolerance, skip, or CPU retry was added. The active compiler retains
+the pre-submit `NUMERICAL_CONTRACT` rejection, and the WIP implementation plus
+hardware notes are archived as `0134-WIP-fused-BN-two-factor-scale.patch` with
+SHA-256 `a472dcbfb2a610e0aa0afe86f0318ad7e293d97417cf11067a6e94473054c22c`.
