@@ -12,32 +12,32 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `d6bb0b304` contains exactly 425 method records:
-165 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 207 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `61288f302` contains exactly 425 method records:
+166 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 206 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 235 failed methods/subtests, 216 passed, 87 passing subtests,
-and 13 skipped in 2,583.60 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 234 failed methods/subtests, 217 passed, 87 passing subtests,
+and 13 skipped in 2,595.16 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to `4e2bbe7ef`, only `TestOps.test_depthwise_conv2d` and
-`TestOps.test_strided_conv2d` change from failure to native pass. The 207 failed
-methods first classify as 65 unsupported-output-dtype, 46 plan-stage-limit, 27 unsupported-layout, 23
+Relative to `d6bb0b304`, only `TestOps.test_fancy_conv2d` changes from failure
+to native pass. The 206 failed methods first classify as 65
+unsupported-output-dtype, 45 plan-stage-limit, 27 unsupported-layout, 23
 unsupported-input-dtype, 19 numerical-contract, 18 requires-reformat, and nine
-unsupported-ALU. Schema version 2 classifies all 207 failures as
+unsupported-ALU. Schema version 2 classifies all 206 failures as
 `NATIVE_REJECT`; no failure
 lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-pointwise-d6bb0b304-20260804/test_ops_coverage.json`
-(SHA-256 `f8a3cfdf986fabeef631b6f05a35ac25cb9fa6252c5a75c10455e148186fb616`);
+is `~/rk2608_backups/census-depthwise-61288f302-20260804/test_ops_coverage.json`
+(SHA-256 `46615a8c66edb0ad9b59c66f74d47f0f842c550a34155ac391e2552a5591c1c7`);
 the JUnit XML SHA-256 is
-`b02b396f7647ffaa69dd3d30f96934c7598e6deebef9a5e8054c80a4c5975991`.
+`d89d75d7b8e4b223af3c81debad7ffef83171465318666f7437ef57f591920b5`.
 
-A later focused per-channel CNA milestone changes `test_fancy_conv2d` from
-`PLAN_STAGE_LIMIT` to native pass, implying 166/40/206/13. That transition is
+A later focused grouped-CNA milestone changes `test_grouped_conv2d` from
+`PLAN_STAGE_LIMIT` to native pass, implying 167/40/205/13. That transition is
 not authoritative until the next complete uncached 425-method census.
 
-The 504 successful native kernels contain 477 `EFFICIENT` and 27
-`CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 179 at
-2--8, 98 at 9--32, 79 at 33--64, ten at 65--128, 14 at 129--256, and three at
+The 506 successful native kernels contain 479 `EFFICIENT` and 27
+`CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 181 at
+2--8, 98 at 9--32, 79 at 33--64, ten at 65--128, 13 at 129--256, and four at
 257--400. The worst path remains `test_matmul` at 399 tasks, 18,326 command
 words and 899,280 constant bytes. Periodic compaction adds three successful
 kernels from later `test_repeat` subcases; its first 1,728-output kernel was
@@ -2441,5 +2441,107 @@ cost-visible correctness fallback; no plan ceiling was raised. The existing
 official depthwise method also passes. All 126 host tests plus ten subtests,
 mypy, and Ruff pass, and the complete serialized device contract passes 89
 tests plus 58 subtests in 730.57 seconds with no timeout, invalid submission,
-reset failure, or process abort. A new full census is required before replacing
-the authoritative 165/40/207/13 count with the focused 166/40/206/13 result.
+reset failure, or process abort. The subsequent census at `61288f302` is now
+complete: `test_fancy_conv2d` is the only
+transition, and 166/40/206/13 is authoritative. Its JSON and JUnit hashes are
+recorded at the top of this document.
+
+## CBUF-pressure references: NVDLA, Mesa Rocket, and `conv_grok`
+
+The local source audit used these exact snapshots:
+
+- NVDLA SW `79538ba1b52b040a4a4645f630e457fa01839e90`;
+- Mesa branch `rocket`, `76c88ba664857088b431e521ab5c1f0f73949ccc`;
+- `allbilly/rk3588`, `40fae7b1ade121bb91f3908f0bcfd1a2a8c350e6`.
+
+NVDLA `ConvCoreNode::calculateEPS` computes feature entries per slice from
+width, channels, bytes per element, memory atomic size, and CBUF entry width.
+`determineSplitDataRatios` multiplies the available data banks by entries per
+bank, derives the resident input height, and creates first/intermediate/last
+partial-height segments with kernel overlap and adjusted input/output offsets.
+Its bank-selection path first tests full input plus full weights, then full
+input plus hardware split-K, then partial-height plus full/hardware-split
+weights, and finally software split-K plus partial-height.
+
+Mesa Rocket's `rkt_task.c` says its splitter is mostly taken from NVDLA. It
+uses 12 banks, 32,768 bytes per bank, 256 entries per bank, a 128-byte entry,
+16-byte feature atom, and 32-byte weight atom. Its path computes input and
+weight banks, chooses seven input banks when both must be partial, retains
+overlap slices, and assigns per-tile input/output offsets. The implementation
+is UINT8 and performs CPU tensor/weight transforms, so neither its precision
+nor host execution is imported.
+
+The current `conv_grok` planner ports the same geometry to FP16 and adds
+empirical RK3588 limits. `_compute_k_step` is driven by the weight footprint
+and available weight banks. `_compute_y_step` first subtracts the chosen tile's
+weight banks, then limits output height using feature bytes, feature grains,
+and entries-per-slice. If both dimensions shrink, `plan_local_serial_rows`
+emits the Y-by-K Cartesian product. Running the ten offline tests succeeds;
+the 217-shape classifier yields:
+
+```text
+NONE              49
+BY_Y              37
+BY_K              24
+BY_YK             51
+depthwise_serial  39
+grouped_serial    17
+```
+
+This corrects the simplistic description of `conv_grok` as geometry-only:
+shape supplies the geometry, but CBUF bank pressure determines the split. A
+clean implementation must express those windows as typed plans and buffer
+offsets after native layout legalization. The reference runner's NumPy tile
+slicing, input/weight packing, output assembly, and loose sweep tolerance are
+not eligible.
+
+Two other ideas are retained. NVDLA engine edges negotiate a common physical
+format, maximum client stride/surface size, and buffer offsets before emission;
+that directly informs executable `RKLayout` legality and internal zero-copy
+split/concat. NVDLA PDP planning gives a useful abstract overlap model for
+sliding pooling, but only the local `experimental/pool.py` exact RK3588
+sliding-MAX result is register evidence. NVDLA's semantic BDMA implementation
+is disabled under `#if 0`, and Mesa Rocket's PPU XML fields are not exercised
+by its driver, so neither is promoted as a working RK3588 reformat/pool path.
+
+## Grouped direct-CNA milestone
+
+The former `test_grouped_conv2d` first reject was a 446-task tiled-CMAC selector
+lower bound. Its exact affine form has batch four, five groups, three input and
+seven output channels per group, a 5x5 input, 3x3 kernel, and 3x3 output. The
+new lowerer derives those roles from coefficients, validates buffer extents and
+convolution geometry, and schedules one native CNA tile for every `(batch,
+group)` pair. Each compute tile occupies one weight CBUF bank; it therefore
+does not require `BY_Y`, `BY_K`, or `BY_YK` splitting.
+
+The first small hardware regression made 27 of 108 values exact and corrupted
+the remaining 81. The selector constructed all real input tiles contiguously
+and appended alignment only after the complete surface, while CNA addresses
+advanced by the padded per-tile size. Tile zero was correct; subsequent tile
+bases were four FP16 values ahead of their packed data. Padding each tile
+independently fixes the contract. Weight tile bases are also padded to a
+32-byte boundary.
+
+The permanent batch-2/group-2 hardware regression passes exactly and requires
+four CONV tasks. The unchanged official grouped method passes in 13.14 seconds
+with one native kernel:
+
+```text
+tasks / resets       112 / 112
+engine tasks          90 CMAC + 20 CONV + 2 DPU
+command words         5,164
+constant bytes        1,819,392
+scratch bytes         16,640
+native quality        CORRECTNESS_FALLBACK
+```
+
+No ceiling or tolerance changed and no CPU tensor path was added. This implies
+167/40/205/13 pending the next complete census. The 90 selector-CMAC tasks show
+that direct reformat/packing remains the dominant problem; CBUF-aware compute
+splitting should be added when logical tiles exceed bank capacity, not used to
+hide layout conversion cost.
+
+Regression gates pass: 127 host tests plus ten subtests, mypy over 225 modules,
+Ruff, the existing simple/medium grouped TestOps methods, and 90 serialized
+device tests plus 58 subtests in 731.94 seconds. The device run had no timeout,
+invalid submission, reset failure, or process abort.

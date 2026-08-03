@@ -6,15 +6,15 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `d6bb0b304` is 165 native,
-40 frontend-only, 207 failed, and 13 upstream-skipped methods across the exact
+The current authoritative uncached strict census at `61288f302` is 166 native,
+40 frontend-only, 206 failed, and 13 upstream-skipped methods across the exact
 425-method inventory. It completed without an NPU timeout, reset failure,
-invalid submission, or process abort. Relative to `4e2bbe7ef`, depthwise and
-strided convolution are the only method transitions and there is no regression.
-A later focused per-channel CNA milestone makes `test_fancy_conv2d` pass and
-implies 166 native methods, but that count remains provisional until the next
-complete uncached census. Coverage details and durable artifact hashes are
-recorded in `coverage.md`.
+invalid submission, or process abort. Relative to `d6bb0b304`, only
+`test_fancy_conv2d` changes from failure to native pass and there is no
+regression. A later focused grouped-CNA milestone makes `test_grouped_conv2d`
+pass and implies 167 native methods, but that count remains provisional until
+the next complete uncached census. Coverage details and durable artifact hashes
+are recorded in `coverage.md`.
 
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor
@@ -56,10 +56,10 @@ ceilings, then compare reset overhead, MACs, traffic, command volume, constants,
 and scratch. Runtime telemetry records exact task/command/reset counts and marks
 plans over 64 tasks or 1 MiB of constants as `CORRECTNESS_FALLBACK`; these remain
 honest native passes but are kept visible for replacement by direct engine paths.
-The richer candidate ordering preserves the complete strict result: 81 tests
-plus 56 subtests pass in 750.28 seconds with fallback disabled.
+The current serialized device contract passes 90 tests plus 58 subtests in
+731.94 seconds with fallback disabled.
 
-Lowering uses seventeen named ordered strategies grouped into elementwise,
+Lowering uses twenty named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
 strategy returns exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
 cannot overwrite a useful reject, while applicable failures are ranked by
@@ -901,3 +901,84 @@ green. All 126 host tests plus ten subtests pass, mypy and Ruff are clean, and
 the complete serialized device contract passes 89 tests plus 58 subtests in
 730.57 seconds without a timeout, invalid submission, reset failure, or process
 abort. The focused result implies 166/40/206/13 pending a complete census.
+
+The subsequent complete census confirms that exact transition; 166/40/206/13
+is now the authoritative inventory.
+
+## NVDLA, Mesa Rocket, and CBUF-pressure planning
+
+The local NVDLA SW snapshot `79538ba1b52b` and Mesa `rocket` snapshot
+`76c88ba66485` confirm that convolution tiling is fundamentally a shared-CBUF
+allocation problem. NVDLA computes feature entries per input slice, reserves
+weight banks, assigns the remaining banks to feature slices, and only then
+derives partial-height tiles and their overlap. If the complete weight surface
+does not fit, it combines partial-height with split-K. Mesa Rocket explicitly
+states that its splitter is mostly taken from NVDLA and implements the same
+full-input/full-weight, partial-input/full-weight, and partial-input/partial-
+weight decisions.
+
+`conv_grok` specializes that model to the empirically proven RK3588 FP16
+formats. Its `k_step` responds to weight-bank pressure, its `y_step` responds
+to the feature banks remaining after the selected weight tile, and simultaneous
+pressure creates the Cartesian `BY_YK` schedule. The ten offline planner tests
+pass, and classifying its 217-shape catalogue produces 49 `NONE`, 37 `BY_Y`,
+24 `BY_K`, 51 `BY_YK`, 39 depthwise-serial, and 17 grouped-serial cases. The
+clean compiler should therefore schedule direct convolution as:
+
+```text
+logical convolution
+  -> choose physical input/weight/output formats
+  -> compute FP16 entries per slice and weight banks
+  -> choose K tile
+  -> recompute remaining feature banks
+  -> choose Y tile and overlap
+  -> emit NONE/BY_Y/BY_K/BY_YK task windows with buffer offsets
+```
+
+Only the formulas and register contracts are reusable. `conv_grok` slices and
+packs every tile with NumPy, Mesa Rocket converts tensors and weights on the
+CPU, and NVDLA targets a different accelerator. None is evidence for host
+packing in the strict backend. The local classifier also mixes conservative
+empirical headroom with the raw bank formula, so every promoted RK3588 boundary
+still requires an exact hardware regression.
+
+NVDLA contributes two further compiler patterns. Surface-format legalization
+intersects producer and consumer capabilities, while line/surface stride and
+buffer offset are negotiated across all clients; concat and split may then use
+one larger physical surface with different offsets. This is the model needed
+for executable `RKLayout` legality and internal zero-copy composition. Its PDP
+planner also models first/middle/last pooling tiles and overlap, complementing
+the exact local RK3588 sliding-MAX PPU register probe. NVDLA's BDMA path is not
+promoted: the semantic 3D implementation in this snapshot is disabled behind
+`#if 0`. Mesa Rocket is likewise a register/planner reference, not a semantic
+oracle: it is a UINT8 prototype with CPU layout transforms and a substantial
+failure/skip inventory.
+
+## Per-group CNA tiles
+
+The generic grouped affine form is now recognized as independent `(batch,
+group)` convolution tiles. Logical NCHW inputs and OIHW weights are packed by
+selector CMAC, each small tile is checked against the proven single-weight-bank
+CBUF contract, CNA executes the convolution, and selector/DPU work compacts the
+physical output. No Python slicing, NumPy packing, test-name predicate, or
+tolerance change participates.
+
+The first hardware regression made only tile zero correct. Packing had appended
+alignment lanes once at the end of the complete surface, while each CNA base
+advanced by a per-tile aligned stride; all later tiles therefore started four
+FP16 values late. Inserting padding after every batch/group tile fixes the
+physical contract. The official batch-4/group-5/IC-per-group-3/OC-per-group-7
+`test_grouped_conv2d` now passes unchanged through 112 tasks: 20 CONV, 90 CMAC,
+and two DPU. It uses 1,819,392 constant bytes and 16,640 scratch bytes and is
+correctly labeled `CORRECTNESS_FALLBACK`. This replaces the former 446-task
+selector-contraction lower bound without raising any ceiling and implies
+167/40/205/13 pending the next complete census. CBUF splitting is not needed
+for these small compute tiles; the remaining cost is almost entirely physical
+packing, which must be replaced by direct native reformatting rather than by a
+wider task limit.
+
+The full host suite passes 127 tests plus ten subtests, mypy checks all 225
+tinygrad modules, and Ruff is clean. The serialized RK3588 suite passes 90
+tests plus 58 subtests in 731.94 seconds without timeout, invalid submission,
+reset failure, or process abort. The existing simple and medium grouped
+TestOps methods also remain green.
