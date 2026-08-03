@@ -1045,6 +1045,12 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 4096)
     self.assertFalse(contains_uop(plan))
 
+  def test_masked_affine_prefix_sum_rejects_unstable_second_output_tile(self):
+    result = lower_affine_reduce_result(sink(Tensor.empty(20,dtype=dtypes.half).cumsum(0)))
+    self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
+    assert result.reject is not None
+    self.assertIs(result.reject.kind, RKRejectKind.NUMERICAL_CONTRACT)
+
   def test_global_mean_folds_scale_into_cmac_weights(self):
     result = lower_add_reduce_result(sink(Tensor.empty(360,dtype=dtypes.half).mean()))
     self.assertIsInstance(result.plan, RKProgram)

@@ -1992,6 +1992,22 @@ task limit.
 The schema-version-2 Pareto contains 48 stage-limit methods. Two graphs that
 previously stopped at that limit now proceed far enough to expose a more
 specific numerical contract, but neither becomes a native method pass. The
-only accepted native numerical failure is a 20-element cumulative sum whose
-output becomes state-sensitive after the mixed-engine workload. It must be
-fixed or rejected before any new native family is claimed.
+only accepted native numerical failure was a 20-element cumulative sum whose
+output became state-sensitive after the mixed-engine workload. The follow-up
+prefix-scan guard below removes it from the accepted contract.
+
+### Masked-sum numerical guard
+
+The 20-element cumulative sum used two CMAC output tiles and returned the same
+corrupt value in all lanes after the complete mixed-engine workload. The
+existing ten-element hardware regression remains bit-exact and uses one output
+tile. This is the additive counterpart of the already guarded masked-product
+second-tile instability.
+
+Legalization now identifies the structural prefix selector—row `i` contains
+exactly source lanes `0..i`—and returns `NUMERICAL_CONTRACT` when it has more
+than sixteen outputs. No test name or sampled value participates. The proven
+ten-output hardware test still passes, while unchanged official `test_cumsum`
+reaches the typed 20-output reject in 2.46 seconds instead of returning wrong
+data. Wider prefix scans remain blocked until alternating-engine stress proves
+the multi-tile state contract.

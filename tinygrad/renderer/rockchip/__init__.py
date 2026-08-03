@@ -1152,6 +1152,9 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
+  if output_count > 16 and output_count == input_count and all(row == list(range(index+1)) for index,row in enumerate(selectors)):
+    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
+      f"affine ADD prefix scan output {output_count} exceeds the stable one-tile contract", reduce.op)
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   initial_scratch = () if prepare is None else prepare.scratch
   reduced = output

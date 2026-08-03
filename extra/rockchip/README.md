@@ -574,6 +574,13 @@ Schema version 2 resolves 218 failures to native rejects and leaves only the
 state-sensitive 20-element cumulative sum plus one pre-device Clang failure
 without a typed first reject.
 
+The accepted cumulative-sum mismatch is now closed conservatively. A static
+prefix selector with more than sixteen outputs returns `NUMERICAL_CONTRACT`,
+matching the proven one-tile boundary already used for masked cumulative
+products. The ten-output prefix sum remains bit-exact on RK3588; unchanged
+official `test_cumsum` now rejects its 20-output case before submission rather
+than exposing the state-sensitive two-tile result.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
