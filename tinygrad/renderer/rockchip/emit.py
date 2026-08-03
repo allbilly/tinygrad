@@ -291,7 +291,7 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
   ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
     plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
   sy, sx = plan.stride_y, plan.stride_x
-  if ic not in (1,2,3,4,16) or not 1 <= oc <= 16 or not (kh > 1 or kw > 1) or max(kh,kw) > 3 or \
+  if ic not in (1,2,3,4,16) or not 1 <= oc <= 16 or not 1 <= kh <= 3 or not 1 <= kw <= 3 or \
      oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or not 1 <= sy <= 7 or not 1 <= sx <= 7 or \
      not 1 <= ih <= 32 or not 1 <= iw <= 32:
     raise ValueError("unsupported direct spatial-convolution contract")
@@ -304,13 +304,16 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
   if plan.out.layout.physical_shape != (align_oc//out_c2,plan.output_width_stride,out_c2):
     raise ValueError("direct convolution has invalid packed output layout")
   width_stride, out_width_stride = plan.input_width_stride, plan.output_width_stride
+  is_spatial = kh != 1 or kw != 1
   row_bytes = width_stride*align_ic*2
   rows_per_two_banks = (((2*256*128+row_bytes-1)//row_bytes)+1)&-2
-  feature_grains = ih+kh if use_nhwc else min(ih+kh,rows_per_two_banks)
-  data_banks = 11 if use_nhwc else min(11,max(1,(width_stride*feature_grains*align_ic*2+32767)//32768))
+  feature_grains = ih if not is_spatial else ih+kh if use_nhwc else min(ih+kh,rows_per_two_banks)
+  weight_bytes = kh*kw*align_ic*2
+  weight_banks = max(1,(weight_bytes*oc+32767)//32768)
+  data_banks = max(1,min(11,12-weight_banks)) if not is_spatial else \
+               11 if use_nhwc else min(11,max(1,(width_stride*feature_grains*align_ic*2+32767)//32768))
   row_entries = max(1,(width_stride*align_ic+31)//32)
   cbuf_entries = row_entries*ih*4 if align_ic < 16 else row_entries
-  weight_bytes = kh*kw*align_ic*2
   dma_line = width_stride if use_nhwc else width_stride*4
   dma_surface = width_stride*(ih-1) if use_nhwc and ih > 1 else (width_stride*(ih-4) if not use_nhwc and ih > 4 else 0)
   commands = (
@@ -327,7 +330,7 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
     _command(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, (kw<<24)|(kh<<16)|oc),
     _command(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, ((12-data_banks)<<4)|data_banks),
     _command(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, cbuf_entries),
-    _command(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
+    _command(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb if is_spatial else 1),
     *(_command(_TARGET_CNA, reg, 0x10000) for reg in
       (rk.REG_CNA_CVT_CON1,rk.REG_CNA_CVT_CON2,rk.REG_CNA_CVT_CON3,rk.REG_CNA_CVT_CON4)),
     _command(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0),
@@ -337,8 +340,8 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
     _command(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, (iw<<16)|ih),
     _command(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_ic),
     _command(_TARGET_CNA, rk.REG_CNA_DCOMP_ADDR0, 0),
-    _command(_TARGET_CNA, 0x1180, (1<<ic)-1 if use_nhwc else 7),
-    _command(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x201),
+    _command(_TARGET_CNA, 0x1180, (1<<ic)-1 if use_nhwc else 7 if is_spatial else 0),
+    _command(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x200|is_spatial),
     _command(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((oh-1)<<16)|(ow-1)),
     _command(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_oc-1),
     _command(_TARGET_CORE, rk.REG_CORE_RESERVED_3030, 0),

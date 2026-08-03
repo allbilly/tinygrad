@@ -817,3 +817,35 @@ still a correctness fallback. All 123 host tests plus eight subtests, mypy over
 225 modules, and Ruff pass. The complete serial device contract passes 86
 tests plus 58 subtests in 731.90 seconds with no timeout, invalid submission,
 reset failure, or process abort.
+
+### Direct pointwise CNA boundary
+
+The same `conv_grok` register catalogue distinguishes 1x1 pointwise work from
+spatial convolution. The clean emitter now uses pointwise CBUF allocation,
+`CNA_CVT_CON0=1`, and `CORE_MISC_CFG=0x200`, while keeping FP16 WDMA output.
+Early simplification flattens pointwise H/W into one axis, so legalization
+recognizes the exact `(output-channel, spatial, input-channel)` affine
+contraction and chooses a balanced hardware H/W factorization no larger than
+32x32. This is geometry-derived and does not match a test name.
+
+The unchanged IC4 9x9 official 1x1 method passes through one CNA task in a
+19-task plan; the former selector-contraction implementation needed a much
+larger correctness plan. A permanent IC16 8x8 regression passes at official
+tolerance through one CNA task in a 21-task plan. The large IC16 32x32 case
+still rejects because native NCHW-to-CNA packing exceeds the unchanged cost
+contract.
+
+A channel-split experiment avoided that pack by running sixteen IC1 CNA tasks,
+then accumulating their FP16 outputs on the DPU. Its 336-task plan stayed
+within all resource ceilings but failed the unchanged official comparison:
+4,458/16,384 outputs mismatched and maximum absolute error was 0.02344 because
+each partial was rounded before accumulation. The implementation is excluded
+and preserved as `wip-pointwise-channel-split-fp16-rounding.patch` (SHA-256
+`2ba6bcccf36fd83039a5c8dbfe448fb4c076713073b19b592cf8d13a46c74de7`). A
+future solution needs direct input-layout conversion or non-FP16 partial
+accumulation; it must not relax tolerance or host-pack the input.
+
+All 124 host tests plus ten subtests pass, mypy checks all 225 modules, and
+Ruff is clean. The complete serialized device contract passes 87 tests plus 58
+subtests in 717.87 seconds without a timeout, invalid submission, reset failure,
+or process abort.

@@ -1193,6 +1193,20 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertLessEqual(plan_cost(result.plan).task_count,limit)
         self.assertFalse(contains_uop(result.plan))
 
+  def test_pointwise_convolution_uses_direct_cna_task(self):
+    for channels,size in ((4,9),(16,8)):
+      with self.subTest(channels=channels,size=size):
+        source = Tensor.empty(1,channels,size,size,dtype=dtypes.half).realize()
+        weight = Tensor.empty(channels,channels,1,1,dtype=dtypes.half).realize()
+        result = lower_spatial_contract_result(sink(source.conv2d(weight)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        convs = [step for step in result.plan.steps if isinstance(step,RKSpatialConv)]
+        self.assertEqual([(step.kernel_height,step.kernel_width,step.stride_y,step.stride_x) for step in convs],[(1,1,1,1)])
+        self.assertLessEqual(plan_cost(result.plan).task_count,24)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.roll(1).contiguous()))

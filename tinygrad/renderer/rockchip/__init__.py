@@ -1355,7 +1355,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
-  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 4 or store.src[0].op is not Ops.INDEX or \
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) not in (2,4) or store.src[0].op is not Ops.INDEX or \
      store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
      _strip_casts(store.src[1]).key != reduce.key:
     return _not_applicable()
@@ -1366,13 +1366,33 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
          parsed[0].src[0].op is not Ops.PARAM for parsed in operands): return _not_applicable()
   parsed_operands = cast(tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool]], operands)
   out_aff = _affine(store.src[0].src[1])
-  if out_aff is None or out_aff[1] != 0 or len(out_aff[0]) not in (3,4): return _not_applicable()
+  if out_aff is None or out_aff[1] != 0 or len(out_aff[0]) not in (2,3,4): return _not_applicable()
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
   if any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
   match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
-  for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
+  if len(out_axes) == 2 and len(red_axes) == 1:
+    point_reduction_axis = red_axes[0]
+    for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
+      feature, weight = feature_parsed[0], weight_parsed[0]
+      feature_aff, weight_aff = _affine(feature.src[1]), _affine(weight.src[1])
+      if feature_aff is None or weight_aff is None or feature_aff[1] or weight_aff[1]: continue
+      for point_channel_axis,point_spatial_axis in permutations(out_axes):
+        in_c, out_c, spatial = ranges[point_reduction_axis], ranges[point_channel_axis], ranges[point_spatial_axis]
+        if out_aff[0] != {point_channel_axis:spatial,point_spatial_axis:1} or \
+           feature_aff[0] != {point_reduction_axis:spatial,point_spatial_axis:1} or \
+           weight_aff[0] != {point_channel_axis:in_c,point_reduction_axis:1}: continue
+        shapes = [(h,spatial//h) for h in range(1,min(32,spatial)+1) if spatial%h == 0 and spatial//h <= 32]
+        if not shapes: continue
+        in_h,in_w = min(shapes,key=lambda shape:abs(shape[0]-shape[1]))
+        feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
+        if (feature_count,weight_count,output_count) != (in_c*spatial,out_c*in_c,out_c*spatial): continue
+        match = (feature,weight,1,in_c,out_c,in_h,in_w,1,1,in_h,in_w,1,1,output_count)
+        break
+      if match is not None: break
+  for feature_parsed,weight_parsed in (() if match is not None or len(red_axes) != 3 or len(out_axes) not in (3,4) else
+                                       (parsed_operands, tuple(reversed(parsed_operands)))):
     feature, weight = feature_parsed[0], weight_parsed[0]
     feature_aff, weight_aff = _affine(feature.src[1]), _affine(weight.src[1])
     if feature_aff is None or weight_aff is None or feature_aff[1] or weight_aff[1]: continue
@@ -1408,7 +1428,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
     if match is not None: break
   if match is None: return _not_applicable()
   feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count = match
-  if in_c not in (1,2,3,4,16) or not 1 <= out_c <= 16 or not (kernel_h > 1 or kernel_w > 1) or max(kernel_h,kernel_w) > 3 or \
+  if in_c not in (1,2,3,4,16) or not 1 <= out_c <= 16 or not 1 <= kernel_h <= 3 or not 1 <= kernel_w <= 3 or \
      max(in_h,in_w) > 32 or batch > 4:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
       f"direct spatial convolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w},S={stride_y}x{stride_x}",
@@ -1438,10 +1458,11 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   scratch:tuple[RKScratch, ...] = ()
   packed_input = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(len(input_rows)*2),)
+  selector_outputs = 128 if kernel_h == kernel_w == 1 else 64
   input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,feature.src[0].arg.slot),
                                  int(feature.src[0].src[0].arg),input_rows,scratch,
                                  direct_capacity=((int(feature.src[0].src[0].arg)*2+4095)&-4096)//2,
-                                 max_window=RK_MAX_CMAC_SELECTOR_WINDOW)
+                                 max_window=RK_MAX_CMAC_SELECTOR_WINDOW,max_outputs=selector_outputs)
   if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution input pack exceeds plan limits",Ops.INDEX)
   scratch, steps = input_plan.scratch, list(input_plan.steps)
   packed_weight = RKArg(RKBufferKind.SCRATCH,len(scratch))
@@ -1470,7 +1491,8 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
       RKTensorRef(packed_weight,weight_layout),in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,
       stride_y,stride_x,input_width_stride,output_width_stride))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
-                             batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count)
+                             batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,
+                             max_outputs=selector_outputs)
   if unpack is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution output unpack exceeds plan limits",Ops.INDEX)
   program = _finish_program([*steps,*unpack.steps],unpack.scratch)
   cost = plan_cost(program)

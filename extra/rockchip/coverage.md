@@ -2329,3 +2329,39 @@ subtests in 731.90 seconds without a timeout, invalid submission, reset failure,
 or process abort. The authoritative full census remains 163/40/209/13. Together
 with the earlier focused depthwise transition, the focused strided-convolution
 result implies 165/40/207/13 pending the next complete uncached census.
+
+## Direct pointwise CNA and rejected channel splitting
+
+The `conv_grok` pointwise register family was revalidated separately from its
+host packer. For 1x1 work the emitter reserves CBUF banks from the actual
+weight footprint, uses feature grains equal to the pointwise height,
+`CNA_CVT_CON0=1`, and `CORE_MISC_CFG=0x200`. Legalization handles the
+early-simplified two-output-axis/one-reduction-axis affine form and factors the
+flat spatial extent into the closest legal dimensions no larger than 32.
+
+The unchanged official IC4 9x9 `test_simple_conv2d_1x1` passes at its original
+tolerance through one direct CONV task; its complete plan has 19 tasks, 628,176
+constant bytes, and 4,208 scratch bytes. A permanent IC16 8x8 device regression
+also passes at `rtol=1e-3, atol=1e-6` through one CONV task; its plan has 21
+tasks, 655,360 constant bytes, and 4,608 scratch bytes. This is an efficiency
+milestone rather than a method-count transition because the official IC4
+method already passed through selector CMAC.
+
+The official IC16 32x32 `test_simple_conv2d_1x1_m4` remains a typed
+`PLAN_STAGE_LIMIT` reject. A fully NPU-native experiment ran sixteen IC1 CNA
+tasks directly over the already-contiguous NCHW channel planes, packed weights
+with selector CMAC, accumulated packed partials with DPU ADD, and performed one
+output reformat. It compiled to 336 tasks, 659,952 constant bytes, and 594,208
+scratch bytes, but early FP16 partial writeback changed the reduction contract:
+4,458 of 16,384 outputs exceeded official tolerance and maximum absolute error
+was 0.02344. No tolerance changed and the path was removed from accepted
+lowering. Its complete diff is preserved as
+`rockchip-upstream-patches/wip-pointwise-channel-split-fp16-rounding.patch`
+with SHA-256
+`2ba6bcccf36fd83039a5c8dbfe448fb4c076713073b19b592cf8d13a46c74de7`.
+
+All 124 host tests plus ten subtests pass, mypy checks all 225 modules, and
+Ruff is clean. The complete serialized device contract passes 87 tests plus 58
+subtests in 717.87 seconds without a timeout, invalid submission, reset failure,
+or process abort. This milestone changes plan quality but not the authoritative
+163/40/209/13 method census or the focused inferred 165/40/207/13 result.
