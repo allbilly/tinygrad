@@ -1756,3 +1756,37 @@ a larger task limit.
 All 103 compiler/image/fallback/telemetry tests plus three subtests pass. The
 complete strict device suite passes 79 tests plus 56 subtests in 769.17 seconds
 with no concurrent NPU process.
+
+One-row CMAC output compaction and a wider proven selector window remove the
+64x99 matmul stage blocker without changing the 400-task or 2 MiB ceilings.
+Hardware establishes that `DPU_SURFACE_ADD=0x20` stores every probed one-row
+FP16 output from N=16 through N=128 contiguously. The same setting does not
+remove multi-row physical row padding, so `RKContract.compact_output` is a
+typed M=1-only emission contract. A final DPU copy writes only the logical
+output extent and therefore never writes CMAC padding beyond the user buffer.
+
+A single selector CMAC exactly gathers the stride-99 positions
+`[0,99,...,1485]` through a 1,504-lane input window. This proven allowance is
+scoped to tiled-contraction RHS packing; all ordinary affine selector plans
+retain their former 512-lane ceiling and cost profiles. Generated selector
+payloads deduplicate to 770,048 bytes. Input tails are bounded by the
+Rockchip allocator's explicit 4-KiB GEM rounding and can only feed zero-weight
+padding lanes. Direct contiguous LHS use eliminates two packing tasks.
+
+The resulting `1x64 @ 64x99` plan is 399 tasks, 18,326 command words, 399
+resets, 803,024 constant bytes, 33,056 scratch bytes, and 9,459,811 estimated
+MACs. A random nonconstant hardware run is bit-exact against FP32 accumulation
+followed by FP16, and unchanged strict `TestOps.test_matmul` passes in 48.05
+seconds with `ROCKCHIP_FALLBACK=0`. This is one focused inferred transition
+from the authoritative 148-pass census, raising the post-census estimate to
+150 after the earlier lerp gain; a complete uncached census is still pending.
+
+The rejected DPU reformat experiment is retained rather than hidden. Scalar
+height rows are written eight half-lanes apart, source line-notch values zero,
+four, and five do not change the gathered addresses, and DPU NONALIGN times
+out. The ordinary DPU recovery test passes after reset. All 103 unit tests plus
+three subtests pass, mypy is clean across 225 modules, touched-file Ruff is
+clean, and the serialized strict device suite passes 79 tests plus 56 subtests
+in 728.41 seconds. Repository-wide Ruff still reports 13 pre-existing
+Python-3.12 nested-f-string syntax findings in `extra/rockchip/gen_lut.py` under
+its Python-3.11 parser target.

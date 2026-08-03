@@ -222,6 +222,9 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if plan.out.layout.dtype not in (dtypes.half,dtypes.float): raise ValueError("CMAC output must be FP16 or FP32")
   if fp32_out and (m != 1 or plan.out.layout.physical_shape != (1,64) or plan.out.layout.strides_bytes != (256,4) or
                    plan.epilogue is not None): raise ValueError("CMAC FP32 output requires one proven 32-lane tile")
+  if plan.compact_output and (fp32_out or m != 1 or plan.out.layout.physical_shape != (1,align_out) or
+                              plan.out.layout.strides_bytes != (align_out*2,2)):
+    raise ValueError("compact CMAC output requires one dense FP16 row")
   input_row_bytes = align_in*2
   feature_grains = max(80, (((2*256*128+input_row_bytes-1)//input_row_bytes)+1)&-2)
   data_banks = min(11, max(1, (m*input_row_bytes+32767)//32768))
@@ -252,7 +255,8 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align_out-1),
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, (m-1)<<16), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0 if fp32_out else 0x10001),
-    e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
+    e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x20 if plan.compact_output else 0x40),
+    e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
   relocs = [RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
             for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out))]
   if plan.epilogue is not None:

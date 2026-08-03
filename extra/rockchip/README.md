@@ -47,8 +47,8 @@ ceilings, then compare reset overhead, MACs, traffic, command volume, constants,
 and scratch. Runtime telemetry records exact task/command/reset counts and marks
 plans over 64 tasks or 1 MiB of constants as `CORRECTNESS_FALLBACK`; these remain
 honest native passes but are kept visible for replacement by direct engine paths.
-The richer candidate ordering preserves the complete strict result: 77 tests
-plus 54 subtests pass in 729.59 seconds with fallback disabled.
+The richer candidate ordering preserves the complete strict result: 79 tests
+plus 56 subtests pass in 728.41 seconds with fallback disabled.
 
 Lowering uses sixteen named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
@@ -87,7 +87,8 @@ are eligible to be ported as native capabilities.
   converted to FP32 on the NPU, then fused through BRDMA before the first FP16
   writeback, with optional ReLU in the same DPU flying-data stage; one CMAC
   task may produce up to 128 logical channels in proven 32-channel groups,
-  with each 16-channel FP16 block occupying one gapped 32-lane WDMA atom;
+  with each 16-channel FP16 block normally occupying one gapped 32-lane WDMA
+  atom; a hardware-proven one-row compact mode writes those blocks contiguously;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
 - dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane
@@ -424,19 +425,32 @@ wrong maxima, `NONALIGN` times out, and unaligned DPU source addends do not
 reduce within an atom. HWC8 remains the declared direct PPU layout.
 
 `extra/rockchip/probe_cmac_width.py` proves direct logical output widths through
-128. FP16 WDMA stores every 16-channel block in a 32-lane atom, so contraction
-unpack uses the physical block map rather than assuming contiguous output.
-Dynamic 4x9 by 9x40 and 1x64 by 64x40 contractions pass bit-exactly on hardware;
-the latter is a 331-task correctness fallback. A 1x64 by 64x99 selector plan is
-rejected immediately because its mathematical lower bound is already 408 tasks.
-The complete strict device suite passes 79 tests plus 56 subtests in 769.17
-seconds with fallback disabled.
+128. Normal FP16 WDMA stores every 16-channel block in a 32-lane atom, while
+`DPU_SURFACE_ADD=0x20` writes one-row CMAC results contiguously for every probed
+N from 16 through 128. Multi-row output retains a padded physical row stride,
+so compact emission is deliberately restricted to M=1. The same probe proves
+that one CMAC selector can gather a stride-99 pattern through a 1,504-lane
+input window exactly.
+
+The tiled RHS pack alone may use that proven window; unrelated affine planners
+retain their 512-lane cap. Zero-weight padded lanes may read only the known
+4-KiB-rounded GEM tail. Together with direct contiguous LHS use and one DPU
+copy from compact CMAC scratch, `1x64 @ 64x99` now has 399 tasks, 803,024 unique
+constant bytes, and 33,056 scratch bytes without raising either global limit.
+Random hardware output is bit-exact against FP32 accumulation followed by FP16,
+and the unchanged strict `TestOps.test_matmul` passes in 48.05 seconds.
+
+`extra/rockchip/probe_dpu_surface_reformat.py` preserves the rejected alternative:
+aligned scalar DPU rows remain eight lanes apart, line-notch variants do not
+change the gather, and DPU NONALIGN times out. A known-good DPU recovery passes
+after reset. The complete strict device suite passes 79 tests plus 56 subtests
+in 728.41 seconds with fallback disabled.
 
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,649, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,649 lines.
-The exact 3,681-line delta is 3,676 counted Rockchip backend lines (3,509
+contains 28,672, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,672 lines.
+The exact 3,704-line delta is 3,699 counted Rockchip backend lines (3,532
 renderer/compiler, 118 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

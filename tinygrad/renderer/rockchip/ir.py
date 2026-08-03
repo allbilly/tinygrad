@@ -117,6 +117,7 @@ class RKContract:
   reduce_axis: int
   constants: bytes = b""
   epilogue: RKEpilogue|None = None
+  compact_output: bool = False
 
 @dataclass(frozen=True)
 class RKReduce:
