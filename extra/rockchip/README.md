@@ -6,26 +6,18 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `85f9cc0af` is 160 native,
-40 frontend-only, 212 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. Raw pytest reports 212 passed, 249 failed, 13 skipped,
-and 77 passing subtests in 2,281.36 seconds. It completed without an NPU
+The current authoritative uncached strict census at `69ea691a8` is 162 native,
+40 frontend-only, 210 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. Raw pytest reports 214 passed, 247 failed, 13 skipped,
+and 77 passing subtests in 2,342.12 seconds. It completed without an NPU
 timeout, reset failure, invalid submission, or process abort. Coverage details
 and durable artifact hashes are recorded in `coverage.md`.
 
-Relative to the preceding census, `test_diag`, `test_pad_circular_mode`,
-`test_pad_reshape`, `test_repeat_interleave`, `test_roll`, and
-`test_simple_repeat` change from failure to native pass. Every remaining
-failure is a typed native reject; there are no device or unclassified frontend
-failures in the authoritative inventory. The compiler preserves split RANGE
-subaxis identity and exactly enumerates bounded compile-time modulo/floor-divide
-maps before choosing the existing costed NPU selector. Dynamic tensor indexing
-is still rejected.
-
-The newer static-CAST/windowed-reformat milestone is not yet part of that
-census. Focused strict telemetry moves both FP16 nearest interpolation methods
-to native execution through efficient 3--17-task plans. The authoritative
-totals remain 160/40/212/13 until the next complete uncached run.
+Relative to the preceding census, `test_interpolate_nearest` and
+`test_interpolate_nearest_exact` change from failure to native pass. Every
+remaining failure is a typed native reject; there are no device or unclassified
+frontend failures in the authoritative inventory. Dynamic tensor indexing is
+still rejected.
 
 The compiler boundary is:
 
@@ -701,3 +693,8 @@ checks nearest and nearest-exact mappings exactly. All 117 Rockchip host tests
 plus three subtests, mypy, and Ruff pass, and the complete device contract
 passes 84 tests plus 58 subtests in 705.30 seconds without a timeout, invalid
 submission, reset failure, or process abort.
+
+The complete uncached census confirms these as the only two method
+transitions, with no regression, and establishes the authoritative
+162/40/210/13 result. All 210 remaining failures are `NATIVE_REJECT`;
+unsupported-layout falls from 28 to 26 method-first rejects.

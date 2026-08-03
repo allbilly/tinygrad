@@ -12,33 +12,33 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `85f9cc0af` contains exactly 425 method records:
-160 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 212 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `69ea691a8` contains exactly 425 method records:
+162 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 210 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 249 failed methods/subtests, 212 passed, 77 passing subtests,
-and 13 skipped in 2,281.36 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 247 failed methods/subtests, 214 passed, 77 passing subtests,
+and 13 skipped in 2,342.12 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to the weak-reduction census, `test_diag`, `test_pad_circular_mode`,
-`test_pad_reshape`, `test_repeat_interleave`, `test_roll`, and
-`test_simple_repeat` change from failure to native pass. The 212 failed methods
-first classify as 65 unsupported-output-dtype, 50 plan-stage-limit, 28
-unsupported-layout, 23 unsupported-input-dtype, 18 requires-reformat, 16
+Relative to the static-reformat census, `test_interpolate_nearest` and
+`test_interpolate_nearest_exact` change from failure to native pass. The 210
+failed methods first classify as 65 unsupported-output-dtype, 50
+plan-stage-limit, 26 unsupported-layout, 23 unsupported-input-dtype, 18
+requires-reformat, 16
 numerical-contract, nine unsupported-ALU, and three unsupported-reduction.
-Schema version 2 classifies all 212 failures as
-`NATIVE_REJECT`; no failure lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-static-reformat-85f9cc0af-20260803/test_ops_coverage.json`
-(SHA-256 `2417190047e0f91278b6b9c67c3a18ba7b9af03cb9bf8ccc5ddea42533f5f895`);
+Schema version 2 classifies all 210 failures as `NATIVE_REJECT`; no failure
+lacks a precise first reject. The durable telemetry
+is `~/rk2608_backups/census-nearest-69ea691a8-20260803/test_ops_coverage.json`
+(SHA-256 `7fd11e9965919c059fe5de403dd273359259f5b1df9d26a768be4288ba5661ab`);
 the JUnit XML SHA-256 is
-`61a68c3cb178fbb0dfa207372ec04d14b55246ad7a1d631e1d9b9c0dbb4ce98b`.
+`cbe8e36a2fa74ae42f19f28930fa8c50e8c7ee26982c4a7ab89661529eeda262`.
 
-The 479 successful native kernels contain 453 `EFFICIENT` and 26
-`CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 173 at
-2--8, 78 at 9--32, 81 at 33--64, nine at 65--128, 14 at 129--256, and three at
+The 501 successful native kernels contain 475 `EFFICIENT` and 26
+`CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 179 at
+2--8, 94 at 9--32, 81 at 33--64, nine at 65--128, 14 at 129--256, and three at
 257--400. The worst path remains `test_matmul` at 399 tasks, 18,326 command
-words, 899,280 constant bytes, and 42.62 seconds. The six new method passes add
-35 successful native kernels. All remain below 64 tasks; the existing count of
-26 correctness-fallback kernels is unchanged.
+words, 899,280 constant bytes. The two new method passes add 22 successful
+native kernels. All remain below 18 tasks; the existing count of 26
+correctness-fallback kernels is unchanged.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -2180,6 +2180,10 @@ native 780-to-858 first-axis plan. A strict hardware regression checks both
 nearest truncation conventions exactly. All 117 Rockchip host tests plus three
 subtests pass, mypy checks all 225 source files, and Ruff is clean. The complete
 serialized device suite passes 84 tests plus 58 subtests in 705.30 seconds with
-no timeout, invalid submission, reset failure, or process abort. The
-authoritative method census remains 160/40/212/13 pending a complete uncached
-rerun.
+no timeout, invalid submission, reset failure, or process abort.
+
+The complete uncached rerun confirms exactly those two transitions and no
+regression. It establishes the authoritative 162/40/210/13 result, with all
+210 failures classified as `NATIVE_REJECT`. Unsupported-layout falls from 28
+to 26 method-first rejects. Durable JSON and JUnit hashes are recorded in the
+current-census section above.
