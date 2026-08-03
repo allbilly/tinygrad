@@ -1838,3 +1838,23 @@ mypy, and touched-file Ruff also pass. This is one focused failure-to-native
 transition not yet folded into a complete 425-method census, so the
 authoritative count remains 150 native, 40 frontend-only, 222 failed, and 13
 upstream-skipped methods until that census is rerun.
+
+### Channel-16 direct layout
+
+The direct matcher now also accepts simplified batch-one graphs and the
+separately proven 16-input-channel CNA contract. Activations are packed on the
+NPU into C1/H/W/C2 eight-lane atoms, while weights are packed into KH/KW/OC/IC
+order with sixteen physical input lanes. The typed emitter selects the matching
+non-NHWC conversion, CBUF, and DMA-stride fields. Its register values are
+identical to the known-good channel-16 `conv_simple.py` task.
+
+`test_simple_conv2d_m4` changes from an early affine-surface plan-limit reject
+to a 275-task program: 12,652 command words, 275 resets, 899,072 constant bytes,
+8,864 scratch bytes, and 1,341,344 estimated MACs. The unchanged official test
+passes in 30.99 seconds, and a randomized device test confirms parity plus one
+telemetry-visible `CONV` task. The complete expanded hardware suite passes 81
+tests plus 56 subtests in 750.28 seconds; 105 host tests plus three subtests,
+mypy, and touched-file Ruff also pass. Together the two direct-convolution
+milestones account for two focused failure-to-native transitions pending the
+next complete census; the authoritative 425-method totals remain unchanged
+until that run completes.

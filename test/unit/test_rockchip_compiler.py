@@ -857,6 +857,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
     self.assertFalse(contains_uop(plan))
 
+  def test_channel16_spatial_contraction_uses_direct_conv(self):
+    plan = lower_spatial_contract_result(sink(Tensor.empty(1,16,9,9,dtype=dtypes.half).conv2d(
+      Tensor.empty(16,16,3,3,dtype=dtypes.half)))).plan
+    self.assertIsInstance(plan,RKProgram)
+    assert isinstance(plan,RKProgram)
+    image, cost = emit_program(plan), plan_cost(plan)
+    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in plan.steps),1)
+    self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),1)
+    self.assertLessEqual(cost.task_count,300)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(plan))
+
   def test_sparse_pair_and_deduplicated_contractions_stay_inside_cost_ceiling(self):
     cases = ((Tensor.empty(1,3,5,7,dtype=dtypes.half), Tensor.empty(6,1,3,3,dtype=dtypes.half), 3),
              (Tensor.empty(1,3,5,7,dtype=dtypes.half), Tensor.empty(6,3,3,5,dtype=dtypes.half), 1))

@@ -1219,7 +1219,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
          parsed[0].src[0].op is not Ops.PARAM for parsed in operands): return _not_applicable()
   parsed_operands = cast(tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool]], operands)
   out_aff = _affine(store.src[0].src[1])
-  if out_aff is None or out_aff[1] != 0 or len(out_aff[0]) != 4: return _not_applicable()
+  if out_aff is None or out_aff[1] != 0 or len(out_aff[0]) not in (3,4): return _not_applicable()
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
   if any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
@@ -1229,14 +1229,18 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
     feature, weight = feature_parsed[0], weight_parsed[0]
     feature_aff, weight_aff = _affine(feature.src[1]), _affine(weight.src[1])
     if feature_aff is None or weight_aff is None or feature_aff[1] or weight_aff[1]: continue
-    for batch_axis,channel_axis,out_y_axis,out_x_axis in permutations(out_axes):
-      batch, out_c, out_h, out_w = (ranges[x] for x in (batch_axis,channel_axis,out_y_axis,out_x_axis))
+    output_roles = ((None,*axes) for axes in permutations(out_axes)) if len(out_axes) == 3 else permutations(out_axes)
+    for batch_axis,channel_axis,out_y_axis,out_x_axis in output_roles:
+      batch = 1 if batch_axis is None else ranges[batch_axis]
+      out_c, out_h, out_w = (ranges[x] for x in (channel_axis,out_y_axis,out_x_axis))
       for in_channel_axis,kernel_y_axis,kernel_x_axis in permutations(red_axes):
         in_c, kernel_h, kernel_w = (ranges[x] for x in (in_channel_axis,kernel_y_axis,kernel_x_axis))
         in_h, in_w = out_h+kernel_h-1, out_w+kernel_w-1
-        if out_aff[0] != {batch_axis:out_c*out_h*out_w, channel_axis:out_h*out_w, out_y_axis:out_w, out_x_axis:1}: continue
-        if feature_aff[0] != {batch_axis:in_c*in_h*in_w, in_channel_axis:in_h*in_w,
-                             kernel_y_axis:in_w, kernel_x_axis:1, out_y_axis:in_w, out_x_axis:1}: continue
+        expected_out = {channel_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1}
+        expected_feature = {in_channel_axis:in_h*in_w,kernel_y_axis:in_w,kernel_x_axis:1,out_y_axis:in_w,out_x_axis:1}
+        if batch_axis is not None:
+          expected_out[batch_axis], expected_feature[batch_axis] = out_c*out_h*out_w, in_c*in_h*in_w
+        if out_aff[0] != expected_out or feature_aff[0] != expected_feature: continue
         if weight_aff[0] != {channel_axis:in_c*kernel_h*kernel_w, in_channel_axis:kernel_h*kernel_w,
                             kernel_y_axis:kernel_w, kernel_x_axis:1}: continue
         feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
@@ -1248,15 +1252,22 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
     if match is not None: break
   if match is None: return _not_applicable()
   feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,output_count = match
-  if in_c != 4 or not 1 <= out_c <= 16 or not (kernel_h > 1 or kernel_w > 1) or max(kernel_h,kernel_w) > 3 or \
+  if in_c not in (4,16) or not 1 <= out_c <= 16 or not (kernel_h > 1 or kernel_w > 1) or max(kernel_h,kernel_w) > 3 or \
      max(in_h,in_w) > 16 or batch > 4:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
       f"direct spatial convolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w}", reduce.op)
 
-  input_width_stride, output_width_stride, align_in = (in_w+1)&-2, (out_h*out_w+3)&-4, 8
+  align_in, input_c2 = (8,4) if in_c == 4 else (16,8)
+  width_alignment = max(1,(16+align_in-1)//align_in)
+  input_width_stride, output_width_stride = ((in_w+width_alignment-1)//width_alignment)*width_alignment, (out_h*out_w+3)&-4
   input_batch_count, output_batch_count = in_h*input_width_stride*in_c, 2*output_width_stride*8
-  input_rows = [[b*in_c*in_h*in_w+c*in_h*in_w+y*in_w+x] if x < in_w else []
-                for b in range(batch) for y in range(in_h) for x in range(input_width_stride) for c in range(in_c)]
+  if in_c == 4:
+    input_rows = [[b*in_c*in_h*in_w+c*in_h*in_w+y*in_w+x] if x < in_w else []
+                  for b in range(batch) for y in range(in_h) for x in range(input_width_stride) for c in range(input_c2)]
+  else:
+    input_rows = [[b*in_c*in_h*in_w+(c1*input_c2+c2)*in_h*in_w+y*in_w+x] if x < in_w else []
+                  for b in range(batch) for c1 in range(in_c//input_c2) for y in range(in_h)
+                  for x in range(input_width_stride) for c2 in range(input_c2)]
   weight_rows = [[oc*in_c*kernel_h*kernel_w+c*kernel_h*kernel_w+ky*kernel_w+kx] if c < in_c else []
                  for ky in range(kernel_h) for kx in range(kernel_w) for oc in range(out_c) for c in range(align_in)]
   output_rows = [[b*output_batch_count+(oc//8)*output_width_stride*8+(y*out_w+x)*8+oc%8]
@@ -1266,7 +1277,8 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   scratch += (RKScratch(len(input_rows)*2),)
   input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,feature.src[0].arg.slot),
                                  int(feature.src[0].src[0].arg),input_rows,scratch,
-                                 direct_capacity=((int(feature.src[0].src[0].arg)*2+4095)&-4096)//2)
+                                 direct_capacity=((int(feature.src[0].src[0].arg)*2+4095)&-4096)//2,
+                                 max_window=RK_MAX_CMAC_SELECTOR_WINDOW)
   if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution input pack exceeds plan limits",Ops.INDEX)
   scratch, steps = input_plan.scratch, list(input_plan.steps)
   packed_weight = RKArg(RKBufferKind.SCRATCH,len(scratch))
@@ -1278,8 +1290,13 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   scratch, steps = weight_plan.scratch, [*steps,*weight_plan.steps]
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(batch*output_batch_count*2),)
-  input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
-                          padding=((0,0),(0,input_width_stride-in_w),(0,0)))
+  if in_c == 4:
+    input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
+                            padding=((0,0),(0,input_width_stride-in_w),(0,0)))
+  else:
+    input_layout = RKLayout((in_c//input_c2,in_h,in_w,input_c2),(in_c//input_c2,in_h,input_width_stride,input_c2),
+      (in_h*input_width_stride*input_c2*2,input_width_stride*input_c2*2,input_c2*2,2),dtypes.half,
+      padding=((0,0),(0,0),(0,input_width_stride-in_w),(0,0)))
   weight_layout = RKLayout((kernel_h,kernel_w,out_c,in_c),(kernel_h,kernel_w,out_c,align_in),
                            (kernel_w*out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,
                            padding=((0,0),(0,0),(0,0),(0,align_in-in_c)))

@@ -49,8 +49,8 @@ ceilings, then compare reset overhead, MACs, traffic, command volume, constants,
 and scratch. Runtime telemetry records exact task/command/reset counts and marks
 plans over 64 tasks or 1 MiB of constants as `CORRECTNESS_FALLBACK`; these remain
 honest native passes but are kept visible for replacement by direct engine paths.
-The richer candidate ordering preserves the complete strict result: 79 tests
-plus 56 subtests pass in 728.41 seconds with fallback disabled.
+The richer candidate ordering preserves the complete strict result: 81 tests
+plus 56 subtests pass in 750.28 seconds with fallback disabled.
 
 Lowering uses seventeen named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
@@ -455,7 +455,7 @@ stage-limit blocker without raising the 400-task ceiling. An exact affine
 matcher recognizes dense FP16 stride-one NCHW/OIHW convolution by enumerating
 axis roles and verifying the complete input, weight, and output stride maps;
 it does not inspect Tensor operation names. The initial hardware contract is
-deliberately narrow: four input channels, at most sixteen output channels,
+deliberately narrow: four or sixteen input channels, at most sixteen output channels,
 spatial kernels up to 3x3, input dimensions at most sixteen, and at most four
 batches. NPU selector tasks pack NCHW input and OIHW weights into proven CNA
 surfaces, one typed `RKSpatialConv` task runs per batch, and selectors unpack
@@ -481,11 +481,31 @@ serialized device suite passes 79 tests plus 56 subtests in 728.68 seconds.
 This focused failure-to-native transition is pending the next complete census,
 so the authoritative headline remains 150 native methods.
 
+The second direct-convolution milestone adds the independently proven
+16-input-channel layout. The exact affine matcher also accepts batch-one graphs
+whose unit batch axis was removed by simplification. Channel-16 activations are
+packed as C1/H/W/C2 with eight-lane inner atoms; weights use the matching
+KH/KW/OC/IC physical order. The emitter selects the corresponding non-NHWC CNA
+conversion, CBUF, and DMA-stride fields. The wider 1,504-lane selector window
+is used only for this typed convolution input pack and remains bounded by the
+same page-tail and zero-weight proof as the wide contraction pack.
+
+The official `(1,16,9,9) * (16,16,3,3)` graph becomes one direct `CONV` task
+plus NPU packing/unpacking: 275 total tasks, 12,652 command words, 275 resets,
+899,072 constant bytes, 8,864 scratch bytes, and 1,341,344 estimated MACs.
+Its register map matches the preserved known-good channel-16 task exactly.
+Strict `TestOps.test_simple_conv2d_m4` passes in 30.99 seconds, and a randomized
+hardware regression verifies numerical parity and one telemetry-visible
+`CONV` task. All 105 host tests plus three subtests pass, mypy and touched-file
+Ruff are clean, and the expanded serialized device suite passes 81 tests plus
+56 subtests in 750.28 seconds. This is a second focused failure-to-native gain
+pending the next complete census.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,860, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,860 lines.
-The exact 3,892-line delta is 3,887 counted Rockchip backend lines plus the
+contains 28,882, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,882 lines.
+The exact 3,914-line delta is 3,909 counted Rockchip backend lines plus the
 five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic
