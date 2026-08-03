@@ -2121,10 +2121,11 @@ expressions, requires a dense destination, and permits duplicate visits only
 when they map that destination to the same source. Enumeration is capped at
 65,536 visits. The resulting immutable map still goes through the established
 NPU-only implementation hierarchy: coalesced aligned DPU atom copies first,
-then the costed selector-CMAC correctness path. The selector remains limited
-to 512 source elements, 4,096 outputs, 400 tasks, and 2 MiB of constants;
-exceeding that contract returns `PLAN_STAGE_LIMIT`. No dynamic tensor index,
-host gather, test-name match, or CPU fallback is introduced.
+then the costed selector-CMAC correctness path. Sparse whole-surface selection
+remains limited to 512 source elements, while windowed selection keeps each
+local source window at K512. Every candidate retains the 4,096-output,
+400-task, and 2 MiB constant ceilings. No dynamic tensor index, host gather,
+test-name match, or CPU fallback is introduced.
 
 Focused schema-v2 telemetry under
 `~/rk2608_backups/focused-static-reformat-4b958169f-20260803/` records four
@@ -2149,3 +2150,36 @@ with no regression, and establishes the authoritative 160/40/212/13 result.
 All 212 failures classify as `NATIVE_REJECT`; unsupported-layout falls from 35
 to 28 method-first rejects. Durable JSON and JUnit hashes are recorded in the
 current-census section above.
+
+## Static CAST and window-bounded large-source reformat
+
+The remaining FP16 nearest and nearest-exact interpolation methods reached a
+fully static reformat, but their source indexes contained float-to-int CASTs.
+The coordinate evaluator previously stripped every CAST, leaving fractional
+indexes such as `13/9`. It now applies the destination dtype's compile-time
+conversion, which reproduces the graph's truncation semantics and yields an
+exact integer selector map.
+
+Multi-dimensional interpolation is realized one axis at a time. Its first 2D
+step may therefore read 780 source elements and write 858 intermediates. The
+old standalone-reformat guard rejected any total source larger than 512 even
+though the windowed selector already constrains each physical CMAC task to a
+local K512 source window. Sparse whole-surface CMAC still requires at most 512
+source lanes; only the existing windowed candidate may address a larger total
+surface. The unchanged 4,096-output, 400-task, and 2 MiB ceilings still apply.
+
+Focused schema-v2 telemetry under
+`~/rk2608_backups/focused-nearest-177f511c7-20260803/` records both unchanged
+official methods as `PASS_NATIVE`. Each method realizes eleven efficient
+DPU/CMAC kernels. Task counts range from three to seventeen and constant bytes
+from 144 to 135,376; neither method is a `CORRECTNESS_FALLBACK`. No tolerance,
+test shape match, runtime conversion, CPU gather, or fallback lane changed.
+
+Permanent compiler regressions prove the exact 13-to-9 nearest mapping and a
+native 780-to-858 first-axis plan. A strict hardware regression checks both
+nearest truncation conventions exactly. All 117 Rockchip host tests plus three
+subtests pass, mypy checks all 225 source files, and Ruff is clean. The complete
+serialized device suite passes 84 tests plus 58 subtests in 705.30 seconds with
+no timeout, invalid submission, reset failure, or process abort. The
+authoritative method census remains 160/40/212/13 pending a complete uncached
+rerun.

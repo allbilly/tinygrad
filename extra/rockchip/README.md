@@ -22,6 +22,11 @@ subaxis identity and exactly enumerates bounded compile-time modulo/floor-divide
 maps before choosing the existing costed NPU selector. Dynamic tensor indexing
 is still rejected.
 
+The newer static-CAST/windowed-reformat milestone is not yet part of that
+census. Focused strict telemetry moves both FP16 nearest interpolation methods
+to native execution through efficient 3--17-task plans. The authoritative
+totals remain 160/40/212/13 until the next complete uncached run.
+
 The compiler boundary is:
 
 ```text
@@ -632,8 +637,8 @@ only method transition, producing the authoritative 154/40/218/13 result.
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,982, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,982 lines.
-The exact 4,014-line delta is 4,005 counted Rockchip backend lines, the
+contains 28,985, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,985 lines.
+The exact 4,017-line delta is 4,008 counted Rockchip backend lines, the
 five-line generic native-program hook, and four generic correctness lines.
 Generated
 register definitions, LUT payloads, and reproducible command data belong under
@@ -654,10 +659,11 @@ The reformat lowerer now retains full RANGE UOp identity for the exact path and
 enumerates at most 65,536 coordinate visits. It accepts redundant writes only
 when they select the same source element, proves a dense destination, and then
 hands the immutable map to the existing coalesced-DPU/selector-CMAC cost
-choice. The proven selector contract remains bounded to 512 source and 4,096
-destination elements plus the unchanged 400-task and 2 MiB constant ceilings;
-larger valid maps return `PLAN_STAGE_LIMIT`. Dynamic gather/scatter indexes
-remain non-evaluable and reject.
+choice. The sparse whole-surface candidate remains bounded to 512 source lanes;
+the later windowed candidate may address a larger total surface while keeping
+each local source window at K512. All candidates retain the 4,096-output,
+400-task, and 2 MiB constant ceilings. Dynamic gather/scatter indexes remain
+non-evaluable and reject.
 
 The complete uncached census records six native transitions:
 `test_simple_repeat`, `test_repeat_interleave`, `test_roll`,
@@ -669,3 +675,29 @@ both maps exactly after mixed-engine work. All 115 Rockchip host tests plus
 three subtests, mypy, and Ruff pass; the complete device suite passes 83 tests
 plus 56 subtests in 695.02 seconds without a timeout, invalid submission, reset
 failure, or process abort.
+
+## Static CAST and large-source windowed reformats
+
+Nearest interpolation computes compile-time source coordinates in floating
+point and casts them to integer. The static coordinate evaluator previously
+treated CAST as an identity, so valid fractional intermediate values reached
+layout validation and rejected. It now applies the target dtype's constant
+conversion, including the required truncation toward zero, before proving the
+immutable output-to-input map.
+
+The selector planner also no longer confuses total source extent with CMAC K.
+Sparse whole-surface CMAC remains limited to 512 source lanes. A larger source
+surface may use the already proven windowed selector only when every selected
+local window fits the unchanged K512 contract; output, task, and constant
+ceilings remain 4,096, 400, and 2 MiB. Thus the 2D interpolation schedule can
+legally materialize its 780-to-858 first-axis step without enabling K>512.
+
+Both unchanged official FP16 `test_interpolate_nearest` and
+`test_interpolate_nearest_exact` pass with `ROCKCHIP_FALLBACK=0` in 30.92
+seconds. Each realizes eleven efficient NPU kernels; the largest contains 17
+tasks and 135,376 constant bytes. Permanent compiler tests cover exact nearest
+coordinate truncation and the larger source surface. A serial hardware test
+checks nearest and nearest-exact mappings exactly. All 117 Rockchip host tests
+plus three subtests, mypy, and Ruff pass, and the complete device contract
+passes 84 tests plus 58 subtests in 705.30 seconds without a timeout, invalid
+submission, reset failure, or process abort.

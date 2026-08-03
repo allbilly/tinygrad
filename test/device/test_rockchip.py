@@ -385,6 +385,13 @@ class TestRockchip(unittest.TestCase):
     rolled = np.arange(32,dtype=np.float16).reshape(4,8)
     np.testing.assert_equal(Tensor(rolled,device="ROCKCHIP").realize().roll(1).contiguous().realize().numpy(), np.roll(rolled,1))
 
+  def test_static_cast_nearest_reformat_native_cmac(self):
+    data = np.arange(2*3*13,dtype=np.float16).reshape(2,3,13)
+    tensor = Tensor(data,device="ROCKCHIP").realize()
+    for mode,indexes in (("nearest", (0,1,2,4,5,7,8,10,11)), ("nearest-exact", (0,2,3,5,6,7,9,10,12))):
+      with self.subTest(mode=mode):
+        np.testing.assert_equal(tensor.interpolate((9,),mode=mode).realize().numpy(), data[...,indexes])
+
   def test_input_dma_atom_padding_survives_lut_then_cmac(self):
     zero, negative = Tensor([0], dtype=dtypes.half, device="ROCKCHIP"), Tensor([-.7], dtype=dtypes.half, device="ROCKCHIP")
     np.testing.assert_equal((zero.log2()*negative).realize().numpy(), np.array([np.inf], dtype=np.float16))

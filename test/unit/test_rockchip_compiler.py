@@ -1140,6 +1140,26 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_static_cast_reformat_truncates_nearest_coordinates(self):
+    source = Tensor.empty(2,3,13,dtype=dtypes.half).realize()
+    result = lower_reformat_result(sink(source.interpolate((9,),mode="nearest").contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    spatial = (0,1,2,4,5,7,8,10,11)
+    self.assertEqual(result.plan.mapping, tuple(batch*13+index for batch in range(6) for index in spatial))
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_windowed_reformat_accepts_large_source_surface(self):
+    source = Tensor.empty(2,3,13,10,dtype=dtypes.half).realize()
+    result = lower_reformat_result(sink(source.interpolate((9,11),mode="nearest").contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    self.assertEqual((result.plan.src.layout.logical_shape, result.plan.out.layout.logical_shape), ((780,), (858,)))
+    self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_affine_reduction_materializes_pointwise_dpu_expression(self):
     x, y = Tensor.empty(3,4,5,dtype=dtypes.half), Tensor.empty(3,4,5,dtype=dtypes.half)
     plan = lower_affine_reduce_result(sink(((x+y)*x).sum(axis=1))).plan

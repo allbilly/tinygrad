@@ -208,7 +208,8 @@ def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[lis
                       scratch:tuple[RKScratch, ...], direct_capacity:int|None=None, max_window:int=512,
                       max_outputs:int=64) -> RKProgram|None:
   sparse_bytes = ((len(rows)+15)//16)*32*max(32,(input_count+31)&-32)*2
-  sparse = _sparse_cmac_pipeline(output,source,input_count,rows,scratch=scratch) if sparse_bytes <= RK_MAX_CONSTANT_BYTES else None
+  sparse = _sparse_cmac_pipeline(output,source,input_count,rows,scratch=scratch) \
+    if input_count <= 512 and sparse_bytes <= RK_MAX_CONSTANT_BYTES else None
   candidates = (sparse,_windowed_cmac_pipeline(output, source, rows, scratch=scratch,
                                                direct_count=input_count if direct_capacity is None else direct_capacity,
                                                max_window=max_window, max_outputs=max_outputs))
@@ -324,7 +325,9 @@ def _strip_casts(u:UOp) -> UOp:
 
 def _static_scalar(u:UOp, ranges:dict[int, int]|dict[UOp, int]) -> int|float|bool|None:
   """Evaluate one compile-time coordinate predicate; tensor loads are never accepted."""
-  if u.op is Ops.CAST: return _static_scalar(u.src[0], ranges)
+  if u.op is Ops.CAST:
+    value = _static_scalar(u.src[0], ranges)
+    return None if value is None else cast(int|float|bool, u.dtype.const(value))
   if u.op is Ops.CONST: return u.arg
   if u.op is Ops.RANGE:
     return cast(dict[UOp,int], ranges)[u] if u in ranges else cast(dict[int,int], ranges).get(u.arg[0])
@@ -469,13 +472,13 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   out_ref, src_ref = _dense_half_ref(output.index, (count,)), _dense_half_ref(source.index, (src_count,))
   if atom_reject is None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.COALESCED_DPU, (RKDPUProgram(tuple(stages)),)))
-  if 0 < src_count <= 512 and 0 < count <= 4096 and (implementation:=_selector_program(
+  if 0 < src_count and 0 < count <= 4096 and (implementation:=_selector_program(
       output, source, src_count, [[src] if src >= 0 else [] for src in mapping], ())) is not None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.SELECTOR_CMAC,
       cast(tuple[RKDPUProgram|RKContract, ...], implementation.steps), implementation.scratch))
-  if src_count > 512 or count > 4096:
+  if count > 4096:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
-      f"static reformat selector surface {src_count}->{count} exceeds the proven 512->4096 bound", Ops.INDEX)
+      f"static reformat selector output {count} exceeds the proven 4096-element bound", Ops.INDEX)
   if 0 < src_count and 0 < count:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "static reformat selector exceeds the native cost contract", Ops.INDEX)
   return atom_reject
