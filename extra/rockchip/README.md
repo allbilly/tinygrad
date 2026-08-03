@@ -743,5 +743,5 @@ regression checks its complete 20,736-element result. All 121 Rockchip host
 tests plus three subtests, mypy over 225 modules, and repository Ruff pass; the
 complete device contract passes 84 tests plus 58 subtests in 721.14 seconds
 without a timeout, invalid submission, reset failure, or process abort. The
-focused method result implies 163 native methods, pending the next complete
-uncached census; the authoritative total remains 162/40/210/13 until then.
+complete uncached census confirms `test_repeat` as the only method transition,
+with no regression, and establishes the authoritative 163/40/209/13 result.

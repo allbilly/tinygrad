@@ -12,33 +12,33 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `69ea691a8` contains exactly 425 method records:
-162 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 210 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `4e2bbe7ef` contains exactly 425 method records:
+163 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 209 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 247 failed methods/subtests, 214 passed, 77 passing subtests,
-and 13 skipped in 2,342.12 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 246 failed methods/subtests, 215 passed, 77 passing subtests,
+and 13 skipped in 2,352.89 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to the static-reformat census, `test_interpolate_nearest` and
-`test_interpolate_nearest_exact` change from failure to native pass. The 210
-failed methods first classify as 65 unsupported-output-dtype, 50
-plan-stage-limit, 26 unsupported-layout, 23 unsupported-input-dtype, 18
-requires-reformat, 16
-numerical-contract, nine unsupported-ALU, and three unsupported-reduction.
-Schema version 2 classifies all 210 failures as `NATIVE_REJECT`; no failure
+Relative to the nearest-reformat census, only `TestOps.test_repeat` changes
+from failure to native pass. The 209 failed methods first classify as 65
+unsupported-output-dtype, 49 plan-stage-limit, 26 unsupported-layout, 23
+unsupported-input-dtype, 19 numerical-contract, 18 requires-reformat, and nine
+unsupported-ALU. Schema version 2 classifies all 209 failures as
+`NATIVE_REJECT`; no failure
 lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-nearest-69ea691a8-20260803/test_ops_coverage.json`
-(SHA-256 `7fd11e9965919c059fe5de403dd273359259f5b1df9d26a768be4288ba5661ab`);
+is `~/rk2608_backups/census-periodic-repeat-4e2bbe7ef-20260803/test_ops_coverage.json`
+(SHA-256 `17b7a27d13da1c92a0def8328806f8ca9cf70d78a747a54ac27a13c29c0e852f`);
 the JUnit XML SHA-256 is
-`cbe8e36a2fa74ae42f19f28930fa8c50e8c7ee26982c4a7ab89661529eeda262`.
+`c53b63f2d68a42332adf31c0d582d3acf67551a1f826667473e99518936fda34`.
 
-The 501 successful native kernels contain 475 `EFFICIENT` and 26
+The 504 successful native kernels contain 477 `EFFICIENT` and 27
 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 179 at
-2--8, 94 at 9--32, 81 at 33--64, nine at 65--128, 14 at 129--256, and three at
+2--8, 98 at 9--32, 79 at 33--64, ten at 65--128, 14 at 129--256, and three at
 257--400. The worst path remains `test_matmul` at 399 tasks, 18,326 command
-words, 899,280 constant bytes. The two new method passes add 22 successful
-native kernels. All remain below 18 tasks; the existing count of 26
-correctness-fallback kernels is unchanged.
+words and 899,280 constant bytes. Periodic compaction adds three successful
+kernels from later `test_repeat` subcases; its first 1,728-output kernel was
+already native. The largest new plan is the 78-task 20,736-output repeat and
+accounts for the one additional correctness-fallback kernel.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -2204,8 +2204,9 @@ confirms all three parameterized
 `test_avg_pool2d_ceil_mode_padding_not_counted` cases stop with that exact
 reason. The WIP implementation is preserved under
 `~/rk2608_backups/wip-affine-mean-rounding-12875809d-20260803/`. Since this is
-a diagnostic/correctness milestone rather than new coverage, the authoritative
-complete census remains 162/40/210/13 until another full uncached run.
+a diagnostic/correctness milestone rather than new coverage, the later
+163/40/209/13 census changes only these three first-reject classifications from
+unsupported reduction to numerical contract.
 
 ## Periodic selector compaction
 
@@ -2230,6 +2231,6 @@ tolerance, dtype contract, runtime conversion, or fallback lane changed. The
 durable focused JSON is
 `~/rk2608_backups/focused-periodic-repeat-f41b6ceaf-20260803/test_ops_coverage.json`.
 All 121 host tests plus three subtests pass, and the complete strict RK3588
-suite passes 84 tests plus 58 subtests in 721.14 seconds. This focused result
-implies one method transition and 163 native methods, but the authoritative
-complete census remains 162/40/210/13 pending an uncached 425-method rerun.
+suite passes 84 tests plus 58 subtests in 721.14 seconds. The complete uncached
+census confirms exactly this transition and no regression, establishing the
+authoritative 163/40/209/13 result.
