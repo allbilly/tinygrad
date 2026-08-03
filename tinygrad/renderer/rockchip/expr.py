@@ -654,21 +654,22 @@ def _is_const(u:UOp, value:float) -> bool:
   u = _unwrap_fp_cast(u)
   return u.op is Ops.CONST and isinstance(u.arg, (int,float)) and math.isclose(float(u.arg), value)
 
-def _is_multistage_lerp(u:UOp) -> bool:
-  """Recognize x + (y-x)*z, which needs one fused DPU task to avoid FP16 intermediate rounding."""
+def _canonical_lerp(u:UOp) -> tuple[UOp,UOp,UOp]|None:
+  """Recognize exact x + (y-x)*z and return its x, y, and z operands."""
   u = _unwrap_fp_cast(u)
-  if u.op is not Ops.ADD: return False
+  if u.op is not Ops.ADD: return None
   for base,weighted in (u.src, u.src[::-1]):
     base, weighted = _unwrap_fp_cast(base), _unwrap_fp_cast(weighted)
     if base.op is not Ops.INDEX or weighted.op is not Ops.MUL: continue
-    for difference in weighted.src:
+    for difference,weight in (weighted.src, weighted.src[::-1]):
       difference = _unwrap_fp_cast(difference)
       if difference.op is not Ops.ADD: continue
-      for negative in difference.src:
-        negative = _unwrap_fp_cast(negative)
-        if negative.op is Ops.MUL and any(_unwrap_fp_cast(x).key == base.key for x in negative.src) and \
-           any(_is_const(x, -1.0) for x in negative.src): return True
-  return False
+      for positive,negative in (difference.src, difference.src[::-1]):
+        positive, negative = _unwrap_fp_cast(positive), _unwrap_fp_cast(negative)
+        if positive.op is not Ops.INDEX or negative.op is not Ops.MUL: continue
+        if any(_unwrap_fp_cast(x).key == base.key for x in negative.src) and any(_is_const(x, -1.0) for x in negative.src):
+          return base, positive, _unwrap_fp_cast(weight)
+  return None
 
 def _uses_reciprocal_signed_zero(u:UOp) -> bool:
   """Detect signbit reconstruction through x<0 OR reciprocal(x)<0; RK3588 FDIV loses the required -0 sign."""
@@ -694,7 +695,7 @@ def _is_unreduced_bce(u:UOp) -> bool:
     any(math.isclose(x, -math.log(2.0)) for x in constants) and any(math.isclose(x, -math.log2(math.e)) for x in constants)
 
 def _numerical_contract(u:UOp) -> str|None:
-  if _is_multistage_lerp(u): return "lerp requires a fused FP32-intermediate DPU task"
+  if _canonical_lerp(u) is not None: return "lerp requires a fused FP32-intermediate DPU task"
   if _uses_reciprocal_signed_zero(u): return "reciprocal sign does not preserve negative-zero copysign semantics"
   if _is_unreduced_bce(u): return "unreduced BCE LUT composition exceeds the FP16 relative-error contract"
   exponential = _unwrap_fp_cast(u)

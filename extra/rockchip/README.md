@@ -65,6 +65,8 @@ are eligible to be ported as native capabilities.
 
 - static, contiguous FP16 elementwise ADD, SUB, MUL, MAX, and division;
 - scalar operands and FP16 fills through the same ALU stages;
+- fused FP16 lerp through CMAC FP32 operand materialization followed by the
+  DPU BS/BN/EW pipeline, preserving the single FP32 intermediate boundary;
 - FP16 `WHERE` with a directly representable less-than mask and finite arms;
 - generated EXP2, EXP, sigmoid, refined SQRT/RSQRT, logarithm, inverse
   trigonometric, and inverse-hyperbolic LUT assets with declared domains;
@@ -389,12 +391,27 @@ packing. The two official `test_biased_conv2d` kernels are now 87 stages each
 tolerance. `test_simple_conv2d_bias` also remains green. The strict device
 suite passes 76 tests plus 54 subtests in 729.98 seconds.
 
+Lerp now uses a generic `RKFusedALUStage` rather than three rounded FP16
+stages. CMAC writes the indexed `x` operand directly as FP32 in 32-lane tiles;
+each following DPU task executes `BS(y-x)`, `BN(*z)`, and `EW(+x)` over one
+eight-channel atom before the only FP16 writeback. BRDMA is channel-broadcast,
+so the compiler emits one fused task per atom. A 1,575-element official kernel
+uses 50 CMAC tasks plus 197 DPU tasks, 2,048 constant bytes, and 6,528 scratch
+bytes, and is bit-exact against the FP32-intermediate reference. Partial DPU
+atoms are submitted as eight channels because four-to-seven-channel fused
+tasks time out; unused lanes stay outside the logical output. The unchanged
+official `test_lerp` method passes in strict native-only mode.
+The raw operand-format, conversion-width, and fused-pipeline probes remain
+reproducible in `extra/rockchip/probe_lerp_pipeline.py`.
+The complete strict Rockchip device suite passes 77 tests plus 54 subtests in
+731.46 seconds with fallback disabled.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,452, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,452 lines.
-The exact 3,484-line delta is 3,479 counted Rockchip backend lines (3,319
-renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
+contains 28,592, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,592 lines.
+The exact 3,624-line delta is 3,619 counted Rockchip backend lines (3,456
+renderer/compiler, 114 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic

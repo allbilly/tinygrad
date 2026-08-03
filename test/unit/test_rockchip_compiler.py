@@ -4,8 +4,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEpilogue, RKEngine, RKLowerKind,
-  RKProgram, RKReduce,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEpilogue, RKEngine,
+  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
   lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_tiled_contract_result, rk_fingerprint)
@@ -172,12 +172,27 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_unproven_fp16_composites_reject_before_submission(self):
     x, y, z = (Tensor.empty(8,dtype=dtypes.half) for _ in range(3))
-    expressions = (x.lerp(y,z), x.copysign(y), 0.7**x, x.sigmoid().binary_crossentropy(y.clip(0,1),reduction="none"))
+    expressions = (x.copysign(y), 0.7**x, x.sigmoid().binary_crossentropy(y.clip(0,1),reduction="none"))
     for expression in expressions:
       with self.subTest(op=expression.uop.op):
         result = lower_native(sink(expression))
         self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
         self.assertEqual(result.reject.kind if result.reject is not None else None, RKRejectKind.NUMERICAL_CONTRACT)
+
+  def test_lerp_uses_cmac_fp32_operand_and_fused_dpu_pipeline(self):
+    x,y,z = (Tensor.empty(1575,dtype=dtypes.half) for _ in range(3))
+    result = lower_native(sink(x.lerp(y,z)))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKContract))
+    fused = tuple(stage for step in result.plan.steps if isinstance(step,RKDPUProgram)
+                  for stage in step.stages if isinstance(stage,RKFusedALUStage))
+    self.assertEqual((len(contracts),len(fused)), (50,197))
+    self.assertTrue(all(step.out.layout.dtype is dtypes.float for step in contracts))
+    image = emit_program(result.plan)
+    self.assertEqual((len(image.stages),len(image.constants)), (247,2048))
+    self.assertFalse(contains_uop(result.plan))
 
   def test_multi_source_affine_sum_composes_source_local_selectors(self):
     lhs = Tensor.empty(256,256,dtype=dtypes.half).realize()

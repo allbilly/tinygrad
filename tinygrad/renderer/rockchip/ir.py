@@ -39,6 +39,23 @@ class RKALUStage:
     if self.op not in RK_ALU_OPS: raise ValueError(f"unsupported RK DPU ALU operation {self.op}")
 
 @dataclass(frozen=True)
+class RKFusedALUStage:
+  """One ordered BS/BN/EW arithmetic pipeline over flying MRDMA data."""
+  dst: RKArg
+  main: RKArg
+  bs_op: Ops
+  bs: RKArg
+  bn_op: Ops
+  bn: RKArg|float
+  ew_op: Ops
+  ew: RKArg
+  count: int
+  def __post_init__(self):
+    if (self.bs_op,self.bn_op,self.ew_op) != (Ops.SUB,Ops.MUL,Ops.ADD):
+      raise ValueError("unsupported RK fused DPU arithmetic pipeline")
+    if not 0 < self.count <= 8: raise ValueError("RK fused DPU arithmetic needs one eight-channel atom")
+
+@dataclass(frozen=True)
 class RKMaskStage:
   dst: RKArg
   src: RKArg
@@ -51,7 +68,7 @@ class RKLUTStage:
   src: RKArg
   count: int
 
-RKDPUStage = RKALUStage|RKMaskStage|RKLUTStage
+RKDPUStage = RKALUStage|RKFusedALUStage|RKMaskStage|RKLUTStage
 
 @dataclass(frozen=True)
 class RKScratch:

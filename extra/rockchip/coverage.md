@@ -1660,9 +1660,9 @@ tests plus 54 subtests in 729.98 seconds. This is one focused inferred native
 gain; the authoritative complete census remains 148 until the next uncached
 425-method run.
 
-The rest of the accepted-numerical audit now fails closed at the exact legality
-boundary. Four structural guards return `NUMERICAL_CONTRACT` before RKImage
-execution: `x + (y-x)*z` until it has one fused FP32-intermediate task;
+The rest of the accepted-numerical audit initially failed closed at the exact
+legality boundary. Structural guards returned `NUMERICAL_CONTRACT` before
+RKImage execution for `x + (y-x)*z` until it had a fused FP32-intermediate task;
 signed-zero `copysign` reconstructed through `x<0 OR reciprocal(x)<0` because
 RK3588 FDIV loses the required negative-zero sign; unreduced probability BCE
 whose staged LUT composition misses 38/320 outputs; and root scaled-EXP2 with
@@ -1677,3 +1677,25 @@ implemented; that deliberate temporary coverage regression prevents a sampled
 pass from claiming an invalid full-domain kernel. Combined with the fused bias
 repair, the post-census inferred native total remains 148 pending a complete
 uncached run, with no known accepted-wrong path left in the audited bucket.
+
+The lerp guard has now been replaced by a hardware-proven generic fused
+arithmetic path. Raw probes establish the operand contract: MRDMA converts the
+main FP16 `y` input to FP32, BRDMA supplies FP32 `x` to BS subtraction, NRDMA
+supplies FP16 `z` to BN multiplication, and ERDMA supplies FP16 `x` to EW
+addition. BRDMA repeats its channel operand across width, so each fused task is
+an eight-channel atom. CMAC materializes dense FP32 `x` directly in 32-lane
+identity tiles; this avoids the rejected padded-half conversion design, whose
+grouped DPU converter timed out above 17 groups and would exceed the 400-stage
+contract when tiled.
+
+The official 45x35 tensor lerp is 247 tasks (50 CMAC plus 197 DPU), 2,048
+constant bytes, and 6,528 scratch bytes. It is bit-exact against the required
+FP32-intermediate calculation. The scalar-weight subcase also passes, and the
+unchanged official `test_lerp` completes in 27.47 seconds with
+`ROCKCHIP_FALLBACK=0`. The focused device regressions pass, and all 90 compiler
+tests plus three subtests pass. This is one inferred complete native-method
+gain, raising the post-census estimate from 148 to 149 pending the next full
+uncached census. The remaining pre-submit numerical guards cover signed-zero
+copysign, unreduced probability BCE, and uncharacterized scaled EXP2.
+The complete strict device suite passes 77 tests plus 54 subtests in 731.46
+seconds with fallback disabled and no concurrent NPU process.

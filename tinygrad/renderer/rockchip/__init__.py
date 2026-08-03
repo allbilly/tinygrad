@@ -11,7 +11,8 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKArg,
-  RKALUStage, RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
+  RKALUStage, RKFusedALUStage as RKFusedALUStage,
+  RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKReduce, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
@@ -175,7 +176,37 @@ def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowe
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
 
 from tinygrad.renderer.rockchip.expr import (_ALUExpr, _MaskExpr, _LUTExpr, _Expr, _Value, _parse_alu, _unwrap_same_cast,
-  _numerical_contract)
+  _canonical_lerp, _numerical_contract)
+
+def _lower_fused_lerp(output:RKArg, operands:tuple[UOp,UOp,UOp], count:int) -> RKLowerResult:
+  x,y,z = operands
+  if x.op is not Ops.INDEX or y.op is not Ops.INDEX or z.op not in (Ops.INDEX,Ops.CONST): return _not_applicable()
+  source = RKArg(RKBufferKind.ARG, x.src[0].arg.slot)
+  x_float = RKArg(RKBufferKind.SCRATCH, 0)
+  scratch = (RKScratch((((count+31)//32)*32+32)*4),)
+  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  for start in range(0,count,32):
+    valid = min(32,count-start)
+    lhs_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
+    out_layout = RKLayout((1,valid), (1,64), (256,4), dtypes.float, padding=((0,0),(0,64-valid)))
+    steps.append(RKContract(RKTensorRef(RKArg(x_float.kind,x_float.index,start*4),out_layout),
+      RKTensorRef(RKArg(source.kind,source.index,source.addend+start*2),lhs_layout),
+      _cmac_weight_ref(0,valid,32,RKBufferKind.CONSTANT,32), 0,
+      _cmac_selection_payload([[lane] for lane in range(32)],32,32,1.0)))
+  bn:RKArg|float = RKArg(RKBufferKind.ARG, z.src[0].arg.slot) if z.op is Ops.INDEX else float(z.arg)
+  stages:list[RKDPUStage] = []
+  for start in range(0,count,8):
+    tile = min(8,count-start)
+    tile_bn = RKArg(bn.kind,bn.index,bn.addend+start*2) if isinstance(bn,RKArg) else bn
+    stages.append(RKFusedALUStage(RKArg(output.kind,output.index,output.addend+start*2),
+      RKArg(RKBufferKind.ARG,y.src[0].arg.slot,start*2), Ops.SUB, RKArg(x_float.kind,x_float.index,start*4),
+      Ops.MUL, tile_bn, Ops.ADD, RKArg(RKBufferKind.ARG,x.src[0].arg.slot,start*2), tile))
+  program = _finish_program([*steps,RKDPUProgram(tuple(stages))], scratch)
+  cost = _plan_cost(program)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"fused ALU needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", Ops.ADD)
+  return _native(program)
 
 def lower_dpu_result(sink:UOp) -> RKLowerResult:
   """Lower one contiguous expression or native wide constant fill to a typed DPU result."""
@@ -199,13 +230,16 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, f"input dtype {bad_dtype.name}", Ops.INDEX)
   if any(u.src[1].key != out_index.key for u in input_indexes):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "input index map differs from output surface", Ops.INDEX)
+  output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  if (lerp:=_canonical_lerp(store.src[1])) is not None:
+    result = _lower_fused_lerp(output, lerp, count)
+    if result.kind is not RKLowerKind.NOT_APPLICABLE: return result
   if (reason:=_numerical_contract(store.src[1])) is not None:
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, reason, _unwrap_same_cast(store.src[1]).op)
   root = _parse_alu(store.src[1], out_index, {})
   if root is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "expression is not legal DPU arithmetic", _unwrap_same_cast(store.src[1]).op)
   if store.src[0].dtype is not dtypes.half and not isinstance(root, float):
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"non-constant {store.src[0].dtype.name} arithmetic", store.src[1].op)
-  output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
     if store.src[0].dtype in (dtypes.int, dtypes.float):
       tile = 64 if store.src[0].dtype is dtypes.int else 4

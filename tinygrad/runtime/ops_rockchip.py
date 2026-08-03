@@ -76,8 +76,9 @@ class RockchipProgram(Program['RockchipDevice']):
       return self._dma(self.constants) + index
 
     start = time.perf_counter()
+    active_stage = -1
     try:
-      for stage, commands in zip(image.stages, patch_image(image, address)):
+      for active_stage,(stage,commands) in enumerate(zip(image.stages, patch_image(image, address))):
         if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
         cmd = self.dev._gpu_alloc(len(commands)*8)
         task = self.dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
@@ -95,8 +96,10 @@ class RockchipProgram(Program['RockchipDevice']):
           self.dev._gpu_free(cmd)
           self.dev._gpu_free(task)
     except Exception as exc:
+      active_engine = image.stages[active_stage].engine.name if active_stage >= 0 else "none"
+      exc.add_note(f"Rockchip image stage {active_stage}/{len(image.stages)} ({active_engine})")
       record_telemetry("kernel", **self.telemetry, outcome="FAIL", duration_ms=(time.perf_counter()-start)*1e3,
-                       error_class=type(exc).__name__, error=str(exc))
+                       error_class=type(exc).__name__, error=str(exc), failed_stage=active_stage)
       raise
     elapsed = time.perf_counter()-start
     record_telemetry("kernel", **self.telemetry, outcome="PASS", duration_ms=elapsed*1e3)
