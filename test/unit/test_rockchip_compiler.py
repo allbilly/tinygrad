@@ -51,6 +51,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(image.stages[0].engine, RKEngine.PPU)
     self.assertEqual(tuple((reloc.word, reloc.index) for reloc in image.stages[0].relocs), ((18,0), (19,1)))
 
+  def test_global_max_rejects_characterized_bad_ppu_splits(self):
+    for shape in ((3,6,8),(9,2,8),(12,12,8)):
+      with self.subTest(shape=shape):
+        result = lower_reduce_result(sink(Tensor.empty(*shape,dtype=dtypes.half).max(axis=(0,1))))
+        self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
+        self.assertIs(result.reject.kind, RKRejectKind.REQUIRES_REFORMAT)
+
   def test_dense_global_max_uses_padded_dpu_tree(self):
     plan = lower_global_max_result(sink(Tensor.empty(135,dtype=dtypes.half).max())).plan
     self.assertIsInstance(plan, RKProgram)

@@ -761,3 +761,23 @@ serial device contract passes 85 tests plus 58 subtests in 735.32 seconds with
 no timeout, invalid submission, reset failure, or process abort. A new full
 census is required before promoting the focused inferred count of 164 native
 methods to an authoritative result.
+
+### Frozen 2607/2608 branch re-audit
+
+The frozen branches remain useful as hardware oracles, not as strict coverage
+implementations. Rechecking their late dtype and movement milestones confirms
+that 2608's public bool output, bool input, int32 comparison/WHERE/movement,
+typed cast, prefix-repeat, and signed-copysign ABIs read or rewrite mapped GEMs
+with NumPy in `RockchipProgram`. Likewise, 2607's cumulative-sum milestone
+selects `_try_cumsum_host_subtasks`, and its final average-pool and broad dtype
+families dispatch through named `_run_host_*` handlers. None of those paths is
+eligible for `ROCKCHIP_FALLBACK=0` coverage.
+
+The re-audit did recover one missing native legality rule. Both old compiler
+generations record that PPU dimensions of nine and global-pool splits `(3,6)`,
+`(6,3)`, and `(12,12)` are hardware-bad on RK3588. The clean shape selector now
+filters those geometries before emitting a PPU task. Compiler regressions cover
+all three classes, while the proven 4x4 HWC8 hardware path still passes exactly.
+The old PPU-average reference is retained only as a future probe: its
+`globalavg` validation uses loose `atol=0.25` plus host post-scaling, so it is
+not evidence that the current strict affine-mean failures can pass unchanged.

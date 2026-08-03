@@ -2261,3 +2261,22 @@ subtests in 735.32 seconds with no NPU timeout, invalid submission, reset
 failure, or process abort. The authoritative full census remains
 163/40/209/13 until an uncached rerun confirms the focused inferred
 164/40/208/13 transition.
+
+## Frozen-branch hardware legality audit
+
+A renewed comparison against `rockchip-2607` and `rockchip-2608` separates
+portable hardware knowledge from their host ABI coverage. The 2608 bool,
+int32, cast, prefix-repeat, and signed-copysign paths use NumPy over mapped GEM
+buffers; 2607 cumulative sum and average pooling likewise route through typed
+host subtasks. They are behavioral references only and remain excluded from
+strict native coverage.
+
+One native PPU constraint was missing from the clean branch. The frozen code
+records RK3588 failures for any pool dimension of nine and for `(3,6)`, `(6,3)`,
+and `(12,12)` surfaces. `_pool_hw_shape` now excludes those characterized-bad
+geometries. Compiler tests prove rejection before image emission, and the
+unchanged 4x4 HWC8 device regression passes one test plus three subtests in
+0.99 seconds. This is a correctness guard, so it intentionally changes no
+coverage count. The frozen PPU `globalavg` probe is not promoted: it validates
+with `atol=0.25` and divides the device result on the host, which does not meet
+the official strict mean contract.

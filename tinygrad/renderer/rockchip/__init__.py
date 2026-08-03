@@ -1651,10 +1651,12 @@ def lower_contract(sink:UOp) -> RKContract|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_contract_result`."""
   return cast(RKContract|None, lower_contract_result(sink).plan)
 
+_PPU_BAD_SPLITS = frozenset({(3,6),(6,3),(12,12)})
 def _pool_hw_shape(extent:int) -> tuple[int, int]|None:
-  """Return a proven PPU global-pool surface: both dimensions fit its four-bit fields."""
-  return min(((height, extent//height) for height in range(2, min(16, extent)+1)
-              if extent % height == 0 and 2 <= extent//height <= 16), key=lambda shape:abs(shape[0]-shape[1]), default=None)
+  """Return a characterized PPU global-pool surface; reject known-bad RK3588 geometries."""
+  return min(((height, extent//height) for height in range(2, min(16, extent)+1) if extent%height == 0 and
+              2 <= extent//height <= 16 and height != 9 and extent//height != 9 and
+              (height,extent//height) not in _PPU_BAD_SPLITS), key=lambda shape:abs(shape[0]-shape[1]), default=None)
 
 def lower_reduce_result(sink:UOp) -> RKLowerResult:
   """Recognize global FP16 MAX over the spatial dimensions of a dense HWC8 surface."""
