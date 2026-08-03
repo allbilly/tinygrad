@@ -170,6 +170,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertGreaterEqual(len(result.plan.stages), 1)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_unproven_fp16_composites_reject_before_submission(self):
+    x, y, z = (Tensor.empty(8,dtype=dtypes.half) for _ in range(3))
+    expressions = (x.lerp(y,z), x.copysign(y), 0.7**x, x.sigmoid().binary_crossentropy(y.clip(0,1),reduction="none"))
+    for expression in expressions:
+      with self.subTest(op=expression.uop.op):
+        result = lower_native(sink(expression))
+        self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
+        self.assertEqual(result.reject.kind if result.reject is not None else None, RKRejectKind.NUMERICAL_CONTRACT)
+
   def test_multi_source_affine_sum_composes_source_local_selectors(self):
     lhs = Tensor.empty(256,256,dtype=dtypes.half).realize()
     rhs = Tensor.empty(256,64,dtype=dtypes.half).realize()

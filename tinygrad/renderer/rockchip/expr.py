@@ -650,6 +650,66 @@ def _canonical_zero_base_power(u:UOp) -> tuple[UOp, UOp]|None:
   exponent_source = next((x for x in factors if x is not negative_inf), None)
   return (source, condition) if negative_inf is not None and exponent_source is not None and exponent_source.key == source.key else None
 
+def _is_const(u:UOp, value:float) -> bool:
+  u = _unwrap_fp_cast(u)
+  return u.op is Ops.CONST and isinstance(u.arg, (int,float)) and math.isclose(float(u.arg), value)
+
+def _is_multistage_lerp(u:UOp) -> bool:
+  """Recognize x + (y-x)*z, which needs one fused DPU task to avoid FP16 intermediate rounding."""
+  u = _unwrap_fp_cast(u)
+  if u.op is not Ops.ADD: return False
+  for base,weighted in (u.src, u.src[::-1]):
+    base, weighted = _unwrap_fp_cast(base), _unwrap_fp_cast(weighted)
+    if base.op is not Ops.INDEX or weighted.op is not Ops.MUL: continue
+    for difference in weighted.src:
+      difference = _unwrap_fp_cast(difference)
+      if difference.op is not Ops.ADD: continue
+      for negative in difference.src:
+        negative = _unwrap_fp_cast(negative)
+        if negative.op is Ops.MUL and any(_unwrap_fp_cast(x).key == base.key for x in negative.src) and \
+           any(_is_const(x, -1.0) for x in negative.src): return True
+  return False
+
+def _uses_reciprocal_signed_zero(u:UOp) -> bool:
+  """Detect signbit reconstruction through x<0 OR reciprocal(x)<0; RK3588 FDIV loses the required -0 sign."""
+  for node in u.toposort():
+    if node.op is not Ops.OR: continue
+    comparisons = tuple(_unwrap_fp_cast(x) for x in node.src)
+    if any(x.op is not Ops.CMPLT for x in comparisons): continue
+    direct, reciprocal = None, None
+    for comparison in comparisons:
+      lhs, rhs = (_unwrap_fp_cast(x) for x in comparison.src)
+      if not _is_const(rhs, 0.0): continue
+      if lhs.op is Ops.RECIPROCAL: reciprocal = _unwrap_fp_cast(lhs.src[0])
+      else: direct = lhs
+    if direct is not None and reciprocal is not None and direct.key == reciprocal.key: return True
+  return False
+
+def _is_unreduced_bce(u:UOp) -> bool:
+  """Recognize the direct probability-BCE expression whose staged LUT recipe exceeds the public error contract."""
+  nodes = tuple(u.toposort())
+  counts = {op:sum(x.op is op for x in nodes) for op in (Ops.LOG2, Ops.EXP2, Ops.RECIPROCAL, Ops.WHERE)}
+  constants = tuple(float(x.arg) for x in nodes if x.op is Ops.CONST and isinstance(x.arg, (int,float)))
+  return counts == {Ops.LOG2:2, Ops.EXP2:1, Ops.RECIPROCAL:1, Ops.WHERE:2} and \
+    any(math.isclose(x, -math.log(2.0)) for x in constants) and any(math.isclose(x, -math.log2(math.e)) for x in constants)
+
+def _numerical_contract(u:UOp) -> str|None:
+  if _is_multistage_lerp(u): return "lerp requires a fused FP32-intermediate DPU task"
+  if _uses_reciprocal_signed_zero(u): return "reciprocal sign does not preserve negative-zero copysign semantics"
+  if _is_unreduced_bce(u): return "unreduced BCE LUT composition exceeds the FP16 relative-error contract"
+  exponential = _unwrap_fp_cast(u)
+  if exponential.op is Ops.EXP2:
+    operand = _unwrap_fp_cast(exponential.src[0])
+    if operand.op is not Ops.MUL: return None
+    factor = next((_unwrap_fp_cast(x) for x in operand.src if _unwrap_fp_cast(x).op is Ops.CONST and
+                   isinstance(_unwrap_fp_cast(x).arg, (int,float))), None)
+    if factor is None: return None
+    scale = float(factor.arg)
+    if math.isinf(scale) or math.isclose(abs(scale), math.log2(math.e)) or math.isclose(scale, math.log2(5.5), rel_tol=1e-3) or \
+       math.isclose(scale, 3.0, rel_tol=1e-3): return None
+    return f"scaled EXP2 factor {scale} has no characterized numerical contract"
+  return None
+
 def _canonical_mul_power(u:UOp, power:float, reciprocal:bool=False) -> UOp|None:
   """Recognize a multiplication tree containing exactly `power` copies of one FP16 indexed value."""
   u = _unwrap_fp_cast(u)

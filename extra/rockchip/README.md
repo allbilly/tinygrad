@@ -130,6 +130,15 @@ reductions outside the proven static affine bounds, general contractions,
 CMAC epilogues other than the proven channel-bias/optional-ReLU form, general
 convolution/pooling, and gradients remain outside the native contract.
 
+Accepted elementwise plans are also gated by structural numerical contracts.
+Multistage `lerp` requires a future fused FP32-intermediate task; dynamic
+`copysign` requires a path that preserves reciprocal sign for negative zero;
+unreduced probability BCE exceeds the current staged LUT error bound; and an
+arbitrary constant-base power needs a separately characterized scaled-EXP2
+contract. These graphs reject before submission rather than returning sampled
+answers outside TestOps tolerance. Proven EXP/activation canonicalizations and
+the repaired zero-base power identity remain native.
+
 ## EXP2 generation and characterization
 
 Run `python extra/rockchip/gen_lut.py` to regenerate

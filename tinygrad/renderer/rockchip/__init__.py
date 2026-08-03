@@ -174,7 +174,8 @@ def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APP
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
 
-from tinygrad.renderer.rockchip.expr import _ALUExpr, _MaskExpr, _LUTExpr, _Expr, _Value, _parse_alu, _unwrap_same_cast
+from tinygrad.renderer.rockchip.expr import (_ALUExpr, _MaskExpr, _LUTExpr, _Expr, _Value, _parse_alu, _unwrap_same_cast,
+  _numerical_contract)
 
 def lower_dpu_result(sink:UOp) -> RKLowerResult:
   """Lower one contiguous expression or native wide constant fill to a typed DPU result."""
@@ -198,6 +199,8 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, f"input dtype {bad_dtype.name}", Ops.INDEX)
   if any(u.src[1].key != out_index.key for u in input_indexes):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "input index map differs from output surface", Ops.INDEX)
+  if (reason:=_numerical_contract(store.src[1])) is not None:
+    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, reason, _unwrap_same_cast(store.src[1]).op)
   root = _parse_alu(store.src[1], out_index, {})
   if root is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "expression is not legal DPU arithmetic", _unwrap_same_cast(store.src[1]).op)
   if store.src[0].dtype is not dtypes.half and not isinstance(root, float):

@@ -1659,3 +1659,21 @@ green, all 88 host compiler tests pass, and the strict hardware suite passes 76
 tests plus 54 subtests in 729.98 seconds. This is one focused inferred native
 gain; the authoritative complete census remains 148 until the next uncached
 425-method run.
+
+The rest of the accepted-numerical audit now fails closed at the exact legality
+boundary. Four structural guards return `NUMERICAL_CONTRACT` before RKImage
+execution: `x + (y-x)*z` until it has one fused FP32-intermediate task;
+signed-zero `copysign` reconstructed through `x<0 OR reciprocal(x)<0` because
+RK3588 FDIV loses the required negative-zero sign; unreduced probability BCE
+whose staged LUT composition misses 38/320 outputs; and root scaled-EXP2 with
+an uncharacterized factor such as `log2(0.7)`. Whole-expression activation
+canonicalizers remain legal, so TANH, Mish, QuickGELU, and both GELU variants
+retain their generated-table paths.
+
+Focused official runs now report those four precise typed rejects instead of
+AssertionError, and all 89 host compiler tests pass. The ordinary sampled
+`test_copysign` method will also reject until signed-zero semantics are truly
+implemented; that deliberate temporary coverage regression prevents a sampled
+pass from claiming an invalid full-domain kernel. Combined with the fused bias
+repair, the post-census inferred native total remains 148 pending a complete
+uncached run, with no known accepted-wrong path left in the audited bucket.
