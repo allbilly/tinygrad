@@ -6,25 +6,21 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `2bf8c337b` is 154 native,
-40 frontend-only, 218 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. Raw pytest reports 206 passed, 255 failed, 13 skipped,
-and 77 passing subtests in 2,255.75 seconds. It completed without an NPU
+The current authoritative uncached strict census at `85f9cc0af` is 160 native,
+40 frontend-only, 212 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. Raw pytest reports 212 passed, 249 failed, 13 skipped,
+and 77 passing subtests in 2,281.36 seconds. It completed without an NPU
 timeout, reset failure, invalid submission, or process abort. Coverage details
 and durable artifact hashes are recorded in `coverage.md`.
 
-Relative to the SIN census, only `test_mulacc_with_zero_strides` changes from
-failure to native pass. Every remaining failure is now a typed native reject;
-there are no device or unclassified frontend failures in the authoritative
-inventory.
-
-The newer bounded static-reformat milestone is not yet part of that census.
-Focused strict telemetry moves `test_simple_repeat`, `test_repeat_interleave`,
-`test_roll`, and `test_pad_reshape` to native execution. The compiler preserves
-the identity of split RANGE subaxes and exactly enumerates bounded compile-time
-modulo/floor-divide maps before choosing the existing costed NPU selector.
-Dynamic tensor indexing is still rejected, and the authoritative totals remain
-154/40/218/13 until the next complete uncached run.
+Relative to the preceding census, `test_diag`, `test_pad_circular_mode`,
+`test_pad_reshape`, `test_repeat_interleave`, `test_roll`, and
+`test_simple_repeat` change from failure to native pass. Every remaining
+failure is a typed native reject; there are no device or unclassified frontend
+failures in the authoritative inventory. The compiler preserves split RANGE
+subaxis identity and exactly enumerates bounded compile-time modulo/floor-divide
+maps before choosing the existing costed NPU selector. Dynamic tensor indexing
+is still rejected.
 
 The compiler boundary is:
 
@@ -663,12 +659,13 @@ destination elements plus the unchanged 400-task and 2 MiB constant ceilings;
 larger valid maps return `PLAN_STAGE_LIMIT`. Dynamic gather/scatter indexes
 remain non-evaluable and reject.
 
-Focused strict TestOps telemetry records native passes for
-`test_simple_repeat`, `test_repeat_interleave`, `test_roll`, and
-`test_pad_reshape`; `test_repeat`, `test_pad`, and `test_pad_slice` still fail
-later independent subcases and are not claimed. Permanent compiler regressions
-cover split-axis repeat multiplicity and exact modulo-roll mapping. A serial
-RK3588 regression executes both maps exactly after mixed-engine work. All 115
-Rockchip host tests plus three subtests, mypy, and Ruff pass; the complete
-device suite passes 83 tests plus 56 subtests in 695.02 seconds without a
-timeout, invalid submission, reset failure, or process abort.
+The complete uncached census records six native transitions:
+`test_simple_repeat`, `test_repeat_interleave`, `test_roll`,
+`test_pad_reshape`, `test_diag`, and `test_pad_circular_mode`. `test_repeat`,
+`test_pad`, and `test_pad_slice` still fail later independent subcases and are
+not claimed. Permanent compiler regressions cover split-axis repeat
+multiplicity and exact modulo-roll mapping. A serial RK3588 regression executes
+both maps exactly after mixed-engine work. All 115 Rockchip host tests plus
+three subtests, mypy, and Ruff pass; the complete device suite passes 83 tests
+plus 56 subtests in 695.02 seconds without a timeout, invalid submission, reset
+failure, or process abort.
