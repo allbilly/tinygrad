@@ -12,34 +12,26 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `d1437ad58` contains exactly 425 method records:
-150 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 222 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `d237777da` contains exactly 425 method records:
+152 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 220 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 258 failed methods/subtests, 202 passed, 78 passing subtests,
-and 13 skipped in 2,484.47 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 256 failed methods/subtests, 204 passed, 78 passing subtests,
+and 13 skipped in 2,345.47 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to the 148-pass `85eeab7f5` census, `test_biased_conv2d`, `test_lerp`,
-and `test_matmul` transition from failure to native pass. `test_copysign` moves
-from sampled native pass to the deliberate full-domain `NUMERICAL_CONTRACT`
-guard because RK3588 FDIV loses negative-zero sign. The net gain is two, and no
-method still accepted by the compiler regresses.
-
-The 222 failed methods first classify as 65 unsupported-output-dtype, 47
-plan-stage-limit, 34 unsupported-layout, 23 unsupported-input-dtype, 18
-requires-reformat, 10 unsupported-ALU, 10 numerical-contract, and 15 failures
-for which the method-level reporter did not retain a first reject. This last
-bucket consists mainly of partially passing pooling, broadcast, convolution,
-and product subcases plus `maximum` and one zero-stride multiplication case;
-it is not one uniform hardware error family. A post-census focused audit shows
-the bucket includes partial subcase failures rather than one accepted-native
-numerical class: `cumprod` passes its 20-element native subcase and later
-rejects a 600-output plan limit, while `maximum` and zero-stride
-multiply-accumulate fail in dtype/compilation plumbing. The durable telemetry
-is `~/rk2608_backups/census-wide-matmul-d1437ad58-20260803/test_ops_coverage.json`
-(SHA-256 `8b2abaca04b8200a16ae92120a9aa98df25e31fce6bdca9715b3a335c7f70d92`);
+Relative to the 152-pass `c65396da1` census, no method changes outcome. The
+32-output selector tile is therefore a cost milestone, not a coverage claim.
+The 220 failed methods first classify as 65 unsupported-output-dtype, 48
+plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
+requires-reformat, 16 numerical-contract, 10 unsupported-ALU, three
+unsupported-reduction, and two failures with no native reject. Schema version
+2 classifies 218 as `NATIVE_REJECT`; `test_cumsum` is a post-execution
+numerical failure and `test_mulacc_with_zero_strides` is a pre-device Clang
+failure. The durable telemetry is
+`~/rk2608_backups/census-wide-selector-d237777da-20260803/test_ops_coverage.json`
+(SHA-256 `cfc3dffab84ac7c1c84c2fede9213a631d3d205d3a757408bc828896afb36e64`);
 the JUnit XML SHA-256 is
-`b85ebee1091c93ee11e4d8dc478be122230224e826b75746a7d457e23d265799`.
+`8b77a964e12230ffa3115633162051b17819e5bf74b16a9de78b7e3e0aa26f03`.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -1979,3 +1971,27 @@ pass. The complete serialized device suite passes 81 tests plus 56 subtests in
 700.77 seconds with no timeout, reset failure, or invalid submission. The next
 complete census must determine which previously stage-limited method families
 cross below the unchanged 400-task ceiling.
+
+## Complete compact-selector census
+
+The complete uncached strict run at `d237777da` finishes normally in 2,345.47
+seconds with 152 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 220 `FAIL`, and 13
+`SKIP_UPSTREAM`. Raw pytest reports 204 passed, 256 failed, 13 skipped, and 78
+passing subtests. No NPU timeout, invalid submission, reset failure, or process
+abort occurs. No method changes outcome relative to the preceding direct-CONV
+census.
+
+The performance improvement is nevertheless visible in full-run telemetry.
+`test_simple_conv2d_batched` falls from 92 to 49 tasks and 9.82 to 5.24
+seconds, while `test_simple_conv2d_m4` falls from 275 to 139 tasks and 29.37 to
+14.85 seconds. The complete run is 153.36 seconds faster. The bounded
+399-task matmul remains a 42.69-second `CORRECTNESS_FALLBACK`, so packing and
+native reformat remain the dominant architectural target rather than a larger
+task limit.
+
+The schema-version-2 Pareto contains 48 stage-limit methods. Two graphs that
+previously stopped at that limit now proceed far enough to expose a more
+specific numerical contract, but neither becomes a native method pass. The
+only accepted native numerical failure is a 20-element cumulative sum whose
+output becomes state-sensitive after the mixed-engine workload. It must be
+fixed or rejected before any new native family is claimed.

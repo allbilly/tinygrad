@@ -6,10 +6,10 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `d1437ad58` is 150 native,
-40 frontend-only, 222 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. Raw pytest reports 202 passed, 258 failed, 13 skipped,
-and 78 passing subtests in 2,484.47 seconds. It completed without an NPU
+The current authoritative uncached strict census at `d237777da` is 152 native,
+40 frontend-only, 220 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. Raw pytest reports 204 passed, 256 failed, 13 skipped,
+and 78 passing subtests in 2,345.47 seconds. It completed without an NPU
 timeout, reset failure, invalid submission, or process abort. Coverage details
 and durable artifact hashes are recorded in `coverage.md`.
 
@@ -562,6 +562,17 @@ MiB ceilings. Batched direct convolution drops from 92 to 49 tasks and 9.82 to
 5.23 seconds; channel-16 drops from 275 to 139 tasks and 29.37 to 14.87 seconds.
 Both unchanged official methods remain bit-exact. The complete device suite
 passes 81 tests plus 56 subtests in 700.77 seconds.
+
+The complete uncached compact-selector census confirms that this optimization
+does not change method outcomes: 152 native, 40 frontend-only, 220 failed, and
+13 upstream-skipped. It completes 153.36 seconds faster than the preceding
+direct-CONV census. The authoritative telemetry and JUnit artifacts are under
+`~/rk2608_backups/census-wide-selector-d237777da-20260803/`, with SHA-256
+`cfc3dffab84ac7c1c84c2fede9213a631d3d205d3a757408bc828896afb36e64` and
+`8b77a964e12230ffa3115633162051b17819e5bf74b16a9de78b7e3e0aa26f03`.
+Schema version 2 resolves 218 failures to native rejects and leaves only the
+state-sensitive 20-element cumulative sum plus one pre-device Clang failure
+without a typed first reject.
 
 ## Current upstream blocker
 
