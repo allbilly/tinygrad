@@ -151,7 +151,7 @@ class TestDPUCompiler(unittest.TestCase):
     assert isinstance(plan, RKProgram)
     image = emit_program(plan)
     self.assertLessEqual(len(image.stages), 160)
-    self.assertLessEqual(len(image.constants), 64*1024)
+    self.assertLessEqual(len(image.constants), 80*1024)
     self.assertFalse(contains_uop(plan))
     scaled = lower_affine_reduce_result(sink(source.sum(axis=1)*0.25)).plan
     self.assertIsInstance(scaled, RKProgram)
@@ -236,7 +236,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 1024*1024)
     self.assertFalse(contains_uop(plan))
 
-  def test_small_affine_gathers_use_sparse_cmac_pipeline(self):
+  def test_small_affine_gathers_choose_bounded_cmac_pipeline(self):
     expressions = (Tensor.empty(8,8,dtype=dtypes.half).T.contiguous(),
                    Tensor.empty(24,dtype=dtypes.half)[1:17].clone(),
                    Tensor.empty(4,3,6,6,dtype=dtypes.half).flip(0).contiguous())
@@ -244,11 +244,11 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(all(isinstance(plan, RKReformat) and plan.kind is RKReformatKind.SELECTOR_CMAC for plan in plans))
     first = plans[0]
     assert isinstance(first, RKReformat)
-    self.assertEqual((sum(isinstance(step, RKContract) for step in first.steps)-1, [stage.engine for stage in emit_reformat(first).stages]),
-                     (3, [RKEngine.DPU]*2+[RKEngine.CMAC]*4))
+    self.assertEqual([stage.engine for stage in emit_reformat(first).stages], [RKEngine.CMAC])
     last = plans[-1]
     assert isinstance(last, RKReformat)
-    self.assertEqual(sum(isinstance(step, RKContract) for step in last.steps)-1, 26)
+    self.assertLessEqual(sum(isinstance(step, RKContract) for step in last.steps), 8)
+    self.assertTrue(all(not contains_uop(plan) for plan in plans))
 
   def test_add_matches_frozen_oracle(self):
     a, b = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
@@ -1001,7 +1001,7 @@ class TestDPUCompiler(unittest.TestCase):
       assert isinstance(result.plan, RKProgram)
       image = emit_program(result.plan)
       self.assertLessEqual(len(image.stages), 64)
-      self.assertLessEqual(len(image.constants), 256*1024)
+      self.assertLessEqual(len(image.constants), 384*1024)
       self.assertFalse(contains_uop(result.plan))
 
   def test_masked_affine_product_materializes_multiplicative_identity(self):
@@ -1093,6 +1093,16 @@ class TestDPUCompiler(unittest.TestCase):
     assert isinstance(plan, RKReformat)
     self.assertEqual([stage.engine for stage in emit_reformat(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
     self.assertFalse(contains_uop(plan))
+
+  def test_windowed_reformat_uses_one_compact_64_output_contract(self):
+    result = lower_reformat_result(sink(Tensor.empty(8,8,dtype=dtypes.half).T.contiguous()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKReformat)
+    assert isinstance(result.plan, RKReformat)
+    contracts = [step for step in result.plan.steps if isinstance(step, RKContract)]
+    self.assertEqual([(step.out.layout.logical_shape,step.out.layout.physical_shape) for step in contracts], [((1,64),(1,64))])
+    self.assertTrue(contracts[0].compact_output)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_affine_reduction_materializes_pointwise_dpu_expression(self):
     x, y = Tensor.empty(3,4,5,dtype=dtypes.half), Tensor.empty(3,4,5,dtype=dtypes.half)

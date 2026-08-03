@@ -82,14 +82,15 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
   return RKProgram((dpu, *contracts), scratch)
 
 def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
-                            scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512) -> RKProgram|None:
+                            scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
+                            max_outputs:int=64) -> RKProgram|None:
   """Reduce consecutive output tiles from bounded, atom-aligned source windows."""
   if struct.unpack("<e", struct.pack("<e", scale))[0] != scale: return None
-  chunks:list[tuple[int, int, int, list[list[int]], bytes]] = []
+  chunks:list[tuple[int, int, int, int, list[list[int]], bytes]] = []
   start = 0
   while start < len(rows):
     tile:list[list[int]] = []
-    for candidate in rows[start:start+32]:
+    for candidate in rows[start:start+max_outputs]:
       tile.append(candidate)
       selected = [index for row in tile for index in row]
       if not selected: continue
@@ -106,18 +107,19 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
       continue
     base, end = min(selected)&-8, max(selected)+1
     span, align_in = end-base, max(32, (end-base+31)&-32)
-    payload = _cmac_selection_payload([[index-base for index in row] for row in tile], align_in, 32, scale)
-    chunks.append((start, base, end, tile, payload))
+    align_out = max(32, (len(tile)+31)&-32)
+    payload = _cmac_selection_payload([[index-base for index in row] for row in tile], align_in, align_out, scale)
+    chunks.append((start, base, end, align_in, tile, payload))
     start += len(tile)
-  direct = tuple(base+len(payload)//64 <= direct_count for _,base,_,_,payload in chunks)
+  direct = tuple(base+align_in <= direct_count for _,base,_,align_in,_,_ in chunks)
   if sum(map(len, set(chunk[-1] for chunk in chunks))) > RK_MAX_CONSTANT_BYTES or \
      (1 if any(not row for row in rows) else 0)+sum(1 if safe else 3 for safe in direct) > RK_MAX_PROGRAM_STAGES: return None
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
-  if not all(direct): scratch += (RKScratch(max((len(chunk[-1])//64 for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
+  if not all(direct): scratch += (RKScratch(max((chunk[3] for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
   steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
                                                   if any(not row for row in rows) else [])
-  for (start,base,end,tile,payload),safe in zip(chunks,direct):
-    span, align_in = end-base, len(payload)//64
+  for (start,base,end,align_in,tile,payload),safe in zip(chunks,direct):
+    span, align_out = end-base, max(32, (len(tile)+31)&-32)
     if safe:
       lhs = RKTensorRef(RKArg(source.kind, source.index, source.addend+base*2),
         RKLayout((1,span), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-span))))
@@ -126,9 +128,9 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
         RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span)), scratch))
       lhs = _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH)
     valid = len(tile)
-    out_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
+    out_layout = RKLayout((1,valid), (1,align_out), (align_out*2,2), dtypes.half, padding=((0,0),(0,align_out-valid)))
     steps.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
-      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload, compact_output=True))
+      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, align_out), 0, payload, compact_output=True))
   return RKProgram(tuple(steps), scratch)
 
 def plan_cost(plan:RKProgram) -> RKPlanCost:
@@ -177,7 +179,7 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
                     sum(resource.size for resource in plan.scratch), reads, writes, macs)
 
 def _two_level_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
-                                scratch:tuple[RKScratch, ...], scale:float=1.0) -> RKProgram|None:
+                                scratch:tuple[RKScratch, ...], scale:float=1.0, max_outputs:int=64) -> RKProgram|None:
   groups:list[list[list[int]]] = []
   for row in rows:
     selected = list(row)
@@ -194,26 +196,29 @@ def _two_level_selector_program(output:RKArg, source:RKArg, input_count:int, row
     intermediate_rows.extend([[] for _ in range((-len(group))%8)])
   intermediate = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(_cmac_tiled_output_bytes(len(intermediate_rows))),)
-  first = _windowed_cmac_pipeline(intermediate, source, intermediate_rows, scratch=scratch, direct_count=input_count)
+  first = _windowed_cmac_pipeline(intermediate, source, intermediate_rows, scratch=scratch, direct_count=input_count,
+                                  max_outputs=max_outputs)
   if first is None: return None
   second = _windowed_cmac_pipeline(output, intermediate, compact_rows, scratch=first.scratch,
-                                   direct_count=_cmac_tiled_output_bytes(len(intermediate_rows))//2, scale=scale)
+                                   direct_count=_cmac_tiled_output_bytes(len(intermediate_rows))//2, scale=scale,
+                                   max_outputs=max_outputs)
   return None if second is None else _finish_program([*first.steps,*second.steps], second.scratch)
 
 def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
-                      scratch:tuple[RKScratch, ...], direct_capacity:int|None=None, max_window:int=512) -> RKProgram|None:
+                      scratch:tuple[RKScratch, ...], direct_capacity:int|None=None, max_window:int=512,
+                      max_outputs:int=64) -> RKProgram|None:
   sparse_bytes = ((len(rows)+15)//16)*32*max(32,(input_count+31)&-32)*2
   sparse = _sparse_cmac_pipeline(output,source,input_count,rows,scratch=scratch) if sparse_bytes <= RK_MAX_CONSTANT_BYTES else None
   candidates = (sparse,_windowed_cmac_pipeline(output, source, rows, scratch=scratch,
                                                direct_count=input_count if direct_capacity is None else direct_capacity,
-                                               max_window=max_window))
+                                               max_window=max_window, max_outputs=max_outputs))
   legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
                 cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)
   if legal:
     return min(legal, key=lambda item:(item[0].reset_count, item[0].estimated_macs,
       item[0].estimated_read_bytes+item[0].estimated_write_bytes, item[0].command_words,
       item[0].constant_bytes, item[0].scratch_bytes))[1]
-  two_level = _two_level_selector_program(output, source, input_count, rows, scratch)
+  two_level = _two_level_selector_program(output, source, input_count, rows, scratch, max_outputs=max_outputs)
   return two_level if two_level is not None and plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
     plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
@@ -444,10 +449,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   out_ref, src_ref = _dense_half_ref(output.index, (count,)), _dense_half_ref(source.index, (src_count,))
   if atom_reject is None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.COALESCED_DPU, (RKDPUProgram(tuple(stages)),)))
-  align_in = max(32, (src_count+31)&-32)
-  constant_bytes = ((count+15)//16)*32*align_in*2
-  if 0 < src_count <= 512 and 0 < count <= 4096 and constant_bytes <= RK_MAX_CONSTANT_BYTES:
-    implementation = _sparse_cmac_pipeline(output, source, src_count, [[src] if src >= 0 else [] for src in mapping])
+  if 0 < src_count <= 512 and 0 < count <= 4096 and (implementation:=_selector_program(
+      output, source, src_count, [[src] if src >= 0 else [] for src in mapping], ())) is not None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.SELECTOR_CMAC,
       cast(tuple[RKDPUProgram|RKContract, ...], implementation.steps), implementation.scratch))
   return atom_reject
@@ -1457,7 +1460,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   else:
     a_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
     scratch += (RKScratch(_cmac_tiled_output_bytes(len(a_selector))),)
-    packed_a = _selector_program(a_arg, RKArg(RKBufferKind.ARG, lhs.src[0].arg.slot), lhs_count, a_selector, scratch)
+    packed_a = _selector_program(a_arg, RKArg(RKBufferKind.ARG, lhs.src[0].arg.slot), lhs_count, a_selector, scratch, max_outputs=32)
     if packed_a is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC lhs selector exceeds plan limits", reduce.op)
     steps.extend(packed_a.steps)
     scratch = packed_a.scratch
@@ -1466,7 +1469,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   # Rockchip GEM allocations are page-rounded. Zero-weight selector lanes may read that physical tail without changing semantics.
   rhs_capacity = ((rhs_count*2+4095)&-4096)//2
   packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch,
-                               rhs_capacity, RK_MAX_CMAC_SELECTOR_WINDOW)
+                               rhs_capacity, RK_MAX_CMAC_SELECTOR_WINDOW, 32)
   if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
   steps.extend(packed_b.steps)
   scratch = packed_b.scratch
@@ -1478,7 +1481,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     bias_rows:list[list[int]] = [[] for _ in range(32)]
     for channel,source in enumerate(channel_bias): bias_rows[(channel//4)*8+channel%4] = [source]
     bias_plan = _selector_program(bias_half, RKArg(RKBufferKind.ARG, fused_epilogue[0].src[0].arg.slot),
-                                  int(fused_epilogue[0].src[0].src[0].arg), bias_rows, scratch)
+                                  int(fused_epilogue[0].src[0].src[0].arg), bias_rows, scratch, max_outputs=32)
     if bias_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "CMAC bias selector exceeds plan limits", fused_epilogue[0].op)
     steps.extend(bias_plan.steps)
     scratch = bias_plan.scratch
@@ -1513,7 +1516,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     for out_index,row,rhs_key in records:
       channel = channel_ids[rhs_key]
       unpack[out_index] = [lhs_rows.index(row)*align_out*2+(channel//16)*32+channel%16]
-    dense = _selector_program(reduced, cmac_out, m*align_out*2, unpack, scratch)
+    dense = _selector_program(reduced, cmac_out, m*align_out*2, unpack, scratch, max_outputs=32)
     if dense is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC output selector exceeds plan limits", reduce.op)
     steps.extend(dense.steps)
     scratch = dense.scratch

@@ -581,11 +581,20 @@ products. The ten-output prefix sum remains bit-exact on RK3588; unchanged
 official `test_cumsum` now rejects its 20-output case before submission rather
 than exposing the state-sensitive two-tile result.
 
+Pure affine `RKReformat` and the already proven direct-CONV packers now use up
+to 64 compact CMAC outputs per selector task. An 8x8 transpose becomes one
+CMAC task, batched direct convolution falls from 49 to 28 tasks, and the
+channel-16 case falls from 139 to 80. The complete device suite passes 81
+tests plus 56 subtests in 680.95 seconds. Generic tiled contraction deliberately
+keeps a 32-output selector fence: widening it exposed a 245-task transposed
+convolution whose output missed the official tolerance, so that graph remains
+the prior typed 415-stage rejection rather than an accepted numerical mismatch.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,882, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,882 lines.
-The exact 3,914-line delta is 3,909 counted Rockchip backend lines plus the
+contains 28,931, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,931 lines.
+The exact 3,963-line delta is 3,958 counted Rockchip backend lines plus the
 five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic

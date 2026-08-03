@@ -2011,3 +2011,34 @@ ten-output hardware test still passes, while unchanged official `test_cumsum`
 reaches the typed 20-output reject in 2.46 seconds instead of returning wrong
 data. Wider prefix scans remain blocked until alternating-engine stress proves
 the multi-tile state contract.
+
+## Compact 64-output reformat tiles
+
+One-row compact CMAC writes were already hardware-characterized through N=128,
+but the reusable windowed selector stopped at 32 outputs and inferred its input
+width from payload size. It now carries `align_in` explicitly and may emit a
+64-output physical selector tile. The standalone typed `RKReformat` lowerer
+also compares the sparse and windowed candidates instead of unconditionally
+choosing the sparse implementation.
+
+An 8x8 transpose consequently changes from two DPU preparation tasks plus four
+16-output CMAC tasks to one direct 64-output CMAC task. The 432-element flip
+falls from 27 selector contracts to seven. Direct-CONV packing uses the same
+proven width: `test_simple_conv2d_batched` drops from 49 to 28 tasks and 5.24
+to 2.99 seconds, while `test_simple_conv2d_m4` drops from 139 to 80 tasks and
+14.85 to 8.55 seconds. Their unchanged official outputs remain exact.
+
+The first unrestricted generic-contraction probe exposed an important
+numerical boundary. `test_padded_conv_transpose2d` fell from a 415-stage reject
+to a 245-task program, but 101 of 504 outputs exceeded the official tolerance
+(maximum absolute error 0.02344). Generic tiled-contraction packing therefore
+retains its previously characterized 32-output selector boundary; the same
+graph again rejects at 415 stages before submission. This is not treated as a
+coverage gain or fixed by relaxing tolerance.
+
+All 112 Rockchip host tests plus three subtests, mypy, and Ruff pass. Exact
+RK3588 movement and focused official methods pass, and the complete serialized
+device suite passes 81 tests plus 56 subtests in 680.95 seconds with no timeout,
+reset failure, or invalid submission. The authoritative method census remains
+152 native, 40 frontend-only, 220 failed, and 13 upstream-skipped pending the
+next complete run.
