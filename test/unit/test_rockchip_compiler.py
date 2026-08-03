@@ -765,6 +765,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.stages), 50)
     self.assertFalse(contains_uop(plan))
 
+  def test_tiled_contraction_maps_second_cmac_output_atom(self):
+    x, y = Tensor.empty(4,9,dtype=dtypes.half), Tensor.empty(9,24,dtype=dtypes.half)
+    result = lower_tiled_contract_result(sink(x@y))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    self.assertTrue(any(isinstance(step,RKContract) and step.rhs.layout.logical_shape[0] == 24 for step in result.plan.steps))
+    self.assertLessEqual(len(emit_program(result.plan).stages),400)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):
     x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x@y)).plan
@@ -1039,7 +1049,7 @@ class TestDPUCompiler(unittest.TestCase):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
                (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
-             (Tensor.empty(17,17,dtype=dtypes.half)@Tensor.empty(17,17,dtype=dtypes.half), "plan_stage_limit"),
+               (Tensor.empty(33,33,dtype=dtypes.half)@Tensor.empty(33,33,dtype=dtypes.half), "plan_stage_limit"),
              (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))

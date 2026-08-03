@@ -1721,3 +1721,19 @@ reduce within an eight-lane atom. A known-good HWC8 PPU recovery passes after
 the timeout. The safe probes and the opt-in timeout case are retained in
 `extra/rockchip/probe_ppu_channels.py`. Consequently the compiler keeps the
 typed stage-limit rejection rather than accepting a corrupt one-channel layout.
+
+Direct CMAC width characterization establishes that a task can produce 32
+logical FP16 channels. The apparent zero outputs above channel 15 were a layout
+mistake: WDMA stores the second channel block in physical lanes 32--47. Hardware
+probes are exact for N=16, 20, 24, 28, and 32. The tiled contraction lowerer now
+accepts N<=32 and maps the second physical atom during output compaction. A
+dynamic 4x9 by 9x24 contraction passes unchanged on hardware; its current cost
+is 83 tasks, 3,762 command words, 388,160 constant bytes, 3,456 scratch bytes,
+and is therefore correctly marked `CORRECTNESS_FALLBACK`.
+
+The first three `test_einsum_ellipsis` subcases now proceed through strict native
+execution, but the method's final 32x7x24x24x24 case honestly remains rejected:
+its contraction surfaces contain 3,096,576 values per operand and K=13,824.
+No complete-method coverage gain is claimed from this milestone.
+All 102 compiler/image/fallback/telemetry tests plus three subtests pass. The
+complete strict device suite passes 78 tests plus 54 subtests in 740.71 seconds.

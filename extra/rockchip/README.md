@@ -85,7 +85,9 @@ are eligible to be ported as native capabilities.
 - bounded affine FP16 contractions with NPU selector packing, tiled CMAC, and
   output compaction; a one-value-per-output-channel FP16 bias is gathered and
   converted to FP32 on the NPU, then fused through BRDMA before the first FP16
-  writeback, with optional ReLU in the same DPU flying-data stage;
+  writeback, with optional ReLU in the same DPU flying-data stage; one CMAC
+  task may produce up to 32 logical channels, with channels 16--31 represented
+  by the second gapped FP16 WDMA atom;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
 - dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane
@@ -421,11 +423,19 @@ simply lower the PPU channel field below eight: tightly packed HWC1/2/4 returns
 wrong maxima, `NONALIGN` times out, and unaligned DPU source addends do not
 reduce within an atom. HWC8 remains the declared direct PPU layout.
 
+`extra/rockchip/probe_cmac_width.py` proves direct logical output widths 16,
+20, 24, 28, and 32. FP16 WDMA stores logical channels 16--31 at physical lanes
+32--47, so the contraction unpack map explicitly accounts for that second atom.
+A dynamic 4x9 by 9x24 contraction passes on hardware with the generic tiled
+lowerer; its current 83-task selector plan is labeled a correctness fallback.
+The complete strict device suite passes 78 tests plus 54 subtests in 740.71
+seconds after adding the focused second-output-atom regression.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,636, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,636 lines.
-The exact 3,668-line delta is 3,663 counted Rockchip backend lines (3,496
+contains 28,638, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,638 lines.
+The exact 3,670-line delta is 3,665 counted Rockchip backend lines (3,498
 renderer/compiler, 118 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

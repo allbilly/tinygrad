@@ -277,6 +277,13 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data,device="ROCKCHIP").realize().conv2d(Tensor(weight,device="ROCKCHIP").realize()).realize().numpy()
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_second_cmac_output_atom_native_contraction(self):
+    lhs = np.linspace(-1,1,4*9,dtype=np.float16).reshape(4,9)
+    rhs = np.linspace(-.5,.5,9*24,dtype=np.float16).reshape(9,24)
+    expected = Tensor(lhs,device="CPU").matmul(Tensor(rhs,device="CPU")).numpy()
+    actual = Tensor(lhs,device="ROCKCHIP").realize().matmul(Tensor(rhs,device="ROCKCHIP").realize()).realize().numpy()
+    np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
+
   def test_direct_aligned_contraction_windows_native_cmac(self):
     for input_shape,weight_shape in (((1,4,9,9),(4,4,3,3)), ((8,1,11),(6,1,2)), ((8,3,11),(6,3,2))):
       with self.subTest(input_shape=input_shape):

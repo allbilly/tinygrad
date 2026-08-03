@@ -1262,7 +1262,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
   m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)): return _not_applicable()
-  if not 1 <= m <= 512 or not 1 <= n <= 16:
+  if not 1 <= m <= 512 or not 1 <= n <= 32:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   channel_bias:list[int]|None = None
   if fused_epilogue is not None:
@@ -1329,7 +1329,9 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
       RKTensorRef(RKArg(a_arg.kind, a_arg.index, row_start*align_in*2), lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0],
       epilogue=contract_epilogue))
   unpack:list[list[int]] = [[] for _ in range(output_count)]
-  for out_index,row,rhs_key in records: unpack[out_index] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
+  for out_index,row,rhs_key in records:
+    channel = rhs_columns.index(rhs_key)
+    unpack[out_index] = [lhs_rows.index(row)*64+(channel//16)*32+channel%16]
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   reduced = output
   if remaining_epilogue:
