@@ -305,6 +305,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(wide.stages), 65)
     self.assertEqual(decode_image(encode_image(emit_dpu(wide))), emit_dpu(wide))
 
+  def test_wide_fill_rejects_values_not_exactly_representable_as_fp16_input(self):
+    for value,dtype in ((dtypes.int.max,dtypes.int), (0.1,dtypes.float)):
+      result = lower_native(sink(Tensor.full((5,), value, dtype=dtype)))
+      self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
+      assert result.reject is not None
+      self.assertIs(result.reject.kind, RKRejectKind.NUMERICAL_CONTRACT)
+
   def test_plan_is_uop_free_and_reuses_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))
     plan = lower_dpu(sink(((a+b)*c)+d))

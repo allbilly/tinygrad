@@ -535,6 +535,13 @@ until an alternating-engine stress test proves a stable multi-tile contract.
 The unchanged focused `test_cumprod` therefore fails honestly at its first
 20-element case instead of sometimes returning incorrect data.
 
+Wide int32 and FP32 constant fills consume an FP16 DPU input even though WDMA
+writes a wider public dtype. Legalization now requires that constant to
+round-trip through FP16 exactly. Values such as `INT_MAX` and FP32 `0.1`
+therefore return `NUMERICAL_CONTRACT` before image emission, while proven exact
+fills remain native. This removes the raw FP16-packing `OverflowError` exposed
+by `test_maximum` without claiming general integer or FP32 arithmetic.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently

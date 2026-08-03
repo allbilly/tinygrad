@@ -1919,3 +1919,18 @@ checks that 20 outputs reject, the proven 10-output hardware test passes in
 reject in 2.36 seconds rather than exposing intermittent wrong output. Wider
 native cumulative products remain blocked until mixed-engine stress testing
 proves the hardware state and multi-tile layout reliable.
+
+### Exact wide-fill input contract
+
+The remaining backend-origin non-reject failure came from `test_maximum`'s
+integer `INT_MAX` case. Lowering accepted a typed int32 fill, but the emitter
+then attempted to materialize `2147483647` as the DPU's FP16 input and leaked a
+Python `OverflowError`. The wide public WDMA dtype does not change the scalar
+input precision.
+
+Legalization now proves exact FP16 round-trip representability for every int32
+or FP32 fill constant. `INT_MAX` and FP32 `0.1` reject with
+`NUMERICAL_CONTRACT`; exact constants such as four retain the existing native
+wide-fill path. The unchanged focused `test_maximum` reaches the typed reject
+in 2.73 seconds after its earlier native subcases pass. No emitter exception,
+host conversion, or relaxed comparison is involved.
