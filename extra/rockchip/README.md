@@ -518,6 +518,14 @@ first-reject Pareto is 65 unsupported-output-dtype, 50 plan-stage-limit, 35
 unsupported-layout, 23 unsupported-input-dtype, 18 requires-reformat, 13
 numerical-contract, 10 unsupported-ALU, and three unsupported-reduction.
 
+Telemetry schema version 2 now promotes the earliest reject attached to a
+failed subcase into the method's `first_reject`, while retaining every original
+event under its subcase. It also distinguishes `NATIVE_REJECT`,
+`DEVICE_FAILURE`, `POST_EXECUTION_FAILURE`, and `NON_DEVICE_FAILURE`; failure
+class and message are preserved for phase and subcase failures. Thus a
+numerical mismatch or frontend/compiler exception is no longer reported as a
+missing or fabricated native reject.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently

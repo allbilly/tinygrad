@@ -1881,13 +1881,23 @@ are `7dd09a9152e43af0fbc726ce71e4972d2bd3eff3a96c17d26c0d7d3f47a3a369`
 and `427a54dc6a4b9fac478b0ab8b548c80740a78b5483c14d121801ca602b758867`
 respectively.
 
-The reporter currently leaves failed subtest rejects under each subcase rather
-than promoting one to a method-level field. Reading both locations resolves 12
-of the 15 apparent method-level gaps. The aggregate first-reject Pareto is 65
+The version-1 census artifact leaves failed subtest rejects under each subcase
+rather than promoting one to a method-level field. Reading both locations
+resolves 12 of the 15 apparent method-level gaps. The aggregate first-reject Pareto is 65
 unsupported-output-dtype, 50 plan-stage-limit, 35 unsupported-layout, 23
 unsupported-input-dtype, 18 requires-reformat, 13 numerical-contract, 10
 unsupported-ALU, and three unsupported-reduction. Only `test_cumprod`,
 `test_maximum`, and `test_mulacc_with_zero_strides` have no compiler reject at
 any level; they require numerical/runtime/frontend failure classification, not
-a fabricated reject. This distinction is the input to the next telemetry
-milestone.
+a fabricated reject.
+
+Telemetry schema version 2 fixes the reporting gap. The method record now
+promotes the earliest reject belonging to a failed subcase into
+`first_reject`; rejects from passing subcases are deliberately excluded. Each
+subcase also carries its own `first_reject`, `failure_kind`, and failure class
+and message. Method failures distinguish `NATIVE_REJECT`, `DEVICE_FAILURE`,
+`POST_EXECUTION_FAILURE`, and `NON_DEVICE_FAILURE`. Consequently `cumprod` is
+recorded as a post-execution numerical failure after its native program,
+`maximum` retains its FP16-packing `OverflowError`, and
+`mulacc_with_zero_strides` retains its pre-device Clang failure instead of any
+of them being counted as an unspecified compiler reject.
