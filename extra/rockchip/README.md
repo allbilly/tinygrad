@@ -40,9 +40,9 @@ declared once at program scope, and each typed DPU, CMAC, or PPU step is emitted
 in order with constants and relocations remapped centrally. The former fixed
 CMAC-prefix/DPU/main-CMAC/CMAC-suffix pipeline no longer constrains composition.
 
-Lowering uses six named ordered passes for DPU arithmetic, affine reformat,
-global sum, affine reduction, PPU reduction, and contraction. Every pass returns
-exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
+Lowering uses sixteen named ordered strategies grouped into elementwise,
+movement/reformat, sum/product/MAX reduction, and contraction families. Every
+strategy returns exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
 cannot overwrite a useful reject, while applicable failures are ranked by
 specificity before telemetry is emitted.
 

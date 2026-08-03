@@ -5,6 +5,11 @@ from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_zero_base_power_masks_exp2_zero_before_evaluation(self):
+    exponent = np.array([-2,-1,0,1,2,3], dtype=np.float16)
+    actual = (0**Tensor(exponent, device="ROCKCHIP")).realize().numpy()
+    np.testing.assert_equal(actual, np.array([np.inf,np.inf,1,0,0,0], dtype=np.float16))
+
   def test_wide_fp16_fill_native_dpu_tiles(self):
     actual = Tensor.ones(65536,dtype=dtypes.half,device="ROCKCHIP").realize().numpy()
     np.testing.assert_equal(actual, np.ones(65536,dtype=np.float16))

@@ -25,7 +25,13 @@ Two methods transition from the previous 146-pass census with no regression:
 The 224 failed methods first classify as 65 unsupported-output-dtype, 53
 plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
 requires-reformat, 10 unsupported-ALU, nine numerical-contract, three
-unsupported-reduction, and eight numerical failures without a native reject.
+unsupported-reduction, and eight failures for which the method-level reporter
+did not retain a first reject. A post-census focused audit shows this last bucket
+is not eight accepted-native numerical failures: `cumprod` passes its 20-element
+native subcase and later rejects a 600-output plan limit; `maximum` and
+zero-stride multiply-accumulate fail in dtype/compilation plumbing. The accepted
+numerical set is biased convolution, BCE `reduction="none"`, exact signed-zero
+`copysign`, `lerp`, and the remaining `pow_const` subcases.
 The durable telemetry is
 `~/rk2608_backups/census-scale-85eeab7f5-20260803/test_ops_coverage.json`
 (SHA-256 `ad2acf33274bd9db8023931e65598f6e2e95c47205bb51b0dfcb28bfbd434605`);
@@ -1599,8 +1605,9 @@ timeout, invalid submission, reset failure, or process abort.
 The fresh first-reject Pareto is 65 unsupported-output-dtype, 53
 plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
 requires-reformat, 10 unsupported-ALU, nine numerical-contract, and three
-unsupported-reduction; eight failed methods reach hardware but mismatch
-numerically without a native reject. Telemetry and JUnit artifacts are stored
+unsupported-reduction; eight failed methods had no method-level first reject.
+The focused audit above separates accepted numerical errors from later rejects
+and frontend/compiler failures. Telemetry and JUnit artifacts are stored
 under `~/rk2608_backups/census-scale-85eeab7f5-20260803/` with SHA-256
 `ad2acf33274bd9db8023931e65598f6e2e95c47205bb51b0dfcb28bfbd434605`
 and `1a1430b4a2a11e21aa31720f92afe6bd359d5e339adbc74f11a3e74aa263a908`
@@ -1625,3 +1632,13 @@ reset. No tolerance, skip, or CPU retry was added. The active compiler retains
 the pre-submit `NUMERICAL_CONTRACT` rejection, and the WIP implementation plus
 hardware notes are archived as `0134-WIP-fused-BN-two-factor-scale.patch` with
 SHA-256 `a472dcbfb2a610e0aa0afe86f0318ad7e293d97417cf11067a6e94473054c22c`.
+
+The first accepted-native numerical repair handles the exact lowered identity
+`WHERE(x != 0, EXP2(-inf*x), 1)` used by zero-base power. Arithmetic selection
+cannot eagerly evaluate the inactive exponent at zero because `-inf*0` becomes
+NaN and `NaN*0` remains NaN. The compiler now replaces inactive zero with one
+before EXP2 and applies the predicate afterward. The strict RK3588 regression
+returns `[inf, inf, 1, 0, 0, 0]` for exponents `[-2,-1,0,1,2,3]`; the official
+`test_pow_const` proceeds past this subcase and next exposes the independent
+arbitrary-base `0.7**x` LUT accuracy contract. No complete-method gain is
+claimed yet.

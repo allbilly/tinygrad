@@ -161,6 +161,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsNone(result.plan)
     self.assertEqual(result.reject.kind if result.reject is not None else None, RKRejectKind.NUMERICAL_CONTRACT)
 
+  def test_zero_base_power_repairs_inactive_exp2_input(self):
+    result = lower_native(sink(0**Tensor.empty(6,dtype=dtypes.half)))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKDPUProgram)
+    assert isinstance(result.plan, RKDPUProgram)
+    self.assertGreaterEqual(len(result.plan.stages), 1)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_multi_source_affine_sum_composes_source_local_selectors(self):
     lhs = Tensor.empty(256,256,dtype=dtypes.half).realize()
     rhs = Tensor.empty(256,64,dtype=dtypes.half).realize()

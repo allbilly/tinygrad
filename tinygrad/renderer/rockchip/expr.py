@@ -634,6 +634,22 @@ def _unwrap_fp_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype in (dtypes.half, dtypes.float) and u.src[0].dtype in (dtypes.half, dtypes.float): u = u.src[0]
   return _unwrap_same_cast(u)
 
+def _canonical_zero_base_power(u:UOp) -> tuple[UOp, UOp]|None:
+  """Recognize WHERE(x != 0, EXP2(-inf*x), 1), whose inactive exponential must not see zero."""
+  u = _unwrap_fp_cast(u)
+  if u.op is not Ops.WHERE or len(u.src) != 3: return None
+  condition, powered, identity = (_unwrap_fp_cast(x) for x in u.src)
+  if condition.op is not Ops.CMPNE or powered.op is not Ops.EXP2 or identity.op is not Ops.CONST or float(identity.arg) != 1.0: return None
+  compared = tuple(_unwrap_fp_cast(x) for x in condition.src)
+  zero = next((x for x in compared if x.op is Ops.CONST and float(x.arg) == 0.0), None)
+  source = next((x for x in compared if x is not zero), None)
+  exponent = _unwrap_fp_cast(powered.src[0])
+  if zero is None or source is None or exponent.op is not Ops.MUL: return None
+  factors = tuple(_unwrap_fp_cast(x) for x in exponent.src)
+  negative_inf = next((x for x in factors if x.op is Ops.CONST and float(x.arg) == -math.inf), None)
+  exponent_source = next((x for x in factors if x is not negative_inf), None)
+  return (source, condition) if negative_inf is not None and exponent_source is not None and exponent_source.key == source.key else None
+
 def _canonical_mul_power(u:UOp, power:float, reciprocal:bool=False) -> UOp|None:
   """Recognize a multiplication tree containing exactly `power` copies of one FP16 indexed value."""
   u = _unwrap_fp_cast(u)
@@ -1118,6 +1134,15 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     if base is None: return None
     positive = _ALUExpr(Ops.MAX, (_ALUExpr(Ops.ADD, (base, .5)), 0.0))
     ret = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (positive, -1.0)), -1.0)), -1.0))
+  elif (zero_power:=_canonical_zero_base_power(u)) is not None:
+    operand, mask = _parse_alu(zero_power[0], output_index, memo), _parse_mask_expr(zero_power[1], output_index, memo)
+    if operand is None or isinstance(operand, float) or mask is None: return None
+    inactive = _sub(1.0, mask)
+    # Generic WHERE uses arithmetic selection, so evaluating -inf*0 first would make the inactive arm NaN.
+    # Replace inactive zero by one before EXP2; the active mask restores the exact 0**0 == 1 result.
+    safe_operand = _ALUExpr(Ops.ADD, (operand, inactive))
+    powered = _exp2_expr(_ALUExpr(Ops.MUL, (safe_operand, -math.inf)))
+    ret = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (powered, mask)), inactive))
   elif u.op is Ops.MUL and any(x.op is Ops.RECIPROCAL for x in u.src):
     reciprocal = next(i for i,x in enumerate(u.src) if x.op is Ops.RECIPROCAL)
     if _canonical_sigmoid(u.src[reciprocal]) is not None:
