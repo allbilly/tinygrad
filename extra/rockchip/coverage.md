@@ -12,27 +12,28 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `02ae2f927` contains exactly 425 method records:
-168 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 204 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `de0ac1406` contains exactly 425 method records:
+169 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 203 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 232 failed methods/subtests, 219 passed, 87 passing subtests,
-and 13 skipped in 2,523.17 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 231 failed methods/subtests, 220 passed, 87 passing subtests,
+and 13 skipped in 2,539.47 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to `61288f302`, only `TestOps.test_grouped_conv2d` and
-`TestOps.test_max_pool2d_unit_stride` change from failure to native pass. The
-204 failed methods first classify as 65 unsupported-output-dtype, 43
+Relative to `02ae2f927`, only `TestOps.test_simple_conv2d_nhwc` changes from
+failure to native pass; no native method regresses. The 203 failed methods
+first classify as 65 unsupported-output-dtype, 42
 plan-stage-limit, 27 unsupported-layout, 23
 unsupported-input-dtype, 19 numerical-contract, 18 requires-reformat, and nine
-unsupported-ALU. Schema version 2 classifies all 204 failures as
+unsupported-ALU. Schema version 2 classifies all 203 failures as
 `NATIVE_REJECT`; no failure
 lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-pool-02ae2f927-20260804/test_ops_coverage.json`
-(SHA-256 `3d93c4de0b5c9fabc820de66f3d5049ea7f439e3ad2fe2659ab0542ddbfb0975`);
+is `~/rk2608_backups/census-nhwc-de0ac1406-20260804/test_ops_coverage.json`
+(SHA-256 `7f8d1ee6f46ddf35136903c12f1d4b768b6f1fbd0a9c89555825f8f38828aa45`);
 the JUnit XML SHA-256 is
-`781f7c42e42627f741352ef013744ded6df4143e9c703814fba5147c8875b864`.
+`2c08cc8240e440c933f402819669323ea8c4e3be1368a2c9eb93bd7aa8fb92af`.
 
-The grouped-CNA and sliding-MAX PPU transitions are both authoritative.
+The grouped-CNA, sliding-MAX PPU, and NHWC/HWIO CNA transitions are all
+authoritative.
 
 Focused work after that census makes `TestOps.test_simple_conv2d_nhwc` pass
 natively without changing its `atol=1e-5`. The generic affine matcher derives
@@ -46,8 +47,8 @@ almost all work. The focused telemetry and JUnit artifacts are under
 `18a897bdc674f18c9ca3c6acc740f5bcade11bdfd9113a6a000bb67e0c6c31f1` and
 `416203e40b416c3874a1376142ba55bdc9e26662540aa194116184925a726db3`.
 
-This implies 169 native, 40 frontend, 203 failed, and 13 upstream-skipped
-methods, but it is not authoritative until a new complete census. The exact
+The complete `de0ac1406` census confirms 169 native, 40 frontend, 203 failed,
+and 13 upstream-skipped methods. The exact
 `conv_grok` lesson is retained: weight banks choose K, the feature banks left
 after that choice choose Y, and simultaneous pressure yields a Cartesian
 BY_YK schedule. This focused geometry needs only K/channel splitting; it does
@@ -55,9 +56,9 @@ not yet prove typed Y-overlap tasks. Full regressions pass with 130 host tests
 plus ten subtests and 92 serialized device tests plus 58 subtests; mypy and
 Ruff are clean.
 
-The 508 successful native kernels contain 479 `EFFICIENT` and 29
+The 509 successful method-level native kernels contain 479 `EFFICIENT` and 30
 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 181 at
-2--8, 98 at 9--32, 80 at 33--64, 11 at 65--128, 13 at 129--256, and four at
+2--8, 98 at 9--32, 80 at 33--64, 11 at 65--128, 14 at 129--256, and four at
 257--400. The worst path remains `test_matmul` at 399 tasks, 18,326 command
 words and 899,280 constant bytes. Periodic compaction adds three successful
 kernels from later `test_repeat` subcases; its first 1,728-output kernel was

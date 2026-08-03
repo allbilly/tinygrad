@@ -1047,12 +1047,17 @@ native quality       CORRECTNESS_FALLBACK
 
 No CPU tensor path, runtime packing, tolerance change, or resource-ceiling
 increase was added. Selector packing still dominates the plan and its
-17.08-second kernel time, so the next optimization is direct native layout
+17.10-second kernel time, so the next optimization is direct native layout
 conversion plus typed CBUF Y/K windows—not wider selector or task limits. The
-focused pass implies 169/40/203/13 pending a complete uncached census; the
-authoritative inventory remains 168/40/204/13 until that run completes.
+complete uncached census at `de0ac1406` confirms this is the only transition:
+169 native, 40 frontend, 203 failed, and 13 upstream-skipped methods. No native
+method regresses.
 
 Regression gates pass: 130 host tests plus ten subtests, mypy over all 225
 tinygrad modules, Ruff, and 92 serialized RK3588 device tests plus 58 subtests
 in 749.63 seconds. The hardware run had no timeout, invalid submission, reset
-failure, or process abort.
+failure, or process abort. The complete census likewise finishes without a
+device-state error in 2,539.47 seconds. Its JSON SHA-256 is
+`7f8d1ee6f46ddf35136903c12f1d4b768b6f1fbd0a9c89555825f8f38828aa45` and
+its JUnit SHA-256 is
+`2c08cc8240e440c933f402819669323ea8c4e3be1368a2c9eb93bd7aa8fb92af`.
