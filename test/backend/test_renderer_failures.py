@@ -4,8 +4,8 @@ from tinygrad.device import Device, Buffer
 from tinygrad.dtype import dtypes, ConstType
 from tinygrad.engine.realize import run_linear
 from tinygrad.codegen import to_program
-from tinygrad.helpers import prod
-from tinygrad.renderer.cstyle import CStyleLanguage
+from tinygrad.helpers import Context, prod
+from tinygrad.renderer.cstyle import ClangRenderer, CStyleLanguage
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.wgsl import WGSLRenderer
 from tinygrad.runtime.ops_python import PythonRenderer
@@ -52,6 +52,13 @@ class TestRendererFailures(unittest.TestCase):
 
 @unittest.skipIf(not isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage), "uops are for cstyle")
 class TestCStyleFailures(unittest.TestCase):
+  @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, ClangRenderer), "test is for clang renderer")
+  def test_vector_cast_from_stack(self):
+    with Context(DEFAULT_FLOAT=dtypes.half):
+      ret = Tensor(1.).reshape(1,1,1).expand(2,4,3).mul(Tensor(1.).reshape(1,1,1).expand(2,4,3)).sum(-1).numpy()
+    self.assertEqual(ret.dtype, np.float16)
+    np.testing.assert_equal(ret, [[3.]*4]*2)
+
   def test_inline_const_alu(self):
     # CPU doesn't use the max function
     ret = _setup_and_test_alu(Ops.MAX, 1, UOp.const(dtypes.int.min+1).cast(dtypes.int))

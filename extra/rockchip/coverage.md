@@ -35,6 +35,15 @@ outcome. The durable telemetry is
 the JUnit XML SHA-256 is
 `549009e30fa00aedca50fcfe3abcbee759271c83e9877441b0b7889857ec68a4`.
 
+Post-census focused work resolves the sole non-reject failure. A generic Clang
+renderer fix performs numeric conversion for four-lane shaped half-to-float
+CASTs, and weakfloat SUM now commits its FP32 accumulator to the configured
+strong default output dtype. The unchanged
+`test_mulacc_with_zero_strides` passes with four realized native DPU/CMAC
+programs and no fallback. This implies a provisional 154/40/218/13 transition,
+but the 153/40/219/13 result above remains authoritative until the next full
+uncached census.
+
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
 image now encodes that actual contract directly. The stale matching planner
@@ -2074,3 +2083,28 @@ The complete uncached census confirms this as the sole method transition from
 153/40/219/13 result. COS is not claimed because the census plugin promotes
 its public method to FP32, and TAN remains rejected because the frozen native
 probes missed strict near-pole comparisons.
+
+## Frontend vector-cast failure resolved
+
+`test_mulacc_with_zero_strides` was the only SIN-census failure that did not
+retain a typed native reject. Its first constant-only subcase failed before
+device execution because the Clang renderer emitted a C-style cast between
+four-lane `__fp16` and float vectors. The late UOp had shape `(4,)` and
+`addrspace=None`; the numeric vector-conversion rule covered only
+`AddrSpace.REG` after the new-style renderer migration.
+
+The generic rule now covers both shaped anonymous values and explicit register
+vectors. A regression compiles and executes the original half-default
+reduction form. A second generic fix makes weakfloat SUM return
+`strong_dtype(weakfloat)` after its existing FP32 accumulation, so
+`DEFAULT_FLOAT=HALF` produces the same public FP16 dtype as the other weak
+reductions and the PyTorch reference.
+
+Focused schema-v2 telemetry at `789ff2784` records the unchanged method as
+`PASS_NATIVE`: all four realized programs use only DPU/CMAC tasks, with task
+counts 18, 1, 1, and 6. The constant-only subcase remains frontend work and no
+CPU semantic fallback is enabled. Durable focused artifacts are stored under
+`~/rk2608_backups/focused-mulacc-789ff2784-20260803/`. The complete device suite
+passes 82 tests plus 56 subtests in 694.38 seconds with no timeout, invalid
+submission, reset failure, or process abort. A complete census is still
+required before replacing the authoritative 153/40/219/13 totals.

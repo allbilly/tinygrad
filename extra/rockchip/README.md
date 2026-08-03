@@ -13,6 +13,11 @@ and 77 passing subtests in 2,250.74 seconds. It completed without an NPU
 timeout, reset failure, invalid submission, or process abort. Coverage details
 and durable artifact hashes are recorded in `coverage.md`.
 
+Post-census focused testing fixes the sole pre-device Clang failure in
+`test_mulacc_with_zero_strides`. The unchanged method now reports
+`PASS_NATIVE` with four realized DPU/CMAC programs and fallback disabled; the
+expected 154/40/218/13 census remains provisional until a complete run.
+
 The compiler boundary is:
 
 ```text
@@ -604,12 +609,28 @@ frontend-only, 219 failed, and 13 upstream-skipped. The complete serialized
 device suite passes 82 tests plus 56 subtests in 693.48 seconds with no timeout,
 reset failure, invalid submission, or process abort.
 
+The sole pre-device failure from that census is now resolved generically.
+Clang numeric vector conversion covers shaped anonymous values as well as
+explicit register vectors, avoiding an illegal `__fp164` to `float4` C cast.
+Weakfloat SUM keeps its existing FP32 accumulator but commits the public result
+to `strong_dtype(weakfloat)`, so `DEFAULT_FLOAT=HALF` returns FP16 consistently
+with the other weak reductions.
+
+This does not add host fallback or a Rockchip test-name special case. The
+constant-only first subcase remains frontend work, while all four realized
+programs in the unchanged method execute only RK3588 DPU/CMAC tasks (18, 1, 1,
+and 6 tasks). Focused schema-v2 telemetry records `PASS_NATIVE` with
+`ROCKCHIP_FALLBACK=0`. The full host selection passes 114 tests plus three
+subtests, and the complete serialized device contract passes 82 tests plus 56
+subtests in 694.38 seconds.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,953, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,953 lines.
-The exact 3,985-line delta is 3,980 counted Rockchip backend lines plus the
-five-line generic native-program hook. Generated
+contains 28,957, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,957 lines.
+The exact 3,989-line delta is 3,980 counted Rockchip backend lines, the
+five-line generic native-program hook, and four generic correctness lines.
+Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic
 remain counted. The generic hook can be reviewed separately, while the backend

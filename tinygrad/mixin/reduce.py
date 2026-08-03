@@ -41,8 +41,10 @@ class ReduceMixin(DTypeMixin, MovementMixin):
     print(t.sum(axis=1).numpy())
     ```
     """
-    ret = self.cast(sum_acc_dtype(self.dtype) if dtype is None else to_dtype(dtype))._reduce(Ops.ADD, axis, keepdim)
-    return ret.cast(self.dtype) if dtype is None and self.dtype in (dtypes.float16, dtypes.bfloat16, *dtypes.fp8s) else ret
+    src_dtype = self.dtype
+    ret = self.cast(sum_acc_dtype(src_dtype) if dtype is None else to_dtype(dtype))._reduce(Ops.ADD, axis, keepdim)
+    low_float = (dtypes.weakfloat, dtypes.float16, dtypes.bfloat16, *dtypes.fp8s)
+    return ret.cast(strong_dtype(src_dtype)) if dtype is None and src_dtype in low_float else ret
 
   def prod(self, axis:int|Sequence[int]|None=None, keepdim=False, dtype:DTypeLike|None=None) -> Self:
     """

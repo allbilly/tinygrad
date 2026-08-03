@@ -21,6 +21,11 @@ class TestWeakPromotion(unittest.TestCase):
       for out in (t.sum(), t.max(), t.prod(), t.cumsum(0), t.cummax(0)[0]): self.assertEqual(out.dtype, strong)
     self.assertEqual((Tensor.const(1.0).expand(3).sum() + Tensor([1], dtype=dtypes.float16)).dtype, dtypes.float32)
 
+  def test_weakfloat_reduce_respects_half_default(self):
+    with Context(DEFAULT_FLOAT=dtypes.float16):
+      t = Tensor.const(1.0).expand(3)
+      for out in (t.sum(), t.max(), t.prod(), t.cumsum(0), t.cummax(0)[0]): self.assertEqual(out.dtype, dtypes.float16)
+
   def test_materialize_at_default_dtype(self):
     for weak, value, strong in ((dtypes.weakfloat, 0.5, dtypes.default_float),):
       t = Tensor.const(value, weak)
