@@ -94,7 +94,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
                       RKLUTId.POW8, RKLUTId.POW8_HIGH, RKLUTId.POW55, RKLUTId.POW55_LOCAL, RKLUTId.POW55_HIGH,
                       RKLUTId.POW_NEG55_LOW, RKLUTId.POW_NEG55_HIGH, RKLUTId.POW_NEG55_FAR,
                       RKLUTId.POW_BASE55_LOW, RKLUTId.POW_BASE55_HIGH, RKLUTId.POW_BASE8_FAR_LOW,
-                      RKLUTId.POW_BASE8_LOW, RKLUTId.POW_BASE8_HIGH, RKLUTId.POW_BASE8_FAR_HIGH):
+                      RKLUTId.POW_BASE8_LOW, RKLUTId.POW_BASE8_HIGH, RKLUTId.POW_BASE8_FAR_HIGH,
+                      RKLUTId.SIN, RKLUTId.SIN_LOCAL):
     raise ValueError(f"unimplemented Rockchip LUT {plan.lut}")
   name = plan.lut.name
   table, entries = getattr(rklut, f"RK_LUT_{name}"), getattr(rklut, f"RK_LUT_{name}_ENTRIES")

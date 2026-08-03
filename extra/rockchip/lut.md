@@ -149,6 +149,31 @@ so unselected extreme inputs cannot overflow and contaminate the result.
 Generic masks saturate finite tails and preserve NaN behavior. Both strict
 `test_tanh` methods pass on RK3588 without a tanh DPU opcode or host fallback.
 
+## Two-level periodic sine
+
+SIN ports the proven rockchip-2608 recipe without importing its rejected TAN
+experiment. Device arithmetic clamps finite inputs to `[-10000, 10000]`, uses
+the native ROUNDOFF LUT to form `round(x/(2*pi))`, and subtracts `2*pi` as the
+FP16-exact split sequence `4 + 2 + 0.25 + 0.03125 + residual`. The reduced
+angle is then evaluated by two ordinary LUT tasks:
+
+- `SIN` has ID 73, index scale `16384/pi`, Q15 output, domain `[-pi, pi]`, and
+  SHA-256 `e5606a81bda56919a107a8a984f26c96aa0ea5de2f3cdcb9d0138f79ae45aded`;
+- `SIN_LOCAL` has ID 74, index scale 8192, and stores `8*sin(z/16)` over
+  `[-2, 2]`, with SHA-256
+  `8f6241fde668f1730cfbbcf6e6509bf025d21f516ab31912a242f364e460b793`.
+
+Inside `abs(reduced)<0.125`, the local result is decoded by one eighth; inside
+`0.04`, the reduced angle itself avoids near-zero relative-error amplification.
+Adding `x*0` propagates NaN for NaN and infinity entirely on the NPU. The typed
+plan has 56 stages and seven reusable scratch surfaces. The unchanged strict
+forward-only `TestOps.test_sin`, including scalar, special-value, and wide
+magnitude cases, passes on RK3588. A uniform exhaustive periodic-accuracy claim
+is deliberately not made: the reference branch measured three dense central
+misses and wider range-reduction error. TAN remains unsupported because its
+best native reference designs missed strict near-pole comparisons; rockchip-2607
+implemented TAN with NumPy and is not a native oracle.
+
 ## Inverse trigonometric functions
 
 Tinygrad decomposes `acos(x)` through `asin(x)` and `atan(x)` through

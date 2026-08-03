@@ -401,9 +401,9 @@ class TestRockchip(unittest.TestCase):
       data = np.linspace(-1, 1, 17, dtype=np.float16)
       x = Tensor(data, device="ROCKCHIP").realize()
       native_before = (x+0.25).realize()
-      fallback = native_before.sin().realize()
+      fallback = native_before.tan().realize()
       actual = (fallback*2).realize().numpy()
-      np.testing.assert_allclose(actual, (np.sin(data+0.25)*2).astype(np.float16), rtol=2e-3, atol=2e-3)
+      np.testing.assert_allclose(actual, (np.tan(data+0.25)*2).astype(np.float16), rtol=2e-3, atol=2e-3)
       lanes = [event["lane"] for event in drain() if event["kind"] == "kernel"]
       self.assertEqual(lanes[-3:], ["RK_DPU", "PYTHON", "RK_DPU"])
     finally:
@@ -505,6 +505,13 @@ class TestRockchip(unittest.TestCase):
                                np.tanh(data.astype(np.float32)).astype(np.float16), rtol=1e-3, atol=1e-6)
     extreme = np.array([-400, -300, 300, 400], dtype=np.float16)
     np.testing.assert_equal(Tensor(extreme, device="ROCKCHIP").tanh().realize().numpy(), np.tanh(extreme))
+
+  def test_generated_sin_luts_and_split_range_reduction(self):
+    data = np.array([-10000, -1000, -100, -10, -2, -.125, -.04, -0., 0., .04, .125, 2, 10, 100, 1000, 10000], dtype=np.float16)
+    np.testing.assert_allclose(Tensor(data, device="ROCKCHIP").sin().realize().numpy(),
+                               np.sin(data.astype(np.float32)).astype(np.float16), rtol=3e-3, atol=3e-3)
+    special = np.array([np.nan, np.inf, -np.inf], dtype=np.float16)
+    self.assertTrue(np.isnan(Tensor(special, device="ROCKCHIP").sin().realize().numpy()).all())
 
   def test_generated_inverse_trig_assets(self):
     unit = np.linspace(-1, 1, 4097, dtype=np.float16)

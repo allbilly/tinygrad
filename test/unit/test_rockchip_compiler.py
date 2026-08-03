@@ -456,6 +456,21 @@ class TestDPUCompiler(unittest.TestCase):
                      {rklut.RKLUTId.TANH, rklut.RKLUTId.TANH_MID})
     self.assertFalse(contains_uop(plan))
 
+  def test_sin_uses_proven_two_level_lut_recipe(self):
+    for name, digest in (("SIN", "e5606a81bda56919a107a8a984f26c96aa0ea5de2f3cdcb9d0138f79ae45aded"),
+                         ("SIN_LOCAL", "8f6241fde668f1730cfbbcf6e6509bf025d21f516ab31912a242f364e460b793")):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), digest)
+      self.assertEqual(digest, getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    plan = lower_dpu(sink(Tensor.empty(128, dtype=dtypes.half).sin()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    assert isinstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.ROUNDOFF, rklut.RKLUTId.SIN, rklut.RKLUTId.SIN_LOCAL})
+    self.assertLessEqual(len(plan.stages), 60)
+    self.assertLessEqual(len(plan.scratch), 7)
+    self.assertFalse(contains_uop(plan))
+
   def test_inverse_trig_uses_generated_math_assets(self):
     for name in ("ASIN", "ASIN_LOCAL", "ASIN_EDGE", "ACOS", "ATAN"):
       table = getattr(rklut, f"RK_LUT_{name}")
@@ -1130,7 +1145,7 @@ class TestDPUCompiler(unittest.TestCase):
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
                (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
                (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,128,dtype=dtypes.half), "plan_stage_limit"),
-             (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
+             (Tensor.empty(16,dtype=dtypes.half).tan(), "unsupported_alu"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
 

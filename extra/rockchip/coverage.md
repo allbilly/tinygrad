@@ -2042,3 +2042,33 @@ device suite passes 81 tests plus 56 subtests in 680.95 seconds with no timeout,
 reset failure, or invalid submission. The authoritative method census remains
 152 native, 40 frontend-only, 220 failed, and 13 upstream-skipped pending the
 next complete run.
+
+## Proven two-level periodic SIN
+
+The current branch previously rejected direct `Ops.SIN` as unsupported ALU.
+The frozen rockchip-2608 branch supplies a genuine NPU implementation: native
+ROUNDOFF plus split FP16 periodic reduction, followed by broad and amplified
+local LUT tasks. The clean port appends `SIN=73` and `SIN_LOCAL=74` without
+renumbering any existing generated asset. Their payload digests match the
+reference byte-for-byte.
+
+The target plan contains 56 DPU tasks, seven reusable scratch surfaces, and no
+UOps. The unchanged official forward-only `TestOps.test_sin` passes in 19.67
+seconds with fallback disabled, including scalar, NaN/infinity, and magnitude
+`10..1e6` subcases. A permanent serial hardware regression covering regional
+boundaries and magnitudes through 10,000 passes in 13.06 seconds. No tolerance,
+task ceiling, runtime conversion, or CPU semantic path changed.
+
+The complete serialized hardware suite passes 82 tests plus 56 subtests in
+693.48 seconds. Its first run exposed only a stale research-test assumption:
+the explicit fallback-coherence test still used SIN to force the Python lane,
+so the now-native kernel correctly reported DPU instead. That test now uses
+still-unsupported TAN and independently proves DPU-to-Python-to-DPU mapped
+buffer coherence; the fallback remains disabled for every official coverage
+run. The clean rerun has no device or numerical failures.
+
+This is a focused expected transition from `unsupported_alu` to
+`PASS_NATIVE`; the authoritative complete census remains 152/40/220/13 until
+the next uncached 425-method run. COS is not claimed because the census plugin
+promotes its public method to FP32, and TAN remains rejected because the frozen
+native probes missed strict near-pole comparisons.

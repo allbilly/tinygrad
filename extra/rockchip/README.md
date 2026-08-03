@@ -80,8 +80,8 @@ are eligible to be ported as native capabilities.
 - fused FP16 lerp through CMAC FP32 operand materialization followed by the
   DPU BS/BN/EW pipeline, preserving the single FP32 intermediate boundary;
 - FP16 `WHERE` with a directly representable less-than mask and finite arms;
-- generated EXP2, EXP, sigmoid, refined SQRT/RSQRT, logarithm, inverse
-  trigonometric, and inverse-hyperbolic LUT assets with declared domains;
+- generated EXP2, EXP, sigmoid, periodic SIN, refined SQRT/RSQRT, logarithm,
+  inverse-trigonometric, and inverse-hyperbolic LUT assets with declared domains;
 - direct FP16 CMAC for `M=1`, `K=32`, and `4 <= N <= 16` when the right-hand
   input is already stored as `(N, 32)`;
 - bounded affine FP16 contractions with NPU selector packing, tiled CMAC, and
@@ -590,11 +590,25 @@ keeps a 32-output selector fence: widening it exposed a 245-task transposed
 convolution whose output missed the official tolerance, so that graph remains
 the prior typed 415-stage rejection rather than an accepted numerical mismatch.
 
+The proven rockchip-2608 periodic SIN implementation is now expressed through
+the clean typed stage IR. Two generated payloads retain their reference
+SHA-256 digests, while generic DPU arithmetic performs split `2*pi` range
+reduction, local/broad selection, near-zero identity, and non-finite NaN
+propagation. The result is a 56-task, seven-scratch NPU-only plan. The unchanged
+strict `TestOps.test_sin` passes in 19.67 seconds and a boundary/wide-magnitude
+hardware regression passes in 13.06 seconds. TAN is not enabled: the reference
+native experiments remained outside strict tolerance and rockchip-2607 used a
+NumPy host implementation. The authoritative method census remains 152 native
+pending a complete uncached run; the focused expected transition is one
+unsupported-ALU failure to native pass. The complete serialized device suite
+passes 82 tests plus 56 subtests in 693.48 seconds with no timeout, reset
+failure, invalid submission, or process abort.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,931, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,931 lines.
-The exact 3,963-line delta is 3,958 counted Rockchip backend lines plus the
+contains 28,953, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,953 lines.
+The exact 3,985-line delta is 3,980 counted Rockchip backend lines plus the
 five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic

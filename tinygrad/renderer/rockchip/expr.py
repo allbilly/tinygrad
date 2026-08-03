@@ -58,6 +58,26 @@ def _trunc_expr(source:_Expr|RKArg|float) -> _Expr:
   increment = _ALUExpr(Ops.MUL, (positive(source, rounded), positive(0.0, source)))
   return _ALUExpr(Ops.ADD, (_sub(rounded, decrement), increment))
 
+def _sin_expr(source:_Expr|RKArg) -> _Expr:
+  """FP16 Cody-Waite range reduction followed by broad/local sine LUTs."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX,
+    (_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, -10000.0)), -1.0)), -10000.0)), -1.0))
+  rounded = _round_expr(_ALUExpr(Ops.MUL, (bounded, 1/(2*math.pi))))
+  reduced:_Value = bounded
+  for coefficient in (4.0, 2.0, .25, .03125, 2*math.pi-6.28125):
+    reduced = _sub(reduced, _ALUExpr(Ops.MUL, (rounded, coefficient)))
+  assert not isinstance(reduced, float)
+  broad = _LUTExpr(RKLUTId.SIN, (reduced,))
+  local = _LUTExpr(RKLUTId.SIN_LOCAL, (_ALUExpr(Ops.MUL, (reduced, 16.0)),))
+  absolute = _ALUExpr(Ops.MAX, (reduced, _ALUExpr(Ops.MUL, (reduced, -1.0))))
+  local_inside, near_inside = _sub(1.0, positive(absolute, .125)), _sub(1.0, positive(absolute, .04))
+  middle = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (local, .125)), _sub(local_inside, near_inside)))
+  near = _ALUExpr(Ops.MUL, (reduced, near_inside))
+  normal = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.ADD, (middle, near))))
+  # Propagate NaN for NaN/infinity while preserving the finite result without a separate classification epilogue.
+  return _ALUExpr(Ops.ADD, (normal, _ALUExpr(Ops.MUL, (source, 0.0))))
+
 def _exp_expr(source:_Expr|RKArg|float) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   def clamp(value:_Expr|RKArg|float, limit:float) -> _Expr:
@@ -1233,6 +1253,14 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None: return None
     ret = _trunc_expr(operand)
+  elif u.op is Ops.SIN:
+    sin_source = _unwrap_same_cast(u.src[0])
+    # The proven contract is direct FP16 SIN. Tinygrad expresses COS/TAN through a phase-shifted SIN;
+    # accepting an arbitrary parsed phase here would silently enable those numerically unproven recipes.
+    if sin_source.op is not Ops.INDEX or sin_source.dtype is not dtypes.half: return None
+    operand = _parse_alu(sin_source, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _sin_expr(operand)
   elif u.op is Ops.SQRT:
     operand = _parse_alu(u.src[0], output_index, memo)
     if operand is None or isinstance(operand, float): return None

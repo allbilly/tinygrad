@@ -24,6 +24,6 @@ class TestRockchipFallback(unittest.TestCase):
 
   def test_strict_mode_still_rejects(self):
     with self.assertRaisesRegex(RuntimeError, "RKPLAN_REJECT"):
-      RockchipRenderer(Target("ROCKCHIP")).native_program(sink(Tensor.empty(7, dtype=dtypes.half).sin()))
+      RockchipRenderer(Target("ROCKCHIP")).native_program(sink(Tensor.empty(7, dtype=dtypes.half).tan()))
 
 if __name__ == "__main__": unittest.main()

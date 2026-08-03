@@ -29,6 +29,12 @@ tanh_mid = [max(-32768, min(32767, round(math.tanh((-(512-i)*TANH_MID_STEP) if t
 TANH_LOCAL_SCALE, TANH_LOCAL_STEP = 65504.0, 32.0/65504.0
 tanh_local = [max(-32768, min(32767, round(math.tanh((-(512-i)*TANH_LOCAL_STEP) if table == 0 else i*TANH_LOCAL_STEP) * 262144)))
               for table in range(2) for i in range(SIZE)]
+SIN_SCALE, SIN_STEP = 16384/math.pi, math.pi/512
+sin_lut = [max(-32768, min(32767, round(math.sin((-(512-i)*SIN_STEP) if table == 0 else i*SIN_STEP) * 32768))) or 1
+           for table in range(2) for i in range(SIZE)]
+SIN_LOCAL_SCALE, SIN_LOCAL_STEP = 8192.0, 32.0/8192.0
+sin_local = [max(-32768, min(32767, round(8*math.sin(((-(512-i)*SIN_LOCAL_STEP) if table == 0 else i*SIN_LOCAL_STEP)/16) * 32768))) or 1
+             for table in range(2) for i in range(SIZE)]
 ASIN_SCALE, ASIN_STEP = 16384.0, 32.0/16384.0
 asin = [max(-32768, min(32767, round(math.asin((-(512-i)*ASIN_STEP) if table == 0 else i*ASIN_STEP) * 16384)))
         for table in range(2) for i in range(SIZE)]
@@ -607,7 +613,9 @@ class RKLUTId(IntEnum):
   POW_BASE8_LOW = 70
   POW_BASE8_HIGH = 71
   POW_BASE8_FAR_HIGH = 72
-RK_LUT_SCHEMA = 56
+  SIN = 73
+  SIN_LOCAL = 74
+RK_LUT_SCHEMA = 57
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -672,6 +680,18 @@ RK_LUT_TANH_MID_MINUS_EXP = 16
 RK_LUT_TANH = (\n{rows(tanh)}\n)
 RK_LUT_TANH_LOCAL = (\n{rows(tanh_local)}\n)
 RK_LUT_TANH_MID = (\n{rows(tanh_mid)}\n)
+RK_LUT_SIN_SHA256 = "{digest(sin_lut)}"
+RK_LUT_SIN_DOMAIN = (-{math.pi!r}, {math.pi!r})
+RK_LUT_SIN_ENTRIES = {SIZE}
+RK_LUT_SIN_BN_MUL = {struct.unpack('<H', struct.pack('<e', SIN_SCALE))[0]}
+RK_LUT_SIN_MINUS_EXP = 15
+RK_LUT_SIN = (\n{rows(sin_lut)}\n)
+RK_LUT_SIN_LOCAL_SHA256 = "{digest(sin_local)}"
+RK_LUT_SIN_LOCAL_DOMAIN = (-2.0, 2.0)
+RK_LUT_SIN_LOCAL_ENTRIES = {SIZE}
+RK_LUT_SIN_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', SIN_LOCAL_SCALE))[0]}
+RK_LUT_SIN_LOCAL_MINUS_EXP = 15
+RK_LUT_SIN_LOCAL = (\n{rows(sin_local)}\n)
 RK_LUT_ASIN_SHA256 = "{digest(asin)}"
 RK_LUT_ASIN_DOMAIN = (-1.0, 1.0)
 RK_LUT_ASIN_ENTRIES = {SIZE}
