@@ -12,37 +12,32 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `95c0cc501` contains exactly 425 method records:
-153 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 219 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `2bf8c337b` contains exactly 425 method records:
+154 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 218 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 256 failed methods/subtests, 205 passed, 77 passing subtests,
-and 13 skipped in 2,250.74 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 255 failed methods/subtests, 206 passed, 77 passing subtests,
+and 13 skipped in 2,255.75 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to the `d237777da` census, only `test_sin` changes from failure to
-native pass. The 219 failed methods first classify as 65
+Relative to the SIN census, only `test_mulacc_with_zero_strides` changes from
+failure to native pass. The 218 failed methods first classify as 65
 unsupported-output-dtype, 49 plan-stage-limit, 35 unsupported-layout, 23
 unsupported-input-dtype, 18
 requires-reformat, 16 numerical-contract, nine unsupported-ALU, and three
-unsupported-reduction. Schema version 2 classifies 218 as `NATIVE_REJECT`;
-only `test_mulacc_with_zero_strides` is a pre-device Clang failure without a
-native reject. The post-census cumsum guard now records its structural
-multi-tile numerical reject. `test_avg_pool2d_padding` reaches stage limit
-before its former numerical contract in this run; neither method changes
-outcome. The durable telemetry is
-`~/rk2608_backups/census-sin-95c0cc501-20260803/test_ops_coverage.json`
-(SHA-256 `0d6c92f01df86185e158077d6ce693253d1a947793b05250e736ec5015d9d57e`);
+unsupported-reduction. Schema version 2 classifies all 218 failures as
+`NATIVE_REJECT`; no failure lacks a precise first reject. The durable telemetry
+is `~/rk2608_backups/census-mulacc-2bf8c337b-20260803/test_ops_coverage.json`
+(SHA-256 `b1ec5b0e2a8f973e3b56fe3589f293f83732999c600e99acfe1eb2d724921c04`);
 the JUnit XML SHA-256 is
-`549009e30fa00aedca50fcfe3abcbee759271c83e9877441b0b7889857ec68a4`.
+`4a1729546d199e10a720afab426e20eb6f1977adb60901c0e44586382c521e6d`.
 
-Post-census focused work resolves the sole non-reject failure. A generic Clang
-renderer fix performs numeric conversion for four-lane shaped half-to-float
-CASTs, and weakfloat SUM now commits its FP32 accumulator to the configured
-strong default output dtype. The unchanged
-`test_mulacc_with_zero_strides` passes with four realized native DPU/CMAC
-programs and no fallback. This implies a provisional 154/40/218/13 transition,
-but the 153/40/219/13 result above remains authoritative until the next full
-uncached census.
+The 444 successful native kernels contain 418 `EFFICIENT` and 26
+`CORRECTNESS_FALLBACK` plans. Task-count buckets are 117 at one task, 146 at
+2--8, 75 at 9--32, 80 at 33--64, nine at 65--128, 14 at 129--256, and three at
+257--400. The worst path remains `test_matmul` at 399 tasks, 18,326 command
+words, 899,280 constant bytes, and 42.65 seconds. The census adds exactly the
+four mulacc kernels (26 tasks total) and otherwise preserves the SIN census's
+native costs and outcomes.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -2106,5 +2101,6 @@ counts 18, 1, 1, and 6. The constant-only subcase remains frontend work and no
 CPU semantic fallback is enabled. Durable focused artifacts are stored under
 `~/rk2608_backups/focused-mulacc-789ff2784-20260803/`. The complete device suite
 passes 82 tests plus 56 subtests in 694.38 seconds with no timeout, invalid
-submission, reset failure, or process abort. A complete census is still
-required before replacing the authoritative 153/40/219/13 totals.
+submission, reset failure, or process abort. The complete uncached census at
+`2bf8c337b` confirms that this is the only outcome transition and establishes
+the authoritative 154/40/218/13 totals.

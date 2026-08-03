@@ -6,17 +6,17 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `95c0cc501` is 153 native,
-40 frontend-only, 219 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. Raw pytest reports 205 passed, 256 failed, 13 skipped,
-and 77 passing subtests in 2,250.74 seconds. It completed without an NPU
+The current authoritative uncached strict census at `2bf8c337b` is 154 native,
+40 frontend-only, 218 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. Raw pytest reports 206 passed, 255 failed, 13 skipped,
+and 77 passing subtests in 2,255.75 seconds. It completed without an NPU
 timeout, reset failure, invalid submission, or process abort. Coverage details
 and durable artifact hashes are recorded in `coverage.md`.
 
-Post-census focused testing fixes the sole pre-device Clang failure in
-`test_mulacc_with_zero_strides`. The unchanged method now reports
-`PASS_NATIVE` with four realized DPU/CMAC programs and fallback disabled; the
-expected 154/40/218/13 census remains provisional until a complete run.
+Relative to the SIN census, only `test_mulacc_with_zero_strides` changes from
+failure to native pass. Every remaining failure is now a typed native reject;
+there are no device or unclassified frontend failures in the authoritative
+inventory.
 
 The compiler boundary is:
 
@@ -622,7 +622,8 @@ programs in the unchanged method execute only RK3588 DPU/CMAC tasks (18, 1, 1,
 and 6 tasks). Focused schema-v2 telemetry records `PASS_NATIVE` with
 `ROCKCHIP_FALLBACK=0`. The full host selection passes 114 tests plus three
 subtests, and the complete serialized device contract passes 82 tests plus 56
-subtests in 694.38 seconds.
+subtests in 694.38 seconds. The complete uncached census confirms this as the
+only method transition, producing the authoritative 154/40/218/13 result.
 
 ## Current upstream blocker
 
