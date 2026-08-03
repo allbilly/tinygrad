@@ -12,32 +12,31 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `61288f302` contains exactly 425 method records:
-166 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 206 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `02ae2f927` contains exactly 425 method records:
+168 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 204 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 234 failed methods/subtests, 217 passed, 87 passing subtests,
-and 13 skipped in 2,595.16 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 232 failed methods/subtests, 219 passed, 87 passing subtests,
+and 13 skipped in 2,523.17 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to `d6bb0b304`, only `TestOps.test_fancy_conv2d` changes from failure
-to native pass. The 206 failed methods first classify as 65
-unsupported-output-dtype, 45 plan-stage-limit, 27 unsupported-layout, 23
+Relative to `61288f302`, only `TestOps.test_grouped_conv2d` and
+`TestOps.test_max_pool2d_unit_stride` change from failure to native pass. The
+204 failed methods first classify as 65 unsupported-output-dtype, 43
+plan-stage-limit, 27 unsupported-layout, 23
 unsupported-input-dtype, 19 numerical-contract, 18 requires-reformat, and nine
-unsupported-ALU. Schema version 2 classifies all 206 failures as
+unsupported-ALU. Schema version 2 classifies all 204 failures as
 `NATIVE_REJECT`; no failure
 lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-depthwise-61288f302-20260804/test_ops_coverage.json`
-(SHA-256 `46615a8c66edb0ad9b59c66f74d47f0f842c550a34155ac391e2552a5591c1c7`);
+is `~/rk2608_backups/census-pool-02ae2f927-20260804/test_ops_coverage.json`
+(SHA-256 `3d93c4de0b5c9fabc820de66f3d5049ea7f439e3ad2fe2659ab0542ddbfb0975`);
 the JUnit XML SHA-256 is
-`d89d75d7b8e4b223af3c81debad7ffef83171465318666f7437ef57f591920b5`.
+`781f7c42e42627f741352ef013744ded6df4143e9c703814fba5147c8875b864`.
 
-A later focused grouped-CNA milestone changes `test_grouped_conv2d` from
-`PLAN_STAGE_LIMIT` to native pass, implying 167/40/205/13. That transition is
-not authoritative until the next complete uncached 425-method census.
+The grouped-CNA and sliding-MAX PPU transitions are both authoritative.
 
-The 506 successful native kernels contain 479 `EFFICIENT` and 27
+The 508 successful native kernels contain 479 `EFFICIENT` and 29
 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 181 at
-2--8, 98 at 9--32, 79 at 33--64, ten at 65--128, 13 at 129--256, and four at
+2--8, 98 at 9--32, 80 at 33--64, 11 at 65--128, 13 at 129--256, and four at
 257--400. The worst path remains `test_matmul` at 399 tasks, 18,326 command
 words and 899,280 constant bytes. Periodic compaction adds three successful
 kernels from later `test_repeat` subcases; its first 1,728-output kernel was
@@ -2535,8 +2534,9 @@ scratch bytes         16,640
 native quality        CORRECTNESS_FALLBACK
 ```
 
-No ceiling or tolerance changed and no CPU tensor path was added. This implies
-167/40/205/13 pending the next complete census. The 90 selector-CMAC tasks show
+No ceiling or tolerance changed and no CPU tensor path was added. This focused
+milestone implied 167/40/205/13; the subsequent census also includes direct
+sliding MAX and confirms 168/40/204/13. The 90 selector-CMAC tasks show
 that direct reformat/packing remains the dominant problem; CBUF-aware compute
 splitting should be added when logical tiles exceed bank capacity, not used to
 hide layout conversion cost.
@@ -2592,9 +2592,8 @@ native quality       CORRECTNESS_FALLBACK
 
 The permanent 2x3x9x9 kernel-5 hardware regression also passes exactly and
 requires one PPU task. No CPU packing, tolerance change, or resource-ceiling
-increase was added. Together with grouped CNA, the focused estimate is now
-168/40/204/13 and the stage-limit Pareto is provisionally 43 pending a complete
-census.
+increase was added. The complete census confirms 168/40/204/13 and a
+43-method stage-limit Pareto.
 
 Regression gates pass: 128 host tests plus ten subtests, mypy over all 225
 tinygrad modules, Ruff, and 91 serialized device tests plus 58 subtests in

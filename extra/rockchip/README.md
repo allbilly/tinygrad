@@ -6,15 +6,13 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `61288f302` is 166 native,
-40 frontend-only, 206 failed, and 13 upstream-skipped methods across the exact
+The current authoritative uncached strict census at `02ae2f927` is 168 native,
+40 frontend-only, 204 failed, and 13 upstream-skipped methods across the exact
 425-method inventory. It completed without an NPU timeout, reset failure,
-invalid submission, or process abort. Relative to `d6bb0b304`, only
-`test_fancy_conv2d` changes from failure to native pass and there is no
-regression. A later focused grouped-CNA milestone makes `test_grouped_conv2d`
-pass and implies 167 native methods, but that count remains provisional until
-the next complete uncached census. Coverage details and durable artifact hashes
-are recorded in `coverage.md`.
+invalid submission, or process abort. Relative to `61288f302`, only
+`test_grouped_conv2d` and `test_max_pool2d_unit_stride` change from failure to
+native pass and there is no regression. Coverage details and durable artifact
+hashes are recorded in `coverage.md`.
 
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor
@@ -972,8 +970,9 @@ physical contract. The official batch-4/group-5/IC-per-group-3/OC-per-group-7
 `test_grouped_conv2d` now passes unchanged through 112 tasks: 20 CONV, 90 CMAC,
 and two DPU. It uses 1,819,392 constant bytes and 16,640 scratch bytes and is
 correctly labeled `CORRECTNESS_FALLBACK`. This replaces the former 446-task
-selector-contraction lower bound without raising any ceiling and implies
-167/40/205/13 pending the next complete census. CBUF splitting is not needed
+selector-contraction lower bound without raising any ceiling. At that focused
+milestone it implied 167/40/205/13; the subsequent census also includes direct
+sliding MAX and confirms 168/40/204/13. CBUF splitting is not needed
 for these small compute tiles; the remaining cost is almost entirely physical
 packing, which must be replaced by direct native reformatting rather than by a
 wider task limit.
@@ -1007,7 +1006,7 @@ native pass. Its plan has 55 tasks: 40 CMAC pack/unpack tasks, 14 DPU tasks, and
 one PPU task; it uses 2,311 command words, 1,273,248 constant bytes, and 7,616
 scratch bytes. It remains a cost-visible `CORRECTNESS_FALLBACK`, but neither
 the 400-task nor 2 MiB constant ceiling changed. Together with the preceding
-grouped-CNA gain this implies 168/40/204/13 pending the next full census.
+grouped-CNA gain is now confirmed by the complete 168/40/204/13 census.
 
 The full host suite passes 128 tests plus ten subtests, mypy checks all 225
 modules, and Ruff is clean. The serialized device contract passes 91 tests plus
