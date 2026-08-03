@@ -1711,3 +1711,13 @@ the 178--395-task passes as direct-path debt rather than hiding them inside the
 native total. The 400-task compiler ceiling is unchanged.
 All 91 compiler tests plus three subtests pass, and the complete strict device
 suite remains green at 77 tests plus 54 subtests in 729.59 seconds.
+
+A direct dense-row PPU investigation rejected an apparent shortcut before it
+entered the compiler. Global MAX over tightly packed HWC1, HWC2, and HWC4
+surfaces submits successfully but returns incomplete channel-stepped maxima;
+the same command is exact only for HWC8. Setting `PPU_MISC_CTRL.NONALIGN` for
+HWC1 times out, and three DPU MAX stages with two-byte source addends do not
+reduce within an eight-lane atom. A known-good HWC8 PPU recovery passes after
+the timeout. The safe probes and the opt-in timeout case are retained in
+`extra/rockchip/probe_ppu_channels.py`. Consequently the compiler keeps the
+typed stage-limit rejection rather than accepting a corrupt one-channel layout.

@@ -416,6 +416,11 @@ reproducible in `extra/rockchip/probe_lerp_pipeline.py`.
 The complete strict Rockchip device suite passes 77 tests plus 54 subtests in
 731.46 seconds with fallback disabled.
 
+`extra/rockchip/probe_ppu_channels.py` records why dense row reductions cannot
+simply lower the PPU channel field below eight: tightly packed HWC1/2/4 returns
+wrong maxima, `NONALIGN` times out, and unaligned DPU source addends do not
+reduce within an atom. HWC8 remains the declared direct PPU layout.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
