@@ -6,11 +6,12 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `85eeab7f5` is 148 native,
-40 frontend-only, 224 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed without an NPU timeout, reset failure,
-invalid submission, or process abort. Coverage details and durable artifact
-hashes are recorded in `coverage.md`.
+The current authoritative uncached strict census at `d1437ad58` is 150 native,
+40 frontend-only, 222 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. Raw pytest reports 202 passed, 258 failed, 13 skipped,
+and 78 passing subtests in 2,484.47 seconds. It completed without an NPU
+timeout, reset failure, invalid submission, or process abort. Coverage details
+and durable artifact hashes are recorded in `coverage.md`.
 
 The compiler boundary is:
 
@@ -438,7 +439,9 @@ retain their 512-lane cap. Zero-weight padded lanes may read only the known
 copy from compact CMAC scratch, `1x64 @ 64x99` now has 399 tasks, 803,024 unique
 constant bytes, and 33,056 scratch bytes without raising either global limit.
 Random hardware output is bit-exact against FP32 accumulation followed by FP16,
-and the unchanged strict `TestOps.test_matmul` passes in 48.05 seconds.
+and the unchanged strict `TestOps.test_matmul` passes in 48.05 seconds. The full
+uncached census confirms this transition with no prior accepted method regressing
+other than the deliberate full-domain `copysign` numerical-contract guard.
 
 `extra/rockchip/probe_dpu_surface_reformat.py` preserves the rejected alternative:
 aligned scalar DPU rows remain eight lanes apart, line-notch variants do not

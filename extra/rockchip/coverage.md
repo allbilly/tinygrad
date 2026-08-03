@@ -12,31 +12,34 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `85eeab7f5` contains exactly 425 method records:
-148 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 224 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `d1437ad58` contains exactly 425 method records:
+150 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 222 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 260 failed methods/subtests, 200 passed, 78 passing subtests,
-and 13 skipped in 2,526.78 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 258 failed methods/subtests, 202 passed, 78 passing subtests,
+and 13 skipped in 2,484.47 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Two methods transition from the previous 146-pass census with no regression:
-`test_sum_collapse` and `test_sum_cat_collapse`.
+Relative to the 148-pass `85eeab7f5` census, `test_biased_conv2d`, `test_lerp`,
+and `test_matmul` transition from failure to native pass. `test_copysign` moves
+from sampled native pass to the deliberate full-domain `NUMERICAL_CONTRACT`
+guard because RK3588 FDIV loses negative-zero sign. The net gain is two, and no
+method still accepted by the compiler regresses.
 
-The 224 failed methods first classify as 65 unsupported-output-dtype, 53
-plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
-requires-reformat, 10 unsupported-ALU, nine numerical-contract, three
-unsupported-reduction, and eight failures for which the method-level reporter
-did not retain a first reject. A post-census focused audit shows this last bucket
-is not eight accepted-native numerical failures: `cumprod` passes its 20-element
-native subcase and later rejects a 600-output plan limit; `maximum` and
-zero-stride multiply-accumulate fail in dtype/compilation plumbing. The accepted
-numerical set is biased convolution, BCE `reduction="none"`, exact signed-zero
-`copysign`, `lerp`, and the remaining `pow_const` subcases.
-The durable telemetry is
-`~/rk2608_backups/census-scale-85eeab7f5-20260803/test_ops_coverage.json`
-(SHA-256 `ad2acf33274bd9db8023931e65598f6e2e95c47205bb51b0dfcb28bfbd434605`);
+The 222 failed methods first classify as 65 unsupported-output-dtype, 47
+plan-stage-limit, 34 unsupported-layout, 23 unsupported-input-dtype, 18
+requires-reformat, 10 unsupported-ALU, 10 numerical-contract, and 15 failures
+for which the method-level reporter did not retain a first reject. This last
+bucket consists mainly of partially passing pooling, broadcast, convolution,
+and product subcases plus `maximum` and one zero-stride multiplication case;
+it is not one uniform hardware error family. A post-census focused audit shows
+the bucket includes partial subcase failures rather than one accepted-native
+numerical class: `cumprod` passes its 20-element native subcase and later
+rejects a 600-output plan limit, while `maximum` and zero-stride
+multiply-accumulate fail in dtype/compilation plumbing. The durable telemetry
+is `~/rk2608_backups/census-wide-matmul-d1437ad58-20260803/test_ops_coverage.json`
+(SHA-256 `8b2abaca04b8200a16ae92120a9aa98df25e31fce6bdca9715b3a335c7f70d92`);
 the JUnit XML SHA-256 is
-`1a1430b4a2a11e21aa31720f92afe6bd359d5e339adbc74f11a3e74aa263a908`.
+`b85ebee1091c93ee11e4d8dc478be122230224e826b75746a7d457e23d265799`.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -1777,9 +1780,8 @@ The resulting `1x64 @ 64x99` plan is 399 tasks, 18,326 command words, 399
 resets, 803,024 constant bytes, 33,056 scratch bytes, and 9,459,811 estimated
 MACs. A random nonconstant hardware run is bit-exact against FP32 accumulation
 followed by FP16, and unchanged strict `TestOps.test_matmul` passes in 48.05
-seconds with `ROCKCHIP_FALLBACK=0`. This is one focused inferred transition
-from the authoritative 148-pass census, raising the post-census estimate to
-150 after the earlier lerp gain; a complete uncached census is still pending.
+seconds with `ROCKCHIP_FALLBACK=0`. The complete uncached census confirms the
+method as `PASS_NATIVE`.
 
 The rejected DPU reformat experiment is retained rather than hidden. Scalar
 height rows are written eight half-lanes apart, source line-notch values zero,
@@ -1790,3 +1792,19 @@ clean, and the serialized strict device suite passes 79 tests plus 56 subtests
 in 728.41 seconds. Repository-wide Ruff still reports 13 pre-existing
 Python-3.12 nested-f-string syntax findings in `extra/rockchip/gen_lut.py` under
 its Python-3.11 parser target.
+
+The complete `d1437ad58` census finishes in 2,484.47 seconds with 150 native,
+40 frontend-only, 222 failed, and 13 upstream-skipped methods. Raw pytest is
+202 passed, 258 failed, 13 skipped, and 78 passing subtests. Relative to
+`85eeab7f5`, biased Conv2D, lerp, and matmul become native while copysign is the
+one intentional pass-to-reject transition described above. There is no NPU
+timeout, invalid submission, reset failure, or process abort.
+
+The telemetry JSON and JUnit XML are stored under
+`~/rk2608_backups/census-wide-matmul-d1437ad58-20260803/`. Their SHA-256 hashes
+are `8b2abaca04b8200a16ae92120a9aa98df25e31fce6bdca9715b3a335c7f70d92`
+and `b85ebee1091c93ee11e4d8dc478be122230224e826b75746a7d457e23d265799`
+respectively. The first-reject Pareto is 65 unsupported-output-dtype, 47
+plan-stage-limit, 34 unsupported-layout, 23 unsupported-input-dtype, 18
+requires-reformat, 10 unsupported-ALU, and 10 numerical-contract, with 15
+partial/front-end failures lacking one method-level first reject.
