@@ -805,7 +805,8 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(too_wide.kind,RKLowerKind.NATIVE)
     assert isinstance(too_wide.plan,RKProgram)
     self.assertLessEqual(plan_cost(too_wide.plan).task_count,400)
-    compact = [step for step in too_wide.plan.steps if isinstance(step,RKContract) and step.compact_output]
+    compact = [step for step in too_wide.plan.steps if isinstance(step,RKContract) and step.compact_output and
+               step.out.layout.physical_shape == (1,128)]
     self.assertEqual((len(compact),compact[0].out.layout.physical_shape), (1,(1,128)))
 
   def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):

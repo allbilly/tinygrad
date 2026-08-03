@@ -89,7 +89,7 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
   start = 0
   while start < len(rows):
     tile:list[list[int]] = []
-    for candidate in rows[start:start+16]:
+    for candidate in rows[start:start+32]:
       tile.append(candidate)
       selected = [index for row in tile for index in row]
       if not selected: continue
@@ -128,7 +128,7 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
     valid = len(tile)
     out_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
     steps.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
-      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload))
+      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload, compact_output=True))
   return RKProgram(tuple(steps), scratch)
 
 def plan_cost(plan:RKProgram) -> RKPlanCost:

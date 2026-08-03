@@ -1957,3 +1957,25 @@ unchanged strict transpose, permute, and flip methods pass on RK3588 in 28.31
 seconds. The full host selection passes 110 tests plus three subtests, and the
 complete serialized hardware suite passes 81 tests plus 56 subtests in 746.38
 seconds without timeout, reset failure, or invalid submission.
+
+## Compact 32-output selector tiles
+
+The windowed selector planner still limited each CMAC task to sixteen logical
+outputs even though the hardware probe proves compact one-row writes for every
+N from 16 through 128. It now builds up to 32 selector rows per task, uses one
+physical 32-channel weight/output surface, and sets the typed
+`RKContract.compact_output` contract. A partial final tile writes only into
+scratch-backed padding; logical copies never expose it to a user buffer.
+
+This does not raise either global plan limit. It reduces batched direct
+convolution from 92 tasks/4,208 command words/9.82 seconds to 49 tasks/2,230
+command words/5.23 seconds. The channel-16 case falls from 275 tasks/12,652
+command words/29.37 seconds to 139 tasks/6,396 command words/14.87 seconds.
+Their official outputs remain bit-exact. Movement, the bounded 399-task matmul,
+and existing max-pool methods also remain green.
+
+All 110 Rockchip host tests plus three subtests, mypy, Ruff, and diff checks
+pass. The complete serialized device suite passes 81 tests plus 56 subtests in
+700.77 seconds with no timeout, reset failure, or invalid submission. The next
+complete census must determine which previously stage-limited method families
+cross below the unchanged 400-task ceiling.

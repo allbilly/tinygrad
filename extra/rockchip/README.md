@@ -553,6 +553,16 @@ Strict transpose, permute, and flip hardware methods remain green. The complete
 serialized device suite passes 81 tests plus 56 subtests in 746.38 seconds;
 all 110 Rockchip host tests plus three subtests pass as well.
 
+Windowed selector CMAC now uses the proven compact one-row 32-output contract
+instead of emitting at most sixteen logical outputs per task. The 32-channel
+weight/output surface is already covered by the exhaustive N=16..128 hardware
+probe, and tail padding remains in scratch rather than a user allocation. This
+halves many packing/unpacking task groups without changing the 400-task or 2
+MiB ceilings. Batched direct convolution drops from 92 to 49 tasks and 9.82 to
+5.23 seconds; channel-16 drops from 275 to 139 tasks and 29.37 to 14.87 seconds.
+Both unchanged official methods remain bit-exact. The complete device suite
+passes 81 tests plus 56 subtests in 700.77 seconds.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
