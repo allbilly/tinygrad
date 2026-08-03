@@ -28,6 +28,19 @@ class TestRockchip(unittest.TestCase):
         expected = (x.astype(np.float32)@y.astype(np.float32)).astype(np.float16)
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_fused_cmac_bias_relu_avoids_intermediate_rounding(self):
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-2,2,(1,8,5,5)).astype(np.float16)
+    weight = rng.uniform(-2,2,(8,8,1,1)).astype(np.float16)
+    bias = rng.uniform(-2,2,(8,)).astype(np.float16)
+    tx, tw, tb = (Tensor(value,device="ROCKCHIP",dtype=dtypes.half) for value in (x,weight,bias))
+    actual = tx.conv2d(tw,tb).relu().conv2d(tw,tb).realize().numpy()
+    first = np.maximum(np.einsum("nchw,oc->nohw", x.astype(np.float32), weight[:,:,0,0].astype(np.float32))+
+                       bias.astype(np.float32)[None,:,None,None], 0).astype(np.float16)
+    expected = (np.einsum("nchw,oc->nohw", first.astype(np.float32), weight[:,:,0,0].astype(np.float32))+
+                bias.astype(np.float32)[None,:,None,None]).astype(np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_contiguous_fp16_sum_native_dpu_cmac(self):
     rng = np.random.default_rng(4)
     for count in (2, 16, 60, 135, 720, 16384):

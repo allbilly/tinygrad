@@ -4,7 +4,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEngine, RKLowerKind, RKProgram, RKReduce,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEpilogue, RKEngine, RKLowerKind,
+  RKProgram, RKReduce,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
   lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_tiled_contract_result, rk_fingerprint)
@@ -745,7 +746,8 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
     image = emit_program(plan)
-    self.assertEqual(image.stages[-1].engine, RKEngine.DPU)
+    self.assertTrue(any(isinstance(step, RKContract) and step.epilogue is not None for step in plan.steps))
+    self.assertEqual(image.stages[-1].engine, RKEngine.CMAC)
     self.assertLessEqual(len(image.stages), 400)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
     self.assertFalse(contains_uop(plan))
@@ -902,6 +904,22 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_program(result.plan)
     self.assertLessEqual(len(image.stages), 96)
     self.assertLessEqual(len(image.constants), 128*1024)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_contraction_bias_and_relu_fuse_before_fp16_writeback(self):
+    x, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((1,8,5,5), (8,8,1,1), (8,)))
+    result = lower_native(sink(x.conv2d(weight,bias).relu()))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    fused = [step for step in result.plan.steps if isinstance(step, RKContract) and step.epilogue is not None]
+    self.assertEqual(len(fused), 1)
+    self.assertIsInstance(fused[0].epilogue, RKEpilogue)
+    assert fused[0].epilogue is not None and fused[0].epilogue.bias is not None
+    self.assertTrue(fused[0].epilogue.relu)
+    self.assertIs(fused[0].epilogue.bias.layout.dtype, dtypes.float)
+    image = emit_program(result.plan)
+    self.assertTrue(any(command & 0xffff == 0x5020 for stage in image.stages for command in stage.commands))
     self.assertFalse(contains_uop(result.plan))
 
   def test_masked_affine_prefix_sum_uses_empty_selector_entries(self):

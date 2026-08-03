@@ -88,12 +88,18 @@ class RKTensorRef:
   layout: RKLayout
 
 @dataclass(frozen=True)
+class RKEpilogue:
+  bias: RKTensorRef|None = None
+  relu: bool = False
+
+@dataclass(frozen=True)
 class RKContract:
   out: RKTensorRef
   lhs: RKTensorRef
   rhs: RKTensorRef
   reduce_axis: int
   constants: bytes = b""
+  epilogue: RKEpilogue|None = None
 
 @dataclass(frozen=True)
 class RKReduce:

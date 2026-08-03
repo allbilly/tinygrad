@@ -70,6 +70,10 @@ are eligible to be ported as native capabilities.
   trigonometric, and inverse-hyperbolic LUT assets with declared domains;
 - direct FP16 CMAC for `M=1`, `K=32`, and `4 <= N <= 16` when the right-hand
   input is already stored as `(N, 32)`;
+- bounded affine FP16 contractions with NPU selector packing, tiled CMAC, and
+  output compaction; a one-value-per-output-channel FP16 bias is gathered and
+  converted to FP32 on the NPU, then fused through BRDMA before the first FP16
+  writeback, with optional ReLU in the same DPU flying-data stage;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
 - dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane
@@ -123,9 +127,8 @@ Native arithmetic is FP16. Int32 and FP32 are currently admitted only for
 operation-specific constant fills; this does not claim general arithmetic for
 either dtype. User-visible bool outputs, noncontiguous elementwise layouts,
 reductions outside the proven static affine bounds, general contractions,
-fused CMAC epilogues, general convolution/pooling, and gradients remain outside
-the native contract. A fused CMAC epilogue is rejected rather than silently
-dropped.
+CMAC epilogues other than the proven channel-bias/optional-ReLU form, general
+convolution/pooling, and gradients remain outside the native contract.
 
 ## EXP2 generation and characterization
 
@@ -367,11 +370,21 @@ remains correct. The complete rejected implementation and probe results are
 preserved in `0134-WIP-fused-BN-two-factor-scale.patch` (SHA-256
 `a472dcbfb2a610e0aa0afe86f0318ad7e293d97417cf11067a6e94473054c22c`).
 
+Channel bias and optional ReLU now use a typed `RKEpilogue` on `RKContract`.
+The selector planner gathers the logical FP16 bias into aligned four-lane
+atoms, ordinary DPU tasks convert those lanes into the FP32 format consumed by
+BRDMA, and the CMAC emitter performs bias/ReLU on the flying FP32 accumulator.
+This removes the incorrect intermediate FP16 rounding boundary without host
+packing. The two official `test_biased_conv2d` kernels are now 87 stages each
+(previously 92 and 91) and the complete method passes at its unchanged
+tolerance. `test_simple_conv2d_bias` also remains green. The strict device
+suite passes 76 tests plus 54 subtests in 729.98 seconds.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,351, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,351 lines.
-The exact 3,383-line delta is 3,378 counted Rockchip backend lines (3,218
+contains 28,452, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,452 lines.
+The exact 3,484-line delta is 3,479 counted Rockchip backend lines (3,319
 renderer/compiler, 111 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

@@ -12,7 +12,7 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKArg,
   RKALUStage, RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKContract, RKReduce, RKProgram, RKPlanCost,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKReduce, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
@@ -272,6 +272,18 @@ def _relu_source(u:UOp) -> UOp|None:
      zero.op is not Ops.CONST or float(zero.arg) != 0: return None
   source = _strip_casts(cond.src[1])
   return source if _strip_casts(positive).key == source.key else None
+
+def _contract_bias_epilogue(stored:UOp, reduce:UOp) -> tuple[UOp, bool]|None:
+  """Recognize a channel-bias ADD, optionally followed by ReLU, directly around one contraction."""
+  relu_source, relu = _relu_source(stored), False
+  if relu_source is not None: stored, relu = relu_source, True
+  stored = _strip_casts(stored)
+  if stored.op is not Ops.ADD: return None
+  for reduced,bias in (stored.src, stored.src[::-1]):
+    bias = _strip_casts(bias)
+    if _strip_casts(reduced).key == reduce.key and bias.op is Ops.INDEX and bias.src[0].op is Ops.PARAM and bias.dtype is dtypes.half:
+      return bias, relu
+  return None
 
 def lower_reformat_result(sink:UOp) -> RKLowerResult:
   """Lower a static affine movement through atom copies or a sparse CMAC selector."""
@@ -1124,6 +1136,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     return _not_applicable()
   stored = _strip_casts(store.src[1])
   epilogue = stored.key != reduce.key
+  fused_epilogue = _contract_bias_epilogue(stored, reduce) if epilogue else None
+  remaining_epilogue = epilogue and fused_epilogue is None
   body, red_ranges = _strip_casts(reduce.src[0]), reduce.src[1:]
   if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in red_ranges): return _not_applicable()
   lhs_value, rhs_value = (_strip_casts(x) for x in body.src)
@@ -1144,6 +1158,9 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
+  bias_sources:list[int] = []
+  if fused_epilogue is not None and {u.arg[0] for u in fused_epilogue[0].src[1].toposort() if u.op is Ops.RANGE} - set(out_axes):
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "CMAC bias depends on a reduction or unrelated axis", fused_epilogue[0].op)
   for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
     point = dict(zip(out_axes, coordinates))
     out_offset = out_aff[1] + sum(out_aff[0].get(axis, 0)*point[axis] for axis in out_axes)
@@ -1168,12 +1185,29 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
       lhs_row.append(indexes[0])
       rhs_column.append(indexes[1])
     records.append((out_offset, tuple(lhs_row), tuple(rhs_column)))
+    if fused_epilogue is not None:
+      bias_source = _static_scalar(fused_epilogue[0].src[1], point)
+      if not isinstance(bias_source, int) or isinstance(bias_source, bool):
+        return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "CMAC bias index is not static", fused_epilogue[0].op)
+      bias_sources.append(bias_source)
   lhs_rows = list(dict.fromkeys(row for _,row,_ in records))
   rhs_columns = list(dict.fromkeys(column for _,_,column in records))
   m, n, align_in = len(lhs_rows), len(rhs_columns), max(32, (k+31)&-32)
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)): return _not_applicable()
   if not 1 <= m <= 512 or not 1 <= n <= 16:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
+  channel_bias:list[int]|None = None
+  if fused_epilogue is not None:
+    bias_count = int(fused_epilogue[0].src[0].src[0].arg)
+    channel_bias = [-1]*n
+    column_ids = {column:index for index,column in enumerate(rhs_columns)}
+    for (_,_,column),source in zip(records,bias_sources):
+      channel = column_ids[column]
+      if not 0 <= source < bias_count or channel_bias[channel] not in (-1, source):
+        return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "CMAC bias is not one value per output channel", fused_epilogue[0].op)
+      channel_bias[channel] = source
+    if -1 in channel_bias:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "CMAC bias does not cover every output channel", fused_epilogue[0].op)
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
                 [[] for _ in range(align_in-k)])]
   b_selector:list[list[int]] = []
@@ -1197,6 +1231,24 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
   steps.extend(packed_b.steps)
   scratch = packed_b.scratch
+  contract_epilogue:RKEpilogue|None = None
+  if fused_epilogue is not None:
+    assert channel_bias is not None
+    bias_half = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(32)),)
+    bias_rows:list[list[int]] = [[] for _ in range(32)]
+    for channel,source in enumerate(channel_bias): bias_rows[(channel//4)*8+channel%4] = [source]
+    bias_plan = _selector_program(bias_half, RKArg(RKBufferKind.ARG, fused_epilogue[0].src[0].arg.slot),
+                                  int(fused_epilogue[0].src[0].src[0].arg), bias_rows, scratch)
+    if bias_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "CMAC bias selector exceeds plan limits", fused_epilogue[0].op)
+    steps.extend(bias_plan.steps)
+    scratch = bias_plan.scratch
+    bias_float = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(32*4),)
+    steps.append(RKDPUProgram(tuple(RKALUStage(Ops.ADD, RKArg(bias_float.kind, bias_float.index, start*4),
+      RKArg(bias_half.kind, bias_half.index, start*4), 0.0, 4, dtypes.float) for start in range(0,32,4)), scratch))
+    contract_epilogue = RKEpilogue(RKTensorRef(bias_float, RKLayout((n,), (32,), (4,), dtypes.float, padding=((0,32-n),))),
+                                   fused_epilogue[1])
   cmac_out = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(m*128),)
   rhs_layout = RKLayout((n,k), (32,align_in), (align_in*2,2), dtypes.half,
@@ -1206,12 +1258,13 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     lhs_layout = RKLayout((tile_m,k), (tile_m,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-k)))
     out_layout = RKLayout((tile_m,n), (tile_m,64), (128,2), dtypes.half, padding=((0,0),(0,64-n)))
     steps.append(RKContract(RKTensorRef(RKArg(cmac_out.kind, cmac_out.index, row_start*128), out_layout),
-      RKTensorRef(RKArg(a_arg.kind, a_arg.index, row_start*align_in*2), lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0]))
+      RKTensorRef(RKArg(a_arg.kind, a_arg.index, row_start*align_in*2), lhs_layout), RKTensorRef(b_arg, rhs_layout), red_axes[0],
+      epilogue=contract_epilogue))
   unpack:list[list[int]] = [[] for _ in range(output_count)]
   for out_index,row,rhs_key in records: unpack[out_index] = [lhs_rows.index(row)*64+rhs_columns.index(rhs_key)]
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   reduced = output
-  if epilogue:
+  if remaining_epilogue:
     reduced = RKArg(RKBufferKind.SCRATCH, len(scratch))
     scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
   dense = _selector_program(reduced, cmac_out, m*64, unpack, scratch)
@@ -1224,8 +1277,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC plan needs {stage_count} stages and {constant_bytes} constant bytes", reduce.op)
   program = _finish_program(steps, scratch)
-  if epilogue: return _finish_reduction_epilogue(program, stored, reduce, store.src[0].src[1], output, reduced,
-                                                  output_count, out_axes, ranges)
+  if remaining_epilogue: return _finish_reduction_epilogue(program, stored, reduce, store.src[0].src[1], output, reduced,
+                                                            output_count, out_axes, ranges)
   return _native(program)
 
 def lower_contract(sink:UOp) -> RKContract|None:

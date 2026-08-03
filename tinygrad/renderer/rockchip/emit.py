@@ -13,6 +13,7 @@ from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, R
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
 _TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
+_REG_DPU_RDMA_BRDMA_CFG, _REG_DPU_RDMA_BS_BASE_ADDR, _REG_DPU_RDMA_WEIGHT = 0x501c, 0x5020, 0x5068
 _EW_BASE = 0x108002c0
 _ERDMA_FP16 = 0x40000008
 _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8), Ops.MAX:_EW_BASE,
@@ -217,9 +218,32 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, (m-1)<<16), e(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
     e(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383), e(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
     e(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, 0x40), e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
-  relocs = tuple(RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
-                 for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out)))
-  return RKImage(target, (RKStage(RKEngine.CMAC, commands, relocs, RK_STAGE_RESET),), constants=plan.constants)
+  relocs = [RKReloc(0, word, ref.buffer.kind, ref.buffer.index, ref.buffer.addend+ref.layout.base_offset)
+            for word,ref in ((18,plan.lhs), (24,plan.rhs), (31,plan.out))]
+  if plan.epilogue is not None:
+    bias = plan.epilogue.bias
+    if bias is None or bias.layout.dtype is not dtypes.float or bias.layout.physical_shape != (32,) or bias.layout.strides_bytes != (4,):
+      raise ValueError("CMAC fused bias must be one 32-channel FP32 surface")
+    mutable = list(commands)
+    if mutable[-1] != e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd): raise ValueError("CMAC operation enable is not last")
+    mutable.pop()
+    mutable = [e(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x20110 if plan.epilogue.relu else 0x20150)
+               if command & 0xffff == rk.REG_DPU_BS_CFG and command >> 48 == _TARGET_DPU else command for command in mutable]
+    mutable.extend(e(_TARGET_DPU, reg, value) for reg,value in
+      ((rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0)))
+    mutable.extend(e(_TARGET_DPU_RDMA, reg, value) for reg,value in (
+      (rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, 0),
+      (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, m-1), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 31),
+      (_REG_DPU_RDMA_BRDMA_CFG, 2)))
+    bias_word = len(mutable)
+    mutable.append(e(_TARGET_DPU_RDMA, _REG_DPU_RDMA_BS_BASE_ADDR, 0))
+    relocs.append(RKReloc(0, bias_word, bias.buffer.kind, bias.buffer.index, bias.buffer.addend+bias.layout.base_offset))
+    mutable.extend(e(_TARGET_DPU_RDMA, reg, value) for reg,value in (
+      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, 1), (rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x2f850),
+      (_REG_DPU_RDMA_WEIGHT, 0x01010101)))
+    mutable.append(e(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x1d))
+    commands = tuple(mutable)
+  return RKImage(target, (RKStage(RKEngine.CMAC, commands, tuple(relocs), RK_STAGE_RESET),), constants=plan.constants)
 
 def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Compose arbitrary typed engine steps into one ordered sequential image."""

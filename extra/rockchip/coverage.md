@@ -1642,3 +1642,20 @@ returns `[inf, inf, 1, 0, 0, 0]` for exponents `[-2,-1,0,1,2,3]`; the official
 `test_pow_const` proceeds past this subcase and next exposes the independent
 arbitrary-base `0.7**x` LUT accuracy contract. No complete-method gain is
 claimed yet.
+
+The biased-convolution failure was not a raw CMAC error: an un-biased 1x1 K8
+probe is bit-identical to PyTorch's FP32 accumulation, while the old separate
+DPU bias task rounded the accumulator to FP16 first. The first biased/ReLU
+convolution already differed in 29 of 200 FP16 encodings, and the second
+convolution amplified that boundary to 38 outputs outside `rtol=1e-3`.
+
+`RKContract` now carries a typed channel-bias/optional-ReLU `RKEpilogue`. The
+compiler gathers FP16 channel bias into aligned four-lane atoms, converts it to
+a padded FP32 bias surface using DPU tasks, and the CMAC command enables BRDMA
+addition before FP16 output conversion. ReLU uses the same flying DPU stage.
+The official `test_biased_conv2d` method now passes unchanged; its two kernels
+are 87 stages each rather than 92 and 91. `test_simple_conv2d_bias` remains
+green, all 88 host compiler tests pass, and the strict hardware suite passes 76
+tests plus 54 subtests in 729.98 seconds. This is one focused inferred native
+gain; the authoritative complete census remains 148 until the next uncached
+425-method run.
