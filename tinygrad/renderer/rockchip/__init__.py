@@ -871,6 +871,9 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "masked affine MUL axes do not form one static partition", Ops.RANGE)
   output_count, input_count = int(store.src[0].src[0].src[0].arg), int(source_index.src[0].src[0].arg)
   reduction_count = math.prod(ranges[axis] for axis in red_axes)
+  if output_count > 16:
+    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
+      f"masked affine MUL output {output_count} exceeds the stable one-tile contract", reduce.op)
   if not 1 <= output_count <= 128 or not 2 <= reduction_count <= 32 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"masked affine MUL surface is {output_count} outputs by {reduction_count} terms", reduce.op)

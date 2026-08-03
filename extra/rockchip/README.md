@@ -526,6 +526,15 @@ class and message are preserved for phase and subcase failures. Thus a
 numerical mismatch or frontend/compiler exception is no longer reported as a
 missing or fabricated native reject.
 
+The census exposed one intermittent accepted numerical failure in the masked
+product scan: the 20-output program was bit-exact in isolated reruns but
+returned a corrupted result after the earlier mixed-engine census workload.
+The proven 10-output, one-CMAC-tile path remains native and passes on hardware.
+Outputs above sixteen now reject with `NUMERICAL_CONTRACT` before submission
+until an alternating-engine stress test proves a stable multi-tile contract.
+The unchanged focused `test_cumprod` therefore fails honestly at its first
+20-element case instead of sometimes returning incorrect data.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently

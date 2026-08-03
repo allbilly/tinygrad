@@ -1901,3 +1901,21 @@ recorded as a post-execution numerical failure after its native program,
 `maximum` retains its FP16-packing `OverflowError`, and
 `mulacc_with_zero_strides` retains its pre-device Clang failure instead of any
 of them being counted as an unspecified compiler reject.
+
+### Masked-product numerical guard
+
+The census's accepted 20-element cumulative-product program returned a
+corrupted result after earlier mixed DPU/CMAC/PPU/CONV workloads. Repeating the
+same seeded input in isolation was bit-exact, so the failure is state-sensitive
+rather than a deterministic expression-recognition error. A separate
+10-element hardware regression remains bit-exact and uses one physical CMAC
+output tile.
+
+The clean contract is consequently narrowed to at most sixteen masked-product
+outputs. Wider plans return `NUMERICAL_CONTRACT` before device submission; the
+400-task ceiling and all tolerances remain unchanged. The compiler regression
+checks that 20 outputs reject, the proven 10-output hardware test passes in
+8.18 seconds, and the unchanged official method now reaches a precise native
+reject in 2.36 seconds rather than exposing intermittent wrong output. Wider
+native cumulative products remain blocked until mixed-engine stress testing
+proves the hardware state and multi-tile layout reliable.
