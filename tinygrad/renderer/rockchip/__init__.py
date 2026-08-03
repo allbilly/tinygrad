@@ -125,10 +125,39 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
       lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, 32), 0, payload))
   return RKProgram(tuple(steps), scratch)
 
-def _plan_cost(plan:RKProgram) -> RKPlanCost:
-  return RKPlanCost(sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in plan.steps),
-                    sum(map(len, {step.constants for step in plan.steps if isinstance(step, RKContract)})),
-                    sum(resource.size for resource in plan.scratch))
+def plan_cost(plan:RKProgram) -> RKPlanCost:
+  image = emit_program(plan)
+  reads = writes = macs = 0
+  for step in plan.steps:
+    if isinstance(step, RKDPUProgram):
+      for stage in step.stages:
+        if isinstance(stage, RKALUStage):
+          reads += sum(stage.count*2 for operand in (stage.lhs,stage.rhs) if isinstance(operand,RKArg))
+          writes += stage.count*stage.out_dtype.itemsize
+          macs += stage.count
+        elif isinstance(stage, RKFusedALUStage):
+          reads += stage.count*(2+4+2) + (stage.count*2 if isinstance(stage.bn,RKArg) else 0)
+          writes += stage.count*2
+          macs += stage.count*3
+        elif isinstance(stage, (RKMaskStage,RKLUTStage)):
+          reads += stage.count*2
+          writes += stage.count*2
+          macs += stage.count
+    elif isinstance(step, RKContract):
+      m, n, k = math.prod(step.lhs.layout.logical_shape[:-1]), step.rhs.layout.logical_shape[0], step.lhs.layout.logical_shape[-1]
+      reads += math.prod(step.lhs.layout.logical_shape)*step.lhs.layout.dtype.itemsize
+      reads += math.prod(step.rhs.layout.logical_shape)*step.rhs.layout.dtype.itemsize
+      if step.epilogue is not None and step.epilogue.bias is not None:
+        reads += math.prod(step.epilogue.bias.layout.logical_shape)*step.epilogue.bias.layout.dtype.itemsize
+      writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
+      macs += m*n*k
+    else:
+      reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
+      writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
+      macs += math.prod(step.src.layout.logical_shape)
+  return RKPlanCost(len(image.stages), sum(len(stage.commands) for stage in image.stages),
+                    sum(bool(stage.flags & RK_STAGE_RESET) for stage in image.stages), len(image.constants),
+                    sum(resource.size for resource in plan.scratch), reads, writes, macs)
 
 def _two_level_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
                                 scratch:tuple[RKScratch, ...], scale:float=1.0) -> RKProgram|None:
@@ -158,13 +187,15 @@ def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[lis
                       scratch:tuple[RKScratch, ...]) -> RKProgram|None:
   candidates = (_sparse_cmac_pipeline(output, source, input_count, rows, scratch=scratch),
                 _windowed_cmac_pipeline(output, source, rows, scratch=scratch, direct_count=input_count))
-  legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=_plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
+  legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
                 cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)
   if legal:
-    return min(legal, key=lambda item:(item[0].stage_count, item[0].constant_bytes, item[0].scratch_bytes))[1]
+    return min(legal, key=lambda item:(item[0].reset_count, item[0].estimated_macs,
+      item[0].estimated_read_bytes+item[0].estimated_write_bytes, item[0].command_words,
+      item[0].constant_bytes, item[0].scratch_bytes))[1]
   two_level = _two_level_selector_program(output, source, input_count, rows, scratch)
-  return two_level if two_level is not None and _plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
-    _plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
+  return two_level if two_level is not None and plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
+    plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
 def _finish_program(steps:list[RKDPUProgram|RKContract|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
   """Give every ordered DPU step the program's final resource table."""
@@ -202,7 +233,7 @@ def _lower_fused_lerp(output:RKArg, operands:tuple[UOp,UOp,UOp], count:int) -> R
       RKArg(RKBufferKind.ARG,y.src[0].arg.slot,start*2), Ops.SUB, RKArg(x_float.kind,x_float.index,start*4),
       Ops.MUL, tile_bn, Ops.ADD, RKArg(RKBufferKind.ARG,x.src[0].arg.slot,start*2), tile))
   program = _finish_program([*steps,RKDPUProgram(tuple(stages))], scratch)
-  cost = _plan_cost(program)
+  cost = plan_cost(program)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"fused ALU needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", Ops.ADD)
@@ -686,7 +717,7 @@ def lower_nested_add_reduce_result(sink:UOp) -> RKLowerResult:
   second = _selector_program(output, intermediate, intermediate_count, [list(range(intermediate_count))], first.scratch)
   if second is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "outer nested ADD selector exceeds plan limits", outer.op)
   completed = _finish_program([*first.steps,*second.steps], second.scratch)
-  cost = _plan_cost(completed)
+  cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"nested ADD needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", outer.op)
@@ -731,7 +762,7 @@ def lower_scalar_mul_reduce_result(sink:UOp) -> RKLowerResult:
     multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, 1))
     accumulator = destination
   completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
-  cost = _plan_cost(completed)
+  cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"scalar MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
@@ -802,7 +833,7 @@ def lower_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
     multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, output_count))
     accumulator = destination
   completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
-  cost = _plan_cost(completed)
+  cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"affine MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
@@ -892,7 +923,7 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
     multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, output_count))
     accumulator = destination
   completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
-  cost = _plan_cost(completed)
+  cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"masked affine MUL needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
@@ -973,7 +1004,7 @@ def lower_multi_source_affine_reduce_result(sink:UOp) -> RKLowerResult:
     accumulator = destination
   if len(partials) == 1: combines.append(RKALUStage(Ops.ADD, output, accumulator, 0.0, output_count))
   completed = _finish_program([*steps,RKDPUProgram(tuple(combines))], scratch)
-  cost = _plan_cost(completed)
+  cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"multi-source SUM needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
@@ -1013,7 +1044,7 @@ def _finish_reduction_epilogue(program:RKProgram, stored:UOp, reduce:UOp, output
   scheduled = _schedule_expr(root, output, output_count, scratch)
   if scheduled is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "reduction epilogue is not materializable", stored.op)
   completed = _finish_program([*steps, scheduled], scheduled.scratch)
-  cost = _plan_cost(completed)
+  cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"reduction epilogue needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", stored.op)

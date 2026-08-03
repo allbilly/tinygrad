@@ -5,10 +5,11 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEpilogue, RKEngine,
-  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce,
+  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
-  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_tiled_contract_result, rk_fingerprint)
+  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_tiled_contract_result, plan_cost,
+  rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -763,6 +764,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual({stage.engine for stage in image.stages}, {RKEngine.DPU,RKEngine.CMAC})
     self.assertLessEqual(len(image.stages), 50)
     self.assertFalse(contains_uop(plan))
+
+  def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):
+    x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)
+    plan = lower_tiled_contract_result(sink(x@y)).plan
+    self.assertIsInstance(plan, RKProgram)
+    assert isinstance(plan, RKProgram)
+    image, cost = emit_program(plan), plan_cost(plan)
+    self.assertEqual((cost.task_count,cost.command_words,cost.reset_count),
+                     (len(image.stages),sum(len(stage.commands) for stage in image.stages),
+                      sum(bool(stage.flags & RK_STAGE_RESET) for stage in image.stages)))
+    self.assertEqual(cost.constant_bytes,len(image.constants))
+    self.assertEqual(cost.scratch_bytes,sum(resource.size for resource in plan.scratch))
+    self.assertGreater(cost.estimated_read_bytes,0)
+    self.assertGreater(cost.estimated_write_bytes,0)
+    self.assertGreater(cost.estimated_macs,0)
 
   def test_tiled_contraction_materializes_pointwise_bias_epilogue(self):
     x, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((1,4,9,9),(4,4,3,3),(4,)))

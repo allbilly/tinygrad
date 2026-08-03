@@ -138,9 +138,16 @@ class RKProgram:
 
 @dataclass(frozen=True)
 class RKPlanCost:
-  stage_count: int
+  task_count: int
+  command_words: int
+  reset_count: int
   constant_bytes: int
   scratch_bytes: int
+  estimated_read_bytes: int
+  estimated_write_bytes: int
+  estimated_macs: int
+  @property
+  def stage_count(self) -> int: return self.task_count
 
 class RKRejectKind(Enum):
   UNSUPPORTED_INPUT_DTYPE = "unsupported_input_dtype"

@@ -1699,3 +1699,15 @@ uncached census. The remaining pre-submit numerical guards cover signed-zero
 copysign, unreduced probability BCE, and uncharacterized scaled EXP2.
 The complete strict device suite passes 77 tests plus 54 subtests in 731.46
 seconds with fallback disabled and no concurrent NPU process.
+
+Plan telemetry now separates native correctness evidence from efficient native
+plans. `RKPlanCost` includes exact emitted task, reset, command-word, constant,
+and scratch counts plus logical read/write and MAC estimates. Selector candidates
+use the richer tuple instead of comparing only stages, constants, and scratch.
+Kernel telemetry retains `PASS_NATIVE` semantics but adds `native_quality`,
+`task_count`, `command_words`, and `reset_count`; plans above 64 tasks or 1 MiB
+of constants are labeled `CORRECTNESS_FALLBACK`. This deliberately identifies
+the 178--395-task passes as direct-path debt rather than hiding them inside the
+native total. The 400-task compiler ceiling is unchanged.
+All 91 compiler tests plus three subtests pass, and the complete strict device
+suite remains green at 77 tests plus 54 subtests in 729.59 seconds.

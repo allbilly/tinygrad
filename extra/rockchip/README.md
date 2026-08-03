@@ -40,6 +40,16 @@ declared once at program scope, and each typed DPU, CMAC, or PPU step is emitted
 in order with constants and relocations remapped centrally. The former fixed
 CMAC-prefix/DPU/main-CMAC/CMAC-suffix pipeline no longer constrains composition.
 
+`RKPlanCost` accounts for task and reset counts, emitted command words,
+deduplicated constants, scratch, estimated engine reads/writes, and CMAC/DPU
+work. Legal selector candidates still respect the 400-task and 2 MiB constant
+ceilings, then compare reset overhead, MACs, traffic, command volume, constants,
+and scratch. Runtime telemetry records exact task/command/reset counts and marks
+plans over 64 tasks or 1 MiB of constants as `CORRECTNESS_FALLBACK`; these remain
+honest native passes but are kept visible for replacement by direct engine paths.
+The richer candidate ordering preserves the complete strict result: 77 tests
+plus 54 subtests pass in 729.59 seconds with fallback disabled.
+
 Lowering uses sixteen named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
 strategy returns exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
@@ -409,9 +419,9 @@ The complete strict Rockchip device suite passes 77 tests plus 54 subtests in
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,592, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,592 lines.
-The exact 3,624-line delta is 3,619 counted Rockchip backend lines (3,456
-renderer/compiler, 114 runtime, 33 historical Python-fallback adapter, and 16
+contains 28,636, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,636 lines.
+The exact 3,668-line delta is 3,663 counted Rockchip backend lines (3,496
+renderer/compiler, 118 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic

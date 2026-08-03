@@ -34,10 +34,14 @@ class RockchipProgram(Program['RockchipDevice']):
       return
     self.image = decode_image(obj.lib)
     engines = {stage.engine.name for stage in self.image.stages}
+    command_words = sum(len(stage.commands) for stage in self.image.stages)
+    reset_count = sum(bool(stage.flags & RK_STAGE_RESET) for stage in self.image.stages)
+    native_quality = "CORRECTNESS_FALLBACK" if len(self.image.stages) > 64 or len(self.image.constants) > 1024*1024 else "EFFICIENT"
     self.telemetry = {"lane": f"RK_{next(iter(engines))}" if len(engines) == 1 else "RK_MIXED", "program": self.name,
       "signature": signature,
       "engine_counts": {engine: sum(stage.engine.name == engine for stage in self.image.stages) for engine in sorted(engines)},
-      "stage_count": len(self.image.stages), "scratch_bytes": sum(x.size for x in self.image.scratch),
+      "stage_count": len(self.image.stages), "task_count": len(self.image.stages), "command_words": command_words,
+      "reset_count": reset_count, "native_quality": native_quality, "scratch_bytes": sum(x.size for x in self.image.scratch),
       "constant_bytes": len(self.image.constants), "image_version": self.image.version}
     self.scratch = tuple(dev._gpu_alloc(x.size) for x in self.image.scratch)
     self.constants = dev._gpu_alloc(len(self.image.constants)) if self.image.constants else None
