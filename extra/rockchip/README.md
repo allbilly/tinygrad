@@ -6,8 +6,8 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `c94d0d24c` is 146 native,
-40 frontend-only, 226 failed, and 13 upstream-skipped methods across the exact
+The current authoritative uncached strict census at `85eeab7f5` is 148 native,
+40 frontend-only, 224 failed, and 13 upstream-skipped methods across the exact
 425-method inventory. It completed without an NPU timeout, reset failure,
 invalid submission, or process abort. Coverage details and durable artifact
 hashes are recorded in `coverage.md`.
@@ -340,6 +340,13 @@ reject before submission. A 0.25
 wide scaled reduction passes hardware, the pooling method completes under its
 original watchdog, and the strict suite passes 74 tests plus 54 subtests. This
 is a correctness/reliability milestone, not a new complete-method pass.
+
+The corrected complete census subsequently confirms both pending gains:
+`test_sum_collapse` and `test_sum_cat_collapse` are the only transitions from
+146 to 148 native methods, with no regression. It finishes in 2,526.78 seconds
+without a timeout, reset failure, invalid submission, or process abort. The
+fresh largest first-reject classes are output dtype (65), plan limit (53),
+layout (35), input dtype (23), and reformat (18).
 
 The subsequent windowed-reduction milestone does not claim another complete
 method: it proves exact 2x2 affine average windows over a 1,232-element input,

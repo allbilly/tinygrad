@@ -12,26 +12,25 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `c94d0d24c` contains exactly 425 method records:
-146 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 226 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `85eeab7f5` contains exactly 425 method records:
+148 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 224 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 262 failed methods/subtests, 198 passed, 78 passing subtests,
-and 13 skipped in 2,477.98 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 260 failed methods/subtests, 200 passed, 78 passing subtests,
+and 13 skipped in 2,526.78 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Nine methods transition from the previous 137-pass census with no regression:
-`test_avg_pool2d_ceil_mode_include_pad_output_size_reduce_by_one`,
-`test_avg_pool2d_ceil_mode_output_size_reduce_by_one`, `test_const_reduce`,
-`test_masked_fill`, `test_prod`, `test_simple_conv2d_bias`,
-`test_small_cumprod`, `test_small_cumsum`, and `test_sum_twice`.
+Two methods transition from the previous 146-pass census with no regression:
+`test_sum_collapse` and `test_sum_cat_collapse`.
 
-The 226 failed methods first reject as 65 unsupported-output-dtype, 55
-plan-stage-limit, 34 unsupported-layout, 23 unsupported-input-dtype, 19
-requires-reformat, and 10 unsupported-ALU. The durable telemetry is
-`~/rk2608_backups/census-reductions-c94d0d24c-20260803/test_ops_coverage.json`
-(SHA-256 `8203a8fd0c10313c0725be4057b83894c7b456b7032bd9a14358f9272d1f8a32`);
+The 224 failed methods first classify as 65 unsupported-output-dtype, 53
+plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
+requires-reformat, 10 unsupported-ALU, nine numerical-contract, three
+unsupported-reduction, and eight numerical failures without a native reject.
+The durable telemetry is
+`~/rk2608_backups/census-scale-85eeab7f5-20260803/test_ops_coverage.json`
+(SHA-256 `ad2acf33274bd9db8023931e65598f6e2e95c47205bb51b0dfcb28bfbd434605`);
 the JUnit XML SHA-256 is
-`b2f7c89e5ae12a504d7aa77c79b1767fbfb7c9f163f821f1040b494d16d7a7cc`.
+`1a1430b4a2a11e21aa31720f92afe6bd359d5e339adbc74f11a3e74aa263a908`.
 
 RKImage v3 removed the unused dependency/read/write masks and the artificial
 64-stage image limit. The runtime already executes stages serially, so the
@@ -1589,3 +1588,20 @@ new complete-method pass is claimed, and the authoritative census remains the
 146-pass artifact until a new uninterrupted run finishes. Counted source is
 28,351 lines. Pre-change sources are preserved under
 `~/rk2608_backups/two-level-scale-before-862202e58-20260803`.
+
+The corrected complete uncached census at `85eeab7f5` finishes normally in
+2,526.78 seconds with exactly 148 native, 40 frontend-only, 224 failed, and 13
+upstream-skipped methods. `test_sum_collapse` and `test_sum_cat_collapse` are
+the only transitions from `c94d0d24c`; no native method regresses. Raw pytest
+reports 260 failed, 200 passed, 13 skipped, and 78 passing subtests. There is no
+timeout, invalid submission, reset failure, or process abort.
+
+The fresh first-reject Pareto is 65 unsupported-output-dtype, 53
+plan-stage-limit, 35 unsupported-layout, 23 unsupported-input-dtype, 18
+requires-reformat, 10 unsupported-ALU, nine numerical-contract, and three
+unsupported-reduction; eight failed methods reach hardware but mismatch
+numerically without a native reject. Telemetry and JUnit artifacts are stored
+under `~/rk2608_backups/census-scale-85eeab7f5-20260803/` with SHA-256
+`ad2acf33274bd9db8023931e65598f6e2e95c47205bb51b0dfcb28bfbd434605`
+and `1a1430b4a2a11e21aa31720f92afe6bd359d5e339adbc74f11a3e74aa263a908`
+respectively.
