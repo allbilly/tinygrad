@@ -1737,3 +1737,22 @@ its contraction surfaces contain 3,096,576 values per operand and K=13,824.
 No complete-method coverage gain is claimed from this milestone.
 All 102 compiler/image/fallback/telemetry tests plus three subtests pass. The
 complete strict device suite passes 78 tests plus 54 subtests in 740.71 seconds.
+
+Wide CMAC characterization now extends the same physical rule through N=64,
+96, and 128, all bit-exact. The lowerer chooses `align_out` in 32-channel groups,
+requires `align_in >= align_out`, sizes physical output rows at twice the logical
+channel group, and maps each 16-channel block through its 32-lane WDMA atom.
+A dynamic 4x9 by 9x40 graph and the larger 1x64 by 64x40 graph are bit-exact on
+hardware; the latter uses 331 tasks without changing the 400-task ceiling.
+
+The old 512-element RHS pre-reject is replaced by cost-bounded planning. Before
+constructing selector payloads, the compiler checks both the sparse constant
+lower bound and the minimum number of 16-output packing/compute/unpack tasks.
+The official 64x99 matmul shape rejects in about 45 ms with a precise 408-task
+lower bound, rather than spending seconds constructing an inevitably illegal
+plan. Passing it now requires a more direct dynamic-weight reformat engine, not
+a larger task limit.
+
+All 103 compiler/image/fallback/telemetry tests plus three subtests pass. The
+complete strict device suite passes 79 tests plus 56 subtests in 769.17 seconds
+with no concurrent NPU process.

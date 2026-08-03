@@ -86,8 +86,8 @@ are eligible to be ported as native capabilities.
   output compaction; a one-value-per-output-channel FP16 bias is gathered and
   converted to FP32 on the NPU, then fused through BRDMA before the first FP16
   writeback, with optional ReLU in the same DPU flying-data stage; one CMAC
-  task may produce up to 32 logical channels, with channels 16--31 represented
-  by the second gapped FP16 WDMA atom;
+  task may produce up to 128 logical channels in proven 32-channel groups,
+  with each 16-channel FP16 block occupying one gapped 32-lane WDMA atom;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
 - dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane
@@ -423,19 +423,20 @@ simply lower the PPU channel field below eight: tightly packed HWC1/2/4 returns
 wrong maxima, `NONALIGN` times out, and unaligned DPU source addends do not
 reduce within an atom. HWC8 remains the declared direct PPU layout.
 
-`extra/rockchip/probe_cmac_width.py` proves direct logical output widths 16,
-20, 24, 28, and 32. FP16 WDMA stores logical channels 16--31 at physical lanes
-32--47, so the contraction unpack map explicitly accounts for that second atom.
-A dynamic 4x9 by 9x24 contraction passes on hardware with the generic tiled
-lowerer; its current 83-task selector plan is labeled a correctness fallback.
-The complete strict device suite passes 78 tests plus 54 subtests in 740.71
-seconds after adding the focused second-output-atom regression.
+`extra/rockchip/probe_cmac_width.py` proves direct logical output widths through
+128. FP16 WDMA stores every 16-channel block in a 32-lane atom, so contraction
+unpack uses the physical block map rather than assuming contiguous output.
+Dynamic 4x9 by 9x40 and 1x64 by 64x40 contractions pass bit-exactly on hardware;
+the latter is a 331-task correctness fallback. A 1x64 by 64x99 selector plan is
+rejected immediately because its mathematical lower bound is already 408 tasks.
+The complete strict device suite passes 79 tests plus 56 subtests in 769.17
+seconds with fallback disabled.
 
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,638, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,638 lines.
-The exact 3,670-line delta is 3,665 counted Rockchip backend lines (3,498
+contains 28,649, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,649 lines.
+The exact 3,681-line delta is 3,676 counted Rockchip backend lines (3,509
 renderer/compiler, 118 runtime, 33 historical Python-fallback adapter, and 16
 telemetry support) plus the five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under

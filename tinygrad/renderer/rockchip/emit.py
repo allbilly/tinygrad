@@ -217,7 +217,7 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   e, align_out, align_in = _command, plan.rhs.layout.physical_shape[0], plan.lhs.layout.physical_shape[-1]
   m = plan.lhs.layout.physical_shape[0]
   if align_in < 32 or align_in % 32: raise ValueError("CMAC K must be aligned to 32")
-  if align_out != 32: raise ValueError("proven CMAC output tile is 32 physical channels")
+  if not 32 <= align_out <= 128 or align_out % 32: raise ValueError("CMAC output tile must be 32..128 physical channels")
   fp32_out = plan.out.layout.dtype is dtypes.float
   if plan.out.layout.dtype not in (dtypes.half,dtypes.float): raise ValueError("CMAC output must be FP16 or FP32")
   if fp32_out and (m != 1 or plan.out.layout.physical_shape != (1,64) or plan.out.layout.strides_bytes != (256,4) or

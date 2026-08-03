@@ -775,6 +775,25 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(emit_program(result.plan).stages),400)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_tiled_contraction_uses_wide_cmac_output_groups(self):
+    x, y = Tensor.empty(4,9,dtype=dtypes.half), Tensor.empty(9,40,dtype=dtypes.half)
+    result = lower_tiled_contract_result(sink(x@y))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKContract) and step.rhs.layout.logical_shape[0] == 40)
+    self.assertEqual(len(contracts),1)
+    self.assertEqual((contracts[0].rhs.layout.physical_shape,contracts[0].out.layout.physical_shape[-1]),((64,64),128))
+    self.assertLessEqual(len(emit_program(result.plan).stages),400)
+    self.assertFalse(contains_uop(result.plan))
+    dynamic = lower_tiled_contract_result(sink(Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,40,dtype=dtypes.half)))
+    self.assertIs(dynamic.kind,RKLowerKind.NATIVE)
+    assert isinstance(dynamic.plan,RKProgram)
+    self.assertLessEqual(plan_cost(dynamic.plan).task_count,400)
+    too_wide = lower_tiled_contract_result(sink(Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,99,dtype=dtypes.half)))
+    self.assertIs(too_wide.reject.kind if too_wide.reject is not None else None,RKRejectKind.PLAN_STAGE_LIMIT)
+    self.assertIn("lower bound is 408 tasks",too_wide.reject.detail if too_wide.reject is not None else "")
+
   def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):
     x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x@y)).plan
@@ -1049,7 +1068,7 @@ class TestDPUCompiler(unittest.TestCase):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
                (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
-               (Tensor.empty(33,33,dtype=dtypes.half)@Tensor.empty(33,33,dtype=dtypes.half), "plan_stage_limit"),
+               (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,99,dtype=dtypes.half), "plan_stage_limit"),
              (Tensor.empty(16,dtype=dtypes.half).sin(), "unsupported_alu"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
