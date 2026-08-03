@@ -23,6 +23,7 @@ post-early_simplify UOps
        RKMaskStage
        RKLUTStage(lut: RKLUTId)
        RKContract
+       RKSpatialConv
        RKProgram(ordered typed steps)
   -> RKImage commands and relocations
   -> DRM allocation, patch, submit, and wait
@@ -37,7 +38,7 @@ only as a historical/debugging reference: it executes generic UOps on the CPU
 and must never contribute to Rockchip pass totals.
 
 Mixed-engine work is represented by a generic ordered `RKProgram`. Scratch is
-declared once at program scope, and each typed DPU, CMAC, or PPU step is emitted
+declared once at program scope, and each typed DPU, CMAC, CONV, or PPU step is emitted
 in order with constants and relocations remapped centrally. The former fixed
 CMAC-prefix/DPU/main-CMAC/CMAC-suffix pipeline no longer constrains composition.
 
@@ -51,7 +52,7 @@ honest native passes but are kept visible for replacement by direct engine paths
 The richer candidate ordering preserves the complete strict result: 79 tests
 plus 56 subtests pass in 728.41 seconds with fallback disabled.
 
-Lowering uses sixteen named ordered strategies grouped into elementwise,
+Lowering uses seventeen named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
 strategy returns exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
 cannot overwrite a useful reject, while applicable failures are ranked by
@@ -60,7 +61,7 @@ specificity before telemetry is emitted.
 The compiler is split by responsibility under `renderer/rockchip/`:
 `ir.py` owns the typed UOp-free plans, `expr.py` owns math recipes and UOp
 canonicalization, `affine.py` owns affine maps and reject fingerprints,
-`emit.py` owns DPU/CMAC/PPU register emission, and `image.py` owns the versioned
+`emit.py` owns DPU/CMAC/CONV/PPU register emission, and `image.py` owns the versioned
 image codec and relocations. The package entry contains resource planning,
 ordered legalization, and renderer integration. Register emission imports no
 UOp definitions and cannot recover source-graph semantics.
@@ -449,13 +450,43 @@ change the gather, and DPU NONALIGN times out. A known-good DPU recovery passes
 after reset. The complete strict device suite passes 79 tests plus 56 subtests
 in 728.41 seconds with fallback disabled.
 
+The first direct spatial-convolution milestone removes the nearest remaining
+stage-limit blocker without raising the 400-task ceiling. An exact affine
+matcher recognizes dense FP16 stride-one NCHW/OIHW convolution by enumerating
+axis roles and verifying the complete input, weight, and output stride maps;
+it does not inspect Tensor operation names. The initial hardware contract is
+deliberately narrow: four input channels, at most sixteen output channels,
+spatial kernels up to 3x3, input dimensions at most sixteen, and at most four
+batches. NPU selector tasks pack NCHW input and OIHW weights into proven CNA
+surfaces, one typed `RKSpatialConv` task runs per batch, and selectors unpack
+the physical C1/W/C2 output. No host packing or tensor semantics are involved.
+
+For the official `(2,4,9,9) * (4,4,3,3)` graph, the old affine-CMAC plan needed
+421 tasks: 310 for im2col-like input packing, 12 for weight packing, two useful
+CMAC tiles, and roughly 81 output-layout tasks. The direct plan needs 92 tasks,
+4,208 command words, 92 resets, 700,384 constant bytes, 5,344 scratch bytes,
+and 294,632 estimated MACs. The global 400-task and 2 MiB constant ceilings are
+unchanged. The first emitter attempt incorrectly assumed a four-lane CNA input
+contract and produced tiny nonconforming values; comparison against the
+preserved `conv_simple.py` oracle exposed the required eight-lane CNA channel
+alignment, NHWC conversion mode, weight padding, DMA strides, and CVT field.
+The corrected register map is identical to the known-good direct task; the
+`RKImage` adds only its normal explicit PC enable word.
+
+Unchanged strict `TestOps.test_simple_conv2d_batched` passes in 10.97 seconds.
+A separate randomized hardware regression verifies numerical parity and that
+telemetry records two `CONV` tasks. All 104 host tests plus three subtests pass,
+mypy is clean across 225 modules, touched-file Ruff is clean, and the complete
+serialized device suite passes 79 tests plus 56 subtests in 728.68 seconds.
+This focused failure-to-native transition is pending the next complete census,
+so the authoritative headline remains 150 native methods.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently
-contains 28,672, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,672 lines.
-The exact 3,704-line delta is 3,699 counted Rockchip backend lines (3,532
-renderer/compiler, 118 runtime, 33 historical Python-fallback adapter, and 16
-telemetry support) plus the five-line generic native-program hook. Generated
+contains 28,860, so `MAX_LINE_COUNT=25000 python sz.py` fails by 3,860 lines.
+The exact 3,892-line delta is 3,887 counted Rockchip backend lines plus the
+five-line generic native-program hook. Generated
 register definitions, LUT payloads, and reproducible command data belong under
 `runtime/autogen`; handwritten legality, layout, scheduling, and emission logic
 remain counted. The generic hook can be reviewed separately, while the backend

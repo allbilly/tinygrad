@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
 from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage,
-  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKReduce, RKProgram)
+  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
@@ -284,12 +284,86 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     commands = tuple(mutable)
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, tuple(relocs), RK_STAGE_RESET),), constants=plan.constants)
 
+def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RKImage:
+  """Emit the proven channel-4 FP16 direct-convolution register family."""
+  if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
+  ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
+    plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
+  if ic != 4 or not 1 <= oc <= 16 or not (kh > 1 or kw > 1) or max(kh,kw) > 3 or \
+     oh != ih-kh+1 or ow != iw-kw+1 or not 1 <= ih <= 16 or not 1 <= iw <= 16:
+    raise ValueError("unsupported direct spatial-convolution contract")
+  align_ic = 8
+  if plan.src.layout.physical_shape != (ih,plan.input_width_stride,ic) or \
+     plan.weight.layout.physical_shape != (kh,kw,oc,align_ic):
+    raise ValueError("direct convolution has invalid packed input or weight layout")
+  align_oc, out_c2 = 16, 8
+  if plan.out.layout.physical_shape != (align_oc//out_c2,plan.output_width_stride,out_c2):
+    raise ValueError("direct convolution has invalid packed output layout")
+  width_stride, out_width_stride = plan.input_width_stride, plan.output_width_stride
+  feature_grains, data_banks = ih+kh, 11
+  row_entries = max(1,(width_stride*align_ic+31)//32)
+  cbuf_entries = row_entries*ih*4
+  weight_bytes = kh*kw*align_ic*2
+  dma_line, dma_surface = width_stride, width_stride*(ih-1) if ih > 1 else 0
+  commands = (
+    _command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0xe),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON1, 0x60000000|((7+ic)<<12)|0x120),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
+    _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, (width_stride<<16)|ih),
+    _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((ic-1)<<16)|align_ic),
+    _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, ow),
+    _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE3, ow*oh),
+    _command(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes*oc),
+    _command(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE1, weight_bytes),
+    _command(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, (kw<<24)|(kh<<16)|oc),
+    _command(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, ((12-data_banks)<<4)|data_banks),
+    _command(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, cbuf_entries),
+    _command(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
+    *(_command(_TARGET_CNA, reg, 0x10000) for reg in
+      (rk.REG_CNA_CVT_CON1,rk.REG_CNA_CVT_CON2,rk.REG_CNA_CVT_CON3,rk.REG_CNA_CVT_CON4)),
+    _command(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0),
+    _command(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),
+    _command(_TARGET_CNA, rk.REG_CNA_DMA_CON1, dma_line),
+    _command(_TARGET_CNA, rk.REG_CNA_DMA_CON2, dma_surface),
+    _command(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE0, (iw<<16)|ih),
+    _command(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_ic),
+    _command(_TARGET_CNA, rk.REG_CNA_DCOMP_ADDR0, 0),
+    _command(_TARGET_CNA, 0x1180, (1<<ic)-1),
+    _command(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x201),
+    _command(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((oh-1)<<16)|(ow-1)),
+    _command(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_oc-1),
+    _command(_TARGET_CORE, rk.REG_CORE_RESERVED_3030, 0),
+    _command(_TARGET_DPU, rk.REG_DPU_FEATURE_MODE_CFG, 0x1e4),
+    _command(_TARGET_DPU, rk.REG_DPU_DATA_FORMAT, 0x48000002),
+    _command(_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, 0),
+    _command(_TARGET_DPU, rk.REG_DPU_DST_SURF_STRIDE, out_width_stride<<4),
+    _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_WIDTH, ow-1),
+    _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, oh-1),
+    _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0),
+    _command(_TARGET_DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, ((oc-1)<<16)|(align_oc-1)),
+    _command(_TARGET_DPU, rk.REG_DPU_BS_CFG, 0x53),
+    _command(_TARGET_DPU, rk.REG_DPU_BS_OW_CFG, 0x126),
+    _command(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_0, align_oc-1),
+    _command(_TARGET_DPU, rk.REG_DPU_WDMA_SIZE_1, ((oh-1)<<16)|(ow-1)),
+    _command(_TARGET_DPU, rk.REG_DPU_BN_CFG, 0x53),
+    _command(_TARGET_DPU, rk.REG_DPU_EW_CFG, 0x383),
+    _command(_TARGET_DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
+    _command(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
+    _command(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, out_width_stride*2<<4),
+    _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
+  relocs = (RKReloc(0,18,plan.src.buffer.kind,plan.src.buffer.index,plan.src.buffer.addend+plan.src.layout.base_offset),
+            RKReloc(0,24,plan.weight.buffer.kind,plan.weight.buffer.index,plan.weight.buffer.addend+plan.weight.layout.base_offset),
+            RKReloc(0,32,plan.out.buffer.kind,plan.out.buffer.index,plan.out.buffer.addend+plan.out.layout.base_offset))
+  return RKImage(target, (RKStage(RKEngine.CONV, commands, relocs, RK_STAGE_RESET),))
+
 def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Compose arbitrary typed engine steps into one ordered sequential image."""
   images:list[RKImage] = []
   for step in plan.steps:
     if isinstance(step, RKDPUProgram): images.append(emit_dpu(step, target))
     elif isinstance(step, RKContract): images.append(emit_contract(step, target))
+    elif isinstance(step, RKSpatialConv): images.append(emit_spatial_conv(step, target))
     elif isinstance(step, RKReduce): images.append(emit_reduce(step, target))
     else: raise TypeError(f"unsupported Rockchip program step {type(step).__name__}")
   stages:list[RKStage] = []

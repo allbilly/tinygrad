@@ -1808,3 +1808,33 @@ respectively. The first-reject Pareto is 65 unsupported-output-dtype, 47
 plan-stage-limit, 34 unsupported-layout, 23 unsupported-input-dtype, 18
 requires-reformat, 10 unsupported-ALU, and 10 numerical-contract, with 15
 partial/front-end failures lacking one method-level first reject.
+
+## Direct spatial convolution milestone (pending full census)
+
+`test_simple_conv2d_batched` was the closest stage-limit reject at 421 tasks,
+only 21 above the unchanged ceiling. Plan inspection showed that merely raising
+the limit would preserve the wrong architecture: 310 tasks performed an
+im2col-like affine input expansion, 12 packed weights, only two performed the
+contraction, and roughly 81 restored NCHW output order. A new exact affine
+matcher identifies dense stride-one NCHW/OIHW spatial contractions from their
+complete coefficient maps and lowers the proven channel-4 family to typed
+`RKSpatialConv` steps. All input, weight, and output layout conversion remains
+in NPU selector tasks; the runtime executes no packing or tensor semantics.
+
+The direct batched plan is 92 tasks, 4,208 command words, 92 resets, 700,384
+constant bytes, 5,344 scratch bytes, and 294,632 estimated MACs. The 400-task
+and 2 MiB limits are unchanged. An initial four-lane CNA alignment assumption
+submitted but returned uniformly tiny values. Register-by-register comparison
+with the preserved `ref/rk3588/examples/conv_simple.py` oracle isolated the
+actual eight-lane input/weight contract, NHWC conversion field, DMA strides,
+and padded weight format. After correction, the emitted register values match
+the known-good direct-convolution task exactly.
+
+The official strict method passes in 10.97 seconds at unchanged tolerance, and
+a randomized device test confirms both numerical parity and two telemetry-
+visible `CONV` tasks. The full serialized device suite passes 79 tests plus 56
+subtests in 728.68 seconds; 104 host tests plus three subtests, full tinygrad
+mypy, and touched-file Ruff also pass. This is one focused failure-to-native
+transition not yet folded into a complete 425-method census, so the
+authoritative count remains 150 native, 40 frontend-only, 222 failed, and 13
+upstream-skipped methods until that census is rerun.

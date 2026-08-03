@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math, os, struct
 from dataclasses import dataclass
-from itertools import product
+from itertools import permutations, product
 from typing import Callable, cast
 from tinygrad.dtype import dtypes, Invalid
 from tinygrad.helpers import Target
@@ -13,7 +13,7 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKArg,
   RKALUStage, RKFusedALUStage as RKFusedALUStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKReduce, RKProgram, RKPlanCost,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
@@ -109,7 +109,7 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
      (1 if any(not row for row in rows) else 0)+sum(1 if safe else 3 for safe in direct) > RK_MAX_PROGRAM_STAGES: return None
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   if not all(direct): scratch += (RKScratch(max((len(chunk[-1])//64 for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
                                                   if any(not row for row in rows) else [])
   for (start,base,end,tile,payload),safe in zip(chunks,direct):
     span, align_in = end-base, len(payload)//64
@@ -152,6 +152,11 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
         reads += math.prod(step.epilogue.bias.layout.logical_shape)*step.epilogue.bias.layout.dtype.itemsize
       writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
       macs += m*n*k
+    elif isinstance(step, RKSpatialConv):
+      reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
+      reads += math.prod(step.weight.layout.logical_shape)*step.weight.layout.dtype.itemsize
+      writes += step.out_channels*step.output_height*step.output_width*2
+      macs += step.out_channels*step.output_height*step.output_width*step.in_channels*step.kernel_height*step.kernel_width
     else:
       reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
       writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
@@ -201,11 +206,11 @@ def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[lis
   return two_level if two_level is not None and plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
     plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
-def _finish_program(steps:list[RKDPUProgram|RKContract|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
+def _finish_program(steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
   """Give every ordered DPU step the program's final resource table."""
   return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
 
-def _native(plan:RKDPUProgram|RKContract|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
+def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
@@ -219,7 +224,7 @@ def _lower_fused_lerp(output:RKArg, operands:tuple[UOp,UOp,UOp], count:int) -> R
   source = RKArg(RKBufferKind.ARG, x.src[0].arg.slot)
   x_float = RKArg(RKBufferKind.SCRATCH, 0)
   scratch = (RKScratch((((count+31)//32)*32+32)*4),)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   for start in range(0,count,32):
     valid = min(32,count-start)
     lhs_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
@@ -501,7 +506,7 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   packed = RKArg(RKBufferKind.SCRATCH, 1)
   max_align = max((max(32, (end-base+31)&-32) for base,end,_ in chunks), default=32)
   scratch:list[RKScratch] = [RKScratch((((count+31)&-32)+16)*2), RKScratch(max_align*2)]
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   if any(all(x < 0 for x in mapping[start:start+16]) for start in range(0, count, 16)):
     steps.append(RKDPUProgram((RKALUStage(Ops.ADD, expanded, 0.0, 0.0, count),)))
   source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
@@ -543,7 +548,7 @@ def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   substitutions:dict[UOp,UOp] = {}
   remaps:dict[RKArg,RKArg] = {}
   scratch:tuple[RKScratch, ...] = ()
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   for source_index in broadcasts:
     src_count = int(source_index.src[0].src[0].arg)
     mapping = [-1]*count
@@ -746,7 +751,7 @@ def lower_scalar_mul_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "scalar MUL source is not one dense reduction axis", value.op)
   packed = RKArg(RKBufferKind.SCRATCH, 0)
   scratch:tuple[RKScratch, ...] = (RKScratch(64),)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, 32),
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, 32),
     RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, value.src[0].arg.slot), 0.0, count)), scratch)]
   operands:list[RKArg] = []
   for index in range(count):
@@ -815,7 +820,7 @@ def lower_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[term][output_index] = [source_index]
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL output has holes", store.src[0].op)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   operands:list[RKArg] = []
   source = RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
@@ -898,7 +903,7 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL output has holes", store.src[0].op)
   one = RKArg(RKBufferKind.SCRATCH, 0)
   scratch:tuple[RKScratch, ...] = (RKScratch(64),)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, one, 0.0, 1.0, 32),), scratch)]
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, one, 0.0, 1.0, 32),), scratch)]
   operands:list[RKArg] = []
   source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
   for value_rows,identity_rows in zip(selected, identities):
@@ -985,7 +990,7 @@ def lower_multi_source_affine_reduce_result(sink:UOp) -> RKLowerResult:
           return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "multi-source SUM inactive value is not zero", value.op)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM output has holes", store.src[0].op)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   partials:list[RKArg] = []
   for index,rows in selectors.items():
@@ -1198,6 +1203,102 @@ def lower_contract_result(sink:UOp) -> RKLowerResult:
   return _native(RKContract(_dense_half_ref(out_param.arg.slot, (1,n)), _dense_half_ref(lhs.src[0].arg.slot, (1,32)),
                             _cmac_weight_ref(rhs.src[0].arg.slot, n, 32), red_axis))
 
+def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
+  """Recognize a proven dense NCHW/OIHW stride-one convolution and pack every surface on the NPU."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 4 or store.src[0].op is not Ops.INDEX or \
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
+     _strip_casts(store.src[1]).key != reduce.key:
+    return _not_applicable()
+  body = _strip_casts(reduce.src[0])
+  if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in reduce.src[1:]): return _not_applicable()
+  operands = tuple(_conditional_index(_strip_casts(value)) for value in body.src)
+  if any(parsed is None or parsed[1] is not None or parsed[0].dtype is not dtypes.half or
+         parsed[0].src[0].op is not Ops.PARAM for parsed in operands): return _not_applicable()
+  parsed_operands = cast(tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool]], operands)
+  out_aff = _affine(store.src[0].src[1])
+  if out_aff is None or out_aff[1] != 0 or len(out_aff[0]) != 4: return _not_applicable()
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
+  if any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
+
+  match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int]|None = None
+  for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
+    feature, weight = feature_parsed[0], weight_parsed[0]
+    feature_aff, weight_aff = _affine(feature.src[1]), _affine(weight.src[1])
+    if feature_aff is None or weight_aff is None or feature_aff[1] or weight_aff[1]: continue
+    for batch_axis,channel_axis,out_y_axis,out_x_axis in permutations(out_axes):
+      batch, out_c, out_h, out_w = (ranges[x] for x in (batch_axis,channel_axis,out_y_axis,out_x_axis))
+      for in_channel_axis,kernel_y_axis,kernel_x_axis in permutations(red_axes):
+        in_c, kernel_h, kernel_w = (ranges[x] for x in (in_channel_axis,kernel_y_axis,kernel_x_axis))
+        in_h, in_w = out_h+kernel_h-1, out_w+kernel_w-1
+        if out_aff[0] != {batch_axis:out_c*out_h*out_w, channel_axis:out_h*out_w, out_y_axis:out_w, out_x_axis:1}: continue
+        if feature_aff[0] != {batch_axis:in_c*in_h*in_w, in_channel_axis:in_h*in_w,
+                             kernel_y_axis:in_w, kernel_x_axis:1, out_y_axis:in_w, out_x_axis:1}: continue
+        if weight_aff[0] != {channel_axis:in_c*kernel_h*kernel_w, in_channel_axis:kernel_h*kernel_w,
+                            kernel_y_axis:kernel_w, kernel_x_axis:1}: continue
+        feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
+        if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c*kernel_h*kernel_w,
+                                                        batch*out_c*out_h*out_w): continue
+        match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,output_count)
+        break
+      if match is not None: break
+    if match is not None: break
+  if match is None: return _not_applicable()
+  feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,output_count = match
+  if in_c != 4 or not 1 <= out_c <= 16 or not (kernel_h > 1 or kernel_w > 1) or max(kernel_h,kernel_w) > 3 or \
+     max(in_h,in_w) > 16 or batch > 4:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
+      f"direct spatial convolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w}", reduce.op)
+
+  input_width_stride, output_width_stride, align_in = (in_w+1)&-2, (out_h*out_w+3)&-4, 8
+  input_batch_count, output_batch_count = in_h*input_width_stride*in_c, 2*output_width_stride*8
+  input_rows = [[b*in_c*in_h*in_w+c*in_h*in_w+y*in_w+x] if x < in_w else []
+                for b in range(batch) for y in range(in_h) for x in range(input_width_stride) for c in range(in_c)]
+  weight_rows = [[oc*in_c*kernel_h*kernel_w+c*kernel_h*kernel_w+ky*kernel_w+kx] if c < in_c else []
+                 for ky in range(kernel_h) for kx in range(kernel_w) for oc in range(out_c) for c in range(align_in)]
+  output_rows = [[b*output_batch_count+(oc//8)*output_width_stride*8+(y*out_w+x)*8+oc%8]
+                 for b in range(batch) for oc in range(out_c) for y in range(out_h) for x in range(out_w)]
+  scratch:tuple[RKScratch, ...] = ()
+  packed_input = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(len(input_rows)*2),)
+  input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,feature.src[0].arg.slot),
+                                 int(feature.src[0].src[0].arg),input_rows,scratch,
+                                 direct_capacity=((int(feature.src[0].src[0].arg)*2+4095)&-4096)//2)
+  if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution input pack exceeds plan limits",Ops.INDEX)
+  scratch, steps = input_plan.scratch, list(input_plan.steps)
+  packed_weight = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(len(weight_rows)*2),)
+  weight_plan = _selector_program(packed_weight,RKArg(RKBufferKind.ARG,weight.src[0].arg.slot),
+                                  int(weight.src[0].src[0].arg),weight_rows,scratch,
+                                  direct_capacity=((int(weight.src[0].src[0].arg)*2+4095)&-4096)//2)
+  if weight_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution weight pack exceeds plan limits",Ops.INDEX)
+  scratch, steps = weight_plan.scratch, [*steps,*weight_plan.steps]
+  packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(batch*output_batch_count*2),)
+  input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
+                          padding=((0,0),(0,input_width_stride-in_w),(0,0)))
+  weight_layout = RKLayout((kernel_h,kernel_w,out_c,in_c),(kernel_h,kernel_w,out_c,align_in),
+                           (kernel_w*out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,
+                           padding=((0,0),(0,0),(0,0),(0,align_in-in_c)))
+  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half)
+  for b in range(batch):
+    steps.append(RKSpatialConv(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
+      RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
+      RKTensorRef(packed_weight,weight_layout),in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,
+      input_width_stride,output_width_stride))
+  unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
+                             batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count)
+  if unpack is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution output unpack exceeds plan limits",Ops.INDEX)
+  program = _finish_program([*steps,*unpack.steps],unpack.scratch)
+  cost = plan_cost(program)
+  if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"direct convolution needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
+  return _native(program)
+
 def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   """Pack, execute, and unpack one bounded affine FP16 MxNxK contraction entirely on the NPU."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -1304,7 +1405,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
           out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
           source = rhs_columns[out_channel][reduction_index] if out_channel < n and reduction_index < k else -1
           b_selector.append([source] if source >= 0 else [])
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   if direct_lhs:
     # CMAC may read the allocator's page-rounded tail, but padded K lanes have zero weights and cannot affect the result.
@@ -1508,7 +1609,7 @@ def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[i
   surface_count, hwc_elements = pool_extent*8, ((pool_extent*8-1)//16)*16+32
   packed, hwc, atoms = (RKArg(RKBufferKind.SCRATCH, index) for index in range(3))
   scratch:tuple[RKScratch, ...] = (RKScratch(max(spec[2] for spec in specs)*2), RKScratch(hwc_elements*2), RKScratch(len(selectors)*16))
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   payloads:set[bytes] = set()
   height, width = pool_shape
   for output_index,(base,span,align_in,sentinel,row) in enumerate(specs):
@@ -1632,7 +1733,7 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   hwc_elements = ((surface_count-1)//16)*16+32
   scratch = (RKScratch(max(window[2] for window in windows)*2), RKScratch(hwc_elements*2))
   source = RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot)
-  steps:list[RKDPUProgram|RKContract|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   payloads:set[bytes] = set()
   height, width = pool_shape
   for base,span,align_in,sentinel,window_groups in windows:
@@ -1696,6 +1797,7 @@ _LOWERERS = (
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
   RKLowerer("affine_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_affine_max_result),
   RKLowerer("global_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_global_max_result),
+  RKLowerer("spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_spatial_contract_result),
   RKLowerer("tiled_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_tiled_contract_result),
   RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),
 )
@@ -1720,8 +1822,8 @@ def lower_native(sink:UOp) -> RKLowerResult:
   reject = max(enumerate(rejects), key=lambda item:(_REJECT_PRIORITY[item[1].kind], item[0]))[1]
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
 
-from tinygrad.renderer.rockchip.emit import (emit_dpu as emit_dpu, emit_contract as emit_contract, emit_program as emit_program,
-  emit_reduce as emit_reduce)
+from tinygrad.renderer.rockchip.emit import (emit_dpu as emit_dpu, emit_contract as emit_contract, emit_spatial_conv as emit_spatial_conv,
+  emit_program as emit_program, emit_reduce as emit_reduce)
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
@@ -1746,6 +1848,7 @@ class RockchipRenderer(Renderer):
       raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
+    elif isinstance(result.plan, RKSpatialConv): image = emit_spatial_conv(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
     elif isinstance(result.plan, RKProgram): image = emit_program(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")

@@ -8,7 +8,8 @@ from tinygrad.runtime.rockchip_fallback import RKPY_MAGIC, RKPythonProgram, deco
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 from tinygrad.runtime.support.rockchip_telemetry import record as record_telemetry
 
-_TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300), RKEngine.PPU:(1, 0x60, 0xc00)}
+_TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300), RKEngine.PPU:(1, 0x60, 0xc00),
+         RKEngine.CONV:(0, 0x0d, 0x300)}
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)

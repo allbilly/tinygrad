@@ -4,11 +4,12 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKDPUProgram, RKEpilogue, RKEngine,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
-  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_tiled_contract_result, plan_cost,
+  lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_spatial_contract_result,
+  lower_tiled_contract_result, plan_cost,
   rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
@@ -843,6 +844,18 @@ class TestDPUCompiler(unittest.TestCase):
     huge_surface = lower_tiled_contract_result(sink(Tensor.empty(1,4,32,32,dtype=dtypes.half).conv2d(
       Tensor.empty(4,4,3,3,dtype=dtypes.half))))
     self.assertIs(huge_surface.reject.kind if huge_surface.reject is not None else None, RKRejectKind.PLAN_STAGE_LIMIT)
+
+  def test_batched_dense_spatial_contraction_uses_direct_conv(self):
+    plan = lower_spatial_contract_result(sink(Tensor.empty(2,4,9,9,dtype=dtypes.half).conv2d(
+      Tensor.empty(4,4,3,3,dtype=dtypes.half)))).plan
+    self.assertIsInstance(plan,RKProgram)
+    assert isinstance(plan,RKProgram)
+    image, cost = emit_program(plan), plan_cost(plan)
+    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in plan.steps),2)
+    self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),2)
+    self.assertLessEqual(cost.task_count,100)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(plan))
 
   def test_sparse_pair_and_deduplicated_contractions_stay_inside_cost_ceiling(self):
     cases = ((Tensor.empty(1,3,5,7,dtype=dtypes.half), Tensor.empty(6,1,3,3,dtype=dtypes.half), 3),

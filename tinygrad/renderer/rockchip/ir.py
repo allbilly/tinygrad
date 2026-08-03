@@ -11,6 +11,7 @@ class RKEngine(IntEnum):
   DPU = 1
   CMAC = 2
   PPU = 3
+  CONV = 4
 class RKBufferKind(IntEnum):
   ARG = 0
   SCRATCH = 1
@@ -120,13 +121,30 @@ class RKContract:
   compact_output: bool = False
 
 @dataclass(frozen=True)
+class RKSpatialConv:
+  """One proven FP16 stride-one spatial convolution over packed RK3588 surfaces."""
+  out: RKTensorRef
+  src: RKTensorRef
+  weight: RKTensorRef
+  in_channels: int
+  out_channels: int
+  input_height: int
+  input_width: int
+  kernel_height: int
+  kernel_width: int
+  output_height: int
+  output_width: int
+  input_width_stride: int
+  output_width_stride: int
+
+@dataclass(frozen=True)
 class RKReduce:
   out: RKTensorRef
   src: RKTensorRef
   op: Ops
   reduce_axis: int
 
-RKProgramStep = RKDPUProgram|RKContract|RKReduce
+RKProgramStep = RKDPUProgram|RKContract|RKSpatialConv|RKReduce
 
 @dataclass(frozen=True)
 class RKProgram:
@@ -180,7 +198,7 @@ class RKLowerKind(Enum):
 @dataclass(frozen=True)
 class RKLowerResult:
   kind: RKLowerKind
-  plan: RKDPUProgram|RKContract|RKReduce|RKProgram|None = None
+  plan: RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKProgram|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     valid = {RKLowerKind.NATIVE:self.plan is not None and self.reject is None,
