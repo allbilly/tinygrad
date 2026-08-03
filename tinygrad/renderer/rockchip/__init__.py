@@ -3,7 +3,7 @@ import math, os, struct
 from dataclasses import dataclass
 from itertools import permutations, product
 from typing import Callable, cast
-from tinygrad.dtype import dtypes, Invalid
+from tinygrad.dtype import dtypes, DType, Invalid
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId as RKLUTId
@@ -63,8 +63,10 @@ def _cmac_selection_payload(rows:list[list[int]], align_in:int, align_out:int, s
   return b"".join(struct.pack("<e", value) for value in values)
 
 def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]], scale:float=1.0,
-                          scratch:tuple[RKScratch, ...]=()) -> RKProgram:
+                          scratch:tuple[RKScratch, ...]=(), out_dtype:DType=dtypes.half) -> RKProgram:
   """Materialize one static selector matrix as sequential, proven-width CMAC tasks."""
+  if out_dtype not in (dtypes.half,dtypes.float) or out_dtype is dtypes.float and len(rows) != 1:
+    raise ValueError("sparse CMAC FP32 output requires one scalar row")
   align_in = max(32, (input_count+31)&-32)
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch += (RKScratch(align_in*2),)
@@ -75,8 +77,9 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
   contracts:list[RKContract] = []
   for start in range(0, len(rows), 16):
     count = min(16, len(rows)-start)
-    out_layout = RKLayout((1,count), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-count)))
-    contracts.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
+    physical, strides = ((1,64),(256,4)) if out_dtype is dtypes.float else ((1,32),(64,2))
+    out_layout = RKLayout((1,count), physical, strides, out_dtype, padding=((0,0),(0,physical[1]-count)))
+    contracts.append(RKContract(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*out_dtype.itemsize), out_layout),
       RKTensorRef(packed, lhs_layout), _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), 0,
       _cmac_selection_payload(rows[start:start+count], align_in, 32, scale)))
   return RKProgram((dpu, *contracts), scratch)
@@ -704,8 +707,8 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
   if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 2: return _not_applicable()
-  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
-    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU sum requires an FP16 output surface", store.src[0].op)
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype not in (dtypes.half,dtypes.float):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "DPU sum requires an FP16 or FP32 output surface", store.src[0].op)
   if store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one scalar output", store.src[0].op)
   stored, scale, final_relu = _strip_casts(store.src[1]), 1.0, False
@@ -731,6 +734,10 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   if src_aff != ({red.arg[0]:1}, 0) or int(value.src[0].src[0].arg) != count:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "DPU sum requires one dense reduction axis", value.op)
   output, input_arg = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  fp32_out = store.src[0].dtype is dtypes.float
+  def output_ref() -> RKTensorRef:
+    return RKTensorRef(output, RKLayout((1,1), (1,64 if fp32_out else 32), (256,4) if fp32_out else (64,2),
+      store.src[0].dtype, padding=((0,0),(0,63 if fp32_out else 31))))
   stages:list[RKDPUStage] = []
   scratch:list[RKScratch] = []
   if pre_relu:
@@ -744,9 +751,8 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
     stages.append(RKALUStage(Ops.ADD, packed, input_arg, 0.0, count))
     scratch.append(RKScratch(align_in*2))
     dpu = RKDPUProgram(tuple(stages), tuple(scratch))
-    out_layout = RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31)))
     lhs_layout = RKLayout((1,count), (1,align_in), (align_in*2,2), dtypes.half, padding=((0,0),(0,align_in-count)))
-    contract = RKContract(RKTensorRef(output, out_layout), RKTensorRef(packed, lhs_layout),
+    contract = RKContract(output_ref(), RKTensorRef(packed, lhs_layout),
       _cmac_weight_ref(0, 4, align_in, RKBufferKind.CONSTANT, 32), red.arg[0], _cmac_mask_payload(count, align_in, scale=scale))
     return _native(RKProgram((dpu, contract), tuple(scratch)))
   runs:list[tuple[RKArg, int]] = []
@@ -788,8 +794,7 @@ def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
     term_offset += run_count
   mask = b"".join(struct.pack("<e", x) for x in mask_values)
   constants = mask*4
-  out_ref = RKTensorRef(output, RKLayout((1,1), (1,32), (64,2), dtypes.half, padding=((0,0),(0,31))))
-  contract = RKContract(out_ref, _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH),
+  contract = RKContract(output_ref(), _dense_half_ref(packed.index, (1,32), RKBufferKind.SCRATCH),
                         _cmac_weight_ref(0, 4, 32, RKBufferKind.CONSTANT), red.arg[0], constants)
   return _native(RKProgram((*prefix, RKDPUProgram(tuple(stages)), contract), tuple(scratch)))
 
@@ -1209,8 +1214,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
   if reduce.arg[0] is not Ops.ADD or not reduce.src[1:]: return _not_applicable()
-  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
-    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine CMAC requires an FP16 output", store.src[0].op)
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype not in (dtypes.half,dtypes.float):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine CMAC requires an FP16 or scalar FP32 output", store.src[0].op)
   stored, scale, epilogue = _strip_casts(store.src[1]), 1.0, False
   if stored.key != reduce.key:
     if stored.op is Ops.MUL:
@@ -1244,6 +1249,9 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   red_axes = tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
   out_axes = tuple(sorted(out_aff[0]))
   output_count, input_count = int(store.src[0].src[0].src[0].arg), int(value_index.src[0].src[0].arg)
+  fp32_out = store.src[0].dtype is dtypes.float
+  if fp32_out and (output_count != 1 or epilogue):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "affine CMAC FP32 output requires one direct scalar reduction", store.src[0].op)
   src_axes = set(src_aff[0]) if src_aff is not None else {u.arg[0] for u in value_index.src[1].toposort() if u.op is Ops.RANGE}
   if len(red_axes) != len(reduce.src)-1 or set(out_axes) & set(red_axes) or \
      src_axes - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
@@ -1281,9 +1289,9 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if epilogue:
     reduced = RKArg(RKBufferKind.SCRATCH, len(initial_scratch))
     initial_scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
-  program = _sparse_cmac_pipeline(reduced, source, input_count, selectors, scale, initial_scratch) if \
-    input_count <= 512 and output_count <= 128 else _windowed_cmac_pipeline(
-      reduced, source, selectors, scale, initial_scratch, direct_count=input_count)
+  program = _sparse_cmac_pipeline(reduced, source, input_count, selectors, scale, initial_scratch, store.src[0].dtype) if \
+    input_count <= 512 and output_count <= 128 else (None if fp32_out else _windowed_cmac_pipeline(
+      reduced, source, selectors, scale, initial_scratch, direct_count=input_count))
   if program is None and struct.unpack("<e", struct.pack("<e", scale))[0] != scale:
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"two-level affine scale {scale} is not exactly FP16", stored.op)
   if program is None: program = _two_level_selector_program(reduced, source, input_count, selectors, initial_scratch, scale)

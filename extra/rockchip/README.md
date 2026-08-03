@@ -6,19 +6,16 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `4e2bbe7ef` is 163 native,
-40 frontend-only, 209 failed, and 13 upstream-skipped methods across the exact
+The current authoritative uncached strict census at `d6bb0b304` is 165 native,
+40 frontend-only, 207 failed, and 13 upstream-skipped methods across the exact
 425-method inventory. It completed without an NPU timeout, reset failure,
-invalid submission, or process abort. Later focused native milestones for
-depthwise broadcast and strided RGB convolution imply 165 native methods, but
-that count remains provisional until the next complete uncached census.
+invalid submission, or process abort. Relative to `4e2bbe7ef`, depthwise and
+strided convolution are the only method transitions and there is no regression.
 Coverage details and durable artifact hashes are recorded in `coverage.md`.
 
-Relative to the preceding census, `test_interpolate_nearest` and
-`test_interpolate_nearest_exact` change from failure to native pass. Every
-remaining failure is a typed native reject; there are no device or unclassified
-frontend failures in the authoritative inventory. Dynamic tensor indexing is
-still rejected.
+Every remaining failure is a typed native reject; there are no device or
+unclassified frontend failures in the authoritative inventory. Dynamic tensor
+indexing is still rejected.
 
 The compiler boundary is:
 
@@ -116,6 +113,8 @@ are eligible to be ported as native capabilities.
   CMAC before the ordinary generic DPU expression;
 - contiguous FP16 global sums whose power-of-two block decomposition fits a
   32-term aligned DPU/CMAC plan;
+- scalar FP16 global sums may commit the unchanged CMAC FP32 accumulator to a
+  public FP32 WDMA surface; FP32 remains an output-only contract for this path;
 - two-level scalar ADD reductions whose affine axes form a proven dense input
   bijection, executed as ordered CMAC plans with the intermediate FP16 rounding
   boundary preserved in NPU scratch;
@@ -147,9 +146,10 @@ are eligible to be ported as native capabilities.
 - one demonstrated two-kernel workload: direct `(1,32) @ (8,32).T`, followed
   by bounded sigmoid using generic ALU stages and two sigmoid LUT assets.
 
-Native arithmetic is FP16. Int32 and FP32 are currently admitted only for
-operation-specific constant fills; this does not claim general arithmetic for
-either dtype. User-visible bool outputs, noncontiguous elementwise layouts,
+Native arithmetic is FP16. Int32 and FP32 are admitted for operation-specific
+constant fills, and scalar FP16 sums can retain their FP32 CMAC accumulator at
+writeback; this does not claim general FP32 input or arithmetic support.
+User-visible bool outputs, noncontiguous elementwise layouts,
 reductions outside the proven static affine bounds, general contractions,
 CMAC epilogues other than the proven channel-bias/optional-ReLU form, general
 convolution/pooling, and gradients remain outside the native contract.
@@ -809,6 +809,28 @@ catalogues: `cast.cpp` asks RKNN for float output and truncates on the host, and
 `pool.cpp` performs host layout conversion/reference work. Neither is evidence
 for native cast or pooling coverage.
 
+A second audit found two narrower reusable mechanisms. `conv_grok/gemm_npu.py`
+builds one PC-linked command chain for a homogeneous set of CMAC tiles and its
+`TileSession` reuses command/task/input/weight/output GEM objects. These are
+useful runtime-overhead references, but they do not solve layout legalization;
+their input and weight surfaces were still packed with NumPy. They also reset
+once around a homogeneous job, whereas the clean mixed-engine compiler has a
+proven state-sensitive multi-tile failure and therefore keeps its per-stage
+reset contract. `plan_depthwise_rows` is only an unexecuted target planner—the
+reference explicitly retains per-channel CPU orchestration—so it is not copied
+as hardware proof.
+
+The raw `allbilly/npu` command catalogue does contain a hardware FP32 writeback
+contract: FP16 input/proc with DPU `OUT_PRECISION=5` and no FP32-to-FP16 output
+conversion. The clean CMAC emitter already used that mode for fused lerp
+materialization. It is now independently verified for a 135-element FP16
+scalar sum and exposed only as FP16 reduction to FP32 output. The official
+`test_sum_dtype_arg` still switches its input to FP32 for the reference
+comparison, so it honestly remains an unsupported-input-dtype failure and this
+capability changes no census total. The raw comparison examples write FP16
+zero/one masks and convert them through RKNN/host code; they do not establish a
+public native bool surface.
+
 Permanent compiler tests require four direct CNA tasks for batched RGB stride
 2 and `(2,1)` plans, while a device regression checks batch-2 IC3 stride `(2,1)`
 against the unchanged strict result and requires two CONV tasks. The focused
@@ -845,7 +867,7 @@ and preserved as `wip-pointwise-channel-split-fp16-rounding.patch` (SHA-256
 future solution needs direct input-layout conversion or non-FP16 partial
 accumulation; it must not relax tolerance or host-pack the input.
 
-All 124 host tests plus ten subtests pass, mypy checks all 225 modules, and
-Ruff is clean. The complete serialized device contract passes 87 tests plus 58
-subtests in 717.87 seconds without a timeout, invalid submission, reset failure,
+All 125 host tests plus ten subtests pass, mypy checks all 225 modules, and
+Ruff is clean. The complete serialized device contract passes 88 tests plus 58
+subtests in 719.03 seconds without a timeout, invalid submission, reset failure,
 or process abort.

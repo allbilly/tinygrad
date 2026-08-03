@@ -996,6 +996,17 @@ class TestDPUCompiler(unittest.TestCase):
     rejected = lower_add_reduce_result(sink(Tensor.empty(511,dtype=dtypes.half).sum()))
     self.assertIsInstance(rejected.plan, RKProgram)
 
+  def test_global_sum_can_commit_fp32_accumulator(self):
+    result = lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum(dtype=dtypes.float)))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    contract = next(step for step in result.plan.steps if isinstance(step,RKContract))
+    self.assertEqual((contract.out.layout.dtype,contract.out.layout.physical_shape,contract.out.layout.strides_bytes),
+                     (dtypes.float,(1,64),(256,4)))
+    self.assertEqual(emit_program(result.plan).stages[-1].engine,RKEngine.CMAC)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_nested_dense_sum_preserves_intermediate_rounding_stage(self):
     for axes in ((0,1), (0,2), (1,2)):
       result = lower_native(sink(Tensor.empty(4,4,4,dtype=dtypes.half).sum(axes).sum()))

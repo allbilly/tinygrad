@@ -12,24 +12,24 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `4e2bbe7ef` contains exactly 425 method records:
-163 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 209 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `d6bb0b304` contains exactly 425 method records:
+165 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 207 `FAIL`, and 13 `SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 246 failed methods/subtests, 215 passed, 77 passing subtests,
-and 13 skipped in 2,352.89 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 235 failed methods/subtests, 216 passed, 87 passing subtests,
+and 13 skipped in 2,583.60 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to the nearest-reformat census, only `TestOps.test_repeat` changes
-from failure to native pass. The 209 failed methods first classify as 65
-unsupported-output-dtype, 49 plan-stage-limit, 26 unsupported-layout, 23
+Relative to `4e2bbe7ef`, only `TestOps.test_depthwise_conv2d` and
+`TestOps.test_strided_conv2d` change from failure to native pass. The 207 failed
+methods first classify as 65 unsupported-output-dtype, 46 plan-stage-limit, 27 unsupported-layout, 23
 unsupported-input-dtype, 19 numerical-contract, 18 requires-reformat, and nine
-unsupported-ALU. Schema version 2 classifies all 209 failures as
+unsupported-ALU. Schema version 2 classifies all 207 failures as
 `NATIVE_REJECT`; no failure
 lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-periodic-repeat-4e2bbe7ef-20260803/test_ops_coverage.json`
-(SHA-256 `17b7a27d13da1c92a0def8328806f8ca9cf70d78a747a54ac27a13c29c0e852f`);
+is `~/rk2608_backups/census-pointwise-d6bb0b304-20260804/test_ops_coverage.json`
+(SHA-256 `f8a3cfdf986fabeef631b6f05a35ac25cb9fa6252c5a75c10455e148186fb616`);
 the JUnit XML SHA-256 is
-`c53b63f2d68a42332adf31c0d582d3acf67551a1f826667473e99518936fda34`.
+`b02b396f7647ffaa69dd3d30f96934c7598e6deebef9a5e8054c80a4c5975991`.
 
 The 504 successful native kernels contain 477 `EFFICIENT` and 27
 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 121 at one task, 179 at
@@ -2363,5 +2363,43 @@ with SHA-256
 All 124 host tests plus ten subtests pass, mypy checks all 225 modules, and
 Ruff is clean. The complete serialized device contract passes 87 tests plus 58
 subtests in 717.87 seconds without a timeout, invalid submission, reset failure,
-or process abort. This milestone changes plan quality but not the authoritative
-163/40/209/13 method census or the focused inferred 165/40/207/13 result.
+or process abort. This milestone changes plan quality but not method coverage;
+the subsequent uncached census confirms the focused result as the current
+authoritative 165/40/207/13 inventory.
+
+## Re-audit: chained tasks and FP32 writeback
+
+`allbilly/rk3588` remains at `40fae7b1ade1`. Its homogeneous GEMM path allocates
+an array of `rknpu_task` descriptors, links command streams through
+`PC_BASE_ADDRESS`/`PC_REGISTER_AMOUNTS`, and submits the full tile list in one
+blocking job. `TileSession` separately proves that command/task and tensor GEM
+objects may be reused across serial convolution tiles. These are useful
+submission-overhead references, not layout solutions: NumPy still performs all
+GEMM/CONV packing and unpacking. The depthwise 32-channel batching code is only
+a planner target; the actual hardware runner remains per-channel serial.
+
+The clean runtime will not adopt the reference's reset-once policy until mixed
+DPU/CMAC/PPU/CONV stress tests resolve the already observed state-sensitive
+multi-tile corruption. Homogeneous command chaining and reusable BOs remain a
+future performance milestone after native layout work reduces pathological
+task counts.
+
+`allbilly/npu` remains at `e02707ca9b01`. Its raw command catalogue repeatedly
+uses FP16 input and processing with DPU output precision five and no
+FP32-to-FP16 converter, including the CMAC/matmul family. That register contract
+matches the clean emitter's existing FP32 CMAC materialization. A new permanent
+device regression now proves that a 135-element FP16 scalar sum writes the
+unchanged FP32 accumulator directly to a public Rockchip GEM buffer. No RKNN
+runtime, NumPy conversion, or CPU postprocessing participates.
+
+This capability does not change the 165/40/207/13 census. The TestOps plugin
+uses an explicit FP32 input for `test_sum_dtype_arg`, so that method advances
+only after native FP32 input is proven. The reference's `cast.cpp` obtains float
+output through RKNN and calls host `trunc`; comparison examples materialize
+FP16 zero/one masks and let RKNN/host code interpret them. Neither supplies the
+missing public bool/int or FP32-input hardware contract.
+
+All 125 host tests plus ten subtests pass, mypy checks all 225 modules, and
+Ruff is clean. The complete serialized RK3588 device contract passes 88 tests
+plus 58 subtests in 719.03 seconds without a timeout, invalid submission, reset
+failure, or process abort.
