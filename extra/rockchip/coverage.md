@@ -2234,3 +2234,30 @@ All 121 host tests plus three subtests pass, and the complete strict RK3588
 suite passes 84 tests plus 58 subtests in 721.14 seconds. The complete uncached
 census confirms exactly this transition and no regression, establishing the
 authoritative 163/40/209/13 result.
+
+## Geometric repeat and aligned constant-run broadcast
+
+Periodic duplication now grows the populated output geometrically instead of
+copying every period from the first materialized period. Each aligned DPU copy
+doubles the valid prefix, bounded by the proven 32,768-lane task width. The
+largest unchanged 20,736-output `test_repeat` kernel drops from 78 tasks to 14
+without changing the selector payload, numerical result, or global cost
+ceilings. The compiler regression now enforces a 16-task upper bound.
+
+A companion generic planner handles aligned constant runs. It selector-packs
+one eight-lane head for each run, then doubles within that run through DPU
+copies. A strict 32,768-element hardware regression proves nonconstant
+`(1,32,32,32) + (1,32,1,1)` exactly. The unchanged official
+`test_depthwise_conv2d` method now passes in focused telemetry through this
+same generic broadcast capability: 305 tasks, 18,496 constant bytes, 67,104
+scratch bytes, 32 CMAC tasks and 273 DPU tasks. It is intentionally reported as
+`CORRECTNESS_FALLBACK`, not as an efficient direct convolution.
+
+The focused JSON is
+`~/rk2608_backups/focused-large-broadcast-c2c44d39a-20260803/test_ops_coverage.json`.
+All 122 host tests plus three subtests pass, mypy checks all 225 source files,
+and Ruff is clean. The complete serial hardware suite passes 85 tests plus 58
+subtests in 735.32 seconds with no NPU timeout, invalid submission, reset
+failure, or process abort. The authoritative full census remains
+163/40/209/13 until an uncached rerun confirms the focused inferred
+164/40/208/13 transition.

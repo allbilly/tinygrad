@@ -745,3 +745,19 @@ complete device contract passes 84 tests plus 58 subtests in 721.14 seconds
 without a timeout, invalid submission, reset failure, or process abort. The
 complete uncached census confirms `test_repeat` as the only method transition,
 with no regression, and establishes the authoritative 163/40/209/13 result.
+
+The subsequent geometric-copy milestone keeps that census as the authoritative
+method count but reduces repeated-surface duplication from one task per period
+to a doubling chain. The 20,736-output repeat consequently falls from 78 tasks
+to 14, and its permanent compiler ceiling is 16 tasks. The same native planner
+now recognizes aligned constant runs: it materializes one eight-lane head per
+run through selector CMAC and doubles the populated portion with aligned DPU
+copies. This makes the unchanged 32-channel depthwise-convolution method's
+32,768-element channel broadcast pass exactly without host expansion. The
+result is still deliberately classified as a 305-task
+`CORRECTNESS_FALLBACK`; no 400-task or 2 MiB ceiling was raised. All 122 host
+tests plus three subtests, mypy over 225 modules, and Ruff pass. The complete
+serial device contract passes 85 tests plus 58 subtests in 735.32 seconds with
+no timeout, invalid submission, reset failure, or process abort. A new full
+census is required before promoting the focused inferred count of 164 native
+methods to an authoritative result.

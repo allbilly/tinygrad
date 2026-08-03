@@ -1157,8 +1157,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(result.plan, RKReformat)
     assert isinstance(result.plan, RKReformat)
     cost = plan_cost(RKProgram(result.plan.steps, result.plan.scratch))
-    self.assertLessEqual(cost.task_count, 100)
+    self.assertLessEqual(cost.task_count, 16)
     self.assertLessEqual(cost.constant_bytes, 2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_large_periodic_broadcast_grows_geometrically(self):
+    lhs = Tensor.empty(1,32,32,32,dtype=dtypes.half).realize()
+    rhs = Tensor.empty(1,32,1,1,dtype=dtypes.half).realize()
+    result = lower_broadcast_alu_result(sink(lhs+rhs))
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    self.assertLessEqual(plan_cost(result.plan).task_count, 320)
     self.assertFalse(contains_uop(result.plan))
 
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):

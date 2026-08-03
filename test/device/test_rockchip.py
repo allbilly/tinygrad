@@ -395,6 +395,12 @@ class TestRockchip(unittest.TestCase):
       with self.subTest(mode=mode):
         np.testing.assert_equal(tensor.interpolate((9,),mode=mode).realize().numpy(), data[...,indexes])
 
+  def test_large_constant_run_broadcast_native_cmac(self):
+    lhs = np.arange(32*32*32,dtype=np.float16).reshape(1,32,32,32)/np.float16(1024)
+    rhs = np.arange(32,dtype=np.float16).reshape(1,32,1,1)/np.float16(32)
+    actual = (Tensor(lhs,device="ROCKCHIP").realize()+Tensor(rhs,device="ROCKCHIP").realize()).realize().numpy()
+    np.testing.assert_equal(actual,lhs+rhs)
+
   def test_input_dma_atom_padding_survives_lut_then_cmac(self):
     zero, negative = Tensor([0], dtype=dtypes.half, device="ROCKCHIP"), Tensor([-.7], dtype=dtypes.half, device="ROCKCHIP")
     np.testing.assert_equal((zero.log2()*negative).realize().numpy(), np.array([np.inf], dtype=np.float16))

@@ -227,17 +227,52 @@ def _finish_program(steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce], 
   """Give every ordered DPU step the program's final resource table."""
   return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
 
-def _periodic_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]]) -> RKProgram|None:
+def _periodic_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
+                               scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
   """Materialize one aligned repeated-map period, then duplicate it through direct DPU copies."""
   count = len(rows)
   period = next((candidate for candidate in range(8,min(count,32769),8) if count%candidate == 0 and
                  all(rows[index] == rows[index%candidate] for index in range(candidate,count))), None)
   if period is None: return None
-  prefix = _selector_program(output, source, input_count, rows[:period], ())
+  prefix = _selector_program(output, source, input_count, rows[:period], scratch)
   if prefix is None: return None
-  copies = RKDPUProgram(tuple(RKALUStage(Ops.ADD, RKArg(output.kind,output.index,start*2), output, 0.0, period)
-                               for start in range(period,count,period)))
+  copy_stages:list[RKALUStage] = []
+  filled = period
+  while filled < count:
+    copied = min(filled, count-filled, 32768)
+    copy_stages.append(RKALUStage(Ops.ADD, RKArg(output.kind,output.index,filled*2), output, 0.0, copied))
+    filled += copied
+  copies = RKDPUProgram(tuple(copy_stages))
   completed = _finish_program([*prefix.steps,copies], prefix.scratch)
+  cost = plan_cost(completed)
+  return completed if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES else None
+
+def _constant_run_selector_program(output:RKArg, source:RKArg, input_count:int, mapping:list[int],
+                                   scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
+  """Materialize aligned constant-run heads, then expand each run through geometric DPU copies."""
+  runs:list[tuple[int,int,int]] = []
+  start = 0
+  while start < len(mapping):
+    end = start+1
+    while end < len(mapping) and mapping[end] == mapping[start]: end += 1
+    if start%8 or end-start < 32 or (end-start)%8 or not 0 <= mapping[start] < input_count: return None
+    runs.append((start,end,mapping[start]))
+    start = end
+  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  for start,end,source_index in runs:
+    head = _selector_program(RKArg(output.kind,output.index,output.addend+start*2), source, input_count, [[source_index]]*8, scratch)
+    if head is None: return None
+    steps.extend(head.steps)
+    scratch = head.scratch
+  copies:list[RKALUStage] = []
+  for start,end,_ in runs:
+    filled = 8
+    while start+filled < end:
+      copied = min(filled, end-start-filled, 32768)
+      copies.append(RKALUStage(Ops.ADD, RKArg(output.kind,output.index,output.addend+(start+filled)*2),
+                               RKArg(output.kind,output.index,output.addend+start*2), 0.0, copied))
+      filled += copied
+  completed = _finish_program([*steps,RKDPUProgram(tuple(copies))], scratch)
   cost = plan_cost(completed)
   return completed if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
@@ -533,7 +568,7 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast does not cover one dense output", Ops.INDEX)
     mapping[dest_offset] = cast(int, source_offset)
   if any(index == -2 for index in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "broadcast output has holes", Ops.INDEX)
-  if not 0 < count <= 4096 or not 0 < src_count:
+  if not 0 < count <= RK_MAX_AFFINE_VISITS or not 0 < src_count:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast surface is {count} from {src_count}", Ops.INDEX)
 
   canonical = source_index.replace(src=(source_index.src[0], output_index))
@@ -548,6 +583,24 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
     if isinstance(value, _LUTExpr): return _LUTExpr(value.lut, (cast(_Expr|RKArg, remap(value.src[0])),))
     return value
   root = cast(_Expr, remap(root))
+
+  source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
+  if count > 4096:
+    initial_scratch = (RKScratch(_cmac_tiled_output_bytes(count)),)
+    expanded_plan = _periodic_selector_program(expanded, source, src_count,
+      [[index] if index >= 0 else [] for index in mapping], initial_scratch) or \
+      _constant_run_selector_program(expanded, source, src_count, mapping, initial_scratch)
+    if expanded_plan is None:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "large broadcast has no legal aligned periodic plan", Ops.INDEX)
+    output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
+    if (scheduled:=_schedule_expr(root, output, count, expanded_plan.scratch)) is None:
+      return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast stage source is not materializable", stored.op)
+    completed = _finish_program([*expanded_plan.steps,scheduled], scheduled.scratch)
+    cost = plan_cost(completed)
+    if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+        f"large periodic broadcast needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", stored.op)
+    return _native(completed)
 
   # Group 16-output CMAC tiles while their source window remains small. This keeps a padded
   # row at 64 inputs instead of constructing one output_count x source_count selector.
@@ -574,7 +627,6 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
   if any(all(x < 0 for x in mapping[start:start+16]) for start in range(0, count, 16)):
     steps.append(RKDPUProgram((RKALUStage(Ops.ADD, expanded, 0.0, 0.0, count),)))
-  source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
   for base,end,blocks in chunks:
     span, align_in = end-base, max(32, (end-base+31)&-32)
     steps.append(RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, align_in),
