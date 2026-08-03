@@ -10,10 +10,10 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId as RKLUTId
 from tinygrad.runtime.support.rockchip_telemetry import record as record_telemetry
 from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
-from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKArg,
+from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
   RKALUStage, RKFusedALUStage as RKFusedALUStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKProgram, RKPlanCost,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKReformat, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
@@ -162,10 +162,16 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
       reads += math.prod(step.weight.layout.logical_shape)*step.weight.layout.dtype.itemsize
       writes += step.out_channels*step.output_height*step.output_width*2
       macs += step.out_channels*step.output_height*step.output_width*step.in_channels*step.kernel_height*step.kernel_width
-    else:
+    elif isinstance(step, RKReformat):
+      nested = plan_cost(RKProgram(step.steps, step.scratch))
+      reads += nested.estimated_read_bytes
+      writes += nested.estimated_write_bytes
+      macs += nested.estimated_macs
+    elif isinstance(step, RKReduce):
       reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
       writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
       macs += math.prod(step.src.layout.logical_shape)
+    else: raise TypeError(f"unsupported Rockchip cost step {type(step).__name__}")
   return RKPlanCost(len(image.stages), sum(len(stage.commands) for stage in image.stages),
                     sum(bool(stage.flags & RK_STAGE_RESET) for stage in image.stages), len(image.constants),
                     sum(resource.size for resource in plan.scratch), reads, writes, macs)
@@ -215,7 +221,8 @@ def _finish_program(steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce], 
   """Give every ordered DPU step the program's final resource table."""
   return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
 
-def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKProgram) -> RKLowerResult: return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
+def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKReformat|RKProgram) -> RKLowerResult:
+  return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
@@ -434,11 +441,15 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       length += following
     stages.append(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, dst*2), RKArg(source.kind, source.index, src*2), 0.0, length))
     dst += length
-  if atom_reject is None: return _native(RKDPUProgram(tuple(stages)))
+  out_ref, src_ref = _dense_half_ref(output.index, (count,)), _dense_half_ref(source.index, (src_count,))
+  if atom_reject is None:
+    return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.COALESCED_DPU, (RKDPUProgram(tuple(stages)),)))
   align_in = max(32, (src_count+31)&-32)
   constant_bytes = ((count+15)//16)*32*align_in*2
   if 0 < src_count <= 512 and 0 < count <= 4096 and constant_bytes <= RK_MAX_CONSTANT_BYTES:
-    return _native(_sparse_cmac_pipeline(output, source, src_count, [[src] if src >= 0 else [] for src in mapping]))
+    implementation = _sparse_cmac_pipeline(output, source, src_count, [[src] if src >= 0 else [] for src in mapping])
+    return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.SELECTOR_CMAC,
+      cast(tuple[RKDPUProgram|RKContract, ...], implementation.steps), implementation.scratch))
   return atom_reject
 
 def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
@@ -1853,7 +1864,7 @@ def lower_native(sink:UOp) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
 
 from tinygrad.renderer.rockchip.emit import (emit_dpu as emit_dpu, emit_contract as emit_contract, emit_spatial_conv as emit_spatial_conv,
-  emit_program as emit_program, emit_reduce as emit_reduce)
+  emit_program as emit_program, emit_reduce as emit_reduce, emit_reformat as emit_reformat)
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
@@ -1880,6 +1891,7 @@ class RockchipRenderer(Renderer):
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
     elif isinstance(result.plan, RKSpatialConv): image = emit_spatial_conv(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
+    elif isinstance(result.plan, RKReformat): image = emit_reformat(result.plan)
     elif isinstance(result.plan, RKProgram): image = emit_program(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))

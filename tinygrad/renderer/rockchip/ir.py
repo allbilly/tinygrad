@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 
@@ -19,6 +20,9 @@ class RKBufferKind(IntEnum):
 class RKLayoutKind(Enum):
   LINEAR = "linear"
   CMAC_WEIGHT = "cmac_weight"
+class RKReformatKind(Enum):
+  COALESCED_DPU = "coalesced_dpu"
+  SELECTOR_CMAC = "selector_cmac"
 
 @dataclass(frozen=True)
 class RKArg:
@@ -144,6 +148,21 @@ class RKReduce:
   op: Ops
   reduce_axis: int
 
+@dataclass(frozen=True)
+class RKReformat:
+  """One static physical-layout transform and its selected NPU implementation."""
+  out: RKTensorRef
+  src: RKTensorRef
+  mapping: tuple[int, ...]
+  kind: RKReformatKind
+  steps: tuple[RKDPUProgram|RKContract, ...]
+  scratch: tuple[RKScratch, ...] = ()
+  def __post_init__(self):
+    out_count, src_count = math.prod(self.out.layout.logical_shape), math.prod(self.src.layout.logical_shape)
+    if len(self.mapping) != out_count or any(index < -1 or index >= src_count for index in self.mapping):
+      raise ValueError("RKReformat mapping is outside its logical surfaces")
+    if not self.steps: raise ValueError("RKReformat has no native implementation")
+
 RKProgramStep = RKDPUProgram|RKContract|RKSpatialConv|RKReduce
 
 @dataclass(frozen=True)
@@ -198,7 +217,7 @@ class RKLowerKind(Enum):
 @dataclass(frozen=True)
 class RKLowerResult:
   kind: RKLowerKind
-  plan: RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKProgram|None = None
+  plan: RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKReformat|RKProgram|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     valid = {RKLowerKind.NATIVE:self.plan is not None and self.reject is None,

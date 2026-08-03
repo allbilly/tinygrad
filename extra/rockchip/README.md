@@ -542,6 +542,17 @@ therefore return `NUMERICAL_CONTRACT` before image emission, while proven exact
 fills remain native. This removes the raw FP16-packing `OverflowError` exposed
 by `test_maximum` without claiming general integer or FP32 arithmetic.
 
+Static affine movement now lowers to a first-class `RKReformat` target plan.
+It records typed logical source and destination surfaces, the complete static
+output-to-input map, and the selected implementation kind:
+`COALESCED_DPU` or `SELECTOR_CMAC`. Its implementation is an ordered tuple of
+already-legal, UOp-free engine steps; the emitter only serializes that choice.
+This changes no command bytes or coverage, but makes selector CMAC an explicit
+fallback that can be compared against future CNA/ERDMA/PPU implementations.
+Strict transpose, permute, and flip hardware methods remain green. The complete
+serialized device suite passes 81 tests plus 56 subtests in 746.38 seconds;
+all 110 Rockchip host tests plus three subtests pass as well.
+
 ## Current upstream blocker
 
 The base master contains 24,968 counted lines. This research branch currently

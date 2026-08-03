@@ -5,8 +5,9 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
-  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RK_STAGE_RESET,
+  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
+  emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_reduce_result, lower_reduce_result,
   lower_affine_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result, lower_spatial_contract_result,
   lower_tiled_contract_result, plan_cost,
@@ -211,8 +212,10 @@ class TestDPUCompiler(unittest.TestCase):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)
     plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in
                   (x.permute(1,0,2), Tensor.empty(2,1,8,dtype=dtypes.half).expand(2,3,8), x.flip(0)))
-    self.assertTrue(all(isinstance(plan, RKDPUProgram) for plan in plans))
-    self.assertEqual(tuple(len(plan.stages) for plan in plans), (6, 5, 2))
+    self.assertTrue(all(isinstance(plan, RKReformat) and plan.kind is RKReformatKind.COALESCED_DPU for plan in plans))
+    reformats = tuple(plan for plan in plans if isinstance(plan, RKReformat))
+    self.assertEqual(tuple(len(plan.steps[0].stages) for plan in reformats if isinstance(plan.steps[0], RKDPUProgram)), (6, 5, 2))
+    self.assertTrue(all(not contains_uop(plan) for plan in reformats))
 
   def test_affine_broadcast_materializes_then_runs_generic_dpu(self):
     lhs, rhs = Tensor.empty(3,9,dtype=dtypes.half), Tensor.empty(3,1,dtype=dtypes.half)
@@ -238,13 +241,13 @@ class TestDPUCompiler(unittest.TestCase):
                    Tensor.empty(24,dtype=dtypes.half)[1:17].clone(),
                    Tensor.empty(4,3,6,6,dtype=dtypes.half).flip(0).contiguous())
     plans = tuple(lower_reformat_result(sink(expression)).plan for expression in expressions)
-    self.assertTrue(all(isinstance(plan, RKProgram) for plan in plans))
+    self.assertTrue(all(isinstance(plan, RKReformat) and plan.kind is RKReformatKind.SELECTOR_CMAC for plan in plans))
     first = plans[0]
-    assert isinstance(first, RKProgram)
-    self.assertEqual((sum(isinstance(step, RKContract) for step in first.steps)-1, [stage.engine for stage in emit_program(first).stages]),
+    assert isinstance(first, RKReformat)
+    self.assertEqual((sum(isinstance(step, RKContract) for step in first.steps)-1, [stage.engine for stage in emit_reformat(first).stages]),
                      (3, [RKEngine.DPU]*2+[RKEngine.CMAC]*4))
     last = plans[-1]
-    assert isinstance(last, RKProgram)
+    assert isinstance(last, RKReformat)
     self.assertEqual(sum(isinstance(step, RKContract) for step in last.steps)-1, 26)
 
   def test_add_matches_frozen_oracle(self):
@@ -1079,9 +1082,9 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_static_conditional_reformat_generates_zero_selector_rows(self):
     plan = lower_reformat_result(sink(Tensor.empty(3,3,dtype=dtypes.half).tril())).plan
-    self.assertIsInstance(plan, RKProgram)
-    assert isinstance(plan, RKProgram)
-    self.assertEqual([stage.engine for stage in emit_program(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
+    self.assertIsInstance(plan, RKReformat)
+    assert isinstance(plan, RKReformat)
+    self.assertEqual([stage.engine for stage in emit_reformat(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
     self.assertFalse(contains_uop(plan))
 
   def test_affine_reduction_materializes_pointwise_dpu_expression(self):

@@ -1934,3 +1934,26 @@ or FP32 fill constant. `INT_MAX` and FP32 `0.1` reject with
 wide-fill path. The unchanged focused `test_maximum` reaches the typed reject
 in 2.73 seconds after its earlier native subcases pass. No emitter exception,
 host conversion, or relaxed comparison is involved.
+
+## First-class native reformat plan
+
+The standalone affine movement lowerer previously returned either a raw
+`RKDPUProgram` or an opaque `RKProgram` of selector contracts. That exposed the
+implementation topology but lost the semantic fact that both represented the
+same physical transform.
+
+It now returns typed `RKReformat` with logical `src` and `out` tensor refs, the
+complete static output-to-source mapping, and `RKReformatKind.COALESCED_DPU` or
+`RKReformatKind.SELECTOR_CMAC`. The selected implementation remains an ordered
+tuple of UOp-free `RKDPUProgram`/`RKContract` steps with an explicit scratch
+table. `emit_reformat` cannot inspect UOps or re-plan the transform; it only
+serializes those chosen steps through the existing emitters.
+
+This milestone is intentionally command-byte and coverage neutral. It creates
+the comparison boundary required for a later direct reformat hierarchy without
+prematurely widening every mixed `RKProgram` step type. All 102 focused
+compiler/image tests plus three subtests pass, mypy and Ruff are clean, and the
+unchanged strict transpose, permute, and flip methods pass on RK3588 in 28.31
+seconds. The full host selection passes 110 tests plus three subtests, and the
+complete serialized hardware suite passes 81 tests plus 56 subtests in 746.38
+seconds without timeout, reset failure, or invalid submission.
