@@ -126,7 +126,7 @@ class RKContract:
 
 @dataclass(frozen=True)
 class RKSpatialConv:
-  """One proven FP16 stride-one spatial convolution over packed RK3588 surfaces."""
+  """One proven FP16 spatial convolution over packed RK3588 surfaces."""
   out: RKTensorRef
   src: RKTensorRef
   weight: RKTensorRef
@@ -138,6 +138,8 @@ class RKSpatialConv:
   kernel_width: int
   output_height: int
   output_width: int
+  stride_y: int
+  stride_x: int
   input_width_stride: int
   output_width_stride: int
 

@@ -2280,3 +2280,52 @@ unchanged 4x4 HWC8 device regression passes one test plus three subtests in
 coverage count. The frozen PPU `globalavg` probe is not promoted: it validates
 with `atol=0.25` and divides the device result on the host, which does not meet
 the official strict mean contract.
+
+## `conv_grok` and raw-RKNN convolution audit
+
+The `allbilly/rk3588` `conv_grok` snapshot `40fae7b1ade1` proves several raw CNA
+contracts that are useful independently of its Python execution harness:
+
+- IC 1--4 uses the NHWC input mode with an eight-lane aligned channel surface;
+- X and Y convolution strides are independent three-bit fields, legal for
+  values 1--7, encoded in `CNA_CONV_CON3` as `(sy << 3) | sx`;
+- its width/DMA stride, feature-grain, CBUF-bank, and packed-weight formulas
+  are candidates for future direct pointwise and wide-channel tiling.
+
+The strict compiler ports the first two capabilities. Affine convolution
+recognition now recovers input height/width and independent stride from index
+coefficients, validates the exact valid-convolution output geometry, and emits
+typed `RKSpatialConv` plans for FP16 `IC in {1,2,3,4,16}`, stride components
+1--7, and the currently proven dimension/tile limits. Existing NPU selector
+plans pack logical NCHW/OIHW surfaces and unpack the CNA result; the runtime
+does not gain NumPy or host tensor semantics.
+
+An initial batch-2 IC3 run made batch zero exact while later batches were
+corrupt. The packed 7x10 IC3 surface occupied 1,848 bytes, which is not a
+16-byte address boundary. Padding each physical packed batch to eight FP16
+lanes before constructing per-batch tensor references fixes the lost low
+address bits. A permanent device test now checks batch-2 IC3 3x3 convolution
+with stride `(2,1)` at unchanged `rtol=1e-3, atol=1e-6` and requires two CONV
+tasks. The unchanged official `test_strided_conv2d` also passes focused strict
+testing.
+
+The compiler fixture uses batch four and records four direct CNA tasks. Its
+stride-2 plan costs 118 tasks, 1,364,800 constant bytes, and 19,008 scratch
+bytes; the `(2,1)` plan costs 152 tasks, 1,405,968 constant bytes, and 29,376
+scratch bytes. Both are correctly visible as selector-heavy correctness
+fallbacks; neither the 400-task nor 2 MiB constant ceiling was raised.
+
+The reference's NumPy `pack_input`, `pack_weights`, and `unpack_output`
+functions and its CPU-serial grouped/depthwise orchestration are excluded. Its
+overall sweep uses `atol=0.12, rtol=0.02`, which is not the official TestOps
+contract. The `allbilly/npu` snapshot `e02707ca9b01` is likewise useful as a raw
+register catalogue, not as strict execution evidence: `cast.cpp` requests
+RKNN float output and calls host `trunc`, while `pool.cpp` performs host layout
+conversion and reference computation.
+
+All 123 host tests plus eight subtests pass, mypy checks all 225 modules, and
+Ruff is clean. The complete serial native device suite passes 86 tests plus 58
+subtests in 731.90 seconds without a timeout, invalid submission, reset failure,
+or process abort. The authoritative full census remains 163/40/209/13. Together
+with the earlier focused depthwise transition, the focused strided-convolution
+result implies 165/40/207/13 pending the next complete uncached census.

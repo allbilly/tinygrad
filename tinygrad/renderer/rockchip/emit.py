@@ -290,10 +290,12 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
     plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
-  if ic not in (4,16) or not 1 <= oc <= 16 or not (kh > 1 or kw > 1) or max(kh,kw) > 3 or \
-     oh != ih-kh+1 or ow != iw-kw+1 or not 1 <= ih <= 16 or not 1 <= iw <= 16:
+  sy, sx = plan.stride_y, plan.stride_x
+  if ic not in (1,2,3,4,16) or not 1 <= oc <= 16 or not (kh > 1 or kw > 1) or max(kh,kw) > 3 or \
+     oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or not 1 <= sy <= 7 or not 1 <= sx <= 7 or \
+     not 1 <= ih <= 32 or not 1 <= iw <= 32:
     raise ValueError("unsupported direct spatial-convolution contract")
-  align_ic, use_nhwc = (8,True) if ic == 4 else (16,False)
+  align_ic, use_nhwc = (8,True) if ic <= 4 else (16,False)
   input_shape = (ih,plan.input_width_stride,ic) if use_nhwc else (ic//8,ih,plan.input_width_stride,8)
   if plan.src.layout.physical_shape != input_shape or \
      plan.weight.layout.physical_shape != (kh,kw,oc,align_ic):
@@ -315,7 +317,7 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
     _command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0xe),
     _command(_TARGET_CNA, rk.REG_CNA_CONV_CON1, (0x60000000|((7+ic)<<12) if use_nhwc else 0)|0x120),
     _command(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4),
-    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, 9),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, (sy<<3)|sx),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, (width_stride<<16)|ih),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((ic-1)<<16)|align_ic),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, ow),

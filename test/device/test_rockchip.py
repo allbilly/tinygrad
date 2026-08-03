@@ -87,6 +87,25 @@ class TestRockchip(unittest.TestCase):
     kernels = [event for event in drain() if event["kind"] == "kernel"]
     self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 1 for event in kernels))
 
+  def test_rgb_strided_spatial_conv_uses_cna(self):
+    rng = np.random.default_rng(21)
+    x = rng.uniform(-1,1,(2,3,7,10)).astype(np.float16)
+    weight = rng.uniform(-1,1,(4,3,3,3)).astype(np.float16)
+    old_telemetry = os.environ.get("ROCKCHIP_TELEMETRY")
+    os.environ["ROCKCHIP_TELEMETRY"] = "memory"
+    clear()
+    try: actual = Tensor(x,device="ROCKCHIP").conv2d(Tensor(weight,device="ROCKCHIP"),stride=(2,1)).realize().numpy()
+    finally:
+      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY",None)
+      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+    expected = np.zeros((2,4,3,8),dtype=np.float32)
+    for ky in range(3):
+      for kx in range(3):
+        expected += np.einsum("nihw,oi->nohw",x[:,:,ky:ky+6:2,kx:kx+8].astype(np.float32),weight[:,:,ky,kx].astype(np.float32))
+    np.testing.assert_allclose(actual,expected.astype(np.float16),rtol=1e-3,atol=1e-6)
+    kernels = [event for event in drain() if event["kind"] == "kernel"]
+    self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 2 for event in kernels))
+
   def test_contiguous_fp16_sum_native_dpu_cmac(self):
     rng = np.random.default_rng(4)
     for count in (2, 16, 60, 135, 720, 16384):

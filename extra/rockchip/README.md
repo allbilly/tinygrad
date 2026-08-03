@@ -6,12 +6,13 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `69ea691a8` is 162 native,
-40 frontend-only, 210 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. Raw pytest reports 214 passed, 247 failed, 13 skipped,
-and 77 passing subtests in 2,342.12 seconds. It completed without an NPU
-timeout, reset failure, invalid submission, or process abort. Coverage details
-and durable artifact hashes are recorded in `coverage.md`.
+The current authoritative uncached strict census at `4e2bbe7ef` is 163 native,
+40 frontend-only, 209 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed without an NPU timeout, reset failure,
+invalid submission, or process abort. Later focused native milestones for
+depthwise broadcast and strided RGB convolution imply 165 native methods, but
+that count remains provisional until the next complete uncached census.
+Coverage details and durable artifact hashes are recorded in `coverage.md`.
 
 Relative to the preceding census, `test_interpolate_nearest` and
 `test_interpolate_nearest_exact` change from failure to native pass. Every
@@ -781,3 +782,38 @@ all three classes, while the proven 4x4 HWC8 hardware path still passes exactly.
 The old PPU-average reference is retained only as a future probe: its
 `globalavg` validation uses loose `atol=0.25` plus host post-scaling, so it is
 not evidence that the current strict affine-mean failures can pass unchanged.
+
+### `allbilly/rk3588` `conv_grok` and `allbilly/npu` re-audit
+
+The `conv_grok` snapshot at `40fae7b1ade1` provides reusable raw CNA facts:
+input channels one through four use the NHWC path with an eight-lane hardware
+alignment, both convolution stride fields are three bits (`1..7`), and
+`CNA_CONV_CON3` encodes them as `(stride_y << 3) | stride_x`. Its width-stride,
+DMA-stride, feature-grain, CBUF-bank, and weight-layout formulas remain useful
+for future direct pointwise/channel tiling.
+
+The clean compiler now uses those facts for typed FP16 direct spatial
+convolution with `IC in {1,2,3,4,16}` and independent X/Y strides in `1..7`.
+Logical NCHW inputs and OIHW weights are still packed and outputs unpacked by
+NPU selector/DPU work; no invocation-time host transformation was imported.
+For IC=3, each physical batch is padded to a 16-byte boundary before assigning
+the next batch address. Without this padding the 1,848-byte regression surface
+lost low address bits and corrupted alternating batches.
+
+The reference's `pack_input`, `pack_weights`, `unpack_output`, grouped, and
+depthwise orchestration are NumPy/CPU code and are not strict backend
+implementations. Its sweep also validates with `atol=0.12, rtol=0.02`, so only
+register/layout facts independently revalidated at unchanged official
+tolerances are promoted. The `allbilly/npu` snapshots similarly remain register
+catalogues: `cast.cpp` asks RKNN for float output and truncates on the host, and
+`pool.cpp` performs host layout conversion/reference work. Neither is evidence
+for native cast or pooling coverage.
+
+Permanent compiler tests require four direct CNA tasks for batched RGB stride
+2 and `(2,1)` plans, while a device regression checks batch-2 IC3 stride `(2,1)`
+against the unchanged strict result and requires two CONV tasks. The focused
+plans contain 118 and 152 total tasks respectively because selector packing is
+still a correctness fallback. All 123 host tests plus eight subtests, mypy over
+225 modules, and Ruff pass. The complete serial device contract passes 86
+tests plus 58 subtests in 731.90 seconds with no timeout, invalid submission,
+reset failure, or process abort.

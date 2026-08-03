@@ -1178,6 +1178,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(plan_cost(result.plan).task_count, 320)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_rgb_strided_convolution_uses_direct_cna_tasks(self):
+    source = Tensor.empty(4,3,11,28,dtype=dtypes.half).realize()
+    weight = Tensor.empty(4,3,3,3,dtype=dtypes.half).realize()
+    for stride,limit in ((2,120),((2,1),155)):
+      with self.subTest(stride=stride):
+        result = lower_spatial_contract_result(sink(source.conv2d(weight,stride=stride)))
+        self.assertIs(result.kind, RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan, RKProgram)
+        assert isinstance(result.plan, RKProgram)
+        convs = [step for step in result.plan.steps if isinstance(step,RKSpatialConv)]
+        expected = (stride,stride) if isinstance(stride,int) else stride
+        self.assertEqual([(step.stride_y,step.stride_x) for step in convs], [expected]*4)
+        self.assertLessEqual(plan_cost(result.plan).task_count,limit)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.roll(1).contiguous()))
