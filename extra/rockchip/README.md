@@ -1522,3 +1522,8 @@ the inputs into aligned scratch and applying the bounded CMAC selector. All
 four three-input stack layouts pass custom hardware tests in nine tasks. The
 official stack method remains rejected because its plugin contract is FP32 and
 its final permutation needs unaligned word writes; no method gain is claimed.
+
+FP32-to-int32 `BITCAST` is native without a conversion stage: the compiler
+selects the proven int32 all-bypass transport and preserves the source words
+verbatim. The unchanged strict `test_bitcast` method passes; this does not
+expand the claimed FP32 arithmetic contract.

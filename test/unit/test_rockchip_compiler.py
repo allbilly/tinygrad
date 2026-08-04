@@ -1448,6 +1448,15 @@ class TestDPUCompiler(unittest.TestCase):
     assert unaligned.reject is not None
     self.assertIs(unaligned.reject.kind,RKRejectKind.UNALIGNED_ROW)
 
+  def test_fp32_to_int32_bitcast_uses_raw_word_bypass(self):
+    source = Tensor([0.0]*9,dtype=dtypes.float,device="ROCKCHIP")
+    result = lower_native(sink(source.bitcast(dtypes.int)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKDPUProgram)
+    assert isinstance(result.plan,RKDPUProgram)
+    self.assertEqual(result.plan.stages,(RKCopyStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),9,dtypes.int),))
+    self.assertFalse(contains_uop(result.plan))
+
   def test_fp16_multi_source_stack_keeps_semantic_map(self):
     sources = tuple(Tensor.empty(5,6,3,dtype=dtypes.half).realize() for _ in range(3))
     for dim in range(-1,3):

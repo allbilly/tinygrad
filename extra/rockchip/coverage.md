@@ -3341,3 +3341,16 @@ That experiment is rejected and archived as
 unchanged official `test_stack` still rejects with `unaligned_row`; no
 method-level gain is claimed and the focused expectation remains
 `191/40/181/13` (`187/40/185/13` authoritative).
+
+## Raw FP32-to-int32 bitcast
+
+An equal-width `BITCAST` from FP32 storage to int32 now lowers to one typed
+`RKCopyStage` in int32 all-bypass mode. The engine reads and writes the same
+32-bit words and never invokes an FP32 arithmetic or conversion path. A device
+regression covers positive and negative zero, infinities, a noncanonical NaN
+payload, the smallest subnormal word, and all-one bits exactly.
+
+The unchanged plugin-driven `test_bitcast` passes natively in 0.90 seconds.
+This is one focused method gain, so the post-census expectation becomes
+`192 native / 40 frontend / 180 failed / 13 skipped`; the complete uncached
+`187/40/185/13` census remains authoritative until rerun.

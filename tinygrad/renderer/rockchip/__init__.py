@@ -355,6 +355,10 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
   if store.src[0].dtype in (dtypes.bool,dtypes.int,dtypes.float) and identity.op is Ops.INDEX and identity.dtype is store.src[0].dtype and \
      identity.src[0].op is Ops.PARAM and identity.src[1].key == out_index.key:
     return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].arg.slot),count,store.src[0].dtype),)))
+  if store.src[0].dtype is dtypes.int and identity.op is Ops.BITCAST and identity.src[0].op is Ops.INDEX and \
+     identity.src[0].dtype is dtypes.float and identity.src[0].src[0].op is Ops.PARAM and identity.src[0].src[1].key == out_index.key:
+    # All-bypass int32 transport preserves each source word; no FP32 arithmetic or conversion is involved.
+    return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].src[0].arg.slot),count,dtypes.int),)))
   if store.src[0].dtype is dtypes.bool:
     if identity.op is Ops.CONST:
       return _native(RKDPUProgram((RKCopyStage(output,bool(identity.arg),count,dtypes.bool),)))
