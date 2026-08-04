@@ -1727,9 +1727,21 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if selected_visits > RK_MAX_AFFINE_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"affine CMAC selects {selected_visits} source terms from {logical_visits} logical visits", reduce.op)
-  if output_count > 16 and output_count == input_count and all(row == list(range(index+1)) for index,row in enumerate(selectors)):
+  prefix_scan = output_count == input_count and all(row == list(range(index+1)) for index,row in enumerate(selectors))
+  if prefix_scan and output_count <= 32 and prepare is None and _fp16_exact(scale):
+    align = 32
+    packed = RKArg(RKBufferKind.SCRATCH,0)
+    scratch = (RKScratch(align*2),)
+    prep = RKDPUProgram((RKALUStage(Ops.ADD,packed,0.0,0.0,align),RKALUStage(Ops.ADD,packed,source,0.0,input_count)),scratch)
+    out_layout = RKLayout((1,output_count),(1,align),(align*2,2),dtypes.half,padding=((0,0),(0,align-output_count)))
+    lhs_layout = RKLayout((1,input_count),(1,align),(align*2,2),dtypes.half,padding=((0,0),(0,align-input_count)))
+    contract = RKCMACTask(RKTensorRef(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),out_layout),
+      RKTensorRef(packed,lhs_layout),_cmac_weight_ref(0,output_count,align,RKBufferKind.CONSTANT,align),reduce.op,
+      _cmac_selection_payload(selectors,align,align,scale),compact_output=True)
+    return _native(_finish_program([prep,contract],scratch))
+  if prefix_scan and output_count > 32:
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
-      f"affine ADD prefix scan output {output_count} exceeds the stable one-tile contract", reduce.op)
+      f"affine ADD prefix scan output {output_count} exceeds the stable compact-task contract", reduce.op)
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   initial_scratch = () if prepare is None else prepare.scratch
   reduced = output

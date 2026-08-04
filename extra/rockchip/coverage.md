@@ -3545,3 +3545,21 @@ accepts only HWC8 one-row factors through eight. This is one focused
 complete-method gain after `test_sum_pad_collapse`; expected coverage is
 `197 native / 40 frontend / 175 failed / 13 skipped`. The authoritative
 uncached census remains `195/40/177/13` at `936f776c3` pending rerun.
+
+## Compact one-task N=20 ADD prefix
+
+The historical N=20 cumulative-sum corruption came from two separate 16-output
+CMAC tasks. Current hardware characterization already proves compact M=1 CMAC
+writeback beyond sixteen channels, so structural ADD prefixes through N=32 now
+use one physical task with a 32x32 triangular selector. Input padding is first
+zero-initialized on the NPU; no host tensor transformation is introduced.
+
+N=10 and N=20 are bit-exact after deliberately executing DPU, CMAC, PPU, and
+CNA work immediately beforehand, followed by both prefix widths in the same
+process. The full unchanged `test_cumsum` run used `DEV=ROCKCHIP`,
+`ROCKCHIP_FALLBACK=0`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`: it passes the
+former N=20 blocker and then rejects the axis-zero 20x30 case because one
+strided prefix spans more than the separately proven 512-lane generic window.
+The guard remains for prefixes above 32 until a direct tiled prefix planner is
+proven. No method-level count changes; the focused expectation remains
+`197 native / 40 frontend / 175 failed / 13 skipped`.

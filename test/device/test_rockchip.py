@@ -371,9 +371,19 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
   def test_masked_affine_prefix_sum_native_cmac(self):
-    data = np.array([1,-2,3,-4,5,-6,7,-8,9,-10], dtype=np.float16)
-    actual = Tensor(data, device="ROCKCHIP").realize().cumsum(0).realize().numpy()
-    np.testing.assert_equal(actual, np.cumsum(data, dtype=np.float16))
+    # The retired two-task N=20 prefix became corrupt after mixed-engine work. Exercise that state transition explicitly.
+    np.testing.assert_equal((Tensor.ones(16,device="ROCKCHIP")+2).realize().numpy(),np.full(16,3,dtype=np.float16))
+    identity = np.eye(4,dtype=np.float16)
+    np.testing.assert_equal((Tensor(identity,device="ROCKCHIP")@Tensor(identity,device="ROCKCHIP")).realize().numpy(),identity)
+    pooled = np.arange(4*4*8,dtype=np.float16).reshape(4,4,8)
+    np.testing.assert_equal(Tensor(pooled,device="ROCKCHIP").max(axis=(0,1)).realize().numpy(),pooled.max(axis=(0,1)))
+    feature, weight = np.ones((1,4,3,3),dtype=np.float16), np.ones((4,4,1,1),dtype=np.float16)
+    np.testing.assert_equal(Tensor(feature,device="ROCKCHIP").conv2d(Tensor(weight,device="ROCKCHIP")).realize().numpy(),4)
+    for count in (10,20):
+      with self.subTest(count=count):
+        data = np.resize(np.array([1,-2,3,-4,5,-6,7,-8,9,-10],dtype=np.float16),count)
+        actual = Tensor(data,device="ROCKCHIP").realize().cumsum(0).realize().numpy()
+        np.testing.assert_equal(actual,np.cumsum(data,dtype=np.float16))
 
   def test_windowed_affine_average_native_cmac(self):
     data = np.linspace(-1,1,2*2*11*28,dtype=np.float16).reshape(2,2,11,28)

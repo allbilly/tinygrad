@@ -1572,3 +1572,18 @@ Partial-channel sliding HWC2 completes but corrupts 172 of 192 outputs, while
 the first one-row width-16 boundary timed out. Those geometries remain outside
 the compiler contract; only the exact HWC8 one-row widths through eight are
 enabled.
+
+## Single-task compact cumulative sums
+
+Structural ADD prefixes through 32 outputs now use one compact CMAC task rather
+than the old fixed 16-output split. The compiler zero-pads the input into one
+32-lane surface, emits one triangular selector matrix, and requests the proven
+compact one-row WDMA layout. This removes the exact second-task transition that
+made the former N=20 implementation state-sensitive.
+
+Both N=10 and N=20 are bit-exact after an explicit DPU, CMAC, PPU, and CNA
+stress sequence in the same process. The unchanged `test_cumsum` advances past
+its 20-element case and now rejects the distinct strided 20x30 axis-zero prefix
+at the unchanged 512-lane generic selector contract. This milestone therefore
+claims no complete-method gain; focused expected coverage remains
+`197/40/175/13`.
