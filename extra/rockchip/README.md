@@ -1812,3 +1812,26 @@ Artifacts are preserved under
 `84da48e03bf39ff886581fc95f19a3963220d7ee36fbad69a0a28d6b1bb464d7` and
 `junit.xml` has SHA-256
 `ea12b7403eab76d42f555cbcee0d975f44cb2500713dfc72180ede93736edc50`.
+
+## Rejected stride-one transpose-as-convolution lowering
+
+A stride-one transposed convolution has an exact affine reformulation as an
+ordinary padded convolution with I/O-transposed and spatially reversed weights.
+The compiler recognized that structure without a test-name or shape match and
+used only native selectors plus the proven CONV path. Simple, padded, and
+dilated official methods all reached RK3588; no CPU tensor work was involved.
+
+The path is disabled because it does not satisfy the official numerical
+contract. `test_simple_conv_transpose2d` missed 164/968 outputs with maximum
+absolute error 0.02344, and the first dilated subcase missed 176/1144 with
+maximum absolute error 0.01563. The asymmetric-padding case additionally
+exposed an invalid physical-padding schedule. These are accepted-plan errors,
+not reasons to relax tolerance. The original typed stage-limit rejection is
+restored exactly.
+
+The complete implementation is preserved as
+`wip-stride1-transpose-as-conv-numerical-contract.patch` with SHA-256
+`0ea1f73a0896f284f9b1c728998884587351086a265cef25fd44dde64bef06d6`.
+Future work must characterize the native deconvolution/Rubik schedule or make
+the existing CMAC legalization compact enough while preserving accumulation
+semantics. The authoritative census remains `202/40/170/13`.

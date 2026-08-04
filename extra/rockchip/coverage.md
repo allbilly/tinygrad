@@ -3830,3 +3830,32 @@ Artifacts:
 - directory: `/home/orangepi/rk2608_backups/census-atrous-2fb47ca2b-20260805`
 - `test_ops_coverage.json`: `84da48e03bf39ff886581fc95f19a3963220d7ee36fbad69a0a28d6b1bb464d7`
 - `junit.xml`: `ea12b7403eab76d42f555cbcee0d975f44cb2500713dfc72180ede93736edc50`
+
+## Rejected stride-one transpose-as-convolution experiment
+
+The affine transposed-convolution graph exposes an ordinary input sampling map
+and an exactly I/O-transposed, spatially reversed weight map. A generic
+recognizer packed those weights on the NPU and reused the proven CONV task; the
+two-batch simple case required 54 tasks, including two CONV tasks, and 1,236,960
+constant bytes. The symmetric-padding case required 49 tasks and 970,080
+constant bytes. No undocumented deconvolution register or host tensor transform
+was used.
+
+All three unchanged official probes failed their existing comparison:
+
+- simple: 164/968 mismatches, maximum absolute error 0.02344 and relative error
+  0.0883;
+- first dilated subcase: 176/1144 mismatches, maximum absolute error 0.01563 and
+  relative error 0.6787;
+- asymmetric padding: a separate physical-padding error caused 446/504
+  mismatches and zeros over part of the output.
+
+The first two failures show that a mathematically equivalent ordinary-CONV
+schedule is not automatically a valid hardware numerical schedule for this
+contract. The implementation was removed and the exact original renderer hash
+restored. The WIP is archived at
+`/home/orangepi/tinygrad/rockchip-upstream-patches/wip-stride1-transpose-as-conv-numerical-contract.patch`
+with SHA-256
+`0ea1f73a0896f284f9b1c728998884587351086a265cef25fd44dde64bef06d6`.
+No native pass is claimed and the authoritative census remains
+`202 PASS_NATIVE / 40 PASS_FRONTEND / 170 FAIL / 13 SKIP_UPSTREAM`.
