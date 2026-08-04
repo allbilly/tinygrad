@@ -1,9 +1,10 @@
-import math, os, unittest
+import glob, math, os, unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
 from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
-@unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
+@unittest.skipUnless(any(os.path.basename(os.path.realpath(f"{node}/device/driver")).lower() in ("rknpu", "rocket")
+                         for node in glob.glob("/sys/class/drm/card[0-9]*")), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
   def test_static_two_tap_linear_interpolation_native_cmac(self):
     rng = np.random.default_rng(0)

@@ -3732,3 +3732,22 @@ stage-limit failures are not candidates for a higher ceiling, and the compact
 two-tap work does not make the FP32-intermediate bilinear/trilinear families
 legal. Selector-CMAC remains a bounded native correctness fallback while
 direct matmul and convolution packing are investigated.
+
+## Driver-bound device discovery
+
+Rockchip runtime and device-test selection now discover the DRM card whose
+sysfs driver is `RKNPU` or `rocket`; `ROCKCHIP_DEVICE` can override the chosen
+path. This removes the enumeration-order assumption that the NPU is always
+`/dev/dri/card1` without changing submission semantics.
+
+Reusing one command GEM and one task GEM for every stage of a compiled program
+was tested and rejected. Six representative tests plus eight subtests passed,
+but two regressions appeared in the first part of the full mixed device suite.
+The safe per-stage allocate/submit/free path and per-stage reset policy remain
+active. The exact WIP is
+`rockchip-upstream-patches/wip-runtime-command-task-gem-reuse-device-regressions.patch`
+(SHA-256
+`8cd9b0fca1381fb3398a1ce99b01acf73d6ad2befda47c55cd627c140f748d4b`).
+After restoration, four focused CONV/PPU tests pass in 37.95 seconds; 158
+compiler/image tests plus 57 subtests, mypy over 228 files, and Ruff also pass.
+The authoritative method census remains `201/40/171/13`.

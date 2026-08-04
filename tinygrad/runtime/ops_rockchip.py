@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, mmap, os, time
+import ctypes, glob, mmap, os, time
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RKImage, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
@@ -10,6 +10,13 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 
 _TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300), RKEngine.PPU:(1, 0x60, 0xc00),
          RKEngine.CONV:(0, 0x0d, 0x300)}
+
+def _rknpu_device() -> str:
+  if path := os.getenv("ROCKCHIP_DEVICE"): return path
+  for node in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+    driver = os.path.basename(os.path.realpath(f"{node}/device/driver")).lower()
+    if driver in ("rknpu", "rocket"): return f"/dev/dri/{os.path.basename(node)}"
+  raise RuntimeError("no DRM device bound to the RKNPU/Rocket driver; set ROCKCHIP_DEVICE explicitly")
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
@@ -115,7 +122,7 @@ class RockchipProgram(Program['RockchipDevice']):
 
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
-    self.fd_ctl = FileIOInterface("/dev/dri/card1", os.O_RDWR)
+    self.fd_ctl = FileIOInterface(_rknpu_device(), os.O_RDWR)
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
 
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:

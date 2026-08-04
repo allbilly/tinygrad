@@ -1737,3 +1737,21 @@ The telemetry JSON SHA-256 is
 `82ffa33a116d4d3d5ae8821647bd653ca504ebc990d0d757dd4a8726dad3e09a` and
 the JUnit XML SHA-256 is
 `04f984fe7e9729903a41c3b6d337406e48da6b6f7d1ae715a2f1d149e5b54026`.
+
+## DRM discovery and rejected submission-buffer reuse
+
+The runtime no longer assumes `/dev/dri/card1`. It enumerates DRM card nodes,
+selects the node whose bound driver is `RKNPU` or mainline `rocket`, and honors
+an explicit `ROCKCHIP_DEVICE` path. The hardware-test availability check uses
+the same driver identity instead of accepting any unrelated `card1` node.
+
+A per-program command/task GEM reuse experiment passed focused DPU, CMAC, PPU,
+CONV, and mixed-engine tests, then produced two regressions early in the full
+device suite. Per-stage allocation, blocking submission, and reset are restored
+unchanged. The rejected implementation is preserved as
+`wip-runtime-command-task-gem-reuse-device-regressions.patch` (SHA-256
+`8cd9b0fca1381fb3398a1ce99b01acf73d6ad2befda47c55cd627c140f748d4b`).
+After restoration, the affected CONV/PPU region passes four focused tests in
+37.95 seconds. All 158 compiler/image tests plus 57 subtests pass, mypy checks
+228 source files, and Ruff is clean. This milestone changes no coverage or
+execution semantics.
