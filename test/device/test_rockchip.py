@@ -18,6 +18,12 @@ class TestRockchip(unittest.TestCase):
     actual = (0**Tensor(exponent, device="ROCKCHIP")).realize().numpy()
     np.testing.assert_equal(actual, np.array([np.inf,np.inf,1,0,0,0], dtype=np.float16))
 
+  def test_constant_base_point7_full_range_luts(self):
+    exponent = np.array([-31.09375,-31.078125,-30,-11.6640625,-2,-1,0,1,2,3,4,16,32,44,48,48.59375], dtype=np.float16)
+    actual = (.7**Tensor(exponent,device="ROCKCHIP")).realize().numpy()
+    with np.errstate(over="ignore"): expected = np.asarray([.7**float(value) for value in exponent],dtype=np.float16)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
+
   def test_wide_fp16_fill_native_dpu_tiles(self):
     actual = Tensor.ones(65536,dtype=dtypes.half,device="ROCKCHIP").realize().numpy()
     np.testing.assert_equal(actual, np.ones(65536,dtype=np.float16))

@@ -307,7 +307,7 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_unproven_fp16_composites_reject_before_submission(self):
     x, y, z = (Tensor.empty(8,dtype=dtypes.half) for _ in range(3))
-    expressions = (x.copysign(y), 0.7**x, x.sigmoid().binary_crossentropy(y.clip(0,1),reduction="none"))
+    expressions = (x.copysign(y), .71**x, x.sigmoid().binary_crossentropy(y.clip(0,1),reduction="none"))
     for expression in expressions:
       with self.subTest(op=expression.uop.op):
         result = lower_native(sink(expression))
@@ -932,6 +932,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKDPUProgram)
     self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
                      {*(getattr(rklut.RKLUTId, name) for name in names), rklut.RKLUTId.EXP2})
+    self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
+    self.assertFalse(contains_uop(plan))
+
+  def test_constant_base_pow07_uses_full_finite_range_bands(self):
+    names = tuple(f"{'N' if low < 0 else 'P'}{abs(low)}" for low in range(-32,48,4))
+    self.assertEqual(rklut.RK_LUT_POW_BASE07_SIM_OFFICIAL_FAILURES, 0)
+    for name in names:
+      table = getattr(rklut, f"RK_LUT_POW_BASE07_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(),
+                       getattr(rklut, f"RK_LUT_POW_BASE07_{name}_SHA256"))
+    plan = lower_dpu(sink(.7**Tensor.empty(128,dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {getattr(rklut.RKLUTId, f"POW_BASE07_{name}") for name in names})
+    self.assertLessEqual(len(plan.stages), 256)
     self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
     self.assertFalse(contains_uop(plan))
 

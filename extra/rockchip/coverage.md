@@ -3151,3 +3151,37 @@ pre-submission `NUMERICAL_CONTRACT` guard restored. The exact WIP is
 `2cfd29f48a5c509f4bb61277a4e1dfcd752ac9e08d2678eb41f72fdb65cf72a7`);
 focused JUnit and telemetry remain under
 `~/rk2608_backups/focused-rounded-average-e6ace78ca-20260804/`.
+
+## Generated constant-base 0.7 contract
+
+The remaining half-input `0.7**x` graph previously rejected at
+`scaled EXP2 factor -0.5145731728297583`. Simply whitelisting that multiplier
+would be incorrect: the existing two-level EXP2 simulator misses 1,531 finite
+FP16 encodings at the official tolerance. The replacement uses twenty
+generated Q15 bands over exponent `[-32,48]`, clamps every inactive LUT input
+to its declared coordinate range, and repairs overflow/underflow with DPU
+arithmetic. It lowers to 245 typed stages without UOps or runtime host work.
+
+Generator simulation covers all 63,488 finite FP16 encodings with zero
+official-tolerance failures. The permanent RK3588 boundary test passes in
+27.23 seconds, and a 2,048-encoding stratified hardware sweep has zero failures,
+maximum absolute error 32 at the high-magnitude end, and maximum allowed-error
+ratio 0.97464. The unchanged isolated `TestOps.test_pow_const` does not yet
+reach this subcase: its earlier explicit-list `0**x` kernel has FP32 input and
+rejects `unsupported_input_dtype`. Therefore the authoritative census remains
+187 native / 40 frontend / 185 failed / 13 upstream skips.
+
+An attempted all-encoding hardware tensor failed before submission while
+mapping a 7,872,512-byte generated constant surface. The input was copied into
+a real Rockchip buffer and no host semantic fallback was enabled; the failure
+shows that scalar materialization currently scales with element count. It is
+not recorded as exhaustive hardware proof. Focused artifacts for the unchanged
+method are under `~/rk2608_backups/focused-pow07-c2f602aff-20260804/`; that run
+retains the earlier FP32 rejection and its eleven preceding native kernels.
+
+The same diagnostic round also disproved two tempting bound changes. A
+temporary pointwise output cap of 512 still cannot legalize strided transpose
+convolution (dynamic input layout, 528 outputs, or an already-native 335-task
+case), so the cap remains 128. The 1x1 M=4 convolution already has one `NONE`
+CBUF tile; its stage limit comes from NCHW/CNA packing rather than feature or
+weight bank splitting. No task, constant, or tolerance ceiling changed.

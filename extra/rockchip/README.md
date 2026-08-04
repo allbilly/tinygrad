@@ -1415,3 +1415,22 @@ their outputs missed the required `rtol=1e-5`; maximum absolute error was
 0.000977 and maximum relative error was 0.001215. The experiment is rejected,
 the exact-scale compiler guard is restored, and the WIP remains archived rather
 than being counted as native coverage.
+
+Constant-base `0.7**x` no longer relaxes the uncharacterized scaled-EXP2
+contract. Twenty generated Q15 bands cover the complete finite-result FP16
+range, with DPU-only overflow and underflow repair. Exhaustive simulation over
+all 63,488 finite FP16 encodings and a 2,048-encoding stratified RK3588 sweep
+both have zero failures at `rtol=1e-3, atol=1e-6`; a permanent boundary test
+passes on hardware. The plan has 245 stages and remains an explicit
+correctness fallback. A clean isolated `test_pow_const` still rejects earlier
+at its explicit FP32 `0**x` input, so this milestone does not claim a method or
+census gain. A full-device exhaustive tensor was also rejected as evidence:
+the current per-element scalar materialization produced a 7,872,512-byte
+constant GEM that could not be mapped.
+
+Two nearby low-hanging probes were rejected without changing limits. Raising
+the pointwise affine-reduction output cap from 128 to 512 did not legalize
+`test_strided_conv_transpose2d`: one case has dynamic unsupported input layout,
+one has 528 outputs, and the stride-one case was already native at 335 tasks.
+`test_simple_conv2d_1x1_m4` already uses a single unsplit CBUF tile; its blocker
+is planar NCHW-to-CNA packing and output conversion, not CBUF bank pressure.

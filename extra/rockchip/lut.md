@@ -562,3 +562,30 @@ plus both infinities and NaN at `rtol=1e-3, atol=1e-6`. The result is a
 43-stage typed plan with six reusable scratch surfaces and five generic LUT
 tasks; none of the 4,104 generated table entries are handwritten compiler
 logic or runtime CPU work.
+
+## Constant base 0.7 full-result-range bands
+
+The generic `EXP2(x*log2(0.7))` path is not accepted: exhaustive simulation of
+the existing two-level residual/integer-scale recipe leaves 1,531 finite FP16
+encodings outside `rtol=1e-3, atol=1e-6`. A dedicated generated recipe instead
+splits exponent space `[-32,48]` into twenty four-wide bands. Each LUT receives
+the original exponent minus its band center, clamped to the declared `[-4,4]`
+coordinate domain, and stores `0.7**x/decode` in Q15. The per-band decode is an
+FP16 constant chosen from the maximum result magnitude in that band.
+
+Nineteen DPU comparison masks select exactly one band. Inputs below
+`-31.078125` synthesize positive infinity; inputs above 48 become zero, whose
+maximum discrepancy from the remaining FP16 subnormal tail is below the
+official absolute tolerance. The complete typed plan contains twenty LUT
+tasks and 245 DPU stages, so it is deliberately reported as a correctness
+fallback under the unchanged 400-task ceiling.
+
+The generator checks all 63,488 finite FP16 encodings and records zero official
+tolerance failures. A serialized RK3588 test covers sample values, every
+result-magnitude region, overflow, the first finite value, subnormals, and the
+zero transition. An additional 2,048-encoding stratified hardware sweep also
+has zero failures; its worst contract ratio is 0.97464. A one-tensor exhaustive
+hardware attempt was not counted because elementwise scalar materialization
+created a 7,872,512-byte constant GEM that the current runtime could not map.
+That is a separate constant-surface scalability limit, not CPU fallback or a
+numerical pass.

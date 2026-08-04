@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from tinygrad.dtype import dtypes
+from tinygrad.runtime.autogen import rockchip_lut as rklut
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops, UOp
 
@@ -816,6 +817,27 @@ def _pow_base8_expr(source:_Expr|RKArg) -> _Expr:
   fallback = _exp2_expr(_ALUExpr(Ops.MUL, (source, 3.0)))
   return _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (corrected, inside)), _ALUExpr(Ops.MUL, (fallback, _sub(1.0, inside)))))
 
+def _pow_base07_expr(source:_Expr|RKArg) -> _Expr:
+  """Evaluate 0.7**x over the complete finite-result FP16 range with generated Q15 bands."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  names = tuple(f"{'N' if low < 0 else 'P'}{abs(low)}" for low in range(-32, 48, 4))
+  thresholds = tuple(positive(source, float(boundary)) for boundary in range(-28, 48, 4))
+  masks:tuple[_Value,...] = (_sub(1.0, thresholds[0]),) + \
+    tuple(_sub(lhs, rhs) for lhs,rhs in zip(thresholds, thresholds[1:])) + (thresholds[-1],)
+  terms:list[_Expr] = []
+  for name,mask in zip(names, masks):
+    center,decode = getattr(rklut, f"RK_LUT_POW_BASE07_{name}_CENTER"), getattr(rklut, f"RK_LUT_POW_BASE07_{name}_DECODE")
+    local = _sub(source, center)
+    bounded_low = _ALUExpr(Ops.MAX, (local, -4.0))
+    bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (_ALUExpr(Ops.MUL, (bounded_low, -1.0)), -4.0)), -1.0))
+    table = _LUTExpr(getattr(RKLUTId, f"POW_BASE07_{name}"), (bounded,))
+    terms.append(_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (table, decode)), mask)))
+  while len(terms) > 1:
+    terms = [_ALUExpr(Ops.ADD, (terms[i], terms[i+1])) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) % 2 else [])
+  overflow, underflow = positive(-31.078125, source), positive(source, 48.0)
+  finite = _ALUExpr(Ops.MUL, (terms[0], _sub(1.0, underflow)))
+  return _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.ADD, (finite, overflow)), _sub(1.0, overflow)))
+
 def _unwrap_same_cast(u:UOp) -> UOp:
   while u.op is Ops.CAST and u.dtype is u.src[0].dtype: u = u.src[0]
   return u
@@ -940,7 +962,8 @@ def _numerical_contract(u:UOp) -> str|None:
                    isinstance(_unwrap_fp_cast(x).arg, (int,float))), None)
     if factor is None: return None
     scale = float(factor.arg)
-    if math.isinf(scale) or math.isclose(abs(scale), math.log2(math.e)) or math.isclose(scale, math.log2(5.5), rel_tol=1e-3) or \
+    if math.isinf(scale) or math.isclose(abs(scale), math.log2(math.e)) or math.isclose(scale, math.log2(.7)) or \
+       math.isclose(scale, math.log2(5.5), rel_tol=1e-3) or \
        math.isclose(scale, 3.0, rel_tol=1e-3): return None
     return f"scaled EXP2 factor {scale} has no characterized numerical contract"
   return None
@@ -1531,11 +1554,14 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     exp_source = next((x for x in exp_operand.src if x is not exp_factor), None) if exp_factor is not None else None
     exp_scale = float(exp_factor.arg) if exp_factor is not None else None
     is_exp = exp_scale is not None and math.isclose(abs(exp_scale), math.log2(math.e))
+    is_pow_base07 = exp_scale is not None and math.isclose(exp_scale, math.log2(.7))
     is_pow_base55 = exp_scale is not None and math.isclose(exp_scale, math.log2(5.5), rel_tol=1e-3)
     is_pow_base8 = exp_scale is not None and math.isclose(exp_scale, 3.0, rel_tol=1e-3)
-    operand = _parse_alu(exp_source if (is_exp or is_pow_base55 or is_pow_base8) and exp_source is not None else u.src[0], output_index, memo)
+    operand = _parse_alu(exp_source if (is_exp or is_pow_base07 or is_pow_base55 or is_pow_base8) and exp_source is not None else u.src[0],
+                         output_index, memo)
     if operand is None or isinstance(operand, float): return None
     if is_exp: ret = _exp_expr(_ALUExpr(Ops.MUL, (operand, -1.0))) if cast(float, exp_scale) < 0 else _exp_expr(operand)
+    elif is_pow_base07: ret = _pow_base07_expr(operand)
     elif is_pow_base55: ret = _pow_base55_expr(operand)
     elif is_pow_base8: ret = _pow_base8_expr(operand)
     else: ret = _exp2_expr(operand)
