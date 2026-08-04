@@ -577,7 +577,8 @@ def _conditional_index_affine(index:UOp) -> tuple[dict[int,int],int]|None:
   return result
 
 def _proves_conv_zero_padding(condition:UOp|None, select_true:bool, ranges:dict[int,int], axes:tuple[int,int,int,int],
-                              in_h:int, in_w:int, stride_y:int, stride_x:int, pad_top:int, pad_left:int) -> bool:
+                              in_h:int, in_w:int, stride_y:int, stride_x:int, pad_top:int, pad_left:int,
+                              dilation_y:int=1, dilation_x:int=1) -> bool:
   """Exhaustively prove that a feature mask selects exactly the in-bounds convolution coordinates."""
   if condition is None: return pad_top == pad_left == 0
   ky_axis,kx_axis,out_y_axis,out_x_axis = axes
@@ -589,21 +590,23 @@ def _proves_conv_zero_padding(condition:UOp|None, select_true:bool, ranges:dict[
     by_axis = {u.arg[0]:value for u,value in point.items()}
     selected = _static_scalar(condition,point)
     if selected is None: return False
-    iy = by_axis.get(ky_axis,0)+by_axis.get(out_y_axis,0)*stride_y-pad_top
-    ix = by_axis.get(kx_axis,0)+by_axis.get(out_x_axis,0)*stride_x-pad_left
+    iy = by_axis.get(ky_axis,0)*dilation_y+by_axis.get(out_y_axis,0)*stride_y-pad_top
+    ix = by_axis.get(kx_axis,0)*dilation_x+by_axis.get(out_x_axis,0)*stride_x-pad_left
     if (bool(selected) is select_true) != (0 <= iy < in_h and 0 <= ix < in_w): return False
   return True
 
 def _conv_zero_padding(feature_aff:tuple[dict[int,int],int], condition:UOp|None, select_true:bool, ranges:dict[int,int],
                        axes:tuple[int,int,int,int], in_h:int, in_w:int, kernel_h:int, kernel_w:int, out_h:int, out_w:int,
-                       stride_y:int, stride_x:int) -> tuple[int,int,int,int]|None:
+                       stride_y:int, stride_x:int, dilation_y:int=1, dilation_x:int=1) -> tuple[int,int,int,int]|None:
   if feature_aff[1] > 0: return None
   pad_top,pad_left = divmod(-feature_aff[1],in_w)
   if max(pad_top,pad_left) > 15: return None
-  pad_bottom = next((pad for pad in range(16) if (in_h+pad_top+pad-kernel_h)//stride_y+1 == out_h),-1)
-  pad_right = next((pad for pad in range(16) if (in_w+pad_left+pad-kernel_w)//stride_x+1 == out_w),-1)
-  if min(pad_bottom,pad_right) < 0 or not _proves_conv_zero_padding(condition,select_true,ranges,axes,
-                                                                   in_h,in_w,stride_y,stride_x,pad_top,pad_left): return None
+  effective_h, effective_w = (kernel_h-1)*dilation_y+1, (kernel_w-1)*dilation_x+1
+  pad_bottom = next((pad for pad in range(16) if (in_h+pad_top+pad-effective_h)//stride_y+1 == out_h),-1)
+  pad_right = next((pad for pad in range(16) if (in_w+pad_left+pad-effective_w)//stride_x+1 == out_w),-1)
+  if min(pad_bottom,pad_right) < 0 or condition is None and any((pad_top,pad_bottom,pad_left,pad_right)) or \
+     not _proves_conv_zero_padding(condition,select_true,ranges,axes,
+    in_h,in_w,stride_y,stride_x,pad_top,pad_left,dilation_y,dilation_x): return None
   return pad_top,pad_bottom,pad_left,pad_right
 
 def _static_index_selected(u:UOp, index:UOp, ranges:dict[int, int]) -> bool|None:
@@ -2218,7 +2221,7 @@ def lower_nhwc_spatial_contract_result(sink:UOp) -> RKLowerResult:
 
   align_in, input_c2 = 16, 8
   input_width_stride, output_width_stride = in_w, (out_h*out_w+3)&-4
-  tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,stride_y,input_width_stride,output_width_stride,
+  tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,(stride_y,stride_x),input_width_stride,output_width_stride,
                           align_in,use_nhwc=False,max_k_step=16)
   if tiling is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"NHWC convolution has no legal CBUF tile",reduce.op)
@@ -2307,7 +2310,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
   if any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
-  match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
+  match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
   if len(out_axes) == 4 and len(red_axes) == 1:
     point_in_channel_axis = red_axes[0]
     for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
@@ -2334,7 +2337,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
           if feature_aff[0] != expected_feature or padding is None: continue
           feature_count,weight_count,output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
           if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c,batch*out_c*out_h*out_w): continue
-          match = (feature,weight,batch,in_c,out_c,in_h,in_w,1,1,out_h,out_w,stride_y,stride_x,output_count,*padding)
+          match = (feature,weight,batch,in_c,out_c,in_h,in_w,1,1,out_h,out_w,stride_y,stride_x,1,1,output_count,*padding)
           break
         if match is not None: break
       if match is not None: break
@@ -2355,7 +2358,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
         in_h,in_w = min(shapes,key=lambda shape:abs(shape[0]-shape[1]))
         feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
         if (feature_count,weight_count,output_count) != (in_c*spatial,out_c*in_c,out_c*spatial): continue
-        match = (feature,weight,1,in_c,out_c,in_h,in_w,1,1,in_h,in_w,1,1,output_count,0,0,0,0)
+        match = (feature,weight,1,in_c,out_c,in_h,in_w,1,1,in_h,in_w,1,1,1,1,output_count,0,0,0,0)
         break
       if match is not None: break
   for feature_parsed,weight_parsed in (() if match is not None or len(red_axes) != 3 or len(out_axes) not in (3,4) else
@@ -2370,37 +2373,43 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
       out_c, out_h, out_w = (ranges[x] for x in (channel_axis,out_y_axis,out_x_axis))
       for in_channel_axis,kernel_y_axis,kernel_x_axis in permutations(red_axes):
         in_c, kernel_h, kernel_w = (ranges[x] for x in (in_channel_axis,kernel_y_axis,kernel_x_axis))
-        in_w = feature_aff[0].get(kernel_y_axis,0)
-        if in_w <= 0 or feature_aff[0].get(in_channel_axis,0)%in_w: continue
-        in_h = feature_aff[0][in_channel_axis]//in_w
-        stride_y_coeff, stride_x = feature_aff[0].get(out_y_axis,0), feature_aff[0].get(out_x_axis,0)
-        if stride_y_coeff <= 0 or stride_y_coeff%in_w: continue
-        stride_y = stride_y_coeff//in_w
-        if not 1 <= stride_y <= 7 or not 1 <= stride_x <= 7: continue
-        expected_out = {channel_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1}
-        expected_feature = {in_channel_axis:in_h*in_w,kernel_y_axis:in_w,kernel_x_axis:1,
-                            out_y_axis:stride_y*in_w,out_x_axis:stride_x}
-        if batch_axis is not None:
-          expected_out[batch_axis], expected_feature[batch_axis] = out_c*out_h*out_w, in_c*in_h*in_w
-        if out_aff[0] != expected_out or feature_aff[0] != expected_feature: continue
-        if weight_aff[0] != {channel_axis:in_c*kernel_h*kernel_w, in_channel_axis:kernel_h*kernel_w,
-                            kernel_y_axis:kernel_w, kernel_x_axis:1}: continue
-        padding = _conv_zero_padding(feature_aff,feature_parsed[1],feature_parsed[2],ranges,
-          (kernel_y_axis,kernel_x_axis,out_y_axis,out_x_axis),in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x)
-        if padding is None: continue
-        feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
-        if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c*kernel_h*kernel_w,
-                                                        batch*out_c*out_h*out_w): continue
-        match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count,*padding)
-        break
+        input_plane, kernel_y_coeff, dilation_x, stride_y_coeff, stride_x = (feature_aff[0].get(axis,0) for axis in
+          (in_channel_axis,kernel_y_axis,kernel_x_axis,out_y_axis,out_x_axis))
+        if min(input_plane,kernel_y_coeff,dilation_x,stride_y_coeff,stride_x) <= 0: continue
+        for in_w in range(1,33):
+          if input_plane%in_w or kernel_y_coeff%in_w or stride_y_coeff%in_w: continue
+          in_h, dilation_y, stride_y = input_plane//in_w, kernel_y_coeff//in_w, stride_y_coeff//in_w
+          if not 1 <= in_h <= 32 or not 1 <= stride_y <= 7 or not 1 <= stride_x <= 7 or \
+             not 1 <= dilation_y <= 32 or not 1 <= dilation_x <= 32: continue
+          expected_out = {channel_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1}
+          expected_feature = {in_channel_axis:in_h*in_w,kernel_y_axis:dilation_y*in_w,kernel_x_axis:dilation_x,
+                              out_y_axis:stride_y*in_w,out_x_axis:stride_x}
+          if batch_axis is not None:
+            expected_out[batch_axis], expected_feature[batch_axis] = out_c*out_h*out_w, in_c*in_h*in_w
+          if out_aff[0] != expected_out or feature_aff[0] != expected_feature: continue
+          if weight_aff[0] != {channel_axis:in_c*kernel_h*kernel_w, in_channel_axis:kernel_h*kernel_w,
+                              kernel_y_axis:kernel_w, kernel_x_axis:1}: continue
+          padding = _conv_zero_padding(feature_aff,feature_parsed[1],feature_parsed[2],ranges,
+            (kernel_y_axis,kernel_x_axis,out_y_axis,out_x_axis),in_h,in_w,kernel_h,kernel_w,out_h,out_w,
+            stride_y,stride_x,dilation_y,dilation_x)
+          if padding is None: continue
+          feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
+          if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c*kernel_h*kernel_w,
+                                                          batch*out_c*out_h*out_w): continue
+          match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,
+                   dilation_y,dilation_x,output_count,*padding)
+          break
+        if match is not None: break
       if match is not None: break
     if match is not None: break
   if match is None: return _not_applicable()
-  feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count,pt,pb,pl,pr = match
+  feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,dilation_y,dilation_x,\
+    output_count,pt,pb,pl,pr = match
   if in_c not in (1,2,3,4,16) or not 1 <= out_c <= 16 or not 1 <= kernel_h <= 3 or not 1 <= kernel_w <= 3 or \
      max(in_h,in_w) > 32 or batch > 4:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
-      f"direct spatial convolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w},S={stride_y}x{stride_x}",
+      f"direct spatial convolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w},"
+      f"S={stride_y}x{stride_x},D={dilation_y}x{dilation_x}",
       reduce.op)
 
   align_in, input_c2 = (8,in_c) if in_c <= 4 else (16,8)
@@ -2455,14 +2464,16 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
                            padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
   output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
                            kind=RKLayoutKind.CONV_OUTPUT)
-  tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,stride_y,input_width_stride,output_width_stride,
-                          align_in,use_nhwc=in_c <= 4,max_k_step=out_c,padding=(pt,pb,pl,pr))
+  tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,(stride_y,stride_x),input_width_stride,output_width_stride,
+                          align_in,use_nhwc=in_c <= 4,max_k_step=out_c,padding=(pt,pb,pl,pr),
+                          dilation=(dilation_y,dilation_x))
   if tiling is None or tiling.split is not RKConvSplit.NONE:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,"direct convolution needs an unlegalized CBUF split",reduce.op)
   for b in range(batch):
     conv_plan = RKConvPlan(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),RKTensorRef(packed_weight,weight_layout),
-      in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride,tiling,pt,pb,pl,pr)
+      in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride,tiling,
+      pt,pb,pl,pr,dilation_y,dilation_x)
     steps.extend(legalize_conv_plan(conv_plan))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
                              batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,

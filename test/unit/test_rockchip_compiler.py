@@ -1715,6 +1715,24 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertLessEqual(plan_cost(result.plan).task_count,limit)
         self.assertFalse(contains_uop(result.plan))
 
+  def test_rgb_dilated_convolution_emits_typed_atrous_fields(self):
+    source = Tensor.empty(4,3,11,28,dtype=dtypes.half).realize()
+    weight = Tensor.empty(4,3,3,3,dtype=dtypes.half).realize()
+    for dilation,expected,limit in ((2,(2,2),120),((2,1),(2,1),170)):
+      with self.subTest(dilation=dilation):
+        result = lower_spatial_contract_result(sink(source.conv2d(weight,dilation=dilation)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        convs = [step for step in result.plan.steps if isinstance(step,RKConvTask)]
+        self.assertEqual([(step.dilation_y,step.dilation_x) for step in convs],[expected]*4)
+        image = emit_program(result.plan)
+        atrous = [next((command>>16)&0xffffffff for command in stage.commands if command&0xffff == rk.REG_CNA_CONV_CON3)
+                  for stage in image.stages if stage.engine is RKEngine.CONV]
+        self.assertEqual(atrous,[((expected[0]-1)<<21)|((expected[1]-1)<<16)|9]*4)
+        self.assertLessEqual(plan_cost(result.plan).task_count,limit)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_pointwise_convolution_uses_direct_cna_task(self):
     for channels,size in ((4,9),(16,8)):
       with self.subTest(channels=channels,size=size):

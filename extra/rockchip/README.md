@@ -1777,3 +1777,25 @@ as `wip-vector-matrix-cna-k31-fp16-partial-rounding.patch` (SHA-256
 `4a5ee50cccb3847bc05d96d52fd9e5524dedd6e7119289f5765be0c7d3bb96de`). A future
 retry requires a proven FP32 partial-output/accumulation path, not relaxed
 tolerance or more FP16 tiles.
+
+## Native atrous convolution
+
+Spatial convolution plans and tasks now carry independent X/Y dilation. The
+CBUF planner uses the effective kernel size `(kernel-1)*dilation+1`, while the
+emitter writes Rockchip's five-bit `ATROUS_{X,Y}_DILATION` fields as the number
+of inserted feature-map positions (`dilation-1`). Affine recognition derives
+dilation from the feature access map instead of matching a Tensor operation or
+test shape. Unmasked inputs may no longer acquire inferred trailing padding;
+nonzero padding still requires an exact static zero-mask proof.
+
+Both unchanged `test_dilated_conv2d` subcases—dilation 2x2 and 2x1—pass on
+RK3588 with `ROCKCHIP_FALLBACK=0` in 35.61 seconds. The current schedules use
+117 and 166 tasks respectively, including four real CONV tasks plus bounded
+native packing, so this is an honest but selector-heavy correctness milestone.
+A deterministic hardware regression checks the official tolerance and CONV
+telemetry, while the compiler regression checks typed dilation and exact
+`CNA_CONV_CON3` words. All 159 compiler/image tests plus 59 subtests pass;
+five direct-CNA hardware regressions plus two dilation subtests pass in 52.48
+seconds; mypy checks 228 files and Ruff is clean. Expected coverage is now
+`202 native / 40 frontend / 170 failed / 13 skipped`; `201/40/171/13` remains
+the authoritative complete census until rerun.

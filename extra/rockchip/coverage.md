@@ -3774,3 +3774,26 @@ change remains. The exact rejected code is archived at
 with SHA-256 `4a5ee50cccb3847bc05d96d52fd9e5524dedd6e7119289f5765be0c7d3bb96de`.
 Future work must identify a hardware FP32 partial-output/accumulation contract;
 raising tolerance or accepting FP16 partial rounding is explicitly excluded.
+
+## Focused native dilation gain
+
+RKConvPlan and RKConvTask now retain independent X/Y dilation through CBUF
+planning, legalization, and register emission. Effective kernel geometry drives
+output dimensions and CBUF row pressure; `CNA_CONV_CON3` receives
+`(dilation_y-1)<<21 | (dilation_x-1)<<16` in addition to the existing stride
+fields. This comes directly from the local RK3588 register specification, whose
+atrous value is the number of inserted feature-map positions.
+
+The unchanged `test_dilated_conv2d` passes both dilation 2 and `(2,1)` subcases
+in 35.61 seconds with `ROCKCHIP_FALLBACK=0`. Their plans contain 117 and 166
+tasks and 1,257,280 and 1,562,384 constant bytes; each uses four CONV tasks and
+remains visibly a selector-heavy correctness fallback. No task/constant ceiling
+or tolerance changed. The permanent random hardware regression passes both
+subcases at `rtol=1e-3, atol=1e-6`, and exact compiler tests cover the typed
+dilation fields and emitted register values.
+
+Validation: 159 compiler/image tests plus 59 subtests pass with `-n12`; five
+existing/new direct-CNA hardware tests plus two subtests pass in 52.48 seconds;
+mypy over 228 files and Ruff are clean. Focused expected coverage becomes
+`202/40/170/13`. The complete authoritative census remains `201/40/171/13`
+until an uncached 425-method rerun.

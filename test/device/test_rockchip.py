@@ -277,6 +277,26 @@ class TestRockchip(unittest.TestCase):
     kernels = [event for event in drain() if event["kind"] == "kernel"]
     self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 2 for event in kernels))
 
+  def test_rgb_dilated_spatial_conv_uses_cna(self):
+    rng = np.random.default_rng(41)
+    x = rng.uniform(-1,1,(4,3,11,28)).astype(np.float16)
+    weight = rng.uniform(-1,1,(4,3,3,3)).astype(np.float16)
+    for dilation in (2,(2,1)):
+      with self.subTest(dilation=dilation):
+        old_telemetry = os.environ.get("ROCKCHIP_TELEMETRY")
+        os.environ["ROCKCHIP_TELEMETRY"] = "memory"
+        clear()
+        try:
+          actual = Tensor(x,device="ROCKCHIP").realize().conv2d(
+            Tensor(weight,device="ROCKCHIP").realize(),dilation=dilation).realize().numpy()
+        finally:
+          if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY",None)
+          else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+        expected = Tensor(x,device="CPU").conv2d(Tensor(weight,device="CPU"),dilation=dilation).numpy()
+        np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
+        kernels = [event for event in drain() if event["kind"] == "kernel"]
+        self.assertTrue(any(event.get("engine_counts",{}).get("CONV") == 4 for event in kernels))
+
   def test_pointwise_spatial_conv_uses_cna(self):
     rng = np.random.default_rng(23)
     x = rng.uniform(-1,1,(1,16,8,8)).astype(np.float16)

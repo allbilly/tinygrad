@@ -32,16 +32,24 @@ def _pointwise_k_step(in_channels:int, out_channels:int, feature_banks:int) -> i
     if (step:=min(out_channels,maximum)//granule*granule): return min(32,step)
   return 1
 
-def plan_conv_cbuf(in_h:int, in_w:int, in_channels:int, out_channels:int, kernel_h:int, kernel_w:int, stride:int=1,
+def plan_conv_cbuf(in_h:int, in_w:int, in_channels:int, out_channels:int, kernel_h:int, kernel_w:int,
+                   stride:int|tuple[int,int]=1,
                    width_stride:int|None=None, output_width_stride:int|None=None, aligned_in:int|None=None,
-                   use_nhwc:bool=False, max_k_step:int=32, padding:tuple[int,int,int,int]=(0,0,0,0)) -> RKConvTiling|None:
+                   use_nhwc:bool=False, max_k_step:int=32, padding:tuple[int,int,int,int]=(0,0,0,0),
+                   dilation:tuple[int,int]=(1,1)) -> RKConvTiling|None:
   """Plan dense FP16 convolution tiles from simultaneous RK3588 feature/weight CBUF pressure."""
-  if min(in_h,in_w,in_channels,out_channels,kernel_h,kernel_w,stride,max_k_step) <= 0 or stride > 7 or \
+  dilation_y,dilation_x = dilation
+  stride_y,stride_x = (stride,stride) if isinstance(stride,int) else stride
+  if min(in_h,in_w,in_channels,out_channels,kernel_h,kernel_w,stride_y,stride_x,max_k_step,dilation_y,dilation_x) <= 0 or \
+     max(stride_y,stride_x) > 7 or max(dilation) > 32 or \
      min(padding) < 0 or max(padding) > 15 or kernel_h > in_h+padding[0]+padding[1] or kernel_w > in_w+padding[2]+padding[3]:
     return None
   width_stride = in_w if width_stride is None else width_stride
   pt,pb,pl,pr = padding
-  spatial, out_h, out_w = kernel_h != 1 or kernel_w != 1, (in_h+pt+pb-kernel_h)//stride+1, (in_w+pl+pr-kernel_w)//stride+1
+  effective_h, effective_w = (kernel_h-1)*dilation_y+1, (kernel_w-1)*dilation_x+1
+  if effective_h > in_h+pt+pb or effective_w > in_w+pl+pr: return None
+  spatial, out_h, out_w = kernel_h != 1 or kernel_w != 1, \
+    (in_h+pt+pb-effective_h)//stride_y+1, (in_w+pl+pr-effective_w)//stride_x+1
   output_width_stride = out_h*out_w if output_width_stride is None else output_width_stride
   aligned_in = (8 if in_channels <= 4 else _ceildiv(in_channels,32)*32 if not spatial and in_channels >= 32 else _ceildiv(in_channels,16)*16) \
     if aligned_in is None else aligned_in
@@ -49,7 +57,7 @@ def plan_conv_cbuf(in_h:int, in_w:int, in_channels:int, out_channels:int, kernel
   row_bytes, weight_bytes_per_k = width_stride*aligned_in*2, kernel_h*kernel_w*aligned_in*2
   full_weight_banks = max(1,_ceildiv(weight_bytes_per_k*out_channels,_BANK_BYTES))
   even_rows = (_ceildiv(2*_BANK_BYTES,row_bytes)+1)&-2
-  feature_grains = in_h+kernel_h if use_nhwc and spatial else min(in_h+kernel_h,even_rows)
+  feature_grains = in_h+effective_h if use_nhwc and spatial else min(in_h+effective_h,even_rows)
   k_step = out_channels
   if spatial and (full_weight_banks > 3 or feature_grains < in_h): k_step = min(32,out_channels)
   elif not spatial and in_channels >= 32:
@@ -64,11 +72,11 @@ def plan_conv_cbuf(in_h:int, in_w:int, in_channels:int, out_channels:int, kernel
   max_input_rows = max(1,_ENTRIES_PER_BANK*data_banks//entries)
   if use_nhwc and spatial:
     max_input_rows = min(max_input_rows,max(1,((_CBUF_BANKS-1)//2)*_BANK_BYTES//row_bytes))
-    headroom = 2*kernel_h
+    headroom = 2*effective_h
   else:
     if spatial: max_input_rows = min(max_input_rows,even_rows)
-    headroom = 2*kernel_h if spatial and max(kernel_h,kernel_w) >= 5 else kernel_h
-  y_step = min(out_h,max(1,(max_input_rows-headroom)//stride+1))
+    headroom = 2*effective_h if spatial and max(effective_h,effective_w) >= 5 else effective_h
+  y_step = min(out_h,max(1,(max_input_rows-headroom)//stride_y+1))
   if not spatial and in_channels > 64: y_step = min(y_step,even_rows+1)
   needed = max(1,_ceildiv(row_bytes*feature_grains,_BANK_BYTES))
   if needed > data_banks: y_step = min(y_step,max(1,out_h*data_banks//needed))
@@ -81,12 +89,12 @@ def plan_conv_cbuf(in_h:int, in_w:int, in_channels:int, out_channels:int, kernel
   y_windows, k_windows = _windows(out_h,y_step), _windows(out_channels,k_step)
   tiles = []
   for y_start,output_height in y_windows:
-    input_height = in_h if any(padding) else min((output_height-1)*stride+kernel_h,in_h-y_start*stride)
+    input_height = in_h if any(padding) else min((output_height-1)*stride_y+effective_h,in_h-y_start*stride_y)
     actual_data_banks = max(1,_ceildiv(entries*input_height,_ENTRIES_PER_BANK))
     for k_start,channels in k_windows:
       actual_weight_banks = max(1,_ceildiv(weight_bytes_per_k*channels,_BANK_BYTES))
       if actual_data_banks+actual_weight_banks > _CBUF_BANKS: return None
-      tiles.append(RKConvTile(y_start,y_start*stride,input_height,output_height,k_start,channels,
+      tiles.append(RKConvTile(y_start,y_start*stride_y,input_height,output_height,k_start,channels,
                               actual_data_banks,actual_weight_banks))
   return RKConvTiling(split,y_step,k_step,tuple(tiles))
 
@@ -122,5 +130,5 @@ def legalize_conv_plan(plan:RKConvPlan) -> tuple[RKConvTask, ...]:
       plan.kernel_height,plan.kernel_width,tile.output_height,plan.output_width,plan.stride_y,plan.stride_x,
       plan.input_width_stride,plan.output_width_stride,
       tile.data_banks if use_planned_banks else None,tile.weight_banks if use_planned_banks else None,
-      plan.pad_top,plan.pad_bottom,plan.pad_left,plan.pad_right))
+      plan.pad_top,plan.pad_bottom,plan.pad_left,plan.pad_right,plan.dilation_y,plan.dilation_x))
   return tuple(tasks)

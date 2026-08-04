@@ -236,6 +236,8 @@ class RKConvTask:
   pad_bottom: int = 0
   pad_left: int = 0
   pad_right: int = 0
+  dilation_y: int = 1
+  dilation_x: int = 1
 
 @dataclass(frozen=True)
 class RKConvTile:
@@ -284,6 +286,8 @@ class RKConvPlan:
   pad_bottom: int = 0
   pad_left: int = 0
   pad_right: int = 0
+  dilation_y: int = 1
+  dilation_x: int = 1
 
 @dataclass(frozen=True)
 class RKReduce:

@@ -347,10 +347,13 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
   ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
     plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
   sy, sx = plan.stride_y, plan.stride_x
+  dy, dx = plan.dilation_y, plan.dilation_x
   pt, pb, pl, pr = plan.pad_top, plan.pad_bottom, plan.pad_left, plan.pad_right
+  effective_h, effective_w = (kh-1)*dy+1, (kw-1)*dx+1
   if not 1 <= ic <= 16 or not 1 <= oc <= 16 or not 1 <= kh <= 3 or not 1 <= kw <= 3 or \
      min(pt,pb,pl,pr) < 0 or max(pt,pb,pl,pr) > 15 or \
-     oh != (ih+pt+pb-kh)//sy+1 or ow != (iw+pl+pr-kw)//sx+1 or not 1 <= sy <= 7 or not 1 <= sx <= 7 or \
+     oh != (ih+pt+pb-effective_h)//sy+1 or ow != (iw+pl+pr-effective_w)//sx+1 or \
+     not 1 <= sy <= 7 or not 1 <= sx <= 7 or not 1 <= dy <= 32 or not 1 <= dx <= 32 or \
      not 1 <= ih <= 32 or not 1 <= iw <= 32:
     raise ValueError("unsupported direct spatial-convolution contract")
   align_ic, use_nhwc = (8,True) if ic <= 4 else (16,False)
@@ -383,7 +386,7 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
     _command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0xe),
     _command(_TARGET_CNA, rk.REG_CNA_CONV_CON1, (0x60000000|((7+ic)<<12) if use_nhwc else 0)|0x120),
     _command(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4),
-    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, (sy<<3)|sx),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, ((dy-1)<<21)|((dx-1)<<16)|(sy<<3)|sx),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, (width_stride<<16)|ih),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((ic-1)<<16)|align_ic),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, ow),
