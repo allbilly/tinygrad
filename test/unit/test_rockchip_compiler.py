@@ -1457,6 +1457,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(result.plan.stages,(RKCopyStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),9,dtypes.int),))
     self.assertFalse(contains_uop(result.plan))
 
+  def test_int32_or_all_ones_is_exact_constant_fill(self):
+    source = Tensor([0,1,-1,0x1234567],dtype=dtypes.int,device="ROCKCHIP")
+    result = lower_native(sink(source | 0xffffffff))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKDPUProgram)
+    assert isinstance(result.plan,RKDPUProgram)
+    self.assertTrue(all(isinstance(stage,RKALUStage) and stage.out_dtype is dtypes.int and
+                        stage.out_cvt_offset == 0xffffffff for stage in result.plan.stages))
+    self.assertFalse(contains_uop(result.plan))
+
   def test_fp16_multi_source_stack_keeps_semantic_map(self):
     sources = tuple(Tensor.empty(5,6,3,dtype=dtypes.half).realize() for _ in range(3))
     for dim in range(-1,3):

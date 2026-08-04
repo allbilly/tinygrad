@@ -1527,3 +1527,7 @@ FP32-to-int32 `BITCAST` is native without a conversion stage: the compiler
 selects the proven int32 all-bypass transport and preserves the source words
 verbatim. The unchanged strict `test_bitcast` method passes; this does not
 expand the claimed FP32 arithmetic contract.
+
+The exact integer identity `x | 0xFFFFFFFF == -1` is canonicalized to the
+native int32 constant-fill plan. The unchanged `test_int_or` passes without
+claiming a general integer bitwise ALU.

@@ -3354,3 +3354,15 @@ The unchanged plugin-driven `test_bitcast` passes natively in 0.90 seconds.
 This is one focused method gain, so the post-census expectation becomes
 `192 native / 40 frontend / 180 failed / 13 skipped`; the complete uncached
 `187/40/185/13` census remains authoritative until rerun.
+
+## Int32 OR-all-ones identity
+
+The compiler now recognizes an int32 OR with an all-one 32-bit constant as the
+constant result `-1`. It emits the established exact int32 fill using the DPU
+output conversion offset; the input tensor is never read or evaluated on the
+host. A 65-lane mixed/extreme device regression is exact.
+
+The unchanged `test_int_or` passes natively in 0.85 seconds. This does not
+claim arbitrary integer OR support. Combined focused expectation is now
+`193 native / 40 frontend / 179 failed / 13 skipped`, while
+`187/40/185/13` remains the last complete uncached census.

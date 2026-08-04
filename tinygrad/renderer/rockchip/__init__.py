@@ -335,6 +335,11 @@ def _lower_fused_lerp(output:RKArg, operands:tuple[UOp,UOp,UOp], count:int) -> R
       f"fused ALU needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", Ops.ADD)
   return _native(program)
 
+def _int_fill_program(output:RKArg, count:int, value:int) -> RKDPUProgram:
+  tile = 64
+  return RKDPUProgram(tuple(RKALUStage(Ops.ADD,RKArg(output.kind,output.index,start*4),0.0,0.0,min(tile,count-start),
+    dtypes.int,value&0xffffffff) for start in range(0,count,tile)))
+
 def lower_dpu_result(sink:UOp) -> RKLowerResult:
   """Lower one contiguous expression or native wide constant fill to a typed DPU result."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
@@ -359,6 +364,9 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
      identity.src[0].dtype is dtypes.float and identity.src[0].src[0].op is Ops.PARAM and identity.src[0].src[1].key == out_index.key:
     # All-bypass int32 transport preserves each source word; no FP32 arithmetic or conversion is involved.
     return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].src[0].arg.slot),count,dtypes.int),)))
+  if store.src[0].dtype is dtypes.int and identity.op is Ops.OR and any(
+      operand.op is Ops.CONST and int(operand.arg)&0xffffffff == 0xffffffff for operand in identity.src):
+    return _native(_int_fill_program(output,count,-1))
   if store.src[0].dtype is dtypes.bool:
     if identity.op is Ops.CONST:
       return _native(RKDPUProgram((RKCopyStage(output,bool(identity.arg),count,dtypes.bool),)))
@@ -401,10 +409,7 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       if store.src[0].dtype is dtypes.int:
         if not root.is_integer() or not dtypes.int.min <= root <= dtypes.int.max:
           return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"int fill value {root!r} is outside signed int32", store.src[1].op)
-        tile = 64
-        fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, 0.0, min(tile, count-start),
-                                     dtypes.int, int(root)&0xffffffff) for start in range(0, count, tile))
-        return _native(RKDPUProgram(fill_stages))
+        return _native(_int_fill_program(output,count,int(root)))
       if not _fp16_exact(root):
         return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
           f"{store.src[0].dtype.name} fill value {root!r} is not exactly representable by the FP16 DPU input", store.src[1].op)

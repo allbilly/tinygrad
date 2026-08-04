@@ -52,6 +52,11 @@ class TestRockchip(unittest.TestCase):
     source = Tensor(words.view(np.float32),device="ROCKCHIP",dtype=dtypes.float)
     np.testing.assert_equal(source.bitcast(dtypes.int).realize().numpy().view(np.uint32),words)
 
+  def test_int32_or_all_ones_uses_exact_fill(self):
+    values = np.resize(np.array([dtypes.int.min,-1234,-1,0,1,1234,dtypes.int.max],dtype=np.int32),65)
+    actual = (Tensor(values,device="ROCKCHIP",dtype=dtypes.int) | 0xffffffff).realize().numpy()
+    np.testing.assert_equal(actual,np.full(65,-1,dtype=np.int32))
+
   def test_fp16_multi_source_stack_uses_npu_selector(self):
     values = tuple((np.arange(90,dtype=np.float16).reshape(5,6,3)+offset) for offset in (0,100,200))
     sources = tuple(Tensor(value,device="ROCKCHIP",dtype=dtypes.half).realize() for value in values)
