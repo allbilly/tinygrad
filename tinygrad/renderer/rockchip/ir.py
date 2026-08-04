@@ -170,8 +170,8 @@ class RKContract:
   compact_output: bool = False
 
 @dataclass(frozen=True)
-class RKSpatialConv:
-  """One proven FP16 spatial convolution over packed RK3588 surfaces."""
+class RKConvTask:
+  """One fully legalized FP16 CONV engine task over packed RK3588 surfaces."""
   out: RKTensorRef
   src: RKTensorRef
   weight: RKTensorRef
@@ -187,6 +187,8 @@ class RKSpatialConv:
   stride_x: int
   input_width_stride: int
   output_width_stride: int
+  data_banks: int|None = None
+  weight_banks: int|None = None
 
 @dataclass(frozen=True)
 class RKConvTile:
@@ -211,6 +213,26 @@ class RKConvTiling:
   tiles: tuple[RKConvTile, ...]
   def __post_init__(self):
     if not self.tiles or min(self.y_step,self.k_step) <= 0: raise ValueError("empty RK3588 convolution tiling")
+
+@dataclass(frozen=True)
+class RKConvPlan:
+  """Logical dense convolution over already-legal physical surfaces, before task tiling."""
+  out: RKTensorRef
+  src: RKTensorRef
+  weight: RKTensorRef
+  in_channels: int
+  out_channels: int
+  input_height: int
+  input_width: int
+  kernel_height: int
+  kernel_width: int
+  output_height: int
+  output_width: int
+  stride_y: int
+  stride_x: int
+  input_width_stride: int
+  output_width_stride: int
+  tiling: RKConvTiling
 
 @dataclass(frozen=True)
 class RKReduce:
@@ -242,7 +264,7 @@ class RKReformatPlan:
     if len(self.mapping) != out_count or any(index < -1 or index >= src_count for index in self.mapping):
       raise ValueError("RKReformatPlan mapping is outside its logical surfaces")
 
-RKProgramStep = RKDPUProgram|RKContract|RKSpatialConv|RKReduce
+RKProgramStep = RKDPUProgram|RKContract|RKConvTask|RKReduce
 
 @dataclass(frozen=True)
 class RKProgram:
@@ -303,7 +325,7 @@ class RKLowerKind(Enum):
 @dataclass(frozen=True)
 class RKLowerResult:
   kind: RKLowerKind
-  plan: RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKLegalizedReformat|RKProgram|None = None
+  plan: RKDPUProgram|RKContract|RKConvTask|RKReduce|RKLegalizedReformat|RKProgram|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     valid = {RKLowerKind.NATIVE:self.plan is not None and self.reject is None,

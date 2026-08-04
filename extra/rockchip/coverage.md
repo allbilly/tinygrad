@@ -1851,7 +1851,7 @@ im2col-like affine input expansion, 12 packed weights, only two performed the
 contraction, and roughly 81 restored NCHW output order. A new exact affine
 matcher identifies dense stride-one NCHW/OIHW spatial contractions from their
 complete coefficient maps and lowers the proven channel-4 family to typed
-`RKSpatialConv` steps. All input, weight, and output layout conversion remains
+`RKConvTask` steps. All input, weight, and output layout conversion remains
 in NPU selector tasks; the runtime executes no packing or tensor semantics.
 
 The direct batched plan is 92 tasks, 4,208 command words, 92 resets, 700,384
@@ -2329,7 +2329,7 @@ contracts that are useful independently of its Python execution harness:
 The strict compiler ports the first two capabilities. Affine convolution
 recognition now recovers input height/width and independent stride from index
 coefficients, validates the exact valid-convolution output geometry, and emits
-typed `RKSpatialConv` plans for FP16 `IC in {1,2,3,4,16}`, stride components
+typed `RKConvTask` plans for FP16 `IC in {1,2,3,4,16}`, stride components
 1--7, and the currently proven dimension/tile limits. Existing NPU selector
 plans pack logical NCHW/OIHW surfaces and unpack the CNA result; the runtime
 does not gain NumPy or host tensor semantics.
@@ -2883,3 +2883,37 @@ unchanged RK3588 test passes in 18.37 seconds. The compiler intentionally does
 not emit Y or YxK plans yet: overlap-address, DMA-surface, and output-offset
 fields still require focused hardware proof. This milestone changes no
 TestOps outcome, task ceiling, tolerance, or CPU execution policy.
+
+## Semantic convolution versus physical CONV tasks
+
+The physical `RKSpatialConv` name has been replaced by `RKConvTask`, and a new
+UOp-free `RKConvPlan` retains the full convolution geometry and
+`RKConvTiling` decision before task legalization. Existing direct NCHW
+convolution lowering now constructs this semantic plan and lowers its proven
+no-split case through `legalize_conv_plan`; established command behavior and
+focused hardware results remain unchanged.
+
+The legalizer also derives the exact Y-tile address contract without executing
+host semantics:
+
+```text
+CNA input base += input_y_start * packed_input_row_bytes
+DPU output base += output_y_start * logical_output_width * 16 bytes
+CNA DMA surface stride remains based on the full backing surface
+```
+
+For the official 64x64, IC16, OC6, 5x2 large-input geometry this yields three
+physical tiles with `(input_h, output_h)` of `(27,23)`, `(27,23)`, and
+`(18,14)`, input byte offsets `0`, `23552`, and `47104`, and output byte
+offsets `0`, `23184`, and `46368`. This is compiler-verified only for now:
+the existing lowering still rejects the graph before hardware because its
+large NCHW-to-CNA packing has no efficient native reformat. `conv_grok` and
+Mesa both perform that public-input packing on the CPU, so neither provides a
+non-cheating implementation to copy. K tiling likewise requires an explicit
+packed-weight reformat and remains a typed legalization error.
+
+The focused host compiler gate passes 125 tests plus 31 subtests, mypy passes,
+Ruff passes for all touched Python modules, and the complete serialized RK3588
+gate passes 96 tests plus 66 subtests in 805.78 seconds without a timeout,
+reset error, invalid submission, or process abort. This milestone adds no
+TestOps pass and leaves the authoritative 172/40/200/13 census unchanged.

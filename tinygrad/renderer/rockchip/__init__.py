@@ -13,8 +13,8 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
   RKALUStage, RKFusedALUStage as RKFusedALUStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKConvSplit as RKConvSplit,
-  RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKConvTask, RKConvPlan as RKConvPlan,
+  RKConvSplit as RKConvSplit, RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan,
   RKLegalizedReformat, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
@@ -22,7 +22,7 @@ from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, 
   patch_image as patch_image, validate_image as validate_image)
 from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint as rk_fingerprint
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
-from tinygrad.renderer.rockchip.conv import plan_conv_cbuf as plan_conv_cbuf
+from tinygrad.renderer.rockchip.conv import plan_conv_cbuf as plan_conv_cbuf, legalize_conv_plan as legalize_conv_plan
 
 RK_MAX_CONSTANT_BYTES = 2*1024*1024
 RK_MAX_AFFINE_VISITS = 65536
@@ -122,7 +122,7 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
      (1 if any(not row for row in rows) else 0)+sum(1 if safe else 3 for safe in direct) > RK_MAX_PROGRAM_STAGES: return None
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   if not all(direct): scratch += (RKScratch(max((chunk[3] for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
                                                   if any(not row for row in rows) else [])
   for (start,base,end,align_in,tile,payload),safe in zip(chunks,direct):
     span, align_out = end-base, max(32, (len(tile)+31)&-32)
@@ -165,7 +165,7 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
         reads += math.prod(step.epilogue.bias.layout.logical_shape)*step.epilogue.bias.layout.dtype.itemsize
       writes += math.prod(step.out.layout.logical_shape)*step.out.layout.dtype.itemsize
       macs += m*n*k
-    elif isinstance(step, RKSpatialConv):
+    elif isinstance(step, RKConvTask):
       reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
       reads += math.prod(step.weight.layout.logical_shape)*step.weight.layout.dtype.itemsize
       writes += step.out_channels*step.output_height*step.output_width*2
@@ -233,7 +233,7 @@ def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[lis
   return two_level if two_level is not None and plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
     plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
-def _finish_program(steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
+def _finish_program(steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
   """Give every ordered DPU step the program's final resource table."""
   return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
 
@@ -272,7 +272,7 @@ def _constant_run_selector_program(output:RKArg, source:RKArg, input_count:int, 
     if start%8 or end-start < 32 or (end-start)%8 or not 0 <= mapping[start] < input_count: return None
     runs.append((start,end,mapping[start]))
     start = end
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   for start,end,source_index in runs:
     head = _selector_program(RKArg(output.kind,output.index,output.addend+start*2), source, input_count, [[source_index]]*8, scratch)
     if head is None: return None
@@ -290,7 +290,7 @@ def _constant_run_selector_program(output:RKArg, source:RKArg, input_count:int, 
   cost = plan_cost(completed)
   return completed if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
-def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKLegalizedReformat|RKProgram) -> RKLowerResult:
+def _native(plan:RKDPUProgram|RKContract|RKConvTask|RKReduce|RKLegalizedReformat|RKProgram) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
@@ -305,7 +305,7 @@ def _lower_fused_lerp(output:RKArg, operands:tuple[UOp,UOp,UOp], count:int) -> R
   source = RKArg(RKBufferKind.ARG, x.src[0].arg.slot)
   x_float = RKArg(RKBufferKind.SCRATCH, 0)
   scratch = (RKScratch((((count+31)//32)*32+32)*4),)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   for start in range(0,count,32):
     valid = min(32,count-start)
     lhs_layout = RKLayout((1,valid), (1,32), (64,2), dtypes.half, padding=((0,0),(0,32-valid)))
@@ -737,7 +737,7 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   packed = RKArg(RKBufferKind.SCRATCH, 1)
   max_align = max((max(32, (end-base+31)&-32) for base,end,_ in chunks), default=32)
   scratch:list[RKScratch] = [RKScratch((((count+31)&-32)+16)*2), RKScratch(max_align*2)]
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   if any(all(x < 0 for x in mapping[start:start+16]) for start in range(0, count, 16)):
     steps.append(RKDPUProgram((RKALUStage(Ops.ADD, expanded, 0.0, 0.0, count),)))
   for base,end,blocks in chunks:
@@ -778,7 +778,7 @@ def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   substitutions:dict[UOp,UOp] = {}
   remaps:dict[RKArg,RKArg] = {}
   scratch:tuple[RKScratch, ...] = ()
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   for source_index in broadcasts:
     src_count = int(source_index.src[0].src[0].arg)
     mapping = [-1]*count
@@ -1007,7 +1007,7 @@ def lower_scalar_mul_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "scalar MUL source is not one dense reduction axis", value.op)
   packed = RKArg(RKBufferKind.SCRATCH, 0)
   scratch:tuple[RKScratch, ...] = (RKScratch(64),)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, 32),
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, packed, 0.0, 0.0, 32),
     RKALUStage(Ops.ADD, packed, RKArg(RKBufferKind.ARG, value.src[0].arg.slot), 0.0, count)), scratch)]
   operands:list[RKArg] = []
   for index in range(count):
@@ -1076,7 +1076,7 @@ def lower_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[term][output_index] = [source_index]
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine MUL output has holes", store.src[0].op)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   operands:list[RKArg] = []
   source = RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
@@ -1162,7 +1162,7 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "masked affine MUL output has holes", store.src[0].op)
   one = RKArg(RKBufferKind.SCRATCH, 0)
   scratch:tuple[RKScratch, ...] = (RKScratch(64),)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, one, 0.0, 1.0, 32),), scratch)]
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, one, 0.0, 1.0, 32),), scratch)]
   operands:list[RKArg] = []
   source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
   for value_rows,identity_rows in zip(selected, identities):
@@ -1249,7 +1249,7 @@ def lower_multi_source_affine_reduce_result(sink:UOp) -> RKLowerResult:
           return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "multi-source SUM inactive value is not zero", value.op)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-source SUM output has holes", store.src[0].op)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   partials:list[RKArg] = []
   for index,rows in selectors.items():
@@ -1384,7 +1384,7 @@ def lower_pointwise_affine_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"pointwise affine SUM surface has holes",Ops.INDEX)
 
   scratch:tuple[RKScratch,...] = ()
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   memo:dict[UOp,_Expr|RKArg|float] = {}
   for index,mapping in mappings.items():
     expanded = RKArg(RKBufferKind.SCRATCH,len(scratch))
@@ -1662,7 +1662,7 @@ def lower_depthwise_spatial_contract_result(sink:UOp) -> RKLowerResult:
   for b in range(batch):
     for channel in range(channels):
       tile = b*channels+channel
-      steps.append(RKSpatialConv(RKTensorRef(RKArg(packed_output.kind,packed_output.index,tile*out_plane*2),output_layout),
+      steps.append(RKConvTask(RKTensorRef(RKArg(packed_output.kind,packed_output.index,tile*out_plane*2),output_layout),
         RKTensorRef(RKArg(packed_input.kind,packed_input.index,tile*input_plane*2),input_layout),
         RKTensorRef(RKArg(packed_weight.kind,packed_weight.index,channel*kernel_h*kernel_w*32),weight_layout),
         1,2,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,in_w,out_width_stride))
@@ -1792,7 +1792,7 @@ def lower_grouped_spatial_contract_result(sink:UOp) -> RKLowerResult:
   for b in range(batch):
     for group in range(groups):
       tile = b*groups+group
-      steps.append(RKSpatialConv(RKTensorRef(RKArg(packed_output.kind,packed_output.index,tile*output_tile_count*2),output_layout),
+      steps.append(RKConvTask(RKTensorRef(RKArg(packed_output.kind,packed_output.index,tile*output_tile_count*2),output_layout),
         RKTensorRef(RKArg(packed_input.kind,packed_input.index,tile*input_tile_count*2),input_layout),
         RKTensorRef(RKArg(packed_weight.kind,packed_weight.index,group*weight_tile_count*2),weight_layout),
         in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride))
@@ -1919,7 +1919,7 @@ def lower_nhwc_spatial_contract_result(sink:UOp) -> RKLowerResult:
       weight_layout = RKLayout((kernel_h,kernel_w,tile_c,in_c),(kernel_h,kernel_w,tile_c,align_in),
         (kernel_w*tile_c*align_in*2,tile_c*align_in*2,align_in*2,2),dtypes.half,
         padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
-      steps.append(RKSpatialConv(
+      steps.append(RKConvTask(
         RKTensorRef(RKArg(packed_output.kind,packed_output.index,(b*len(channel_tiles)+tile)*output_tile_count*2),output_layout),
         RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
         RKTensorRef(RKArg(packed_weight.kind,packed_weight.index,weight_offsets[tile]*2),weight_layout),
@@ -2071,11 +2071,15 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
                            padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
   output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
                            kind=RKLayoutKind.CONV_OUTPUT)
+  tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,stride_y,input_width_stride,output_width_stride,
+                          align_in,use_nhwc=in_c <= 4,max_k_step=out_c)
+  if tiling is None or tiling.split is not RKConvSplit.NONE:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,"direct convolution needs an unlegalized CBUF split",reduce.op)
   for b in range(batch):
-    steps.append(RKSpatialConv(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
-      RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
-      RKTensorRef(packed_weight,weight_layout),in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,
-      stride_y,stride_x,input_width_stride,output_width_stride))
+    conv_plan = RKConvPlan(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
+      RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),RKTensorRef(packed_weight,weight_layout),
+      in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride,tiling)
+    steps.extend(legalize_conv_plan(conv_plan))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
                              batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,
                              max_outputs=selector_outputs)
@@ -2193,7 +2197,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
           out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
           source = rhs_columns[out_channel][reduction_index] if out_channel < n and reduction_index < k else -1
           b_selector.append([source] if source >= 0 else [])
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   if direct_lhs:
     # CMAC may read the allocator's page-rounded tail, but padded K lanes have zero weights and cannot affect the result.
@@ -2400,7 +2404,7 @@ def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[i
   surface_count, hwc_elements = pool_extent*8, ((pool_extent*8-1)//16)*16+32
   packed, hwc, atoms = (RKArg(RKBufferKind.SCRATCH, index) for index in range(3))
   scratch:tuple[RKScratch, ...] = (RKScratch(max(spec[2] for spec in specs)*2), RKScratch(hwc_elements*2), RKScratch(len(selectors)*16))
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   payloads:set[bytes] = set()
   height, width = pool_shape
   for output_index,(base,span,align_in,sentinel,row) in enumerate(specs):
@@ -2600,7 +2604,7 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   hwc_elements = ((surface_count-1)//16)*16+32
   scratch = (RKScratch(max(window[2] for window in windows)*2), RKScratch(hwc_elements*2))
   source = RKArg(RKBufferKind.ARG, value_index.src[0].arg.slot)
-  steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce] = []
+  steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   payloads:set[bytes] = set()
   height, width = pool_shape
   for base,span,align_in,sentinel,window_groups in windows:
@@ -2724,7 +2728,7 @@ class RockchipRenderer(Renderer):
       raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKContract): image = emit_contract(result.plan)
-    elif isinstance(result.plan, RKSpatialConv): image = emit_spatial_conv(result.plan)
+    elif isinstance(result.plan, RKConvTask): image = emit_spatial_conv(result.plan)
     elif isinstance(result.plan, RKPool): image = emit_pool(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
     elif isinstance(result.plan, RKLegalizedReformat): image = emit_reformat(result.plan)

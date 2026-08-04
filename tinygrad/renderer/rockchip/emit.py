@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
 from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKDPUStage,
-  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKPool, RKLegalizedReformat, RKProgram)
+  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKConvTask, RKReduce, RKPool, RKLegalizedReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
@@ -302,7 +302,7 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
     commands = tuple(mutable)
   return RKImage(target, (RKStage(RKEngine.CMAC, commands, tuple(relocs), RK_STAGE_RESET),), constants=plan.constants)
 
-def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RKImage:
+def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven channel-4/16 FP16 direct-convolution register families."""
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   plan.src.layout.validate_for(RKEngine.CONV)
@@ -320,8 +320,10 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
      not 1 <= ih <= 32 or not 1 <= iw <= 32:
     raise ValueError("unsupported direct spatial-convolution contract")
   align_ic, use_nhwc = (8,True) if ic <= 4 else (16,False)
-  input_shape = (ih,plan.input_width_stride,ic) if use_nhwc else ((ic+7)//8,ih,plan.input_width_stride,8)
-  if plan.src.layout.physical_shape != input_shape or \
+  input_shape = plan.src.layout.physical_shape
+  input_shape_ok = len(input_shape) == 3 and input_shape[0] >= ih and input_shape[1:] == (plan.input_width_stride,ic) if use_nhwc else \
+                   len(input_shape) == 4 and input_shape[0] == (ic+7)//8 and input_shape[1] >= ih and input_shape[2:] == (plan.input_width_stride,8)
+  if not input_shape_ok or \
      plan.weight.layout.physical_shape != (kh,kw,oc,align_ic):
     raise ValueError("direct convolution has invalid packed input or weight layout")
   align_oc, out_c2 = 16, 8
@@ -333,13 +335,16 @@ def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RK
   rows_per_two_banks = (((2*256*128+row_bytes-1)//row_bytes)+1)&-2
   feature_grains = ih if not is_spatial else ih+kh if use_nhwc else min(ih+kh,rows_per_two_banks)
   weight_bytes = kh*kw*align_ic*2
-  weight_banks = max(1,(weight_bytes*oc+32767)//32768)
-  data_banks = max(1,min(11,12-weight_banks)) if not is_spatial else \
-               11 if use_nhwc else min(11,max(1,(width_stride*feature_grains*align_ic*2+32767)//32768))
+  weight_banks = plan.weight_banks if plan.weight_banks is not None else max(1,(weight_bytes*oc+32767)//32768)
+  data_banks = plan.data_banks if plan.data_banks is not None else (max(1,min(11,12-weight_banks)) if not is_spatial else \
+               11 if use_nhwc else min(11,max(1,(width_stride*feature_grains*align_ic*2+32767)//32768)))
+  if min(data_banks,weight_banks) <= 0 or data_banks+weight_banks > 12: raise ValueError("invalid CONV CBUF bank allocation")
   row_entries = max(1,(width_stride*align_ic+31)//32)
   cbuf_entries = row_entries*ih*4 if align_ic < 16 else row_entries
   dma_line = width_stride if use_nhwc else width_stride*4
-  dma_surface = width_stride*(ih-1) if use_nhwc and ih > 1 else (width_stride*(ih-4) if not use_nhwc and ih > 4 else 0)
+  backing_height = input_shape[0] if use_nhwc else input_shape[1]
+  dma_surface = width_stride*(backing_height-1) if use_nhwc and backing_height > 1 else \
+                ((width_stride*(backing_height-4))&0xffffffff if not use_nhwc else 0)
   commands = (
     _command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0xe),
     _command(_TARGET_CNA, rk.REG_CNA_CONV_CON1, (0x60000000|((7+ic)<<12) if use_nhwc else 0)|0x120),
@@ -398,7 +403,7 @@ def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   for step in plan.steps:
     if isinstance(step, RKDPUProgram): images.append(emit_dpu(step, target))
     elif isinstance(step, RKContract): images.append(emit_contract(step, target))
-    elif isinstance(step, RKSpatialConv): images.append(emit_spatial_conv(step, target))
+    elif isinstance(step, RKConvTask): images.append(emit_spatial_conv(step, target))
     elif isinstance(step, RKPool): images.append(emit_pool(step, target))
     elif isinstance(step, RKReduce): images.append(emit_reduce(step, target))
     else: raise TypeError(f"unsupported Rockchip program step {type(step).__name__}")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tinygrad.renderer.rockchip.ir import RKConvSplit, RKConvTile, RKConvTiling
+from tinygrad.renderer.rockchip.ir import RKArg, RKTensorRef, RKConvSplit, RKConvTile, RKConvTiling, RKConvPlan, RKConvTask
 
 _CBUF_BANKS, _BANK_BYTES, _ENTRY_BYTES, _ENTRIES_PER_BANK = 12, 32768, 128, 256
 
@@ -87,3 +87,35 @@ def plan_conv_cbuf(in_h:int, in_w:int, in_channels:int, out_channels:int, kernel
       tiles.append(RKConvTile(y_start,y_start*stride,input_height,output_height,k_start,channels,
                               actual_data_banks,actual_weight_banks))
   return RKConvTiling(split,y_step,k_step,tuple(tiles))
+
+def legalize_conv_plan(plan:RKConvPlan) -> tuple[RKConvTask, ...]:
+  """Turn one logical Y-tiled convolution into physical tasks using surface-relative offsets.
+
+  K tiling remains outside this legalization step because a K slice is not contiguous in the
+  canonical packed-weight surface. Callers must first choose and materialize a K-tile layout.
+  """
+  if any(tile.k_start or tile.out_channels != plan.out_channels for tile in plan.tiling.tiles):
+    raise ValueError("CBUF K tiles require an explicit packed-weight reformat")
+  src_shape = plan.src.layout.physical_shape
+  if len(src_shape) == 3:
+    backing_height, src_y_stride = src_shape[0], plan.src.layout.strides_bytes[0]
+  elif len(src_shape) == 4:
+    backing_height, src_y_stride = src_shape[1], plan.src.layout.strides_bytes[1]
+  else: raise ValueError("convolution source must be HWC or C1HWC2")
+  if backing_height < plan.input_height: raise ValueError("convolution source surface is shorter than its logical input")
+  output_row_bytes = plan.output_width*16
+  tasks = []
+  use_planned_banks = plan.tiling.split is not RKConvSplit.NONE
+  for tile in plan.tiling.tiles:
+    if tile.input_y_start+tile.input_height > plan.input_height or tile.y_start+tile.output_height > plan.output_height:
+      raise ValueError("convolution tile exceeds its logical surface")
+    tasks.append(RKConvTask(
+      RKTensorRef(RKArg(plan.out.buffer.kind,plan.out.buffer.index,
+                        plan.out.buffer.addend+tile.y_start*output_row_bytes),plan.out.layout),
+      RKTensorRef(RKArg(plan.src.buffer.kind,plan.src.buffer.index,
+                        plan.src.buffer.addend+tile.input_y_start*src_y_stride),plan.src.layout),
+      plan.weight,plan.in_channels,plan.out_channels,tile.input_height,plan.input_width,
+      plan.kernel_height,plan.kernel_width,tile.output_height,plan.output_width,plan.stride_y,plan.stride_x,
+      plan.input_width_stride,plan.output_width_stride,
+      tile.data_banks if use_planned_banks else None,tile.weight_banks if use_planned_banks else None))
+  return tuple(tasks)

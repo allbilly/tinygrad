@@ -5,8 +5,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
-  RKLayout, RKLayoutKind, RKConvSplit, RKConvTiling,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKConvTask, RKConvPlan, RKDPUProgram, RKEpilogue, RKEngine,
+  RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKLegalizedReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
@@ -16,7 +16,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
-  plan_conv_cbuf, rk_fingerprint)
+  plan_conv_cbuf, legalize_conv_plan, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -79,6 +79,24 @@ class TestDPUCompiler(unittest.TestCase):
                          ([sum(size for _,size in y_windows[:i]) for i in range(len(y_windows))],
                           [sum(size for _,size in k_windows[:i]) for i in range(len(k_windows))]))
     self.assertIsNone(plan_conv_cbuf(2,2,16,16,3,3))
+
+  def test_conv_plan_legalizes_y_tiles_with_surface_relative_offsets(self):
+    tiling = plan_conv_cbuf(64,64,16,6,5,2)
+    self.assertIsInstance(tiling,RKConvTiling)
+    assert isinstance(tiling,RKConvTiling)
+    src_layout = RKLayout((2,64,64,8),(2,64,64,8),(65536,1024,16,2),dtypes.half,
+                          kind=RKLayoutKind.CNA_ACTIVATION)
+    weight_layout = RKLayout((5,2,6,16),(5,2,6,16),(384,192,32,2),dtypes.half,kind=RKLayoutKind.CNA_WEIGHT)
+    out_layout = RKLayout((2,3780,8),(2,3780,8),(60480,16,2),dtypes.half,kind=RKLayoutKind.CONV_OUTPUT)
+    plan = RKConvPlan(RKTensorRef(RKArg(RKBufferKind.SCRATCH,2),out_layout),
+      RKTensorRef(RKArg(RKBufferKind.SCRATCH,0),src_layout),RKTensorRef(RKArg(RKBufferKind.SCRATCH,1),weight_layout),
+      16,6,64,64,5,2,60,63,1,1,64,3780,tiling)
+    tasks = legalize_conv_plan(plan)
+    self.assertEqual([(task.input_height,task.output_height) for task in tasks],[(27,23),(27,23),(18,14)])
+    self.assertEqual([task.src.buffer.addend for task in tasks],[0,23*1024,46*1024])
+    self.assertEqual([task.out.buffer.addend for task in tasks],[0,23*63*16,46*63*16])
+    self.assertTrue(all(task.data_banks is not None and task.weight_banks is not None for task in tasks))
+    self.assertFalse(contains_uop(plan) or contains_uop(tasks))
 
   def test_wide_fp16_fill_tiles_at_proven_dpu_width(self):
     plan = lower_dpu(sink(Tensor.full((65536,), 1, dtype=dtypes.half)))
@@ -966,7 +984,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan,RKProgram)
     assert isinstance(plan,RKProgram)
     image, cost = emit_program(plan), plan_cost(plan)
-    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in plan.steps),2)
+    self.assertEqual(sum(isinstance(step,RKConvTask) for step in plan.steps),2)
     self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),2)
     self.assertLessEqual(cost.task_count,100)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
@@ -980,7 +998,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(result.plan,RKProgram)
     assert isinstance(result.plan,RKProgram)
     image, cost = emit_program(result.plan), plan_cost(result.plan)
-    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in result.plan.steps),6)
+    self.assertEqual(sum(isinstance(step,RKConvTask) for step in result.plan.steps),6)
     self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),6)
     self.assertLessEqual(cost.task_count,128)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
@@ -996,7 +1014,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(result.plan,RKProgram)
     assert isinstance(result.plan,RKProgram)
     image, cost = emit_program(result.plan), plan_cost(result.plan)
-    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in result.plan.steps),20)
+    self.assertEqual(sum(isinstance(step,RKConvTask) for step in result.plan.steps),20)
     self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),20)
     self.assertLessEqual(cost.task_count,200)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
@@ -1008,7 +1026,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan,RKProgram)
     assert isinstance(plan,RKProgram)
     image, cost = emit_program(plan), plan_cost(plan)
-    self.assertEqual(sum(isinstance(step,RKSpatialConv) for step in plan.steps),1)
+    self.assertEqual(sum(isinstance(step,RKConvTask) for step in plan.steps),1)
     self.assertEqual(sum(stage.engine is RKEngine.CONV for stage in image.stages),1)
     self.assertLessEqual(cost.task_count,300)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
@@ -1358,7 +1376,7 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertIs(result.kind, RKLowerKind.NATIVE)
         self.assertIsInstance(result.plan, RKProgram)
         assert isinstance(result.plan, RKProgram)
-        convs = [step for step in result.plan.steps if isinstance(step,RKSpatialConv)]
+        convs = [step for step in result.plan.steps if isinstance(step,RKConvTask)]
         expected = (stride,stride) if isinstance(stride,int) else stride
         self.assertEqual([(step.stride_y,step.stride_x) for step in convs], [expected]*4)
         self.assertLessEqual(plan_cost(result.plan).task_count,limit)
@@ -1373,7 +1391,7 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertIs(result.kind,RKLowerKind.NATIVE)
         self.assertIsInstance(result.plan,RKProgram)
         assert isinstance(result.plan,RKProgram)
-        convs = [step for step in result.plan.steps if isinstance(step,RKSpatialConv)]
+        convs = [step for step in result.plan.steps if isinstance(step,RKConvTask)]
         self.assertEqual([(step.kernel_height,step.kernel_width,step.stride_y,step.stride_x) for step in convs],[(1,1,1,1)])
         self.assertLessEqual(plan_cost(result.plan).task_count,24)
         self.assertFalse(contains_uop(result.plan))
@@ -1385,7 +1403,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind,RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan,RKProgram)
     assert isinstance(result.plan,RKProgram)
-    convs = [step for step in result.plan.steps if isinstance(step,RKSpatialConv)]
+    convs = [step for step in result.plan.steps if isinstance(step,RKConvTask)]
     self.assertEqual([(step.in_channels,step.out_channels) for step in convs],[(10,16),(10,4)]*2)
     cost = plan_cost(result.plan)
     self.assertLessEqual(cost.task_count,200)

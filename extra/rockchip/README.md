@@ -30,7 +30,7 @@ post-early_simplify UOps
        RKMaskStage
        RKLUTStage(lut: RKLUTId)
        RKContract
-       RKSpatialConv
+       RKConvPlan -> RKConvTask(s)
        RKPool
        RKProgram(ordered typed steps)
   -> RKImage commands and relocations
@@ -469,7 +469,7 @@ it does not inspect Tensor operation names. The initial hardware contract is
 deliberately narrow: four or sixteen input channels, at most sixteen output channels,
 spatial kernels up to 3x3, input dimensions at most sixteen, and at most four
 batches. NPU selector tasks pack NCHW input and OIHW weights into proven CNA
-surfaces, one typed `RKSpatialConv` task runs per batch, and selectors unpack
+surfaces, one typed `RKConvTask` task runs per batch, and selectors unpack
 the physical C1/W/C2 output. No host packing or tensor semantics are involved.
 
 For the official `(2,4,9,9) * (4,4,3,3)` graph, the old affine-CMAC plan needed
@@ -1236,3 +1236,24 @@ reference offline planner tests pass. The current NHWC compiler now consumes
 the typed planner for its proven K-only 16+4 split; its unchanged device test
 passes in 18.37 seconds. Plans containing Y windows remain typed rejects until
 CNA input overlap and output-offset emission are proven on hardware.
+
+## Semantic convolution plan boundary
+
+Convolution now has the same two-level distinction as reformatting.
+`RKConvPlan` owns logical geometry, legal packed surfaces, and the typed CBUF
+tiling decision. `legalize_conv_plan` converts it to one or more physical
+`RKConvTask` submissions. A Y tile advances the CNA input base by its
+overlapping input-row offset and the DPU output base by its logical output-row
+offset while retaining the backing surface stride. This is the behavior used
+by Mesa Rocket's split tasks; it is materially different from copying each
+tile into a compact host buffer.
+
+The local `conv_grok` harness does copy and repack every tile with NumPy before
+submission, so that portion is deliberately not imported. K tiles are also
+still rejected by generic legalization because a channel slice is not
+contiguous in the canonical packed-weight surface; an explicit native weight
+reformat must precede them. Existing no-split direct convolution now passes
+through the semantic plan boundary and its focused RK3588 tests remain green.
+The complete serialized device gate passes 96 tests plus 66 subtests in
+805.78 seconds with no timeout, reset error, invalid submission, or process
+abort.
