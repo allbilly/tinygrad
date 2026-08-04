@@ -11,7 +11,7 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
-  RKALUStage, RKFusedALUStage as RKFusedALUStage,
+  RKALUStage, RKFusedALUStage as RKFusedALUStage, RKCopyStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKConvTask, RKConvPlan as RKConvPlan,
   RKConvSplit as RKConvSplit, RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan,
@@ -344,6 +344,11 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
   if not 0 < count <= 65536 or (out_index.op is Ops.RANGE and int(out_index.src[0].arg) != count) or \
      (out_index.op is Ops.CONST and (count != 1 or int(out_index.arg) != 0)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, f"unsupported contiguous output extent {count}", out_index.op)
+  output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  identity = _strip_casts(store.src[1])
+  if store.src[0].dtype is dtypes.int and identity.op is Ops.INDEX and identity.dtype is dtypes.int and \
+     identity.src[0].op is Ops.PARAM and identity.src[1].key == out_index.key:
+    return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].arg.slot),count,dtypes.int),)))
   input_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   # Rejected WIP: DATA_FORMAT in_precision=precision_float32 exists in the register enum, but a direct FP32->FP16 ADD timed out on RK3588.
   # The exact typed-stage/emitter probe is preserved as wip-native-fp32-dpu-input-timeout.patch; do not restore 2607's CPU narrowing instead.
@@ -351,7 +356,6 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, f"input dtype {bad_dtype.name}", Ops.INDEX)
   if any(u.src[1].key != out_index.key for u in input_indexes):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "input index map differs from output surface", Ops.INDEX)
-  output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   if (lerp:=_canonical_lerp(store.src[1])) is not None:
     result = _lower_fused_lerp(output, lerp, count)
     if result.kind is not RKLowerKind.NOT_APPLICABLE: return result

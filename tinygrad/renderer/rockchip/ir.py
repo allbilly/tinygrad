@@ -75,6 +75,16 @@ class RKFusedALUStage:
     if not 0 < self.count <= 8: raise ValueError("RK fused DPU arithmetic needs one eight-channel atom")
 
 @dataclass(frozen=True)
+class RKCopyStage:
+  dst: RKArg
+  src: RKArg
+  count: int
+  dtype: DType
+  def __post_init__(self):
+    if self.dtype is not dtypes.int: raise ValueError("RK native copy probe only supports int32")
+    if not 0 < self.count <= 16384: raise ValueError("RK int32 copy extent exceeds DPU width")
+
+@dataclass(frozen=True)
 class RKMaskStage:
   dst: RKArg
   src: RKArg
@@ -87,7 +97,7 @@ class RKLUTStage:
   src: RKArg
   count: int
 
-RKDPUStage = RKALUStage|RKFusedALUStage|RKMaskStage|RKLUTStage
+RKDPUStage = RKALUStage|RKFusedALUStage|RKCopyStage|RKMaskStage|RKLUTStage
 
 @dataclass(frozen=True)
 class RKScratch:

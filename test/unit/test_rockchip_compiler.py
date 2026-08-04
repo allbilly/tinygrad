@@ -5,7 +5,8 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKConvTask, RKConvPlan, RKDPUProgram, RKEpilogue, RKEngine,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKConvTask, RKConvPlan, RKCopyStage, RKDPUProgram,
+  RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKLegalizedReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
@@ -462,6 +463,19 @@ class TestDPUCompiler(unittest.TestCase):
       offsets = tuple((command >> 16)&0xffffffff for stage in image.stages for command in stage.commands
                       if command&0xffff == rk.REG_DPU_OUT_CVT_OFFSET)
       self.assertEqual(offsets,(value&0xffffffff,value&0xffffffff))
+
+  def test_int32_identity_uses_all_bypass_dpu_copy(self):
+    source = Tensor.empty(65,dtype=dtypes.int).realize()
+    result = lower_native(sink(source.maximum(dtypes.int.min)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKDPUProgram)
+    assert isinstance(result.plan,RKDPUProgram)
+    self.assertEqual(result.plan.stages,(RKCopyStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),65,dtypes.int),))
+    image = emit_dpu(result.plan)
+    formats = tuple((command>>16)&0xffffffff for command in image.stages[0].commands
+                    if command&0xffff == rk.REG_DPU_DATA_FORMAT)
+    self.assertEqual(formats,((4<<29)|(4<<26)|4,))
+    self.assertEqual(decode_image(encode_image(image)),image)
 
   def test_wide_float_fill_rejects_values_not_exactly_representable_as_fp16_input(self):
     result = lower_native(sink(Tensor.full((5,), 0.1, dtype=dtypes.float)))

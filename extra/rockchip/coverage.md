@@ -3243,3 +3243,17 @@ separate unproven input/layout capability. No CPU semantic path, runtime dtype
 conversion, tolerance change, or wider supported-arithmetic claim was added.
 The complete census has not been rerun, so `187/40/185/13` remains the
 authoritative tally.
+
+## Exact int32 identity movement
+
+The RK3588 DPU data-format register independently supports int32 input,
+processing, and output precision. A new typed `RKCopyStage` uses that contract
+with the BS, BN, and EW blocks fully bypassed. MRDMA and WDMA operate on four
+int32 lanes per 16-byte atom; compiler and image tests pin the precision fields
+and a 65-element hardware boundary preserves `INT_MIN`, `INT_MAX`, and mixed
+positive/negative values bit-for-bit.
+
+This is raw native identity movement, not integer ALU emulation. It completes
+the `maximum(x, INT_MIN)` simplified subcase, while the unchanged method now
+stops at its later public-bool output. The authoritative method tally is still
+`187/40/185/13` pending a complete uncached census.

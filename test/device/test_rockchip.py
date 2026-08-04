@@ -34,6 +34,12 @@ class TestRockchip(unittest.TestCase):
         actual = Tensor.full((65,),value,dtype=dtypes.int,device="ROCKCHIP").realize().numpy()
         np.testing.assert_equal(actual,np.full((65,),value,dtype=np.int32))
 
+  def test_int32_identity_uses_all_bypass_dpu(self):
+    values = np.resize(np.array([dtypes.int.min,-1234,-1,0,1,1234,dtypes.int.max],dtype=np.int32),65)
+    source = Tensor(values,device="ROCKCHIP",dtype=dtypes.int).realize()
+    actual = source.maximum(dtypes.int.min).realize().numpy()
+    np.testing.assert_equal(actual,values)
+
   def test_dense_fp16_row_sum_native_cmac(self):
     data = np.linspace(-2, 2, 8*32, dtype=np.float16).reshape(8,32)
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()

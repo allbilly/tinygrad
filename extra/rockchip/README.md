@@ -1456,3 +1456,10 @@ advances to a distinct int32 identity-reformat rejection in the following
 `maximum(x, INT_MIN)` subcase. Therefore this milestone expands the honest
 fill-only hardware contract but does not yet claim a method-level census gain;
 the authoritative tally remains `187/40/185/13`.
+
+The immediately following int32 identity movement is also now hardware-proven.
+A typed `RKCopyStage` selects int32 MRDMA, DPU process, and WDMA precision while
+bypassing BS, BN, and EW semantics. A 65-value boundary vector containing both
+signed extrema is bit-exact. This lets `maximum(x, INT_MIN)` simplify to a
+single native DPU copy; `test_maximum` now proceeds to its public-bool case,
+which remains an honest `unsupported_output_dtype` rejection.
