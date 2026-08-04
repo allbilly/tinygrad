@@ -47,8 +47,8 @@ RK_ALU_OPS = frozenset((Ops.ADD, Ops.MUL, Ops.MAX, Ops.FDIV, Ops.SUB))
 class RKALUStage:
   op: Ops
   dst: RKArg
-  lhs: RKArg|float
-  rhs: RKArg|float
+  lhs: RKArg|float|bytes
+  rhs: RKArg|float|bytes
   count: int
   out_dtype: DType = dtypes.half
   out_cvt_offset: int = 0
@@ -56,6 +56,8 @@ class RKALUStage:
     if self.op not in RK_ALU_OPS: raise ValueError(f"unsupported RK DPU ALU operation {self.op}")
     if not 0 <= self.out_cvt_offset <= 0xffffffff: raise ValueError("RK DPU output conversion offset does not fit 32 bits")
     if self.out_cvt_offset and self.out_dtype is not dtypes.int: raise ValueError("RK DPU output conversion offset requires int32 output")
+    if any(isinstance(value,bytes) and (self.out_dtype is not dtypes.bool or len(value) != self.count) for value in (self.lhs,self.rhs)):
+      raise ValueError("RK DPU byte operand requires one bool value per output")
 
 @dataclass(frozen=True)
 class RKFusedALUStage:

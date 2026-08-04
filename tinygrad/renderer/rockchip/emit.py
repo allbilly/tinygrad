@@ -122,7 +122,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   constants, stages = bytearray(), []
   constant_offsets:dict[tuple[object, ...], int] = {}
-  def shifted(value:RKArg|float, count:int) -> RKArg|float:
+  def shifted(value:RKArg|float|bytes, count:int) -> RKArg|float|bytes:
     return RKArg(value.kind,value.index,value.addend+count*2) if isinstance(value,RKArg) else value
   plans:list[RKDPUStage] = []
   for plan in program.stages:
@@ -136,8 +136,9 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     else: plans.append(plan)
   # Rejected WIP: splitting every non-atom ALU avoids all recycled padding reads, but inflated established plans by up to 12
   # tasks. Only NaN/inf-producing stages need the state-safe true tail; ordinary uploads have their physical tail cleared.
-  def materialize(value:RKArg|float, count:int) -> RKArg:
+  def materialize(value:RKArg|float|bytes, count:int) -> RKArg:
     if isinstance(value, RKArg): return value
+    if isinstance(value,bytes): raise ValueError("byte DPU operand requires bool output")
     bits, key = struct.pack("<e", value), (value, count)
     if key not in constant_offsets:
       constant_offsets[key] = len(constants)
@@ -213,12 +214,13 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     if not isinstance(plan, RKALUStage): raise ValueError(f"unimplemented Rockchip stage {type(plan).__name__}")
     bool_out = plan.out_dtype is dtypes.bool
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
-    def materialize_bool(value:RKArg|float) -> RKArg:
+    def materialize_bool(value:RKArg|float|bytes) -> RKArg:
       if isinstance(value,RKArg): return value
-      key = ("bool",bool(value),plan.count)
+      payload = value if isinstance(value,bytes) else bytes((int(bool(value)),))*plan.count
+      key = ("bool",payload)
       if key not in constant_offsets:
         constant_offsets[key] = len(constants)
-        constants.extend(bytes((int(bool(value)),))*((plan.count+15)//16*16))
+        constants.extend(payload+bytes((-len(payload))%16))
       return RKArg(RKBufferKind.CONSTANT,constant_offsets[key])
     lhs, rhs = ((materialize_bool(plan.lhs),materialize_bool(plan.rhs)) if bool_out else
                 (materialize(plan.lhs,material_count),materialize(plan.rhs,material_count)))

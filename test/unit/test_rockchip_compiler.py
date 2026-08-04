@@ -499,6 +499,22 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(not_stage,RKALUStage)
     self.assertIs(cast(RKALUStage,not_stage).op,Ops.SUB)
 
+  def test_bool_triangular_reformat_uses_static_int8_mask(self):
+    source = Tensor.empty(5,5,dtype=dtypes.bool).realize()
+    for expression in (source.tril(),source.triu(1)):
+      result = lower_native(sink(expression))
+      self.assertIs(result.kind,RKLowerKind.NATIVE)
+      self.assertIsInstance(result.plan,RKLegalizedReformat)
+      assert isinstance(result.plan,RKLegalizedReformat)
+      self.assertIs(result.plan.kind,RKReformatKind.COALESCED_DPU)
+      self.assertEqual(len(result.plan.program.steps),1)
+      stage = cast(RKDPUProgram,result.plan.program.steps[0]).stages[0]
+      self.assertIsInstance(stage,RKALUStage)
+      self.assertIs(cast(RKALUStage,stage).op,Ops.MUL)
+      self.assertIsInstance(cast(RKALUStage,stage).rhs,bytes)
+      self.assertEqual(len(emit_reformat(result.plan).stages),1)
+      self.assertFalse(contains_uop(result.plan))
+
   def test_wide_float_fill_rejects_values_not_exactly_representable_as_fp16_input(self):
     result = lower_native(sink(Tensor.full((5,), 0.1, dtype=dtypes.float)))
     self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)

@@ -542,8 +542,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       value, condition, select_true, fill = negative, cond, False, float(positive.arg)
     else: return _not_applicable()
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2: return _not_applicable()
-  if store.src[0].dtype is not dtypes.half or value.dtype is not dtypes.half:
-    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires FP16 input and output", store.src[0].op)
+  if store.src[0].dtype is not value.dtype or value.dtype not in (dtypes.bool,dtypes.half):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires matching bool or FP16 input/output", store.src[0].op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
   count, src_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
   mapping = [-2] * count
@@ -585,6 +585,14 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       mapping[dst] = src if selected else -1
   if any(source == -2 for source in mapping): return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "reformat output has holes", Ops.INDEX)
   output, source = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG, value.src[0].arg.slot)
+  if value.dtype is dtypes.bool:
+    if fill == 0.0 and all(src in (-1,dst) for dst,src in enumerate(mapping)):
+      mask = bytes(src >= 0 for src in mapping)
+      out_ref = RKTensorRef(output,RKLayout((count,),(count,),(1,),dtypes.bool))
+      src_ref = RKTensorRef(source,RKLayout((src_count,),(src_count,),(1,),dtypes.bool))
+      program = RKProgram((RKDPUProgram((RKALUStage(Ops.MUL,output,source,mask,count,dtypes.bool),)),))
+      return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.COALESCED_DPU,program))
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT,"bool movement needs an identity-or-zero static mask",Ops.INDEX)
   stages:list[RKDPUStage] = []
   atom_reject:RKLowerResult|None = None
   dst = 0

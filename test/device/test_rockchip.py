@@ -50,6 +50,12 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(tlhs.minimum(trhs).realize().numpy(),np.logical_and(lhs,rhs))
     np.testing.assert_equal(tlhs.logical_not().realize().numpy(),np.logical_not(lhs))
 
+  def test_bool_triangular_reformat_uses_int8_mask(self):
+    values = np.resize(np.array([True,False,True,True,False],dtype=np.bool_),(5,5))
+    source = Tensor(values,device="ROCKCHIP",dtype=dtypes.bool).realize()
+    np.testing.assert_equal(source.tril().realize().numpy(),np.tril(values))
+    np.testing.assert_equal(source.triu(1).realize().numpy(),np.triu(values,1))
+
   def test_dense_fp16_row_sum_native_cmac(self):
     data = np.linspace(-2, 2, 8*32, dtype=np.float16).reshape(8,32)
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()

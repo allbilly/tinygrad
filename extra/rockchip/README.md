@@ -1489,3 +1489,10 @@ Bool logical NOT also has a direct int8 implementation: the compiler recognizes
 with an aligned immutable int8-one surface. The 65-lane boundary is bit-exact.
 The official `test_logical_not` passes its bool-input subcase and then reaches
 the separate FP16-comparison-to-public-bool conversion boundary.
+
+Static bool movement whose map is either identity or zero now lowers to one
+int8 DPU multiplication against an immutable byte mask. This is a semantic
+`RKReformatPlan` with one physical task, not a selector-CMAC matrix. The full
+unchanged `test_tril` and `test_triu` methods pass, including their final bool
+subcases, for two focused method gains. The authoritative full census remains
+`187/40/185/13`; current focused expectation is `189/40/183/13`.

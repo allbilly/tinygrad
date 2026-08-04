@@ -3292,3 +3292,15 @@ inside the proven public-bool representation. Its 65-lane hardware boundary
 passes exactly. `test_logical_not` advances through the bool-input case but its
 later FP16 input still requires the rejected FP16-mask-to-int8 conversion, so
 the method remains a typed failure pending a different hardware path.
+
+## Static bool identity-or-zero reformat
+
+Affine bool movement maps containing only `source[dst]` or static zero now
+legalize as one int8 DPU multiply against an immutable 0/1 byte mask. The
+semantic `RKReformatPlan` is retained and the physical program has one typed
+bool ALU stage; no sparse selector matrix or host gather is involved.
+
+The complete unchanged `test_tril` and `test_triu` methods both pass, including
+all FP16 shapes/diagonals and their final bool inputs. This predicts two focused
+method gains (`189 native / 40 frontend / 183 failed / 13 skipped`), but
+`187/40/185/13` remains authoritative until a full uncached census is run.
