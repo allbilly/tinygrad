@@ -2917,3 +2917,37 @@ Ruff passes for all touched Python modules, and the complete serialized RK3588
 gate passes 96 tests plus 66 subtests in 805.78 seconds without a timeout,
 reset error, invalid submission, or process abort. This milestone adds no
 TestOps pass and leaves the authoritative 172/40/200/13 census unchanged.
+
+## Direct CNA zero-padding contract
+
+`RKConvPlan` and `RKConvTask` now carry top, bottom, left, and right zero-pad
+extents. CNA `PAD_CON0` receives the four-bit top/left values, `PAD_CON1` is
+zero, and output dimensions prove the effective bottom/right extent. The
+emitter accepts no negative pad, no field larger than 15, and no output shape
+outside the exact strided-convolution equation. Padded Y splitting remains a
+typed legalization error; only a single CBUF tile is currently proven.
+
+The graph matcher unwraps the guarded INDEX address, recovers its affine
+branch, and then enumerates the static convolution coordinates to prove that
+the load predicate is true exactly for the original input rectangle. This is
+an exact compiler proof, not pattern matching on characteristic constants.
+The unchanged official hardware results are:
+
+| Method | Result | Representative physical cost |
+|---|---|---:|
+| `test_padded_conv2d_bs1` | PASS_NATIVE | 64 tasks for the batch-one plan |
+| `test_padded_conv2d_p21` | PASS_NATIVE | 259 tasks for the batch-four plan |
+| `test_padded_conv2d_p22` | PASS_NATIVE | 282 tasks for the batch-four plan |
+
+The three methods previously rejected at the plan-stage limit in the
+authoritative census. They now pass at the unchanged official tolerance in
+70.59 seconds combined, with no fallback, timeout, reset error, invalid
+submission, or process abort. Selector packing still dominates the two large
+plans, so all three are correctness evidence for CNA padding rather than a
+claim that layout conversion is efficient. Focused expected coverage is 179
+native / 40 frontend / 193 failed / 13 upstream skips. The complete
+`2e40def50` 172/40/200/13 census remains authoritative until rerun.
+The host gate passes 132 tests plus 34 subtests, full mypy and touched-module
+Ruff pass, and the complete serialized RK3588 gate passes 96 tests plus 66
+subtests in 804.61 seconds without a timeout, reset error, invalid submission,
+or process abort.

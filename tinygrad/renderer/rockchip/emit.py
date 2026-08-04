@@ -315,8 +315,10 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
   ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
     plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
   sy, sx = plan.stride_y, plan.stride_x
+  pt, pb, pl, pr = plan.pad_top, plan.pad_bottom, plan.pad_left, plan.pad_right
   if not 1 <= ic <= 16 or not 1 <= oc <= 16 or not 1 <= kh <= 3 or not 1 <= kw <= 3 or \
-     oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or not 1 <= sy <= 7 or not 1 <= sx <= 7 or \
+     min(pt,pb,pl,pr) < 0 or max(pt,pb,pl,pr) > 15 or \
+     oh != (ih+pt+pb-kh)//sy+1 or ow != (iw+pl+pr-kw)//sx+1 or not 1 <= sy <= 7 or not 1 <= sx <= 7 or \
      not 1 <= ih <= 32 or not 1 <= iw <= 32:
     raise ValueError("unsupported direct spatial-convolution contract")
   align_ic, use_nhwc = (8,True) if ic <= 4 else (16,False)
@@ -362,6 +364,7 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
     _command(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb if is_spatial else 1),
     *(_command(_TARGET_CNA, reg, 0x10000) for reg in
       (rk.REG_CNA_CVT_CON1,rk.REG_CNA_CVT_CON2,rk.REG_CNA_CVT_CON3,rk.REG_CNA_CVT_CON4)),
+    _command(_TARGET_CNA, rk.REG_CNA_PAD_CON0, (pl<<4)|pt),
     _command(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0),
     _command(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),
     _command(_TARGET_CNA, rk.REG_CNA_DMA_CON1, dma_line),
@@ -370,6 +373,7 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
     _command(_TARGET_CNA, rk.REG_CNA_FC_DATA_SIZE1, align_ic),
     _command(_TARGET_CNA, rk.REG_CNA_DCOMP_ADDR0, 0),
     _command(_TARGET_CNA, 0x1180, (1<<ic)-1 if use_nhwc else 7 if is_spatial else 0),
+    _command(_TARGET_CNA, rk.REG_CNA_PAD_CON1, 0),
     _command(_TARGET_CORE, rk.REG_CORE_MISC_CFG, 0x200|is_spatial),
     _command(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_0, ((oh-1)<<16)|(ow-1)),
     _command(_TARGET_CORE, rk.REG_CORE_DATAOUT_SIZE_1, align_oc-1),
@@ -392,9 +396,16 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
     _command(_TARGET_DPU, rk.REG_DPU_OUT_CVT_SCALE, 0x10001),
     _command(_TARGET_DPU, rk.REG_DPU_SURFACE_ADD, out_width_stride*2<<4),
     _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0xd))
-  relocs = (RKReloc(0,18,plan.src.buffer.kind,plan.src.buffer.index,plan.src.buffer.addend+plan.src.layout.base_offset),
-            RKReloc(0,24,plan.weight.buffer.kind,plan.weight.buffer.index,plan.weight.buffer.addend+plan.weight.layout.base_offset),
-            RKReloc(0,32,plan.out.buffer.kind,plan.out.buffer.index,plan.out.buffer.addend+plan.out.layout.base_offset))
+  def command_word(target:int, register:int) -> int:
+    matches = tuple(i for i,command in enumerate(commands) if command>>48 == target and command&0xffff == register)
+    if len(matches) != 1: raise ValueError(f"expected one relocation command for register 0x{register:x}")
+    return matches[0]
+  relocs = (RKReloc(0,command_word(_TARGET_CNA,rk.REG_CNA_FEATURE_DATA_ADDR),plan.src.buffer.kind,plan.src.buffer.index,
+                    plan.src.buffer.addend+plan.src.layout.base_offset),
+            RKReloc(0,command_word(_TARGET_CNA,rk.REG_CNA_DCOMP_ADDR0),plan.weight.buffer.kind,plan.weight.buffer.index,
+                    plan.weight.buffer.addend+plan.weight.layout.base_offset),
+            RKReloc(0,command_word(_TARGET_DPU,rk.REG_DPU_DST_BASE_ADDR),plan.out.buffer.kind,plan.out.buffer.index,
+                    plan.out.buffer.addend+plan.out.layout.base_offset))
   return RKImage(target, (RKStage(RKEngine.CONV, commands, relocs, RK_STAGE_RESET),))
 
 def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:

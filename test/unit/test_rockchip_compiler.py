@@ -98,6 +98,32 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(all(task.data_banks is not None and task.weight_banks is not None for task in tasks))
     self.assertFalse(contains_uop(plan) or contains_uop(tasks))
 
+  def test_direct_convolution_padding_is_typed_and_emitted(self):
+    src_layout = RKLayout((3,3,1),(3,4,1),(8,2,2),dtypes.half,
+                          padding=((0,0),(0,1),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
+    weight_layout = RKLayout((2,2,1,1),(2,2,1,8),(32,16,16,2),dtypes.half,
+                             padding=((0,0),(0,0),(0,0),(0,7)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
+    out_layout = RKLayout((2,16,8),(2,16,8),(256,16,2),dtypes.half,kind=RKLayoutKind.CONV_OUTPUT)
+    tiling = plan_conv_cbuf(3,3,1,1,2,2,width_stride=4,output_width_stride=16,use_nhwc=True,padding=(2,1,1,0))
+    self.assertIsInstance(tiling,RKConvTiling)
+    assert isinstance(tiling,RKConvTiling)
+    plan = RKConvPlan(RKTensorRef(RKArg(RKBufferKind.SCRATCH,2),out_layout),
+      RKTensorRef(RKArg(RKBufferKind.SCRATCH,0),src_layout),RKTensorRef(RKArg(RKBufferKind.SCRATCH,1),weight_layout),
+      1,1,3,3,2,2,5,3,1,1,4,16,tiling,2,1,1,0)
+    tasks = legalize_conv_plan(plan)
+    self.assertEqual([(task.pad_top,task.pad_bottom,task.pad_left,task.pad_right) for task in tasks],[(2,1,1,0)])
+    image = emit_program(RKProgram(tasks,(RKScratch(24),RKScratch(64),RKScratch(512))))
+    commands = image.stages[0].commands
+    emitted = {(command>>48,command&0xffff):(command>>16)&0xffffffff for command in commands}
+    cna_target = next(command>>48 for command in commands if command&0xffff == rk.REG_CNA_FEATURE_DATA_ADDR)
+    self.assertEqual(emitted[(cna_target,rk.REG_CNA_PAD_CON0)],0x12)
+    self.assertEqual(emitted[(cna_target,rk.REG_CNA_PAD_CON1)],0)
+    self.assertEqual([reloc.word for reloc in image.stages[0].relocs],
+                     [next(i for i,x in enumerate(commands) if x&0xffff == rk.REG_CNA_FEATURE_DATA_ADDR),
+                      next(i for i,x in enumerate(commands) if x&0xffff == rk.REG_CNA_DCOMP_ADDR0),
+                      next(i for i,x in enumerate(commands) if x&0xffff == rk.REG_DPU_DST_BASE_ADDR)])
+    self.assertFalse(contains_uop(plan) or contains_uop(tasks))
+
   def test_wide_fp16_fill_tiles_at_proven_dpu_width(self):
     plan = lower_dpu(sink(Tensor.full((65536,), 1, dtype=dtypes.half)))
     self.assertIsInstance(plan, RKDPUProgram)
@@ -1394,6 +1420,20 @@ class TestDPUCompiler(unittest.TestCase):
         convs = [step for step in result.plan.steps if isinstance(step,RKConvTask)]
         self.assertEqual([(step.kernel_height,step.kernel_width,step.stride_y,step.stride_x) for step in convs],[(1,1,1,1)])
         self.assertLessEqual(plan_cost(result.plan).task_count,24)
+        self.assertFalse(contains_uop(result.plan))
+
+  def test_padded_spatial_convolution_proves_exact_zero_mask(self):
+    source = Tensor.empty(1,3,11,28,dtype=dtypes.half).realize()
+    weight = Tensor.empty(4,3,3,3,dtype=dtypes.half).realize()
+    for padding,expected,limit in (((1,1),(1,1,1,1),70),((2,1),(2,2,1,1),76),((2,2),(2,2,2,2),80)):
+      with self.subTest(padding=padding):
+        result = lower_spatial_contract_result(sink(source.conv2d(weight,padding=padding)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        convs = [step for step in result.plan.steps if isinstance(step,RKConvTask)]
+        self.assertEqual([(step.pad_top,step.pad_bottom,step.pad_left,step.pad_right) for step in convs],[expected])
+        self.assertLessEqual(plan_cost(result.plan).task_count,limit)
         self.assertFalse(contains_uop(result.plan))
 
   def test_nhwc_convolution_splits_output_channels_to_cbuf_tiles(self):

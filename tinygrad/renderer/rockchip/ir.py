@@ -189,6 +189,10 @@ class RKConvTask:
   output_width_stride: int
   data_banks: int|None = None
   weight_banks: int|None = None
+  pad_top: int = 0
+  pad_bottom: int = 0
+  pad_left: int = 0
+  pad_right: int = 0
 
 @dataclass(frozen=True)
 class RKConvTile:
@@ -233,6 +237,10 @@ class RKConvPlan:
   input_width_stride: int
   output_width_stride: int
   tiling: RKConvTiling
+  pad_top: int = 0
+  pad_bottom: int = 0
+  pad_left: int = 0
+  pad_right: int = 0
 
 @dataclass(frozen=True)
 class RKReduce:

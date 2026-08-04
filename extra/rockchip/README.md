@@ -1257,3 +1257,31 @@ through the semantic plan boundary and its focused RK3588 tests remain green.
 The complete serialized device gate passes 96 tests plus 66 subtests in
 805.78 seconds with no timeout, reset error, invalid submission, or process
 abort.
+
+## Direct CNA zero padding
+
+Convolution plans and tasks now retain four explicit zero-padding extents.
+The emitter programs CNA `PAD_CON0` with the proven top/left offsets and
+`PAD_CON1` with the FP16 zero value; bottom/right are represented by the exact
+output geometry, as in Mesa Rocket and the independent `allbilly/rk3588`
+register traces. Padding is limited to the four-bit hardware fields and padded
+Y tiling remains rejected until its edge-tile overlap rules are proven.
+
+The NCHW matcher accepts a masked feature load only after recovering its one
+real affine address branch and exhaustively proving that the predicate selects
+exactly `0 <= y < input_height` and `0 <= x < input_width` over every compiled
+coordinate. It does not infer padding merely from a negative address constant.
+Relocations now find their unique address-register commands instead of relying
+on word numbers that changed when the two padding registers were inserted.
+
+The unchanged official `test_padded_conv2d_bs1`, `test_padded_conv2d_p21`, and
+`test_padded_conv2d_p22` methods pass on RK3588 at the stock tolerance. Their
+batch-one compiler plans use 64--70 tasks; the batch-four official plans use
+229--282 tasks and remain selector-heavy correctness fallbacks. This adds three
+focused native methods without CPU execution, a tolerance change, or a task
+ceiling increase. The expected focused tally is 179 native / 40 frontend / 193
+fail / 13 skip; 172/40/200/13 remains authoritative until a complete census.
+The host gate passes 132 tests plus 34 subtests, full mypy and touched-module
+Ruff pass, and the complete serialized RK3588 gate passes 96 tests plus 66
+subtests in 804.61 seconds without a timeout, reset error, invalid submission,
+or process abort.

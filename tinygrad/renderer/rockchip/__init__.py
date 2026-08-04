@@ -423,6 +423,32 @@ def _conditional_index(u:UOp) -> tuple[UOp, UOp|None, bool]|None:
     return negative, condition, False
   return None
 
+def _conditional_index_affine(index:UOp) -> tuple[dict[int,int],int]|None:
+  """Recover the one real affine address branch from a bounds-checked INDEX."""
+  result = _affine(index.src[1])
+  if result is None and index.src[1].op is Ops.WHERE:
+    branches = tuple(x for branch in index.src[1].src[1:] if branch.arg is not Invalid and (x:=_affine(branch)) is not None)
+    if len(branches) == 1: result = branches[0]
+  return result
+
+def _proves_conv_zero_padding(condition:UOp|None, select_true:bool, ranges:dict[int,int], axes:tuple[int,int,int,int],
+                              in_h:int, in_w:int, stride_y:int, stride_x:int, pad_top:int, pad_left:int) -> bool:
+  """Exhaustively prove that a feature mask selects exactly the in-bounds convolution coordinates."""
+  if condition is None: return pad_top == pad_left == 0
+  ky_axis,kx_axis,out_y_axis,out_x_axis = axes
+  relevant = tuple(dict.fromkeys(u for u in condition.toposort() if u.op is Ops.RANGE))
+  if any(u.arg[0] not in ranges for u in relevant) or math.prod(ranges[u.arg[0]] for u in relevant) > RK_MAX_AFFINE_VISITS:
+    return False
+  for coordinates in product(*(range(ranges[u.arg[0]]) for u in relevant)):
+    point = dict(zip(relevant,coordinates))
+    by_axis = {u.arg[0]:value for u,value in point.items()}
+    selected = _static_scalar(condition,point)
+    if selected is None: return False
+    iy = by_axis.get(ky_axis,0)+by_axis.get(out_y_axis,0)*stride_y-pad_top
+    ix = by_axis.get(kx_axis,0)+by_axis.get(out_x_axis,0)*stride_x-pad_left
+    if (bool(selected) is select_true) != (0 <= iy < in_h and 0 <= ix < in_w): return False
+  return True
+
 def _static_index_selected(u:UOp, index:UOp, ranges:dict[int, int]) -> bool|None:
   """Follow static WHERE branches and report whether one coordinate selects `index`."""
   value = _strip_casts(u)
@@ -1947,7 +1973,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   body = _strip_casts(reduce.src[0])
   if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in reduce.src[1:]): return _not_applicable()
   operands = tuple(_conditional_index(_strip_casts(value)) for value in body.src)
-  if any(parsed is None or parsed[1] is not None or parsed[0].dtype is not dtypes.half or
+  if any(parsed is None or parsed[0].dtype is not dtypes.half or
          parsed[0].src[0].op is not Ops.PARAM for parsed in operands): return _not_applicable()
   parsed_operands = cast(tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool]], operands)
   out_aff = _affine(store.src[0].src[1])
@@ -1956,13 +1982,14 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
   if any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
-  match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
+  match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
   if len(out_axes) == 2 and len(red_axes) == 1:
     point_reduction_axis = red_axes[0]
     for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
       feature, weight = feature_parsed[0], weight_parsed[0]
-      feature_aff, weight_aff = _affine(feature.src[1]), _affine(weight.src[1])
-      if feature_aff is None or weight_aff is None or feature_aff[1] or weight_aff[1]: continue
+      feature_aff, weight_aff = _conditional_index_affine(feature), _affine(weight.src[1])
+      if feature_parsed[1] is not None or weight_parsed[1] is not None or feature_aff is None or weight_aff is None or \
+         feature_aff[1] or weight_aff[1]: continue
       for point_channel_axis,point_spatial_axis in permutations(out_axes):
         in_c, out_c, spatial = ranges[point_reduction_axis], ranges[point_channel_axis], ranges[point_spatial_axis]
         if out_aff[0] != {point_channel_axis:spatial,point_spatial_axis:1} or \
@@ -1973,14 +2000,14 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
         in_h,in_w = min(shapes,key=lambda shape:abs(shape[0]-shape[1]))
         feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
         if (feature_count,weight_count,output_count) != (in_c*spatial,out_c*in_c,out_c*spatial): continue
-        match = (feature,weight,1,in_c,out_c,in_h,in_w,1,1,in_h,in_w,1,1,output_count)
+        match = (feature,weight,1,in_c,out_c,in_h,in_w,1,1,in_h,in_w,1,1,output_count,0,0,0,0)
         break
       if match is not None: break
   for feature_parsed,weight_parsed in (() if match is not None or len(red_axes) != 3 or len(out_axes) not in (3,4) else
                                        (parsed_operands, tuple(reversed(parsed_operands)))):
     feature, weight = feature_parsed[0], weight_parsed[0]
-    feature_aff, weight_aff = _affine(feature.src[1]), _affine(weight.src[1])
-    if feature_aff is None or weight_aff is None or feature_aff[1] or weight_aff[1]: continue
+    feature_aff, weight_aff = _conditional_index_affine(feature), _affine(weight.src[1])
+    if weight_parsed[1] is not None or feature_aff is None or weight_aff is None or weight_aff[1] or feature_aff[1] > 0: continue
     output_roles = ((None,*axes) for axes in permutations(out_axes)) if len(out_axes) == 3 else permutations(out_axes)
     for batch_axis,channel_axis,out_y_axis,out_x_axis in output_roles:
       if channel_axis is None or out_y_axis is None or out_x_axis is None: continue
@@ -1994,8 +2021,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
         stride_y_coeff, stride_x = feature_aff[0].get(out_y_axis,0), feature_aff[0].get(out_x_axis,0)
         if stride_y_coeff <= 0 or stride_y_coeff%in_w: continue
         stride_y = stride_y_coeff//in_w
-        if not 1 <= stride_y <= 7 or not 1 <= stride_x <= 7 or \
-           out_h != (in_h-kernel_h)//stride_y+1 or out_w != (in_w-kernel_w)//stride_x+1: continue
+        if not 1 <= stride_y <= 7 or not 1 <= stride_x <= 7: continue
         expected_out = {channel_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1}
         expected_feature = {in_channel_axis:in_h*in_w,kernel_y_axis:in_w,kernel_x_axis:1,
                             out_y_axis:stride_y*in_w,out_x_axis:stride_x}
@@ -2004,15 +2030,22 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
         if out_aff[0] != expected_out or feature_aff[0] != expected_feature: continue
         if weight_aff[0] != {channel_axis:in_c*kernel_h*kernel_w, in_channel_axis:kernel_h*kernel_w,
                             kernel_y_axis:kernel_w, kernel_x_axis:1}: continue
+        pad_top,pad_left = divmod(-feature_aff[1],in_w)
+        if max(pad_top,pad_left) > 15: continue
+        pad_bottom = next((pad for pad in range(16) if (in_h+pad_top+pad-kernel_h)//stride_y+1 == out_h),-1)
+        pad_right = next((pad for pad in range(16) if (in_w+pad_left+pad-kernel_w)//stride_x+1 == out_w),-1)
+        if min(pad_bottom,pad_right) < 0 or not _proves_conv_zero_padding(feature_parsed[1],feature_parsed[2],ranges,
+            (kernel_y_axis,kernel_x_axis,out_y_axis,out_x_axis),in_h,in_w,stride_y,stride_x,pad_top,pad_left): continue
         feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
         if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c*kernel_h*kernel_w,
                                                         batch*out_c*out_h*out_w): continue
-        match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count)
+        match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count,
+                 pad_top,pad_bottom,pad_left,pad_right)
         break
       if match is not None: break
     if match is not None: break
   if match is None: return _not_applicable()
-  feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count = match
+  feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count,pt,pb,pl,pr = match
   if in_c not in (1,2,3,4,16) or not 1 <= out_c <= 16 or not 1 <= kernel_h <= 3 or not 1 <= kernel_w <= 3 or \
      max(in_h,in_w) > 32 or batch > 4:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
@@ -2072,13 +2105,13 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
                            kind=RKLayoutKind.CONV_OUTPUT)
   tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,stride_y,input_width_stride,output_width_stride,
-                          align_in,use_nhwc=in_c <= 4,max_k_step=out_c)
+                          align_in,use_nhwc=in_c <= 4,max_k_step=out_c,padding=(pt,pb,pl,pr))
   if tiling is None or tiling.split is not RKConvSplit.NONE:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,"direct convolution needs an unlegalized CBUF split",reduce.op)
   for b in range(batch):
     conv_plan = RKConvPlan(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),RKTensorRef(packed_weight,weight_layout),
-      in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride,tiling)
+      in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride,tiling,pt,pb,pl,pr)
     steps.extend(legalize_conv_plan(conv_plan))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
                              batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,
