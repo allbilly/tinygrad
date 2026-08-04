@@ -1186,3 +1186,19 @@ subtests, mypy, and Ruff; the serialized device gate passes 96 tests plus 66
 subtests in 807.11 seconds. The focused expected tally is 176 native / 40
 frontend / 196 fail / 13 skip; 172/40/200/13 remains authoritative until the
 next complete census.
+
+## Semantic reformat plan boundary
+
+Reformat lowering now preserves two explicit levels. `RKReformatPlan` contains
+only the logical source and destination surfaces, exact static mapping, and fill
+contract. `RKLegalizedReformat` pairs that semantic plan with the chosen DPU or
+selector-CMAC kind and a UOp-free physical `RKProgram`. Engine steps and scratch
+resources no longer live inside the logical transform itself.
+
+This is deliberately a no-coverage, no-register-change milestone. Frozen
+coalesced-copy, selector, finite-fill, and infinity-fill RKImage SHA-256 goldens
+remain byte-identical, as do their complete task/command/constant/scratch cost
+records. The combined host gate passes 135 tests plus 26 subtests, mypy, and
+Ruff; the serialized RK3588 gate passes 96 tests plus 66 subtests in 806.83
+seconds. The split provides the boundary required to compare direct
+CNA/PPU/ERDMA packing against selector CMAC before selecting physical work.

@@ -13,7 +13,8 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
   RKALUStage, RKFusedALUStage as RKFusedALUStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformat, RKProgram, RKPlanCost,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformatPlan,
+  RKLegalizedReformat, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
@@ -167,8 +168,8 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
       reads += math.prod(step.weight.layout.logical_shape)*step.weight.layout.dtype.itemsize
       writes += step.out_channels*step.output_height*step.output_width*2
       macs += step.out_channels*step.output_height*step.output_width*step.in_channels*step.kernel_height*step.kernel_width
-    elif isinstance(step, RKReformat):
-      nested = plan_cost(RKProgram(step.steps, step.scratch))
+    elif isinstance(step, RKLegalizedReformat):
+      nested = plan_cost(step.program)
       reads += nested.estimated_read_bytes
       writes += nested.estimated_write_bytes
       macs += nested.estimated_macs
@@ -234,6 +235,10 @@ def _finish_program(steps:list[RKDPUProgram|RKContract|RKSpatialConv|RKReduce], 
   """Give every ordered DPU step the program's final resource table."""
   return RKProgram(tuple(RKDPUProgram(step.stages, scratch) if isinstance(step, RKDPUProgram) else step for step in steps), scratch)
 
+def _legalized_reformat(out:RKTensorRef, src:RKTensorRef, mapping:tuple[int, ...], fill:float,
+                        kind:RKReformatKind, program:RKProgram) -> RKLegalizedReformat:
+  return RKLegalizedReformat(RKReformatPlan(out, src, mapping, fill), kind, program)
+
 def _periodic_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
                                scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
   """Materialize one aligned repeated-map period, then duplicate it through direct DPU copies."""
@@ -283,7 +288,7 @@ def _constant_run_selector_program(output:RKArg, source:RKArg, input_count:int, 
   cost = plan_cost(completed)
   return completed if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
-def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKReformat|RKProgram) -> RKLowerResult:
+def _native(plan:RKDPUProgram|RKContract|RKSpatialConv|RKReduce|RKLegalizedReformat|RKProgram) -> RKLowerResult:
   return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
 def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
 def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
@@ -533,7 +538,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
     dst += length
   out_ref, src_ref = _dense_half_ref(output.index, (count,)), _dense_half_ref(source.index, (src_count,))
   if atom_reject is None:
-    return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.COALESCED_DPU, (RKDPUProgram(tuple(stages)),)))
+    return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.COALESCED_DPU,
+      RKProgram((RKDPUProgram(tuple(stages)),))))
   rows = [[src] if src >= 0 else [] for src in mapping]
   # A finite fill can be appended to an aligned source scratch and selected like any other lane. Non-finite fills cannot enter CMAC:
   # zero selector weights multiplied by infinity would contaminate ordinary source rows with NaN. Select a finite padding mask instead,
@@ -559,8 +565,7 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
         completed = _finish_program([seed,*implementation.steps],implementation.scratch)
         cost = plan_cost(completed)
         if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES:
-          return _native(RKReformat(out_ref,src_ref,tuple(mapping),RKReformatKind.SELECTOR_CMAC,
-            cast(tuple[RKDPUProgram|RKContract, ...],completed.steps),completed.scratch))
+          return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.SELECTOR_CMAC,completed))
     else:
       selected_surface, padding_mask, one = (RKArg(RKBufferKind.SCRATCH,index) for index in range(3))
       mask_scratch = (RKScratch(_cmac_tiled_output_bytes(count)),RKScratch(_cmac_tiled_output_bytes(count)),RKScratch(64))
@@ -577,14 +582,12 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
             completed = _finish_program([seed,*selected_plan.steps,*mask_plan.steps,final],final.scratch)
             cost = plan_cost(completed)
             if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES:
-              return _native(RKReformat(out_ref,src_ref,tuple(mapping),RKReformatKind.SELECTOR_CMAC,
-                cast(tuple[RKDPUProgram|RKContract, ...],completed.steps),completed.scratch))
+              return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.SELECTOR_CMAC,completed))
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"constant-filled reformat exceeds the native cost contract",Ops.WHERE)
   implementation = (_periodic_selector_program(output,source,src_count,rows) or
                     _selector_program(output,source,src_count,rows,())) if 0 < src_count and 0 < count else None
   if implementation is not None:
-    return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.SELECTOR_CMAC,
-      cast(tuple[RKDPUProgram|RKContract, ...], implementation.steps), implementation.scratch))
+    return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.SELECTOR_CMAC,implementation))
   if 0 < src_count and 0 < count:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "static reformat selector exceeds the native cost contract", Ops.INDEX)
   return atom_reject
@@ -636,8 +639,8 @@ def lower_static_selector_reformat_result(sink:UOp) -> RKLowerResult:
   implementation = _periodic_selector_program(output,source_arg,src_count,rows) or _selector_program(output,source_arg,src_count,rows,())
   if implementation is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"static selector reformat exceeds the native cost contract",Ops.INDEX)
-  return _native(RKReformat(_dense_half_ref(output.index,(count,)),_dense_half_ref(source_arg.index,(src_count,)),tuple(mapping),
-    RKReformatKind.SELECTOR_CMAC,cast(tuple[RKDPUProgram|RKContract,...],implementation.steps),implementation.scratch))
+  return _native(_legalized_reformat(_dense_half_ref(output.index,(count,)),_dense_half_ref(source_arg.index,(src_count,)),tuple(mapping),
+    0.0,RKReformatKind.SELECTOR_CMAC,implementation))
 
 def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   """Materialize one static affine or zero-masked FP16 surface, then schedule generic DPU arithmetic."""
@@ -2710,7 +2713,7 @@ class RockchipRenderer(Renderer):
     elif isinstance(result.plan, RKSpatialConv): image = emit_spatial_conv(result.plan)
     elif isinstance(result.plan, RKPool): image = emit_pool(result.plan)
     elif isinstance(result.plan, RKReduce): image = emit_reduce(result.plan)
-    elif isinstance(result.plan, RKReformat): image = emit_reformat(result.plan)
+    elif isinstance(result.plan, RKLegalizedReformat): image = emit_reformat(result.plan)
     elif isinstance(result.plan, RKProgram): image = emit_program(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))

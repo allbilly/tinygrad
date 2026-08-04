@@ -2791,3 +2791,34 @@ semantic lane, tolerance change, resource-ceiling change, timeout, reset error,
 invalid submission, or process abort. The focused expected tally is therefore
 176 native / 40 frontend / 196 fail / 13 skip; the complete `2e40def50`
 172/40/200/13 census remains authoritative until the next full run.
+
+## Semantic reformat versus physical task schedule
+
+The former `RKReformat` combined a logical mapping with its already-selected
+engine kind, physical DPU/CMAC steps, and scratch table. It is now split into:
+
+```text
+RKReformatPlan(out, src, mapping, fill)
+        -> legalization and cost selection
+RKLegalizedReformat(plan, kind, RKProgram)
+        -> RKImage emission
+```
+
+The semantic plan is typed and UOp-free but contains no implementation
+topology. The legalized wrapper owns the physical ordered task program. Frozen
+image goldens prove that this refactor does not alter command streams:
+
+| Case | RKImage SHA-256 |
+|---|---|
+| coalesced atom copy | `a5b646b014c2554098226f506a9ba4bbf73cc5183a688abef49c95d23160db8e` |
+| selector transpose | `f439fd352c45be0eff632da61e90d2db8fde573dd2aeb88d2808fa0206d0d46b` |
+| rounded finite fill | `8ae18bc960ac16815280326b084638ad9b779048b25b2d8471f557158eff6cd5` |
+| positive-infinity fill | `f33fe40ac5384e47c8bee558ec422917a530bec31b72b2321d042699837fcbba` |
+
+Task count, command words, constants, scratch, traffic, and estimated MACs are
+also unchanged for all five sampled reformat families. The combined host gate
+passes 135 tests plus 26 subtests, full mypy, and repository-wide Ruff. The
+serialized device gate passes 96 tests plus 66 subtests in 806.83 seconds with
+no timeout, reset error, invalid submission, or process abort. This milestone
+adds no new TestOps pass and leaves the authoritative 172/40/200/13 census
+unchanged.

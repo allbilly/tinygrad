@@ -6,7 +6,7 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
-  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformat, RKReformatKind, RK_STAGE_RESET,
+  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKLegalizedReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
@@ -258,9 +258,10 @@ class TestDPUCompiler(unittest.TestCase):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)
     plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in
                   (x.permute(1,0,2), Tensor.empty(2,1,8,dtype=dtypes.half).expand(2,3,8), x.flip(0)))
-    self.assertTrue(all(isinstance(plan, RKReformat) and plan.kind is RKReformatKind.COALESCED_DPU for plan in plans))
-    reformats = tuple(plan for plan in plans if isinstance(plan, RKReformat))
-    self.assertEqual(tuple(len(plan.steps[0].stages) for plan in reformats if isinstance(plan.steps[0], RKDPUProgram)), (6, 5, 2))
+    self.assertTrue(all(isinstance(plan, RKLegalizedReformat) and plan.kind is RKReformatKind.COALESCED_DPU for plan in plans))
+    reformats = tuple(plan for plan in plans if isinstance(plan, RKLegalizedReformat))
+    self.assertEqual(tuple(len(plan.program.steps[0].stages) for plan in reformats
+                           if isinstance(plan.program.steps[0], RKDPUProgram)), (6, 5, 2))
     self.assertTrue(all(not contains_uop(plan) for plan in reformats))
 
   def test_affine_broadcast_materializes_then_runs_generic_dpu(self):
@@ -288,13 +289,13 @@ class TestDPUCompiler(unittest.TestCase):
                    Tensor.empty(24,dtype=dtypes.half)[1:17].clone(),
                    Tensor.empty(4,3,6,6,dtype=dtypes.half).flip(0).contiguous())
     plans = tuple(lower_reformat_result(sink(expression)).plan for expression in expressions)
-    self.assertTrue(all(isinstance(plan, RKReformat) and plan.kind is RKReformatKind.SELECTOR_CMAC for plan in plans))
+    self.assertTrue(all(isinstance(plan, RKLegalizedReformat) and plan.kind is RKReformatKind.SELECTOR_CMAC for plan in plans))
     first = plans[0]
-    assert isinstance(first, RKReformat)
+    assert isinstance(first, RKLegalizedReformat)
     self.assertEqual([stage.engine for stage in emit_reformat(first).stages], [RKEngine.CMAC])
     last = plans[-1]
-    assert isinstance(last, RKReformat)
-    self.assertLessEqual(sum(isinstance(step, RKContract) for step in last.steps), 8)
+    assert isinstance(last, RKLegalizedReformat)
+    self.assertLessEqual(sum(isinstance(step, RKContract) for step in last.program.steps), 8)
     self.assertTrue(all(not contains_uop(plan) for plan in plans))
 
   def test_add_matches_frozen_oracle(self):
@@ -1199,17 +1200,37 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_static_conditional_reformat_generates_zero_selector_rows(self):
     plan = lower_reformat_result(sink(Tensor.empty(3,3,dtype=dtypes.half).tril())).plan
-    self.assertIsInstance(plan, RKReformat)
-    assert isinstance(plan, RKReformat)
+    self.assertIsInstance(plan, RKLegalizedReformat)
+    assert isinstance(plan, RKLegalizedReformat)
     self.assertEqual([stage.engine for stage in emit_reformat(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
     self.assertFalse(contains_uop(plan))
+
+  def test_semantic_reformat_split_preserves_frozen_images(self):
+    cases = (
+      (Tensor.empty(2,3,8,dtype=dtypes.half).permute(1,0,2).contiguous(),
+       "a5b646b014c2554098226f506a9ba4bbf73cc5183a688abef49c95d23160db8e"),
+      (Tensor.empty(8,8,dtype=dtypes.half).T.contiguous(),
+       "f439fd352c45be0eff632da61e90d2db8fde573dd2aeb88d2808fa0206d0d46b"),
+      (Tensor.empty(3,3,dtype=dtypes.half).pad((1,2,3,4),value=3.456).contiguous(),
+       "8ae18bc960ac16815280326b084638ad9b779048b25b2d8471f557158eff6cd5"),
+      (Tensor.empty(3,3,dtype=dtypes.half).pad((1,2,3,4),value=math.inf).contiguous(),
+       "f33fe40ac5384e47c8bee558ec422917a530bec31b72b2321d042699837fcbba"),
+    )
+    for expression,expected in cases:
+      with self.subTest(expected=expected):
+        legalized = lower_reformat_result(sink(expression)).plan
+        self.assertIsInstance(legalized,RKLegalizedReformat)
+        assert isinstance(legalized,RKLegalizedReformat)
+        self.assertIsInstance(legalized.plan,RKReformatPlan)
+        self.assertEqual(hashlib.sha256(encode_image(emit_reformat(legalized))).hexdigest(),expected)
+        self.assertFalse(contains_uop(legalized))
 
   def test_windowed_reformat_uses_one_compact_64_output_contract(self):
     result = lower_reformat_result(sink(Tensor.empty(8,8,dtype=dtypes.half).T.contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
-    contracts = [step for step in result.plan.steps if isinstance(step, RKContract)]
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
+    contracts = [step for step in result.plan.program.steps if isinstance(step, RKContract)]
     self.assertEqual([(step.out.layout.logical_shape,step.out.layout.physical_shape) for step in contracts], [((1,64),(1,64))])
     self.assertTrue(contracts[0].compact_output)
     self.assertFalse(contains_uop(result.plan))
@@ -1218,9 +1239,9 @@ class TestDPUCompiler(unittest.TestCase):
     source = Tensor.empty(3,3,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.repeat(3,3,4).contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
-    self.assertEqual(Counter(result.plan.mapping), {index:36 for index in range(9)})
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
+    self.assertEqual(Counter(result.plan.plan.mapping), {index:36 for index in range(9)})
     self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
 
@@ -1228,10 +1249,10 @@ class TestDPUCompiler(unittest.TestCase):
     source = Tensor.empty(4,6,3,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.repeat(2,4,3,4).contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
-    self.assertEqual(Counter(result.plan.mapping), {index:96 for index in range(72)})
-    cost = plan_cost(RKProgram(result.plan.steps, result.plan.scratch))
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
+    self.assertEqual(Counter(result.plan.plan.mapping), {index:96 for index in range(72)})
+    cost = plan_cost(result.plan.program)
     self.assertLessEqual(cost.task_count, 400)
     self.assertLessEqual(cost.constant_bytes, 2*1024*1024)
     self.assertFalse(contains_uop(result.plan))
@@ -1240,9 +1261,9 @@ class TestDPUCompiler(unittest.TestCase):
     source = Tensor.empty(4,6,3,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.repeat(2,4,3,3,2,2).contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
-    cost = plan_cost(RKProgram(result.plan.steps, result.plan.scratch))
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
+    cost = plan_cost(result.plan.program)
     self.assertLessEqual(cost.task_count, 16)
     self.assertLessEqual(cost.constant_bytes, 2*1024*1024)
     self.assertFalse(contains_uop(result.plan))
@@ -1263,9 +1284,10 @@ class TestDPUCompiler(unittest.TestCase):
       with self.subTest(fill=fill):
         result = lower_reformat_result(sink(source.pad((1,2,3,4),value=fill).contiguous()))
         self.assertIs(result.kind,RKLowerKind.NATIVE)
-        self.assertIsInstance(result.plan,RKReformat)
-        assert isinstance(result.plan,RKReformat)
-        cost = plan_cost(RKProgram(result.plan.steps,result.plan.scratch))
+        self.assertIsInstance(result.plan,RKLegalizedReformat)
+        assert isinstance(result.plan,RKLegalizedReformat)
+        self.assertEqual(result.plan.plan.fill,struct.unpack("<e",struct.pack("<e",fill))[0])
+        cost = plan_cost(result.plan.program)
         self.assertLessEqual(cost.task_count,160)
         self.assertLessEqual(cost.constant_bytes,2*1024*1024)
         self.assertFalse(contains_uop(result.plan))
@@ -1281,9 +1303,9 @@ class TestDPUCompiler(unittest.TestCase):
           source = Tensor.empty(*shape,dtype=dtypes.half).realize()
           result = lower_static_selector_reformat_result(sink(source.pad(padding,mode=mode).contiguous()))
           self.assertIs(result.kind,RKLowerKind.NATIVE)
-          self.assertIsInstance(result.plan,RKReformat)
-          assert isinstance(result.plan,RKReformat)
-          self.assertLessEqual(plan_cost(RKProgram(result.plan.steps,result.plan.scratch)).task_count,200)
+          self.assertIsInstance(result.plan,RKLegalizedReformat)
+          assert isinstance(result.plan,RKLegalizedReformat)
+          self.assertLessEqual(plan_cost(result.plan.program).task_count,200)
           self.assertFalse(contains_uop(result.plan))
 
   def test_rgb_strided_convolution_uses_direct_cna_tasks(self):
@@ -1348,9 +1370,9 @@ class TestDPUCompiler(unittest.TestCase):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.roll(1).contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
-    self.assertEqual(result.plan.mapping, (31,*range(31)))
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
+    self.assertEqual(result.plan.plan.mapping, (31,*range(31)))
     self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
 
@@ -1358,19 +1380,19 @@ class TestDPUCompiler(unittest.TestCase):
     source = Tensor.empty(2,3,13,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.interpolate((9,),mode="nearest").contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
     spatial = (0,1,2,4,5,7,8,10,11)
-    self.assertEqual(result.plan.mapping, tuple(batch*13+index for batch in range(6) for index in spatial))
+    self.assertEqual(result.plan.plan.mapping, tuple(batch*13+index for batch in range(6) for index in spatial))
     self.assertFalse(contains_uop(result.plan))
 
   def test_windowed_reformat_accepts_large_source_surface(self):
     source = Tensor.empty(2,3,13,10,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.interpolate((9,11),mode="nearest").contiguous()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKReformat)
-    assert isinstance(result.plan, RKReformat)
-    self.assertEqual((result.plan.src.layout.logical_shape, result.plan.out.layout.logical_shape), ((780,), (858,)))
+    self.assertIsInstance(result.plan, RKLegalizedReformat)
+    assert isinstance(result.plan, RKLegalizedReformat)
+    self.assertEqual((result.plan.plan.src.layout.logical_shape, result.plan.plan.out.layout.logical_shape), ((780,), (858,)))
     self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
 

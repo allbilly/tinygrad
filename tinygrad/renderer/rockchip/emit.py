@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
 from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKDPUStage,
-  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformat, RKProgram)
+  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKSpatialConv, RKReduce, RKPool, RKLegalizedReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
@@ -406,9 +406,9 @@ def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       stages.append(RKStage(stage.engine, stage.commands, relocs, stage.flags))
   return RKImage(target, tuple(stages), plan.scratch, bytes(constants))
 
-def emit_reformat(plan:RKReformat, target:RKTarget=RKTarget.RK3588) -> RKImage:
+def emit_reformat(plan:RKLegalizedReformat, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit only the already-selected, UOp-free NPU implementation of a physical transform."""
-  return emit_program(RKProgram(plan.steps, plan.scratch), target)
+  return emit_program(plan.program, target)
 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""
