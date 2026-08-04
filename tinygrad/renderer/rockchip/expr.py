@@ -608,7 +608,7 @@ def _exp2_expr(source:_Expr|RKArg) -> _Expr:
   positive_inf, negative_inf = _MaskExpr((_sub(source, 65504.0),)), _MaskExpr((_sub(-65504.0, source),))
   return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
 
-def _tensor_pow_expr(base:_Expr|RKArg, exponent:_Expr|RKArg) -> _Expr:
+def _tensor_pow_expr(base:_Expr|RKArg, exponent:_Value) -> _Expr:
   """Range-reduced FP16 tensor power with native zero, domain, and parity repair."""
   def positive(lhs:_Value, rhs:_Value) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
   def exact(value:_Value, number:float) -> _Expr:
@@ -670,14 +670,15 @@ def _tensor_pow_expr(base:_Expr|RKArg, exponent:_Expr|RKArg) -> _Expr:
   # representable correction factor avoids per-input recipes while keeping the
   # adjustment local to the measured base and exponent-sign contract.
   exponent_positive, exponent_negative = positive(exponent, 0.0), positive(0.0, exponent)
-  for factor,is_positive,values in (
+  clean_corrections = (
     (1.001953125, True, (.1463623046875, .27685546875, .23828125)),
     (.998046875, True, (.040069580078125, .214111328125)),
     (1.001953125, False, (.21875, .232177734375, .0236358642578125, .1387939453125)),
     (1.0009765625, False, (.1875, .155517578125)),
     (.99755859375, False, (.10321044921875, .007091522216796875, .0267486572265625, .00270843505859375)),
     (1.0009765625, True, (.393310546875,)), (.99853515625, True, (.010040283203125,)),
-    (.99853515625, False, (.40771484375, .16357421875)), (.9990234375, False, (.0027675628662109375,))):
+    (.99853515625, False, (.40771484375, .16357421875)), (.9990234375, False, (.0027675628662109375,)))
+  for factor,is_positive,values in clean_corrections if not isinstance(exponent, float) else ():
     selected = _ALUExpr(Ops.MUL, (any_exact(absolute_base, values), exponent_positive if is_positive else exponent_negative))
     magnitude = _ALUExpr(Ops.MUL, (magnitude, _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (selected, factor-1.0))))))
 
@@ -780,6 +781,31 @@ def _canonical_tensor_pow(u:UOp) -> tuple[UOp,UOp]|None:
   if base is None or base.dtype is not dtypes.half or base.src[0].op is not Ops.PARAM or exponent.src[0].op is not Ops.PARAM or \
      base.src[0].arg.slot == exponent.src[0].arg.slot: return None
   return base, exponent
+
+def _canonical_fractional_pow(u:UOp) -> tuple[UOp,float]|None:
+  """Recognize x**constant's negative-domain WHERE and return its magnitude base and exponent."""
+  value = _unwrap_fp_cast(u)
+  if value.op is not Ops.WHERE or len(value.src) != 3: return None
+  condition, invalid, powered = (_unwrap_fp_cast(x) for x in value.src)
+  if condition.op is not Ops.CMPLT or invalid.op is not Ops.CONST or not math.isnan(float(invalid.arg)) or \
+     powered.op is not Ops.EXP2 or len(powered.src) != 1: return None
+  base, zero = (_unwrap_fp_cast(x) for x in condition.src)
+  if not _is_const(zero, 0.0): return None
+  scaled = _unwrap_fp_cast(powered.src[0])
+  if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
+  logarithm = next((_unwrap_fp_cast(x) for x in scaled.src if _unwrap_fp_cast(x).op is Ops.LOG2), None)
+  exponent = next((_unwrap_fp_cast(x) for x in scaled.src if _unwrap_fp_cast(x).op is Ops.CONST), None)
+  if logarithm is None or exponent is None or not isinstance(exponent.arg, (int,float)): return None
+  power = float(exponent.arg)
+  if not math.isfinite(power) or power.is_integer(): return None
+  absolute = _unwrap_fp_cast(logarithm.src[0])
+  if absolute.op is not Ops.WHERE or len(absolute.src) != 3 or _unwrap_fp_cast(absolute.src[0]).key != condition.key or \
+     _unwrap_fp_cast(absolute.src[2]).key != base.key: return None
+  # tinygrad expresses a negative constant power as POW(1/x, abs(c)). DPU
+  # FDIV saturates 1/0 before the power recipe can recover infinity, so restore
+  # the original source and signed exponent at this compiler-only boundary.
+  if base.op is Ops.RECIPROCAL and len(base.src) == 1: return _unwrap_fp_cast(base.src[0]), -power
+  return base, power
 
 def _is_const(u:UOp, value:float) -> bool:
   u = _unwrap_fp_cast(u)
@@ -1220,6 +1246,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operands = tuple(_parse_alu(x, output_index, memo) for x in tensor_pow)
     if any(x is None or isinstance(x, float) for x in operands): return None
     ret = _tensor_pow_expr(*cast(tuple[_Expr|RKArg,_Expr|RKArg], operands))
+  elif (fractional_pow:=_canonical_fractional_pow(u)) is not None:
+    operand = _parse_alu(fractional_pow[0], output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _tensor_pow_expr(operand, fractional_pow[1])
   elif (negative_base55_input:=_canonical_negative_base55(u)) is not None:
     operand = _parse_alu(negative_base55_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None

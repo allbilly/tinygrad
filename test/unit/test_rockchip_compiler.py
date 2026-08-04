@@ -844,6 +844,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(plan_cost(result.plan).stage_count, 400)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_fractional_constant_pow_reuses_range_reduction(self):
+    for power in (.3, -.3):
+      plan = lower_dpu(sink(Tensor.empty(8,dtype=dtypes.half)**power))
+      self.assertIsInstance(plan, RKDPUProgram)
+      self.assertEqual({rklut.RKLUTId.EXP2_RESIDUAL, rklut.RKLUTId.EXP2_SCALE},
+                       {stage.lut for stage in plan.stages if isinstance(stage,RKLUTStage)} &
+                       {rklut.RKLUTId.EXP2_RESIDUAL, rklut.RKLUTId.EXP2_SCALE})
+      self.assertLessEqual(len(plan.stages), 256)
+      self.assertFalse(contains_uop(plan))
+
   def test_pow8_uses_generated_two_level_lut(self):
     for name in ("POW8", "POW8_HIGH"):
       table = getattr(rklut, f"RK_LUT_{name}")

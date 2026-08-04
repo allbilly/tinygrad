@@ -1340,3 +1340,15 @@ The complete host gate passes 144 tests plus 34 subtests, full mypy and
 touched-module Ruff pass, and the serialized RK3588 gate passes 96 tests plus
 66 subtests in 807.23 seconds without a timeout, invalid submission, reset
 failure, or process abort.
+
+Constant fractional power now canonicalizes tinygrad's exact negative-domain
+`WHERE(NaN, EXP2(LOG2(abs(x))*c))` decomposition into the same range-reduced
+NPU recipe. A negative constant exponent is represented upstream as
+`(1/x)**abs(c)`; the compiler restores `x**c` before legalization because DPU
+FDIV saturates `1/0` and would otherwise hide the required positive infinity.
+The constant recipe needs 209 tasks and omits the runtime-tensor calibration
+groups. The unchanged official `test_pow_zero_const` passes all four subcases
+in 102.53 seconds and `test_pow` passes all fourteen subcases in 158.06
+seconds. Focused expected coverage is now 186 native / 40 frontend / 186 fail /
+13 skip; the authoritative complete census remains 172/40/200/13. The expanded
+host gate passes 145 tests plus 34 subtests, full mypy, and touched-module Ruff.

@@ -3027,3 +3027,24 @@ gate passes 144 tests plus 34 subtests, full mypy and touched-module Ruff pass,
 and the complete serialized RK3588 gate passes 96 tests plus 66 subtests in
 807.23 seconds without a timeout, invalid submission, reset failure, or process
 abort.
+
+## Constant fractional power canonicalization
+
+Tinygrad expresses a fractional constant exponent as a negative-domain WHERE
+around `EXP2(LOG2(abs(base))*constant)`. The literal NaN arm cannot be selected
+through ordinary arithmetic masks because inactive `0*NaN` remains NaN, so an
+exact compiler-only canonicalizer now feeds this graph into the proven native
+tensor-power range reduction. Compile-time constants omit the dynamic
+input-calibration groups and produce a 209-task correctness plan.
+
+For negative constants, upstream first rewrites `x**-c` as `(1/x)**c`. The
+compiler restores the original base and signed exponent before target
+legalization; otherwise RK3588 FDIV saturates `1/0` and returns 512 after the
+power recipe instead of positive infinity. The unchanged official
+`test_pow_zero_const` passes its positive, zero, negative fractional, and
+reciprocal subcases in 102.53 seconds. The unchanged `test_pow` passes all
+fourteen integer, scalar, regression-range, and fractional subcases in 158.06
+seconds. No tolerance, fallback, skip, or task ceiling changed. Focused
+expected coverage is 186 native / 40 frontend / 186 failed / 13 upstream skips;
+172/40/200/13 remains the last authoritative complete census. The expanded
+host gate passes 145 tests plus 34 subtests, full mypy, and touched-module Ruff.
