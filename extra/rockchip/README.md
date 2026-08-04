@@ -1407,3 +1407,11 @@ correctness fallbacks; the largest remains the unchanged 399-task matmul.
 Rockchip compiler concentration remains visible: package `__init__.py` is 2,682
 lines and `expr.py` is 1,445 lines, so contraction/reformat/reduction extraction
 remains cleanup work rather than being hidden under generated files.
+
+A post-census two-level average probe rounded the final reciprocal scale only
+when its relative FP16 representation error was at most `2^-11`. All four
+unchanged `test_avg_pool2d` subcases then executed on RK3588, but 35--39% of
+their outputs missed the required `rtol=1e-5`; maximum absolute error was
+0.000977 and maximum relative error was 0.001215. The experiment is rejected,
+the exact-scale compiler guard is restored, and the WIP remains archived rather
+than being counted as native coverage.

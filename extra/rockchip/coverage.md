@@ -3138,3 +3138,16 @@ selector-heavy plans instead of treating all native passes as equally mature.
 compiler modules are still `renderer/rockchip/__init__.py` at 2,682 lines and
 `expr.py` at 1,445 lines. Those figures preserve the modularization debt
 explicitly and do not move handwritten compiler code under `autogen/`.
+
+The first post-census numerical probe tested whether an unrepresentable
+two-level average scale could be rounded once at final CMAC writeback under a
+relative scale-error ceiling of `2^-11`. All four unchanged
+`TestOps.test_avg_pool2d` subcases reached RK3588, but 35.3--39.3% of outputs
+failed the official `rtol=1e-5, atol=1e-6`; the worst absolute and relative
+errors were 0.000977 and 0.001215. The change was therefore removed and the
+pre-submission `NUMERICAL_CONTRACT` guard restored. The exact WIP is
+`rockchip-upstream-patches/wip-rounded-two-level-average-official-mismatch.patch`
+(SHA-256
+`2cfd29f48a5c509f4bb61277a4e1dfcd752ac9e08d2678eb41f72fdb65cf72a7`);
+focused JUnit and telemetry remain under
+`~/rk2608_backups/focused-rounded-average-e6ace78ca-20260804/`.
