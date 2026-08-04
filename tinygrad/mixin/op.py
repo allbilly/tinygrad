@@ -759,7 +759,9 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     # for now this is a two stage cumsum
     SPLIT = 256
     value = identity_element(op, self.dtype)
-    if not isinstance(s:=self.shape[axis], int) or s <= SPLIT*2: return self._cumalu(axis, op)
+    # Splitting an FP16 sum rounds every block before adding its carry and can miss cumsum's output contract near zero.
+    direct_limit = SPLIT*4 if op is Ops.ADD and self.dtype is dtypes.half else SPLIT*2
+    if not isinstance(s:=self.shape[axis], int) or s <= direct_limit: return self._cumalu(axis, op)
     chunks = self.transpose(axis,-1)._pad_constant((None,)*(self.ndim-1)+((round_up(s,SPLIT)-s,0),), value).unflatten(-1,(-1,SPLIT))._cumalu(-1, op)
     base = chunks[..., -1]._cumalu(-1, op)._pad_constant((None,)*(chunks.ndim-2) + ((1, -1),), value)
     return chunks.alu(op, base.unsqueeze(-1)).flatten(start_dim=-2)[..., -s:].transpose(axis,-1)

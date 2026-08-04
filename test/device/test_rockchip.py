@@ -388,6 +388,14 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data,device="ROCKCHIP").realize().cumsum(0).realize().numpy()
     np.testing.assert_equal(actual,np.cumsum(data.astype(np.float32),axis=0).astype(np.float16))
 
+  def test_wide_prefix_sum_native_cmac_windows(self):
+    rng = np.random.default_rng(20260804)
+    for count in (512,1022):
+      with self.subTest(count=count):
+        data = rng.uniform(-2,2,count).astype(np.float16)
+        actual = Tensor(data,device="ROCKCHIP").realize().cumsum(0).realize().numpy()
+        np.testing.assert_allclose(actual,np.cumsum(data.astype(np.float32)).astype(np.float16),rtol=1e-3,atol=1e-6)
+
   def test_windowed_affine_average_native_cmac(self):
     data = np.linspace(-1,1,2*2*11*28,dtype=np.float16).reshape(2,2,11,28)
     actual = Tensor(data,device="ROCKCHIP").realize().avg_pool2d(2).realize().numpy()

@@ -38,9 +38,9 @@ RK_MAX_CMAC_SELECTOR_WINDOW = 1504
 # A dense 64x64 transpose pack proves a 2,048-lane CMAC source window; keep ordinary affine selectors on their narrower contract.
 RK_MAX_TILED_CMAC_SELECTOR_WINDOW = 2048
 RK_MAX_TILED_CONTRACT_VISITS = 4*RK_MAX_AFFINE_VISITS
-# One compact strided-prefix task is exact through a 608-lane source window; this also bounds compiler coordinate inspection.
-RK_MAX_PREFIX_WINDOW = 608
-RK_MAX_PREFIX_VISITS = 1_000_000
+# Compact prefix CMAC is exact through a 1,024-lane padded source window. Bound both the hardware surface and compiler work.
+RK_MAX_PREFIX_WINDOW = 1024
+RK_MAX_PREFIX_VISITS = RK_MAX_PREFIX_WINDOW**2
 
 def _fp16_exact(value:float) -> bool:
   try: rounded = struct.unpack("<e", struct.pack("<e", value))[0]
@@ -1702,7 +1702,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   # A statically masked reduction may describe identity padding that never reaches CMAC. Inspect a bounded amount of that
   # logical padding, then apply the unchanged affine-visit budget to the selected source terms below.
   logical_visits = output_count*reduction_count
-  prefix_candidate = condition is not None and not epilogue and output_count == input_count and len(red_axes) == 1 and reduction_count <= 40
+  prefix_candidate = condition is not None and not epilogue and len(red_axes) == 1 and reduction_count <= RK_MAX_PREFIX_WINDOW and \
+                     (output_count == input_count or max(output_count,input_count) <= RK_MAX_PREFIX_WINDOW)
   visit_limit = RK_MAX_PREFIX_VISITS if prefix_candidate else RK_MAX_STATIC_MASK_VISITS if condition is not None else RK_MAX_AFFINE_VISITS
   output_limit = 64*RK_MAX_PROGRAM_STAGES if prefix_candidate else 8192
   input_limit = output_limit if prefix_candidate else 65536
@@ -1730,21 +1731,30 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
   selected_visits = sum(map(len, selectors))
-  prefix_scan = prefix_candidate and output_count%reduction_count == 0 and all(len(row) == index%reduction_count+1 and
+  ordinary_prefix = output_count%reduction_count == 0 and all(len(row) == index%reduction_count+1 and
     (index%reduction_count == 0 or row[:-1] == selectors[index-1]) for index,row in enumerate(selectors))
+  # Tinygrad's long scan pads 1,022 inputs to four 256-output groups. The first group begins with identity rows and the
+  # final group repeats its saturated tail. Retain this only when every group is one monotone contiguous source prefix.
+  def monotone_prefix_group(rows:list[list[int]]) -> bool:
+    nonempty, lengths = [row for row in rows if row], [len(row) for row in rows]
+    return all(row == list(range(row[0],row[0]+len(row))) for row in nonempty) and len({row[0] for row in nonempty}) <= 1 and \
+      all(lhs <= rhs for lhs,rhs in zip(lengths,lengths[1:]))
+  padded_prefix = output_count <= RK_MAX_PREFIX_WINDOW and input_count <= RK_MAX_PREFIX_WINDOW and \
+    all(monotone_prefix_group(selectors[start:start+reduction_count]) for start in range(0,output_count,reduction_count))
+  prefix_scan = prefix_candidate and (ordinary_prefix or padded_prefix)
   if selected_visits > (RK_MAX_PREFIX_VISITS if prefix_scan else RK_MAX_AFFINE_VISITS):
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"affine CMAC selects {selected_visits} source terms from {logical_visits} logical visits", reduce.op)
   if prefix_scan and output_count <= 32 and prepare is None and _fp16_exact(scale):
-    align = 32
+    align_in, align_out = max(32,(input_count+31)&-32), 32
     packed = RKArg(RKBufferKind.SCRATCH,0)
-    scratch = (RKScratch(align*2),)
-    prep = RKDPUProgram((RKALUStage(Ops.ADD,packed,0.0,0.0,align),RKALUStage(Ops.ADD,packed,source,0.0,input_count)),scratch)
-    out_layout = RKLayout((1,output_count),(1,align),(align*2,2),dtypes.half,padding=((0,0),(0,align-output_count)))
-    lhs_layout = RKLayout((1,input_count),(1,align),(align*2,2),dtypes.half,padding=((0,0),(0,align-input_count)))
+    scratch = (RKScratch(align_in*2),)
+    prep = RKDPUProgram((RKALUStage(Ops.ADD,packed,0.0,0.0,align_in),RKALUStage(Ops.ADD,packed,source,0.0,input_count)),scratch)
+    out_layout = RKLayout((1,output_count),(1,align_out),(align_out*2,2),dtypes.half,padding=((0,0),(0,align_out-output_count)))
+    lhs_layout = RKLayout((1,input_count),(1,align_in),(align_in*2,2),dtypes.half,padding=((0,0),(0,align_in-input_count)))
     contract = RKCMACTask(RKTensorRef(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),out_layout),
-      RKTensorRef(packed,lhs_layout),_cmac_weight_ref(0,output_count,align,RKBufferKind.CONSTANT,align),reduce.op,
-      _cmac_selection_payload(selectors,align,align,scale),compact_output=True)
+      RKTensorRef(packed,lhs_layout),_cmac_weight_ref(0,output_count,align_in,RKBufferKind.CONSTANT,align_out),reduce.op,
+      _cmac_selection_payload(selectors,align_in,align_out,scale),compact_output=True)
     return _native(_finish_program([prep,contract],scratch))
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   initial_scratch = () if prepare is None else prepare.scratch

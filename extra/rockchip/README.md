@@ -1600,3 +1600,35 @@ only 57,696 unique constant bytes. A permanent random axis-zero boundary proves
 the 608-lane strided window. Focused expected coverage is now
 `198/40/174/13`; the authoritative census remains `195/40/177/13` pending a
 new complete run.
+
+## Direct FP16 cumulative sums through 1,024 elements
+
+The 512/1,022-element `test_simple_cumsum` failure was not a device timeout or
+a missing arithmetic operation. Tinygrad's generic two-level scan splits inputs
+above 512 into 256-element blocks, stores every block prefix in FP16, and then
+adds an FP16 carry. Under `DEFAULT_FLOAT=HALF` that intermediate rounding makes
+the unchanged 1,022-element test miss Torch's tolerance; the CPU backend showed
+the same 33-lane failure.
+
+FP16 ADD scans now remain in the direct generic formulation through 1,024
+elements; MUL and MAX retain the existing split threshold. The Rockchip
+legalizer proves only monotone contiguous prefix groups before applying the
+wider contract. A standalone worst-tail probe with K padded to 1,024 was
+bit-exact, and the complete direct plans cost:
+
+| extent | tasks | constants | scratch |
+|---|---:|---:|---:|
+| 512 | 8 | 294,912 | 0 |
+| 1,022 | 18 | 1,118,208 | 2,048 |
+
+The unchanged `test_simple_cumsum` passes on both RK3588 and CPU with
+`DEFAULT_FLOAT=HALF`. The permanent RK3588 512/1,022 random boundary meets the
+official `rtol=1e-3, atol=1e-6` contract; together with the mixed-engine prefix
+stress test, two device tests plus four subtests pass in 32.39 seconds. All 152
+compiler/image tests pass with 53 subtests, mypy covers 228 source files, and
+Ruff is clean. No CPU fallback, tolerance change, task-limit increase, or host
+tensor transformation was added.
+
+This is one focused complete-method gain. Expected coverage is now
+`199 native / 40 frontend / 173 failed / 13 skipped`; the authoritative
+uncached baseline remains `195/40/177/13` until rerun.

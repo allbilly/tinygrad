@@ -1475,6 +1475,19 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertTrue(all(not isinstance(step,RKCMACTask) or step.compact_output for step in result.plan.steps))
         self.assertFalse(contains_uop(result.plan))
 
+  def test_wide_prefix_sums_use_direct_bounded_cmac_windows(self):
+    for count,task_limit,constant_limit in ((512,8,300000),(1022,20,1200000)):
+      with self.subTest(count=count):
+        result = lower_affine_reduce_result(sink(Tensor.empty(count,dtype=dtypes.half).cumsum(0)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        cost = plan_cost(result.plan)
+        self.assertLessEqual(cost.task_count,task_limit)
+        self.assertLessEqual(cost.constant_bytes,constant_limit)
+        self.assertTrue(all(not isinstance(step,RKCMACTask) or step.compact_output for step in result.plan.steps))
+        self.assertFalse(contains_uop(result.plan))
+
   def test_global_mean_folds_scale_into_cmac_weights(self):
     result = lower_add_reduce_result(sink(Tensor.empty(360,dtype=dtypes.half).mean()))
     self.assertIsInstance(result.plan, RKProgram)
