@@ -362,6 +362,11 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       lhs,rhs = (RKArg(RKBufferKind.ARG,u.src[0].arg.slot) for u in bool_sources)
       assert physical_op is not None
       return _native(RKDPUProgram((RKALUStage(physical_op,output,lhs,rhs,count,dtypes.bool),)))
+    if identity.op is Ops.CMPNE and identity.src[1].op is Ops.CONST and identity.src[1].arg is True and \
+       identity.src[0].op is Ops.INDEX and identity.src[0].dtype is dtypes.bool and identity.src[0].src[0].op is Ops.PARAM and \
+       identity.src[0].src[1].key == out_index.key:
+      source = RKArg(RKBufferKind.ARG,identity.src[0].src[0].arg.slot)
+      return _native(RKDPUProgram((RKALUStage(Ops.SUB,output,1.0,source,count,dtypes.bool),)))
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE,"non-identity bool output",store.src[1].op)
   input_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   # Rejected WIP: DATA_FORMAT in_precision=precision_float32 exists in the register enum, but a direct FP32->FP16 ADD timed out on RK3588.

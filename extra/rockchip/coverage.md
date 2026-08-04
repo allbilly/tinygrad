@@ -3286,3 +3286,9 @@ that is exact `AND`; a 65-lane hardware boundary passes bit-for-bit. The
 unchanged `test_minimum` now passes every integer and bool subcase before its
 first mixed int32/FP16 rejection. This adds a generic native bool capability,
 not a method-level census gain yet.
+
+Bool `CMPNE(x, True)` now lowers exactly to int8 DPU `1 - x`; both inputs stay
+inside the proven public-bool representation. Its 65-lane hardware boundary
+passes exactly. `test_logical_not` advances through the bool-input case but its
+later FP16 input still requires the rejected FP16-mask-to-int8 conversion, so
+the method remains a typed failure pending a different hardware path.

@@ -213,7 +213,15 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     if not isinstance(plan, RKALUStage): raise ValueError(f"unimplemented Rockchip stage {type(plan).__name__}")
     bool_out = plan.out_dtype is dtypes.bool
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
-    lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count)
+    def materialize_bool(value:RKArg|float) -> RKArg:
+      if isinstance(value,RKArg): return value
+      key = ("bool",bool(value),plan.count)
+      if key not in constant_offsets:
+        constant_offsets[key] = len(constants)
+        constants.extend(bytes((int(bool(value)),))*((plan.count+15)//16*16))
+      return RKArg(RKBufferKind.CONSTANT,constant_offsets[key])
+    lhs, rhs = ((materialize_bool(plan.lhs),materialize_bool(plan.rhs)) if bool_out else
+                (materialize(plan.lhs,material_count),materialize(plan.rhs,material_count)))
     width = ((plan.count*2 if plan.out_dtype is dtypes.int else plan.count)+(15 if bool_out else 7))//(16 if bool_out else 8)-1
     wide_out = plan.out_dtype in (dtypes.int, dtypes.float)
     lanes = 16 if bool_out else (8 if wide_out or plan.count >= 8 else plan.count)
@@ -226,7 +234,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0),
       (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if wide_out else lanes-1), (rk.REG_DPU_WDMA_SIZE_1, width),
       (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0),
-      (rk.REG_DPU_EW_CFG, (1<<22)|0x2c0|((1<<2) if plan.op is Ops.MUL else 0) if bool_out else _EW_CFG[plan.op]),
+      (rk.REG_DPU_EW_CFG, (1<<22)|0x2c0|((1<<2) if plan.op is Ops.MUL else ((4<<16) if plan.op is Ops.SUB else 0))
+       if bool_out else _EW_CFG[plan.op]),
       (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1), (rk.REG_DPU_OUT_CVT_OFFSET, plan.out_cvt_offset),
       (rk.REG_DPU_OUT_CVT_SCALE, 0 if plan.out_dtype is dtypes.float else (1 if plan.op is Ops.FDIV or
        plan.out_dtype in (dtypes.bool,dtypes.int) else 0x10001)), (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))

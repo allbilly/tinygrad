@@ -1483,3 +1483,9 @@ structural recognition maps that identity to int8 DPU multiplication, which is
 equivalent to `AND` for public bool lanes. Its 65-lane RK3588 boundary is
 bit-exact, and `test_minimum` likewise advances through every bool subcase
 before reaching the same unproven mixed int32/FP16 conversion boundary.
+
+Bool logical NOT also has a direct int8 implementation: the compiler recognizes
+`CMPNE(x, True)` exactly and emits `1 - x` through the DPU subtraction ALU,
+with an aligned immutable int8-one surface. The 65-lane boundary is bit-exact.
+The official `test_logical_not` passes its bool-input subcase and then reaches
+the separate FP16-comparison-to-public-bool conversion boundary.
