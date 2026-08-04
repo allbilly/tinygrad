@@ -57,8 +57,8 @@ ceilings, then compare reset overhead, MACs, traffic, command volume, constants,
 and scratch. Runtime telemetry records exact task/command/reset counts and marks
 plans over 64 tasks or 1 MiB of constants as `CORRECTNESS_FALLBACK`; these remain
 honest native passes but are kept visible for replacement by direct engine paths.
-The current serialized device contract passes 95 tests plus 64 subtests in
-805.79 seconds with fallback disabled.
+The current serialized device contract passes 96 tests plus 66 subtests in
+807.11 seconds with fallback disabled.
 
 Lowering uses twenty-one named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
@@ -1168,3 +1168,21 @@ therefore excluded from the clean compiler rather than being counted as a
 coverage gain. Its complete code and tests are preserved as
 `wip-multi-source-reformat-fp32-contract.patch` (SHA-256
 `2a6c591f305b8e12eda17d5c6d199340286e53386caf87b7d0653f430ca704a7`).
+
+## Static selector-expression reformat
+
+Reflect and replicate padding simplify into disjoint ADD/WHERE trees containing
+several guarded indexes of the same FP16 surface. A generic movement lowerer
+now evaluates only the static predicates and index arithmetic for every output
+coordinate, requires exactly one selected index and one source parameter, and
+hands the resulting mapping to the existing typed CMAC reformatter. It cannot
+claim arithmetic, multi-input, dynamic-index, or non-FP16 graphs.
+
+Representative 3D, 4D, and 5D compiler cases pass, as does a permanent RK3588
+reflect/replicate sweep. The unchanged official `test_pad_reflect_mode` and
+`test_pad_replicate_mode` methods both pass natively in 16.78 seconds combined,
+with ten RK kernels each and no fallback. Host gates pass 134 tests plus 22
+subtests, mypy, and Ruff; the serialized device gate passes 96 tests plus 66
+subtests in 807.11 seconds. The focused expected tally is 176 native / 40
+frontend / 196 fail / 13 skip; 172/40/200/13 remains authoritative until the
+next complete census.

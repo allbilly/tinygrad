@@ -12,6 +12,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_pointwise_affine_reduce_result, lower_reduce_result,
   lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result,
+  lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
   rk_fingerprint)
@@ -1272,6 +1273,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind,RKLowerKind.UNSUPPORTED)
     assert result.reject is not None
     self.assertIs(result.reject.kind,RKRejectKind.NUMERICAL_CONTRACT)
+
+  def test_static_selector_padding_modes_use_reformat(self):
+    for mode in ("reflect","replicate"):
+      for shape,padding in (((1,1,5,5),(0,2,3,2)),((5,5,5),(0,2)),((1,1,5,5,5),(1,2,3,4,1,2))):
+        with self.subTest(mode=mode,shape=shape):
+          source = Tensor.empty(*shape,dtype=dtypes.half).realize()
+          result = lower_static_selector_reformat_result(sink(source.pad(padding,mode=mode).contiguous()))
+          self.assertIs(result.kind,RKLowerKind.NATIVE)
+          self.assertIsInstance(result.plan,RKReformat)
+          assert isinstance(result.plan,RKReformat)
+          self.assertLessEqual(plan_cost(RKProgram(result.plan.steps,result.plan.scratch)).task_count,200)
+          self.assertFalse(contains_uop(result.plan))
 
   def test_rgb_strided_convolution_uses_direct_cna_tasks(self):
     source = Tensor.empty(4,3,11,28,dtype=dtypes.half).realize()

@@ -2768,3 +2768,26 @@ the FP16 probe would add code without removing a TestOps failure family. The
 working implementation and tests were removed from the active compiler and
 preserved in `wip-multi-source-reformat-fp32-contract.patch` (SHA-256
 `2a6c591f305b8e12eda17d5c6d199340286e53386caf87b7d0653f430ca704a7`).
+
+## Static selector-expression reformat milestone
+
+Reflect and replicate padding are not single affine indexes after
+simplification. They are disjoint ADD/WHERE expressions containing several
+statically guarded indexes of one source buffer. The new movement lowerer
+enumerates the static range coordinates, resolves WHERE predicates, permits
+only zero constants and ADD composition, and requires exactly one in-bounds
+FP16 index for every dense output. The resulting single-source mapping uses
+the existing typed `RKReformat` selector implementation.
+
+The unchanged `test_pad_reflect_mode` and `test_pad_replicate_mode` methods
+both report `PASS_NATIVE` in 16.78 seconds combined. Each realizes ten kernels
+using only RK DPU, CMAC, and mixed lanes. Their telemetry JSON SHA-256 is
+`a3b1ca2dc6a1555c2d4262a8e43b2b1ecb2280296b4d4b0b9dd42d230a2ddc54` and
+JUnit SHA-256 is
+`b59fde219e6d5f9726c9088acb6663135fbb56642637499c40bda272c10d2731`.
+Permanent validation passes 134 host tests plus 22 subtests, mypy, Ruff, and 96
+serialized device tests plus 66 subtests in 807.11 seconds. There is no CPU
+semantic lane, tolerance change, resource-ceiling change, timeout, reset error,
+invalid submission, or process abort. The focused expected tally is therefore
+176 native / 40 frontend / 196 fail / 13 skip; the complete `2e40def50`
+172/40/200/13 census remains authoritative until the next full run.

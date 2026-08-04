@@ -589,6 +589,56 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "static reformat selector exceeds the native cost contract", Ops.INDEX)
   return atom_reject
 
+def lower_static_selector_reformat_result(sink:UOp) -> RKLowerResult:
+  """Resolve a disjoint static ADD/WHERE expression of indexes from one FP16 surface."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return _not_applicable()
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  stored, output_index = _strip_casts(store.src[1]), store.src[0].src[1]
+  indexes = tuple(dict.fromkeys(u for u in stored.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM))
+  params = tuple(dict.fromkeys(index.src[0] for index in indexes))
+  if len(indexes) < 2 or len(params) != 1 or any(index.dtype is not dtypes.half for index in indexes): return _not_applicable()
+  count, src_count = int(store.src[0].src[0].src[0].arg), int(params[0].src[0].arg)
+  range_uops = tuple(dict.fromkeys(u for root in (output_index,stored) for u in root.toposort()
+                                  if u.op is Ops.RANGE and u.src[0].op is Ops.CONST))
+  visits = math.prod(int(u.src[0].arg) for u in range_uops)
+  if not 0 < count <= RK_MAX_AFFINE_VISITS or visits > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"static selector reformat is {count} outputs and {visits} visits",Ops.WHERE)
+  def selected_indexes(value:UOp, point:dict[UOp,int]) -> list[UOp]|None:
+    value = _strip_casts(value)
+    if value.op is Ops.INDEX and value.src[0].op is Ops.PARAM: return [value]
+    if value.op is Ops.CONST and float(value.arg) == 0.0: return []
+    if value.op is Ops.ADD:
+      parts = tuple(selected_indexes(source,point) for source in value.src)
+      return None if any(part is None for part in parts) else \
+        [index for part in cast(tuple[list[UOp],...],parts) for index in part]
+    if value.op is Ops.WHERE:
+      predicate = _static_scalar(value.src[0],point)
+      return None if predicate is None else selected_indexes(value.src[1] if predicate else value.src[2],point)
+    return None
+  mapping = [-2]*count
+  for coordinates in product(*(range(int(u.src[0].arg)) for u in range_uops)):
+    point = dict(zip(range_uops,coordinates))
+    dst, selected = _static_scalar(output_index,point), selected_indexes(stored,point)
+    if not isinstance(dst,int) or isinstance(dst,bool) or not 0 <= dst < count or mapping[dst] != -2 or selected is None or len(selected) != 1:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static selector does not cover one dense output",Ops.WHERE)
+    source_offset = _static_scalar(selected[0].src[1],point)
+    if not isinstance(source_offset,int) or isinstance(source_offset,bool) or not 0 <= source_offset < src_count:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static selector source is out of bounds",Ops.INDEX)
+    mapping[dst] = source_offset
+  if any(source_offset < 0 for source_offset in mapping):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static selector reformat has output holes",Ops.WHERE)
+  output, source_arg = RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot), RKArg(RKBufferKind.ARG,params[0].arg.slot)
+  rows = [[index] for index in mapping]
+  implementation = _periodic_selector_program(output,source_arg,src_count,rows) or _selector_program(output,source_arg,src_count,rows,())
+  if implementation is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"static selector reformat exceeds the native cost contract",Ops.INDEX)
+  return _native(RKReformat(_dense_half_ref(output.index,(count,)),_dense_half_ref(source_arg.index,(src_count,)),tuple(mapping),
+    RKReformatKind.SELECTOR_CMAC,cast(tuple[RKDPUProgram|RKContract,...],implementation.steps),implementation.scratch))
+
 def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   """Materialize one static affine or zero-masked FP16 surface, then schedule generic DPU arithmetic."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
@@ -2584,6 +2634,7 @@ def _has_reduction(nodes:tuple[UOp, ...], op:Ops|None=None) -> bool:
 
 _LOWERERS = (
   RKLowerer("dpu", lambda nodes:not _has_reduction(nodes), lower_dpu_result),
+  RKLowerer("static_selector_reformat", lambda nodes:not _has_reduction(nodes), lower_static_selector_reformat_result),
   RKLowerer("multi_broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_multi_broadcast_alu_result),
   RKLowerer("broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_broadcast_alu_result),
   RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),

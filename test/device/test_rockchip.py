@@ -522,6 +522,14 @@ class TestRockchip(unittest.TestCase):
         expected = np.pad(data,((0,0),(0,0),(3,4),(1,2)),constant_values=fill)
         np.testing.assert_equal(actual,expected)
 
+  def test_static_selector_padding_modes_native_reformat(self):
+    data = np.arange(25,dtype=np.float16).reshape(1,1,5,5)
+    for mode,numpy_mode in (("reflect","reflect"),("replicate","edge")):
+      with self.subTest(mode=mode):
+        actual = Tensor(data,device="ROCKCHIP").realize().pad((0,2,3,2),mode=mode).contiguous().realize().numpy()
+        expected = np.pad(data,((0,0),(0,0),(3,2),(0,2)),mode=numpy_mode)
+        np.testing.assert_equal(actual,expected)
+
   def test_static_split_and_modulo_movements_native_cmac(self):
     data = np.arange(9,dtype=np.float16).reshape(3,3)
     tensor = Tensor(data,device="ROCKCHIP").realize()
