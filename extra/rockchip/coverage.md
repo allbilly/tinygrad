@@ -3887,3 +3887,23 @@ movement, large block-transpose, and split/modulo device regressions pass four
 tests plus nine subtests; mypy over 228 source files and full Ruff are clean. This is one
 focused expected transition to `203/40/169/13`; the authoritative complete
 census remains `202/40/170/13` until the next locked uncached run.
+
+## Reusable command and task GEMs
+
+The native runtime formerly allocated, mapped, submitted, unmapped, and
+destroyed one command GEM plus one kernel task-descriptor GEM for every
+physical stage. `RockchipProgram` now allocates one command buffer sized for
+its largest stage and one task descriptor, overwrites them for each blocking
+submission, and frees them at program teardown. Scratch, constants, relocation
+patching, per-stage reset, task ordering, and the one-task ioctl contract are
+unchanged.
+
+Five focused programs cover DPU, CMAC, PPU, CONV, and the 141-task mixed block
+transpose; a repeated sparse-movement program covers reuse across invocations.
+All six tests plus eight subtests pass on RK3588. Unit image/telemetry tests,
+mypy over 228 files, and Ruff pass. The unchanged `test_multicat` also passes
+after the change in 113.04 seconds versus 112.20 seconds immediately before
+it, so no performance improvement is claimed: per-stage reset and device work
+dominate. The value of this milestone is bounded resource lifetime—323 stages
+no longer cause 646 temporary GEM allocations. Coverage remains the focused
+expected `203/40/169/13`, with `202/40/170/13` authoritative.

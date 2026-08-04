@@ -1860,3 +1860,18 @@ All 160 compiler/image tests plus 59 subtests pass, four focused RK3588
 movement tests plus nine subtests pass, mypy checks 228 source files, and Ruff
 is clean. This is one focused expected gain (`203/40/169/13`); the last full
 uncached census remains `202/40/170/13` pending its next run.
+
+## Reusable submission buffers
+
+Each compiled native program now allocates one maximum-sized command GEM and
+one kernel-mapped task descriptor GEM. Every sequential stage overwrites and
+submits those two buffers after the existing per-stage reset; program teardown
+frees them with scratch and constant storage. A 323-task plan consequently no
+longer creates and destroys 646 temporary GEMs during one invocation.
+
+The reset and one-task blocking submission contracts are unchanged. DPU,
+CMAC, PPU, CONV, mixed-engine, and repeated-program hardware regressions pass.
+The unchanged `test_multicat` remains correct but measures 113.04 seconds,
+essentially unchanged from 112.20 seconds, proving reset/device work dominates
+this workload. This milestone claims resource-lifecycle cleanup, not a speed or
+coverage gain; the expected tally remains `203/40/169/13`.
