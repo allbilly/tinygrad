@@ -20,6 +20,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   lower_multi_broadcast_alu_result, lower_global_max_result,
   lower_nested_add_reduce_result,
   lower_reformat_result,
+  lower_static_two_tap_result,
   lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
@@ -1821,6 +1822,21 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((result.plan.plan.src.layout.logical_shape, result.plan.plan.out.layout.logical_shape), ((780,), (858,)))
     self.assertIs(result.plan.kind, RKReformatKind.SELECTOR_CMAC)
     self.assertFalse(contains_uop(result.plan))
+
+  def test_static_two_tap_interpolation_uses_windowed_weighted_cmac(self):
+    for align_corners in (False,True):
+      for source_extent,output_extent in ((52,29),(29,52)):
+        with self.subTest(align_corners=align_corners,source_extent=source_extent,output_extent=output_extent):
+          source = Tensor.empty(2,3,source_extent,dtype=dtypes.half)
+          result = lower_static_two_tap_result(sink(source.interpolate((output_extent,),mode="linear",align_corners=align_corners)))
+          self.assertIs(result.kind,RKLowerKind.NATIVE)
+          self.assertIsInstance(result.plan,RKProgram)
+          assert isinstance(result.plan,RKProgram)
+          cost = plan_cost(result.plan)
+          self.assertLessEqual(cost.task_count,7)
+          self.assertLessEqual(cost.constant_bytes,46*1024)
+          self.assertTrue(all(isinstance(step,(RKDPUProgram,RKCMACTask)) for step in result.plan.steps))
+          self.assertFalse(contains_uop(result.plan))
 
   def test_affine_reduction_materializes_pointwise_dpu_expression(self):
     x, y = Tensor.empty(3,4,5,dtype=dtypes.half), Tensor.empty(3,4,5,dtype=dtypes.half)

@@ -1673,3 +1673,37 @@ on CPU in 1.27 seconds and on RK3588 in 18.66 seconds under
 `DEFAULT_FLOAT=HALF`; no backend dtype support changed. Focused expected
 coverage is therefore `199/40/173/13`, while `198/40/174/13` remains the last
 complete uncached census until the next full run.
+
+## Static convex two-tap transforms
+
+One-dimensional linear interpolation is now lowered as a generic static
+linear transform rather than an interpolation-named runtime task. The compiler
+symbolically evaluates the FP32 expression at each bounded output coordinate,
+accepts only zero-bias convex rows containing one source value or two adjacent
+source values, rounds the upper coefficient once to FP16, and derives the lower
+coefficient with the same FP16 complement used by the reference formulation.
+Runtime tensor values are never inspected by the host.
+
+The existing windowed selector planner is generalized from zero/one matrices
+to FP16 weighted matrices. It still bounds each CMAC source window to 512
+lanes and retains the 400-task and 2 MiB global ceilings. Existing selectors
+remain a wrapper over the weighted primitive and their compiler/device
+regressions are unchanged. The official plans are small:
+
+| input → output | tasks | constants | scratch |
+|---|---:|---:|---:|
+| 52 → 29 | 5 | 45,424 | 192 |
+| 29 → 52 | 7 | 41,168 | 128 |
+
+Both unchanged `test_interpolate_linear` and
+`test_interpolate_linear_corners_aligned` pass with the strict plugin in 6.56
+seconds. The former FP32 reference exceptions are removed because current
+PyTorch supports the same FP16 inputs. A permanent random RK3588 test covers
+both directions and both corner policies bit-exactly. All 153 compiler tests
+plus 57 subtests pass, the existing nearest and conditional selector device
+regressions pass, mypy checks 228 files, and Ruff is clean. There is no CPU
+fallback, dynamic host packing, tolerance change, or limit increase.
+
+Together with the verified FP16 simple-cumsum plugin correction, focused
+expected coverage is `201 native / 40 frontend / 171 failed / 13 skipped`.
+The last complete uncached census remains `198/40/174/13` until rerun.

@@ -5,6 +5,25 @@ from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(os.path.exists("/dev/dri/card1"), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_static_two_tap_linear_interpolation_native_cmac(self):
+    rng = np.random.default_rng(0)
+    for align_corners in (False,True):
+      for source_extent,output_extent in ((52,29),(29,52)):
+        with self.subTest(align_corners=align_corners,source_extent=source_extent,output_extent=output_extent):
+          values = rng.uniform(-2,2,(2,3,source_extent)).astype(np.float16)
+          actual = Tensor(values,device="ROCKCHIP",dtype=dtypes.half).interpolate(
+            (output_extent,),mode="linear",align_corners=align_corners).realize().numpy()
+          expected = np.empty((2,3,output_extent),dtype=np.float16)
+          for output in range(output_extent):
+            coordinate = output*(source_extent-1)/(output_extent-1) if align_corners else \
+              (output+.5)*source_extent/output_extent-.5
+            coordinate = max(0,min(coordinate,source_extent-1))
+            low,high = int(np.floor(coordinate)),min(int(np.floor(coordinate))+1,source_extent-1)
+            weight = np.float16(coordinate-low)
+            expected[:,:,output] = (values[:,:,low].astype(np.float32)*np.float32(np.float16(1)-weight)+
+              values[:,:,high].astype(np.float32)*np.float32(weight)).astype(np.float16)
+          np.testing.assert_equal(actual,expected)
+
   def test_fused_fp32_intermediate_lerp_native_dpu(self):
     rng = np.random.default_rng(12)
     x,y,z = (rng.uniform(-1,1,33).astype(np.float16) for _ in range(3))

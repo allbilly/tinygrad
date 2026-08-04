@@ -24,7 +24,6 @@ def pytest_runtest_call(item):
   needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
     "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
     "test_softmax", "test_softmax_argmax", "test_softmax_other_axis",
-    "test_interpolate_linear", "test_interpolate_linear_corners_aligned",
     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
     "test_isclose", "test_linspace", "test_log", "test_log_softmax", "test_log_softmax_other_axis",
     "test_logaddexp", "test_logcumsumexp", "test_logcumsumexp_numerical", "test_logsumexp",

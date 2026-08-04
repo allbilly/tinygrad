@@ -72,13 +72,16 @@ def _cmac_mask_payload(count:int, align_in:int, outputs:int=4, scale:float=1.0) 
     for k in range(count): values[(((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)] = active
   return struct.pack(f"<{len(values)}H", *values)
 
-def _cmac_selection_payload(rows:list[list[int]], align_in:int, align_out:int, scale:float) -> bytes:
+def _cmac_weighted_payload(rows:list[list[tuple[int,float]]], align_in:int, align_out:int) -> bytes:
   values = [0.0] * (align_out*align_in)
-  for out,indexes in enumerate(rows):
-    for k in indexes:
+  for out,terms in enumerate(rows):
+    for k,weight in terms:
       packed = (((out//16)*(align_in//32)+(k//32))*16+(out%16))*32+(k%32)
-      values[packed] += scale
+      values[packed] += weight
   return b"".join(struct.pack("<e", value) for value in values)
+
+def _cmac_selection_payload(rows:list[list[int]], align_in:int, align_out:int, scale:float) -> bytes:
+  return _cmac_weighted_payload([[(index,scale) for index in row] for row in rows], align_in, align_out)
 
 def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]], scale:float=1.0,
                           scratch:tuple[RKScratch, ...]=(), out_dtype:DType=dtypes.half) -> RKProgram:
@@ -102,34 +105,33 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
       _cmac_selection_payload(rows[start:start+count], align_in, 32, scale)))
   return RKProgram((dpu, *contracts), scratch)
 
-def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
-                            scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
-                            max_outputs:int=64) -> RKProgram|None:
-  """Reduce consecutive output tiles from bounded, atom-aligned source windows."""
-  if struct.unpack("<e", struct.pack("<e", scale))[0] != scale: return None
-  chunks:list[tuple[int, int, int, int, list[list[int]], bytes]] = []
+def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[tuple[int,float]]],
+                                     scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
+                                     max_outputs:int=64) -> RKProgram|None:
+  """Apply consecutive static weighted rows from bounded, atom-aligned source windows."""
+  chunks:list[tuple[int, int, int, int, list[list[tuple[int,float]]], bytes]] = []
   start = 0
   while start < len(rows):
-    tile:list[list[int]] = []
+    tile:list[list[tuple[int,float]]] = []
     for candidate in rows[start:start+max_outputs]:
       tile.append(candidate)
-      selected = [index for row in tile for index in row]
+      selected = [index for row in tile for index,_ in row]
       if not selected: continue
       base, end = min(selected)&-8, max(selected)+1
-      span, align_in = end-base, max(32, (end-base+31)&-32)
+      align_in = max(32, (end-base+31)&-32)
       if align_in > max_window:
         tile.pop()
         while len(tile)%8: tile.pop()
         break
     if not tile: return None
-    selected = [index for row in tile for index in row]
+    selected = [index for row in tile for index,_ in row]
     if not selected:
       start += len(tile)
       continue
     base, end = min(selected)&-8, max(selected)+1
-    span, align_in = end-base, max(32, (end-base+31)&-32)
+    align_in = max(32, (end-base+31)&-32)
     align_out = max(32, (len(tile)+31)&-32)
-    payload = _cmac_selection_payload([[index-base for index in row] for row in tile], align_in, align_out, scale)
+    payload = _cmac_weighted_payload([[(index-base,weight) for index,weight in row] for row in tile], align_in, align_out)
     chunks.append((start, base, end, align_in, tile, payload))
     start += len(tile)
   direct = tuple(base+align_in <= direct_count for _,base,_,align_in,_,_ in chunks)
@@ -153,6 +155,14 @@ def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], sc
     steps.append(RKCMACTask(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
       lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, align_out), 0, payload, compact_output=True))
   return RKProgram(tuple(steps), scratch)
+
+def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
+                            scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
+                            max_outputs:int=64) -> RKProgram|None:
+  """Reduce consecutive output tiles from bounded, atom-aligned source windows."""
+  if struct.unpack("<e", struct.pack("<e", scale))[0] != scale: return None
+  return _windowed_weighted_cmac_pipeline(output,source,[[(index,scale) for index in row] for row in rows],
+                                          scratch,direct_count,max_window,max_outputs)
 
 def plan_cost(plan:RKProgram) -> RKPlanCost:
   image = emit_program(plan)
@@ -460,12 +470,90 @@ def _static_scalar(u:UOp, ranges:dict[int, int]|dict[UOp, int]) -> int|float|boo
   if u.op is Ops.MAX: return max(values)  # type: ignore[type-var]
   if u.op is Ops.FLOORDIV: return int(cast(int|float|bool, values[0]))//int(cast(int|float|bool, values[1]))
   if u.op is Ops.FLOORMOD: return int(cast(int|float|bool, values[0]))%int(cast(int|float|bool, values[1]))
+  if u.op is Ops.TRUNC: return math.trunc(cast(int|float, values[0]))
   if u.op is Ops.CMPLT: return values[0] < values[1]  # type: ignore[operator]
   if u.op is Ops.CMPNE: return values[0] != values[1]
   if u.op is Ops.AND: return bool(values[0]) and bool(values[1])
   if u.op is Ops.OR: return bool(values[0]) or bool(values[1])
   if u.op is Ops.WHERE: return values[1] if values[0] else values[2]
   return None
+
+def _static_linear_form(u:UOp, point:dict[UOp,int], source:UOp) -> tuple[float,dict[int,float]]|None:
+  """Evaluate one statically indexed linear expression without reading runtime tensor data."""
+  if u.op is Ops.INDEX:
+    if u.src[0].key != source.key or u.dtype is not dtypes.half: return None
+    offset = _static_scalar(u.src[1],point)
+    return (0.0,{offset:1.0}) if isinstance(offset,int) and not isinstance(offset,bool) else None
+  if u.op is Ops.WHERE:
+    predicate = _static_scalar(u.src[0],point)
+    return None if predicate is None else _static_linear_form(u.src[1] if predicate else u.src[2],point,source)
+  if not any(x.op is Ops.INDEX for x in u.toposort()):
+    value = _static_scalar(u,point)
+    return (float(value),{}) if isinstance(value,(int,float,bool)) else None
+  if u.op is Ops.CAST:
+    # FP16 input promoted into one FP32 expression is linear. A rounded intermediate cast is not.
+    return _static_linear_form(u.src[0],point,source) if u.dtype is dtypes.float else None
+  if u.op not in (Ops.ADD,Ops.MUL) or (lhs:=_static_linear_form(u.src[0],point,source)) is None or \
+     (rhs:=_static_linear_form(u.src[1],point,source)) is None: return None
+  lhs_const,lhs_terms = lhs
+  rhs_const,rhs_terms = rhs
+  if u.op is Ops.ADD:
+    terms = dict(lhs_terms)
+    for index,weight in rhs_terms.items(): terms[index] = terms.get(index,0.0)+weight
+    return lhs_const+rhs_const,{index:weight for index,weight in terms.items() if weight != 0.0}
+  if lhs_terms and rhs_terms: return None
+  terms = {index:weight*rhs_const for index,weight in lhs_terms.items()}
+  for index,weight in rhs_terms.items(): terms[index] = terms.get(index,0.0)+weight*lhs_const
+  return lhs_const*rhs_const,{index:weight for index,weight in terms.items() if weight != 0.0}
+
+def lower_static_two_tap_result(sink:UOp) -> RKLowerResult:
+  """Lower a dense FP32 convex blend of at most two statically indexed FP16 values through CMAC."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return _not_applicable()
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  output_index,stored = store.src[0].src[1],_strip_casts(store.src[1])
+  if stored.dtype is not dtypes.float: return _not_applicable()
+  indexes = tuple(u for u in stored.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM)
+  sources = tuple(dict.fromkeys(u.src[0] for u in indexes))
+  if not indexes or len(sources) != 1 or any(u.dtype is not dtypes.half for u in indexes): return _not_applicable()
+  source = sources[0]
+  ranges = tuple(u for u in sink.toposort() if u.op is Ops.RANGE)
+  visits = math.prod(int(u.src[0].arg) for u in ranges)
+  count,source_count = int(store.src[0].src[0].src[0].arg),int(source.src[0].arg)
+  if not ranges or visits != count or visits > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,f"static two-tap transform visits {visits} outputs",Ops.RANGE)
+  rows:list[list[tuple[int,float]]|None] = [None]*count
+  for coordinates in product(*(range(int(u.src[0].arg)) for u in ranges)):
+    point = dict(zip(ranges,coordinates))
+    dst,form = _static_scalar(output_index,point),_static_linear_form(stored,point,source)
+    if not isinstance(dst,int) or isinstance(dst,bool) or not 0 <= dst < count or rows[dst] is not None or form is None:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static two-tap transform does not cover one dense output",Ops.INDEX)
+    constant,terms = form
+    if constant != 0.0 or not 1 <= len(terms) <= 2 or any(not 0 <= index < source_count for index in terms) or \
+       not math.isclose(sum(terms.values()),1.0,rel_tol=0.0,abs_tol=1e-12):
+      return _unsupported(RKRejectKind.UNSUPPORTED_ALU,"static transform is not a zero-bias two-tap blend",stored.op)
+    ordered = sorted(terms.items())
+    if len(ordered) == 2 and ordered[1][0] != ordered[0][0]+1:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static two-tap sources are not adjacent",Ops.INDEX)
+    high = struct.unpack("<e",struct.pack("<e",ordered[-1][1]))[0]
+    rounded = [(ordered[0][0],struct.unpack("<e",struct.pack("<e",1.0-high))[0]),(ordered[1][0],high)] if len(ordered) == 2 else \
+      [(ordered[0][0],struct.unpack("<e",struct.pack("<e",ordered[0][1]))[0])]
+    if any(not math.isfinite(weight) or not 0.0 <= weight <= 1.0 for _,weight in rounded):
+      return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,"static two-tap coefficients do not fit FP16",stored.op)
+    rows[dst] = rounded
+  if any(row is None for row in rows):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static two-tap transform has output holes",Ops.INDEX)
+  output = RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot)
+  source_arg = RKArg(RKBufferKind.ARG,source.arg.slot)
+  program = _windowed_weighted_cmac_pipeline(output,source_arg,cast(list[list[tuple[int,float]]],rows),direct_count=source_count)
+  if program is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"static two-tap transform exceeds native plan limits",stored.op)
+  cost = plan_cost(program)
+  return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+    f"static two-tap transform needs {cost.task_count} tasks and {cost.constant_bytes} constant bytes",stored.op) \
+    if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES else _native(program)
 
 def _conditional_index(u:UOp) -> tuple[UOp, UOp|None, bool]|None:
   """Return the indexed tensor and an optional static zero-mask around it."""
@@ -3039,6 +3127,7 @@ _LOWERERS = (
   RKLowerer("dpu", lambda nodes:not _has_reduction(nodes), lower_dpu_result),
   RKLowerer("multi_source_reformat", lambda nodes:not _has_reduction(nodes), lower_multi_source_reformat_result),
   RKLowerer("static_selector_reformat", lambda nodes:not _has_reduction(nodes), lower_static_selector_reformat_result),
+  RKLowerer("static_two_tap", lambda nodes:not _has_reduction(nodes), lower_static_two_tap_result),
   RKLowerer("multi_broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_multi_broadcast_alu_result),
   RKLowerer("broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_broadcast_alu_result),
   RKLowerer("reformat", lambda nodes:not _has_reduction(nodes), lower_reformat_result),

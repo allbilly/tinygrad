@@ -3660,3 +3660,31 @@ CPU in 1.27 seconds and on RK3588 in 18.66 seconds, both with
 `DEFAULT_FLOAT=HALF`. This changes only reference construction; it adds no
 backend FP32 claim or fallback. Focused expected coverage is `199/40/173/13`;
 the table above remains authoritative pending another full census.
+
+## Bounded static two-tap CMAC transforms
+
+The compiler now extracts dense FP32 linear forms over one FP16 source without
+reading runtime data. Legality is deliberately narrow: every output must have
+zero bias and either one source term or two adjacent source terms whose exact
+coefficients form a convex partition. Coefficients are converted to the FP16
+CMAC contract using the reference's rounded upper weight and FP16 complement.
+Nonlinear, non-adjacent, non-convex, multi-source, or oversized transforms
+reject before emission.
+
+The windowed CMAC planner now accepts weighted rows; zero/one selectors use the
+same implementation through a compatibility wrapper. The four 1D linear
+interpolation plans cost five to seven tasks, at most 45,424 constant bytes,
+and at most 192 scratch bytes. Random RK3588 coverage for 52→29 and 29→52 with
+both corner policies is bit-exact. Existing nearest and conditional selector
+hardware tests also remain exact after the planner refactor.
+
+The strict census plugin no longer promotes the two linear interpolation
+methods to FP32 because the installed PyTorch reference supports FP16. The
+unchanged official `test_interpolate_linear` and
+`test_interpolate_linear_corners_aligned` pass together in 6.56 seconds with
+`ROCKCHIP_FALLBACK=0`. All 153 compiler tests plus 57 subtests, mypy over 228
+files, and Ruff pass. No tolerance or physical-plan ceiling changed.
+
+These are two focused method gains. Including the separately verified
+simple-cumsum plugin correction, expected coverage is `201/40/171/13`; the
+authoritative complete baseline remains `198/40/174/13` pending rerun.
