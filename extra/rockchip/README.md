@@ -1383,3 +1383,11 @@ tensor-POW broadcasts now reject before submission with `NUMERICAL_CONTRACT`
 until an output-domain calibration is proven. The unchanged official method
 finishes with four typed POW rejects and sixteen passing subtests in 222.70
 seconds without a device failure.
+
+The subsequent 425-method run completed device-stably but exposed that the old
+external 2607 pytest plugin mutates `dtypes.default_float`, which is now a
+read-only property. From `test_exp` onward it corrupted reference setup and
+reported 253 failures, so that tally is explicitly invalid. The research branch
+now owns a checkout-local plugin using `Context(DEFAULT_FLOAT=...)`; focused
+`test_exp` and `test_arange` both pass with the repaired setup. Future censuses
+must use `PYTHONPATH=$PWD/test/rockchip` and never the frozen 2607 plugin.

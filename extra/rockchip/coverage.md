@@ -3089,3 +3089,20 @@ method consequently reports four typed rejects plus sixteen passing subtests in
 was already failing; the guard removes two incorrectly accepted kernels. The
 aborted census produced no final JSON/JUnit because pytest did not reach its
 session-finish hooks and is not an authoritative result.
+
+## Checkout-local census harness
+
+The next run reached all 425 methods without a device failure, but the external
+2607 `conftest_rockchip.py` attempted to assign `dtypes.default_float`. That
+property is read-only on this branch; its teardown first failed at `test_exp`,
+and later FP32-reference methods failed for harness reasons. The resulting raw
+`253 failed, 198 passed, 13 skipped` summary is invalid backend coverage. Its
+diagnostic artifacts remain under
+`~/rk2608_backups/census-pow-guard-d93c874f4-20260804/`.
+
+A checkout-local plugin now uses tinygrad's supported
+`Context(DEFAULT_FLOAT=dtypes.float)` boundary only for the declared CPU
+reference gaps and leaves all ordinary tests in HALF. Focused `test_exp` and
+`test_arange` pass together in 10.59 seconds, with no hook warning. Authoritative
+runs must set `PYTHONPATH=/home/orangepi/rk_upstream/test/rockchip`; the frozen
+2607 plugin is no longer compatible with this branch.
