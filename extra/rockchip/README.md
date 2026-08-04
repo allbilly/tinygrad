@@ -1707,3 +1707,33 @@ fallback, dynamic host packing, tolerance change, or limit increase.
 Together with the verified FP16 simple-cumsum plugin correction, focused
 expected coverage is `201 native / 40 frontend / 171 failed / 13 skipped`.
 The last complete uncached census remains `198/40/174/13` until rerun.
+
+## Authoritative census after static two-tap lowering
+
+The complete uncached native-only run at `92846845f` establishes:
+
+| outcome | methods |
+|---|---:|
+| PASS_NATIVE | 201 |
+| PASS_FRONTEND | 40 |
+| FAIL (typed native reject) | 171 |
+| SKIP_UPSTREAM | 13 |
+
+All 171 failures are classified native rejections and retain an exact first
+reject. The 56m56s run had no numerical mismatch, NPU timeout, invalid
+submission, reset failure, process abort, or unclassified failure. Fully
+native methods executed 549 kernels: 500 efficient and 49 bounded correctness
+fallbacks. No task, constant, or tolerance ceiling changed.
+
+The run makes the FP16 `test_simple_cumsum` census correction and both static
+two-tap interpolation methods authoritative. The first-reject Pareto is 53
+unsupported output dtype, 35 plan-stage limit, 27 unsupported input dtype, 18
+numerical contract, 18 unsupported layout, 12 unsupported ALU, six requires
+reformat, and two unaligned row.
+
+Artifacts are preserved under
+`/home/orangepi/rk2608_backups/census-two-tap-telemetry-92846845f-20260805`.
+The telemetry JSON SHA-256 is
+`82ffa33a116d4d3d5ae8821647bd653ca504ebc990d0d757dd4a8726dad3e09a` and
+the JUnit XML SHA-256 is
+`04f984fe7e9729903a41c3b6d337406e48da6b6f7d1ae715a2f1d149e5b54026`.

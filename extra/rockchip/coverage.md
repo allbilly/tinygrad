@@ -3688,3 +3688,47 @@ files, and Ruff pass. No tolerance or physical-plan ceiling changed.
 These are two focused method gains. Including the separately verified
 simple-cumsum plugin correction, expected coverage is `201/40/171/13`; the
 authoritative complete baseline remains `198/40/174/13` pending rerun.
+
+## Complete uncached census at `92846845f`
+
+The immutable-head run completed all 425 collected methods in 56m56s:
+
+| outcome | count |
+|---|---:|
+| PASS_NATIVE | 201 |
+| PASS_FRONTEND | 40 |
+| NATIVE_REJECT | 171 |
+| SKIP_UPSTREAM | 13 |
+
+All failed methods have `failure_kind=NATIVE_REJECT` and preserve a first
+typed reject. There were no numerical mismatches, timeouts, invalid
+submissions, reset failures, process aborts, or unclassified failures. The
+549 kernels belonging to fully native methods comprise 500 `EFFICIENT` and 49
+`CORRECTNESS_FALLBACK` kernels.
+
+This run makes all three focused gains after `746707b3e` authoritative:
+`test_simple_cumsum`, `test_interpolate_linear`, and
+`test_interpolate_linear_corners_aligned`. The first-reject Pareto is:
+
+| first reject | methods |
+|---|---:|
+| unsupported output dtype | 53 |
+| plan-stage limit | 35 |
+| unsupported input dtype | 27 |
+| numerical contract | 18 |
+| unsupported layout | 18 |
+| unsupported ALU | 12 |
+| requires reformat | 6 |
+| unaligned row | 2 |
+
+Artifacts:
+
+- directory: `/home/orangepi/rk2608_backups/census-two-tap-telemetry-92846845f-20260805`
+- `test_ops_coverage.json`: `82ffa33a116d4d3d5ae8821647bd653ca504ebc990d0d757dd4a8726dad3e09a`
+- `junit.xml`: `04f984fe7e9729903a41c3b6d337406e48da6b6f7d1ae715a2f1d149e5b54026`
+
+The direct next structural target remains physical packing/layout: the 35
+stage-limit failures are not candidates for a higher ceiling, and the compact
+two-tap work does not make the FP32-intermediate bilinear/trilinear families
+legal. Selector-CMAC remains a bounded native correctness fallback while
+direct matmul and convolution packing are investigated.
