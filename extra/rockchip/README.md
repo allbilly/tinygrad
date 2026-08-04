@@ -1755,3 +1755,25 @@ After restoration, the affected CONV/PPU region passes four focused tests in
 37.95 seconds. All 158 compiler/image tests plus 57 subtests pass, mypy checks
 228 source files, and Ruff is clean. This milestone changes no coverage or
 execution semantics.
+
+## Rejected vector-matrix-as-convolution experiment
+
+A dense FP16 `1xK @ KxN` contraction has a useful direct CNA interpretation:
+the row-major matrix is already an `H=K,W=N,C=1` activation surface, while the
+dynamic vector can be packed on the NPU as a `Kx1` one-channel convolution
+kernel. This avoids transposing the entire dynamic matrix into CMAC weight
+order. Hardware probes established a precise boundary: kernel heights 4, 8,
+16, 17, 24, and 31 are bit-exact, while height 32 and the official height 128
+time out in the CONV stage.
+
+Splitting K=128 into `31+31+31+31+4` avoids the timeout and produces a compact
+29-task plan, but each CONV tile materializes an FP16 partial. DPU addition of
+those partials disagrees with the official single-accumulator result in 11 of
+128 values (`max_abs=0.012695`, `max_rel=0.01415`). The hardware reference also
+records that separate CONV tasks overwrite the destination rather than
+accumulating partial sums. The experiment is therefore disabled; `test_matvec`
+retains its typed stage-limit rejection. Its full implementation is preserved
+as `wip-vector-matrix-cna-k31-fp16-partial-rounding.patch` (SHA-256
+`4a5ee50cccb3847bc05d96d52fd9e5524dedd6e7119289f5765be0c7d3bb96de`). A future
+retry requires a proven FP32 partial-output/accumulation path, not relaxed
+tolerance or more FP16 tiles.

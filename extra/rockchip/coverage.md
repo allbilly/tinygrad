@@ -3751,3 +3751,26 @@ active. The exact WIP is
 After restoration, four focused CONV/PPU tests pass in 37.95 seconds; 158
 compiler/image tests plus 57 subtests, mypy over 228 files, and Ruff also pass.
 The authoritative method census remains `201/40/171/13`.
+
+## Rejected Kx1 CNA matvec lowering
+
+The row-major KxN matrix in `1xK @ KxN` can be consumed directly as a
+single-channel CNA activation, reducing the current selector-packing problem
+to packing only the K-element vector as convolution weights. Direct Kx1 probes
+are bit-exact for K=4, 8, 16, 17, 24, and 31. K=32 and K=128 time out at the
+CONV stage, establishing 31 as the current proven kernel-height boundary.
+
+A five-tile K=128 implementation (`31+31+31+31+4`) runs without a device fault
+in 29 tasks, 1,270 command words, 71,936 constant bytes, and 39,200 scratch
+bytes. It is not numerically legal: the unchanged official `test_matvec`
+comparison reports 11/128 mismatches, maximum absolute error 0.012695, and
+maximum relative error 0.01415. Each tile rounds its partial to FP16 before DPU
+addition; the reference implementation confirms that independent convolution
+tasks overwrite outputs and do not provide cross-task accumulation.
+
+The compiler and emitter were restored, so no unsafe native path or census
+change remains. The exact rejected code is archived at
+`/home/orangepi/tinygrad/rockchip-upstream-patches/wip-vector-matrix-cna-k31-fp16-partial-rounding.patch`
+with SHA-256 `4a5ee50cccb3847bc05d96d52fd9e5524dedd6e7119289f5765be0c7d3bb96de`.
+Future work must identify a hardware FP32 partial-output/accumulation contract;
+raising tolerance or accepting FP16 partial rounding is explicitly excluded.
