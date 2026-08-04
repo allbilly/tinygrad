@@ -19,7 +19,13 @@ class RKBufferKind(IntEnum):
   CONSTANT = 2
 class RKLayoutKind(Enum):
   LINEAR = "linear"
+  DPU_FEATURE = "dpu_feature"
+  CMAC_ACTIVATION = "cmac_activation"
   CMAC_WEIGHT = "cmac_weight"
+  PPU_HWC8 = "ppu_hwc8"
+  CNA_ACTIVATION = "cna_activation"
+  CNA_WEIGHT = "cna_weight"
+  CONV_OUTPUT = "conv_output"
 class RKReformatKind(Enum):
   COALESCED_DPU = "coalesced_dpu"
   SELECTOR_CMAC = "selector_cmac"
@@ -96,13 +102,47 @@ class RKLayout:
   channel_alignment: int = 8
   padding: tuple[tuple[int, int], ...] = ()
   kind: RKLayoutKind = RKLayoutKind.LINEAR
+  padding_value: float|int|None = None
   def __post_init__(self):
     rank = len(self.logical_shape)
     if len(self.physical_shape) != rank or len(self.strides_bytes) != rank or self.padding and len(self.padding) != rank:
       raise ValueError("RKLayout rank mismatch")
     if any(logical < 0 or physical < logical for logical,physical in zip(self.logical_shape, self.physical_shape)):
       raise ValueError("RKLayout physical shape does not contain its logical shape")
-    if self.base_offset < 0 or self.row_alignment <= 0 or self.channel_alignment <= 0: raise ValueError("invalid RKLayout alignment")
+    if self.base_offset < 0 or self.row_alignment <= 0 or self.channel_alignment <= 0 or any(stride <= 0 for stride in self.strides_bytes):
+      raise ValueError("invalid RKLayout alignment or stride")
+  def byte_size(self) -> int:
+    return 0 if any(extent == 0 for extent in self.physical_shape) else \
+      self.base_offset+sum((extent-1)*stride for extent,stride in zip(self.physical_shape,self.strides_bytes))+self.dtype.itemsize
+  def is_dense(self) -> bool:
+    stride = self.dtype.itemsize
+    for extent,actual in zip(reversed(self.physical_shape),reversed(self.strides_bytes)):
+      if actual != stride: return False
+      stride *= extent
+    return True
+  def can_view_as(self, other:RKLayout) -> bool:
+    return self.dtype is other.dtype and self.base_offset == other.base_offset and self.is_dense() and other.is_dense() and \
+      math.prod(self.logical_shape) == math.prod(other.logical_shape) and math.prod(self.physical_shape) == math.prod(other.physical_shape)
+  def padding_is_initialized(self) -> bool:
+    has_padding = any(logical != physical for logical,physical in zip(self.logical_shape,self.physical_shape)) or \
+      any(before or after for before,after in self.padding)
+    return not has_padding or self.padding_value is not None
+  def is_legal_for(self, engine:RKEngine) -> bool:
+    if engine is RKEngine.DPU:
+      return self.kind in (RKLayoutKind.LINEAR,RKLayoutKind.DPU_FEATURE,RKLayoutKind.CONV_OUTPUT) and \
+        self.dtype in (dtypes.half,dtypes.float,dtypes.int) and self.strides_bytes[-1] == self.dtype.itemsize
+    if engine is RKEngine.CMAC:
+      return self.kind in (RKLayoutKind.LINEAR,RKLayoutKind.CMAC_ACTIVATION,RKLayoutKind.CMAC_WEIGHT) and \
+        self.dtype in (dtypes.half,dtypes.float) and self.strides_bytes[-1] == self.dtype.itemsize
+    if engine is RKEngine.PPU:
+      return self.kind is RKLayoutKind.PPU_HWC8 and self.dtype is dtypes.half and len(self.physical_shape) == 3 and \
+        self.physical_shape[-1] == 8 and self.strides_bytes[-1] == 2
+    assert engine is RKEngine.CONV
+    return self.kind in (RKLayoutKind.CNA_ACTIVATION,RKLayoutKind.CNA_WEIGHT,RKLayoutKind.CONV_OUTPUT) and \
+      self.dtype is dtypes.half and self.strides_bytes[-1] == 2
+  def requires_reformat_for(self, engine:RKEngine) -> bool: return not self.is_legal_for(engine)
+  def validate_for(self, engine:RKEngine) -> None:
+    if not self.is_legal_for(engine): raise ValueError(f"{self.kind.value} layout is not legal for {engine.name}")
 
 @dataclass(frozen=True)
 class RKTensorRef:

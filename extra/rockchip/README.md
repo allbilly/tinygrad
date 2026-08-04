@@ -1202,3 +1202,20 @@ records. The combined host gate passes 135 tests plus 26 subtests, mypy, and
 Ruff; the serialized RK3588 gate passes 96 tests plus 66 subtests in 806.83
 seconds. The split provides the boundary required to compare direct
 CNA/PPU/ERDMA packing against selector CMAC before selecting physical work.
+
+## Executable physical layout contracts
+
+`RKLayout` now distinguishes linear, DPU feature, CMAC activation/weight, PPU
+HWC8, CNA activation/weight, and CONV-output surfaces. It computes exact
+physical byte extent, detects dense/view-compatible storage, tracks whether
+padding has a known initializer, and conservatively answers legality for each
+RK engine. Emitters validate those contracts before producing CMAC, PPU, or
+CONV commands, so physical-format knowledge no longer exists only as repeated
+shape checks inside individual lowering paths.
+
+Every established direct convolution and PPU reduction/pooling surface is
+annotated without changing its serialized commands. The focused host gate
+passes 128 tests plus 26 subtests, mypy, and Ruff. Twelve serialized RK3588
+CONV/PPU tests plus three subtests pass in 79.72 seconds. This is a no-coverage
+milestone and leaves 172/40/200/13 authoritative; it prepares direct packing
+and CBUF-pressure candidates to state their input/output contracts explicitly.

@@ -228,6 +228,9 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
 def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit one direct CMAC task; all surfaces are already hardware-legal."""
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
+  plan.lhs.layout.validate_for(RKEngine.CMAC)
+  plan.rhs.layout.validate_for(RKEngine.CMAC)
+  plan.out.layout.validate_for(RKEngine.CMAC)
   if plan.rhs.layout.kind is not RKLayoutKind.CMAC_WEIGHT: raise ValueError("CMAC RHS is not in weight layout")
   e, align_out, align_in = _command, plan.rhs.layout.physical_shape[0], plan.lhs.layout.physical_shape[-1]
   m = plan.lhs.layout.physical_shape[0]
@@ -302,6 +305,13 @@ def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
 def emit_spatial_conv(plan:RKSpatialConv, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven channel-4/16 FP16 direct-convolution register families."""
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
+  plan.src.layout.validate_for(RKEngine.CONV)
+  plan.weight.layout.validate_for(RKEngine.CONV)
+  plan.out.layout.validate_for(RKEngine.CONV)
+  if plan.src.layout.kind is not RKLayoutKind.CNA_ACTIVATION or plan.weight.layout.kind is not RKLayoutKind.CNA_WEIGHT or \
+     plan.out.layout.kind is not RKLayoutKind.CONV_OUTPUT: raise ValueError("direct convolution surface roles are invalid")
+  if not plan.src.layout.padding_is_initialized() or not plan.weight.layout.padding_is_initialized():
+    raise ValueError("direct convolution input padding is not initialized")
   ic, oc, ih, iw, kh, kw, oh, ow = (plan.in_channels, plan.out_channels, plan.input_height, plan.input_width,
     plan.kernel_height, plan.kernel_width, plan.output_height, plan.output_width)
   sy, sx = plan.stride_y, plan.stride_x
@@ -413,6 +423,8 @@ def emit_reformat(plan:RKLegalizedReformat, target:RKTarget=RKTarget.RK3588) -> 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""
   if target is not RKTarget.RK3588 or plan.op is not Ops.MAX: raise ValueError("unsupported Rockchip PPU reduction")
+  plan.src.layout.validate_for(RKEngine.PPU)
+  plan.out.layout.validate_for(RKEngine.PPU)
   height, width, channels = plan.src.layout.logical_shape
   if channels != 8 or not 2 <= height <= 16 or not 2 <= width <= 16: raise ValueError("PPU global MAX requires 2..16 x 2..16 x 8")
   h, w, c = height-1, width-1, channels-1
@@ -441,6 +453,8 @@ def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
 def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit one exact FP16 sliding-MAX PPU task over a dense HWC8 surface."""
   if target is not RKTarget.RK3588 or plan.op is not Ops.MAX: raise ValueError("unsupported Rockchip PPU pool")
+  plan.src.layout.validate_for(RKEngine.PPU)
+  plan.out.layout.validate_for(RKEngine.PPU)
   ih, iw, channels = plan.src.layout.logical_shape
   oh, ow, out_channels = plan.out.layout.logical_shape
   kh, kw, sy, sx = plan.kernel_height, plan.kernel_width, plan.stride_y, plan.stride_x

@@ -2822,3 +2822,33 @@ serialized device gate passes 96 tests plus 66 subtests in 806.83 seconds with
 no timeout, reset error, invalid submission, or process abort. This milestone
 adds no new TestOps pass and leaves the authoritative 172/40/200/13 census
 unchanged.
+
+## Executable physical-layout legality
+
+The physical-layout vocabulary now includes `LINEAR`, `DPU_FEATURE`,
+`CMAC_ACTIVATION`, `CMAC_WEIGHT`, `PPU_HWC8`, `CNA_ACTIVATION`, `CNA_WEIGHT`,
+and `CONV_OUTPUT`. `RKLayout` provides conservative executable checks for:
+
+```text
+byte_size
+is_dense
+can_view_as
+padding_is_initialized
+is_legal_for(engine)
+requires_reformat_for(engine)
+validate_for(engine)
+```
+
+All existing direct CONV and PPU plans now identify their physical surface
+roles, and CMAC/PPU/CONV emitters reject a mismatched role before register
+emission. The change does not alter command words or coverage. The focused
+compiler/image gate passes 128 tests plus 26 subtests, full mypy and Ruff pass,
+and twelve direct-CONV/PPU hardware tests plus three subtests pass in 79.72
+seconds. The authoritative census remains 172 native / 40 frontend / 200 fail /
+13 skip.
+
+This layout contract is also where the `conv_grok` CBUF observation becomes
+actionable: CNA activation and weight layouts expose separate feature-bank and
+weight-bank requirements, allowing legalization to choose Y, K, or Cartesian
+YxK task windows from simultaneous bank pressure instead of encoding that
+choice as ad-hoc convolution cases.

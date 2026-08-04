@@ -1652,10 +1652,11 @@ def lower_depthwise_spatial_contract_result(sink:UOp) -> RKLowerResult:
   out_width_stride, out_plane = (out_h*out_w+3)&-4, 2*((out_h*out_w+3)&-4)*8
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(batch*channels*out_plane*2),)
-  input_layout = RKLayout((in_h,in_w,1),(in_h,in_w,1),(in_w*2,2,2),dtypes.half)
+  input_layout = RKLayout((in_h,in_w,1),(in_h,in_w,1),(in_w*2,2,2),dtypes.half,kind=RKLayoutKind.CNA_ACTIVATION)
   weight_layout = RKLayout((kernel_h,kernel_w,2,1),(kernel_h,kernel_w,2,8),
-    (kernel_w*32,32,16,2),dtypes.half,padding=((0,0),(0,0),(0,0),(0,7)))
-  output_layout = RKLayout((2,out_width_stride,8),(2,out_width_stride,8),(out_width_stride*16,16,2),dtypes.half)
+    (kernel_w*32,32,16,2),dtypes.half,padding=((0,0),(0,0),(0,0),(0,7)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
+  output_layout = RKLayout((2,out_width_stride,8),(2,out_width_stride,8),(out_width_stride*16,16,2),dtypes.half,
+                           kind=RKLayoutKind.CONV_OUTPUT)
   for b in range(batch):
     for channel in range(channels):
       tile = b*channels+channel
@@ -1780,10 +1781,12 @@ def lower_grouped_spatial_contract_result(sink:UOp) -> RKLowerResult:
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(batch*groups*output_tile_count*2),)
   input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
-                          padding=((0,0),(0,input_width_stride-in_w),(0,0)))
+                          padding=((0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
   weight_layout = RKLayout((kernel_h,kernel_w,out_c,in_c),(kernel_h,kernel_w,out_c,align_in),
-    (kernel_w*out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,padding=((0,0),(0,0),(0,0),(0,align_in-in_c)))
-  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half)
+    (kernel_w*out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),
+    kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
+  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
+                           kind=RKLayoutKind.CONV_OUTPUT)
   for b in range(batch):
     for group in range(groups):
       tile = b*groups+group
@@ -1903,13 +1906,15 @@ def lower_nhwc_spatial_contract_result(sink:UOp) -> RKLowerResult:
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(batch*len(channel_tiles)*output_tile_count*2),)
   input_layout = RKLayout(((in_c+7)//8,in_h,in_w,8),((in_c+7)//8,in_h,input_width_stride,8),
-    (in_h*input_width_stride*16,input_width_stride*16,16,2),dtypes.half)
-  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half)
+    (in_h*input_width_stride*16,input_width_stride*16,16,2),dtypes.half,
+    padding=((0,0),(0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
+  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
+                           kind=RKLayoutKind.CONV_OUTPUT)
   for b in range(batch):
     for tile,(start,tile_c) in enumerate(channel_tiles):
       weight_layout = RKLayout((kernel_h,kernel_w,tile_c,in_c),(kernel_h,kernel_w,tile_c,align_in),
         (kernel_w*tile_c*align_in*2,tile_c*align_in*2,align_in*2,2),dtypes.half,
-        padding=((0,0),(0,0),(0,0),(0,align_in-in_c)))
+        padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
       steps.append(RKSpatialConv(
         RKTensorRef(RKArg(packed_output.kind,packed_output.index,(b*len(channel_tiles)+tile)*output_tile_count*2),output_layout),
         RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
@@ -2052,15 +2057,16 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   scratch += (RKScratch(batch*output_batch_count*2),)
   if in_c <= 4:
     input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
-                            padding=((0,0),(0,input_width_stride-in_w),(0,0)))
+                            padding=((0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
   else:
     input_layout = RKLayout((in_c//input_c2,in_h,in_w,input_c2),(in_c//input_c2,in_h,input_width_stride,input_c2),
       (in_h*input_width_stride*input_c2*2,input_width_stride*input_c2*2,input_c2*2,2),dtypes.half,
-      padding=((0,0),(0,0),(0,input_width_stride-in_w),(0,0)))
+      padding=((0,0),(0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
   weight_layout = RKLayout((kernel_h,kernel_w,out_c,in_c),(kernel_h,kernel_w,out_c,align_in),
                            (kernel_w*out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,
-                           padding=((0,0),(0,0),(0,0),(0,align_in-in_c)))
-  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half)
+                           padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
+  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
+                           kind=RKLayoutKind.CONV_OUTPUT)
   for b in range(batch):
     steps.append(RKSpatialConv(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
@@ -2299,9 +2305,9 @@ def lower_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU input buffer extent does not match HWC8 surface", Ops.INDEX)
   height, width = hw_shape
   out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot),
-                    RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
+                    RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC8))
   src = RKTensorRef(RKArg(RKBufferKind.ARG, value.src[0].arg.slot),
-                    RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+                    RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC8))
   return _native(RKReduce(out, src, Ops.MAX, red_axis))
 
 def lower_global_max_result(sink:UOp) -> RKLowerResult:
@@ -2367,8 +2373,9 @@ def lower_global_max_result(sink:UOp) -> RKLowerResult:
   pooled = RKArg(RKBufferKind.SCRATCH, len(scratch))
   scratch.append(RKScratch(16))
   scratch_tuple = tuple(scratch)
-  reduce_plan = RKReduce(RKTensorRef(pooled, RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half)),
-    RKTensorRef(hwc, RKLayout((2,4,8), (2,4,8), (64,16,2), dtypes.half)), Ops.MAX, red.arg[0])
+  reduce_plan = RKReduce(RKTensorRef(pooled, RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,
+    kind=RKLayoutKind.PPU_HWC8)), RKTensorRef(hwc, RKLayout((2,4,8), (2,4,8), (64,16,2), dtypes.half,
+    kind=RKLayoutKind.PPU_HWC8)), Ops.MAX, red.arg[0])
   final = RKDPUProgram((RKALUStage(Ops.ADD if output_scale == 1.0 else Ops.MUL, output, pooled,
                                    0.0 if output_scale == 1.0 else output_scale, 1),), scratch_tuple)
   return _native(RKProgram((RKDPUProgram(tuple(stages), scratch_tuple), *contracts, reduce_plan, final), scratch_tuple))
@@ -2408,8 +2415,10 @@ def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[i
       steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
         _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
         _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), reduce_axis, payload))
-    out = RKTensorRef(RKArg(atoms.kind, atoms.index, output_index*16), RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
-    src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+    out = RKTensorRef(RKArg(atoms.kind, atoms.index, output_index*16), RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,
+      kind=RKLayoutKind.PPU_HWC8))
+    src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half,
+      kind=RKLayoutKind.PPU_HWC8))
     steps.append(RKReduce(out, src, Ops.MAX, reduce_axis))
   gather = _sparse_cmac_pipeline(output, atoms, len(selectors)*8, [[index*8] for index in range(len(selectors))], scratch=scratch)
   steps.extend(gather.steps)
@@ -2477,8 +2486,8 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
   scratch, steps = input_plan.scratch, list(input_plan.steps)
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(groups*output_tile_count*2),)
-  input_layout = RKLayout((in_h,in_w,8),(in_h,in_w,8),(in_w*16,16,2),dtypes.half)
-  output_layout = RKLayout((out_h,out_w,8),(out_h,out_w,8),(out_w*16,16,2),dtypes.half)
+  input_layout = RKLayout((in_h,in_w,8),(in_h,in_w,8),(in_w*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8)
+  output_layout = RKLayout((out_h,out_w,8),(out_h,out_w,8),(out_w*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8)
   for group in range(groups):
     steps.append(RKPool(RKTensorRef(RKArg(packed_output.kind,packed_output.index,group*output_tile_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,group*input_tile_count*2),input_layout),Ops.MAX,red_axes[0],
@@ -2616,8 +2625,9 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
         steps.append(RKContract(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
           lhs, _cmac_weight_ref(0, min(16, surface_count-start), contract_align, RKBufferKind.CONSTANT, 32), reduce.arg[0], payload))
       out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
-                        RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half))
-      src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half))
+                        RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC8))
+      src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half,
+        kind=RKLayoutKind.PPU_HWC8))
       steps.append(RKReduce(out, src, Ops.MAX, red_axes[0]))
   stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)
   if stage_count > RK_MAX_PROGRAM_STAGES or sum(map(len, payloads)) > RK_MAX_CONSTANT_BYTES:

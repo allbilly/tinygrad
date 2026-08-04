@@ -6,6 +6,7 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
+  RKLayout, RKLayoutKind,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKLegalizedReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
@@ -39,6 +40,22 @@ def contains_uop(obj) -> bool:
   return False
 
 class TestDPUCompiler(unittest.TestCase):
+  def test_layout_contracts_are_executable_and_conservative(self):
+    dense = RKLayout((2,3),(2,3),(6,2),dtypes.half)
+    reshaped = RKLayout((6,),(6,),(2,),dtypes.half)
+    padded = RKLayout((2,3),(2,4),(8,2),dtypes.half,padding=((0,0),(0,1)))
+    initialized = RKLayout((2,3),(2,4),(8,2),dtypes.half,padding=((0,0),(0,1)),padding_value=0)
+    self.assertEqual((dense.byte_size(),padded.byte_size()),(12,16))
+    self.assertTrue(dense.is_dense() and dense.can_view_as(reshaped))
+    self.assertTrue(padded.is_dense())
+    self.assertFalse(padded.can_view_as(dense) or padded.padding_is_initialized())
+    self.assertTrue(initialized.padding_is_initialized())
+    self.assertTrue(dense.is_legal_for(RKEngine.DPU) and dense.is_legal_for(RKEngine.CMAC))
+    self.assertTrue(dense.requires_reformat_for(RKEngine.PPU) and dense.requires_reformat_for(RKEngine.CONV))
+    self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8).is_legal_for(RKEngine.PPU))
+    self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.CONV_OUTPUT).is_legal_for(RKEngine.CONV))
+    with self.assertRaises(ValueError): dense.validate_for(RKEngine.PPU)
+
   def test_wide_fp16_fill_tiles_at_proven_dpu_width(self):
     plan = lower_dpu(sink(Tensor.full((65536,), 1, dtype=dtypes.half)))
     self.assertIsInstance(plan, RKDPUProgram)
