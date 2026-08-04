@@ -508,7 +508,7 @@ def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
   oh, ow, out_channels = plan.out.layout.logical_shape
   kh, kw, sy, sx = plan.kernel_height, plan.kernel_width, plan.stride_y, plan.stride_x
   if channels != 8 or out_channels != 8 or not 2 <= ih <= 256 or not 2 <= iw <= 256 or \
-     not 2 <= kh <= 8 or not 2 <= kw <= 8 or not 1 <= sy <= 8 or not 1 <= sx <= 8 or \
+     not 1 <= kh <= 8 or not 1 <= kw <= 8 or kh == kw == 1 or not 1 <= sy <= 8 or not 1 <= sx <= 8 or \
      oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or min(oh,ow) < 1:
     raise ValueError("unsupported sliding-MAX PPU contract")
   h, w, c, out_h, out_w = ih-1, iw-1, channels-1, oh-1, ow-1

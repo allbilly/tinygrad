@@ -16,7 +16,8 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_pointwise_affine_reduce_result, lower_reduce_result,
-  lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_multi_broadcast_alu_result, lower_global_max_result,
+  lower_affine_max_result, lower_dense_row_max_result, lower_sliding_max_result, lower_broadcast_alu_result,
+  lower_multi_broadcast_alu_result, lower_global_max_result,
   lower_nested_add_reduce_result,
   lower_reformat_result,
   lower_static_selector_reformat_result,
@@ -235,6 +236,18 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(sum(stage.engine is RKEngine.PPU for stage in image.stages),1)
     self.assertLessEqual(cost.task_count,100)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_dense_row_max_uses_direct_ppu_width_tree(self):
+    result = lower_dense_row_max_result(sink(Tensor.empty(256,256,dtype=dtypes.half).max(axis=1)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    image, cost = emit_program(result.plan), plan_cost(result.plan)
+    self.assertEqual(sum(isinstance(step,RKPool) for step in result.plan.steps),2)
+    self.assertEqual(sum(stage.engine is RKEngine.PPU for stage in image.stages),2)
+    self.assertLessEqual(cost.task_count,48)
+    self.assertLessEqual(cost.constant_bytes,1024*1024)
     self.assertFalse(contains_uop(result.plan))
 
   def test_affine_max_uses_compact_cmac_scratch_subviews(self):

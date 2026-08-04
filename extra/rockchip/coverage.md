@@ -3519,3 +3519,29 @@ and windowed MAX regressions pass together (four tests plus six subtests) in
 17.62 seconds. No TestOps method gain is claimed: the softmax/log-softmax
 plugin cases that motivated the investigation compile in FP32 and continue to
 reject honestly at the dtype boundary.
+
+## Dense row MAX through direct PPU width reduction
+
+The previous `test_max_dont_collapse` plan tried to materialize 256 independent
+256-value scalar windows and rejected at the 400-task contract. The dense
+source can instead be viewed directly as `H=256,W=32,C=8`. Hardware probes
+prove exact one-row HWC8 MAX at `1x8/stride 8` and `1x4/stride 4`, including the
+full 256-row boundary. The two PPU tasks leave one eight-lane atom per logical
+row. A 32-task selector transpose makes those lanes planar, and a seven-task
+DPU tree reduces eight channels to one.
+
+The accepted program costs 41 tasks, 1,742 command words, 41 resets, 524,288
+constant bytes, 27,648 scratch bytes, 2,284,320 estimated read bytes, 28,160
+estimated write bytes, and 1,116,928 estimated MACs. Random 256x256 input is
+bit-exact against NumPy, and the unchanged TestOps method passes with
+`ROCKCHIP_FALLBACK=0`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`.
+
+The characterization also prevents an invalid generalization: tightly packed
+HWC2 sliding 2x2 MAX returns 172 wrong values out of 192, even though the
+separate global HWC2 path is exact. A one-row 16-wide boundary timed out.
+`extra/rockchip/probe_ppu_sliding_channels.py` requires one explicitly selected
+case so a timeout cannot contaminate later observations. The compiler therefore
+accepts only HWC8 one-row factors through eight. This is one focused
+complete-method gain after `test_sum_pad_collapse`; expected coverage is
+`197 native / 40 frontend / 175 failed / 13 skipped`. The authoritative
+uncached census remains `195/40/177/13` at `936f776c3` pending rerun.

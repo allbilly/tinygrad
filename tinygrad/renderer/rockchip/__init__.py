@@ -2781,6 +2781,90 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
       f"sliding PPU MAX needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
   return _native(program)
 
+def _ppu_width_factors(width:int) -> tuple[int, ...]|None:
+  """Factor one dense HWC8 width into characterized 1xK, stride-K PPU tasks."""
+  factors:list[int] = []
+  while width > 1:
+    factor = next((candidate for candidate in range(min(8,width),1,-1) if width%candidate == 0),None)
+    if factor is None: return None
+    factors.append(factor)
+    width //= factor
+  return tuple(factors)
+
+def _dense_axis_coefficients(axes:tuple[int, ...], ranges:dict[int, int]) -> dict[int, int]:
+  coefficients, stride = {}, 1
+  for axis in reversed(axes): coefficients[axis], stride = stride, stride*ranges[axis]
+  return coefficients
+
+def lower_dense_row_max_result(sink:UOp) -> RKLowerResult:
+  """Reduce contiguous FP16 rows through direct HWC8 width pooling and an eight-channel DPU fold."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.MAX or len(reduce.src) < 2 or _strip_casts(store.src[1]).key != reduce.key:
+    return _not_applicable()
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
+    return _not_applicable()
+  value = _strip_casts(reduce.src[0])
+  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half:
+    return _not_applicable()
+  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
+  if out_aff is None or src_aff is None or out_aff[1] or src_aff[1]: return _not_applicable()
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  out_axes, red_axes = tuple(sorted(out_aff[0])), tuple(u.arg[0] for u in reduce.src[1:] if u.op is Ops.RANGE)
+  if len(red_axes) != len(reduce.src)-1 or not out_axes or set(out_axes)&set(red_axes) or \
+     set(src_aff[0]) != set(out_axes)|set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
+    return _not_applicable()
+  output_count, reduction_count = math.prod(ranges[axis] for axis in out_axes), math.prod(ranges[axis] for axis in red_axes)
+  input_count = int(value.src[0].src[0].arg)
+  if not 2 <= output_count <= 256 or input_count != output_count*reduction_count or reduction_count%8:
+    return _not_applicable()
+  factors = _ppu_width_factors(reduction_count//8)
+  if factors is None or not factors or out_aff[0] != _dense_axis_coefficients(out_axes,ranges) or \
+     src_aff[0] != _dense_axis_coefficients((*out_axes,*red_axes),ranges): return _not_applicable()
+
+  scratch:tuple[RKScratch, ...] = ()
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+  current = RKArg(RKBufferKind.ARG,value.src[0].arg.slot)
+  width = reduction_count//8
+  for factor in factors:
+    next_width = width//factor
+    target = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(output_count*next_width*16),)
+    src_layout = RKLayout((output_count,width,8),(output_count,width,8),(width*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC)
+    out_layout = RKLayout((output_count,next_width,8),(output_count,next_width,8),(next_width*16,16,2),dtypes.half,
+                          kind=RKLayoutKind.PPU_HWC)
+    steps.append(RKPool(RKTensorRef(target,out_layout),RKTensorRef(current,src_layout),Ops.MAX,red_axes[0],1,factor,1,factor))
+    current, width = target, next_width
+
+  planar = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(output_count*16),)
+  transpose = _selector_program(planar,current,output_count*8,
+    [[row*8+channel] for channel in range(8) for row in range(output_count)],scratch,
+    direct_capacity=output_count*8,max_outputs=64)
+  if transpose is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"dense row MAX channel transpose exceeds plan limits",reduce.op)
+  scratch, steps = transpose.scratch, [*steps,*transpose.steps]
+  level = [RKArg(planar.kind,planar.index,(channel*output_count)*2) for channel in range(8)]
+  dpu_stages:list[RKALUStage] = []
+  while len(level) > 1:
+    last = len(level) == 2
+    target = RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot) if last else RKArg(RKBufferKind.SCRATCH,len(scratch))
+    if not last: scratch += (RKScratch((len(level)//2)*output_count*2),)
+    next_level:list[RKArg] = []
+    for index in range(0,len(level),2):
+      dst = RKArg(target.kind,target.index,target.addend+(index//2)*output_count*2)
+      dpu_stages.append(RKALUStage(Ops.MAX,dst,level[index],level[index+1],output_count))
+      next_level.append(dst)
+    level = next_level
+  steps.append(RKDPUProgram(tuple(dpu_stages),scratch))
+  program = _finish_program(steps,scratch)
+  cost = plan_cost(program)
+  if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"dense row MAX needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
+  return _native(program)
+
 def lower_affine_max_result(sink:UOp) -> RKLowerResult:
   """Lower a static affine FP16 MAX by reformatting eight outputs into PPU channels per batch."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
@@ -2945,6 +3029,7 @@ _LOWERERS = (
   RKLowerer("multi_source_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_multi_source_affine_reduce_result),
   RKLowerer("ppu_reduce", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_reduce_result),
   RKLowerer("sliding_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_sliding_max_result),
+  RKLowerer("dense_row_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_dense_row_max_result),
   RKLowerer("affine_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_affine_max_result),
   RKLowerer("global_max", lambda nodes:_has_reduction(nodes, Ops.MAX), lower_global_max_result),
   RKLowerer("depthwise_spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_depthwise_spatial_contract_result),

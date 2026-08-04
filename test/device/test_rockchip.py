@@ -85,6 +85,11 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()
     np.testing.assert_equal(actual, data.astype(np.float32).sum(axis=1).astype(np.float16))
 
+  def test_dense_fp16_row_max_native_ppu_tree(self):
+    data = np.random.default_rng(42).uniform(-8,8,(256,256)).astype(np.float16)
+    actual = Tensor(data,device="ROCKCHIP").realize().max(axis=1).realize().numpy()
+    np.testing.assert_equal(actual,data.max(axis=1))
+
   def test_small_dynamic_fp16_gemm_native_pack_compute_unpack(self):
     rng = np.random.default_rng(19)
     for size in (4,8,9):

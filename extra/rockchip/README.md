@@ -1551,3 +1551,24 @@ expand the claimed FP32 arithmetic contract.
 The exact integer identity `x | 0xFFFFFFFF == -1` is canonicalized to the
 native int32 constant-fill plan. The unchanged `test_int_or` passes without
 claiming a general integer bitwise ALU.
+
+## Direct dense-row PPU MAX tree
+
+`test_max_dont_collapse` is a dense 256x256 FP16 row reduction. Reinterpreting
+each row as 32 HWC8 pixels needs no input packing. Two exact PPU tasks reduce
+the width through `1x8/stride 8` and `1x4/stride 4`; a bounded CMAC transpose
+then makes the eight surviving channels planar, and seven DPU MAX tasks fold
+them to one value per row.
+
+The complete plan has 41 tasks, 1,742 command words, 41 resets, 524,288
+constant bytes, 27,648 scratch bytes, and 1,116,928 estimated MACs. A random
+256x256 hardware boundary is bit-exact, and the unchanged official method
+passes in strict native-only mode. The 400-task and 2 MiB ceilings are
+unchanged. Focused expected coverage is now `197/40/175/13`; the authoritative
+complete census remains `195/40/177/13` until rerun.
+
+`probe_ppu_sliding_channels.py` also records the rejected alternatives.
+Partial-channel sliding HWC2 completes but corrupts 172 of 192 outputs, while
+the first one-row width-16 boundary timed out. Those geometries remain outside
+the compiler contract; only the exact HWC8 one-row widths through eight are
+enabled.
