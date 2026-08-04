@@ -1964,7 +1964,7 @@ reject in 2.36 seconds rather than exposing intermittent wrong output. Wider
 native cumulative products remain blocked until mixed-engine stress testing
 proves the hardware state and multi-tile layout reliable.
 
-### Exact wide-fill input contract
+### Exact wide-fill input contract (superseded for int32)
 
 The remaining backend-origin non-reject failure came from `test_maximum`'s
 integer `INT_MAX` case. Lowering accepted a typed int32 fill, but the emitter
@@ -1978,6 +1978,13 @@ or FP32 fill constant. `INT_MAX` and FP32 `0.1` reject with
 wide-fill path. The unchanged focused `test_maximum` reaches the typed reject
 in 2.73 seconds after its earlier native subcases pass. No emitter exception,
 host conversion, or relaxed comparison is involved.
+
+The later output-converter probe supersedes only the int32 part of this
+historical boundary. `DPU_OUT_CVT_OFFSET` is a full 32-bit field and, with a
+zero FP16 arithmetic result, writes the supplied signed int32 bit pattern
+exactly. `INT_MIN`, -1234, 0, 1234, and `INT_MAX` all pass a 65-element RK3588
+test, exercising two WDMA tiles. FP32 constants remain subject to exact FP16
+input representability.
 
 ## First-class native reformat plan
 
@@ -3217,3 +3224,22 @@ and the rejected fused register path as
 `dc14748b290323286cc661de6eae1c24eb839d566da808249eb56d096d6e89bc`).
 The authoritative tally remains 187 native / 40 frontend / 185 failed / 13
 upstream skips.
+
+## Exact signed-int32 constant fills through the output converter
+
+The post-softmin dtype investigation proved that wide int32 constant fills do
+not need to represent the requested integer in the FP16 DPU input. A typed
+`RKALUStage` now carries a validated 32-bit output-converter offset. The stage
+computes FP16 zero, uses int32 WDMA output precision, and writes the exact
+two's-complement constant through `DPU_OUT_CVT_OFFSET`. Nonzero offsets are
+legal only for int32 output stages.
+
+Compiler tests verify image round-trip and the exact emitted register value
+for both 64-element and tail tiles. A serialized hardware test covers 65 lanes
+for `INT_MIN`, -1234, 0, 1234, and `INT_MAX`; all outputs are bit-exact. The
+unchanged `test_maximum` passes its former `INT_MAX` subcase, then rejects the
+next `maximum(x, INT_MIN)` identity movement because public int32 reformat is a
+separate unproven input/layout capability. No CPU semantic path, runtime dtype
+conversion, tolerance change, or wider supported-arithmetic claim was added.
+The complete census has not been rerun, so `187/40/185/13` remains the
+authoritative tally.

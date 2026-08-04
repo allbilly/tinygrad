@@ -546,12 +546,13 @@ until an alternating-engine stress test proves a stable multi-tile contract.
 The unchanged focused `test_cumprod` therefore fails honestly at its first
 20-element case instead of sometimes returning incorrect data.
 
-Wide int32 and FP32 constant fills consume an FP16 DPU input even though WDMA
-writes a wider public dtype. Legalization now requires that constant to
-round-trip through FP16 exactly. Values such as `INT_MAX` and FP32 `0.1`
-therefore return `NUMERICAL_CONTRACT` before image emission, while proven exact
-fills remain native. This removes the raw FP16-packing `OverflowError` exposed
-by `test_maximum` without claiming general integer or FP32 arithmetic.
+FP32 constant fills still consume an FP16 DPU input even though WDMA writes a
+wider public dtype, so legalization requires exact FP16 round-trip. Int32 fills
+now use a different proven hardware contract: the FP16 arithmetic lane emits
+zero and the DPU's 32-bit output-converter offset supplies the exact signed
+int32 bit pattern. This covers the complete signed int32 constant range,
+including `INT_MIN` and `INT_MAX`, without host conversion or a claim of
+general integer arithmetic. FP32 `0.1` remains a typed numerical rejection.
 
 Static affine movement now lowers to a first-class `RKReformat` target plan.
 It records typed logical source and destination surfaces, the complete static
@@ -1445,3 +1446,13 @@ HALF invocation. A BS-subtract-to-EW-LUT fusion register experiment submitted
 but produced incorrect values, so it was rejected and archived. The active
 compiler remains at the clean `187/40/185/13` census contract with no accepted
 numerical failure.
+
+The next dtype probe used the documented full-width `DPU_OUT_CVT_OFFSET`
+register instead of trying to materialize large integers as FP16 constants.
+Five exact RK3588 boundary values (`INT_MIN`, -1234, 0, 1234, and `INT_MAX`),
+each crossing the 64-element WDMA tile boundary, match NumPy bit-for-bit. The
+unchanged `test_maximum` now passes its former `INT_MAX` fill blocker and
+advances to a distinct int32 identity-reformat rejection in the following
+`maximum(x, INT_MIN)` subcase. Therefore this milestone expands the honest
+fill-only hardware contract but does not yet claim a method-level census gain;
+the authoritative tally remains `187/40/185/13`.

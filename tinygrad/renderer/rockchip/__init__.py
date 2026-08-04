@@ -365,10 +365,17 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     if store.src[0].dtype in (dtypes.int, dtypes.float):
       if not isinstance(root, float):
         return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"non-constant {store.src[0].dtype.name} fill", store.src[1].op)
+      if store.src[0].dtype is dtypes.int:
+        if not root.is_integer() or not dtypes.int.min <= root <= dtypes.int.max:
+          return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"int fill value {root!r} is outside signed int32", store.src[1].op)
+        tile = 64
+        fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, 0.0, min(tile, count-start),
+                                     dtypes.int, int(root)&0xffffffff) for start in range(0, count, tile))
+        return _native(RKDPUProgram(fill_stages))
       if not _fp16_exact(root):
         return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
           f"{store.src[0].dtype.name} fill value {root!r} is not exactly representable by the FP16 DPU input", store.src[1].op)
-      tile = 64 if store.src[0].dtype is dtypes.int else 4
+      tile = 4
       fill_stages = tuple(RKALUStage(Ops.ADD, RKArg(output.kind, output.index, start*4), 0.0, root, min(tile, count-start),
                                      store.src[0].dtype) for start in range(0, count, tile))
       return _native(RKDPUProgram(fill_stages))

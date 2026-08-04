@@ -51,8 +51,11 @@ class RKALUStage:
   rhs: RKArg|float
   count: int
   out_dtype: DType = dtypes.half
+  out_cvt_offset: int = 0
   def __post_init__(self):
     if self.op not in RK_ALU_OPS: raise ValueError(f"unsupported RK DPU ALU operation {self.op}")
+    if not 0 <= self.out_cvt_offset <= 0xffffffff: raise ValueError("RK DPU output conversion offset does not fit 32 bits")
+    if self.out_cvt_offset and self.out_dtype is not dtypes.int: raise ValueError("RK DPU output conversion offset requires int32 output")
 
 @dataclass(frozen=True)
 class RKFusedALUStage:

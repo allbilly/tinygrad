@@ -451,12 +451,23 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(wide.stages), 65)
     self.assertEqual(decode_image(encode_image(emit_dpu(wide))), emit_dpu(wide))
 
-  def test_wide_fill_rejects_values_not_exactly_representable_as_fp16_input(self):
-    for value,dtype in ((dtypes.int.max,dtypes.int), (0.1,dtypes.float)):
-      result = lower_native(sink(Tensor.full((5,), value, dtype=dtype)))
-      self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
-      assert result.reject is not None
-      self.assertIs(result.reject.kind, RKRejectKind.NUMERICAL_CONTRACT)
+  def test_int32_fill_uses_exact_output_converter_offset(self):
+    for value in (dtypes.int.min, -1234, 0, 1234, dtypes.int.max):
+      plan = lower_dpu(sink(Tensor.full((65,), value, dtype=dtypes.int)))
+      self.assertIsInstance(plan, RKDPUProgram)
+      assert isinstance(plan, RKDPUProgram)
+      self.assertEqual(tuple(stage.out_cvt_offset for stage in plan.stages if isinstance(stage,RKALUStage)),
+                       (value&0xffffffff,value&0xffffffff))
+      image = emit_dpu(plan)
+      offsets = tuple((command >> 16)&0xffffffff for stage in image.stages for command in stage.commands
+                      if command&0xffff == rk.REG_DPU_OUT_CVT_OFFSET)
+      self.assertEqual(offsets,(value&0xffffffff,value&0xffffffff))
+
+  def test_wide_float_fill_rejects_values_not_exactly_representable_as_fp16_input(self):
+    result = lower_native(sink(Tensor.full((5,), 0.1, dtype=dtypes.float)))
+    self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
+    assert result.reject is not None
+    self.assertIs(result.reject.kind, RKRejectKind.NUMERICAL_CONTRACT)
 
   def test_plan_is_uop_free_and_reuses_scratch(self):
     a, b, c, d = (Tensor.empty(16,dtype=dtypes.half) for _ in range(4))
