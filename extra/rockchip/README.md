@@ -1295,3 +1295,13 @@ whereas the earlier 128-output candidate did not fit. Focused expected coverage
 is now 180 native / 40 frontend / 192 fail / 13 skip. The complete host gate
 passes 132 tests plus 34 subtests, and all four direct padded-convolution
 TestOps regressions pass together on RK3588 in 92.30 seconds.
+
+The singleton input/weight case simplifies past contraction entirely into a
+zero-masked padded surface multiplied by one runtime scalar. Generic
+multi-broadcast lowering now gives each indexed input its enclosing conditional
+surface, proves the mask statically, materializes false coordinates as zero,
+and substitutes the complete surface into the DPU expression. The unchanged
+official `test_simple_padding_conv2d` passes natively in 1.44 seconds through a
+seven-task plan with 4,176 constant bytes. This is reusable masked-broadcast
+composition, not a convolution-name special case. Focused expected coverage is
+181 native / 40 frontend / 191 fail / 13 skip.

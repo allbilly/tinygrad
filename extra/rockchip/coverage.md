@@ -2965,3 +2965,14 @@ selector-heavy correctness fallback. Focused expected coverage is 180 native /
 132 tests plus 34 subtests, and the four direct padded-convolution TestOps
 methods pass together on RK3588 in 92.30 seconds without fallback or a device
 error.
+
+`test_simple_padding_conv2d` has no REDUCE after simplification: it is a
+zero-masked two-element input broadcast to twelve outputs and multiplied by a
+one-element runtime weight. The generic multi-broadcast lowerer now associates
+each INDEX with its enclosing conditional surface, evaluates that predicate at
+every static output coordinate, emits empty selector rows for zero-filled
+positions, and substitutes the whole materialized surface into the arithmetic
+expression. The unchanged official method passes natively in 1.44 seconds with
+seven tasks, 252 command words, 4,176 constant bytes, 256 scratch bytes, and
+115 estimated MACs. Focused expected coverage is 181 native / 40 frontend /
+191 failed / 13 upstream skips.

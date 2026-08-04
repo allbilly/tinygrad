@@ -818,13 +818,20 @@ def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   scratch:tuple[RKScratch, ...] = ()
   steps:list[RKDPUProgram|RKContract|RKConvTask|RKReduce] = []
   for source_index in broadcasts:
+    surfaces = [(u, parsed) for u in stored.toposort() if (parsed:=_conditional_index(u)) is not None and parsed[0].key == source_index.key]
+    if not surfaces: return _not_applicable()
+    surface,(_,condition,select_true) = surfaces[-1]
+    if {u.arg[0] for u in surface.toposort() if u.op is Ops.RANGE}-set(axes):
+      return _unsupported(RKRejectKind.UNSUPPORTED_BROADCAST,"multi-broadcast surface has axes outside its output",Ops.RANGE)
     src_count = int(source_index.src[0].src[0].arg)
     mapping = [-1]*count
     for coordinates in product(*(range(ranges[axis]) for axis in axes)):
       point = dict(zip(axes, coordinates))
-      dst, src = (_static_scalar(index, point) for index in (output_index,source_index.src[1]))
+      dst, predicate = _static_scalar(output_index,point), True if condition is None else _static_scalar(condition,point)
+      selected = predicate is not None and bool(predicate) is select_true
+      src = _static_scalar(source_index.src[1],point) if selected else -1
       if not isinstance(dst, int) or isinstance(dst, bool) or not 0 <= dst < count or mapping[dst] != -1 or \
-         not isinstance(src, int) or isinstance(src, bool) or not 0 <= src < src_count:
+         predicate is None or not isinstance(src, int) or isinstance(src, bool) or selected and not 0 <= src < src_count:
         return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "multi-broadcast does not cover one dense output", Ops.INDEX)
       mapping[dst] = src
     expanded = RKArg(RKBufferKind.SCRATCH, len(scratch))
@@ -834,7 +841,7 @@ def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
     if packed is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "multi-broadcast selector exceeds plan limits", Ops.INDEX)
     steps.extend(packed.steps)
     scratch = packed.scratch
-    substitutions[source_index] = source_index.replace(src=(source_index.src[0], output_index))
+    substitutions[surface] = source_index.replace(src=(source_index.src[0], output_index))
     remaps[RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)] = expanded
   root = _parse_alu(stored.substitute(substitutions), output_index, {})
   def remap(value:_Value) -> _Value:

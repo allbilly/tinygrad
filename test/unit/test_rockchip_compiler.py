@@ -12,7 +12,8 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_pointwise_affine_reduce_result, lower_reduce_result,
-  lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_global_max_result, lower_reformat_result,
+  lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_multi_broadcast_alu_result, lower_global_max_result,
+  lower_reformat_result,
   lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
@@ -1446,6 +1447,16 @@ class TestDPUCompiler(unittest.TestCase):
                       for step in convs],[(1,1,2,2,2,2)]*4)
     self.assertLessEqual(plan_cost(pointwise.plan).task_count,200)
     self.assertFalse(contains_uop(pointwise.plan))
+
+  def test_zero_masked_surface_and_scalar_use_generic_multi_broadcast(self):
+    source = Tensor.empty(1,1,1,2,dtype=dtypes.half).realize()
+    weight = Tensor.empty(1,1,1,1,dtype=dtypes.half).realize()
+    result = lower_multi_broadcast_alu_result(sink(source.conv2d(weight,padding=(1,1,1,1))))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    self.assertLessEqual(plan_cost(result.plan).task_count,8)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_nhwc_convolution_splits_output_channels_to_cbuf_tiles(self):
     source = Tensor.empty(2,9,9,10,dtype=dtypes.half).realize()
