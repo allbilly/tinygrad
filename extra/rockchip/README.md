@@ -6,15 +6,15 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `2e40def50` is 172 native,
-40 frontend-only, 200 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed without an NPU timeout, reset failure,
-invalid submission, or process abort. Relative to `de0ac1406`,
-`test_var_one_in_axis`, `test_std_one_in_axis`, and
-`test_binary_crossentropy_logits_pos_weights` change from failure to native
-pass and there is no regression. Coverage details, the corrected explicit
-pytest-plugin invocation, and the durable artifact hash are recorded in
-`coverage.md`.
+The current authoritative uncached strict census at `2d4c34807` is 187 native,
+40 frontend-only, 185 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed in 3,138.18 seconds without an NPU timeout,
+reset failure, invalid submission, process abort, or test-context warning.
+Relative to `2e40def50`, fifteen methods change from failure to native pass and
+none regress: four padding movements, four padded-convolution cases, four power
+cases, simple padded convolution, stack-MAX, and tangent. Coverage details,
+the checkout-local pytest-plugin invocation, reject Pareto, plan-cost
+histograms, and durable artifact hashes are recorded in `coverage.md`.
 
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor
@@ -1391,3 +1391,19 @@ reported 253 failures, so that tally is explicitly invalid. The research branch
 now owns a checkout-local plugin using `Context(DEFAULT_FLOAT=...)`; focused
 `test_exp` and `test_arange` both pass with the repaired setup. Future censuses
 must use `PYTHONPATH=$PWD/test/rockchip` and never the frozen 2607 plugin.
+
+The corrected uncached census at `2d4c34807` then completed all 425 methods in
+3,138.18 seconds: 187 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 185 typed native
+rejects, and 13 `SKIP_UPSTREAM`. It has no numerical mismatch, unclassified
+failure, device error, or regression from `2e40def50`. The fifteen new native
+methods are `test_pad`, `test_pad_reflect_mode`, `test_pad_replicate_mode`,
+`test_pad_slice`, `test_padded_conv2d_1x1`, `test_padded_conv2d_bs1`,
+`test_padded_conv2d_p21`, `test_padded_conv2d_p22`, `test_pow`,
+`test_pow_full`, `test_pow_zero_const`, `test_pow_zero_tensor`,
+`test_simple_padding_conv2d`, `test_stack_max`, and `test_tan`. The 499 kernels
+belonging to fully native methods include 457 efficient plans and 42 explicit
+correctness fallbacks; the largest remains the unchanged 399-task matmul.
+`sz.py` records 30,334 counted repository lines at this milestone. The main
+Rockchip compiler concentration remains visible: package `__init__.py` is 2,682
+lines and `expr.py` is 1,445 lines, so contraction/reformat/reduction extraction
+remains cleanup work rather than being hidden under generated files.
