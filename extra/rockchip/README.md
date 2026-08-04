@@ -1496,3 +1496,11 @@ int8 DPU multiplication against an immutable byte mask. This is a semantic
 unchanged `test_tril` and `test_triu` methods pass, including their final bool
 subcases, for two focused method gains. The authoritative full census remains
 `187/40/185/13`; current focused expectation is `189/40/183/13`.
+
+The same committed bool-fill contract also makes the complete unchanged
+`test_all_zero_axis` and `test_any_zero_axis` methods pass: their empty
+reductions simplify to the correct bool identity constants and execute through
+native int8 fill. Nonempty `all` and `any` still reject at bool reduction or
+FP16-comparison conversion. Focused expectation is therefore
+`191 native / 40 frontend / 181 failed / 13 skipped`; the full-census baseline
+remains `187/40/185/13`.

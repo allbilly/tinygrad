@@ -3304,3 +3304,10 @@ The complete unchanged `test_tril` and `test_triu` methods both pass, including
 all FP16 shapes/diagonals and their final bool inputs. This predicts two focused
 method gains (`189 native / 40 frontend / 183 failed / 13 skipped`), but
 `187/40/185/13` remains authoritative until a full uncached census is run.
+
+The unchanged `test_all_zero_axis` and `test_any_zero_axis` methods also pass
+completely after this milestone. Their empty reductions simplify to bool
+identity constants and use the exact int8 fill path. Nonempty `all` and `any`
+remain typed rejects and are not counted. Combined focused expectation is now
+`191 native / 40 frontend / 181 failed / 13 skipped`; `187/40/185/13` is still
+the authoritative full-census result.
