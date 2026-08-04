@@ -3925,3 +3925,23 @@ writes that immutable value at session finish. Previously a commit made during
 a long serialized census could make the final report name a newer tree than
 the code loaded by the test process. Six focused telemetry tests pass. This
 changes report provenance only, not compilation, execution, or method counts.
+
+## Rejected reusable command/task GEM lifetime
+
+The complete run started from `053ec3b6d` invalidated the preceding reusable
+submission-buffer experiment. It produced 177 native passes, 40 frontend
+passes, 170 typed rejects, 16 device failures, nine post-execution failures,
+and 13 upstream skips. The first timeout occurred at collected method 37 and
+later failures crossed CONV, CMAC, DPU/LUT, and reduction families. A separate
+fresh-process DPU lerp check mismatched every element with reuse enabled and
+passed unchanged as soon as the runtime returned to a fresh command GEM and
+task GEM for every submission.
+
+The run is preserved at
+`/home/orangepi/rk2608_backups/census-post-multicat-053ec3b6d-20260805` with
+JSON SHA-256
+`d795480d836cd0cc396c109035052730b0f3b489ddd9be380f85b31a4dcbebe0`.
+Because the old telemetry plugin resolved `HEAD` at teardown, its embedded
+commit is newer than the code loaded at process start. This run is rejected as
+state-polluted and does not replace the authoritative `202/40/170/13` census.
+It does independently confirm `test_multicat` as native.

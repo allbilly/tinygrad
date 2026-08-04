@@ -36,8 +36,6 @@ class RockchipProgram(Program['RockchipDevice']):
     self.fallback:RKPythonProgram|None = None
     self.scratch:tuple[HCQBuffer, ...] = ()
     self.constants:HCQBuffer|None = None
-    self.command:HCQBuffer|None = None
-    self.task:HCQBuffer|None = None
     signature = [{"name": name, "slot": slot, "dtype": dtype.name,
                   "shape": [x if isinstance(x, int) else str(x) for x in shape]} for name,slot,dtype,shape in obj.signature]
     if obj.lib[:4] == RKPY_MAGIC:
@@ -59,15 +57,11 @@ class RockchipProgram(Program['RockchipDevice']):
     self.scratch = tuple(dev._gpu_alloc(x.size) for x in self.image.scratch)
     self.constants = dev._gpu_alloc(len(self.image.constants)) if self.image.constants else None
     if self.constants is not None: ctypes.memmove(int(self.constants.va_addr), self.image.constants, len(self.image.constants))
-    self.command = dev._gpu_alloc(max(len(stage.commands) for stage in self.image.stages)*8)
-    self.task = dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
 
   @suppress_finalizing
   def __del__(self):
     for buf in self.scratch: self.dev._gpu_free(buf)
     if self.constants is not None: self.dev._gpu_free(self.constants)
-    if self.command is not None: self.dev._gpu_free(self.command)
-    if self.task is not None: self.dev._gpu_free(self.task)
 
   def _dma(self, buf:HCQBuffer) -> int:
     if buf.meta is None: raise RuntimeError("Rockchip program requires an NPU DMA buffer")
@@ -83,7 +77,7 @@ class RockchipProgram(Program['RockchipDevice']):
         raise
       record_telemetry("kernel", **self.telemetry, outcome="PASS", duration_ms=elapsed*1e3)
       return elapsed if wait else None
-    assert self.image is not None and self.command is not None and self.task is not None
+    assert self.image is not None
     image = self.image
     del global_size, local_size, vals, kwargs
     def address(kind:RKBufferKind, index:int) -> int:
@@ -101,15 +95,21 @@ class RockchipProgram(Program['RockchipDevice']):
     try:
       for active_stage,(stage,commands) in enumerate(zip(image.stages, patch_image(image, address))):
         if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
-        ctypes.memmove(int(self.command.va_addr), (ctypes.c_uint64*len(commands))(*commands), len(commands)*8)
-        op_idx, enable_mask, int_mask = _TASK[stage.engine]
-        descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
-          int_status=0, regcfg_amount=len(commands), regcfg_offset=0, regcmd_addr=self._dma(self.command))
-        ctypes.memmove(int(self.task.va_addr), ctypes.addressof(descriptor), ctypes.sizeof(descriptor))
-        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000, task_start=0, task_number=1,
-          task_counter=0, priority=0, task_obj_addr=self.task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
-          core_mask=1, fence_fd=-1, subcore_task=(rk.struct_rknpu_subcore_task*5)(rk.struct_rknpu_subcore_task(0,1)))
+        cmd = self.dev._gpu_alloc(len(commands)*8)
+        task = self.dev._gpu_alloc(ctypes.sizeof(rk.struct_rknpu_task), rk.RKNPU_MEM_KERNEL_MAPPING)
+        try:
+          ctypes.memmove(int(cmd.va_addr), (ctypes.c_uint64*len(commands))(*commands), len(commands)*8)
+          op_idx, enable_mask, int_mask = _TASK[stage.engine]
+          descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
+            int_status=0, regcfg_amount=len(commands), regcfg_offset=0, regcmd_addr=self._dma(cmd))
+          ctypes.memmove(int(task.va_addr), ctypes.addressof(descriptor), ctypes.sizeof(descriptor))
+          rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+            flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000, task_start=0, task_number=1,
+            task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
+            core_mask=1, fence_fd=-1, subcore_task=(rk.struct_rknpu_subcore_task*5)(rk.struct_rknpu_subcore_task(0,1)))
+        finally:
+          self.dev._gpu_free(cmd)
+          self.dev._gpu_free(task)
     except Exception as exc:
       active_engine = image.stages[active_stage].engine.name if active_stage >= 0 else "none"
       exc.add_note(f"Rockchip image stage {active_stage}/{len(image.stages)} ({active_engine})")

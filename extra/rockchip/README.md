@@ -1894,3 +1894,24 @@ can therefore be followed by independent milestone commits without causing
 the finished JSON to identify code that the running Python process never
 loaded. The focused telemetry suite passes six tests; execution and coverage
 classification are unchanged.
+
+## Rejected reusable-submission-buffer experiment
+
+The reusable command/task GEM milestone above is retained in history as a
+negative hardware result, but is no longer enabled. A complete serialized
+native-only census using that runtime first timed out at method 37 and then
+reported 16 device failures plus nine post-execution numerical failures. A
+fresh-process DPU lerp regression also returned 33/33 incorrect elements while
+the reusable buffers were enabled; restoring fresh command and task GEMs per
+submission made the unchanged test pass immediately.
+
+This is consistent with the RKNPU submission path retaining object/address or
+command visibility state that the current userspace ABI does not explicitly
+invalidate when the same GEM is overwritten. Per-program command/task reuse is
+therefore not a proven optimization and must not be used. The polluted census
+is preserved at
+`/home/orangepi/rk2608_backups/census-post-multicat-053ec3b6d-20260805`;
+its JSON identifies the later teardown-time `HEAD`, but the process-start code
+was `053ec3b6d`. It is diagnostic evidence only, not an authoritative coverage
+result. `test_multicat` did pass natively in that run and the 170 typed reject
+population was unchanged.
