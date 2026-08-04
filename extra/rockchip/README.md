@@ -29,7 +29,7 @@ post-early_simplify UOps
        RKALUStage(op: Ops)
        RKMaskStage
        RKLUTStage(lut: RKLUTId)
-       RKContract
+       RKContractionPlan -> RKCMACTask
        RKConvPlan -> RKConvTask(s)
        RKPool
        RKProgram(ordered typed steps)
@@ -407,7 +407,7 @@ remains correct. The complete rejected implementation and probe results are
 preserved in `0134-WIP-fused-BN-two-factor-scale.patch` (SHA-256
 `a472dcbfb2a610e0aa0afe86f0318ad7e293d97417cf11067a6e94473054c22c`).
 
-Channel bias and optional ReLU now use a typed `RKEpilogue` on `RKContract`.
+Channel bias and optional ReLU now use a typed `RKEpilogue` on `RKCMACTask`.
 The selector planner gathers the logical FP16 bias into aligned four-lane
 atoms, ordinary DPU tasks convert those lanes into the FP32 format consumed by
 BRDMA, and the CMAC emitter performs bias/ReLU on the flying FP32 accumulator.

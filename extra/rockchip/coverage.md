@@ -3401,3 +3401,27 @@ The unchanged `test_pow_const` now passes its former `(-2)**x` rejection and
 advances to the independent final `0.7**int32` input-conversion blocker. No
 method-level gain is claimed; the authoritative tally remains
 `193/40/179/13`.
+
+## Logical contraction / physical CMAC task boundary
+
+The contraction IR now names its two levels explicitly. `RKContractionPlan`
+owns logical M/N/K geometry, reduction axes, tensor surfaces, constants, and
+the optional epilogue. `legalize_contraction_plan` validates the currently
+proven direct family (`M=1`, `K=32`, `4<=N<=16`) and produces an
+`RKCMACTask`. `RKProgram` contains only the physical task; register emission
+accepts `RKCMACTask` and cannot inspect the semantic plan or UOps.
+
+All selector, reduction, and tiled-contraction CMAC invocations were renamed
+mechanically from the ambiguous `RKContract` to `RKCMACTask`. This milestone
+does not change command words, native coverage, or the 400-task ceiling. A
+new compiler test proves that direct semantic legalization emits byte-identical
+images, all 150 compiler/image tests pass with 38 subtests, full mypy covers
+227 source files, and full Ruff is clean. RK3588 hardware validation passes
+the direct row-sum, fused bias/ReLU, and K=65 tiled-contraction regressions in
+57.02 seconds. The authoritative tally remains `193/40/179/13`.
+
+The local register audit also closed a misleading dtype lead: the shared old
+`precision_int32 = 4` enum describes an output/accumulator encoding, while the
+independently decoded CNA input contract exposes int8, int16, and FP16—not an
+int32 input surface. Therefore the compiler does not add an speculative CNA
+int32-to-FP16 conversion after the already archived direct-DPU timeout.

@@ -6,8 +6,8 @@ import numpy as np
 
 from tinygrad.device import Target, TinyELF
 from tinygrad.dtype import dtypes
-from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKContract, RKLayout, RKLayoutKind, RKTensorRef,
-  RKImage, RKTarget, encode_image, emit_contract)
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKCMACTask, RKLayout, RKLayoutKind, RKTensorRef,
+  RKImage, RKTarget, encode_image, emit_cmac_task)
 from tinygrad.renderer.rockchip.image import RKStage
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipProgram
@@ -28,7 +28,7 @@ def image(channels:int, compact:bool=False, rows:int=1):
   lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((rows,align),(rows,align),(align*2,2),dtypes.half))
   rhs = RKTensorRef(RKArg(RKBufferKind.ARG,2),RKLayout((channels,align),(align,align),(align*2,2),dtypes.half,
     padding=((0,align-channels),(0,0)),kind=RKLayoutKind.CMAC_WEIGHT))
-  base = emit_contract(RKContract(out,lhs,rhs,0))
+  base = emit_cmac_task(RKCMACTask(out,lhs,rhs,0))
   if not compact: return base
   # The normal FP16 WDMA layout places each 16-channel group in a 32-lane atom.
   # Probe whether a one-atom SURFACE_ADD packs those groups without another task.
@@ -43,7 +43,7 @@ def selector_image(span:int, indexes:list[int]) -> RKImage:
   lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((1,span),(1,align),(align*2,2),dtypes.half,padding=((0,0),(0,align-span))))
   rhs = RKTensorRef(RKArg(RKBufferKind.CONSTANT,0),RKLayout((len(indexes),span),(32,align),(align*2,2),dtypes.half,
     padding=((0,32-len(indexes)),(0,align-span)),kind=RKLayoutKind.CMAC_WEIGHT))
-  return emit_contract(RKContract(out,lhs,rhs,0,packed.tobytes()))
+  return emit_cmac_task(RKCMACTask(out,lhs,rhs,0,packed.tobytes()))
 
 def main() -> None:
   dev = RockchipDevice("ROCKCHIP")

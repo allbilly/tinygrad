@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
 from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKCopyStage, RKDPUStage,
-  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKContract, RKConvTask, RKReduce, RKPool, RKLegalizedReformat, RKProgram)
+  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKCMACTask, RKConvTask, RKReduce, RKPool, RKLegalizedReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
@@ -257,7 +257,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), RK_STAGE_RESET))
   return RKImage(target, tuple(stages), program.scratch, bytes(constants))
 
-def emit_contract(plan:RKContract, target:RKTarget=RKTarget.RK3588) -> RKImage:
+def emit_cmac_task(plan:RKCMACTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Emit one direct CMAC task; all surfaces are already hardware-legal."""
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
   plan.lhs.layout.validate_for(RKEngine.CMAC)
@@ -445,7 +445,7 @@ def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   images:list[RKImage] = []
   for step in plan.steps:
     if isinstance(step, RKDPUProgram): images.append(emit_dpu(step, target))
-    elif isinstance(step, RKContract): images.append(emit_contract(step, target))
+    elif isinstance(step, RKCMACTask): images.append(emit_cmac_task(step, target))
     elif isinstance(step, RKConvTask): images.append(emit_spatial_conv(step, target))
     elif isinstance(step, RKPool): images.append(emit_pool(step, target))
     elif isinstance(step, RKReduce): images.append(emit_reduce(step, target))

@@ -6,12 +6,13 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKConvTask, RKConvPlan, RKCopyStage, RKDPUProgram,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan,
+  RKCopyStage, RKDPUProgram,
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan, RKLegalizedReformat,
   RKReformatKind, RK_STAGE_RESET,
-  RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
+  RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_cmac_task, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_pointwise_affine_reduce_result, lower_reduce_result,
@@ -21,7 +22,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
-  plan_conv_cbuf, legalize_conv_plan, rk_fingerprint)
+  plan_conv_cbuf, legalize_conv_plan, legalize_contraction_plan, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -237,7 +238,7 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(image.constants), 2*1024*1024)
       self.assertFalse(contains_uop(plan))
       plans.append(plan)
-    self.assertTrue(any(isinstance(step, RKContract) and step.lhs.buffer.addend for plan in plans for step in plan.steps))
+    self.assertTrue(any(isinstance(step, RKCMACTask) and step.lhs.buffer.addend for plan in plans for step in plan.steps))
 
   def test_wide_affine_max_atoms_reduce_scalars_then_gather(self):
     plans = []
@@ -324,7 +325,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind, RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan, RKProgram)
     assert isinstance(result.plan,RKProgram)
-    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKContract))
+    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask))
     fused = tuple(stage for step in result.plan.steps if isinstance(step,RKDPUProgram)
                   for stage in step.stages if isinstance(stage,RKFusedALUStage))
     self.assertEqual((len(contracts),len(fused)), (50,197))
@@ -394,7 +395,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual([stage.engine for stage in emit_reformat(first).stages], [RKEngine.CMAC])
     last = plans[-1]
     assert isinstance(last, RKLegalizedReformat)
-    self.assertLessEqual(sum(isinstance(step, RKContract) for step in last.program.steps), 8)
+    self.assertLessEqual(sum(isinstance(step, RKCMACTask) for step in last.program.steps), 8)
     self.assertTrue(all(not contains_uop(plan) for plan in plans))
 
   def test_add_matches_frozen_oracle(self):
@@ -432,7 +433,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_ordered_program_composes_engine_steps_and_resources(self):
     dpu = RKDPUProgram((RKALUStage(Ops.ADD, RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.ARG, 0), 0.0, 8),))
     contract = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
-    assert isinstance(contract, RKContract)
+    assert isinstance(contract, RKCMACTask)
     program = RKProgram((dpu, contract), (RKScratch(64),))
     image = emit_program(program)
     self.assertEqual(([stage.engine for stage in image.stages], image.scratch, len(image.constants)),
@@ -1034,24 +1035,35 @@ class TestDPUCompiler(unittest.TestCase):
   def test_direct_affine_contract_is_typed(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     plan = lower_contract(sink(a@packed_b.T))
-    self.assertIsInstance(plan, RKContract)
+    self.assertIsInstance(plan, RKCMACTask)
     self.assertFalse(contains_uop(plan))
     self.assertEqual(plan.lhs.layout.logical_shape, (1,32))
     self.assertEqual(plan.lhs.layout.physical_shape, (1,32))
     self.assertEqual(plan.lhs.layout.strides_bytes, (64,2))
     self.assertEqual(plan.rhs.layout.strides_bytes, (64,2))
-    image = emit_contract(plan)
+    image = emit_cmac_task(plan)
     self.assertEqual((len(image.stages[0].commands), tuple(r.word for r in image.stages[0].relocs)), (46, (18,24,31)))
     self.assertIsNone(lower_contract(sink(a@Tensor.empty(32,8,dtype=dtypes.half))))
     self.assertIsNone(lower_contract(sink((a@packed_b.T).sigmoid())))
 
+  def test_logical_contraction_legalizes_to_byte_identical_cmac_task(self):
+    a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
+    physical = lower_contract(sink(a@packed_b.T))
+    self.assertIsInstance(physical,RKCMACTask)
+    assert isinstance(physical,RKCMACTask)
+    semantic = RKContractionPlan(physical.out,physical.lhs,physical.rhs,1,8,32,(physical.reduce_axis,))
+    legalized, = legalize_contraction_plan(semantic)
+    self.assertEqual((legalized.physical_m,legalized.physical_n,legalized.physical_k),(1,32,32))
+    self.assertEqual(emit_cmac_task(legalized),emit_cmac_task(physical))
+    self.assertFalse(contains_uop(semantic) or contains_uop(legalized))
+
   def test_row_sum_is_constant_backed_contract(self):
     plan = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
-    self.assertIsInstance(plan, RKContract)
+    self.assertIsInstance(plan, RKCMACTask)
     self.assertFalse(contains_uop(plan))
     self.assertIs(plan.lhs.buffer.kind, RKBufferKind.CONSTANT)
     self.assertEqual(plan.rhs.layout.logical_shape, (8,32))
-    image = emit_contract(plan)
+    image = emit_cmac_task(plan)
     self.assertEqual(len(image.constants), 64)
     self.assertIs(image.stages[0].relocs[0].kind, RKBufferKind.CONSTANT)
     self.assertEqual(decode_image(encode_image(image)), image)
@@ -1072,7 +1084,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind,RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan,RKProgram)
     assert isinstance(result.plan,RKProgram)
-    self.assertTrue(any(isinstance(step,RKContract) and step.rhs.layout.logical_shape[0] == 24 for step in result.plan.steps))
+    self.assertTrue(any(isinstance(step,RKCMACTask) and step.rhs.layout.logical_shape[0] == 24 for step in result.plan.steps))
     self.assertLessEqual(len(emit_program(result.plan).stages),400)
     self.assertFalse(contains_uop(result.plan))
 
@@ -1082,7 +1094,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind,RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan,RKProgram)
     assert isinstance(result.plan,RKProgram)
-    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKContract) and step.rhs.layout.logical_shape[0] == 40)
+    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask) and step.rhs.layout.logical_shape[0] == 40)
     self.assertEqual(len(contracts),1)
     self.assertEqual((contracts[0].rhs.layout.physical_shape,contracts[0].out.layout.physical_shape[-1]),((64,64),128))
     self.assertLessEqual(len(emit_program(result.plan).stages),400)
@@ -1095,7 +1107,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(too_wide.kind,RKLowerKind.NATIVE)
     assert isinstance(too_wide.plan,RKProgram)
     self.assertLessEqual(plan_cost(too_wide.plan).task_count,400)
-    compact = [step for step in too_wide.plan.steps if isinstance(step,RKContract) and step.compact_output and
+    compact = [step for step in too_wide.plan.steps if isinstance(step,RKCMACTask) and step.compact_output and
                step.out.layout.physical_shape == (1,128)]
     self.assertEqual((len(compact),compact[0].out.layout.physical_shape), (1,(1,128)))
 
@@ -1120,7 +1132,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
     image = emit_program(plan)
-    self.assertTrue(any(isinstance(step, RKContract) and step.epilogue is not None for step in plan.steps))
+    self.assertTrue(any(isinstance(step, RKCMACTask) and step.epilogue is not None for step in plan.steps))
     self.assertEqual(image.stages[-1].engine, RKEngine.CMAC)
     self.assertLessEqual(len(image.stages), 400)
     self.assertLessEqual(len(image.constants), 2*1024*1024)
@@ -1221,7 +1233,7 @@ class TestDPUCompiler(unittest.TestCase):
     image = emit_program(plan)
     self.assertLessEqual(len(image.stages), 400)
     self.assertLessEqual(len(image.constants), 1024*1024)
-    self.assertTrue(all(not isinstance(step, RKContract) or step.out.buffer.addend%16 == 0 for step in plan.steps))
+    self.assertTrue(all(not isinstance(step, RKCMACTask) or step.out.buffer.addend%16 == 0 for step in plan.steps))
     self.assertFalse(contains_uop(plan))
 
   def test_tall_k4_contraction_uses_resource_bound_instead_of_m64_cap(self):
@@ -1244,7 +1256,7 @@ class TestDPUCompiler(unittest.TestCase):
       image = emit_program(plan)
       self.assertLessEqual(len(image.stages), 400)
       self.assertLessEqual(len(image.constants), 2*1024*1024)
-      self.assertTrue(any(isinstance(step, RKContract) and step.lhs.buffer.kind is RKBufferKind.ARG for step in plan.steps))
+      self.assertTrue(any(isinstance(step, RKCMACTask) and step.lhs.buffer.kind is RKBufferKind.ARG for step in plan.steps))
       self.assertFalse(contains_uop(plan))
 
   def test_multi_broadcast_and_tiled_m_contractions_stay_native(self):
@@ -1259,7 +1271,7 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertLessEqual(len(image.constants), 2*1024*1024)
       self.assertFalse(contains_uop(plan))
     assert isinstance(tiled, RKProgram)
-    self.assertGreaterEqual(sum(isinstance(step, RKContract) and not step.constants for step in tiled.steps), 2)
+    self.assertGreaterEqual(sum(isinstance(step, RKCMACTask) and not step.constants for step in tiled.steps), 2)
 
   def test_zero_masked_contraction_operand_generates_empty_selector_rows(self):
     x, weight = Tensor.empty(1,1,3,dtype=dtypes.half), Tensor.empty(1,1,2,dtype=dtypes.half)
@@ -1285,7 +1297,7 @@ class TestDPUCompiler(unittest.TestCase):
     long_plan = lower_add_reduce_result(sink(Tensor.empty(135,dtype=dtypes.half).sum())).plan
     self.assertIsInstance(long_plan, RKProgram)
     assert isinstance(long_plan, RKProgram)
-    long_contract = next(step for step in long_plan.steps if isinstance(step, RKContract))
+    long_contract = next(step for step in long_plan.steps if isinstance(step, RKCMACTask))
     self.assertEqual((long_contract.lhs.layout.physical_shape, len(long_contract.constants)), ((1,160), 10240))
     long_image = emit_program(long_plan)
     self.assertEqual(([stage.engine for stage in long_image.stages], len(long_image.constants)), ([RKEngine.DPU,RKEngine.CMAC], 10512))
@@ -1297,7 +1309,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind, RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan, RKProgram)
     assert isinstance(result.plan, RKProgram)
-    contract = next(step for step in result.plan.steps if isinstance(step,RKContract))
+    contract = next(step for step in result.plan.steps if isinstance(step,RKCMACTask))
     self.assertEqual((contract.out.layout.dtype,contract.out.layout.physical_shape,contract.out.layout.strides_bytes),
                      (dtypes.float,(1,64),(256,4)))
     self.assertEqual(emit_program(result.plan).stages[-1].engine,RKEngine.CMAC)
@@ -1309,7 +1321,7 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertIs(result.kind, RKLowerKind.NATIVE)
       self.assertIsInstance(result.plan, RKProgram)
       assert isinstance(result.plan, RKProgram)
-      self.assertGreaterEqual(sum(isinstance(step, RKContract) for step in result.plan.steps), 2)
+      self.assertGreaterEqual(sum(isinstance(step, RKCMACTask) for step in result.plan.steps), 2)
       self.assertFalse(contains_uop(result.plan))
 
   def test_nested_sum_does_not_claim_sibling_reductions(self):
@@ -1370,7 +1382,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind, RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan, RKProgram)
     assert isinstance(result.plan, RKProgram)
-    fused = [step for step in result.plan.steps if isinstance(step, RKContract) and step.epilogue is not None]
+    fused = [step for step in result.plan.steps if isinstance(step, RKCMACTask) and step.epilogue is not None]
     self.assertEqual(len(fused), 1)
     self.assertIsInstance(fused[0].epilogue, RKEpilogue)
     assert fused[0].epilogue is not None and fused[0].epilogue.bias is not None
@@ -1400,7 +1412,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(result.plan, RKProgram)
     plan = result.plan
     assert isinstance(plan, RKProgram)
-    contract = next(step for step in plan.steps if isinstance(step, RKContract))
+    contract = next(step for step in plan.steps if isinstance(step, RKCMACTask))
     self.assertEqual(contract.lhs.layout.physical_shape, (1,384))
     active = struct.unpack_from("<e", contract.constants, 0)[0]
     self.assertEqual(active, struct.unpack("<e", struct.pack("<e", 1/360))[0])
@@ -1423,7 +1435,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(all(isinstance(plan, RKProgram) for plan in plans))
     first = plans[0]
     assert isinstance(first, RKProgram)
-    contracts = tuple(step for step in first.steps if isinstance(step, RKContract))
+    contracts = tuple(step for step in first.steps if isinstance(step, RKCMACTask))
     self.assertEqual([contract.out.layout.logical_shape for contract in contracts], [(1,16),(1,16),(1,16),(1,12)])
     self.assertTrue(all(contract.out.layout.physical_shape == (1,32) for contract in contracts))
     self.assertEqual([contract.out.buffer.addend for contract in contracts], [0,32,64,96])
@@ -1514,7 +1526,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(result.kind, RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan, RKLegalizedReformat)
     assert isinstance(result.plan, RKLegalizedReformat)
-    contracts = [step for step in result.plan.program.steps if isinstance(step, RKContract)]
+    contracts = [step for step in result.plan.program.steps if isinstance(step, RKCMACTask)]
     self.assertEqual([(step.out.layout.logical_shape,step.out.layout.physical_shape) for step in contracts], [((1,64),(1,64))])
     self.assertTrue(contracts[0].compact_output)
     self.assertFalse(contains_uop(result.plan))
@@ -1679,7 +1691,7 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertIs(result.kind,RKLowerKind.NATIVE)
         self.assertIsInstance(result.plan,RKProgram)
         assert isinstance(result.plan,RKProgram)
-        contracts = [step for step in result.plan.steps if isinstance(step,RKContract)]
+        contracts = [step for step in result.plan.steps if isinstance(step,RKCMACTask)]
         self.assertTrue(contracts)
         self.assertIn(96,{step.lhs.layout.physical_shape[-1] for step in contracts})
         self.assertLessEqual(plan_cost(result.plan).task_count,200)

@@ -175,7 +175,28 @@ class RKEpilogue:
   relu: bool = False
 
 @dataclass(frozen=True)
-class RKContract:
+class RKContractionPlan:
+  """Logical dense contraction before CMAC tile and physical-layout legalization."""
+  out: RKTensorRef
+  lhs: RKTensorRef
+  rhs: RKTensorRef
+  logical_m: int
+  logical_n: int
+  logical_k: int
+  reduction_axes: tuple[int, ...]
+  constants: bytes = b""
+  epilogue: RKEpilogue|None = None
+  def __post_init__(self):
+    if min(self.logical_m,self.logical_n,self.logical_k) <= 0 or not self.reduction_axes:
+      raise ValueError("invalid logical RK contraction geometry")
+    if math.prod(self.out.layout.logical_shape) != self.logical_m*self.logical_n or \
+       math.prod(self.lhs.layout.logical_shape) != self.logical_m*self.logical_k or \
+       math.prod(self.rhs.layout.logical_shape) != self.logical_n*self.logical_k:
+      raise ValueError("RK contraction surfaces do not match logical M/N/K")
+
+@dataclass(frozen=True)
+class RKCMACTask:
+  """One fully legalized physical CMAC invocation."""
   out: RKTensorRef
   lhs: RKTensorRef
   rhs: RKTensorRef
@@ -183,6 +204,12 @@ class RKContract:
   constants: bytes = b""
   epilogue: RKEpilogue|None = None
   compact_output: bool = False
+  @property
+  def physical_m(self) -> int: return self.lhs.layout.physical_shape[0]
+  @property
+  def physical_n(self) -> int: return self.rhs.layout.physical_shape[0]
+  @property
+  def physical_k(self) -> int: return self.lhs.layout.physical_shape[-1]
 
 @dataclass(frozen=True)
 class RKConvTask:
@@ -300,7 +327,7 @@ class RKMultiSourceReformatPlan:
            index >= math.prod(self.sources[source].layout.logical_shape) for source,index in self.mapping):
       raise ValueError("RK multi-source reformat mapping is outside its logical surfaces")
 
-RKProgramStep = RKDPUProgram|RKContract|RKConvTask|RKReduce
+RKProgramStep = RKDPUProgram|RKCMACTask|RKConvTask|RKReduce
 
 @dataclass(frozen=True)
 class RKProgram:
@@ -361,7 +388,7 @@ class RKLowerKind(Enum):
 @dataclass(frozen=True)
 class RKLowerResult:
   kind: RKLowerKind
-  plan: RKDPUProgram|RKContract|RKConvTask|RKReduce|RKLegalizedReformat|RKProgram|None = None
+  plan: RKDPUProgram|RKCMACTask|RKConvTask|RKReduce|RKLegalizedReformat|RKProgram|None = None
   reject: RKReject|None = None
   def __post_init__(self):
     valid = {RKLowerKind.NATIVE:self.plan is not None and self.reject is None,
