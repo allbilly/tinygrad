@@ -1980,3 +1980,37 @@ the generated `[-2,2]` LUT domain. It now rejects explicitly with
 numerical mismatch. The previously archived negative-EXP bands still cannot
 recover Torch's fused HALF normalization precision, so no failed LUT experiment
 was restored and no coverage transition is claimed.
+
+## Authoritative 204-pass native census
+
+The complete uncached native-only census at `2385767d1` establishes:
+
+| outcome | methods |
+|---|---:|
+| `PASS_NATIVE` | 204 |
+| `PASS_FRONTEND` | 40 |
+| `FAIL` | 168 |
+| `SKIP_UPSTREAM` | 13 |
+| total | 425 |
+
+The two transitions from the preceding 202-pass census are exactly
+`test_multicat` and `test_where`. All 168 failures are typed native rejects;
+there is no CPU fallback, numerical mismatch, NPU timeout, invalid submission,
+reset failure, process abort, or unclassified failure. `test_softmin` reaches
+the exact negative-MAX kernel and then rejects its final dynamic EXP as
+`LUT_DOMAIN_UNPROVEN`, confirming that the new capability does not weaken the
+accepted numerical contract.
+
+The 56m15s run executed 653 successful native kernels: 590 efficient and 63
+bounded correctness fallbacks. At method level, 169 native methods are fully
+efficient and 35 contain at least one correctness fallback. The largest
+successful plan remains `test_matmul` at 399 tasks and 42.64 seconds; the
+largest constant payload remains 1,819,392 bytes in `test_grouped_conv2d`.
+Neither cost ceiling changed.
+
+Durable artifacts are stored under
+`/home/orangepi/rk2608_backups/census-negative-max-2385767d1-20260805/`.
+The telemetry JSON SHA-256 is
+`fddc4fc0fe64d5229481ef6d7695cf9e72d9199b8186be6718f1a7983f701cc1` and
+the JUnit XML SHA-256 is
+`1a89c93b75e5952c59960d229f5e0e86a423ebcfd11eedbe7a63ac2e19fc905f`.

@@ -4013,3 +4013,54 @@ fused-normalization experiments remain only in the patch archive. This is a
 native capability and cost milestone, not a method-count change, so the
 authoritative tally remains `202 PASS_NATIVE / 40 PASS_FRONTEND / 170 FAIL /
 13 SKIP_UPSTREAM`.
+
+## Complete native census at the negative-MAX head
+
+The uncached serialized run at commit
+`2385767d147de0193880732c986fbbe31c914d72` completed all 425 methods in
+3,375.14 seconds:
+
+```text
+204 PASS_NATIVE
+ 40 PASS_FRONTEND
+168 FAIL
+ 13 SKIP_UPSTREAM
+425 total
+```
+
+Relative to the preceding authoritative `202/40/170/13` census, only
+`test_multicat` and `test_where` move from typed rejection to fully native
+passes. Every remaining failure is `NATIVE_REJECT`; there are no numerical,
+device, teardown, or unclassified failures. The method-first reject kinds are:
+
+| reject kind | methods |
+|---|---:|
+| `unsupported_output_dtype` | 53 |
+| `plan_stage_limit` | 33 |
+| `unsupported_input_dtype` | 26 |
+| `numerical_contract` | 18 |
+| `unsupported_layout` | 18 |
+| `unsupported_alu` | 12 |
+| `requires_reformat` | 5 |
+| `unaligned_row` | 2 |
+| `lut_domain_unproven` | 1 |
+
+The single LUT-domain reject is `test_softmin`: its first two kernels execute
+natively, including exact pointwise-negative row MAX, and its final kernel
+rejects because the multi-broadcast EXP input is not proven inside `[-2,2]`.
+This replaces neither the archived negative-EXP bands nor the rejected fused
+normalization experiment.
+
+Fully native methods execute 653 successful kernels, split into 590
+`EFFICIENT` and 63 `CORRECTNESS_FALLBACK` kernels. At method level the split is
+169 efficient and 35 containing a correctness fallback. `test_matmul` remains
+the worst successful task/time plan at 399 tasks and 42,641.18 ms;
+`test_grouped_conv2d` retains the largest successful constant image at
+1,819,392 bytes. Existing 400-task and 2 MiB constant ceilings remain intact.
+
+Artifacts are preserved under
+`/home/orangepi/rk2608_backups/census-negative-max-2385767d1-20260805/`.
+The JSON SHA-256 is
+`fddc4fc0fe64d5229481ef6d7695cf9e72d9199b8186be6718f1a7983f701cc1` and
+the JUnit SHA-256 is
+`1a89c93b75e5952c59960d229f5e0e86a423ebcfd11eedbe7a63ac2e19fc905f`.
