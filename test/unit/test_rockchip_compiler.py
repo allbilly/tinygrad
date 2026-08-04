@@ -340,6 +340,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 128*1024)
     self.assertFalse(contains_uop(plan))
 
+  def test_multi_source_scalar_max_uses_one_direct_dpu_task(self):
+    lhs,rhs = Tensor.empty(1,dtype=dtypes.half).realize(),Tensor.empty(1,dtype=dtypes.half).realize()
+    result = lower_native(sink(Tensor.stack(lhs,rhs).max(axis=0)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    self.assertEqual(plan_cost(result.plan).task_count,1)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_affine_movements_use_aligned_npu_atom_copies(self):
     x = Tensor.empty(2,3,8,dtype=dtypes.half)
     plans = tuple(lower_reformat_result(sink(expression.contiguous())).plan for expression in

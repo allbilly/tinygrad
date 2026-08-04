@@ -2976,3 +2976,14 @@ expression. The unchanged official method passes natively in 1.44 seconds with
 seven tasks, 252 command words, 4,176 constant bytes, 256 scratch bytes, and
 115 estimated MACs. Focused expected coverage is 181 native / 40 frontend /
 191 failed / 13 upstream skips.
+
+The static multi-source reduction planner now supports a conservative MAX
+contract in addition to ADD: each source must supply exactly one element per
+logical output, after which source-local surfaces are combined by DPU MAX.
+Identity mappings bypass selector materialization entirely. The simplified
+`Tensor.stack(lhs,rhs).max(axis=0)` graph consequently becomes one
+`RKALUStage(Ops.MAX)` reading the two one-element argument buffers directly.
+The unchanged official `test_stack_max` passes natively in 0.73 seconds; its
+cost is one task, 32 command words, zero constants, zero scratch, four estimated
+read bytes, and two write bytes. Focused expected coverage is 182 native / 40
+frontend / 190 failed / 13 upstream skips.

@@ -1305,3 +1305,12 @@ official `test_simple_padding_conv2d` passes natively in 1.44 seconds through a
 seven-task plan with 4,176 constant bytes. This is reusable masked-broadcast
 composition, not a convolution-name special case. Focused expected coverage is
 181 native / 40 frontend / 191 fail / 13 skip.
+
+Static affine multi-source reduction now accepts both ADD and MAX. MAX is
+legal only when every source contributes exactly one value to every output, so
+selector-CMAC can never accidentally sum two values before the maximum. When a
+source mapping is already the output identity, the plan uses that argument
+directly rather than packing it. The unchanged official `test_stack_max`
+therefore passes through one DPU MAX task in 0.73 seconds with no scratch or
+constants. Focused expected coverage is 182 native / 40 frontend / 190 fail /
+13 skip.
