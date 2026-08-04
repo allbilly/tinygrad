@@ -1958,3 +1958,25 @@ materialization, a 100-element comparison, and a public bool condition. This
 is one focused method gain; together with the earlier `test_multicat` result,
 the expected tally is `204/40/168/13`. The authoritative complete census
 remains `202/40/170/13` pending a clean rerun.
+
+## Exact pointwise-negative affine MAX
+
+Affine PPU MAX can now materialize the exact FP16 pointwise transform `x * -1`
+before selector packing. This is the native primitive needed by MIN-style
+reductions and by the first centered-softmin kernel; it is deliberately not an
+arbitrary expression-before-MAX path. A `9x65` row reduction is bit-exact on
+RK3588 and costs 28 tasks, 104,112 constant bytes, and 3,328 scratch bytes.
+
+The shared 64-output CMAC selector also halves existing affine-MAX packing:
+the `(3,4,5,6) -> max(axis=1)` compiler case uses 12 CMAC tasks instead of 24,
+and the scalar multiaxis pool case uses one instead of two. Six focused MAX and
+pool hardware regressions pass, while the complete compiler suite is 159
+tests plus 59 subtests passing.
+
+This exact first kernel does not make `test_softmin` native. Its final
+multi-broadcast EXP has no proof that the dynamic centered input remains inside
+the generated `[-2,2]` LUT domain. It now rejects explicitly with
+`LUT_DOMAIN_UNPROVEN` instead of executing the LUT clamp and returning a
+numerical mismatch. The previously archived negative-EXP bands still cannot
+recover Torch's fused HALF normalization precision, so no failed LUT experiment
+was restored and no coverage transition is claimed.

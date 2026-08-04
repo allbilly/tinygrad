@@ -3988,3 +3988,28 @@ fallback or tolerance change. The new focused transition predicts
 `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM` when combined
 with the already proven `test_multicat` gain. The authoritative census remains
 `202/40/170/13` until the next clean serialized run.
+
+## Pointwise-negative MAX and explicit softmin domain rejection
+
+The affine MAX lowerer now accepts one exact FP16 preprocessing operation:
+multiplication of its direct source by `-1`. The transformed surface remains on
+device, selector packing is CBUF-bounded, partial PPU channel groups are written
+to aligned HWC8 atoms, and a final native selector compacts only their valid
+lanes. A deterministic `9x65` device regression is bit-exact and the plan costs
+28 tasks, 104,112 constant bytes, and 3,328 scratch bytes.
+
+The same change replaces the old 16-output CMAC packing loop with the shared
+64-output selector planner. Existing affine MAX coverage stays exact while the
+`(3,4,5,6)` compiler case drops from 24 to 12 CMAC tasks and a scalar pool drops
+from two CMAC tasks to one. The 400-task and 2 MiB constant limits are unchanged.
+
+Enabling the exact first `test_softmin` kernel exposed the already documented
+EXP-domain boundary. The final kernel combines two broadcast surfaces with a
+dynamic exponential, but the active generated EXP assets are characterized
+only on `[-2,2]`. Multi-broadcast EXP therefore produces the typed reject
+`RKPLAN_REJECT:lut_domain_unproven` before submission. This preserves the
+zero-numerical-failure census contract; the old negative-band and attempted
+fused-normalization experiments remain only in the patch archive. This is a
+native capability and cost milestone, not a method-count change, so the
+authoritative tally remains `202 PASS_NATIVE / 40 PASS_FRONTEND / 170 FAIL /
+13 SKIP_UPSTREAM`.

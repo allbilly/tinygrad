@@ -188,16 +188,39 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
     engines = [stage.engine for stage in emit_program(plan).stages]
-    self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.CMAC), engines.count(RKEngine.PPU)), (2,24,12))
+    self.assertEqual((engines.count(RKEngine.DPU), engines.count(RKEngine.PPU)),(2,12))
+    self.assertLessEqual(engines.count(RKEngine.CMAC),12)
     self.assertEqual(len(plan.scratch), 2)
     self.assertFalse(contains_uop(plan))
+
+  def test_affine_max_materializes_exact_negative_source(self):
+    source = Tensor.empty(9,65,dtype=dtypes.half)
+    plan = lower_affine_max_result(sink((-source).max(axis=1))).plan
+    self.assertIsInstance(plan,RKProgram)
+    assert isinstance(plan,RKProgram)
+    self.assertIsInstance(plan.steps[0],RKDPUProgram)
+    first = cast(RKDPUProgram,plan.steps[0]).stages[0]
+    self.assertIsInstance(first,RKALUStage)
+    self.assertEqual((cast(RKALUStage,first).op,cast(RKALUStage,first).rhs),(Ops.MUL,-1.0))
+    self.assertGreaterEqual(len(plan.scratch),3)
+    self.assertLessEqual(plan_cost(plan).task_count,32)
+    self.assertFalse(contains_uop(plan))
+
+  def test_multi_broadcast_exp_requires_a_proven_lut_domain(self):
+    source = Tensor.empty(9,65,dtype=dtypes.half).realize()
+    row_max, denominator = Tensor.empty(9,1,dtype=dtypes.half).realize(), Tensor.empty(9,1,dtype=dtypes.half).realize()
+    result = lower_multi_broadcast_alu_result(sink((-source-row_max).exp()/denominator))
+    self.assertIs(result.kind,RKLowerKind.UNSUPPORTED)
+    assert result.reject is not None
+    self.assertIs(result.reject.kind,RKRejectKind.LUT_DOMAIN_UNPROVEN)
 
   def test_scalar_multiaxis_max_uses_affine_ppu_plan(self):
     plan = lower_affine_max_result(sink(Tensor.empty(1,1,2,3,dtype=dtypes.half).max_pool2d((2,2)))).plan
     self.assertIsInstance(plan, RKProgram)
     assert isinstance(plan, RKProgram)
-    self.assertEqual([stage.engine for stage in emit_program(plan).stages],
-                     [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC,RKEngine.CMAC,RKEngine.PPU])
+    engines = [stage.engine for stage in emit_program(plan).stages]
+    self.assertEqual((engines.count(RKEngine.DPU),engines.count(RKEngine.PPU)),(2,1))
+    self.assertLessEqual(engines.count(RKEngine.CMAC),1)
     self.assertFalse(contains_uop(plan))
     dense = lower_native(sink(Tensor.empty(135,dtype=dtypes.half).max())).plan
     self.assertIsInstance(dense, RKProgram)

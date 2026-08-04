@@ -530,6 +530,11 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(data, device="ROCKCHIP").realize().max(axis=1).realize().numpy()
     np.testing.assert_equal(actual, data.max(axis=1))
 
+  def test_affine_fp16_max_after_exact_negation(self):
+    data = np.linspace(-8,8,9*65,dtype=np.float16).reshape(9,65)
+    actual = (-Tensor(data,device="ROCKCHIP").realize()).max(axis=1).realize().numpy()
+    np.testing.assert_equal(actual,(-data).max(axis=1))
+
   def test_static_conditional_fp16_reformat_native_cmac(self):
     data = np.arange(20, dtype=np.float16).reshape(4,5)
     tensor = Tensor(data, device="ROCKCHIP").realize()
