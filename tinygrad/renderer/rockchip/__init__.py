@@ -11,7 +11,7 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
-  RKALUStage, RKFusedALUStage as RKFusedALUStage, RKCopyStage,
+  RKALUStage, RKFusedALUStage as RKFusedALUStage, RKCopyStage, RKCastStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan as RKConvPlan,
   RKConvSplit as RKConvSplit, RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan,
@@ -416,9 +416,20 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       return _native(RKDPUProgram((RKALUStage(Ops.SUB,output,1.0,source,count,dtypes.bool),)))
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE,"non-identity bool output",store.src[1].op)
   input_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
+  bool_indexes = tuple(u for u in input_indexes if u.dtype is dtypes.bool)
+  if any(u.src[1].key != out_index.key for u in bool_indexes):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "bool input index map differs from output surface", Ops.INDEX)
+  if bool_indexes and count > 8:
+    return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE,"bool input conversion requires one eight-value atom",Ops.INDEX)
+  bool_params = tuple(dict.fromkeys(u.src[0] for u in bool_indexes))
+  scratch = tuple(RKScratch(((count+7)//8)*16) for _ in bool_params)
+  bool_refs = {param.key:RKArg(RKBufferKind.SCRATCH,slot) for slot,param in enumerate(bool_params)}
+  cast_stages = tuple(RKCastStage(ref,RKArg(RKBufferKind.ARG,param.arg.slot),count,dtypes.bool,dtypes.half)
+                      for param,ref in zip(bool_params,bool_refs.values()))
+  memo:dict[UOp,_Expr|RKArg|float] = {u:bool_refs[u.src[0].key] for u in bool_indexes}
   # Rejected WIP: DATA_FORMAT in_precision=precision_float32 exists in the register enum, but a direct FP32->FP16 ADD timed out on RK3588.
   # The exact typed-stage/emitter probe is preserved as wip-native-fp32-dpu-input-timeout.patch; do not restore 2607's CPU narrowing instead.
-  if (bad_dtype:=next((u.dtype for u in input_indexes if u.dtype is not dtypes.half), None)) is not None:
+  if (bad_dtype:=next((u.dtype for u in input_indexes if u.dtype not in (dtypes.bool,dtypes.half)), None)) is not None:
     return _unsupported(RKRejectKind.UNSUPPORTED_INPUT_DTYPE, f"input dtype {bad_dtype.name}", Ops.INDEX)
   if any(u.src[1].key != out_index.key for u in input_indexes):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "input index map differs from output surface", Ops.INDEX)
@@ -427,9 +438,12 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     if result.kind is not RKLowerKind.NOT_APPLICABLE: return result
   if (reason:=_numerical_contract(store.src[1])) is not None:
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, reason, _unwrap_same_cast(store.src[1]).op)
-  root = _parse_alu(store.src[1], out_index, {})
+  root = _parse_alu(store.src[1], out_index, memo)
   if root is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "expression is not legal DPU arithmetic", _unwrap_same_cast(store.src[1]).op)
-  if store.src[0].dtype is not dtypes.half and not isinstance(root, float):
+  int_where = store.src[0].dtype is dtypes.int and identity.op is Ops.WHERE and all(
+    arm.op is Ops.CONST and isinstance(arm.arg,(int,float)) and float(arm.arg).is_integer() and _fp16_exact(float(arm.arg))
+    for arm in identity.src[1:])
+  if store.src[0].dtype is not dtypes.half and not isinstance(root, float) and not int_where:
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"non-constant {store.src[0].dtype.name} arithmetic", store.src[1].op)
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
     if store.src[0].dtype in (dtypes.int, dtypes.float):
@@ -450,9 +464,30 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
       min(32768, count-start)) for start in range(0, count, 32768))))
   # Rejected WIP: materializing every partial-atom DPU input is correct but unnecessarily duplicates ordinary elementwise work.
   # The allocator clears upload padding instead; selector planners remain responsible for initializing scratch padding.
-  if (program:=_schedule_expr(root, output, count)) is None:
+  scheduled_output = output
+  if int_where:
+    scheduled_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(((count+7)//8)*16),)
+  if (program:=_schedule_expr(root, scheduled_output, count, scratch)) is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "stage source is not materializable")
-  return _native(program)
+  stages:list[RKDPUStage] = [*cast_stages,*program.stages]
+  if int_where:
+    if count > 4:
+      padded_count = ((count+3)//4)*8
+      padded = RKArg(RKBufferKind.SCRATCH,len(program.scratch))
+      padded_scratch = program.scratch+(RKScratch(padded_count*2),)
+      rows = [[[start+lane] if start+lane < count and lane < 4 else [] for lane in range(8)]
+              for start in range(0,count,4)]
+      packed = _selector_program(padded,scheduled_output,count,[row for group in rows for row in group],padded_scratch,
+                                 direct_capacity=count)
+      if packed is None:
+        return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"int WHERE packing exceeds the native cost contract",Ops.WHERE)
+      conversions = tuple(RKALUStage(Ops.ADD,RKArg(output.kind,output.index,start*4),
+        RKArg(padded.kind,padded.index,start//4*16),0.0,min(4,count-start),dtypes.int) for start in range(0,count,4))
+      return _native(_finish_program([RKDPUProgram(tuple(stages),packed.scratch),*packed.steps,
+        RKDPUProgram(conversions,packed.scratch)],packed.scratch))
+    stages.append(RKALUStage(Ops.ADD,output,scheduled_output,0.0,count,dtypes.int))
+  return _native(RKDPUProgram(tuple(stages),program.scratch))
 
 def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   """Compatibility helper for compiler probes; production lowering consumes `lower_dpu_result`."""

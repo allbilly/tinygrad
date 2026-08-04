@@ -94,6 +94,14 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(tlhs.minimum(trhs).realize().numpy(),np.logical_and(lhs,rhs))
     np.testing.assert_equal(tlhs.logical_not().realize().numpy(),np.logical_not(lhs))
 
+  def test_bool_masks_feed_fp16_and_int32_where(self):
+    values = np.linspace(-1,1,100,dtype=np.float16)
+    source = Tensor(values,device="ROCKCHIP",dtype=dtypes.half).realize()
+    np.testing.assert_equal((source > .5).where(4,2).clone().realize().numpy(),np.where(values > .5,4,2).astype(np.int32))
+    condition = np.resize(np.array([True,False,False,True,True],dtype=np.bool_),8)
+    mask = Tensor(condition,device="ROCKCHIP",dtype=dtypes.bool).realize()
+    np.testing.assert_equal(mask.where(1,3).clone().realize().numpy(),np.where(condition,1,3).astype(np.int32))
+
   def test_bool_triangular_reformat_uses_int8_mask(self):
     values = np.resize(np.array([True,False,True,True,False],dtype=np.bool_),(5,5))
     source = Tensor(values,device="ROCKCHIP",dtype=dtypes.bool).realize()

@@ -3965,3 +3965,26 @@ with SHA-256
 `249b4f6d08c499f8156de6dfa77cfcc41acc4f706fc2cdf34b729cd37a6caec4`.
 The authoritative count remains `202/40/170/13`; focused `test_multicat`
 evidence still predicts `203/40/169/13` after a clean full census.
+
+## Bool input conversion and WHERE
+
+An RK3588 register probe proves an exact eight-lane int8/bool-to-FP16 DPU
+conversion. Sixteen logical lanes in the same geometry produced only the first
+eight outputs, and changing RDMA to one 16-channel input atom timed out; the
+compiler therefore emits `RKCastStage` only when the complete bool input has
+at most eight values. A second tile starting at byte offset eight also corrupts
+its lanes, while a known-good DPU regression passed immediately after the
+rejected timeout. These wider forms reject before submission.
+
+FP16-to-int32 conversion is exact for one four-value output atom. Multi-atom
+output is not dense under the currently known WDMA geometry, so the compiler
+does not pretend otherwise. Integer WHERE first computes a dense FP16 result,
+uses selector CMAC to create an aligned `4 values + 4 padding lanes` surface,
+and issues one aligned conversion per four logical outputs. This is entirely
+NPU work and remains below the existing cost ceilings.
+
+The unchanged full `TestOps.test_where` passes in 12.11 seconds with no CPU
+fallback or tolerance change. The new focused transition predicts
+`204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM` when combined
+with the already proven `test_multicat` gain. The authoritative census remains
+`202/40/170/13` until the next clean serialized run.

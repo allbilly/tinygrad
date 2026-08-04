@@ -7,7 +7,7 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan,
-  RKCopyStage, RKDPUProgram,
+  RKCopyStage, RKCastStage, RKDPUProgram,
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan, RKLegalizedReformat,
@@ -536,6 +536,26 @@ class TestDPUCompiler(unittest.TestCase):
     not_stage = cast(RKDPUProgram,lower_native(sink(lhs.logical_not())).plan).stages[0]
     self.assertIsInstance(not_stage,RKALUStage)
     self.assertIs(cast(RKALUStage,not_stage).op,Ops.SUB)
+
+  def test_bool_where_materializes_fp16_mask_before_int32_output(self):
+    condition = Tensor.empty(8,dtype=dtypes.bool).realize()
+    result = lower_native(sink(condition.where(1,3).clone()))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    stages = tuple(stage for step in result.plan.steps if isinstance(step,RKDPUProgram) for stage in step.stages)
+    casts = tuple(stage for stage in stages if isinstance(stage,RKCastStage))
+    int_writes = tuple(stage for stage in stages if isinstance(stage,RKALUStage) and stage.out_dtype is dtypes.int)
+    self.assertEqual(tuple(stage.count for stage in casts),(8,))
+    self.assertEqual(tuple(stage.count for stage in int_writes),(4,4))
+    self.assertTrue(any(isinstance(step,RKCMACTask) for step in result.plan.steps))
+    self.assertEqual(decode_image(encode_image(emit_program(result.plan))),emit_program(result.plan))
+    self.assertFalse(contains_uop(result.plan))
+    rejected = lower_native(sink(Tensor.empty(9,dtype=dtypes.bool).realize().where(1,3).clone()))
+    self.assertIs(rejected.kind,RKLowerKind.UNSUPPORTED)
+    self.assertIsNotNone(rejected.reject)
+    assert rejected.reject is not None
+    self.assertIs(rejected.reject.kind,RKRejectKind.UNSUPPORTED_INPUT_DTYPE)
 
   def test_bool_triangular_reformat_uses_static_int8_mask(self):
     source = Tensor.empty(5,5,dtype=dtypes.bool).realize()

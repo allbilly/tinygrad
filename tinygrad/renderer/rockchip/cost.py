@@ -3,7 +3,7 @@ import math
 
 from tinygrad.renderer.rockchip.emit import emit_program
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET
-from tinygrad.renderer.rockchip.ir import (RKALUStage, RKArg, RKCopyStage, RKDPUProgram, RKFusedALUStage, RKLegalizedReformat,
+from tinygrad.renderer.rockchip.ir import (RKALUStage, RKArg, RKCopyStage, RKCastStage, RKDPUProgram, RKFusedALUStage, RKLegalizedReformat,
   RKLUTStage, RKMaskStage, RKCMACTask, RKConvTask, RKPlanCost, RKPool, RKProgram, RKReduce)
 
 def plan_cost(plan:RKProgram) -> RKPlanCost:
@@ -24,6 +24,9 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
         elif isinstance(stage, RKCopyStage):
           reads += stage.count*stage.dtype.itemsize
           writes += stage.count*stage.dtype.itemsize
+        elif isinstance(stage, RKCastStage):
+          reads += stage.count*stage.src_dtype.itemsize
+          writes += stage.count*stage.dst_dtype.itemsize
         elif isinstance(stage, (RKMaskStage,RKLUTStage)):
           reads += stage.count*2
           writes += stage.count*2

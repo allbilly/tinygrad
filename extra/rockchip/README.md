@@ -1933,3 +1933,28 @@ at 160, 256, 384, and 416 channels. A unit regression accepts 416 and rejects
 unchanged. The rejected planner is preserved as
 `wip-large-cat-second-reformat-stage-limit-20260805.patch` with SHA-256
 `249b4f6d08c499f8156de6dfa77cfcc41acc4f706fc2cdf34b729cd37a6caec4`.
+
+## Native bool-mask WHERE conversion
+
+The DPU can consume an int8/bool surface and write an FP16 mask when the whole
+public input fits one eight-value atom. The typed `RKCastStage` represents only that
+proven `(bool -> half)` contract; it is not a general cast opcode. A wider
+single-task geometry converted only its first eight values, while a mismatched
+16-channel RDMA geometry timed out. Starting a second conversion at byte eight
+also corrupts its lanes because the int8 RDMA base is not atom-aligned, so all
+three wider forms are excluded before submission.
+
+Integer WHERE uses two proven pieces: evaluate the selection in FP16, then
+convert one four-value atom to int32. Because a dense FP16 source would make
+every other four-value tile start at an illegal half-atom address, longer
+results are first placed into a native selector surface with four values plus
+four padding lanes per group. Each final conversion consequently reads and
+writes aligned 16-byte atoms. The host never reads or repacks tensor data.
+
+The unchanged `TestOps.test_where` passes all scalar, comparison, broadcast,
+and tensor-arm cases in 12.11 seconds with `ROCKCHIP_FALLBACK=0`. Focused
+compiler and device tests cover the typed cast, image round trip, padded int32
+materialization, a 100-element comparison, and a public bool condition. This
+is one focused method gain; together with the earlier `test_multicat` result,
+the expected tally is `204/40/168/13`. The authoritative complete census
+remains `202/40/170/13` pending a clean rerun.

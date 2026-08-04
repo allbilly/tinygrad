@@ -1372,9 +1372,10 @@ def _canonical_relu_difference(u:UOp) -> UOp|None:
       return pos[0]
   return None
 
-def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|None:
+def _parse_mask_expr(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _Expr|RKArg|None:
   """Build an FP16 0/1 predicate from comparisons and boolean composition."""
   u = _unwrap_same_cast(u)
+  if isinstance(cached:=memo.get(u),RKArg): return cached
   if u.op in (Ops.CMPLT, Ops.CMPNE):
     operands = tuple(_parse_alu(x, output_index, memo) for x in u.src)
     if any(x is None for x in operands): return None

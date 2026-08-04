@@ -88,6 +88,17 @@ class RKCopyStage:
     if not 0 < self.count <= 16384: raise ValueError("RK native copy extent exceeds DPU width")
 
 @dataclass(frozen=True)
+class RKCastStage:
+  dst: RKArg
+  src: RKArg
+  count: int
+  src_dtype: DType
+  dst_dtype: DType
+  def __post_init__(self):
+    if (self.src_dtype,self.dst_dtype) != (dtypes.bool,dtypes.half) or not 0 < self.count <= 8:
+      raise ValueError("RK native cast supports one bool-to-FP16 atom")
+
+@dataclass(frozen=True)
 class RKMaskStage:
   dst: RKArg
   src: RKArg
@@ -100,7 +111,7 @@ class RKLUTStage:
   src: RKArg
   count: int
 
-RKDPUStage = RKALUStage|RKFusedALUStage|RKCopyStage|RKMaskStage|RKLUTStage
+RKDPUStage = RKALUStage|RKFusedALUStage|RKCopyStage|RKCastStage|RKMaskStage|RKLUTStage
 
 @dataclass(frozen=True)
 class RKScratch:
