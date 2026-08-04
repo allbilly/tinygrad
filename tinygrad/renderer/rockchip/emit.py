@@ -17,6 +17,7 @@ _REG_DPU_RDMA_BRDMA_CFG, _REG_DPU_RDMA_BS_BASE_ADDR = 0x501c, 0x5020
 _REG_DPU_RDMA_NRDMA_CFG, _REG_DPU_RDMA_BN_BASE_ADDR, _REG_DPU_RDMA_WEIGHT = 0x5028, 0x502c, 0x5068
 _EW_BASE = 0x108002c0
 _ERDMA_FP16 = 0x40000008
+_CBUF_BANKS, _CBUF_BANK_BYTES, _MAX_CMAC_CHANNELS = 12, 32768, 416
 _EW_CFG = {Ops.ADD:_EW_BASE | (2 << 16), Ops.MUL:_EW_BASE | (1 << 2) | (1 << 8), Ops.MAX:_EW_BASE,
            Ops.SUB:_EW_BASE | (4 << 16), Ops.FDIV:_EW_BASE | (3 << 16) | (1 << 8)}
 
@@ -267,7 +268,8 @@ def emit_cmac_task(plan:RKCMACTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
   e, align_out, align_in = _command, plan.rhs.layout.physical_shape[0], plan.lhs.layout.physical_shape[-1]
   m = plan.lhs.layout.physical_shape[0]
   if align_in < 32 or align_in % 32: raise ValueError("CMAC K must be aligned to 32")
-  if not 32 <= align_out <= 128 or align_out % 32: raise ValueError("CMAC output tile must be 32..128 physical channels")
+  if not 32 <= align_out <= _MAX_CMAC_CHANNELS or align_out % 32:
+    raise ValueError(f"CMAC output tile must be 32..{_MAX_CMAC_CHANNELS} physical channels")
   fp32_out = plan.out.layout.dtype is dtypes.float
   if plan.out.layout.dtype not in (dtypes.half,dtypes.float): raise ValueError("CMAC output must be FP16 or FP32")
   if fp32_out and (m != 1 or plan.out.layout.physical_shape != (1,64) or plan.out.layout.strides_bytes != (256,4) or
@@ -277,7 +279,9 @@ def emit_cmac_task(plan:RKCMACTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
     raise ValueError("compact CMAC output requires one dense FP16 row")
   input_row_bytes = align_in*2
   feature_grains = max(80, (((2*256*128+input_row_bytes-1)//input_row_bytes)+1)&-2)
-  data_banks = min(11, max(1, (m*input_row_bytes+32767)//32768))
+  data_banks = min(_CBUF_BANKS-1, max(1, (m*input_row_bytes+_CBUF_BANK_BYTES-1)//_CBUF_BANK_BYTES))
+  if input_row_bytes*align_out > (_CBUF_BANKS-data_banks)*_CBUF_BANK_BYTES:
+    raise ValueError("CMAC weight surface exceeds remaining CBUF banks")
   line_stride = 4*min(align_in//32, 13)
   notch = 8*min(align_out//32, 13)-1
   commands = (
@@ -287,7 +291,7 @@ def emit_cmac_task(plan:RKCMACTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
     e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, 1), e(_TARGET_CNA, rk.REG_CNA_DATA_SIZE3, m),
     e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE0, input_row_bytes*align_out), e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE1, input_row_bytes),
     e(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, 0x1010000|align_out),
-    e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, ((12-data_banks)<<4)|data_banks),
+    e(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, ((_CBUF_BANKS-data_banks)<<4)|data_banks),
     e(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, align_in//32), e(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb),
     *(e(_TARGET_CNA, reg, 0x10000) for reg in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4)),
     e(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0), e(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),

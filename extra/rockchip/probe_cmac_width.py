@@ -47,7 +47,9 @@ def selector_image(span:int, indexes:list[int]) -> RKImage:
 
 def main() -> None:
   dev = RockchipDevice("ROCKCHIP")
-  for channels in (16,20,24,28,32,40,64,96,99,128):
+  # One 32-KiB feature bank leaves eleven weight banks. Square FP16 selectors
+  # therefore stop at 416 aligned channels: 416*416*2 <= 11*32 KiB.
+  for channels in (16,20,24,28,32,40,64,96,99,128,160,256,384,416):
     align = max(32,(channels+31)&-32)
     rows = 4 if channels in (40,99) else 1
     lhs = np.linspace(-3,3,rows*align,dtype=np.float16).reshape(rows,align)
@@ -66,7 +68,9 @@ def main() -> None:
         physical = np.frombuffer(ctypes.string_at(int(out.va_addr),rows*align*4),dtype=np.float16).copy()
         actual = physical[:rows*channels].reshape(rows,channels) if compact else physical.reshape(rows,-1)[:,
           [channel//16*32+channel%16 for channel in range(channels)]]
-        print(f"M={rows} N={channels} compact={compact} exact={np.array_equal(actual,lhs[:,:channels])} actual={actual.tolist()}")
+        exact = np.array_equal(actual,lhs[:,:channels])
+        print(f"M={rows} N={channels} compact={compact} exact={exact} "
+              f"mismatches={np.count_nonzero(actual != lhs[:,:channels])} first={actual.ravel()[:8].tolist()}")
     finally:
       dev._gpu_free(out)
       dev._gpu_free(lhs_buf)

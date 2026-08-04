@@ -1092,6 +1092,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(emit_cmac_task(legalized),emit_cmac_task(physical))
     self.assertFalse(contains_uop(semantic) or contains_uop(legalized))
 
+  def test_cmac_output_width_stops_at_cbuf_capacity(self):
+    def task(width:int) -> RKCMACTask:
+      linear = RKLayout((1,width),(1,width),(width*2,2),dtypes.half)
+      weight = RKLayout((width,width),(width,width),(width*2,2),dtypes.half,kind=RKLayoutKind.CMAC_WEIGHT)
+      return RKCMACTask(RKTensorRef(RKArg(RKBufferKind.ARG,0),linear),
+        RKTensorRef(RKArg(RKBufferKind.ARG,1),linear),RKTensorRef(RKArg(RKBufferKind.ARG,2),weight),0,compact_output=True)
+    self.assertEqual(len(emit_cmac_task(task(416)).stages),1)
+    with self.assertRaisesRegex(ValueError,"32..416 physical channels"): emit_cmac_task(task(448))
+
   def test_row_sum_is_constant_backed_contract(self):
     plan = lower_contract(sink(Tensor.empty(8,32,dtype=dtypes.half).sum(axis=1)))
     self.assertIsInstance(plan, RKCMACTask)

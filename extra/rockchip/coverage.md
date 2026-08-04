@@ -3945,3 +3945,23 @@ Because the old telemetry plugin resolved `HEAD` at teardown, its embedded
 commit is newer than the code loaded at process start. This run is rejected as
 state-polluted and does not replace the authoritative `202/40/170/13` census.
 It does independently confirm `test_multicat` as native.
+
+## Wide CMAC CBUF boundary and rejected large-cat schedule
+
+An isolated RK3588 probe establishes exact M=1 FP16 CMAC writes at 160, 256,
+384, and 416 physical output channels in both ordinary and compact modes. The
+emitter now validates the corresponding CBUF contract: at least one of twelve
+32-KiB banks belongs to feature data, and the complete packed weight surface
+must fit the remaining banks. A 416-square FP16 selector fits; 448 is rejected.
+
+Using that boundary for the first `test_cat` kernel produces a legal 239-task,
+1,373,408-byte multi-source gather. It is not a method pass. Materializing the
+result requires a second 78,975-element block transpose; generic partitioned
+selectors cost 495--885 tasks and 5.8--37.9 MiB of constants even with the
+wider output. No ceiling was raised and the planner is disabled. Its patch is
+archived at
+`/home/orangepi/tinygrad/rockchip-upstream-patches/wip-large-cat-second-reformat-stage-limit-20260805.patch`
+with SHA-256
+`249b4f6d08c499f8156de6dfa77cfcc41acc4f706fc2cdf34b729cd37a6caec4`.
+The authoritative count remains `202/40/170/13`; focused `test_multicat`
+evidence still predicts `203/40/169/13` after a clean full census.

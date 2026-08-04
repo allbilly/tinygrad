@@ -1915,3 +1915,21 @@ its JSON identifies the later teardown-time `HEAD`, but the process-start code
 was `053ec3b6d`. It is diagnostic evidence only, not an authoritative coverage
 result. `test_multicat` did pass natively in that run and the 170 typed reject
 population was unchanged.
+
+## CBUF-bounded wide CMAC output
+
+Direct M=1 CMAC output is now legal through 416 physical channels when the
+feature and weight surfaces fit the twelve 32-KiB CBUF banks. The emitter
+computes feature-bank pressure, reserves at least one data bank, and rejects a
+weight surface larger than the remaining banks. The boundary follows directly
+from `416*416*2 <= 11*32768`; 448 channels are rejected before emission.
+
+The standalone hardware probe is exact for ordinary and compact FP16 output
+at 160, 256, 384, and 416 channels. A unit regression accepts 416 and rejects
+448. This capability does not claim a TestOps transition: a proposed large
+`test_cat` gather reached native execution, but its following
+`(3,45,585)->(45,3,585)` physical transpose still costs 495--885 tasks and
+5.8--37.9 MiB of selector constants. The 400-task and 2 MiB ceilings remain
+unchanged. The rejected planner is preserved as
+`wip-large-cat-second-reformat-stage-limit-20260805.patch` with SHA-256
+`249b4f6d08c499f8156de6dfa77cfcc41acc4f706fc2cdf34b729cd37a6caec4`.
