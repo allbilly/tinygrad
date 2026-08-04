@@ -3366,3 +3366,18 @@ The unchanged `test_int_or` passes natively in 0.85 seconds. This does not
 claim arbitrary integer OR support. Combined focused expectation is now
 `193 native / 40 frontend / 179 failed / 13 skipped`, while
 `187/40/185/13` remains the last complete uncached census.
+
+## Rejected direct int32 elementwise processing
+
+The int32 transport results above do not extend to the DPU elementwise plane.
+A typed one-stage probe configured int32 input, process, and output precision
+and attempted exact bitwise NOT as `SUB(-1, x)`. A 65-element hardware test
+covering both int32 extrema, signed values, and the four-lane tail timed out at
+submission with errno 110 before producing output.
+
+The compiler, IR, and emitter experiment were removed and archived as
+`wip-int32-dpu-ew-timeout-93c523345.patch` (SHA-256
+`cd00e5c8eedde074570bddb57bad524f49d6c002d7d901861703ba3352ec73ae`).
+Consequently arbitrary int32 arithmetic and `test_bitwise_not` remain typed
+rejects. Exact int32 fill, all-bypass copy, raw-word bitcast, and compile-time
+identities remain valid because none enables the elementwise processing path.
