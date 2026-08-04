@@ -1632,3 +1632,37 @@ tensor transformation was added.
 This is one focused complete-method gain. Expected coverage is now
 `199 native / 40 frontend / 173 failed / 13 skipped`; the authoritative
 uncached baseline remains `195/40/177/13` until rerun.
+
+## Authoritative census after direct prefix lowering
+
+The complete uncached native-only run at `746707b3e` establishes:
+
+| outcome | methods |
+|---|---:|
+| PASS_NATIVE | 198 |
+| PASS_FRONTEND | 40 |
+| FAIL (typed native reject) | 174 |
+| SKIP_UPSTREAM | 13 |
+
+All 174 failures are classified native rejections. The 56m32s run had no
+numerical mismatch, NPU timeout, invalid submission, reset failure, process
+abort, or unclassified failure. Fully native methods executed 543 kernels:
+495 efficient and 48 bounded correctness fallbacks. The existing ceilings
+remain unchanged; the largest successful plan has 399 tasks and the largest
+constant payload is 1,819,392 bytes.
+
+`test_sum_pad_collapse`, `test_max_dont_collapse`, and grouped `test_cumsum`
+are confirmed native with no regression. `test_simple_cumsum` is not counted:
+the strict census plugin still deliberately changes that method's default
+float contract to FP32 for an older CPU-reference workaround, so its first
+kernel rejects honestly as `unsupported_output_dtype`. The focused FP16 method
+does pass after the direct-prefix change. The plugin exception must be removed
+and retested now that the generic CPU FP16 scan has the same direct formulation;
+the authoritative count remains 198 until that verification is complete.
+
+Artifacts are preserved under
+`/home/orangepi/rk2608_backups/census-wide-prefix-746707b3e-20260804-223120`.
+The telemetry JSON SHA-256 is
+`5dad8510c28b0664c846f57269aea95955c90baf543cb6e3552a0c8b05eeb4d4` and
+the JUnit XML SHA-256 is
+`b78d65a0f23047791a7ab58e1da3bd14f0428dc1611c338e8b0dd290acb3284e`.

@@ -3621,3 +3621,35 @@ tensor transformation was added.
 This is one focused complete-method gain. Expected coverage is now
 `199 native / 40 frontend / 173 failed / 13 skipped`; the authoritative
 uncached baseline remains `195/40/177/13` until rerun.
+
+## Complete uncached census at `746707b3e`
+
+The immutable-head run completed all 425 collected methods in 56m32s:
+
+| outcome | count |
+|---|---:|
+| PASS_NATIVE | 198 |
+| PASS_FRONTEND | 40 |
+| NATIVE_REJECT | 174 |
+| SKIP_UPSTREAM | 13 |
+
+There were no numerical mismatches, timeouts, invalid submissions, reset
+failures, process aborts, or unclassified failures. The first-reject Pareto is
+54 unsupported output dtype, 35 plan-stage limit, 27 unsupported input dtype,
+20 unsupported layout, 18 numerical contract, 12 unsupported ALU, six requires
+reformat, and two unaligned row. The 543 kernels belonging to fully native
+methods comprise 495 `EFFICIENT` and 48 `CORRECTNESS_FALLBACK` kernels.
+
+The census confirms `test_sum_pad_collapse`, `test_max_dont_collapse`, and
+grouped `test_cumsum`. It does not confirm `test_simple_cumsum`: the census
+plugin still places that method in its historical FP32 CPU-reference context,
+so the backend correctly rejects its FP32 reduction even though the unchanged
+focused method passes under the requested `DEFAULT_FLOAT=HALF` contract. The
+next verification removes only that obsolete reference exception; it does not
+add dtype conversion, CPU fallback, a tolerance exception, or an NPU feature.
+
+Artifacts:
+
+- directory: `/home/orangepi/rk2608_backups/census-wide-prefix-746707b3e-20260804-223120`
+- `test_ops_coverage.json`: `5dad8510c28b0664c846f57269aea95955c90baf543cb6e3552a0c8b05eeb4d4`
+- `junit.xml`: `b78d65a0f23047791a7ab58e1da3bd14f0428dc1611c338e8b0dd290acb3284e`
