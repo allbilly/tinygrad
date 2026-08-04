@@ -947,6 +947,13 @@ class TestRockchip(unittest.TestCase):
     with np.errstate(all="ignore"): expected = np.power(np.float32(-5.5), data.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
+  def test_negative_base_pow2_range_reduction_and_special_values(self):
+    data = np.array([-np.inf,-2048,-30,-25,-24,-23,-15,-3,-2,-1,-.5,-0.0,.5,1,2,3,15,16,17,20,2047,2048,np.inf,np.nan],
+                    dtype=np.float16)
+    actual = ((-2.0)**Tensor(data,device="ROCKCHIP")).realize().numpy()
+    with np.errstate(all="ignore"): expected = np.power(np.float16(-2),data,dtype=np.float16)
+    np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6,equal_nan=True)
+
   def test_constant_base_pow8_four_generated_bands(self):
     encodings = np.arange(1 << 16, dtype=np.uint16)
     all_half = encodings.view(np.float16)

@@ -3379,3 +3379,25 @@ The compiler, IR, and emitter experiment were removed and archived as
 Consequently arbitrary int32 arithmetic and `test_bitwise_not` remain typed
 rejects. Exact int32 fill, all-bypass copy, raw-word bitcast, and compile-time
 identities remain valid because none enables the elementwise processing path.
+
+## Range-reduced negative-base power
+
+Tinygrad's decomposed `(-2)**x` graph now canonicalizes to the existing native
+power primitives rather than exposing CAST/FLOORMOD nodes to the physical
+lowerer. A shared `_exp2_range_reduced` recipe splits the exponent into an
+integer scale and LUT residual; a separate parity/validity epilogue restores
+the sign of odd integers and returns NaN for noninteger exponents.
+
+A raw EXP2 shortcut was explicitly rejected: hardware clamps magnitude outside
+approximately `[-2,2]`, producing `6.0078125` instead of `8` at exponent 3 and
+`0.25` for all exponents below -2. The accepted recipe bounds only the
+magnitude coordinate at the final FP16 underflow/overflow points. Its parity
+coordinate is bounded at +/-2048 because every representable FP16 integer
+beyond that point is even. The resulting 140-task correctness-fallback plan
+passes integers from -2048 through 2048, fractional NaNs, signed underflow,
+overflow sign, both infinities, and NaN at `rtol=1e-3, atol=1e-6`.
+
+The unchanged `test_pow_const` now passes its former `(-2)**x` rejection and
+advances to the independent final `0.7**int32` input-conversion blocker. No
+method-level gain is claimed; the authoritative tally remains
+`193/40/179/13`.

@@ -988,6 +988,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
     self.assertFalse(contains_uop(plan))
 
+  def test_negative_base_pow2_uses_range_reduction_and_parity(self):
+    plan = lower_dpu(sink((-2.0)**Tensor.empty(128,dtype=dtypes.half)))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertEqual({stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)},
+                     {rklut.RKLUTId.EXP2_RESIDUAL, rklut.RKLUTId.EXP2_SCALE, rklut.RKLUTId.ROUNDOFF})
+    self.assertLessEqual(len(plan.stages), 160)
+    self.assertEqual(decode_image(encode_image(emit_dpu(plan))), emit_dpu(plan))
+    self.assertFalse(contains_uop(plan))
+
   def test_constant_base_pow8_uses_four_generated_bands(self):
     names = ("POW_BASE8_FAR_LOW", "POW_BASE8_LOW", "POW_BASE8_HIGH", "POW_BASE8_FAR_HIGH")
     for name in names:
