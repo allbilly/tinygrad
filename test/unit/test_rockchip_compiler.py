@@ -281,6 +281,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIn(struct.pack("<e", 0.25), emit_program(scaled).constants)
     self.assertFalse(contains_uop(scaled))
 
+  def test_static_zero_padding_is_removed_before_affine_sum_costing(self):
+    source = Tensor.empty(256,256,dtype=dtypes.half).realize()
+    result = lower_affine_reduce_result(sink(source.pad(((0,0),(0,64))).sum(axis=1)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    cost = plan_cost(result.plan)
+    self.assertLessEqual(cost.task_count,160)
+    self.assertLessEqual(cost.constant_bytes,80*1024)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_two_level_affine_sum_rejects_unrepresentable_scale(self):
     source = Tensor.empty(32,2,11,28,dtype=dtypes.half).realize()
     result = lower_affine_reduce_result(sink(source.avg_pool2d(kernel_size=(3,3), padding=1)))

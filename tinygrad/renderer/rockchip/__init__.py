@@ -30,6 +30,8 @@ from tinygrad.renderer.rockchip.contract import legalize_contraction_plan as leg
 
 RK_MAX_CONSTANT_BYTES = 2*1024*1024
 RK_MAX_AFFINE_VISITS = 65536
+# Static identity masks may describe more logical coordinates than physical source terms. Keep their compiler-work fence separate.
+RK_MAX_STATIC_MASK_VISITS = 2*RK_MAX_AFFINE_VISITS
 RK_MAX_PROGRAM_STAGES = 400
 RK_MAX_AFFINE_WINDOW = 192
 RK_MAX_CMAC_SELECTOR_WINDOW = 1504
@@ -1694,7 +1696,11 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
      src_axes - set(out_axes) - set(red_axes) or any(axis not in ranges for axis in (*out_axes,*red_axes)):
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "affine CMAC axes do not form one static output/reduction partition", Ops.RANGE)
   reduction_count = math.prod(ranges[axis] for axis in red_axes)
-  if not 1 <= output_count <= 8192 or not 2 <= input_count <= 65536 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
+  # A statically masked reduction may describe identity padding that never reaches CMAC. Inspect a bounded amount of that
+  # logical padding, then apply the unchanged affine-visit budget to the selected source terms below.
+  logical_visits = output_count*reduction_count
+  visit_limit = RK_MAX_STATIC_MASK_VISITS if condition is not None else RK_MAX_AFFINE_VISITS
+  if not 1 <= output_count <= 8192 or not 2 <= input_count <= 65536 or logical_visits > visit_limit:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine CMAC surface is {output_count}x{input_count}", reduce.op)
   selectors:list[list[int]] = [[] for _ in range(output_count)]
   seen:set[int] = set()
@@ -1717,6 +1723,10 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       selectors[out_index].append(src_index)
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
+  selected_visits = sum(map(len, selectors))
+  if selected_visits > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"affine CMAC selects {selected_visits} source terms from {logical_visits} logical visits", reduce.op)
   if output_count > 16 and output_count == input_count and all(row == list(range(index+1)) for index,row in enumerate(selectors)):
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
       f"affine ADD prefix scan output {output_count} exceeds the stable one-tile contract", reduce.op)

@@ -3474,3 +3474,23 @@ the numerical guard that blocked its inaccurate wider-packing experiment.
 These are two focused complete-method gains. The post-census expectation is
 `195 native / 40 frontend / 177 failed / 13 skipped`; the complete uncached
 `193/40/179/13` census remains authoritative until rerun.
+
+## Static identity padding in affine sums
+
+The affine ADD legalizer now distinguishes bounded compiler inspection from
+physical selected-source work. A static mask may describe at most 131,072
+logical coordinates, but after its identity lanes are removed the unchanged
+65,536 selected-term ceiling is enforced. The 400-task and 2 MiB program
+ceilings are also unchanged. Dynamic predicates remain rejected.
+
+This makes the 64 zero lanes in each row of `test_sum_pad_collapse` disappear
+before plan costing. The resulting 256-row reduction uses 133 tasks, 6,104
+command words, 133 resets, 67,584 constant bytes, 2,080 scratch bytes, and
+589,312 estimated MACs. The unchanged official method passes strict native-only
+RK3588 execution in 16.43 seconds at its original tolerance. All 153
+compiler/image tests pass with 42 subtests; full mypy covers 228 source files
+and full Ruff is clean.
+
+This is one focused complete-method gain. The current focused expectation is
+`196 native / 40 frontend / 176 failed / 13 skipped`; the complete uncached
+`195/40/177/13` census at `936f776c3` remains authoritative until rerun.
