@@ -3185,3 +3185,35 @@ convolution (dynamic input layout, 528 outputs, or an already-native 335-task
 case), so the cap remains 128. The 1x1 M=4 convolution already has one `NONE`
 CBUF tile; its stage limit comes from NCHW/CNA packing rather than feature or
 weight bank splitting. No task, constant, or tolerance ceiling changed.
+
+## Rejected staged softmin and fused-LUT experiments
+
+The `test_softmin` first reject was traced to row-wise `MAX(-x)`. A generic
+pointwise-DPU preprocess followed by a dense DPU MAX tree and grouped PPU
+writeback computes all 45 row maxima bit-exactly. The resulting first kernel
+has 241 tasks, 281,088 constant bytes, and 29,392 scratch bytes. It exposes the
+next issue rather than completing the method: generic EXP clamps centered
+inputs below -2 to `exp(-2)`, causing 1,418 mismatches in the 2,925-lane EXP
+surface.
+
+Generated negative EXP bands over `[-4,-2]`, `[-2,-1]`, and `[-1,0]` reduce
+the exact RK3588 EXP disagreements against Torch from 1,418 to four; every
+band passes exhaustive FP16 simulation at the official tolerance. The complete
+softmin nevertheless leaves 271/2,925 mismatches, with maximum relative error
+0.002249. This is a fusion/precision boundary, not remaining LUT error: with
+`DEFAULT_FLOAT=HALF`, the tinygrad CPU backend itself misses 10 official lanes
+because Torch's HALF softmin uses a higher-precision fused implementation.
+
+A typed BS-subtract-to-EW-LUT task was then tested as a possible hardware
+fusion. It submits without timeout, but the LUT does not consume the BS result
+in the assumed pipeline order; one eight-lane boundary vector has large errors.
+The register experiment and all softmin compiler changes were removed, so the
+authoritative branch retains a typed rejection rather than accepting a wrong
+native result. The complete staged experiment is archived as
+`wip-softmin-staged-negative-exp-still-needs-fused-normalization-a6689bd42.patch`
+(SHA-256 `881fa04bdb602e09d02688620b648dcb035c14ee92fe31d4d4ba8f082d82f4cf`),
+and the rejected fused register path as
+`wip-fused-bs-sub-ew-lut-wrong-pipeline-a6689bd42.patch` (SHA-256
+`dc14748b290323286cc661de6eae1c24eb839d566da808249eb56d096d6e89bc`).
+The authoritative tally remains 187 native / 40 frontend / 185 failed / 13
+upstream skips.

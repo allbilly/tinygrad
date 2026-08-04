@@ -1434,3 +1434,14 @@ the pointwise affine-reduction output cap from 128 to 512 did not legalize
 one has 528 outputs, and the stride-one case was already native at 335 tasks.
 `test_simple_conv2d_1x1_m4` already uses a single unsplit CBUF tile; its blocker
 is planar NCHW-to-CNA packing and output conversion, not CBUF bank pressure.
+
+The next `test_softmin` probe proved a generic 241-task transformed row-MAX
+plan bit-exact, then exposed the existing EXP clamp below -2. Three generated
+negative EXP bands make 2,921/2,925 centered exponentials bit-exact on RK3588,
+but the unchanged method still misses 271 outputs because intermediate FP16
+normalization cannot reproduce Torch's fused higher-precision HALF softmin.
+For comparison, the tinygrad CPU backend also misses 10 lanes under the same
+HALF invocation. A BS-subtract-to-EW-LUT fusion register experiment submitted
+but produced incorrect values, so it was rejected and archived. The active
+compiler remains at the clean `187/40/185/13` census contract with no accepted
+numerical failure.

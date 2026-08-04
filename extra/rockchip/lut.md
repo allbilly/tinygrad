@@ -589,3 +589,21 @@ hardware attempt was not counted because elementwise scalar materialization
 created a 7,872,512-byte constant GEM that the current runtime could not map.
 That is a separate constant-surface scalability limit, not CPU fallback or a
 numerical pass.
+
+## Rejected negative-EXP softmin bands
+
+Three generated negative EXP bands were characterized while diagnosing
+softmin. Q17 `[-4,-2]` and Q16 `[-2,-1]` tables can be calibrated to reproduce
+every rounded FP16 exponential exactly; a Q14 `[-1,0]` table keeps all 15,362
+FP16 encodings inside `rtol=1e-3, atol=1e-7`. On the exact seeded softmin
+surface, RK3588 then matches Torch EXP exactly in 2,921 of 2,925 lanes and the
+other four remain within tolerance.
+
+The tables are not active assets because softmin still fails after the
+denominator and final normalization are written through FP16 intermediates.
+This is important when tuning multi-level LUTs: improving the transcendental
+stage cannot recover precision already lost at a later materialization
+boundary. A BS-subtract-to-EW-LUT fusion probe was also rejected because the
+EW LUT did not observe the assumed flying BS result. Both implementations are
+preserved in the patch archive named in `coverage.md`; neither changes the LUT
+schema or the accepted numerical contract.
