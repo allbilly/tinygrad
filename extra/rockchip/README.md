@@ -1885,3 +1885,12 @@ scratch, traffic, and MAC accounting are unchanged. This is a mechanical
 module-boundary milestone with no compiler legality, plan selection, register,
 runtime, or coverage change. All 160 compiler/image tests plus 59 subtests
 pass with `-n12`, mypy checks 229 source files, and Ruff is clean.
+
+## Census commit snapshot
+
+Telemetry now snapshots the repository commit when pytest configures the
+census rather than resolving `HEAD` during session teardown. Long RK3588 runs
+can therefore be followed by independent milestone commits without causing
+the finished JSON to identify code that the running Python process never
+loaded. The focused telemetry suite passes six tests; execution and coverage
+classification are unchanged.

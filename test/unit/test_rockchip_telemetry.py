@@ -1,5 +1,6 @@
 import os
 from unittest.mock import patch
+import conftest
 from conftest import _failure_events, _failure_kind, _first_reject
 from tinygrad.runtime.support.rockchip_telemetry import clear, drain, record
 
@@ -22,6 +23,15 @@ def test_coverage_first_reject_uses_event_order():
   rejects = [{"sequence": 9, "reject_kind": "unsupported_layout"}, {"sequence": 4, "reject_kind": "plan_stage_limit"}]
   assert _first_reject(rejects) == rejects[1]
   assert _first_reject([]) is None
+
+def test_coverage_snapshots_commit_when_session_starts():
+  previous = conftest._rockchip_commit
+  try:
+    with patch.dict(os.environ, {"ROCKCHIP_TELEMETRY":"memory"}, clear=True), \
+         patch.object(conftest, "_current_commit", return_value="start-head"):
+      conftest.pytest_configure(None)
+    assert conftest._rockchip_commit == "start-head"
+  finally: conftest._rockchip_commit = previous
 
 def test_coverage_failure_kind_distinguishes_non_rejects():
   reject = [{"sequence": 1, "reject_kind": "unsupported_layout"}]

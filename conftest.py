@@ -3,6 +3,7 @@ from collections import Counter
 from pathlib import Path
 
 _rockchip_methods:dict[str, dict] = {}
+_rockchip_commit:str|None = None
 
 def _telemetry_path() -> Path|None:
   return Path(value).expanduser() if (value:=os.getenv("ROCKCHIP_TELEMETRY")) else None
@@ -49,6 +50,10 @@ def _read_identity(path:str) -> str|None:
   try: return Path(path).read_bytes().replace(b"\0", b",").decode(errors="replace").strip("\n,") or None
   except OSError: return None
 
+def _current_commit() -> str|None:
+  try: return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True).strip()
+  except (OSError, subprocess.CalledProcessError): return None
+
 def _write_rockchip_coverage(exitstatus:int) -> None:
   if (path:=_telemetry_path()) is None: return
   methods = list(_rockchip_methods.values())
@@ -62,9 +67,7 @@ def _write_rockchip_coverage(exitstatus:int) -> None:
     method["outcome"] = _coverage_outcome(sub_failed or phase_failed, phase_skipped, kernels)
     method["first_reject"] = _first_reject(failure_rejects)
     method["failure_kind"] = _failure_kind(sub_failed or phase_failed, failure_rejects, failure_kernels)
-  try: commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True).strip()
-  except (OSError, subprocess.CalledProcessError): commit = None
-  report = {"schema_version": 2, "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "commit": commit,
+  report = {"schema_version": 2, "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "commit": _rockchip_commit,
     "exit_status": exitstatus, "environment": {"DEV": os.getenv("DEV"), "DEFAULT_FLOAT": os.getenv("DEFAULT_FLOAT"),
       "FORWARD_ONLY": os.getenv("FORWARD_ONLY"), "ROCKCHIP_FALLBACK": os.getenv("ROCKCHIP_FALLBACK", "0")},
     "hardware": {"hostname": platform.node(), "machine": platform.machine(), "kernel": platform.release(),
@@ -77,8 +80,10 @@ def _write_rockchip_coverage(exitstatus:int) -> None:
   os.replace(partial, path)
 
 def pytest_configure(config):
+  global _rockchip_commit
   if _telemetry_path() is not None:
     from tinygrad.runtime.support.rockchip_telemetry import clear
+    _rockchip_commit = _current_commit()
     clear()
     _rockchip_methods.clear()
 

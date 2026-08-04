@@ -3917,3 +3917,11 @@ reset, constants, scratch, traffic, and MAC calculations used by every plan
 ceiling and candidate comparison. Compiler/image tests remain 160 passing plus
 59 passing subtests, mypy passes 229 source files, and Ruff is clean. This is
 an architecture-only milestone; it claims no native-method transition.
+
+## Census commit identity
+
+The telemetry plugin now captures `HEAD` at pytest configuration time and
+writes that immutable value at session finish. Previously a commit made during
+a long serialized census could make the final report name a newer tree than
+the code loaded by the test process. Six focused telemetry tests pass. This
+changes report provenance only, not compilation, execution, or method counts.
