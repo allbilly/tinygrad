@@ -2715,3 +2715,33 @@ uncached `2e40def50` census verifies both focused transitions and also finds
 that the same generic capability makes
 `test_binary_crossentropy_logits_pos_weights` pass. The authoritative tally is
 therefore 172 native / 40 frontend / 200 fail / 13 skip with no regression.
+
+## Constant-filled static reformat milestone
+
+`test_pad` previously passed its zero-filled cases and first rejected the
+static value-five case because the simplified graph is an indexed-versus-
+constant WHERE over a non-contiguous output. Reformat legality now retains the
+constant branch as data rather than treating it as a new operation family.
+
+For finite fills, the compiler creates an aligned scratch copy of the source,
+appends one constant lane at an atom boundary, and selects source or fill using
+the existing CMAC reformat planner. The representative value-five plan uses 24
+tasks and 81,888 constant bytes. Infinity is kept out of CMAC so inactive
+`0*inf` terms cannot generate NaN. A finite 0/1 padding selector feeds DPU
+`+/-mask/(1-mask)`, producing signed infinity only in padded lanes; the two
+non-finite plans use 33--34 tasks and 73,088 constant bytes.
+NaN and an explicitly preserved negative-zero fill reject with
+`NUMERICAL_CONTRACT` rather than entering an uncharacterized path.
+
+The unchanged official method passes all subcases in 11.10 seconds and its
+schema-v2 telemetry is `PASS_NATIVE` with only RK DPU/mixed-engine lanes. The
+JSON SHA-256 is
+`7824de6cd15ccd709133643a908e4192eac3ac0c5dc4555d297d6a43dcb18b5a` and
+the JUnit SHA-256 is
+`57be2bd3097bbb64ee1a578ad88b3ea3416389d65cfd600b30c8d76b7e047699`.
+Permanent validation passes 133 host tests plus 15 subtests, mypy, Ruff, and 95
+serialized device tests plus 63 subtests in 803.47 seconds. No resource limit,
+tolerance, CPU semantic lane, timeout, reset error, invalid submission, or
+process abort is involved. This predicts 173 native / 40 frontend / 199 fail /
+13 skip; the complete `2e40def50` 172/40/200/13 census remains authoritative
+until the next full run.

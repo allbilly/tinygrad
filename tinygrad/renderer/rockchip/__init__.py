@@ -453,14 +453,18 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   store = stores[0]
   if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM:
     return _not_applicable()
-  value, condition, select_true = _strip_casts(store.src[1]), None, True
+  value, condition, select_true, fill = _strip_casts(store.src[1]), None, True, 0.0
   if value.op is Ops.WHERE:
     cond, positive, negative = value.src
     positive, negative = _strip_casts(positive), _strip_casts(negative)
-    if positive.op is Ops.INDEX and negative.op is Ops.CONST and float(negative.arg) == 0:
-      value, condition = positive, cond
-    elif negative.op is Ops.INDEX and positive.op is Ops.CONST and float(positive.arg) == 0:
-      value, condition, select_true = negative, cond, False
+    # Padding with a nonzero value is simplified as WHERE(p, WHERE(p, load, 0), fill). Inside the outer true/false arms,
+    # an identical nested predicate has a statically known branch and can be removed without changing tensor semantics.
+    if positive.op is Ops.WHERE and positive.src[0].key == cond.key: positive = _strip_casts(positive.src[1])
+    if negative.op is Ops.WHERE and negative.src[0].key == cond.key: negative = _strip_casts(negative.src[2])
+    if positive.op is Ops.INDEX and negative.op is Ops.CONST:
+      value, condition, fill = positive, cond, float(negative.arg)
+    elif negative.op is Ops.INDEX and positive.op is Ops.CONST:
+      value, condition, select_true, fill = negative, cond, False, float(positive.arg)
     else: return _not_applicable()
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2: return _not_applicable()
   if store.src[0].dtype is not dtypes.half or value.dtype is not dtypes.half:
@@ -531,6 +535,50 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   if atom_reject is None:
     return _native(RKReformat(out_ref, src_ref, tuple(mapping), RKReformatKind.COALESCED_DPU, (RKDPUProgram(tuple(stages)),)))
   rows = [[src] if src >= 0 else [] for src in mapping]
+  # A finite fill can be appended to an aligned source scratch and selected like any other lane. Non-finite fills cannot enter CMAC:
+  # zero selector weights multiplied by infinity would contaminate ordinary source rows with NaN. Select a finite padding mask instead,
+  # then construct signed infinity as +/-mask/(1-mask) in DPU arithmetic.
+  positive_zero = fill == 0.0 and math.copysign(1.0,fill) > 0
+  if any(src < 0 for src in mapping) and not positive_zero:
+    if math.isnan(fill) or fill == 0.0:
+      return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
+        f"reformat fill {fill!r} has an unproven NaN or signed-zero contract",Ops.CONST)
+    if not _fp16_exact(fill):
+      return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"reformat fill {fill!r} is not exactly FP16", Ops.CONST)
+    if math.isfinite(fill):
+      fill_index, augmented = (src_count+7)&-8, RKArg(RKBufferKind.SCRATCH, 0)
+      augmented_count, aligned_count = fill_index+1, max(32, (fill_index+32)&-32)
+      finite_scratch = (RKScratch(aligned_count*2),)
+      seed = RKDPUProgram((RKALUStage(Ops.ADD, augmented, 0.0, 0.0, aligned_count),
+        RKALUStage(Ops.ADD, augmented, source, 0.0, src_count),
+        RKALUStage(Ops.ADD, RKArg(augmented.kind,augmented.index,fill_index*2), 0.0, fill, 1)), finite_scratch)
+      filled_rows = [[src if src >= 0 else fill_index] for src in mapping]
+      implementation = _selector_program(output,augmented,augmented_count,filled_rows,finite_scratch,direct_capacity=aligned_count)
+      if implementation is not None:
+        completed = _finish_program([seed,*implementation.steps],implementation.scratch)
+        cost = plan_cost(completed)
+        if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES:
+          return _native(RKReformat(out_ref,src_ref,tuple(mapping),RKReformatKind.SELECTOR_CMAC,
+            cast(tuple[RKDPUProgram|RKContract, ...],completed.steps),completed.scratch))
+    else:
+      selected_surface, padding_mask, one = (RKArg(RKBufferKind.SCRATCH,index) for index in range(3))
+      mask_scratch = (RKScratch(_cmac_tiled_output_bytes(count)),RKScratch(_cmac_tiled_output_bytes(count)),RKScratch(64))
+      seed = RKDPUProgram((RKALUStage(Ops.ADD,one,0.0,0.0,32),RKALUStage(Ops.ADD,one,0.0,1.0,1)),mask_scratch)
+      selected_plan = _selector_program(selected_surface,source,src_count,rows,mask_scratch)
+      if selected_plan is not None:
+        mask_rows = [[0] if src < 0 else [] for src in mapping]
+        mask_plan = _selector_program(padding_mask,one,1,mask_rows,selected_plan.scratch,direct_capacity=32)
+        if mask_plan is not None:
+          numerator = _ALUExpr(Ops.MUL,(padding_mask,math.copysign(1.0,fill)))
+          denominator = _ALUExpr(Ops.ADD,(_ALUExpr(Ops.MUL,(padding_mask,-1.0)),1.0))
+          root = _ALUExpr(Ops.ADD,(selected_surface,_ALUExpr(Ops.FDIV,(numerator,denominator))))
+          if (final:=_schedule_expr(root,output,count,mask_plan.scratch)) is not None:
+            completed = _finish_program([seed,*selected_plan.steps,*mask_plan.steps,final],final.scratch)
+            cost = plan_cost(completed)
+            if cost.stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES:
+              return _native(RKReformat(out_ref,src_ref,tuple(mapping),RKReformatKind.SELECTOR_CMAC,
+                cast(tuple[RKDPUProgram|RKContract, ...],completed.steps),completed.scratch))
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"constant-filled reformat exceeds the native cost contract",Ops.WHERE)
   implementation = (_periodic_selector_program(output,source,src_count,rows) or
                     _selector_program(output,source,src_count,rows,())) if 0 < src_count and 0 < count else None
   if implementation is not None:

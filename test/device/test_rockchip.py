@@ -514,6 +514,14 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(square,device="ROCKCHIP").realize().T.contiguous().realize().numpy()
     np.testing.assert_equal(actual,square.T)
 
+  def test_static_padding_constants_native_reformat(self):
+    data = np.linspace(-2,2,3*3*3*3,dtype=np.float16).reshape(3,3,3,3)
+    for fill in (5.0,np.inf,-np.inf):
+      with self.subTest(fill=fill):
+        actual = Tensor(data,device="ROCKCHIP").realize().pad((1,2,3,4),value=float(fill)).contiguous().realize().numpy()
+        expected = np.pad(data,((0,0),(0,0),(3,4),(1,2)),constant_values=fill)
+        np.testing.assert_equal(actual,expected)
+
   def test_static_split_and_modulo_movements_native_cmac(self):
     data = np.arange(9,dtype=np.float16).reshape(3,3)
     tensor = Tensor(data,device="ROCKCHIP").realize()

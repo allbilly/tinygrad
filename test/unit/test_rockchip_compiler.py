@@ -1256,6 +1256,23 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(plan_cost(result.plan).task_count, 320)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_static_padding_selects_finite_and_infinite_constants(self):
+    source = Tensor.empty(3,3,3,3,dtype=dtypes.half).realize()
+    for fill in (5.0,math.inf,-math.inf):
+      with self.subTest(fill=fill):
+        result = lower_reformat_result(sink(source.pad((1,2,3,4),value=fill).contiguous()))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKReformat)
+        assert isinstance(result.plan,RKReformat)
+        cost = plan_cost(RKProgram(result.plan.steps,result.plan.scratch))
+        self.assertLessEqual(cost.task_count,160)
+        self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+        self.assertFalse(contains_uop(result.plan))
+    result = lower_reformat_result(sink(source.pad((1,2,3,4),value=math.nan).contiguous()))
+    self.assertIs(result.kind,RKLowerKind.UNSUPPORTED)
+    assert result.reject is not None
+    self.assertIs(result.reject.kind,RKRejectKind.NUMERICAL_CONTRACT)
+
   def test_rgb_strided_convolution_uses_direct_cna_tasks(self):
     source = Tensor.empty(4,3,11,28,dtype=dtypes.half).realize()
     weight = Tensor.empty(4,3,3,3,dtype=dtypes.half).realize()
