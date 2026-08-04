@@ -23,7 +23,7 @@ class RKLayoutKind(Enum):
   DPU_FEATURE = "dpu_feature"
   CMAC_ACTIVATION = "cmac_activation"
   CMAC_WEIGHT = "cmac_weight"
-  PPU_HWC8 = "ppu_hwc8"
+  PPU_HWC = "ppu_hwc"
   CNA_ACTIVATION = "cna_activation"
   CNA_WEIGHT = "cna_weight"
   CONV_OUTPUT = "conv_output"
@@ -156,8 +156,8 @@ class RKLayout:
       return self.kind in (RKLayoutKind.LINEAR,RKLayoutKind.CMAC_ACTIVATION,RKLayoutKind.CMAC_WEIGHT) and \
         self.dtype in (dtypes.half,dtypes.float) and self.strides_bytes[-1] == self.dtype.itemsize
     if engine is RKEngine.PPU:
-      return self.kind is RKLayoutKind.PPU_HWC8 and self.dtype is dtypes.half and len(self.physical_shape) == 3 and \
-        self.physical_shape[-1] == 8 and self.strides_bytes[-1] == 2
+      return self.kind is RKLayoutKind.PPU_HWC and self.dtype is dtypes.half and len(self.physical_shape) == 3 and \
+        2 <= self.physical_shape[-1] <= 8 and self.strides_bytes[-1] == 2
     assert engine is RKEngine.CONV
     return self.kind in (RKLayoutKind.CNA_ACTIVATION,RKLayoutKind.CNA_WEIGHT,RKLayoutKind.CONV_OUTPUT) and \
       self.dtype is dtypes.half and self.strides_bytes[-1] == 2

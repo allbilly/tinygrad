@@ -400,6 +400,13 @@ class TestRockchip(unittest.TestCase):
         actual = Tensor(data, device="ROCKCHIP").realize().max(axis=(0,1)).realize().numpy()
         np.testing.assert_equal(actual, data.max(axis=(0,1)))
 
+  def test_global_max_partial_hwc_channels_native_ppu(self):
+    for channels in range(2,8):
+      with self.subTest(channels=channels):
+        data = np.linspace(-8,8,5*13*channels,dtype=np.float16).reshape(5,13,channels)
+        actual = Tensor(data,device="ROCKCHIP").realize().max(axis=(0,1)).realize().numpy()
+        np.testing.assert_equal(actual,data.max(axis=(0,1)))
+
   def test_scalar_multiaxis_max_native_cmac_ppu(self):
     data = np.array([[[[-2,3,1], [4,-1,2]]]],dtype=np.float16)
     actual = Tensor(data,device="ROCKCHIP").realize().max_pool2d((2,2)).realize().numpy()

@@ -23,6 +23,13 @@ bytes without changing the 400-task, 2 MiB, or 65,536 selected-term ceilings.
 The focused expectation is therefore 196 native, 40 frontend-only, 176 failed,
 and 13 skipped; 195/40/177/13 remains authoritative until the next full run.
 
+The PPU layout contract now names the actual `PPU_HWC` format and accepts every
+hardware-characterized FP16 channel count from two through eight. This follows
+the variable `align_c` register contract in the local `allbilly/rk3588`
+`rknnops.h` oracle and is independently verified on RK3588. It does not change
+the focused TestOps tally because the relevant softmax methods deliberately run
+their tinygrad reference-gap side in FP32.
+
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor
 indexing is still rejected.

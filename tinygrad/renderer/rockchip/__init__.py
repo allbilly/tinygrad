@@ -2557,7 +2557,7 @@ def _pool_hw_shape(extent:int) -> tuple[int, int]|None:
               (height,extent//height) not in _PPU_BAD_SPLITS), key=lambda shape:abs(shape[0]-shape[1]), default=None)
 
 def lower_reduce_result(sink:UOp) -> RKLowerResult:
-  """Recognize global FP16 MAX over the spatial dimensions of a dense HWC8 surface."""
+  """Recognize global FP16 MAX over the spatial dimensions of a dense HWC surface."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
@@ -2571,21 +2571,22 @@ def lower_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU reduction input is not a direct FP16 surface", reduce.op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
   if out_aff is None or src_aff is None or out_aff[1] or src_aff[1] or len(out_aff[0]) != 1:
-    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "PPU reduction needs zero-based affine HWC8 surfaces", Ops.INDEX)
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "PPU reduction needs zero-based affine HWC surfaces", Ops.INDEX)
   out_axis, red_axis = next(iter(out_aff[0])), red.arg[0]
   channels, extent = int(store.src[0].src[0].src[0].arg), int(red.src[0].arg)
   hw_shape = _pool_hw_shape(extent)
-  if channels != 8 or out_aff[0] != {out_axis:1} or src_aff[0] != {red_axis:8, out_axis:1}:
-    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "PPU global MAX requires dense HWC8 indexing", Ops.INDEX)
+  if not 2 <= channels <= 8 or out_aff[0] != {out_axis:1} or src_aff[0] != {red_axis:channels, out_axis:1}:
+    return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "PPU global MAX requires dense HWC indexing", Ops.INDEX)
   if hw_shape is None:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, f"PPU global MAX spatial extent {extent} needs tiling or reformat", reduce.op)
   if int(value.src[0].src[0].arg) != extent*channels:
-    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU input buffer extent does not match HWC8 surface", Ops.INDEX)
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "PPU input buffer extent does not match HWC surface", Ops.INDEX)
   height, width = hw_shape
   out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot),
-                    RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC8))
+                    RKLayout((1,1,channels), (1,1,channels), (channels*2,channels*2,2), dtypes.half,kind=RKLayoutKind.PPU_HWC))
   src = RKTensorRef(RKArg(RKBufferKind.ARG, value.src[0].arg.slot),
-                    RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC8))
+                    RKLayout((height,width,channels), (height,width,channels), (width*channels*2,channels*2,2), dtypes.half,
+                             kind=RKLayoutKind.PPU_HWC))
   return _native(RKReduce(out, src, Ops.MAX, red_axis))
 
 def lower_global_max_result(sink:UOp) -> RKLowerResult:
@@ -2652,8 +2653,8 @@ def lower_global_max_result(sink:UOp) -> RKLowerResult:
   scratch.append(RKScratch(16))
   scratch_tuple = tuple(scratch)
   reduce_plan = RKReduce(RKTensorRef(pooled, RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,
-    kind=RKLayoutKind.PPU_HWC8)), RKTensorRef(hwc, RKLayout((2,4,8), (2,4,8), (64,16,2), dtypes.half,
-    kind=RKLayoutKind.PPU_HWC8)), Ops.MAX, red.arg[0])
+    kind=RKLayoutKind.PPU_HWC)), RKTensorRef(hwc, RKLayout((2,4,8), (2,4,8), (64,16,2), dtypes.half,
+    kind=RKLayoutKind.PPU_HWC)), Ops.MAX, red.arg[0])
   final = RKDPUProgram((RKALUStage(Ops.ADD if output_scale == 1.0 else Ops.MUL, output, pooled,
                                    0.0 if output_scale == 1.0 else output_scale, 1),), scratch_tuple)
   return _native(RKProgram((RKDPUProgram(tuple(stages), scratch_tuple), *contracts, reduce_plan, final), scratch_tuple))
@@ -2694,9 +2695,9 @@ def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[i
         _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH),
         _cmac_weight_ref(0, count, align_in, RKBufferKind.CONSTANT, 32), reduce_axis, payload))
     out = RKTensorRef(RKArg(atoms.kind, atoms.index, output_index*16), RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,
-      kind=RKLayoutKind.PPU_HWC8))
+      kind=RKLayoutKind.PPU_HWC))
     src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half,
-      kind=RKLayoutKind.PPU_HWC8))
+      kind=RKLayoutKind.PPU_HWC))
     steps.append(RKReduce(out, src, Ops.MAX, reduce_axis))
   gather = _sparse_cmac_pipeline(output, atoms, len(selectors)*8, [[index*8] for index in range(len(selectors))], scratch=scratch)
   steps.extend(gather.steps)
@@ -2764,8 +2765,8 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
   scratch, steps = input_plan.scratch, list(input_plan.steps)
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(groups*output_tile_count*2),)
-  input_layout = RKLayout((in_h,in_w,8),(in_h,in_w,8),(in_w*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8)
-  output_layout = RKLayout((out_h,out_w,8),(out_h,out_w,8),(out_w*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8)
+  input_layout = RKLayout((in_h,in_w,8),(in_h,in_w,8),(in_w*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC)
+  output_layout = RKLayout((out_h,out_w,8),(out_h,out_w,8),(out_w*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC)
   for group in range(groups):
     steps.append(RKPool(RKTensorRef(RKArg(packed_output.kind,packed_output.index,group*output_tile_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,group*input_tile_count*2),input_layout),Ops.MAX,red_axes[0],
@@ -2903,9 +2904,9 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
         steps.append(RKCMACTask(RKTensorRef(RKArg(hwc.kind, hwc.index, start*2), out_layout),
           lhs, _cmac_weight_ref(0, min(16, surface_count-start), contract_align, RKBufferKind.CONSTANT, 32), reduce.arg[0], payload))
       out = RKTensorRef(RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot, group_start*2),
-                        RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC8))
+                        RKLayout((1,1,8), (1,1,8), (16,16,2), dtypes.half,kind=RKLayoutKind.PPU_HWC))
       src = RKTensorRef(hwc, RKLayout((height,width,8), (height,width,8), (width*16,16,2), dtypes.half,
-        kind=RKLayoutKind.PPU_HWC8))
+        kind=RKLayoutKind.PPU_HWC))
       steps.append(RKReduce(out, src, Ops.MAX, red_axes[0]))
   stage_count = sum(len(step.stages) if isinstance(step, RKDPUProgram) else 1 for step in steps)
   if stage_count > RK_MAX_PROGRAM_STAGES or sum(map(len, payloads)) > RK_MAX_CONSTANT_BYTES:

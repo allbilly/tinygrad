@@ -3494,3 +3494,28 @@ and full Ruff is clean.
 This is one focused complete-method gain. The current focused expectation is
 `196 native / 40 frontend / 176 failed / 13 skipped`; the complete uncached
 `195/40/177/13` census at `936f776c3` remains authoritative until rerun.
+
+## Variable-channel PPU surfaces
+
+The local `allbilly/rk3588` `rknnops.h` reference exposes the PPU channel field
+through a variable `align_c` rather than an HWC8-only contract. Direct RK3588
+probes now prove dense FP16 HWC global MAX for every channel count from two
+through eight at a 5x13 spatial extent. The typed layout is consequently named
+`PPU_HWC`; its engine legality and emitter both enforce the characterized
+2..8-channel range.
+
+A follow-up attempt to transpose 45 planar 65-value rows into partial-channel
+PPU surfaces was rejected. Direct partial-channel PPU remained exact, but
+CMAC staging with 32- or 64-logical-output noncompact tasks did not produce the
+assumed linear HWC surface and corrupted both the new row reduction and existing
+pooling regressions. Restoring the proven 16-logical-output CMAC staging shape
+would exceed the unchanged 2 MiB selector-weight ceiling, so no planar-row path
+is enabled. The exact failed experiment is archived as
+`wip-planar-row-max-partial-ppu-cmac-layout-failure.patch` with SHA-256
+`a3118f2b452435a165bc27e39ba658929ae014fd0d81fce95d9a436606acf421`.
+
+The retained partial-channel test and the established HWC8, scalar, padded,
+and windowed MAX regressions pass together (four tests plus six subtests) in
+17.62 seconds. No TestOps method gain is claimed: the softmax/log-softmax
+plugin cases that motivated the investigation compile in FP32 and continue to
+reject honestly at the dtype boundary.

@@ -469,12 +469,13 @@ def emit_reformat(plan:RKLegalizedReformat, target:RKTarget=RKTarget.RK3588) -> 
   return emit_program(plan.program, target)
 
 def emit_reduce(plan:RKReduce, target:RKTarget=RKTarget.RK3588) -> RKImage:
-  """Emit the proven direct PPU global-MAX program for a dense FP16 HWC8 surface."""
+  """Emit the proven direct PPU global-MAX program for a dense FP16 HWC surface."""
   if target is not RKTarget.RK3588 or plan.op is not Ops.MAX: raise ValueError("unsupported Rockchip PPU reduction")
   plan.src.layout.validate_for(RKEngine.PPU)
   plan.out.layout.validate_for(RKEngine.PPU)
   height, width, channels = plan.src.layout.logical_shape
-  if channels != 8 or not 2 <= height <= 16 or not 2 <= width <= 16: raise ValueError("PPU global MAX requires 2..16 x 2..16 x 8")
+  if not 2 <= channels <= 8 or not 2 <= height <= 16 or not 2 <= width <= 16:
+    raise ValueError("PPU global MAX requires 2..16 x 2..16 x 2..8")
   h, w, c = height-1, width-1, channels-1
   regs = (
     (_TARGET_PPU, rk.REG_PPU_S_POINTER, 0xe), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_S_POINTER, 0xe),

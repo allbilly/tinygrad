@@ -58,7 +58,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(initialized.padding_is_initialized())
     self.assertTrue(dense.is_legal_for(RKEngine.DPU) and dense.is_legal_for(RKEngine.CMAC))
     self.assertTrue(dense.requires_reformat_for(RKEngine.PPU) and dense.requires_reformat_for(RKEngine.CONV))
-    self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8).is_legal_for(RKEngine.PPU))
+    self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC).is_legal_for(RKEngine.PPU))
     self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.CONV_OUTPUT).is_legal_for(RKEngine.CONV))
     with self.assertRaises(ValueError): dense.validate_for(RKEngine.PPU)
 
@@ -170,6 +170,16 @@ class TestDPUCompiler(unittest.TestCase):
                      ([Ops.ADD,Ops.ADD,Ops.MAX], 9, 9))
     self.assertEqual([stage.engine for stage in emit_program(plan).stages], [RKEngine.DPU]*9+[RKEngine.CMAC]*4+[RKEngine.PPU,RKEngine.DPU])
     self.assertFalse(contains_uop(plan))
+
+  def test_global_max_partial_hwc_channels_uses_typed_ppu_reduction(self):
+    for channels in range(2,8):
+      with self.subTest(channels=channels):
+        plan = lower_reduce_result(sink(Tensor.empty(5,13,channels,dtype=dtypes.half).max(axis=(0,1)))).plan
+        self.assertIsInstance(plan,RKReduce)
+        assert isinstance(plan,RKReduce)
+        self.assertEqual(plan.src.layout.logical_shape,(5,13,channels))
+        self.assertEqual(plan.src.layout.strides_bytes,(26*channels,2*channels,2))
+        self.assertFalse(contains_uop(plan))
 
   def test_affine_max_batches_outputs_through_ppu_channels(self):
     plan = lower_affine_max_result(sink(Tensor.empty(3,4,5,6,dtype=dtypes.half).max(axis=1))).plan
