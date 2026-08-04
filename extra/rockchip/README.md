@@ -1470,3 +1470,10 @@ bool `OR` maps to the DPU's int8 MAX engine. Sixty-five-lane fill, copy, and OR
 boundaries are bit-exact. This is distinct from the archived FP16-mask-to-int8
 conversion timeout. `test_maximum` now passes every bool subcase and advances
 to its mixed int32/FP16 case, which remains an unsupported input conversion.
+
+A direct mixed-precision probe did not loosen that boundary. One typed task
+selected int32 MRDMA input, FP16 DPU processing/output, and FP16 scalar MAX;
+the RK3588 submission timed out with errno 110. The code was removed and is
+preserved as `wip-native-int32-fp16-dpu-max-timeout-22c974ac2.patch` (SHA-256
+`cedab6b795ef7dc1e7b893d6082002dde0f73b9dd6e3bf1f239f1b13904c8f8f`). A
+different proven converter engine is required for mixed int/float maximum.

@@ -3270,3 +3270,12 @@ No FP16 mask conversion was re-enabled: that register path remains rejected
 and archived. The unchanged `test_maximum` now passes all bool subcases and
 first rejects at its following mixed int32/FP16 maximum. A full census has not
 yet run, so the authoritative method tally remains `187/40/185/13`.
+
+The first direct mixed-precision follow-up configured int32 MRDMA input, FP16
+process/output precision, and a FP16 scalar MAX in one typed DPU stage. It
+timed out at submission with errno 110, so the compiler and IR experiment were
+removed. The complete probe is archived as
+`wip-native-int32-fp16-dpu-max-timeout-22c974ac2.patch` (SHA-256
+`cedab6b795ef7dc1e7b893d6082002dde0f73b9dd6e3bf1f239f1b13904c8f8f`). This
+rules out a simple precision-field change; it does not rule out a CNA, PPU, or
+dedicated converter path.
