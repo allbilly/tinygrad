@@ -12,25 +12,34 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `de0ac1406` contains exactly 425 method records:
-169 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 203 `FAIL`, and 13 `SKIP_UPSTREAM`.
+The complete uncached run at `2e40def50` contains exactly 425 JUnit method
+records: 172 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 200 `FAIL`, and 13
+`SKIP_UPSTREAM`.
 `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set throughout.
-Raw pytest reports 231 failed methods/subtests, 220 passed, 87 passing subtests,
-and 13 skipped in 2,539.47 seconds. No NPU timeout, invalid submission, reset
+Raw pytest reports 228 failed methods/subtests, 223 passed, 87 passing subtests,
+and 13 skipped in 2,619.22 seconds. No NPU timeout, invalid submission, reset
 failure, or process abort occurred.
 
-Relative to `02ae2f927`, only `TestOps.test_simple_conv2d_nhwc` changes from
-failure to native pass; no native method regresses. The 203 failed methods
-first classify as 65 unsupported-output-dtype, 42
-plan-stage-limit, 27 unsupported-layout, 23
-unsupported-input-dtype, 19 numerical-contract, 18 requires-reformat, and nine
-unsupported-ALU. Schema version 2 classifies all 203 failures as
-`NATIVE_REJECT`; no failure
-lacks a precise first reject. The durable telemetry
-is `~/rk2608_backups/census-nhwc-de0ac1406-20260804/test_ops_coverage.json`
-(SHA-256 `7f8d1ee6f46ddf35136903c12f1d4b768b6f1fbd0a9c89555825f8f38828aa45`);
-the JUnit XML SHA-256 is
-`2c08cc8240e440c933f402819669323ea8c4e3be1368a2c9eb93bd7aa8fb92af`.
+Relative to `de0ac1406`, `test_var_one_in_axis`, `test_std_one_in_axis`, and
+`test_binary_crossentropy_logits_pos_weights` change from failure to native
+pass; no method regresses. The 200 failed methods first classify from their
+JUnit `RKPLAN_REJECT` messages as 65 unsupported-output-dtype, 43
+plan-stage-limit, 27 unsupported-layout, 23 unsupported-input-dtype, 19
+numerical-contract, ten unsupported-ALU, seven unsupported-reduction, and six
+requires-reformat. Every failure is a typed native reject; none is a device or
+post-execution failure. The durable JUnit artifact is
+`~/rk2608_backups/census-pointwise-2e40def50-20260804/junit.xml` (SHA-256
+`85dd53aeaffa9e018ca4c3dbae94ebfcb0ef6648456e338fa19d8d6f40c9513f`).
+
+This run used a test file outside this checkout without explicit `-p conftest`,
+so pytest did not auto-load the root telemetry and hardware-lock plugin and no
+event JSON was written. The JUnit still contains exactly one element per
+inventory method and is sufficient for the tally, transitions, and reject
+Pareto above. Use the checkout-local path in the commands below so the root
+plugin loads automatically. An external test path instead needs exactly one
+explicit `-p conftest`; a focused hardware run verifies that form records
+native kernels and rejects in schema-v2 JSON. Do not explicitly load
+`conftest` with the local path because that registers the same hooks twice.
 
 The grouped-CNA, sliding-MAX PPU, and NHWC/HWIO CNA transitions are all
 authoritative.
@@ -297,7 +306,7 @@ CACHELEVEL=0 DEV=ROCKCHIP DEFAULT_FLOAT=HALF FORWARD_ONLY=1 \
 python -m pytest test/backend/test_ops.py -p conftest_rockchip -q --tb=no
 ```
 
-The version-1 JSON records the commit, environment, RK3588/driver identity,
+The schema-v2 JSON records the commit, environment, RK3588/driver identity,
 method result, exact unittest subcase parameters and result, every executed
 kernel lane, physical compiler signature, engine counts, RKImage version,
 stage count, scratch bytes, constants bytes, duration, and every native reject.
@@ -2701,6 +2710,8 @@ test_std_one_in_axis   PASS_NATIVE 17.20 s
 
 Validation is 132 host tests plus 12 subtests, mypy over 225 modules, Ruff, and
 94 serialized RK3588 tests plus 60 subtests in 792.84 seconds. No timeout,
-invalid submission, reset failure, or process abort occurred. The expected
-census is 171 native / 40 frontend / 201 fail / 13 skip, but the authoritative
-count remains 169/40/203/13 until the complete uncached census is rerun.
+invalid submission, reset failure, or process abort occurred. The complete
+uncached `2e40def50` census verifies both focused transitions and also finds
+that the same generic capability makes
+`test_binary_crossentropy_logits_pos_weights` pass. The authoritative tally is
+therefore 172 native / 40 frontend / 200 fail / 13 skip with no regression.

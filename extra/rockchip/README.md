@@ -6,13 +6,15 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `02ae2f927` is 168 native,
-40 frontend-only, 204 failed, and 13 upstream-skipped methods across the exact
+The current authoritative uncached strict census at `2e40def50` is 172 native,
+40 frontend-only, 200 failed, and 13 upstream-skipped methods across the exact
 425-method inventory. It completed without an NPU timeout, reset failure,
-invalid submission, or process abort. Relative to `61288f302`, only
-`test_grouped_conv2d` and `test_max_pool2d_unit_stride` change from failure to
-native pass and there is no regression. Coverage details and durable artifact
-hashes are recorded in `coverage.md`.
+invalid submission, or process abort. Relative to `de0ac1406`,
+`test_var_one_in_axis`, `test_std_one_in_axis`, and
+`test_binary_crossentropy_logits_pos_weights` change from failure to native
+pass and there is no regression. Coverage details, the corrected explicit
+pytest-plugin invocation, and the durable artifact hash are recorded in
+`coverage.md`.
 
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor
