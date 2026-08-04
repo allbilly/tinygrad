@@ -3279,3 +3279,10 @@ removed. The complete probe is archived as
 `cedab6b795ef7dc1e7b893d6082002dde0f73b9dd6e3bf1f239f1b13904c8f8f`). This
 rules out a simple precision-field change; it does not rule out a CNA, PPU, or
 dedicated converter path.
+
+Bool minimum's exact `NOT(OR(NOT a, NOT b))` canonical form now maps to int8
+DPU multiplication. For values constrained to the public bool representation,
+that is exact `AND`; a 65-lane hardware boundary passes bit-for-bit. The
+unchanged `test_minimum` now passes every integer and bool subcase before its
+first mixed int32/FP16 rejection. This adds a generic native bool capability,
+not a method-level census gain yet.

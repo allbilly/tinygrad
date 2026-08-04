@@ -1477,3 +1477,9 @@ the RK3588 submission timed out with errno 110. The code was removed and is
 preserved as `wip-native-int32-fp16-dpu-max-timeout-22c974ac2.patch` (SHA-256
 `cedab6b795ef7dc1e7b893d6082002dde0f73b9dd6e3bf1f239f1b13904c8f8f`). A
 different proven converter engine is required for mixed int/float maximum.
+
+The symmetric bool minimum decomposition is `NOT(OR(NOT a, NOT b))`. Exact
+structural recognition maps that identity to int8 DPU multiplication, which is
+equivalent to `AND` for public bool lanes. Its 65-lane RK3588 boundary is
+bit-exact, and `test_minimum` likewise advances through every bool subcase
+before reaching the same unproven mixed int32/FP16 conversion boundary.

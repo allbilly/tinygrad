@@ -226,7 +226,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0),
       (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if wide_out else lanes-1), (rk.REG_DPU_WDMA_SIZE_1, width),
       (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0),
-      (rk.REG_DPU_EW_CFG, (1<<22)|0x2c0 if bool_out else _EW_CFG[plan.op]),
+      (rk.REG_DPU_EW_CFG, (1<<22)|0x2c0|((1<<2) if plan.op is Ops.MUL else 0) if bool_out else _EW_CFG[plan.op]),
       (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1), (rk.REG_DPU_OUT_CVT_OFFSET, plan.out_cvt_offset),
       (rk.REG_DPU_OUT_CVT_SCALE, 0 if plan.out_dtype is dtypes.float else (1 if plan.op is Ops.FDIV or
        plan.out_dtype in (dtypes.bool,dtypes.int) else 0x10001)), (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))

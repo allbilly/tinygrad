@@ -47,6 +47,7 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_equal(Tensor.full((65,),True,dtype=dtypes.bool,device="ROCKCHIP").realize().numpy(),np.ones(65,dtype=np.bool_))
     np.testing.assert_equal(tlhs.maximum(False).realize().numpy(),lhs)
     np.testing.assert_equal(tlhs.maximum(trhs).realize().numpy(),np.logical_or(lhs,rhs))
+    np.testing.assert_equal(tlhs.minimum(trhs).realize().numpy(),np.logical_and(lhs,rhs))
 
   def test_dense_fp16_row_sum_native_cmac(self):
     data = np.linspace(-2, 2, 8*32, dtype=np.float16).reshape(8,32)

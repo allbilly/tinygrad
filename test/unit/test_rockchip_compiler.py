@@ -480,7 +480,7 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_bool_fill_copy_and_or_use_int8_dpu(self):
     lhs,rhs = Tensor.empty(65,dtype=dtypes.bool).realize(),Tensor.empty(65,dtype=dtypes.bool).realize()
-    expressions = (Tensor.full((65,),True,dtype=dtypes.bool),lhs.maximum(False),lhs.maximum(rhs))
+    expressions = (Tensor.full((65,),True,dtype=dtypes.bool),lhs.maximum(False),lhs.maximum(rhs),lhs.minimum(rhs))
     for expression in expressions:
       result = lower_native(sink(expression))
       self.assertIs(result.kind,RKLowerKind.NATIVE)
@@ -492,6 +492,9 @@ class TestDPUCompiler(unittest.TestCase):
       self.assertEqual(formats,(0,))
       self.assertEqual(decode_image(encode_image(image)),image)
     self.assertIsInstance(cast(RKDPUProgram,lower_native(sink(lhs.maximum(rhs))).plan).stages[0],RKALUStage)
+    and_stage = cast(RKDPUProgram,lower_native(sink(lhs.minimum(rhs))).plan).stages[0]
+    self.assertIsInstance(and_stage,RKALUStage)
+    self.assertIs(cast(RKALUStage,and_stage).op,Ops.MUL)
 
   def test_wide_float_fill_rejects_values_not_exactly_representable_as_fp16_input(self):
     result = lower_native(sink(Tensor.full((5,), 0.1, dtype=dtypes.float)))

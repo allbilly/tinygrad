@@ -352,10 +352,16 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
   if store.src[0].dtype is dtypes.bool:
     if identity.op is Ops.CONST:
       return _native(RKDPUProgram((RKCopyStage(output,bool(identity.arg),count,dtypes.bool),)))
-    if identity.op is Ops.OR and all(u.op is Ops.INDEX and u.dtype is dtypes.bool and u.src[0].op is Ops.PARAM and
-                                     u.src[1].key == out_index.key for u in identity.src):
-      lhs,rhs = (RKArg(RKBufferKind.ARG,u.src[0].arg.slot) for u in identity.src)
-      return _native(RKDPUProgram((RKALUStage(Ops.MAX,output,lhs,rhs,count,dtypes.bool),)))
+    bool_sources,physical_op = (identity.src,Ops.MAX) if identity.op is Ops.OR else (None,None)
+    if identity.op is Ops.CMPNE and identity.src[1].op is Ops.CONST and identity.src[1].arg is True and \
+       identity.src[0].op is Ops.OR and all(u.op is Ops.CMPNE and u.src[1].op is Ops.CONST and u.src[1].arg is True
+                                          for u in identity.src[0].src):
+      bool_sources,physical_op = (tuple(u.src[0] for u in identity.src[0].src),Ops.MUL)
+    if bool_sources is not None and all(u.op is Ops.INDEX and u.dtype is dtypes.bool and u.src[0].op is Ops.PARAM and
+                                        u.src[1].key == out_index.key for u in bool_sources):
+      lhs,rhs = (RKArg(RKBufferKind.ARG,u.src[0].arg.slot) for u in bool_sources)
+      assert physical_op is not None
+      return _native(RKDPUProgram((RKALUStage(physical_op,output,lhs,rhs,count,dtypes.bool),)))
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE,"non-identity bool output",store.src[1].op)
   input_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   # Rejected WIP: DATA_FORMAT in_precision=precision_float32 exists in the register enum, but a direct FP32->FP16 ADD timed out on RK3588.
