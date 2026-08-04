@@ -2723,9 +2723,10 @@ static value-five case because the simplified graph is an indexed-versus-
 constant WHERE over a non-contiguous output. Reformat legality now retains the
 constant branch as data rather than treating it as a new operation family.
 
-For finite fills, the compiler creates an aligned scratch copy of the source,
-appends one constant lane at an atom boundary, and selects source or fill using
-the existing CMAC reformat planner. The representative value-five plan uses 24
+For finite fills, the compiler rounds once to the FP16 destination contract,
+creates an aligned scratch copy of the source, appends one constant lane at an
+atom boundary, and selects source or fill using the existing CMAC reformat
+planner. The representative value-five plan uses 24
 tasks and 81,888 constant bytes. Infinity is kept out of CMAC so inactive
 `0*inf` terms cannot generate NaN. A finite 0/1 padding selector feeds DPU
 `+/-mask/(1-mask)`, producing signed infinity only in padded lanes; the two
@@ -2739,10 +2740,16 @@ JSON SHA-256 is
 `7824de6cd15ccd709133643a908e4192eac3ac0c5dc4555d297d6a43dcb18b5a` and
 the JUnit SHA-256 is
 `57be2bd3097bbb64ee1a578ad88b3ea3416389d65cfd600b30c8d76b7e047699`.
-Permanent validation passes 133 host tests plus 15 subtests, mypy, Ruff, and 95
-serialized device tests plus 63 subtests in 803.47 seconds. No resource limit,
+`test_pad_slice` subsequently exposes the required rounding rule with fill
+`3.456`; all 34 zero/finite crop-and-slice subcases pass natively in 15.30
+seconds. Its telemetry JSON SHA-256 is
+`3a3851dfd34009513e8df076ef9810aec0d3e29163dae2d4435d92d7c7982705` and
+JUnit SHA-256 is
+`4a0b485289fbf5e3899167a1376ff402428942019369158d959c072e5b63293c`.
+Permanent validation passes 133 host tests plus 16 subtests, mypy, Ruff, and 95
+serialized device tests plus 64 subtests in 805.79 seconds. No resource limit,
 tolerance, CPU semantic lane, timeout, reset error, invalid submission, or
-process abort is involved. This predicts 173 native / 40 frontend / 199 fail /
+process abort is involved. This predicts 174 native / 40 frontend / 198 fail /
 13 skip; the complete `2e40def50` 172/40/200/13 census remains authoritative
 until the next full run.
 

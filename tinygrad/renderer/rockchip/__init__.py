@@ -543,8 +543,9 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
     if math.isnan(fill) or fill == 0.0:
       return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
         f"reformat fill {fill!r} has an unproven NaN or signed-zero contract",Ops.CONST)
-    if not _fp16_exact(fill):
-      return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"reformat fill {fill!r} is not exactly FP16", Ops.CONST)
+    try: fill = struct.unpack("<e",struct.pack("<e",fill))[0]
+    except OverflowError:
+      return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,f"reformat fill {fill!r} overflows FP16",Ops.CONST)
     if math.isfinite(fill):
       fill_index, augmented = (src_count+7)&-8, RKArg(RKBufferKind.SCRATCH, 0)
       augmented_count, aligned_count = fill_index+1, max(32, (fill_index+32)&-32)

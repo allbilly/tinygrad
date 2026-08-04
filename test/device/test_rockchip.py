@@ -516,7 +516,7 @@ class TestRockchip(unittest.TestCase):
 
   def test_static_padding_constants_native_reformat(self):
     data = np.linspace(-2,2,3*3*3*3,dtype=np.float16).reshape(3,3,3,3)
-    for fill in (5.0,np.inf,-np.inf):
+    for fill in (5.0,3.456,np.inf,-np.inf):
       with self.subTest(fill=fill):
         actual = Tensor(data,device="ROCKCHIP").realize().pad((1,2,3,4),value=float(fill)).contiguous().realize().numpy()
         expected = np.pad(data,((0,0),(0,0),(3,4),(1,2)),constant_values=fill)

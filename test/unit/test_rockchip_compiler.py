@@ -1258,7 +1258,7 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_static_padding_selects_finite_and_infinite_constants(self):
     source = Tensor.empty(3,3,3,3,dtype=dtypes.half).realize()
-    for fill in (5.0,math.inf,-math.inf):
+    for fill in (5.0,3.456,math.inf,-math.inf):
       with self.subTest(fill=fill):
         result = lower_reformat_result(sink(source.pad((1,2,3,4),value=fill).contiguous()))
         self.assertIs(result.kind,RKLowerKind.NATIVE)

@@ -57,8 +57,8 @@ ceilings, then compare reset overhead, MACs, traffic, command volume, constants,
 and scratch. Runtime telemetry records exact task/command/reset counts and marks
 plans over 64 tasks or 1 MiB of constants as `CORRECTNESS_FALLBACK`; these remain
 honest native passes but are kept visible for replacement by direct engine paths.
-The current serialized device contract passes 95 tests plus 63 subtests in
-803.47 seconds with fallback disabled.
+The current serialized device contract passes 95 tests plus 64 subtests in
+805.79 seconds with fallback disabled.
 
 Lowering uses twenty-one named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
@@ -1136,9 +1136,9 @@ authoritative 172/40/200/13 tally.
 ## Constant-filled static reformat
 
 Static affine reformat now recognizes an indexed-versus-constant WHERE rather
-than limiting the inactive branch to zero. Finite fills append one atom-aligned
-constant lane to an NPU scratch copy and select it through the existing CMAC
-reformatter. Non-finite fills deliberately never enter CMAC because zero
+than limiting the inactive branch to zero. Finite values round once to the
+FP16 destination contract, append one atom-aligned constant lane to an NPU
+scratch copy, and select it through the existing CMAC reformatter. Non-finite fills deliberately never enter CMAC because zero
 weights multiplied by infinity could poison ordinary rows with NaN; a second
 finite selector creates a padding mask and DPU constructs signed infinity as
 `+/-mask/(1-mask)` before adding it to the selected source.
@@ -1147,11 +1147,13 @@ rejects until their hardware sign/payload behavior is characterized.
 
 The unchanged official `test_pad` passes every zero, finite, positive-infinity,
 negative-infinity, crop, and exception subcase in 11.10 seconds with only
-native RK lanes. A permanent mixed-workload hardware test covers `5`, `+inf`,
-and `-inf`. Host gates pass 133 tests plus 15 subtests, mypy over 225 modules,
-and Ruff; the serialized device gate passes 95 tests plus 63 subtests in
-803.47 seconds without a timeout, reset failure, invalid submission, or abort.
-The focused expected tally is 173 native / 40 frontend / 199 fail / 13 skip;
+native RK lanes. `test_pad_slice` likewise passes all 34 zero and value-3.456
+crop/slice subcases in 15.30 seconds. A permanent mixed-workload hardware test
+covers `5`, rounded `3.456`, `+inf`, and `-inf`. Host gates pass 133 tests plus
+16 subtests, mypy over 225 modules, and Ruff; the serialized device gate passes
+95 tests plus 64 subtests in 805.79 seconds without a timeout, reset failure,
+invalid submission, or abort. The focused expected tally is 174 native / 40
+frontend / 198 fail / 13 skip;
 172/40/200/13 remains authoritative until the next complete census.
 
 ### Rejected FP16-only multi-source stack promotion
