@@ -576,9 +576,11 @@ class TestRockchip(unittest.TestCase):
       data = np.linspace(-1, 1, 17, dtype=np.float16)
       x = Tensor(data, device="ROCKCHIP").realize()
       native_before = (x+0.25).realize()
-      fallback = native_before.tan().realize()
+      # COS remains outside the strict native contract; keep this as an explicit
+      # mapped-buffer coherence test even as formerly unsupported math becomes native.
+      fallback = native_before.cos().realize()
       actual = (fallback*2).realize().numpy()
-      np.testing.assert_allclose(actual, (np.tan(data+0.25)*2).astype(np.float16), rtol=2e-3, atol=2e-3)
+      np.testing.assert_allclose(actual, (np.cos(data+0.25)*2).astype(np.float16), rtol=2e-3, atol=2e-3)
       lanes = [event["lane"] for event in drain() if event["kind"] == "kernel"]
       self.assertEqual(lanes[-3:], ["RK_DPU", "PYTHON", "RK_DPU"])
     finally:

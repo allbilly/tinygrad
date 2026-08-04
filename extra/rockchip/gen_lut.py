@@ -58,6 +58,16 @@ sin_lut = [max(-32768, min(32767, round(math.sin((-(512-i)*SIN_STEP) if table ==
 SIN_LOCAL_SCALE, SIN_LOCAL_STEP = 8192.0, 32.0/8192.0
 sin_local = [max(-32768, min(32767, round(8*math.sin(((-(512-i)*SIN_LOCAL_STEP) if table == 0 else i*SIN_LOCAL_STEP)/16) * 32768))) or 1
              for table in range(2) for i in range(SIZE)]
+TAN_LOCAL_SCALE, TAN_LOCAL_STEP = 32768.0, 32.0/32768.0
+tan_local = [max(-32768, min(32767, round(math.tan((-(512-i)*TAN_LOCAL_STEP) if table == 0 else i*TAN_LOCAL_STEP) * 32768))) or 1
+             for table in range(2) for i in range(SIZE)]
+TAN_WIDE_SCALE = float(struct.unpack("<e", struct.pack("<e", 16384.0/1.05))[0])
+TAN_WIDE_STEP = 32.0/TAN_WIDE_SCALE
+tan_wide = [max(-32768, min(32767, round(.5*math.tan((-(512-i)*TAN_WIDE_STEP) if table == 0 else i*TAN_WIDE_STEP) * 32768))) or 1
+            for table in range(2) for i in range(SIZE)]
+COS_LOCAL_SCALE, COS_LOCAL_STEP = 8192.0, 32.0/8192.0
+cos_local = [max(-32768, min(32767, round(2*math.cos((-(512-i)*COS_LOCAL_STEP) if table == 0 else i*COS_LOCAL_STEP) * 32768))) or 1
+             for table in range(2) for i in range(SIZE)]
 ASIN_SCALE, ASIN_STEP = 16384.0, 32.0/16384.0
 asin = [max(-32768, min(32767, round(math.asin((-(512-i)*ASIN_STEP) if table == 0 else i*ASIN_STEP) * 16384)))
         for table in range(2) for i in range(SIZE)]
@@ -640,7 +650,10 @@ class RKLUTId(IntEnum):
   SIN_LOCAL = 74
   EXP2_RESIDUAL = 75
   EXP2_SCALE = 76
-RK_LUT_SCHEMA = 58
+  TAN_LOCAL = 77
+  TAN_WIDE = 78
+  COS_LOCAL = 79
+RK_LUT_SCHEMA = 59
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -729,6 +742,24 @@ RK_LUT_SIN_LOCAL_ENTRIES = {SIZE}
 RK_LUT_SIN_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', SIN_LOCAL_SCALE))[0]}
 RK_LUT_SIN_LOCAL_MINUS_EXP = 15
 RK_LUT_SIN_LOCAL = (\n{rows(sin_local)}\n)
+RK_LUT_TAN_LOCAL_SHA256 = "{digest(tan_local)}"
+RK_LUT_TAN_LOCAL_DOMAIN = (-0.5, 0.5)
+RK_LUT_TAN_LOCAL_ENTRIES = {SIZE}
+RK_LUT_TAN_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', TAN_LOCAL_SCALE))[0]}
+RK_LUT_TAN_LOCAL_MINUS_EXP = 15
+RK_LUT_TAN_LOCAL = (\n{rows(tan_local)}\n)
+RK_LUT_TAN_WIDE_SHA256 = "{digest(tan_wide)}"
+RK_LUT_TAN_WIDE_DOMAIN = (-1.05, 1.05)
+RK_LUT_TAN_WIDE_ENTRIES = {SIZE}
+RK_LUT_TAN_WIDE_BN_MUL = {struct.unpack('<H', struct.pack('<e', TAN_WIDE_SCALE))[0]}
+RK_LUT_TAN_WIDE_MINUS_EXP = 15
+RK_LUT_TAN_WIDE = (\n{rows(tan_wide)}\n)
+RK_LUT_COS_LOCAL_SHA256 = "{digest(cos_local)}"
+RK_LUT_COS_LOCAL_DOMAIN = (-2.0, 2.0)
+RK_LUT_COS_LOCAL_ENTRIES = {SIZE}
+RK_LUT_COS_LOCAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', COS_LOCAL_SCALE))[0]}
+RK_LUT_COS_LOCAL_MINUS_EXP = 15
+RK_LUT_COS_LOCAL = (\n{rows(cos_local)}\n)
 RK_LUT_ASIN_SHA256 = "{digest(asin)}"
 RK_LUT_ASIN_DOMAIN = (-1.0, 1.0)
 RK_LUT_ASIN_ENTRIES = {SIZE}

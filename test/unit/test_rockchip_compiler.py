@@ -614,6 +614,20 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.scratch), 7)
     self.assertFalse(contains_uop(plan))
 
+  def test_tan_uses_piecewise_generated_luts_and_bounded_range_reduction(self):
+    for name in ("TAN_LOCAL", "TAN_WIDE", "COS_LOCAL"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    plan = lower_dpu(sink(Tensor.empty(128,dtype=dtypes.half).tan()))
+    self.assertIsInstance(plan, RKDPUProgram)
+    assert isinstance(plan, RKDPUProgram)
+    self.assertTrue({rklut.RKLUTId.ROUNDOFF, rklut.RKLUTId.SIN,
+                     rklut.RKLUTId.TAN_LOCAL, rklut.RKLUTId.TAN_WIDE, rklut.RKLUTId.COS_LOCAL}.issubset(
+                       {stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}))
+    self.assertLessEqual(len(plan.stages), 160)
+    self.assertLessEqual(len(plan.scratch), 10)
+    self.assertFalse(contains_uop(plan))
+
   def test_inverse_trig_uses_generated_math_assets(self):
     for name in ("ASIN", "ASIN_LOCAL", "ASIN_EDGE", "ACOS", "ATAN"):
       table = getattr(rklut, f"RK_LUT_{name}")
@@ -1582,9 +1596,8 @@ class TestDPUCompiler(unittest.TestCase):
   def test_renderer_classifies_rejections(self):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
-               (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
-               (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,128,dtype=dtypes.half), "plan_stage_limit"),
-             (Tensor.empty(16,dtype=dtypes.half).tan(), "unsupported_alu"))
+                 (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
+                 (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,128,dtype=dtypes.half), "plan_stage_limit"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
 

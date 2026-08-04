@@ -3048,3 +3048,26 @@ seconds. No tolerance, fallback, skip, or task ceiling changed. Focused
 expected coverage is 186 native / 40 frontend / 186 failed / 13 upstream skips;
 172/40/200/13 remains the last authoritative complete census. The expanded
 host gate passes 145 tests plus 34 subtests, full mypy, and touched-module Ruff.
+
+## Native piecewise tangent
+
+`test_tan` now passes unchanged on RK3588 in 66.92 seconds. An exact compiler
+canonicalizer replaces tinygrad's decomposed sine quotient with a 148-task
+piecewise program using generated `TAN_LOCAL`, `TAN_WIDE`, and `COS_LOCAL`
+tables. The pole band reconstructs a split distance from the original FP16
+value; inputs beyond magnitude five use the newer two-pi range reducer before
+the piecewise evaluator, which fixes the old 2607 failures at finite 1000 and
+10000 without a float32 host boundary.
+
+The first clean sine-quotient attempt is preserved by history: it missed
+760/2925 values in the first dense range. Arithmetic branch selection initially
+allowed an inactive infinite quotient to contaminate the second range with NaN;
+masking the input before evaluation fixed that, but large-angle quotient error
+still failed four explicit values. Reducing the large input before the direct
+tangent tables passes all official subcases at the stock tolerances. Cached
+expression-node hashes reduce compiler time for the heavily shared DAG from
+about three minutes to 2.2 seconds. Focused expected coverage is 187 native / 40
+frontend / 185 failed / 13 upstream skips; the last complete authoritative
+census remains 172/40/200/13. The host gate passes 141 tests plus 34 subtests,
+full mypy and touched-file Ruff pass, and the complete serialized RK3588 gate
+passes 96 tests plus 66 subtests in 804.40 seconds without a device failure.

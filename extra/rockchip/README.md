@@ -1352,3 +1352,23 @@ in 102.53 seconds and `test_pow` passes all fourteen subcases in 158.06
 seconds. Focused expected coverage is now 186 native / 40 frontend / 186 fail /
 13 skip; the authoritative complete census remains 172/40/200/13. The expanded
 host gate passes 145 tests plus 34 subtests, full mypy, and touched-module Ruff.
+
+## Native piecewise tangent
+
+The exact `sin(x)/sin(pi/2-x)` decomposition now canonicalizes to a typed,
+UOp-free tangent recipe. Generated direct Q15 tables cover the local and middle
+ranges, while a sine/local-cosine quotient and split pole distance preserve
+accuracy near odd multiples of pi/2. Values beyond magnitude five first use the
+newer Cody--Waite two-pi reducer, avoiding the old 2607 FP16 period-counter
+failure at 1000 and 10000. NaN and infinities are repaired on the NPU.
+
+The final plan has 148 tasks and nine scratch surfaces. The unchanged official
+`test_tan` passes all dense, scalar, IEEE-special, and large-angle subcases in
+66.92 seconds without host conversion or tolerance changes. Cached structural
+hashes on the immutable expression DAG reduce compilation of this shared recipe
+from roughly three minutes to 2.2 seconds. Focused expected coverage is 187
+native / 40 frontend / 185 fail / 13 skip; 172/40/200/13 remains authoritative
+until the complete uncached census is rerun. The host gate passes 141 tests plus
+34 subtests, full mypy and touched-file Ruff pass, and the complete serialized
+RK3588 gate passes 96 tests plus 66 subtests in 804.40 seconds. Its explicit
+fallback-coherence test now uses still-unsupported cosine rather than tangent.

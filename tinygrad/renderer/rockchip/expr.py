@@ -13,15 +13,27 @@ from tinygrad.renderer.rockchip.ir import RKArg, RKBufferKind, RK_ALU_OPS as _RK
 class _ALUExpr:
   op: Ops
   src: tuple[_ALUExpr|_MaskExpr|_LUTExpr|RKArg|float, _ALUExpr|_MaskExpr|_LUTExpr|RKArg|float]
+  def __hash__(self) -> int:
+    if (cached:=self.__dict__.get("_cached_hash")) is None:
+      object.__setattr__(self, "_cached_hash", cached:=hash((self.op, self.src)))
+    return cached
 
 @dataclass(frozen=True)
 class _MaskExpr:
   src: tuple[_ALUExpr|_MaskExpr|_LUTExpr|RKArg]
+  def __hash__(self) -> int:
+    if (cached:=self.__dict__.get("_cached_hash")) is None:
+      object.__setattr__(self, "_cached_hash", cached:=hash(self.src))
+    return cached
 
 @dataclass(frozen=True)
 class _LUTExpr:
   lut: RKLUTId
   src: tuple[_ALUExpr|_MaskExpr|_LUTExpr|RKArg]
+  def __hash__(self) -> int:
+    if (cached:=self.__dict__.get("_cached_hash")) is None:
+      object.__setattr__(self, "_cached_hash", cached:=hash((self.lut, self.src)))
+    return cached
 
 _Expr = _ALUExpr|_MaskExpr|_LUTExpr
 _Value = _Expr|RKArg|float
@@ -58,9 +70,8 @@ def _trunc_expr(source:_Expr|RKArg|float) -> _Expr:
   increment = _ALUExpr(Ops.MUL, (positive(source, rounded), positive(0.0, source)))
   return _ALUExpr(Ops.ADD, (_sub(rounded, decrement), increment))
 
-def _sin_expr(source:_Expr|RKArg) -> _Expr:
-  """FP16 Cody-Waite range reduction followed by broad/local sine LUTs."""
-  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+def _sin_reduced_expr(source:_Expr|RKArg) -> _Expr:
+  """FP16 Cody-Waite reduction to one two-pi period, proven for finite FP16 through magnitude 10000."""
   bounded = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX,
     (_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MAX, (source, -10000.0)), -1.0)), -10000.0)), -1.0))
   rounded = _round_expr(_ALUExpr(Ops.MUL, (bounded, 1/(2*math.pi))))
@@ -68,6 +79,12 @@ def _sin_expr(source:_Expr|RKArg) -> _Expr:
   for coefficient in (4.0, 2.0, .25, .03125, 2*math.pi-6.28125):
     reduced = _sub(reduced, _ALUExpr(Ops.MUL, (rounded, coefficient)))
   assert not isinstance(reduced, float)
+  return cast(_Expr, reduced)
+
+def _sin_expr(source:_Expr|RKArg) -> _Expr:
+  """FP16 Cody-Waite range reduction followed by broad/local sine LUTs."""
+  def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  reduced = _sin_reduced_expr(source)
   broad = _LUTExpr(RKLUTId.SIN, (reduced,))
   local = _LUTExpr(RKLUTId.SIN_LOCAL, (_ALUExpr(Ops.MUL, (reduced, 16.0)),))
   absolute = _ALUExpr(Ops.MAX, (reduced, _ALUExpr(Ops.MUL, (reduced, -1.0))))
@@ -77,6 +94,66 @@ def _sin_expr(source:_Expr|RKArg) -> _Expr:
   normal = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (broad, _sub(1.0, local_inside))), _ALUExpr(Ops.ADD, (middle, near))))
   # Propagate NaN for NaN/infinity while preserving the finite result without a separate classification epilogue.
   return _ALUExpr(Ops.ADD, (normal, _ALUExpr(Ops.MUL, (source, 0.0))))
+
+def _tan_expr(source:_Expr|RKArg) -> _Expr:
+  """Piecewise direct tangent with a pole-safe quotient and large-angle sine reduction."""
+  def positive(lhs:_Value, rhs:_Value) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  negative_source = _ALUExpr(Ops.MUL, (source, -1.0))
+  magnitude = _ALUExpr(Ops.MAX, (source, negative_source))
+  large = positive(magnitude, 5.0)
+  small_source = _ALUExpr(Ops.MUL, (source, _sub(1.0, large)))
+  large_source = _ALUExpr(Ops.MUL, (source, large))
+  piece_source = _ALUExpr(Ops.ADD, (small_source, _ALUExpr(Ops.MUL, (_sin_reduced_expr(large_source), large))))
+  piece_magnitude = _ALUExpr(Ops.MAX, (piece_source, _ALUExpr(Ops.MUL, (piece_source, -1.0))))
+  quotient = _ALUExpr(Ops.MUL, (piece_source, 1/math.pi))
+  abs_quotient = _ALUExpr(Ops.MAX, (quotient, _ALUExpr(Ops.MUL, (quotient, -1.0))))
+  # FP16 1/pi can create false exact .5 ties just below an odd pi/2. No FP16 value is exactly pi/2.
+  rounded_abs = _trunc_expr(_ALUExpr(Ops.ADD, (_sub(abs_quotient, .0005), .5)))
+  positive_period = positive(quotient, 0.0)
+  rounded = _sub(_ALUExpr(Ops.MUL, (rounded_abs, positive_period)),
+                 _ALUExpr(Ops.MUL, (rounded_abs, _sub(1.0, positive_period))))
+  reduced:_Value = piece_source
+  for coefficient in (3.140625, math.pi-3.140625): reduced = _sub(reduced, _ALUExpr(Ops.MUL, (rounded, coefficient)))
+  assert not isinstance(reduced, float)
+
+  local, sine = _LUTExpr(RKLUTId.TAN_LOCAL, (reduced,)), _LUTExpr(RKLUTId.SIN, (reduced,))
+  wide, cos_local = _LUTExpr(RKLUTId.TAN_WIDE, (reduced,)), _LUTExpr(RKLUTId.COS_LOCAL, (reduced,))
+  abs_reduced = _ALUExpr(Ops.MAX, (reduced, _ALUExpr(Ops.MUL, (reduced, -1.0))))
+  outside, near_outside = positive(abs_reduced, .45), positive(abs_reduced, .04)
+  local_mask = _sub(_sub(1.0, outside), _sub(1.0, near_outside))
+  quotient_outside = positive(abs_reduced, 1.05)
+
+  # Reconstruct distance from the original FP16 magnitude so range reduction does not lose pole low bits.
+  pole_group = positive(piece_magnitude, 3.0)
+  pole_base = _ALUExpr(Ops.ADD, (1.5, _ALUExpr(Ops.MUL, (pole_group, 3.0))))
+  pole_distance = _sub(pole_base, piece_magnitude)
+  remainder = _ALUExpr(Ops.ADD, (.0703125, _ALUExpr(Ops.MUL, (pole_group, .140625))))
+  center_hi = _ALUExpr(Ops.ADD, (pole_distance, remainder))
+  center_lo = _ALUExpr(Ops.ADD, (math.pi/2-1.5703125,
+    _ALUExpr(Ops.MUL, (pole_group, math.pi-3.140625))))
+  center = _ALUExpr(Ops.ADD, (center_hi, center_lo))
+  abs_center = _ALUExpr(Ops.MAX, (center, _ALUExpr(Ops.MUL, (center, -1.0))))
+  center_inside = _sub(1.0, positive(abs_center, .05))
+  center_mask = _sub(quotient_outside, center_inside)
+
+  abs_sine = _ALUExpr(Ops.MAX, (sine, _ALUExpr(Ops.MUL, (sine, -1.0))))
+  center_factor = _sub(1.0, _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (abs_center, abs_center)), 1/3)))
+  center_cos = _ALUExpr(Ops.MUL, (abs_center, abs_sine))
+  cosine = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD,
+    (_ALUExpr(Ops.MUL, (center_cos, center_inside)), _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (cos_local, .5)), center_mask)))),
+    _sub(1.0, quotient_outside)))
+  tangent = _ALUExpr(Ops.FDIV, (sine, cosine))
+  quotient_selected = _ALUExpr(Ops.ADD,
+    (_ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (tangent, center_factor)), center_inside)),
+     _ALUExpr(Ops.MUL, (tangent, center_mask))))
+  wide_selected = _ALUExpr(Ops.MUL, (_ALUExpr(Ops.MUL, (wide, 2.0)), _sub(outside, quotient_outside)))
+  local_selected = _ALUExpr(Ops.MUL, (local, local_mask))
+  near_selected = _ALUExpr(Ops.MUL, (reduced, _sub(1.0, near_outside)))
+  piecewise = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.ADD, (quotient_selected, wide_selected)),
+                                _ALUExpr(Ops.ADD, (local_selected, near_selected))))
+
+  # Propagate NaN for NaN/infinity after the bounded reducer has produced a harmless finite working value.
+  return _ALUExpr(Ops.ADD, (piecewise, _ALUExpr(Ops.MUL, (source, 0.0))))
 
 def _exp_expr(source:_Expr|RKArg|float) -> _Expr:
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
@@ -912,6 +989,25 @@ def _canonical_tanh(u:UOp) -> UOp|None:
     if math.isclose(sigmoid[1], 2.0): return sigmoid[0]
   return None
 
+def _canonical_tan(u:UOp) -> UOp|None:
+  """Recognize tinygrad's exact sin(x)/sin(pi/2-x) tangent decomposition."""
+  u = _unwrap_fp_cast(u)
+  if u.op is not Ops.MUL or len(u.src) != 2: return None
+  for numerator, reciprocal in (u.src, u.src[::-1]):
+    numerator, reciprocal = _unwrap_fp_cast(numerator), _unwrap_fp_cast(reciprocal)
+    if numerator.op is not Ops.SIN or reciprocal.op is not Ops.RECIPROCAL: continue
+    source, denominator = _unwrap_fp_cast(numerator.src[0]), _unwrap_fp_cast(reciprocal.src[0])
+    if source.op is not Ops.INDEX or source.dtype is not dtypes.half or denominator.op is not Ops.SIN: continue
+    shifted = _unwrap_fp_cast(denominator.src[0])
+    if shifted.op is not Ops.ADD or len(shifted.src) != 2: continue
+    constant = next((_unwrap_fp_cast(x) for x in shifted.src if _unwrap_fp_cast(x).op is Ops.CONST), None)
+    negative = next((_unwrap_fp_cast(x) for x in shifted.src if _unwrap_fp_cast(x).op is Ops.MUL), None)
+    if constant is None or not math.isclose(float(constant.arg), math.pi/2) or negative is None: continue
+    minus_one = next((_unwrap_fp_cast(x) for x in negative.src if _unwrap_fp_cast(x).op is Ops.CONST), None)
+    neg_source = next((_unwrap_fp_cast(x) for x in negative.src if _unwrap_fp_cast(x).op is not Ops.CONST), None)
+    if minus_one is not None and float(minus_one.arg) == -1 and neg_source is not None and neg_source.key == source.key: return source
+  return None
+
 def _canonical_expm1(u:UOp) -> tuple[UOp,float,float]|None:
   """Recognize +/- (exp(+/- x)-1) after EXP has become EXP2."""
   u = _unwrap_same_cast(u)
@@ -1312,6 +1408,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
     operand = _parse_alu(tanh_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
     ret = _tanh_expr(operand)
+  elif (tan_input:=_canonical_tan(u)) is not None:
+    operand = _parse_alu(tan_input, output_index, memo)
+    if operand is None or isinstance(operand, float): return None
+    ret = _tan_expr(operand)
   elif (expm1:=_canonical_expm1(u)) is not None:
     operand = _parse_alu(expm1[0], output_index, memo)
     if operand is None: return None
