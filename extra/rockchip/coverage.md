@@ -2745,3 +2745,19 @@ tolerance, CPU semantic lane, timeout, reset error, invalid submission, or
 process abort is involved. This predicts 173 native / 40 frontend / 199 fail /
 13 skip; the complete `2e40def50` 172/40/200/13 census remains authoritative
 until the next full run.
+
+## Rejected FP16-only multi-source stack promotion
+
+A generic multi-source reformatter statically resolved nested WHERE trees,
+materialized one disjoint selector surface per FP16 input, and summed them on
+DPU. All four `(5,6,3)` three-input stack dimensions compiled to 20--32 tasks,
+and dimensions 0, 2, and 3 passed RK3588 hardware exactly.
+
+The unchanged official method nevertheless rejects before this planner because
+`conftest_rockchip` runs the complete `test_stack` method in its required FP32
+reference context; that preserves the final direct scalar-3.14 assertion.
+General FP32 DPU input already has a durable timeout result, so accepting only
+the FP16 probe would add code without removing a TestOps failure family. The
+working implementation and tests were removed from the active compiler and
+preserved in `wip-multi-source-reformat-fp32-contract.patch` (SHA-256
+`2a6c591f305b8e12eda17d5c6d199340286e53386caf87b7d0653f430ca704a7`).

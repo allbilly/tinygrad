@@ -1153,3 +1153,16 @@ and Ruff; the serialized device gate passes 95 tests plus 63 subtests in
 803.47 seconds without a timeout, reset failure, invalid submission, or abort.
 The focused expected tally is 173 native / 40 frontend / 199 fail / 13 skip;
 172/40/200/13 remains authoritative until the next complete census.
+
+### Rejected FP16-only multi-source stack promotion
+
+A generic static-WHERE planner successfully resolved three FP16 input surfaces,
+emitted 20--32 task selector/DPU plans for every stack dimension, and passed a
+permanent-style RK3588 hardware sweep. It does not make the unchanged official
+`test_stack` method pass: that method is intentionally executed under the
+FP32 reference context so its final scalar `3.14` assertion retains precision,
+and general FP32 NPU input remains a proven hardware timeout. The experiment is
+therefore excluded from the clean compiler rather than being counted as a
+coverage gain. Its complete code and tests are preserved as
+`wip-multi-source-reformat-fp32-contract.patch` (SHA-256
+`2a6c591f305b8e12eda17d5c6d199340286e53386caf87b7d0653f430ca704a7`).
