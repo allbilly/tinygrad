@@ -14,6 +14,9 @@ unclassified failure. Relative to `92846845f`, only `test_dilated_conv2d`
 changes from typed rejection to native pass and no method regresses. Coverage
 details, the checkout-local pytest-plugin invocation, reject Pareto, plan-cost
 histograms, and durable artifact hashes are recorded in `coverage.md`.
+Focused native-only validation after that census makes `test_multicat` pass,
+so the expected tally is `203/40/169/13`; `202/40/170/13` remains authoritative
+until the next complete uncached run.
 
 The PPU layout contract now names the actual `PPU_HWC` format and accepts every
 hardware-characterized FP16 channel count from two through eight. This follows
@@ -1835,3 +1838,25 @@ The complete implementation is preserved as
 Future work must characterize the native deconvolution/Rubik schedule or make
 the existing CMAC legalization compact enough while preserving accumulation
 semantics. The authoritative census remains `202/40/170/13`.
+
+## Bounded multi-source concatenation transpose
+
+Large concatenation movement no longer requires one selector window to span
+the complete source. The compiler first gathers directly from the original
+NPU buffers in aligned output tiles. A following block transpose partitions
+each output tile into source-index windows no wider than the proven 512-lane
+CMAC input, emits one disjoint selector per window, and combines partials with
+ordinary DPU ADD. Runtime tensor data is never read or packed by the host.
+
+Candidate tile widths remain multiples of the eight-lane FP16 atom. The cost
+model selects only schedules below the unchanged 400-task and 2 MiB constant
+ceilings. For the official `(45,65)` three-source case, the gather is 83 tasks
+and 216,512 constant bytes; the required `(3,45,65)->(45,3,65)` block
+transpose is 323 tasks and 598,224 constant bytes. The unchanged
+`test_multicat` passes all three dimensions in 112.20 seconds with
+`ROCKCHIP_FALLBACK=0`.
+
+All 160 compiler/image tests plus 59 subtests pass, four focused RK3588
+movement tests plus nine subtests pass, mypy checks 228 source files, and Ruff
+is clean. This is one focused expected gain (`203/40/169/13`); the last full
+uncached census remains `202/40/170/13` pending its next run.

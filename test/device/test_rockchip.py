@@ -652,6 +652,11 @@ class TestRockchip(unittest.TestCase):
     actual = Tensor(square,device="ROCKCHIP").realize().T.contiguous().realize().numpy()
     np.testing.assert_equal(actual,square.T)
 
+  def test_large_block_transpose_uses_bounded_native_windows(self):
+    data = np.random.default_rng(19).uniform(-4,4,(3,9,129)).astype(np.float16)
+    actual = Tensor(data,device="ROCKCHIP").realize().permute(1,0,2).contiguous().realize().numpy()
+    np.testing.assert_equal(actual,data.transpose(1,0,2))
+
   def test_static_padding_constants_native_reformat(self):
     data = np.linspace(-2,2,3*3*3*3,dtype=np.float16).reshape(3,3,3,3)
     for fill in (5.0,3.456,np.inf,-np.inf):

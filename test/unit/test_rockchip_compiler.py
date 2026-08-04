@@ -1627,6 +1627,16 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(contracts[0].compact_output)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_large_block_transpose_partitions_bounded_source_windows(self):
+    result = lower_reformat_result(sink(Tensor.empty(3,45,65,dtype=dtypes.half).permute(1,0,2).contiguous()))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKLegalizedReformat)
+    assert isinstance(result.plan,RKLegalizedReformat)
+    cost = plan_cost(result.plan.program)
+    self.assertLessEqual(cost.task_count,400)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_split_range_reformat_preserves_subaxis_identity(self):
     source = Tensor.empty(3,3,dtype=dtypes.half).realize()
     result = lower_reformat_result(sink(source.repeat(3,3,4).contiguous()))

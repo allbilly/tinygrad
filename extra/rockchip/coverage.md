@@ -3859,3 +3859,31 @@ with SHA-256
 `0ea1f73a0896f284f9b1c728998884587351086a265cef25fd44dde64bef06d6`.
 No native pass is claimed and the authoritative census remains
 `202 PASS_NATIVE / 40 PASS_FRONTEND / 170 FAIL / 13 SKIP_UPSTREAM`.
+
+## Bounded multi-source concatenation transpose
+
+The unchanged `test_multicat` previously completed its first native gather but
+rejected the following block transpose because one selector window could not
+span the 2,925-element source planes within the shared cost contract. The new
+generic reformat planner keeps output tiles atom-aligned, partitions each tile
+into source windows no wider than 512 FP16 lanes, emits disjoint CMAC selector
+partials, and combines only crossing windows with DPU ADD. The same mechanism
+reads a multi-source gather directly from its original argument buffers rather
+than first packing every input into one large scratch surface. No host code
+reads, rearranges, or converts runtime tensor data.
+
+The planner evaluates aligned widths from 64 through 128 and accepts only
+plans below the unchanged 400-task and 2 MiB constant ceilings. The official
+three-source `(45,65)` gather costs 83 tasks, 216,512 constant bytes, and 928
+scratch bytes. Its `(3,45,65)->(45,3,65)` block transpose costs 323 tasks,
+598,224 constant bytes, and 384 scratch bytes. An earlier 128-output prototype
+passed hardware but required 3,432,784 constant bytes; it was tightened rather
+than committed or used to raise the ceiling.
+
+The complete unchanged `TestOps.test_multicat` passes all dimensions on
+RK3588 in 112.20 seconds with `ROCKCHIP_FALLBACK=0`. All 160 compiler/image
+tests plus 59 subtests pass with `-n12`; the multi-source stack, sparse affine
+movement, large block-transpose, and split/modulo device regressions pass four
+tests plus nine subtests; mypy over 228 source files and full Ruff are clean. This is one
+focused expected transition to `203/40/169/13`; the authoritative complete
+census remains `202/40/170/13` until the next locked uncached run.

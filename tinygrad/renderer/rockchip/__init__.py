@@ -107,7 +107,7 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
 
 def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[tuple[int,float]]],
                                      scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
-                                     max_outputs:int=64) -> RKProgram|None:
+                                     max_outputs:int=64, clear_empty:bool=True) -> RKProgram|None:
   """Apply consecutive static weighted rows from bounded, atom-aligned source windows."""
   chunks:list[tuple[int, int, int, int, list[list[tuple[int,float]]], bytes]] = []
   start = 0
@@ -140,7 +140,7 @@ def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   if not all(direct): scratch += (RKScratch(max((chunk[3] for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
   steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
-                                                  if any(not row for row in rows) else [])
+                                                  if clear_empty and any(not row for row in rows) else [])
   for (start,base,end,align_in,tile,payload),safe in zip(chunks,direct):
     span, align_out = end-base, max(32, (len(tile)+31)&-32)
     if safe:
@@ -158,11 +158,11 @@ def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[
 
 def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
                             scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
-                            max_outputs:int=64) -> RKProgram|None:
+                            max_outputs:int=64, clear_empty:bool=True) -> RKProgram|None:
   """Reduce consecutive output tiles from bounded, atom-aligned source windows."""
   if struct.unpack("<e", struct.pack("<e", scale))[0] != scale: return None
   return _windowed_weighted_cmac_pipeline(output,source,[[(index,scale) for index in row] for row in rows],
-                                          scratch,direct_count,max_window,max_outputs)
+                                          scratch,direct_count,max_window,max_outputs,clear_empty)
 
 def plan_cost(plan:RKProgram) -> RKPlanCost:
   image = emit_program(plan)
@@ -260,6 +260,64 @@ def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[lis
   two_level = _two_level_selector_program(output, source, input_count, rows, scratch, max_outputs=max_outputs)
   return two_level if two_level is not None and plan_cost(two_level).stage_count <= RK_MAX_PROGRAM_STAGES and \
     plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
+
+def _multi_source_windowed_program(output:RKArg, sources:tuple[RKArg, ...], source_counts:tuple[int, ...],
+                                   mapping:tuple[tuple[int,int], ...], max_outputs:int=128) -> RKProgram|None:
+  """Select aligned output tiles directly from their source surfaces, combining only tiles which cross a source boundary."""
+  scratch:tuple[RKScratch, ...] = (RKScratch(_cmac_tiled_output_bytes(max_outputs)),)
+  partial = RKArg(RKBufferKind.SCRATCH, 0)
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+  for start in range(0,len(mapping),max_outputs):
+    tile = mapping[start:start+max_outputs]
+    target = RKArg(output.kind,output.index,output.addend+start*2)
+    source_ids = tuple(dict.fromkeys(sid for sid,_ in tile))
+    for position,sid in enumerate(source_ids):
+      rows = [[src] if row_sid == sid else [] for row_sid,src in tile]
+      selected = _windowed_cmac_pipeline(target if position == 0 else partial,sources[sid],rows,scratch=scratch,
+                                         direct_count=source_counts[sid],max_outputs=max_outputs)
+      if selected is None: return None
+      steps.extend(selected.steps)
+      scratch = selected.scratch
+      if position:
+        steps.append(RKDPUProgram((RKALUStage(Ops.ADD,target,target,partial,len(tile)),),scratch))
+  return _finish_program(steps,scratch)
+
+def _partitioned_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
+                                  scratch:tuple[RKScratch, ...]=(), max_window:int=512,
+                                  max_outputs:int=128) -> RKProgram|None:
+  """Split aligned output tiles by bounded source windows, then combine their disjoint selector results on the DPU."""
+  partial = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(_cmac_tiled_output_bytes(max_outputs)),)
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+  for start in range(0,len(rows),max_outputs):
+    tile = rows[start:start+max_outputs]
+    selected = sorted({index for row in tile for index in row})
+    target = RKArg(output.kind,output.index,output.addend+start*2)
+    if not selected:
+      steps.append(RKDPUProgram((RKALUStage(Ops.ADD,target,0.0,0.0,len(tile)),),scratch))
+      continue
+    windows:list[tuple[int,int]] = []
+    for index in selected:
+      if not windows or index-(windows[-1][0]&-8) >= max_window: windows.append((index,index+1))
+      else: windows[-1] = (windows[-1][0],index+1)
+    for position,(lo,hi) in enumerate(windows):
+      window_rows = [[index for index in row if lo <= index < hi] for row in tile]
+      plan = _windowed_cmac_pipeline(target if position == 0 else partial,source,window_rows,scratch=scratch,
+                                     direct_count=input_count,max_window=max_window,max_outputs=max_outputs,clear_empty=False)
+      if plan is None: return None
+      steps.extend(plan.steps)
+      scratch = plan.scratch
+      if position: steps.append(RKDPUProgram((RKALUStage(Ops.ADD,target,target,partial,len(tile)),),scratch))
+  return _finish_program(steps,scratch)
+
+def _best_partitioned_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]]) -> RKProgram|None:
+  candidates = tuple(_partitioned_selector_program(output,source,input_count,rows,max_outputs=width)
+                     for width in range(64,129,8))
+  legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
+                cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)
+  return None if not legal else min(legal,key=lambda item:(item[0].reset_count,item[0].estimated_macs,
+    item[0].estimated_read_bytes+item[0].estimated_write_bytes,item[0].command_words,
+    item[0].constant_bytes,item[0].scratch_bytes))[1]
 
 def _finish_program(steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], scratch:tuple[RKScratch, ...]) -> RKProgram:
   """Give every ordered DPU step the program's final resource table."""
@@ -807,7 +865,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
               return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.SELECTOR_CMAC,completed))
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"constant-filled reformat exceeds the native cost contract",Ops.WHERE)
   implementation = (_periodic_selector_program(output,source,src_count,rows) or
-                    _selector_program(output,source,src_count,rows,())) if 0 < src_count and 0 < count else None
+                    _selector_program(output,source,src_count,rows,()) or
+                    _best_partitioned_selector_program(output,source,src_count,rows)) if 0 < src_count and 0 < count else None
   if implementation is not None:
     return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.SELECTOR_CMAC,implementation))
   if 0 < src_count and 0 < count:
@@ -866,6 +925,8 @@ def lower_multi_source_reformat_result(sink:UOp) -> RKLowerResult:
     stages = tuple(RKCopyStage(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot,dst*4),
       RKArg(RKBufferKind.ARG,params[sid].arg.slot,src*4),count,dtypes.float) for dst,sid,src,count in runs)
     return _native(RKLegalizedReformat(semantic,RKReformatKind.COALESCED_DPU,RKProgram((RKDPUProgram(stages),))))
+  sources = tuple(RKArg(RKBufferKind.ARG,param.arg.slot) for param in params)
+  direct = _multi_source_windowed_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),sources,source_counts,typed_mapping)
   bases, packed_count = [], 0
   for source_count in source_counts:
     bases.append(packed_count)
@@ -876,15 +937,17 @@ def lower_multi_source_reformat_result(sink:UOp) -> RKLowerResult:
   seed_stages.extend(RKALUStage(Ops.ADD,RKArg(packed.kind,packed.index,bases[sid]*2),RKArg(RKBufferKind.ARG,param.arg.slot),0.0,count)
                      for sid,(param,count) in enumerate(zip(params,source_counts)))
   rows = [[bases[sid]+src] for sid,src in typed_mapping]
-  implementation = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed,packed_count,rows,scratch,
-                                     direct_capacity=max(32,packed_count))
-  if implementation is None:
+  packed_implementation = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed,packed_count,rows,scratch,
+                                            direct_capacity=max(32,packed_count))
+  if packed_implementation is not None:
+    packed_implementation = _finish_program([RKDPUProgram(tuple(seed_stages),scratch),*packed_implementation.steps],
+                                            packed_implementation.scratch)
+  legal = tuple((cost,candidate) for candidate in (direct,packed_implementation) if candidate is not None and
+                (cost:=plan_cost(candidate)).stage_count <= RK_MAX_PROGRAM_STAGES and cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)
+  if not legal:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"multi-source reformat selector exceeds plan limits",Ops.WHERE)
-  program = _finish_program([RKDPUProgram(tuple(seed_stages),scratch),*implementation.steps],implementation.scratch)
-  cost = plan_cost(program)
-  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
-      f"multi-source reformat needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes",Ops.WHERE)
+  _,program = min(legal,key=lambda item:(item[0].reset_count,item[0].estimated_macs,
+    item[0].estimated_read_bytes+item[0].estimated_write_bytes,item[0].command_words,item[0].constant_bytes,item[0].scratch_bytes))
   return _native(RKLegalizedReformat(semantic,RKReformatKind.SELECTOR_CMAC,program))
 
 def lower_static_selector_reformat_result(sink:UOp) -> RKLowerResult:
