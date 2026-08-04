@@ -3653,3 +3653,10 @@ Artifacts:
 - directory: `/home/orangepi/rk2608_backups/census-wide-prefix-746707b3e-20260804-223120`
 - `test_ops_coverage.json`: `5dad8510c28b0664c846f57269aea95955c90baf543cb6e3552a0c8b05eeb4d4`
 - `junit.xml`: `b78d65a0f23047791a7ab58e1da3bd14f0428dc1611c338e8b0dd290acb3284e`
+
+The historical plugin exception for `test_simple_cumsum` has since been
+removed. The unchanged focused method passes with the active strict plugin on
+CPU in 1.27 seconds and on RK3588 in 18.66 seconds, both with
+`DEFAULT_FLOAT=HALF`. This changes only reference construction; it adds no
+backend FP32 claim or fallback. Focused expected coverage is `199/40/173/13`;
+the table above remains authoritative pending another full census.

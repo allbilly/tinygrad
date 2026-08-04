@@ -1666,3 +1666,10 @@ The telemetry JSON SHA-256 is
 `5dad8510c28b0664c846f57269aea95955c90baf543cb6e3552a0c8b05eeb4d4` and
 the JUnit XML SHA-256 is
 `b78d65a0f23047791a7ab58e1da3bd14f0428dc1611c338e8b0dd290acb3284e`.
+
+The obsolete `test_simple_cumsum` FP32 census exception is now removed. With
+the normal strict plugin loaded from this checkout, the unchanged method passes
+on CPU in 1.27 seconds and on RK3588 in 18.66 seconds under
+`DEFAULT_FLOAT=HALF`; no backend dtype support changed. Focused expected
+coverage is therefore `199/40/173/13`, while `198/40/174/13` remains the last
+complete uncached census until the next full run.
