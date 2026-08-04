@@ -6,6 +6,7 @@ from enum import Enum, IntEnum
 from tinygrad.dtype import dtypes, DType
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
+from tinygrad.renderer.rockchip.access import RKAccessMap
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum):
@@ -307,12 +308,15 @@ class RKReformatPlan:
   """One logical static physical-layout transform, before selecting engine tasks."""
   out: RKTensorRef
   src: RKTensorRef
-  mapping: tuple[int, ...]
+  access: RKAccessMap
   fill: float = 0.0
   def __post_init__(self):
     out_count, src_count = math.prod(self.out.layout.logical_shape), math.prod(self.src.layout.logical_shape)
-    if len(self.mapping) != out_count or any(index < -1 or index >= src_count for index in self.mapping):
+    mapping = self.access.expand()
+    if len(mapping) != out_count or any(index < -1 or index >= src_count for index in mapping):
       raise ValueError("RKReformatPlan mapping is outside its logical surfaces")
+  @property
+  def mapping(self) -> tuple[int, ...]: return self.access.expand()
 
 @dataclass(frozen=True)
 class RKMultiSourceReformatPlan:

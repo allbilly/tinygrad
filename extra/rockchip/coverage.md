@@ -3425,3 +3425,23 @@ The local register audit also closed a misleading dtype lead: the shared old
 independently decoded CNA input contract exposes int8, int16, and FP16—not an
 int32 input surface. Therefore the compiler does not add an speculative CNA
 int32-to-FP16 conversion after the already archived direct-DPU timeout.
+
+## Compact semantic reformat access maps
+
+`RKReformatPlan` no longer retains one expanded source index for every logical
+output as its semantic representation. The new `access.py` layer recognizes
+identity, affine (including zero-stride broadcast), contiguous padding,
+periodic, and piecewise-affine maps, with an explicit static-selector map only
+when none of those compact forms describes the transform. The compatibility
+`mapping` property expands the semantic map only for existing physical
+legalizers, so this milestone deliberately leaves task schedules and RKImage
+bytes unchanged while creating the boundary needed for direct layout-aware
+legalization.
+
+Compiler coverage proves flip uses an affine map, transpose a piecewise-affine
+map, repeat a periodic map, and one-dimensional padding a padding map. All 151
+compiler/image tests pass with 42 subtests; full mypy covers 228 source files
+and full Ruff is clean. Strict native-only RK3588 regressions pass the affine
+movement, static-padding, and repeat/roll families (the last was also rerun
+alone to confirm a clean one-test process exit). No TestOps behavior changes,
+so the authoritative tally remains `193/40/179/13`.

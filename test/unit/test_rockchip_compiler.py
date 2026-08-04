@@ -9,7 +9,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan,
   RKCopyStage, RKDPUProgram,
   RKEpilogue, RKEngine,
-  RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling,
+  RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan, RKLegalizedReformat,
   RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_cmac_task, emit_dpu, emit_program, emit_reduce,
@@ -1519,6 +1519,20 @@ class TestDPUCompiler(unittest.TestCase):
         assert isinstance(legalized,RKLegalizedReformat)
         self.assertIsInstance(legalized.plan,RKReformatPlan)
         self.assertEqual(hashlib.sha256(encode_image(emit_reformat(legalized))).hexdigest(),expected)
+        self.assertFalse(contains_uop(legalized))
+
+  def test_semantic_reformat_retains_compact_access_maps(self):
+    cases = ((Tensor.empty(32,dtype=dtypes.half).flip(0).contiguous(),RKAffineMap),
+             (Tensor.empty(8,8,dtype=dtypes.half).T.contiguous(),RKPiecewiseAffineMap),
+             (Tensor.empty(3,3,dtype=dtypes.half).repeat(3,3,4).contiguous(),RKPeriodicMap),
+             (Tensor.empty(8,dtype=dtypes.half).pad((2,3)).contiguous(),RKPadMap))
+    for expression,access_type in cases:
+      with self.subTest(access_type=access_type.__name__):
+        legalized = lower_reformat_result(sink(expression)).plan
+        self.assertIsInstance(legalized,RKLegalizedReformat)
+        assert isinstance(legalized,RKLegalizedReformat) and isinstance(legalized.plan,RKReformatPlan)
+        self.assertIsInstance(legalized.plan.access,access_type)
+        self.assertEqual(len(legalized.plan.mapping),math.prod(legalized.plan.out.layout.logical_shape))
         self.assertFalse(contains_uop(legalized))
 
   def test_windowed_reformat_uses_one_compact_64_output_contract(self):

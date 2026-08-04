@@ -69,6 +69,8 @@ specificity before telemetry is emitted.
 The compiler is split by responsibility under `renderer/rockchip/`:
 `ir.py` owns the typed UOp-free plans, `expr.py` owns math recipes and UOp
 canonicalization, `affine.py` owns affine maps and reject fingerprints,
+`access.py` owns compact semantic identity, affine, padding, periodic,
+piecewise-affine, and final static-selector access maps,
 `emit.py` owns DPU/CMAC/CONV/PPU register emission, and `image.py` owns the versioned
 image codec and relocations. The package entry contains resource planning,
 ordered legalization, and renderer integration. Register emission imports no

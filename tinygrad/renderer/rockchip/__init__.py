@@ -21,6 +21,9 @@ from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, 
   encode_image, decode_image as decode_image,
   patch_image as patch_image, validate_image as validate_image)
 from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint as rk_fingerprint
+from tinygrad.renderer.rockchip.access import (RKAccessMap as RKAccessMap, RKIdentityMap as RKIdentityMap, RKAffineMap as RKAffineMap,
+  RKPadMap as RKPadMap, RKPeriodicMap as RKPeriodicMap, RKAffineSegment as RKAffineSegment,
+  RKPiecewiseAffineMap as RKPiecewiseAffineMap, RKStaticSelectorMap as RKStaticSelectorMap, compact_access_map)
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 from tinygrad.renderer.rockchip.conv import plan_conv_cbuf as plan_conv_cbuf, legalize_conv_plan as legalize_conv_plan
 from tinygrad.renderer.rockchip.contract import legalize_contraction_plan as legalize_contraction_plan
@@ -246,7 +249,7 @@ def _finish_program(steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], scr
 
 def _legalized_reformat(out:RKTensorRef, src:RKTensorRef, mapping:tuple[int, ...], fill:float,
                         kind:RKReformatKind, program:RKProgram) -> RKLegalizedReformat:
-  return RKLegalizedReformat(RKReformatPlan(out, src, mapping, fill), kind, program)
+  return RKLegalizedReformat(RKReformatPlan(out, src, compact_access_map(mapping), fill), kind, program)
 
 def _periodic_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
                                scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
