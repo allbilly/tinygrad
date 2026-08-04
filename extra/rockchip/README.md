@@ -1875,3 +1875,13 @@ The unchanged `test_multicat` remains correct but measures 113.04 seconds,
 essentially unchanged from 112.20 seconds, proving reset/device work dominates
 this workload. This milestone claims resource-lifecycle cleanup, not a speed or
 coverage gain; the expected tally remains `203/40/169/13`.
+
+## Physical cost module
+
+Physical-plan cost analysis now lives in `renderer/rockchip/cost.py` rather
+than the lowering entry module. The estimator still consumes only legalized
+`RKProgram` work and the emitted `RKImage`; task, command, reset, constant,
+scratch, traffic, and MAC accounting are unchanged. This is a mechanical
+module-boundary milestone with no compiler legality, plan selection, register,
+runtime, or coverage change. All 160 compiler/image tests plus 59 subtests
+pass with `-n12`, mypy checks 229 source files, and Ruff is clean.

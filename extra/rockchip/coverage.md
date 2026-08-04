@@ -3907,3 +3907,13 @@ it, so no performance improvement is claimed: per-stage reset and device work
 dominate. The value of this milestone is bounded resource lifetime—323 stages
 no longer cause 646 temporary GEM allocations. Coverage remains the focused
 expected `203/40/169/13`, with `202/40/170/13` authoritative.
+
+## Physical cost module extraction
+
+The physical cost model has been moved unchanged from the monolithic lowering
+module into `renderer/rockchip/cost.py`. It continues to estimate legalized
+task programs from their emitted image and retains the exact task, command,
+reset, constants, scratch, traffic, and MAC calculations used by every plan
+ceiling and candidate comparison. Compiler/image tests remain 160 passing plus
+59 passing subtests, mypy passes 229 source files, and Ruff is clean. This is
+an architecture-only milestone; it claims no native-method transition.
