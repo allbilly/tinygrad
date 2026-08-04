@@ -384,6 +384,9 @@ class TestRockchip(unittest.TestCase):
         data = np.resize(np.array([1,-2,3,-4,5,-6,7,-8,9,-10],dtype=np.float16),count)
         actual = Tensor(data,device="ROCKCHIP").realize().cumsum(0).realize().numpy()
         np.testing.assert_equal(actual,np.cumsum(data,dtype=np.float16))
+    data = np.random.default_rng(43).uniform(-2,2,(20,30)).astype(np.float16)
+    actual = Tensor(data,device="ROCKCHIP").realize().cumsum(0).realize().numpy()
+    np.testing.assert_equal(actual,np.cumsum(data.astype(np.float32),axis=0).astype(np.float16))
 
   def test_windowed_affine_average_native_cmac(self):
     data = np.linspace(-1,1,2*2*11*28,dtype=np.float16).reshape(2,2,11,28)

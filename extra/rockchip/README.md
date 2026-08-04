@@ -1587,3 +1587,16 @@ its 20-element case and now rejects the distinct strided 20x30 axis-zero prefix
 at the unchanged 512-lane generic selector contract. This milestone therefore
 claims no complete-method gain; focused expected coverage remains
 `197/40/175/13`.
+
+Grouped structural prefixes now receive their own bounded compiler contract:
+at most one million inspected coordinates, 608 source lanes per CMAC window,
+64 compact outputs per task, and the unchanged 400-task/2 MiB physical limits.
+The selector proof requires every group to grow exactly from `[x0]` through
+`[x0,...,xN]`; arbitrary masks retain the old affine budgets.
+
+The complete unchanged `test_cumsum` passes natively in 107.09 seconds. Its
+20x30 axes cost 16 and 10 tasks; the 20x30x40 inner-axis plan uses 377 tasks but
+only 57,696 unique constant bytes. A permanent random axis-zero boundary proves
+the 608-lane strided window. Focused expected coverage is now
+`198/40/174/13`; the authoritative census remains `195/40/177/13` pending a
+new complete run.

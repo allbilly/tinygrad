@@ -3560,6 +3560,32 @@ process. The full unchanged `test_cumsum` run used `DEV=ROCKCHIP`,
 `ROCKCHIP_FALLBACK=0`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`: it passes the
 former N=20 blocker and then rejects the axis-zero 20x30 case because one
 strided prefix spans more than the separately proven 512-lane generic window.
-The guard remains for prefixes above 32 until a direct tiled prefix planner is
-proven. No method-level count changes; the focused expectation remains
-`197 native / 40 frontend / 175 failed / 13 skipped`.
+At that intermediate checkpoint, prefixes above 32 remained guarded pending a
+direct tiled planner. It changed no method-level count, leaving the focused
+expectation at `197 native / 40 frontend / 175 failed / 13 skipped`.
+
+## Grouped compact cumulative sums
+
+The exact static selector proof now recognizes multiple independent prefixes:
+within every reduction group, row `i` must contain precisely the previous row
+plus one new source coordinate. Only that structure may use the enlarged
+one-million-coordinate inspection fence and the hardware-proven 608-lane CMAC
+window. Ordinary affine masks remain capped at 65,536 selected visits and their
+existing narrower windows.
+
+The relevant physical costs are:
+
+| shape / axis | tasks | constants | scratch |
+|---|---:|---:|---:|
+| 20x30 / 0 | 16 | 416,080 | 1,216 |
+| 20x30 / 1 | 10 | 108,544 | 0 |
+| 20x30x40 / 2 | 377 | 57,696 | 192 |
+
+The largest program stays below 400 tasks because compact 64-output CMAC tiles
+share periodic selector payloads. The full unchanged `test_cumsum` passes in
+107.09 seconds with `DEV=ROCKCHIP`, `ROCKCHIP_FALLBACK=0`, `FORWARD_ONLY=1`,
+and `DEFAULT_FLOAT=HALF`. A random 20x30 axis-zero regression separately pins
+the 608-lane strided window after mixed DPU/CMAC/PPU/CNA execution. This adds
+one focused complete method, giving an expected `198 native / 40 frontend /
+174 failed / 13 skipped`; the authoritative uncached baseline remains
+`195/40/177/13` until rerun.

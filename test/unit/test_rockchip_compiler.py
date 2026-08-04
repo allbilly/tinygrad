@@ -1461,6 +1461,20 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(plan_cost(result.plan).task_count,3)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_grouped_prefix_sums_use_bounded_compact_cmac_tiles(self):
+    cases = (((20,30),0,16),((20,30),1,16),((20,30,40),2,400))
+    for shape,axis,task_limit in cases:
+      with self.subTest(shape=shape,axis=axis):
+        result = lower_affine_reduce_result(sink(Tensor.empty(*shape,dtype=dtypes.half).cumsum(axis)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        cost = plan_cost(result.plan)
+        self.assertLessEqual(cost.task_count,task_limit)
+        self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+        self.assertTrue(all(not isinstance(step,RKCMACTask) or step.compact_output for step in result.plan.steps))
+        self.assertFalse(contains_uop(result.plan))
+
   def test_global_mean_folds_scale_into_cmac_weights(self):
     result = lower_add_reduce_result(sink(Tensor.empty(360,dtype=dtypes.half).mean()))
     self.assertIsInstance(result.plan, RKProgram)

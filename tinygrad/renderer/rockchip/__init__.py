@@ -38,6 +38,9 @@ RK_MAX_CMAC_SELECTOR_WINDOW = 1504
 # A dense 64x64 transpose pack proves a 2,048-lane CMAC source window; keep ordinary affine selectors on their narrower contract.
 RK_MAX_TILED_CMAC_SELECTOR_WINDOW = 2048
 RK_MAX_TILED_CONTRACT_VISITS = 4*RK_MAX_AFFINE_VISITS
+# One compact strided-prefix task is exact through a 608-lane source window; this also bounds compiler coordinate inspection.
+RK_MAX_PREFIX_WINDOW = 608
+RK_MAX_PREFIX_VISITS = 1_000_000
 
 def _fp16_exact(value:float) -> bool:
   try: rounded = struct.unpack("<e", struct.pack("<e", value))[0]
@@ -1699,8 +1702,11 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   # A statically masked reduction may describe identity padding that never reaches CMAC. Inspect a bounded amount of that
   # logical padding, then apply the unchanged affine-visit budget to the selected source terms below.
   logical_visits = output_count*reduction_count
-  visit_limit = RK_MAX_STATIC_MASK_VISITS if condition is not None else RK_MAX_AFFINE_VISITS
-  if not 1 <= output_count <= 8192 or not 2 <= input_count <= 65536 or logical_visits > visit_limit:
+  prefix_candidate = condition is not None and not epilogue and output_count == input_count and len(red_axes) == 1 and reduction_count <= 40
+  visit_limit = RK_MAX_PREFIX_VISITS if prefix_candidate else RK_MAX_STATIC_MASK_VISITS if condition is not None else RK_MAX_AFFINE_VISITS
+  output_limit = 64*RK_MAX_PROGRAM_STAGES if prefix_candidate else 8192
+  input_limit = output_limit if prefix_candidate else 65536
+  if not 1 <= output_count <= output_limit or not 2 <= input_count <= input_limit or logical_visits > visit_limit:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"affine CMAC surface is {output_count}x{input_count}", reduce.op)
   selectors:list[list[int]] = [[] for _ in range(output_count)]
   seen:set[int] = set()
@@ -1724,10 +1730,11 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
   if seen != set(range(output_count)):
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "affine CMAC output has holes", Ops.INDEX)
   selected_visits = sum(map(len, selectors))
-  if selected_visits > RK_MAX_AFFINE_VISITS:
+  prefix_scan = prefix_candidate and output_count%reduction_count == 0 and all(len(row) == index%reduction_count+1 and
+    (index%reduction_count == 0 or row[:-1] == selectors[index-1]) for index,row in enumerate(selectors))
+  if selected_visits > (RK_MAX_PREFIX_VISITS if prefix_scan else RK_MAX_AFFINE_VISITS):
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"affine CMAC selects {selected_visits} source terms from {logical_visits} logical visits", reduce.op)
-  prefix_scan = output_count == input_count and all(row == list(range(index+1)) for index,row in enumerate(selectors))
   if prefix_scan and output_count <= 32 and prepare is None and _fp16_exact(scale):
     align = 32
     packed = RKArg(RKBufferKind.SCRATCH,0)
@@ -1739,9 +1746,6 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
       RKTensorRef(packed,lhs_layout),_cmac_weight_ref(0,output_count,align,RKBufferKind.CONSTANT,align),reduce.op,
       _cmac_selection_payload(selectors,align,align,scale),compact_output=True)
     return _native(_finish_program([prep,contract],scratch))
-  if prefix_scan and output_count > 32:
-    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
-      f"affine ADD prefix scan output {output_count} exceeds the stable compact-task contract", reduce.op)
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   initial_scratch = () if prepare is None else prepare.scratch
   reduced = output
@@ -1750,7 +1754,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
     initial_scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
   program = _sparse_cmac_pipeline(reduced, source, input_count, selectors, scale, initial_scratch, store.src[0].dtype) if \
     input_count <= 512 and output_count <= 128 else (None if fp32_out else _windowed_cmac_pipeline(
-      reduced, source, selectors, scale, initial_scratch, direct_count=input_count))
+      reduced, source, selectors, scale, initial_scratch, direct_count=input_count,
+      max_window=RK_MAX_PREFIX_WINDOW if prefix_scan else 512))
   if program is None and struct.unpack("<e", struct.pack("<e", scale))[0] != scale:
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"two-level affine scale {scale} is not exactly FP16", stored.op)
   if program is None: program = _two_level_selector_program(reduced, source, input_count, selectors, initial_scratch, scale)
