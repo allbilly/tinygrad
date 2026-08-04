@@ -40,6 +40,14 @@ class TestRockchip(unittest.TestCase):
     actual = source.maximum(dtypes.int.min).realize().numpy()
     np.testing.assert_equal(actual,values)
 
+  def test_bool_fill_copy_and_or_use_int8_dpu(self):
+    lhs = np.resize(np.array([True,False,False,True,False,True],dtype=np.bool_),65)
+    rhs = np.resize(np.array([True,True,False,False,True,False,False],dtype=np.bool_),65)
+    tlhs,trhs = Tensor(lhs,device="ROCKCHIP").realize(),Tensor(rhs,device="ROCKCHIP").realize()
+    np.testing.assert_equal(Tensor.full((65,),True,dtype=dtypes.bool,device="ROCKCHIP").realize().numpy(),np.ones(65,dtype=np.bool_))
+    np.testing.assert_equal(tlhs.maximum(False).realize().numpy(),lhs)
+    np.testing.assert_equal(tlhs.maximum(trhs).realize().numpy(),np.logical_or(lhs,rhs))
+
   def test_dense_fp16_row_sum_native_cmac(self):
     data = np.linspace(-2, 2, 8*32, dtype=np.float16).reshape(8,32)
     actual = Tensor(data, device="ROCKCHIP").realize().sum(axis=1).realize().numpy()

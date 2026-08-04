@@ -1462,4 +1462,11 @@ A typed `RKCopyStage` selects int32 MRDMA, DPU process, and WDMA precision while
 bypassing BS, BN, and EW semantics. A 65-value boundary vector containing both
 signed extrema is bit-exact. This lets `maximum(x, INT_MIN)` simplify to a
 single native DPU copy; `test_maximum` now proceeds to its public-bool case,
-which remains an honest `unsupported_output_dtype` rejection.
+which was the next hardware probe.
+
+All-int8 DPU operation proves that public bool storage itself is valid. Typed
+bool fill and identity stages use 16 lanes per atom with BS/BN/EW bypassed;
+bool `OR` maps to the DPU's int8 MAX engine. Sixty-five-lane fill, copy, and OR
+boundaries are bit-exact. This is distinct from the archived FP16-mask-to-int8
+conversion timeout. `test_maximum` now passes every bool subcase and advances
+to its mixed int32/FP16 case, which remains an unsupported input conversion.

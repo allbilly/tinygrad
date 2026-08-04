@@ -335,7 +335,7 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
   if len(stores) != 1: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, f"expected one store, found {len(stores)}", Ops.STORE)
   store = stores[0]
   if store.src[0].op is not Ops.INDEX: return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, "output is not an indexed surface", store.src[0].op)
-  if store.src[0].dtype not in (dtypes.half, dtypes.int, dtypes.float):
+  if store.src[0].dtype not in (dtypes.bool, dtypes.half, dtypes.int, dtypes.float):
     return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, f"output dtype {store.src[0].dtype.name}", store.src[0].op)
   out_index, out_param = store.src[0].src[1], store.src[0].src[0]
   if out_param.op is not Ops.PARAM or out_index.op not in (Ops.RANGE, Ops.CONST) or out_param.src[0].op is not Ops.CONST:
@@ -346,9 +346,17 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, f"unsupported contiguous output extent {count}", out_index.op)
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   identity = _strip_casts(store.src[1])
-  if store.src[0].dtype is dtypes.int and identity.op is Ops.INDEX and identity.dtype is dtypes.int and \
+  if store.src[0].dtype in (dtypes.bool,dtypes.int) and identity.op is Ops.INDEX and identity.dtype is store.src[0].dtype and \
      identity.src[0].op is Ops.PARAM and identity.src[1].key == out_index.key:
-    return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].arg.slot),count,dtypes.int),)))
+    return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].arg.slot),count,store.src[0].dtype),)))
+  if store.src[0].dtype is dtypes.bool:
+    if identity.op is Ops.CONST:
+      return _native(RKDPUProgram((RKCopyStage(output,bool(identity.arg),count,dtypes.bool),)))
+    if identity.op is Ops.OR and all(u.op is Ops.INDEX and u.dtype is dtypes.bool and u.src[0].op is Ops.PARAM and
+                                     u.src[1].key == out_index.key for u in identity.src):
+      lhs,rhs = (RKArg(RKBufferKind.ARG,u.src[0].arg.slot) for u in identity.src)
+      return _native(RKDPUProgram((RKALUStage(Ops.MAX,output,lhs,rhs,count,dtypes.bool),)))
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE,"non-identity bool output",store.src[1].op)
   input_indexes = [u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   # Rejected WIP: DATA_FORMAT in_precision=precision_float32 exists in the register enum, but a direct FP32->FP16 ADD timed out on RK3588.
   # The exact typed-stage/emitter probe is preserved as wip-native-fp32-dpu-input-timeout.patch; do not restore 2607's CPU narrowing instead.

@@ -77,12 +77,12 @@ class RKFusedALUStage:
 @dataclass(frozen=True)
 class RKCopyStage:
   dst: RKArg
-  src: RKArg
+  src: RKArg|bool
   count: int
   dtype: DType
   def __post_init__(self):
-    if self.dtype is not dtypes.int: raise ValueError("RK native copy probe only supports int32")
-    if not 0 < self.count <= 16384: raise ValueError("RK int32 copy extent exceeds DPU width")
+    if self.dtype not in (dtypes.bool,dtypes.int): raise ValueError("RK native copy only supports bool or int32")
+    if not 0 < self.count <= 16384: raise ValueError("RK native copy extent exceeds DPU width")
 
 @dataclass(frozen=True)
 class RKMaskStage:

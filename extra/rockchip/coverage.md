@@ -3257,3 +3257,16 @@ This is raw native identity movement, not integer ALU emulation. It completes
 the `maximum(x, INT_MIN)` simplified subcase, while the unchanged method now
 stops at its later public-bool output. The authoritative method tally is still
 `187/40/185/13` pending a complete uncached census.
+
+## Native bool storage, fill, copy, and OR
+
+An all-int8 DPU path proves that the earlier public-mask timeout was not a
+general bool-WDMA limitation. Bool identity and immutable fill use the same
+typed `RKCopyStage` at 16 lanes per 16-byte atom. Bool `OR`, which is the
+canonical form of `maximum` on bool tensors, lowers to an int8 DPU MAX stage.
+Fill, identity, and pairwise OR all pass 65-lane RK3588 boundary tests exactly.
+
+No FP16 mask conversion was re-enabled: that register path remains rejected
+and archived. The unchanged `test_maximum` now passes all bool subcases and
+first rejects at its following mixed int32/FP16 maximum. A full census has not
+yet run, so the authoritative method tally remains `187/40/185/13`.

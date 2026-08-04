@@ -25,7 +25,7 @@ def _command(target:int, reg:int, value:int) -> int:
 
 def _emit_mask(stage_idx:int, plan:RKMaskStage) -> RKStage:
   width = (plan.count+7)//8-1
-  # Rejected WIP: setting out_precision=int8 for a final public bool mask timed out on RK3588; exact probe is archived separately.
+  # Rejected WIP: direct FP16 mask-result conversion to int8 timed out. Native bool copy and OR instead use int8 throughout.
   regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5), (rk.REG_DPU_DATA_FORMAT, 0x48000002),
     (rk.REG_DPU_DATA_CUBE_WIDTH, width), (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0),
     (rk.REG_DPU_DATA_CUBE_CHANNEL, 0x70007), (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53),
@@ -120,7 +120,8 @@ def _emit_lut(stage_idx:int, plan:RKLUTStage) -> RKStage:
 
 def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   if target is not RKTarget.RK3588: raise ValueError(f"unsupported Rockchip target {target}")
-  constants, constant_offsets, stages = bytearray(), {}, []
+  constants, stages = bytearray(), []
+  constant_offsets:dict[tuple[object, ...], int] = {}
   def shifted(value:RKArg|float, count:int) -> RKArg|float:
     return RKArg(value.kind,value.index,value.addend+count*2) if isinstance(value,RKArg) else value
   plans:list[RKDPUStage] = []
@@ -178,47 +179,60 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       stages.append(RKStage(RKEngine.DPU, tuple(fused_cmds), tuple(fused_relocs), RK_STAGE_RESET))
       continue
     if isinstance(plan,RKCopyStage):
-      width = (plan.count+3)//4-1
+      precision, lanes = (0,16) if plan.dtype is dtypes.bool else (4,4)
+      width = (plan.count+lanes-1)//lanes-1
+      source = plan.src
+      if isinstance(source,bool):
+        key = ("bool",source,plan.count)
+        if key not in constant_offsets:
+          constant_offsets[key] = len(constants)
+          constants.extend(bytes((int(source),))*((plan.count+15)//16*16))
+        source = RKArg(RKBufferKind.CONSTANT,constant_offsets[key])
       regs = ((rk.REG_DPU_S_POINTER,0xe),(rk.REG_DPU_FEATURE_MODE_CFG,0x1e5),
-        (rk.REG_DPU_DATA_FORMAT,(4<<29)|(4<<26)|4),(rk.REG_DPU_DATA_CUBE_WIDTH,width),
-        (rk.REG_DPU_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(rk.REG_DPU_DATA_CUBE_CHANNEL,0x30003),
+        (rk.REG_DPU_DATA_FORMAT,(precision<<29)|(precision<<26)|precision),(rk.REG_DPU_DATA_CUBE_WIDTH,width),
+        (rk.REG_DPU_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
+        (rk.REG_DPU_DATA_CUBE_CHANNEL,((lanes-1)<<16)|(lanes-1)),
         (rk.REG_DPU_BS_CFG,0x53),(rk.REG_DPU_BN_CFG,0x53),(rk.REG_DPU_BS_ALU_CFG,0),(rk.REG_DPU_BS_MUL_CFG,0),
-        (rk.REG_DPU_BS_OW_CFG,2),(rk.REG_DPU_WDMA_SIZE_0,3),(rk.REG_DPU_WDMA_SIZE_1,width),
+        (rk.REG_DPU_BS_OW_CFG,2),(rk.REG_DPU_WDMA_SIZE_0,lanes-1),(rk.REG_DPU_WDMA_SIZE_1,width),
         (rk.REG_DPU_BN_MUL_CFG,0),(rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(rk.REG_DPU_EW_CFG,0x383),
         (rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(rk.REG_DPU_OUT_CVT_OFFSET,0),(rk.REG_DPU_OUT_CVT_SCALE,1),
         (rk.REG_DPU_OUT_CVT_SHIFT,0),(rk.REG_DPU_SURFACE_ADD,0x40))
       rdma = ((rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
-        (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,3),
-        (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,1),(rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,0x27881))
+        (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
+        (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,1),
+        (rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,(precision<<15)|(15<<11)|(precision<<5)|1))
       cmds = [_command(_TARGET_DPU,*x) for x in regs]+[_command(_TARGET_DPU_RDMA,*x) for x in rdma]
       relocs = []
       for target_id,reg,arg in ((_TARGET_DPU,rk.REG_DPU_DST_BASE_ADDR,plan.dst),
-                                (_TARGET_DPU_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,plan.src)):
+                                (_TARGET_DPU_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,source)):
         cmds.append(_command(target_id,reg,0))
         relocs.append(RKReloc(stage_idx,len(cmds)-1,arg.kind,arg.index,arg.addend))
       cmds.append(_command(_TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18))
       stages.append(RKStage(RKEngine.DPU,tuple(cmds),tuple(relocs),RK_STAGE_RESET))
       continue
     if not isinstance(plan, RKALUStage): raise ValueError(f"unimplemented Rockchip stage {type(plan).__name__}")
+    bool_out = plan.out_dtype is dtypes.bool
     material_count = plan.count*2 if plan.out_dtype is dtypes.int else (32 if plan.out_dtype is dtypes.float else plan.count)
     lhs, rhs = materialize(plan.lhs, material_count), materialize(plan.rhs, material_count)
-    width = ((plan.count*2 if plan.out_dtype is dtypes.int else plan.count)+7)//8-1
+    width = ((plan.count*2 if plan.out_dtype is dtypes.int else plan.count)+(15 if bool_out else 7))//(16 if bool_out else 8)-1
     wide_out = plan.out_dtype in (dtypes.int, dtypes.float)
-    lanes = 8 if wide_out or plan.count >= 8 else plan.count
-    out_precision = 4 if plan.out_dtype is dtypes.int else (5 if plan.out_dtype is dtypes.float else 2)
+    lanes = 16 if bool_out else (8 if wide_out or plan.count >= 8 else plan.count)
+    out_precision = 0 if bool_out else (4 if plan.out_dtype is dtypes.int else (5 if plan.out_dtype is dtypes.float else 2))
     dpu_regs = ((rk.REG_DPU_S_POINTER, 0xe), (rk.REG_DPU_FEATURE_MODE_CFG, 0x1e5),
-      (rk.REG_DPU_DATA_FORMAT, (out_precision<<29)|(2<<26)|2), (rk.REG_DPU_DATA_CUBE_WIDTH, width),
+      (rk.REG_DPU_DATA_FORMAT, (out_precision<<29)|((0 if bool_out else 2)<<26)|(0 if bool_out else 2)),
+      (rk.REG_DPU_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0),
       (rk.REG_DPU_DATA_CUBE_CHANNEL, ((lanes-1)<<16)|(lanes-1)),
       (rk.REG_DPU_BS_CFG, 0x53), (rk.REG_DPU_BN_CFG, 0x53), (rk.REG_DPU_BS_ALU_CFG, 0), (rk.REG_DPU_BS_MUL_CFG, 0),
       (rk.REG_DPU_BS_OW_CFG, 2), (rk.REG_DPU_WDMA_SIZE_0, 3 if wide_out else lanes-1), (rk.REG_DPU_WDMA_SIZE_1, width),
-      (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0), (rk.REG_DPU_EW_CFG, _EW_CFG[plan.op]),
+      (rk.REG_DPU_BN_MUL_CFG, 0), (rk.REG_DPU_BN_RELUX_CMP_VALUE, 0),
+      (rk.REG_DPU_EW_CFG, (1<<22)|0x2c0 if bool_out else _EW_CFG[plan.op]),
       (rk.REG_DPU_EW_CVT_SCALE_VALUE, 1), (rk.REG_DPU_OUT_CVT_OFFSET, plan.out_cvt_offset),
       (rk.REG_DPU_OUT_CVT_SCALE, 0 if plan.out_dtype is dtypes.float else (1 if plan.op is Ops.FDIV or
-       plan.out_dtype is dtypes.int else 0x10001)), (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
+       plan.out_dtype in (dtypes.bool,dtypes.int) else 0x10001)), (rk.REG_DPU_OUT_CVT_SHIFT, 0), (rk.REG_DPU_SURFACE_ADD, 0x40))
     rdma_regs = ((rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xe), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, width),
       (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0), (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, lanes-1),
-      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, _ERDMA_FP16))
+      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG, (1<<30)|(1<<2) if bool_out else _ERDMA_FP16))
     cmds = [_command(_TARGET_DPU, *x) for x in dpu_regs] + [_command(_TARGET_DPU_RDMA, *x) for x in rdma_regs]
     relocs = []
     for target_id, reg, arg in ((_TARGET_DPU, rk.REG_DPU_DST_BASE_ADDR, plan.dst),
@@ -226,7 +240,8 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
                                 (_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, rhs)):
       cmds.append(_command(target_id, reg, 0))
       relocs.append(RKReloc(stage_idx, len(cmds)-1, arg.kind, arg.index, arg.addend))
-    cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17841 if plan.op is Ops.FDIV else 0x17849),
+    cmds += [_command(_TARGET_DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
+                      0x7801 if bool_out else (0x17841 if plan.op is Ops.FDIV else 0x17849)),
              _command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
     stages.append(RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), RK_STAGE_RESET))
   return RKImage(target, tuple(stages), program.scratch, bytes(constants))
