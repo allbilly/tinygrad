@@ -9,7 +9,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKConvTask, RKConvPlan, RKCopyStage, RKDPUProgram,
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling,
-  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKLegalizedReformat, RKReformatKind, RK_STAGE_RESET,
+  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan, RKLegalizedReformat,
+  RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
@@ -1428,6 +1429,38 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual([stage.engine for stage in emit_reformat(plan).stages], [RKEngine.DPU,RKEngine.DPU,RKEngine.CMAC])
     self.assertFalse(contains_uop(plan))
 
+  def test_fp32_reformat_uses_bit_exact_aligned_bypass_atoms(self):
+    source = Tensor.empty(2,2,4,dtype=dtypes.float).realize()
+    result = lower_native(sink(source.permute(1,0,2).contiguous()))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKLegalizedReformat)
+    assert isinstance(result.plan,RKLegalizedReformat)
+    stages = result.plan.program.steps[0].stages
+    self.assertEqual(len(stages),4)
+    self.assertTrue(all(isinstance(stage,RKCopyStage) and stage.dtype is dtypes.float and
+                        stage.dst.addend%16 == stage.src.addend%16 == 0 for stage in stages))
+    self.assertEqual(plan_cost(result.plan.program).estimated_macs,0)
+    self.assertFalse(contains_uop(result.plan))
+
+    unaligned = lower_native(sink(Tensor.empty(4,4,dtype=dtypes.float).realize().T.contiguous()))
+    self.assertIs(unaligned.kind,RKLowerKind.UNSUPPORTED)
+    self.assertIsNotNone(unaligned.reject)
+    assert unaligned.reject is not None
+    self.assertIs(unaligned.reject.kind,RKRejectKind.UNALIGNED_ROW)
+
+  def test_fp16_multi_source_stack_keeps_semantic_map(self):
+    sources = tuple(Tensor.empty(5,6,3,dtype=dtypes.half).realize() for _ in range(3))
+    for dim in range(-1,3):
+      with self.subTest(dim=dim):
+        result = lower_native(sink(Tensor.stack(*sources,dim=dim)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKLegalizedReformat)
+        assert isinstance(result.plan,RKLegalizedReformat)
+        self.assertIsInstance(result.plan.plan,RKMultiSourceReformatPlan)
+        self.assertEqual(len(result.plan.plan.mapping),270)
+        self.assertLessEqual(plan_cost(result.plan.program).task_count,9)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_semantic_reformat_split_preserves_frozen_images(self):
     cases = (
       (Tensor.empty(2,3,8,dtype=dtypes.half).permute(1,0,2).contiguous(),
@@ -1678,7 +1711,7 @@ class TestDPUCompiler(unittest.TestCase):
   def test_renderer_classifies_rejections(self):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
-                 (Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)), "unsupported_layout"),
+                 (Tensor.empty(4,4,dtype=dtypes.float).T.contiguous(), "unaligned_row"),
                  (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,128,dtype=dtypes.half), "plan_stage_limit"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
@@ -1688,11 +1721,11 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual((result.kind, result.plan, result.reject), (RKLowerKind.NOT_APPLICABLE, None, None))
 
   def test_typed_reject_has_stable_slot_independent_fingerprint(self):
-    expressions = [Tensor.cat(Tensor.empty(4,4,dtype=dtypes.half),Tensor.empty(4,4,dtype=dtypes.half)) for _ in range(2)]
+    expressions = [Tensor.empty(4,4,dtype=dtypes.float).T.contiguous() for _ in range(2)]
     sinks = [sink(expression) for expression in expressions]
     results = [lower_native(graph) for graph in sinks]
     self.assertTrue(all(result.plan is None and result.reject is not None for result in results))
-    self.assertTrue(all(result.reject.kind is RKRejectKind.UNSUPPORTED_LAYOUT for result in results if result.reject is not None))
+    self.assertTrue(all(result.reject.kind is RKRejectKind.UNALIGNED_ROW for result in results if result.reject is not None))
     self.assertEqual(results[0].reject.fingerprint, results[1].reject.fingerprint)
     self.assertEqual(results[0].reject.fingerprint, rk_fingerprint(sinks[0]))
 

@@ -180,7 +180,7 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       stages.append(RKStage(RKEngine.DPU, tuple(fused_cmds), tuple(fused_relocs), RK_STAGE_RESET))
       continue
     if isinstance(plan,RKCopyStage):
-      precision, lanes = (0,16) if plan.dtype is dtypes.bool else (4,4)
+      precision, lanes = ((0,16) if plan.dtype is dtypes.bool else (4,4) if plan.dtype is dtypes.int else (5,4))
       width = (plan.count+lanes-1)//lanes-1
       source = plan.src
       if isinstance(source,bool):

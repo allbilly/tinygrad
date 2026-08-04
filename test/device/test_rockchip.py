@@ -40,6 +40,19 @@ class TestRockchip(unittest.TestCase):
     actual = source.maximum(dtypes.int.min).realize().numpy()
     np.testing.assert_equal(actual,values)
 
+  def test_fp32_aligned_reformat_uses_all_bypass_dpu(self):
+    values = np.array([0.0,-0.0,1.0,-1.0,np.inf,-np.inf,np.nan,3.14,1e-30,-1e30,42.5,-7.25,0.125,65504.0,2.0,-2.0],
+                      dtype=np.float32).reshape(2,2,4)
+    actual = Tensor(values,device="ROCKCHIP",dtype=dtypes.float).realize().permute(1,0,2).contiguous().realize().numpy()
+    np.testing.assert_equal(actual.view(np.uint32),values.transpose(1,0,2).view(np.uint32))
+
+  def test_fp16_multi_source_stack_uses_npu_selector(self):
+    values = tuple((np.arange(90,dtype=np.float16).reshape(5,6,3)+offset) for offset in (0,100,200))
+    sources = tuple(Tensor(value,device="ROCKCHIP",dtype=dtypes.half).realize() for value in values)
+    for dim in range(-1,3):
+      with self.subTest(dim=dim):
+        np.testing.assert_equal(Tensor.stack(*sources,dim=dim).realize().numpy(),np.stack(values,axis=dim))
+
   def test_bool_fill_copy_and_or_use_int8_dpu(self):
     lhs = np.resize(np.array([True,False,False,True,False,True],dtype=np.bool_),65)
     rhs = np.resize(np.array([True,True,False,False,True,False,False],dtype=np.bool_),65)

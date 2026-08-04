@@ -83,7 +83,7 @@ class RKCopyStage:
   count: int
   dtype: DType
   def __post_init__(self):
-    if self.dtype not in (dtypes.bool,dtypes.int): raise ValueError("RK native copy only supports bool or int32")
+    if self.dtype not in (dtypes.bool,dtypes.int,dtypes.float): raise ValueError("RK native copy only supports bool, int32, or FP32")
     if not 0 < self.count <= 16384: raise ValueError("RK native copy extent exceeds DPU width")
 
 @dataclass(frozen=True)
@@ -287,6 +287,19 @@ class RKReformatPlan:
     if len(self.mapping) != out_count or any(index < -1 or index >= src_count for index in self.mapping):
       raise ValueError("RKReformatPlan mapping is outside its logical surfaces")
 
+@dataclass(frozen=True)
+class RKMultiSourceReformatPlan:
+  """One logical static transform selecting every output from one of several surfaces."""
+  out: RKTensorRef
+  sources: tuple[RKTensorRef, ...]
+  mapping: tuple[tuple[int, int], ...]
+  def __post_init__(self):
+    if not self.sources or len(self.mapping) != math.prod(self.out.layout.logical_shape):
+      raise ValueError("RK multi-source reformat has an invalid output map")
+    if any(source < 0 or source >= len(self.sources) or index < 0 or
+           index >= math.prod(self.sources[source].layout.logical_shape) for source,index in self.mapping):
+      raise ValueError("RK multi-source reformat mapping is outside its logical surfaces")
+
 RKProgramStep = RKDPUProgram|RKContract|RKConvTask|RKReduce
 
 @dataclass(frozen=True)
@@ -301,7 +314,7 @@ class RKProgram:
 @dataclass(frozen=True)
 class RKLegalizedReformat:
   """A semantic reformat paired with one selected, UOp-free physical task schedule."""
-  plan: RKReformatPlan
+  plan: RKReformatPlan|RKMultiSourceReformatPlan
   kind: RKReformatKind
   program: RKProgram
 

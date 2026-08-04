@@ -15,7 +15,7 @@ from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKE
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKConvTask, RKConvPlan as RKConvPlan,
   RKConvSplit as RKConvSplit, RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan,
-  RKLegalizedReformat, RKProgram, RKPlanCost,
+  RKMultiSourceReformatPlan, RKLegalizedReformat, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
@@ -39,12 +39,15 @@ def _cmac_tiled_output_bytes(count:int) -> int:
   # Each logical 16-lane tile is a physical 32-lane write, including the final tile's tail.
   return (((count+15)&-16)+16)*2
 
-def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
-  stride, strides = 2, []
+def _dense_ref(slot:int, shape:tuple[int, ...], dtype:DType, kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
+  stride, strides = dtype.itemsize, []
   for extent in reversed(shape):
     strides.append(stride)
     stride *= extent
-  return RKTensorRef(RKArg(kind, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtypes.half))
+  return RKTensorRef(RKArg(kind, slot), RKLayout(shape, shape, tuple(reversed(strides)), dtype))
+
+def _dense_half_ref(slot:int, shape:tuple[int, ...], kind:RKBufferKind=RKBufferKind.ARG) -> RKTensorRef:
+  return _dense_ref(slot,shape,dtypes.half,kind)
 
 def _cmac_weight_ref(slot:int, logical_n:int, k:int, kind:RKBufferKind=RKBufferKind.ARG, physical_n:int|None=None) -> RKTensorRef:
   physical_n = max(32, (logical_n+31)&-32) if physical_n is None else physical_n
@@ -153,6 +156,9 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
           reads += stage.count*(2+4+2) + (stage.count*2 if isinstance(stage.bn,RKArg) else 0)
           writes += stage.count*2
           macs += stage.count*3
+        elif isinstance(stage,RKCopyStage):
+          reads += stage.count*stage.dtype.itemsize
+          writes += stage.count*stage.dtype.itemsize
         elif isinstance(stage, (RKMaskStage,RKLUTStage)):
           reads += stage.count*2
           writes += stage.count*2
@@ -346,7 +352,7 @@ def lower_dpu_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT, f"unsupported contiguous output extent {count}", out_index.op)
   output = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   identity = _strip_casts(store.src[1])
-  if store.src[0].dtype in (dtypes.bool,dtypes.int) and identity.op is Ops.INDEX and identity.dtype is store.src[0].dtype and \
+  if store.src[0].dtype in (dtypes.bool,dtypes.int,dtypes.float) and identity.op is Ops.INDEX and identity.dtype is store.src[0].dtype and \
      identity.src[0].op is Ops.PARAM and identity.src[1].key == out_index.key:
     return _native(RKDPUProgram((RKCopyStage(output,RKArg(RKBufferKind.ARG,identity.src[0].arg.slot),count,store.src[0].dtype),)))
   if store.src[0].dtype is dtypes.bool:
@@ -501,6 +507,14 @@ def _static_index_selected(u:UOp, index:UOp, ranges:dict[int, int]) -> bool|None
   if predicate is None: return None
   return _static_index_selected(value.src[1] if predicate else value.src[2], index, ranges)
 
+def _static_selected_index(u:UOp, ranges:dict[UOp, int]) -> UOp|None:
+  """Follow one statically decidable WHERE tree to its selected parameter INDEX."""
+  value = _strip_casts(u)
+  if value.op is Ops.INDEX and value.src[0].op is Ops.PARAM: return value
+  if value.op is not Ops.WHERE: return None
+  predicate = _static_scalar(value.src[0],ranges)
+  return None if predicate is None else _static_selected_index(value.src[1] if predicate else value.src[2],ranges)
+
 def _relu_source(u:UOp) -> UOp|None:
   if u.op is not Ops.WHERE or len(u.src) != 3: return None
   cond, positive, zero = u.src
@@ -542,8 +556,8 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       value, condition, select_true, fill = negative, cond, False, float(positive.arg)
     else: return _not_applicable()
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or len(value.src) != 2: return _not_applicable()
-  if store.src[0].dtype is not value.dtype or value.dtype not in (dtypes.bool,dtypes.half):
-    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires matching bool or FP16 input/output", store.src[0].op)
+  if store.src[0].dtype is not value.dtype or value.dtype not in (dtypes.bool,dtypes.half,dtypes.float):
+    return _unsupported(RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE, "atom reformat requires matching bool, FP16, or FP32 input/output", store.src[0].op)
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
   count, src_count = int(store.src[0].src[0].src[0].arg), int(value.src[0].src[0].arg)
   mapping = [-2] * count
@@ -593,6 +607,24 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
       program = RKProgram((RKDPUProgram((RKALUStage(Ops.MUL,output,source,mask,count,dtypes.bool),)),))
       return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.COALESCED_DPU,program))
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT,"bool movement needs an identity-or-zero static mask",Ops.INDEX)
+  if value.dtype is dtypes.float:
+    if any(src < 0 for src in mapping):
+      return _unsupported(RKRejectKind.REQUIRES_REFORMAT,"FP32 movement cannot materialize static fill lanes",Ops.WHERE)
+    runs:list[tuple[int,int,int]] = []
+    for dst,src in enumerate(mapping):
+      if runs and runs[-1][1]+runs[-1][2] == src:
+        start,run_src,length = runs[-1]
+        runs[-1] = (start,run_src,length+1)
+      else: runs.append((dst,src,1))
+    if any(dst*4%16 or src*4%16 for dst,src,_ in runs):
+      return _unsupported(RKRejectKind.UNALIGNED_ROW,"FP32 reformat copy begins outside a 16-byte atom",Ops.INDEX)
+    if len(runs) > RK_MAX_PROGRAM_STAGES:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,f"FP32 reformat needs {len(runs)} copy tasks",Ops.INDEX)
+    copy_stages = tuple(RKCopyStage(RKArg(output.kind,output.index,dst*4),RKArg(source.kind,source.index,src*4),length,dtypes.float)
+                        for dst,src,length in runs)
+    out_ref,src_ref = _dense_ref(output.index,(count,),dtypes.float),_dense_ref(source.index,(src_count,),dtypes.float)
+    return _native(_legalized_reformat(out_ref,src_ref,tuple(mapping),fill,RKReformatKind.COALESCED_DPU,
+      RKProgram((RKDPUProgram(copy_stages),))))
   stages:list[RKDPUStage] = []
   atom_reject:RKLowerResult|None = None
   dst = 0
@@ -669,6 +701,79 @@ def lower_reformat_result(sink:UOp) -> RKLowerResult:
   if 0 < src_count and 0 < count:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "static reformat selector exceeds the native cost contract", Ops.INDEX)
   return atom_reject
+
+def lower_multi_source_reformat_result(sink:UOp) -> RKLowerResult:
+  """Lower a static WHERE-selected FP16/FP32 layout from several parameter surfaces."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return _not_applicable()
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype not in (dtypes.half,dtypes.float):
+    return _not_applicable()
+  indexes = tuple(dict.fromkeys(u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM))
+  params = tuple(sorted(dict.fromkeys(index.src[0] for index in indexes),key=lambda param:param.arg.slot))
+  dtype = store.src[0].dtype
+  if len(params) < 2 or any(index.dtype is not dtype for index in indexes): return _not_applicable()
+  output_count = int(store.src[0].src[0].src[0].arg)
+  ranges = tuple(dict.fromkeys(u for root in (store.src[0].src[1],store.src[1]) for u in root.toposort()
+                               if u.op is Ops.RANGE and u.src[0].op is Ops.CONST))
+  visits = math.prod(int(u.src[0].arg) for u in ranges)
+  if visits > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,f"multi-source reformat needs {visits} coordinate visits",Ops.RANGE)
+  source_id = {param.key:index for index,param in enumerate(params)}
+  source_counts = tuple(int(param.src[0].arg) for param in params)
+  mapping:list[tuple[int,int]|None] = [None]*output_count
+  for coordinates in product(*(range(int(u.src[0].arg)) for u in ranges)):
+    point = dict(zip(ranges,coordinates))
+    dst = _static_scalar(store.src[0].src[1],point)
+    selected = _static_selected_index(store.src[1],point)
+    src = None if selected is None else _static_scalar(selected.src[1],point)
+    if not isinstance(dst,int) or isinstance(dst,bool) or selected is None or not isinstance(src,int) or isinstance(src,bool) or \
+       not 0 <= dst < output_count or selected.src[0].key not in source_id:
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"multi-source reformat has a dynamic selection",Ops.WHERE)
+    sid = source_id[selected.src[0].key]
+    if not 0 <= src < source_counts[sid] or mapping[dst] not in (None,(sid,src)):
+      return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"multi-source reformat does not cover one dense output",Ops.INDEX)
+    mapping[dst] = (sid,src)
+  if any(item is None for item in mapping):
+    return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"multi-source reformat output has holes",Ops.INDEX)
+  typed_mapping = cast(tuple[tuple[int,int], ...],tuple(mapping))
+  out_ref = _dense_ref(store.src[0].src[0].arg.slot,(output_count,),dtype)
+  source_refs = tuple(_dense_ref(param.arg.slot,(count,),dtype) for param,count in zip(params,source_counts))
+  semantic = RKMultiSourceReformatPlan(out_ref,source_refs,typed_mapping)
+  if dtype is dtypes.float:
+    runs:list[tuple[int,int,int,int]] = []
+    for dst,(sid,src) in enumerate(typed_mapping):
+      if runs and runs[-1][1] == sid and runs[-1][2]+runs[-1][3] == src:
+        start,run_sid,run_src,length = runs[-1]
+        runs[-1] = (start,run_sid,run_src,length+1)
+      else: runs.append((dst,sid,src,1))
+    if any(dst*4%16 or src*4%16 for dst,_,src,_ in runs):
+      return _unsupported(RKRejectKind.UNALIGNED_ROW,"FP32 multi-source copy begins outside a 16-byte atom",Ops.INDEX)
+    if len(runs) > RK_MAX_PROGRAM_STAGES:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,f"FP32 multi-source reformat needs {len(runs)} copy tasks",Ops.WHERE)
+    stages = tuple(RKCopyStage(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot,dst*4),
+      RKArg(RKBufferKind.ARG,params[sid].arg.slot,src*4),count,dtypes.float) for dst,sid,src,count in runs)
+    return _native(RKLegalizedReformat(semantic,RKReformatKind.COALESCED_DPU,RKProgram((RKDPUProgram(stages),))))
+  bases, packed_count = [], 0
+  for source_count in source_counts:
+    bases.append(packed_count)
+    packed_count += (source_count+7)&-8
+  scratch = (RKScratch(max(32,packed_count)*2),)
+  packed = RKArg(RKBufferKind.SCRATCH,0)
+  seed_stages = [RKALUStage(Ops.ADD,packed,0.0,0.0,max(32,packed_count))]
+  seed_stages.extend(RKALUStage(Ops.ADD,RKArg(packed.kind,packed.index,bases[sid]*2),RKArg(RKBufferKind.ARG,param.arg.slot),0.0,count)
+                     for sid,(param,count) in enumerate(zip(params,source_counts)))
+  rows = [[bases[sid]+src] for sid,src in typed_mapping]
+  implementation = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed,packed_count,rows,scratch,
+                                     direct_capacity=max(32,packed_count))
+  if implementation is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"multi-source reformat selector exceeds plan limits",Ops.WHERE)
+  program = _finish_program([RKDPUProgram(tuple(seed_stages),scratch),*implementation.steps],implementation.scratch)
+  cost = plan_cost(program)
+  if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"multi-source reformat needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes",Ops.WHERE)
+  return _native(RKLegalizedReformat(semantic,RKReformatKind.SELECTOR_CMAC,program))
 
 def lower_static_selector_reformat_result(sink:UOp) -> RKLowerResult:
   """Resolve a disjoint static ADD/WHERE expression of indexes from one FP16 surface."""
@@ -2790,6 +2895,7 @@ def _has_reduction(nodes:tuple[UOp, ...], op:Ops|None=None) -> bool:
 
 _LOWERERS = (
   RKLowerer("dpu", lambda nodes:not _has_reduction(nodes), lower_dpu_result),
+  RKLowerer("multi_source_reformat", lambda nodes:not _has_reduction(nodes), lower_multi_source_reformat_result),
   RKLowerer("static_selector_reformat", lambda nodes:not _has_reduction(nodes), lower_static_selector_reformat_result),
   RKLowerer("multi_broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_multi_broadcast_alu_result),
   RKLowerer("broadcast_alu", lambda nodes:not _has_reduction(nodes), lower_broadcast_alu_result),

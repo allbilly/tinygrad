@@ -3317,3 +3317,27 @@ exist somewhere in the sink. It requires the stored expression itself to be
 the outer reduction; sibling numerator/denominator loss graphs return
 `NOT_APPLICABLE`. This removes a misleading `unsupported_reduction` family
 without treating NLL or cross-entropy as implemented.
+
+## Multi-source FP16 reformat and aligned FP32 bypass movement
+
+A typed `RKMultiSourceReformatPlan` now retains the complete source identity
+and source index for each logical output before legalization. FP16 plans pack
+the source surfaces into aligned scratch using DPU and apply the existing
+bounded CMAC selector. All four three-input `(5,6,3)` stack dimensions use nine
+physical tasks and pass custom RK3588 hardware comparisons exactly. This is a
+generic multi-surface movement capability, not a named stack runtime handler.
+
+The official `test_stack` plugin contract is FP32. RK3588 hardware proves that
+the DPU all-bypass path can preserve aligned FP32 atoms bit-for-bit: a blocked
+`(2,2,4)` transpose retains ordinary values, infinities, NaN payload bits, and
+positive/negative zero exactly. The compiler accepts only coalesced FP32 runs
+whose input and output byte offsets are both 16-byte aligned.
+
+An attempted one-lane WDMA configuration did not make unaligned writes legal.
+The destination base address remained atom-aligned and only the first lane of
+each four-word group was updated, producing a sparse corrupt stack result.
+That experiment is rejected and archived as
+`wip-fp32-one-lane-wdma-unaligned-corruption-59b9edebd.patch`. Consequently the
+unchanged official `test_stack` still rejects with `unaligned_row`; no
+method-level gain is claimed and the focused expectation remains
+`191/40/181/13` (`187/40/185/13` authoritative).

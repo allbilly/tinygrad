@@ -1510,3 +1510,15 @@ reduction. Sibling numerator/count reductions used by NLL and cross-entropy
 return `NOT_APPLICABLE` instead of the misleading “nested ADD reduction
 requires one FP16 scalar output” rejection. This changes diagnostics and pass
 ownership only; it does not claim native loss coverage.
+
+FP32 identity movement is deliberately narrower than FP32 arithmetic. The DPU
+all-bypass path preserves aligned 16-byte atoms bit-for-bit, including NaNs and
+signed zero, without claiming an FP32 processing pipeline. Static FP32
+reformats therefore legalize only when every coalesced source and destination
+run starts on a 16-byte atom; unaligned permutations reject before submission.
+
+Multi-source FP16 movement now retains a typed source/index map before packing
+the inputs into aligned scratch and applying the bounded CMAC selector. All
+four three-input stack layouts pass custom hardware tests in nine tasks. The
+official stack method remains rejected because its plugin contract is FP32 and
+its final permutation needs unaligned word writes; no method gain is claimed.
