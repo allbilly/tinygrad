@@ -6,15 +6,15 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `2d4c34807` is 187 native,
-40 frontend-only, 185 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed in 3,138.18 seconds without an NPU timeout,
-reset failure, invalid submission, process abort, or test-context warning.
-Relative to `2e40def50`, fifteen methods change from failure to native pass and
-none regress: four padding movements, four padded-convolution cases, four power
-cases, simple padded convolution, stack-MAX, and tangent. Coverage details,
-the checkout-local pytest-plugin invocation, reject Pareto, plan-cost
-histograms, and durable artifact hashes are recorded in `coverage.md`.
+The current authoritative uncached strict census at `936f776c3` is 195 native,
+40 frontend-only, 177 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed in 3,607.71 seconds without an NPU timeout,
+reset failure, invalid submission, process abort, numerical mismatch, or
+unclassified failure. Relative to `33d5e4756`, dense 64x64 `test_gemm` and
+`test_gemm_fp16` change from typed rejection to native pass and no method
+regresses. Coverage details, the checkout-local pytest-plugin invocation,
+reject Pareto, plan-cost histograms, and durable artifact hashes are recorded
+in `coverage.md`.
 
 Every remaining failure is a typed native reject; there are no device or
 unclassified frontend failures in the authoritative inventory. Dynamic tensor

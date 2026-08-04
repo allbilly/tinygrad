@@ -12,44 +12,43 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `33d5e4756` contains exactly 425 telemetry method
-records: 193 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 179 `FAIL`, and 13
+The complete uncached run at `936f776c3` contains exactly 425 telemetry method
+records: 195 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 177 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set
 throughout, with `FORWARD_ONLY=1` and `DEFAULT_FLOAT=HALF`. Raw pytest reports
-207 failed methods/subtests, 244 passed, 87 passing subtests, and 13 skipped in
-3,205.21 seconds. No NPU timeout, invalid submission, reset failure, process
+205 failed methods/subtests, 246 passed, 87 passing subtests, and 13 skipped in
+3,607.71 seconds. No NPU timeout, invalid submission, reset failure, process
 abort, fallback execution, or test-context warning occurred.
 
-Relative to `2d4c34807`, six methods change from failure to native pass and none
-regress: `test_all_zero_axis`, `test_any_zero_axis`, `test_bitcast`,
-`test_int_or`, `test_tril`, and `test_triu`. Every one of the 179 failures is a
+Relative to `33d5e4756`, two methods change from failure to native pass and none
+regress: `test_gemm` and `test_gemm_fp16`. Every one of the 177 failures is a
 typed native reject with a retained method-level first reject;
 there are no numerical mismatches, device failures, or unclassified failures.
-Their first-reject Pareto is 54 unsupported-output-dtype, 39 plan-stage-limit,
-26 unsupported-input-dtype, 20 unsupported-layout, 19 numerical-contract,
-13 unsupported-ALU, six requires-reformat, and two unaligned-row.
+Their first-reject Pareto is 54 unsupported-output-dtype, 37 plan-stage-limit,
+27 unsupported-input-dtype, 20 unsupported-layout, 19 numerical-contract,
+12 unsupported-ALU, six requires-reformat, and two unaligned-row.
 
-The 531 successful kernels belonging to fully native methods contain 489
-`EFFICIENT` and 42 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at
-one task, 230 at 2--8, 84 at 9--32, 72 at 33--64, eight at 65--128, 22 at
-129--256, and eleven at 257--400. The maximum remains 399 tasks; no task or
+The 599 successful kernels belonging to fully native methods contain 523
+`EFFICIENT` and 76 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at
+one task, 231 at 2--8, 103 at 9--32, 86 at 33--64, 21 at 65--128, 34 at
+129--256, and 20 at 257--400. The maximum remains 399 tasks; no task or
 constant ceiling changed. The worst single-kernel wall time is 42.63 seconds,
 and the largest generated constant payload is 1,819,392 bytes. These costs
 remain visible rather than being hidden by the native pass count.
 
 The durable artifacts are
-`~/rk2608_backups/census-local-plugin-33d5e4756-20260804/junit.xml` (SHA-256
-`e6feb043ae4d568e8a00393feafa6ab4a4b4824dbfc6cb6c9b502c4a8e1a53cd`) and
-`~/rk2608_backups/census-local-plugin-33d5e4756-20260804/test_ops_coverage.json`
+`~/rk2608_backups/census-dense-square-936f776c3-20260804/junit.xml` (SHA-256
+`24e5375cf858759b8d06a4324289b2249133a423e9c04e75819837d0112a7a9e`) and
+`~/rk2608_backups/census-dense-square-936f776c3-20260804/test_ops_coverage.json`
 (SHA-256
-`a0b51584d5b3ed31bb0e524969040b642dba28dd0efa01f473e16d89274d76c5`). The
+`9284bbb2be3175255ca49fc49c6d5820f50eaba61a53182adfbdd7bba821abd5`). The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through exact int32 OR-all-ones fill are now
+All focused milestones through dense 64x64 contraction are now
 authoritative. The chronological sections below retain the individual focused
 evidence and their then-current estimates for debugging history.
 
