@@ -1472,11 +1472,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 128*1024)
     self.assertFalse(contains_uop(result.plan))
 
-  def test_masked_affine_product_rejects_unstable_second_output_tile(self):
+  def test_masked_affine_product_splits_stable_output_tiles(self):
     result = lower_native(sink(Tensor.empty(20,dtype=dtypes.half).cumprod(0)))
-    self.assertIs(result.kind, RKLowerKind.UNSUPPORTED)
-    assert result.reject is not None
-    self.assertIs(result.reject.kind, RKRejectKind.NUMERICAL_CONTRACT)
+    self.assertIs(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    image = emit_program(result.plan)
+    self.assertLessEqual(len(image.stages), 256)
+    self.assertLessEqual(len(image.constants), 128*1024)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_contraction_bias_and_relu_fuse_before_fp16_writeback(self):
     x, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((1,8,5,5), (8,8,1,1), (8,)))

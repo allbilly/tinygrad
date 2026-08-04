@@ -2014,3 +2014,27 @@ The telemetry JSON SHA-256 is
 `fddc4fc0fe64d5229481ef6d7695cf9e72d9199b8186be6718f1a7983f701cc1` and
 the JUnit XML SHA-256 is
 `1a89c93b75e5952c59960d229f5e0e86a423ebcfd11eedbe7a63ac2e19fc905f`.
+
+## Stable atom-split cumulative product
+
+The masked affine product lowerer no longer shares one multi-tile selector
+schedule across cumulative-product outputs. It partitions the public output
+into independent groups of at most sixteen FP16 values and materializes and
+folds every group separately. Each full group begins on a 32-byte output atom,
+so no selector state or output compaction crosses the hardware boundary that
+previously corrupted the second tile after mixed-engine work.
+
+The 20-element cumulative product is exact on RK3588 and remains inside the
+existing limits at 249 tasks, 106,784 constant bytes, and 9,312 scratch bytes.
+It is deliberately classified as a correctness fallback. Three explicit
+`DPU -> CMAC -> PPU -> CONV -> cumprod(20) -> cumprod(10) -> cumprod(20)`
+stress iterations pass, and the checked-in mixed-engine regression passes in
+38.90 seconds. The unmasked product lowerer remains preferred for ordinary
+products, so its existing cost does not regress.
+
+This is not yet a full `TestOps.test_cumprod` transition. The unchanged method
+continues with `(20,30)` and `(20,30,40)` scans; the first 600-output by
+20-term surface exceeds the bounded masked-affine schedule and rejects with
+`PLAN_STAGE_LIMIT`. No task, constant, compiler-work, or numerical tolerance
+ceiling changed. The authoritative tally therefore remains
+`204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.

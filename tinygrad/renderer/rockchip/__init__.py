@@ -1480,6 +1480,7 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
      store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _not_applicable()
   value = _strip_casts(reduce.src[0])
+  if not any(u.op is Ops.WHERE for u in value.toposort()): return _not_applicable()
   indexes = [u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   if len(indexes) != 1 or indexes[0].dtype is not dtypes.half or not reduce.src[1:] or \
      any(u.op is not Ops.RANGE or u.src[0].op is not Ops.CONST for u in reduce.src[1:]):
@@ -1494,9 +1495,6 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.REQUIRES_REFORMAT, "masked affine MUL axes do not form one static partition", Ops.RANGE)
   output_count, input_count = int(store.src[0].src[0].src[0].arg), int(source_index.src[0].src[0].arg)
   reduction_count = math.prod(ranges[axis] for axis in red_axes)
-  if output_count > 16:
-    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,
-      f"masked affine MUL output {output_count} exceeds the stable one-tile contract", reduce.op)
   if not 1 <= output_count <= 128 or not 2 <= reduction_count <= 32 or output_count*reduction_count > RK_MAX_AFFINE_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"masked affine MUL surface is {output_count} outputs by {reduction_count} terms", reduce.op)
@@ -1530,34 +1528,40 @@ def lower_masked_affine_mul_reduce_result(sink:UOp) -> RKLowerResult:
   one = RKArg(RKBufferKind.SCRATCH, 0)
   scratch:tuple[RKScratch, ...] = (RKScratch(64),)
   steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = [RKDPUProgram((RKALUStage(Ops.ADD, one, 0.0, 1.0, 32),), scratch)]
-  operands:list[RKArg] = []
   source = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)
-  for value_rows,identity_rows in zip(selected, identities):
-    selected_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
-    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
-    value_plan = _selector_program(selected_arg, source, input_count, value_rows, scratch)
-    if value_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "masked MUL value selector exceeds limits", reduce.op)
-    steps.extend(value_plan.steps)
-    scratch = value_plan.scratch
-    identity_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
-    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
-    identity_plan = _selector_program(identity_arg, one, 32, identity_rows, scratch)
-    if identity_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "masked MUL identity selector exceeds limits", reduce.op)
-    steps.extend(identity_plan.steps)
-    scratch = identity_plan.scratch
-    operand = RKArg(RKBufferKind.SCRATCH, len(scratch))
-    scratch += (RKScratch(((output_count+7)//8)*16),)
-    steps.append(RKDPUProgram((RKALUStage(Ops.ADD, operand, selected_arg, identity_arg, output_count),), scratch))
-    operands.append(operand)
-  output, accumulator = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), operands[0]
-  multiplies:list[RKDPUStage] = []
-  for index,operand in enumerate(operands[1:], 1):
-    final = index == len(operands)-1
-    destination = output if final else RKArg(RKBufferKind.SCRATCH, len(scratch))
-    if not final: scratch += (RKScratch(((output_count+7)//8)*16),)
-    multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, output_count))
-    accumulator = destination
-  completed = _finish_program([*steps,RKDPUProgram(tuple(multiplies))], scratch)
+  output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
+  # Keep every prefix-product schedule inside the proven single-tile contract. Public tile starts are 16 FP16 values
+  # (one 32-byte atom) apart, so independent tiles neither share selector state nor require an output compaction pass.
+  for tile_start in range(0, output_count, 16):
+    tile_count = min(16, output_count-tile_start)
+    operands:list[RKArg] = []
+    for value_rows,identity_rows in zip(selected, identities):
+      selected_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+      scratch += (RKScratch(_cmac_tiled_output_bytes(tile_count)),)
+      value_plan = _selector_program(selected_arg, source, input_count, value_rows[tile_start:tile_start+tile_count], scratch)
+      if value_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "masked MUL value selector exceeds limits", reduce.op)
+      steps.extend(value_plan.steps)
+      scratch = value_plan.scratch
+      identity_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+      scratch += (RKScratch(_cmac_tiled_output_bytes(tile_count)),)
+      identity_plan = _selector_program(identity_arg, one, 32, identity_rows[tile_start:tile_start+tile_count], scratch)
+      if identity_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "masked MUL identity selector exceeds limits", reduce.op)
+      steps.extend(identity_plan.steps)
+      scratch = identity_plan.scratch
+      operand = RKArg(RKBufferKind.SCRATCH, len(scratch))
+      scratch += (RKScratch(((tile_count+7)//8)*16),)
+      steps.append(RKDPUProgram((RKALUStage(Ops.ADD, operand, selected_arg, identity_arg, tile_count),), scratch))
+      operands.append(operand)
+    accumulator = operands[0]
+    multiplies:list[RKDPUStage] = []
+    for index,operand in enumerate(operands[1:], 1):
+      final = index == len(operands)-1
+      destination = RKArg(output.kind, output.index, output.addend+tile_start*2) if final else RKArg(RKBufferKind.SCRATCH, len(scratch))
+      if not final: scratch += (RKScratch(((tile_count+7)//8)*16),)
+      multiplies.append(RKALUStage(Ops.MUL, destination, accumulator, operand, tile_count))
+      accumulator = destination
+    steps.append(RKDPUProgram(tuple(multiplies)))
+  completed = _finish_program(steps, scratch)
   cost = plan_cost(completed)
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,

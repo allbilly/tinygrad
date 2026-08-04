@@ -4064,3 +4064,41 @@ The JSON SHA-256 is
 `fddc4fc0fe64d5229481ef6d7695cf9e72d9199b8186be6718f1a7983f701cc1` and
 the JUnit SHA-256 is
 `1a89c93b75e5952c59960d229f5e0e86a423ebcfd11eedbe7a63ac2e19fc905f`.
+
+## Stable independent tiles for masked cumulative product
+
+The old 20-output cumulative-product schedule was exact in isolation but
+could corrupt its second physical output tile after earlier mixed-engine
+submissions. The replacement treats every at-most-sixteen-output group as a
+complete independent schedule: its value selectors, multiplicative-identity
+selectors, DPU materializations, and ordered product fold are not shared with
+another output group. Sixteen FP16 outputs occupy exactly one 32-byte public
+output atom, so later groups write at aligned offsets without a compaction
+task.
+
+The resulting 20-output plan has this bounded cost:
+
+```text
+tasks              249
+command words     8780
+resets              249
+constant bytes   106784
+scratch bytes       9312
+estimated MACs     10120
+quality       CORRECTNESS_FALLBACK
+```
+
+Both the isolated 10/20-output regression and three alternating mixed-engine
+stress iterations pass at unchanged tolerance. The checked-in regression
+preconditions DPU, CMAC, PPU, and CONV before the scan, specifically covering
+the state history that exposed the older corruption. Ordinary unmasked
+products are explicitly excluded from this lowerer and retain their cheaper
+native schedules. The full compiler suite reports 159 tests plus 59 subtests
+passing; mypy and Ruff are clean.
+
+The official `test_cumprod` method is still a typed failure, not a coverage
+gain. After its scalar and 20-element cases, it requests a 600-output by
+20-term scan and then 24,000-output scans. Those surfaces remain outside the
+bounded selector implementation and reject with `PLAN_STAGE_LIMIT`; solving
+them requires a direct strided/physical-layout scan rather than a higher task
+ceiling. The authoritative census remains `204/40/168/13`.

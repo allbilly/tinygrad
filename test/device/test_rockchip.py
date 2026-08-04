@@ -367,9 +367,18 @@ class TestRockchip(unittest.TestCase):
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-6)
 
   def test_masked_affine_fp16_cumprod_native_cmac_dpu(self):
-    data = np.linspace(.8,1.2,10,dtype=np.float16)
-    actual = Tensor(data,device="ROCKCHIP").realize().cumprod(0).realize().numpy()
-    np.testing.assert_allclose(actual, np.cumprod(data,dtype=np.float16), rtol=1e-3, atol=1e-6)
+    # The old two-tile schedule corrupted this scan after mixed-engine work. Exercise every preceding engine class here.
+    Tensor(np.linspace(-1,1,32,dtype=np.float16),device="ROCKCHIP").realize().relu().realize()
+    Tensor(np.linspace(-1,1,32,dtype=np.float16).reshape(1,32),device="ROCKCHIP").realize().sum(axis=1).realize()
+    Tensor(np.linspace(-1,1,2*3*9*9,dtype=np.float16).reshape(2,3,9,9),device="ROCKCHIP").realize().max_pool2d((5,5)).realize()
+    feature = Tensor(np.linspace(-1,1,4*5*5,dtype=np.float16).reshape(1,4,5,5),device="ROCKCHIP").realize()
+    weight = Tensor(np.linspace(-.5,.5,4*4,dtype=np.float16).reshape(4,4,1,1),device="ROCKCHIP").realize()
+    feature.conv2d(weight).realize()
+    for count in (10,20):
+      with self.subTest(count=count):
+        data = np.linspace(.8,1.2,count,dtype=np.float16)
+        actual = Tensor(data,device="ROCKCHIP").realize().cumprod(0).realize().numpy()
+        np.testing.assert_allclose(actual, np.cumprod(data,dtype=np.float16), rtol=1e-3, atol=1e-6)
 
   def test_contiguous_fp16_mean_native_cmac(self):
     np.random.seed(0)
