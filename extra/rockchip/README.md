@@ -101,6 +101,10 @@ are eligible to be ported as native capabilities.
   task may produce up to 128 logical channels in proven 32-channel groups,
   with each 16-channel FP16 block normally occupying one gapped 32-lane WDMA
   atom; a hardware-proven one-row compact mode writes those blocks contiguously;
+- dense multi-row FP16 contraction LHS surfaces whose physical row stride is
+  already the CMAC K alignment are consumed directly; a separately proven
+  2,048-lane selector window packs dynamic RHS tiles without raising the global
+  400-task or 2 MiB image limits;
 - direct FP16 sums of 4–16 dense rows of length 32 using an image-owned ones
   vector and the same CMAC contract;
 - dense FP16 global MAX/MIN through an ordered DPU block tree, CMAC lane

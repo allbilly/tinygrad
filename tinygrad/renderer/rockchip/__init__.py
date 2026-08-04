@@ -33,6 +33,9 @@ RK_MAX_AFFINE_VISITS = 65536
 RK_MAX_PROGRAM_STAGES = 400
 RK_MAX_AFFINE_WINDOW = 192
 RK_MAX_CMAC_SELECTOR_WINDOW = 1504
+# A dense 64x64 transpose pack proves a 2,048-lane CMAC source window; keep ordinary affine selectors on their narrower contract.
+RK_MAX_TILED_CMAC_SELECTOR_WINDOW = 2048
+RK_MAX_TILED_CONTRACT_VISITS = 4*RK_MAX_AFFINE_VISITS
 
 def _fp16_exact(value:float) -> bool:
   try: rounded = struct.unpack("<e", struct.pack("<e", value))[0]
@@ -2375,7 +2378,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
-  if not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_AFFINE_VISITS:
+  if not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
@@ -2420,13 +2423,14 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   lhs_values = sum(source >= 0 for row in lhs_rows for source in row)
   rhs_values = sum(source >= 0 for column in rhs_columns for source in column)
-  lhs_base = lhs_rows[0][0] if m == 1 and lhs_rows[0] else -1
+  lhs_base = lhs_rows[0][0] if lhs_rows and lhs_rows[0] else -1
   lhs_capacity = ((lhs_count*2+4095)&-4096)//2
-  direct_lhs = lhs_base >= 0 and lhs_rows[0] == tuple(range(lhs_base,lhs_base+k)) and lhs_base+align_in <= lhs_capacity
+  direct_lhs = lhs_base >= 0 and all(row == tuple(range(lhs_base+index*align_in,lhs_base+index*align_in+k))
+                                     for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
-  selector_floor = (0 if direct_lhs else (lhs_values+15)//16) + (rhs_values+15)//16 + \
-    (1 if compact_output else (output_count+15)//16) + \
+  selector_floor = (0 if direct_lhs else (lhs_values+31)//32) + (rhs_values+31)//32 + \
+    (1 if compact_output else (output_count+31)//32) + \
     (m+(4096//align_in)-1)//(4096//align_in)
   if selector_floor > RK_MAX_PROGRAM_STAGES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC selector lower bound is {selector_floor} tasks", reduce.op)
@@ -2470,7 +2474,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   # Rockchip GEM allocations are page-rounded. Zero-weight selector lanes may read that physical tail without changing semantics.
   rhs_capacity = ((rhs_count*2+4095)&-4096)//2
   packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch,
-                               rhs_capacity, RK_MAX_CMAC_SELECTOR_WINDOW, 32)
+                               rhs_capacity, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, 32)
   if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
   steps.extend(packed_b.steps)
   scratch = packed_b.scratch

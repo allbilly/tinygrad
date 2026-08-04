@@ -3445,3 +3445,33 @@ and full Ruff is clean. Strict native-only RK3588 regressions pass the affine
 movement, static-padding, and repeat/roll families (the last was also rerun
 alone to confirm a clean one-test process exit). No TestOps behavior changes,
 so the authoritative tally remains `193/40/179/13`.
+
+## Dense 64x64 FP16 contraction
+
+The tiled contraction legalizer now recognizes every dense LHS row whose
+physical stride already equals the aligned CMAC K extent. It passes the whole
+multi-row argument surface directly to CMAC instead of generating one selector
+entry for every LHS value. The selector lower-bound calculation now uses the
+actual proven 32-output generic-contraction tile width rather than the obsolete
+16-output estimate.
+
+A dense dynamic 64x64 RHS transpose establishes a 2,048-lane source-window
+contract specifically for tiled-contraction packing; ordinary affine selectors
+retain their narrower 1,504-lane contract. The logical coordinate enumeration
+budget grows to 262,144 only for tiled contractions, while the physical limits
+remain unchanged at 400 tasks and 2 MiB of constants. The resulting 64x64
+matmul uses 305 tasks, 13,358 command words, 305 resets, 1,044,304 constant
+bytes, 28,640 scratch bytes, and 8,720,876 estimated MACs. It is therefore an
+honest `CORRECTNESS_FALLBACK`, not an efficient final GEMM path.
+
+Both unchanged official `test_gemm` and `test_gemm_fp16` pass on RK3588 in
+about 38 seconds each. A deterministic 64x64 hardware regression and the prior
+wide-output CMAC regressions pass together (two tests plus two subtests) in
+55.76 seconds. All 152 compiler/image tests pass with 42 subtests, full mypy
+covers 228 source files, and full Ruff is clean. The previously rejected padded
+transpose-convolution still rejects at its unchanged 415-task cost, preserving
+the numerical guard that blocked its inaccurate wider-packing experiment.
+
+These are two focused complete-method gains. The post-census expectation is
+`195 native / 40 frontend / 177 failed / 13 skipped`; the complete uncached
+`193/40/179/13` census remains authoritative until rerun.

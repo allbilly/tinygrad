@@ -1111,6 +1111,21 @@ class TestDPUCompiler(unittest.TestCase):
                step.out.layout.physical_shape == (1,128)]
     self.assertEqual((len(compact),compact[0].out.layout.physical_shape), (1,(1,128)))
 
+  def test_dense_square_contraction_uses_direct_lhs_rows(self):
+    result = lower_tiled_contract_result(sink(Tensor.empty(64,64,dtype=dtypes.half)@Tensor.empty(64,64,dtype=dtypes.half)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    contractions = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask))
+    main = tuple(step for step in contractions if step.lhs.layout.logical_shape == (64,64) and
+                 step.rhs.layout.logical_shape == (64,64))
+    self.assertEqual(len(main),1)
+    self.assertIs(main[0].lhs.buffer.kind,RKBufferKind.ARG)
+    cost = plan_cost(result.plan)
+    self.assertLessEqual(cost.task_count,320)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):
     x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)
     plan = lower_tiled_contract_result(sink(x@y)).plan
