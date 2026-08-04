@@ -6,22 +6,14 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `936f776c3` is 195 native,
-40 frontend-only, 177 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed in 3,607.71 seconds without an NPU timeout,
+The current authoritative uncached strict census at `2fb47ca2b` is 202 native,
+40 frontend-only, 170 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed in 3,452.89 seconds without an NPU timeout,
 reset failure, invalid submission, process abort, numerical mismatch, or
-unclassified failure. Relative to `33d5e4756`, dense 64x64 `test_gemm` and
-`test_gemm_fp16` change from typed rejection to native pass and no method
-regresses. Coverage details, the checkout-local pytest-plugin invocation,
-reject Pareto, plan-cost histograms, and durable artifact hashes are recorded
-in `coverage.md`.
-
-Focused work after that census removes statically proven zero-padding terms
-before charging the affine CMAC physical-visit budget. The unchanged
-`test_sum_pad_collapse` now passes natively in 133 tasks and 67,584 constant
-bytes without changing the 400-task, 2 MiB, or 65,536 selected-term ceilings.
-The focused expectation is therefore 196 native, 40 frontend-only, 176 failed,
-and 13 skipped; 195/40/177/13 remains authoritative until the next full run.
+unclassified failure. Relative to `92846845f`, only `test_dilated_conv2d`
+changes from typed rejection to native pass and no method regresses. Coverage
+details, the checkout-local pytest-plugin invocation, reject Pareto, plan-cost
+histograms, and durable artifact hashes are recorded in `coverage.md`.
 
 The PPU layout contract now names the actual `PPU_HWC` format and accepts every
 hardware-characterized FP16 channel count from two through eight. This follows
@@ -1796,6 +1788,27 @@ A deterministic hardware regression checks the official tolerance and CONV
 telemetry, while the compiler regression checks typed dilation and exact
 `CNA_CONV_CON3` words. All 159 compiler/image tests plus 59 subtests pass;
 five direct-CNA hardware regressions plus two dilation subtests pass in 52.48
-seconds; mypy checks 228 files and Ruff is clean. Expected coverage is now
-`202 native / 40 frontend / 170 failed / 13 skipped`; `201/40/171/13` remains
-the authoritative complete census until rerun.
+seconds; mypy checks 228 files and Ruff is clean. The complete uncached census
+confirms `202 native / 40 frontend / 170 failed / 13 skipped` with no
+regression.
+
+## Complete native-only census after atrous convolution
+
+The uncached `2fb47ca2b` run makes the native atrous-convolution milestone
+authoritative. Exactly one method changes relative to `92846845f`:
+`test_dilated_conv2d` moves from `PLAN_STAGE_LIMIT` to `PASS_NATIVE`. All 170
+remaining failures are typed native rejects with retained first rejects; there
+are no device, numerical, fallback, or unclassified failures.
+
+Fully native methods execute 549 kernels: 500 `EFFICIENT` and 49 bounded
+`CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at one task, 238 at
+2--8, 87 at 9--32, 73 at 33--64, nine at 65--128, 23 at 129--256, and 15 at
+257--400. The maximum remains 399 tasks, 1,819,392 constant bytes, and
+42,636.60 ms for one kernel; no task, constant, or tolerance ceiling changed.
+
+Artifacts are preserved under
+`/home/orangepi/rk2608_backups/census-atrous-2fb47ca2b-20260805`.
+`test_ops_coverage.json` has SHA-256
+`84da48e03bf39ff886581fc95f19a3963220d7ee36fbad69a0a28d6b1bb464d7` and
+`junit.xml` has SHA-256
+`ea12b7403eab76d42f555cbcee0d975f44cb2500713dfc72180ede93736edc50`.

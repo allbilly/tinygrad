@@ -12,43 +12,43 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `936f776c3` contains exactly 425 telemetry method
-records: 195 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 177 `FAIL`, and 13
+The complete uncached run at `2fb47ca2b` contains exactly 425 telemetry method
+records: 202 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 170 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set
 throughout, with `FORWARD_ONLY=1` and `DEFAULT_FLOAT=HALF`. Raw pytest reports
-205 failed methods/subtests, 246 passed, 87 passing subtests, and 13 skipped in
-3,607.71 seconds. No NPU timeout, invalid submission, reset failure, process
+197 failed methods/subtests, 252 passed, 89 passing subtests, and 13 skipped in
+3,452.89 seconds. No NPU timeout, invalid submission, reset failure, process
 abort, fallback execution, or test-context warning occurred.
 
-Relative to `33d5e4756`, two methods change from failure to native pass and none
-regress: `test_gemm` and `test_gemm_fp16`. Every one of the 177 failures is a
+Relative to `92846845f`, one method changes from failure to native pass and none
+regresses: `test_dilated_conv2d`. Every one of the 170 failures is a
 typed native reject with a retained method-level first reject;
 there are no numerical mismatches, device failures, or unclassified failures.
-Their first-reject Pareto is 54 unsupported-output-dtype, 37 plan-stage-limit,
-27 unsupported-input-dtype, 20 unsupported-layout, 19 numerical-contract,
+Their first-reject Pareto is 53 unsupported-output-dtype, 34 plan-stage-limit,
+27 unsupported-input-dtype, 18 unsupported-layout, 18 numerical-contract,
 12 unsupported-ALU, six requires-reformat, and two unaligned-row.
 
-The 599 successful kernels belonging to fully native methods contain 523
-`EFFICIENT` and 76 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at
-one task, 231 at 2--8, 103 at 9--32, 86 at 33--64, 21 at 65--128, 34 at
-129--256, and 20 at 257--400. The maximum remains 399 tasks; no task or
+The 549 successful kernels belonging to fully native methods contain 500
+`EFFICIENT` and 49 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at
+one task, 238 at 2--8, 87 at 9--32, 73 at 33--64, nine at 65--128, 23 at
+129--256, and 15 at 257--400. The maximum remains 399 tasks; no task or
 constant ceiling changed. The worst single-kernel wall time is 42.63 seconds,
 and the largest generated constant payload is 1,819,392 bytes. These costs
 remain visible rather than being hidden by the native pass count.
 
 The durable artifacts are
-`~/rk2608_backups/census-dense-square-936f776c3-20260804/junit.xml` (SHA-256
-`24e5375cf858759b8d06a4324289b2249133a423e9c04e75819837d0112a7a9e`) and
-`~/rk2608_backups/census-dense-square-936f776c3-20260804/test_ops_coverage.json`
+`~/rk2608_backups/census-atrous-2fb47ca2b-20260805/junit.xml` (SHA-256
+`ea12b7403eab76d42f555cbcee0d975f44cb2500713dfc72180ede93736edc50`) and
+`~/rk2608_backups/census-atrous-2fb47ca2b-20260805/test_ops_coverage.json`
 (SHA-256
-`9284bbb2be3175255ca49fc49c6d5820f50eaba61a53182adfbdd7bba821abd5`). The
+`84da48e03bf39ff886581fc95f19a3963220d7ee36fbad69a0a28d6b1bb464d7`). The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through dense 64x64 contraction are now
+All focused milestones through native atrous convolution are now
 authoritative. The chronological sections below retain the individual focused
 evidence and their then-current estimates for debugging history.
 
@@ -3794,6 +3794,39 @@ dilation fields and emitted register values.
 
 Validation: 159 compiler/image tests plus 59 subtests pass with `-n12`; five
 existing/new direct-CNA hardware tests plus two subtests pass in 52.48 seconds;
-mypy over 228 files and Ruff are clean. Focused expected coverage becomes
-`202/40/170/13`. The complete authoritative census remains `201/40/171/13`
-until an uncached 425-method rerun.
+mypy over 228 files and Ruff are clean. The complete uncached census confirms
+`202/40/170/13` with `test_dilated_conv2d` as the sole method transition and no
+regression.
+
+## Complete census after native dilation
+
+The locked, uncached run at immutable `2fb47ca2bb47aba25faa915c526993488236b7b7`
+contains exactly 425 method records:
+
+| outcome | count |
+|---|---:|
+| PASS_NATIVE | 202 |
+| PASS_FRONTEND | 40 |
+| NATIVE_REJECT | 170 |
+| SKIP_UPSTREAM | 13 |
+
+All rejected methods retain their exact first typed reject. The first-reject
+Pareto is 53 unsupported output dtype, 34 plan-stage limit, 27 unsupported
+input dtype, 18 numerical contract, 18 unsupported layout, 12 unsupported ALU,
+six requires reformat, and two unaligned row. The run had no numerical
+mismatch, NPU timeout, invalid submission, reset failure, process abort,
+fallback execution, or unclassified failure.
+
+Fully native methods executed 549 kernels: 500 efficient and 49 bounded
+correctness fallbacks. Task-count buckets are 104 at one task, 238 at 2--8, 87
+at 9--32, 73 at 33--64, nine at 65--128, 23 at 129--256, and 15 at 257--400.
+Maximum cost remains 399 tasks, 1,819,392 constant bytes, and 42,636.60 ms for
+one kernel; no ceiling or tolerance changed. Raw pytest reports 197 failures
+including unittest subtests, 252 passes, 89 passing subtests, and 13 skips in
+3,452.89 seconds.
+
+Artifacts:
+
+- directory: `/home/orangepi/rk2608_backups/census-atrous-2fb47ca2b-20260805`
+- `test_ops_coverage.json`: `84da48e03bf39ff886581fc95f19a3963220d7ee36fbad69a0a28d6b1bb464d7`
+- `junit.xml`: `ea12b7403eab76d42f555cbcee0d975f44cb2500713dfc72180ede93736edc50`
