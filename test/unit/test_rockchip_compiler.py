@@ -1436,6 +1436,17 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertLessEqual(plan_cost(result.plan).task_count,limit)
         self.assertFalse(contains_uop(result.plan))
 
+    pointwise = lower_spatial_contract_result(sink(
+      Tensor.empty(4,3,11,28,dtype=dtypes.half).conv2d(Tensor.empty(4,3,1,1,dtype=dtypes.half),padding=2)))
+    self.assertIs(pointwise.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(pointwise.plan,RKProgram)
+    assert isinstance(pointwise.plan,RKProgram)
+    convs = [step for step in pointwise.plan.steps if isinstance(step,RKConvTask)]
+    self.assertEqual([(step.kernel_height,step.kernel_width,step.pad_top,step.pad_bottom,step.pad_left,step.pad_right)
+                      for step in convs],[(1,1,2,2,2,2)]*4)
+    self.assertLessEqual(plan_cost(pointwise.plan).task_count,200)
+    self.assertFalse(contains_uop(pointwise.plan))
+
   def test_nhwc_convolution_splits_output_channels_to_cbuf_tiles(self):
     source = Tensor.empty(2,9,9,10,dtype=dtypes.half).realize()
     weight = Tensor.empty(3,3,10,20,dtype=dtypes.half).realize()

@@ -1285,3 +1285,13 @@ The host gate passes 132 tests plus 34 subtests, full mypy and touched-module
 Ruff pass, and the complete serialized RK3588 gate passes 96 tests plus 66
 subtests in 804.61 seconds without a timeout, reset error, invalid submission,
 or process abort.
+
+The same exact predicate proof now handles a four-axis output with only the
+channel reduction axis present, which is the simplified form of padded 1x1
+convolution. The unchanged official `test_padded_conv2d_1x1` passes natively in
+23.10 seconds. Its batch-four plan has 193 tasks and 1,086,784 constant bytes;
+using 64-output selector tiles keeps it below the unchanged 2 MiB ceiling,
+whereas the earlier 128-output candidate did not fit. Focused expected coverage
+is now 180 native / 40 frontend / 192 fail / 13 skip. The complete host gate
+passes 132 tests plus 34 subtests, and all four direct padded-convolution
+TestOps regressions pass together on RK3588 in 92.30 seconds.

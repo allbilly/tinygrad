@@ -449,6 +449,18 @@ def _proves_conv_zero_padding(condition:UOp|None, select_true:bool, ranges:dict[
     if (bool(selected) is select_true) != (0 <= iy < in_h and 0 <= ix < in_w): return False
   return True
 
+def _conv_zero_padding(feature_aff:tuple[dict[int,int],int], condition:UOp|None, select_true:bool, ranges:dict[int,int],
+                       axes:tuple[int,int,int,int], in_h:int, in_w:int, kernel_h:int, kernel_w:int, out_h:int, out_w:int,
+                       stride_y:int, stride_x:int) -> tuple[int,int,int,int]|None:
+  if feature_aff[1] > 0: return None
+  pad_top,pad_left = divmod(-feature_aff[1],in_w)
+  if max(pad_top,pad_left) > 15: return None
+  pad_bottom = next((pad for pad in range(16) if (in_h+pad_top+pad-kernel_h)//stride_y+1 == out_h),-1)
+  pad_right = next((pad for pad in range(16) if (in_w+pad_left+pad-kernel_w)//stride_x+1 == out_w),-1)
+  if min(pad_bottom,pad_right) < 0 or not _proves_conv_zero_padding(condition,select_true,ranges,axes,
+                                                                   in_h,in_w,stride_y,stride_x,pad_top,pad_left): return None
+  return pad_top,pad_bottom,pad_left,pad_right
+
 def _static_index_selected(u:UOp, index:UOp, ranges:dict[int, int]) -> bool|None:
   """Follow static WHERE branches and report whether one coordinate selects `index`."""
   value = _strip_casts(u)
@@ -1983,6 +1995,36 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   if any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
   match:tuple[UOp,UOp,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
+  if len(out_axes) == 4 and len(red_axes) == 1:
+    point_in_channel_axis = red_axes[0]
+    for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
+      feature, weight = feature_parsed[0], weight_parsed[0]
+      feature_aff, weight_aff = _conditional_index_affine(feature), _affine(weight.src[1])
+      if weight_parsed[1] is not None or feature_aff is None or weight_aff is None or weight_aff[1] or feature_aff[1] > 0: continue
+      for point_batch_axis,point_channel_axis,point_y_axis,point_x_axis in permutations(out_axes):
+        batch,in_c,out_c,out_h,out_w = (ranges[x] for x in
+          (point_batch_axis,point_in_channel_axis,point_channel_axis,point_y_axis,point_x_axis))
+        if out_aff[0] != {point_batch_axis:out_c*out_h*out_w,point_channel_axis:out_h*out_w,
+                          point_y_axis:out_w,point_x_axis:1} or \
+           weight_aff[0] != {point_channel_axis:in_c,point_in_channel_axis:1}: continue
+        input_plane, row_step, stride_x = (feature_aff[0].get(axis,0) for axis in
+          (point_in_channel_axis,point_y_axis,point_x_axis))
+        if min(input_plane,row_step,stride_x) <= 0 or stride_x > 7: continue
+        for in_w in range(1,33):
+          if input_plane%in_w or row_step%in_w: continue
+          in_h,stride_y = input_plane//in_w,row_step//in_w
+          if not 1 <= in_h <= 32 or not 1 <= stride_y <= 7: continue
+          expected_feature = {point_batch_axis:in_c*in_h*in_w,point_in_channel_axis:in_h*in_w,
+                              point_y_axis:stride_y*in_w,point_x_axis:stride_x}
+          padding = _conv_zero_padding(feature_aff,feature_parsed[1],feature_parsed[2],ranges,
+            (-1,-1,point_y_axis,point_x_axis),in_h,in_w,1,1,out_h,out_w,stride_y,stride_x)
+          if feature_aff[0] != expected_feature or padding is None: continue
+          feature_count,weight_count,output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
+          if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c,batch*out_c*out_h*out_w): continue
+          match = (feature,weight,batch,in_c,out_c,in_h,in_w,1,1,out_h,out_w,stride_y,stride_x,output_count,*padding)
+          break
+        if match is not None: break
+      if match is not None: break
   if len(out_axes) == 2 and len(red_axes) == 1:
     point_reduction_axis = red_axes[0]
     for feature_parsed,weight_parsed in (parsed_operands, tuple(reversed(parsed_operands))):
@@ -2030,17 +2072,13 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
         if out_aff[0] != expected_out or feature_aff[0] != expected_feature: continue
         if weight_aff[0] != {channel_axis:in_c*kernel_h*kernel_w, in_channel_axis:kernel_h*kernel_w,
                             kernel_y_axis:kernel_w, kernel_x_axis:1}: continue
-        pad_top,pad_left = divmod(-feature_aff[1],in_w)
-        if max(pad_top,pad_left) > 15: continue
-        pad_bottom = next((pad for pad in range(16) if (in_h+pad_top+pad-kernel_h)//stride_y+1 == out_h),-1)
-        pad_right = next((pad for pad in range(16) if (in_w+pad_left+pad-kernel_w)//stride_x+1 == out_w),-1)
-        if min(pad_bottom,pad_right) < 0 or not _proves_conv_zero_padding(feature_parsed[1],feature_parsed[2],ranges,
-            (kernel_y_axis,kernel_x_axis,out_y_axis,out_x_axis),in_h,in_w,stride_y,stride_x,pad_top,pad_left): continue
+        padding = _conv_zero_padding(feature_aff,feature_parsed[1],feature_parsed[2],ranges,
+          (kernel_y_axis,kernel_x_axis,out_y_axis,out_x_axis),in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x)
+        if padding is None: continue
         feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
         if (feature_count,weight_count,output_count) != (batch*in_c*in_h*in_w,out_c*in_c*kernel_h*kernel_w,
                                                         batch*out_c*out_h*out_w): continue
-        match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count,
-                 pad_top,pad_bottom,pad_left,pad_right)
+        match = (feature,weight,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,output_count,*padding)
         break
       if match is not None: break
     if match is not None: break
@@ -2076,7 +2114,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   scratch:tuple[RKScratch, ...] = ()
   packed_input = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(len(input_rows)*2),)
-  selector_outputs = 128 if kernel_h == kernel_w == 1 else 64
+  selector_outputs = 128 if kernel_h == kernel_w == 1 and not any((pt,pb,pl,pr)) else 64
   input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,feature.src[0].arg.slot),
                                  int(feature.src[0].src[0].arg),input_rows,scratch,
                                  direct_capacity=((int(feature.src[0].src[0].arg)*2+4095)&-4096)//2,

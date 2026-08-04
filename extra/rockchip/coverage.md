@@ -2951,3 +2951,17 @@ The host gate passes 132 tests plus 34 subtests, full mypy and touched-module
 Ruff pass, and the complete serialized RK3588 gate passes 96 tests plus 66
 subtests in 804.61 seconds without a timeout, reset error, invalid submission,
 or process abort.
+
+The degenerate-axis extension recognizes padded 1x1 convolution after
+`early_simplify` removes both singleton kernel ranges. It enumerates the same
+exact zero-mask contract with virtual zero-valued kernel coordinates, derives
+the 11x28 input from the remaining affine plane/row coefficients, and emits
+four CNA tasks with `(top,bottom,left,right)=(2,2,2,2)`. The unchanged official
+`test_padded_conv2d_1x1` passes natively in 23.10 seconds. Its complete physical
+plan has 193 tasks, 8,866 command words, 1,086,784 constant bytes, 68,928
+scratch bytes, and 6,241,696 estimated MACs, so it remains explicitly a
+selector-heavy correctness fallback. Focused expected coverage is 180 native /
+40 frontend / 192 failed / 13 upstream skips. The complete host gate passes
+132 tests plus 34 subtests, and the four direct padded-convolution TestOps
+methods pass together on RK3588 in 92.30 seconds without fallback or a device
+error.
