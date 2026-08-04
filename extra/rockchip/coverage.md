@@ -3311,3 +3311,9 @@ identity constants and use the exact int8 fill path. Nonempty `all` and `any`
 remain typed rejects and are not counted. Combined focused expectation is now
 `191 native / 40 frontend / 181 failed / 13 skipped`; `187/40/185/13` is still
 the authoritative full-census result.
+
+The nested-sum pass no longer claims graphs merely because two ADD reductions
+exist somewhere in the sink. It requires the stored expression itself to be
+the outer reduction; sibling numerator/denominator loss graphs return
+`NOT_APPLICABLE`. This removes a misleading `unsupported_reduction` family
+without treating NLL or cross-entropy as implemented.

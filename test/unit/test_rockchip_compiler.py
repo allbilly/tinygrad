@@ -15,6 +15,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   encode_image, lower_contract, lower_dpu, lower_native, lower_add_reduce_result, lower_affine_mean_result, lower_affine_reduce_result,
   lower_pointwise_affine_reduce_result, lower_reduce_result,
   lower_affine_max_result, lower_sliding_max_result, lower_broadcast_alu_result, lower_multi_broadcast_alu_result, lower_global_max_result,
+  lower_nested_add_reduce_result,
   lower_reformat_result,
   lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
@@ -1300,6 +1301,12 @@ class TestDPUCompiler(unittest.TestCase):
       assert isinstance(result.plan, RKProgram)
       self.assertGreaterEqual(sum(isinstance(step, RKContract) for step in result.plan.steps), 2)
       self.assertFalse(contains_uop(result.plan))
+
+  def test_nested_sum_does_not_claim_sibling_reductions(self):
+    lhs,rhs = Tensor.empty(8,dtype=dtypes.half),Tensor.empty(8,dtype=dtypes.half)
+    for expression in (lhs.sum()+rhs.sum(),lhs.sum()/rhs.sum()):
+      result = lower_nested_add_reduce_result(sink(expression))
+      self.assertIs(result.kind,RKLowerKind.NOT_APPLICABLE)
 
   def test_affine_mean_rejects_selector_rounding(self):
     source = Tensor.empty(1,1,6,6,dtype=dtypes.half).realize()

@@ -1033,9 +1033,9 @@ def lower_nested_add_reduce_result(sink:UOp) -> RKLowerResult:
   if len(stores) != 1 or len(reductions) != 2 or any(u.arg[0] is not Ops.ADD or len(u.src) < 2 for u in reductions):
     return _not_applicable()
   store, outer = stores[0], _strip_casts(stores[0].src[1])
-  if outer.op is not Ops.REDUCE or store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or \
-     store.src[0].dtype is not dtypes.half or store.src[0].src[1].op is not Ops.CONST or \
-     int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
+  if outer.op is not Ops.REDUCE: return _not_applicable()
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
+     store.src[0].src[1].op is not Ops.CONST or int(store.src[0].src[1].arg) != 0 or int(store.src[0].src[0].src[0].arg) != 1:
     return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION, "nested ADD reduction requires one FP16 scalar output", store.src[0].op)
   chain:list[UOp] = []
   range_groups:list[tuple[UOp, ...]] = []

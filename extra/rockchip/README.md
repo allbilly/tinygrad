@@ -1504,3 +1504,9 @@ native int8 fill. Nonempty `all` and `any` still reject at bool reduction or
 FP16-comparison conversion. Focused expectation is therefore
 `191 native / 40 frontend / 181 failed / 13 skipped`; the full-census baseline
 remains `187/40/185/13`.
+
+The nested-sum lowerer now owns only graphs whose stored value is the outer
+reduction. Sibling numerator/count reductions used by NLL and cross-entropy
+return `NOT_APPLICABLE` instead of the misleading “nested ADD reduction
+requires one FP16 scalar output” rejection. This changes diagnostics and pass
+ownership only; it does not claim native loss coverage.
