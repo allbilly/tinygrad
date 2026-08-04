@@ -297,7 +297,7 @@ def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowe
   return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
 
 from tinygrad.renderer.rockchip.expr import (_ALUExpr, _MaskExpr, _LUTExpr, _Expr, _Value, _parse_alu, _unwrap_same_cast,
-  _canonical_lerp, _numerical_contract)
+  _canonical_lerp, _canonical_tensor_pow, _numerical_contract)
 
 def _lower_fused_lerp(output:RKArg, operands:tuple[UOp,UOp,UOp], count:int) -> RKLowerResult:
   x,y,z = operands
@@ -695,6 +695,11 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   indexes = [u for u in stored.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM]
   broadcast = [u for u in indexes if u.src[1].key != output_index.key]
   if len(broadcast) != 1 or any(u.dtype is not dtypes.half for u in indexes): return _not_applicable()
+  # Direct tensor POW is calibrated against exact paired FP16 inputs. Reusing one operand through a materialized
+  # broadcast changes the deterministic rounding groups: the two official small layouts miss one lane by 0.015625.
+  # Keep this native-only path rejected until broadcast-output calibration is proven over the complete FP16 domain.
+  if _canonical_tensor_pow(stored) is not None:
+    return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, "broadcast tensor POW lacks an output-domain error contract", Ops.EXP2)
   source_index = broadcast[0]
   surfaces = [(u, parsed) for u in stored.toposort() if (parsed:=_conditional_index(u)) is not None and parsed[0].key == source_index.key]
   if not surfaces: return _not_applicable()

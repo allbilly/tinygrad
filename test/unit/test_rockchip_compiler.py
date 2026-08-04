@@ -849,14 +849,11 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(plan.stages), 400)
     self.assertFalse(contains_uop(plan))
 
-  def test_tensor_pow_reuses_one_unmasked_broadcast_surface(self):
+  def test_tensor_pow_broadcast_rejects_without_output_domain_calibration(self):
     base, exponent = Tensor.empty(8,dtype=dtypes.half), Tensor.empty(1,dtype=dtypes.half)
     result = lower_broadcast_alu_result(sink(base**exponent))
-    self.assertEqual(result.kind, RKLowerKind.NATIVE)
-    self.assertIsInstance(result.plan, RKProgram)
-    assert isinstance(result.plan, RKProgram)
-    self.assertLessEqual(plan_cost(result.plan).stage_count, 400)
-    self.assertFalse(contains_uop(result.plan))
+    self.assertEqual(result.kind, RKLowerKind.UNSUPPORTED)
+    self.assertEqual(result.reject.kind if result.reject is not None else None, RKRejectKind.NUMERICAL_CONTRACT)
 
   def test_fractional_constant_pow_reuses_range_reduction(self):
     for power in (.3, -.3):

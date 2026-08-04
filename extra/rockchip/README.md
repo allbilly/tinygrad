@@ -1372,3 +1372,14 @@ until the complete uncached census is rerun. The host gate passes 141 tests plus
 34 subtests, full mypy and touched-file Ruff pass, and the complete serialized
 RK3588 gate passes 96 tests plus 66 subtests in 804.40 seconds. Its explicit
 fallback-coherence test now uses still-unsupported cosine rather than tangent.
+
+The first post-tangent census attempt exposed an unproven broadcast extension:
+the two small tensor-POW broadcast layouts each missed one of twenty outputs by
+0.015625, and the later census process aborted inside a reset after the long
+partial-broadcast group. An exact replay confirmed all sixteen ADD/SUB/MUL/DIV
+subcases remain native and correct, both large POW layouts already exceed the
+cost ceiling, and both small POW layouts are numerical mismatches. Materialized
+tensor-POW broadcasts now reject before submission with `NUMERICAL_CONTRACT`
+until an output-domain calibration is proven. The unchanged official method
+finishes with four typed POW rejects and sixteen passing subtests in 222.70
+seconds without a device failure.

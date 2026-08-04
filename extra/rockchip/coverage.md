@@ -3071,3 +3071,21 @@ frontend / 185 failed / 13 upstream skips; the last complete authoritative
 census remains 172/40/200/13. The host gate passes 141 tests plus 34 subtests,
 full mypy and touched-file Ruff pass, and the complete serialized RK3588 gate
 passes 96 tests plus 66 subtests in 804.40 seconds without a device failure.
+
+## Broadcast tensor-POW numerical guard
+
+The first full census after native tangent aborted in `reset_npu` immediately
+after `test_broadcast_partial`; an isolated exact replay found that the method's
+two small POW layouts had already been accepted with one 0.015625 error among
+twenty outputs. The sixteen non-POW subcases pass, the two large POW shapes
+reject on cost, and the two small POW shapes reproduce the numerical mismatch.
+A following FP16 ADD remains healthy in the isolated process, so the reset abort
+is sequence-sensitive rather than a permanently wedged device.
+
+The broadcast lowerer now detects the exact tensor-POW canonical form and
+returns `NUMERICAL_CONTRACT` before materialization or submission. The official
+method consequently reports four typed rejects plus sixteen passing subtests in
+222.70 seconds with no crash. No method-level tally changes because the method
+was already failing; the guard removes two incorrectly accepted kernels. The
+aborted census produced no final JSON/JUnit because pytest did not reach its
+session-finish hooks and is not an authoritative result.
