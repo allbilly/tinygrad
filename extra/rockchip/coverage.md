@@ -12,48 +12,46 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `2d4c34807` contains exactly 425 telemetry method
-records: 187 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 185 `FAIL`, and 13
+The complete uncached run at `33d5e4756` contains exactly 425 telemetry method
+records: 193 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 179 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set
 throughout, with `FORWARD_ONLY=1` and `DEFAULT_FLOAT=HALF`. Raw pytest reports
-213 failed methods/subtests, 238 passed, 87 passing subtests, and 13 skipped in
-3,138.18 seconds. No NPU timeout, invalid submission, reset failure, process
+207 failed methods/subtests, 244 passed, 87 passing subtests, and 13 skipped in
+3,205.21 seconds. No NPU timeout, invalid submission, reset failure, process
 abort, fallback execution, or test-context warning occurred.
 
-Relative to `2e40def50`, fifteen methods change from failure to native pass and
-none regress: `test_pad`, `test_pad_reflect_mode`, `test_pad_replicate_mode`,
-`test_pad_slice`, `test_padded_conv2d_1x1`, `test_padded_conv2d_bs1`,
-`test_padded_conv2d_p21`, `test_padded_conv2d_p22`, `test_pow`,
-`test_pow_full`, `test_pow_zero_const`, `test_pow_zero_tensor`,
-`test_simple_padding_conv2d`, `test_stack_max`, and `test_tan`. Every one of the
-185 failures is a typed native reject with a retained method-level first reject;
+Relative to `2d4c34807`, six methods change from failure to native pass and none
+regress: `test_all_zero_axis`, `test_any_zero_axis`, `test_bitcast`,
+`test_int_or`, `test_tril`, and `test_triu`. Every one of the 179 failures is a
+typed native reject with a retained method-level first reject;
 there are no numerical mismatches, device failures, or unclassified failures.
-Their first-reject Pareto is 66 unsupported-output-dtype, 39 plan-stage-limit,
-23 unsupported-input-dtype, 21 numerical-contract, 18 unsupported-layout,
-seven unsupported-reduction, six requires-reformat, and five unsupported-ALU.
+Their first-reject Pareto is 54 unsupported-output-dtype, 39 plan-stage-limit,
+26 unsupported-input-dtype, 20 unsupported-layout, 19 numerical-contract,
+13 unsupported-ALU, six requires-reformat, and two unaligned-row.
 
-The 499 successful kernels belonging to fully native methods contain 457
-`EFFICIENT` and 42 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 85 at
-one task, 217 at 2--8, 84 at 9--32, 72 at 33--64, eight at 65--128, 22 at
+The 531 successful kernels belonging to fully native methods contain 489
+`EFFICIENT` and 42 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at
+one task, 230 at 2--8, 84 at 9--32, 72 at 33--64, eight at 65--128, 22 at
 129--256, and eleven at 257--400. The maximum remains 399 tasks; no task or
 constant ceiling changed. The worst single-kernel wall time is 42.63 seconds,
 and the largest generated constant payload is 1,819,392 bytes. These costs
 remain visible rather than being hidden by the native pass count.
 
 The durable artifacts are
-`~/rk2608_backups/census-local-plugin-2d4c34807-20260804/junit.xml` (SHA-256
-`99c6dfa0010fadb25df291b70049c664a6b5d4416d53775a196839e0d73dbb5a`) and
-`~/rk2608_backups/census-local-plugin-2d4c34807-20260804/test_ops_coverage.json`
+`~/rk2608_backups/census-local-plugin-33d5e4756-20260804/junit.xml` (SHA-256
+`e6feb043ae4d568e8a00393feafa6ab4a4b4824dbfc6cb6c9b502c4a8e1a53cd`) and
+`~/rk2608_backups/census-local-plugin-33d5e4756-20260804/test_ops_coverage.json`
 (SHA-256
-`f3865596cf1976c06aff971d22c341281126ad13174cafb8228fd5d3218fd46a`). The
+`a0b51584d5b3ed31bb0e524969040b642dba28dd0efa01f473e16d89274d76c5`). The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-The grouped-CNA, sliding-MAX PPU, NHWC/HWIO CNA, padding, power, and tangent
-transitions are all authoritative.
+All focused milestones through exact int32 OR-all-ones fill are now
+authoritative. The chronological sections below retain the individual focused
+evidence and their then-current estimates for debugging history.
 
 Focused work after that census makes `TestOps.test_simple_conv2d_nhwc` pass
 natively without changing its `atol=1e-5`. The generic affine matcher derives
