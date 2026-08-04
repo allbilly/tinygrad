@@ -2852,3 +2852,34 @@ actionable: CNA activation and weight layouts expose separate feature-bank and
 weight-bank requirements, allowing legalization to choose Y, K, or Cartesian
 YxK task windows from simultaneous bank pressure instead of encoding that
 choice as ad-hoc convolution cases.
+
+## Typed CBUF Y/K planner
+
+`renderer/rockchip/conv.py` now contains a UOp-free, NumPy-free CBUF planner
+that produces `RKConvTiling(split, y_step, k_step, tiles)`. Each `RKConvTile`
+states `y_start`, overlapping input height, output height, K start/count, and
+the exact feature/weight bank counts. The planner derives:
+
+```text
+feature entries per slice -> resident input rows -> Y windows
+packed FP16 weight bytes   -> weight banks        -> K windows
+Y pressure + K pressure    -> Cartesian BY_YK tiles
+```
+
+Its outputs match the local `conv_grok` snapshot for five representative
+families:
+
+| Geometry | Split | Y step | K step | Tasks |
+|---|---:|---:|---:|---:|
+| 9x9, IC4, OC4, 3x3 | `NONE` | 7 | 4 | 1 |
+| 224x224, IC3, OC32, 3x3 | `BY_Y` | 32 | 32 | 7 |
+| 3x3, IC128, OC128, 3x3 | `BY_K` | 1 | 32 | 4 |
+| 28x28, IC256, OC512, 1x1 | `BY_YK` | 7 | 32 | 64 |
+| 64x64, IC16, OC6, 5x2 | `BY_Y` | 23 | 6 | 3 |
+
+All ten `conv_grok/test_planner.py` tests pass. The established NHWC direct
+convolution now obtains its 16+4 K windows from this typed planner and its
+unchanged RK3588 test passes in 18.37 seconds. The compiler intentionally does
+not emit Y or YxK plans yet: overlap-address, DMA-surface, and output-offset
+fields still require focused hardware proof. This milestone changes no
+TestOps outcome, task ceiling, tolerance, or CPU execution policy.

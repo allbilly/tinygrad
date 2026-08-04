@@ -6,7 +6,7 @@ from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContract, RKSpatialConv, RKDPUProgram, RKEpilogue, RKEngine,
-  RKLayout, RKLayoutKind,
+  RKLayout, RKLayoutKind, RKConvSplit, RKConvTiling,
   RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKLegalizedReformat, RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_contract, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
@@ -16,7 +16,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   lower_static_selector_reformat_result,
   lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
-  rk_fingerprint)
+  plan_conv_cbuf, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.uop.ops import KernelInfo, Ops, ProgramInfo, UOp
 
@@ -55,6 +55,30 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC8).is_legal_for(RKEngine.PPU))
     self.assertTrue(RKLayout((2,4,8),(2,4,8),(64,16,2),dtypes.half,kind=RKLayoutKind.CONV_OUTPUT).is_legal_for(RKEngine.CONV))
     with self.assertRaises(ValueError): dense.validate_for(RKEngine.PPU)
+
+  def test_conv_cbuf_planner_cartesian_splits_follow_bank_pressure(self):
+    cases = (
+      ((9,9,4,4,3,3), True, RKConvSplit.NONE, 7, 4, 1),
+      ((224,224,3,32,3,3), True, RKConvSplit.BY_Y, 32, 32, 7),
+      ((3,3,128,128,3,3), False, RKConvSplit.BY_K, 1, 32, 4),
+      ((28,28,256,512,1,1), False, RKConvSplit.BY_YK, 7, 32, 64),
+      ((64,64,16,6,5,2), False, RKConvSplit.BY_Y, 23, 6, 3),
+    )
+    for shape,use_nhwc,split,y_step,k_step,tasks in cases:
+      with self.subTest(shape=shape):
+        plan = plan_conv_cbuf(*shape,use_nhwc=use_nhwc)
+        self.assertIsInstance(plan,RKConvTiling)
+        assert isinstance(plan,RKConvTiling)
+        self.assertEqual((plan.split,plan.y_step,plan.k_step,len(plan.tiles)),(split,y_step,k_step,tasks))
+        self.assertTrue(all(tile.data_banks+tile.weight_banks <= 12 for tile in plan.tiles))
+        self.assertEqual({(tile.y_start,tile.k_start) for tile in plan.tiles},
+          {(y,k) for y in {tile.y_start for tile in plan.tiles} for k in {tile.k_start for tile in plan.tiles}})
+        y_windows = sorted({(tile.y_start,tile.output_height) for tile in plan.tiles})
+        k_windows = sorted({(tile.k_start,tile.out_channels) for tile in plan.tiles})
+        self.assertEqual(([start for start,_ in y_windows],[start for start,_ in k_windows]),
+                         ([sum(size for _,size in y_windows[:i]) for i in range(len(y_windows))],
+                          [sum(size for _,size in k_windows[:i]) for i in range(len(k_windows))]))
+    self.assertIsNone(plan_conv_cbuf(2,2,16,16,3,3))
 
   def test_wide_fp16_fill_tiles_at_proven_dpu_width(self):
     plan = lower_dpu(sink(Tensor.full((65536,), 1, dtype=dtypes.half)))

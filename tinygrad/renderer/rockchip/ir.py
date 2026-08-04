@@ -29,6 +29,11 @@ class RKLayoutKind(Enum):
 class RKReformatKind(Enum):
   COALESCED_DPU = "coalesced_dpu"
   SELECTOR_CMAC = "selector_cmac"
+class RKConvSplit(Enum):
+  NONE = "none"
+  BY_Y = "by_y"
+  BY_K = "by_k"
+  BY_YK = "by_yk"
 
 @dataclass(frozen=True)
 class RKArg:
@@ -182,6 +187,30 @@ class RKSpatialConv:
   stride_x: int
   input_width_stride: int
   output_width_stride: int
+
+@dataclass(frozen=True)
+class RKConvTile:
+  y_start: int
+  input_y_start: int
+  input_height: int
+  output_height: int
+  k_start: int
+  out_channels: int
+  data_banks: int
+  weight_banks: int
+  def __post_init__(self):
+    if min(self.y_start,self.input_y_start,self.k_start) < 0 or \
+       min(self.input_height,self.output_height,self.out_channels,self.data_banks,self.weight_banks) <= 0 or \
+       self.data_banks+self.weight_banks > 12: raise ValueError("invalid RK3588 CBUF convolution tile")
+
+@dataclass(frozen=True)
+class RKConvTiling:
+  split: RKConvSplit
+  y_step: int
+  k_step: int
+  tiles: tuple[RKConvTile, ...]
+  def __post_init__(self):
+    if not self.tiles or min(self.y_step,self.k_step) <= 0: raise ValueError("empty RK3588 convolution tiling")
 
 @dataclass(frozen=True)
 class RKReduce:

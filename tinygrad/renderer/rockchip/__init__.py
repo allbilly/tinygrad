@@ -13,7 +13,8 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind, RKReformatKind, RKArg,
   RKALUStage, RKFusedALUStage as RKFusedALUStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
-  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKReduce, RKPool, RKReformatPlan,
+  RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContract, RKSpatialConv, RKConvSplit as RKConvSplit,
+  RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan,
   RKLegalizedReformat, RKProgram, RKPlanCost,
   RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
@@ -21,6 +22,7 @@ from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, 
   patch_image as patch_image, validate_image as validate_image)
 from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint as rk_fingerprint
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
+from tinygrad.renderer.rockchip.conv import plan_conv_cbuf as plan_conv_cbuf
 
 RK_MAX_CONSTANT_BYTES = 2*1024*1024
 RK_MAX_AFFINE_VISITS = 65536
@@ -1864,12 +1866,14 @@ def lower_nhwc_spatial_contract_result(sink:UOp) -> RKLowerResult:
       f"direct NHWC convolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w},S={stride_y}x{stride_x}",reduce.op)
 
   align_in, input_c2 = 16, 8
-  bytes_per_output_channel = kernel_h*kernel_w*align_in*2
-  cbuf_k_step = min(16, max(1,32768//bytes_per_output_channel))
-  channel_tiles = tuple((start,min(cbuf_k_step,out_c-start)) for start in range(0,out_c,cbuf_k_step))
-  if any((kernel_h*kernel_w*align_in*tile_c*2+32767)//32768 > 1 for _,tile_c in channel_tiles):
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"NHWC convolution K tile exceeds one weight CBUF bank",reduce.op)
   input_width_stride, output_width_stride = in_w, (out_h*out_w+3)&-4
+  tiling = plan_conv_cbuf(in_h,in_w,in_c,out_c,kernel_h,kernel_w,stride_y,input_width_stride,output_width_stride,
+                          align_in,use_nhwc=False,max_k_step=16)
+  if tiling is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"NHWC convolution has no legal CBUF tile",reduce.op)
+  if tiling.split in (RKConvSplit.BY_Y,RKConvSplit.BY_YK):
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,"NHWC convolution needs unlegalized CBUF Y tiling",reduce.op)
+  channel_tiles = tuple(dict.fromkeys((tile.k_start,tile.out_channels) for tile in tiling.tiles))
   input_surface_count = ((in_c+7)//8)*in_h*input_width_stride*8
   input_batch_count, output_tile_count = (input_surface_count+7)&-8, 2*output_width_stride*8
   input_rows:list[list[int]] = []

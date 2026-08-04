@@ -1219,3 +1219,20 @@ passes 128 tests plus 26 subtests, mypy, and Ruff. Twelve serialized RK3588
 CONV/PPU tests plus three subtests pass in 79.72 seconds. This is a no-coverage
 milestone and leaves 172/40/200/13 authoritative; it prepares direct packing
 and CBUF-pressure candidates to state their input/output contracts explicitly.
+
+## Typed CBUF-pressure convolution tiling
+
+The formula-only `conv_grok` scheduler is now represented by typed
+`RKConvTiling` and `RKConvTile` plans in the clean compiler. FP16 feature rows
+determine resident data banks and Y windows; packed weight bytes determine K
+windows; simultaneous pressure emits the Cartesian `BY_YK` product. Every tile
+records input/output Y geometry, K range, and its data/weight bank allocation,
+and construction rejects any tile exceeding the twelve-bank RK3588 CBUF.
+
+Five representative shapes reproduce `conv_grok` exactly: `NONE` 7x4,
+RGB `BY_Y` 32x32, spatial `BY_K` 1x32, pointwise `BY_YK` 7x32, and the
+TestOps 64x64 5x2 large-input geometry as `BY_Y` with 23 output rows. All ten
+reference offline planner tests pass. The current NHWC compiler now consumes
+the typed planner for its proven K-only 16+4 split; its unchanged device test
+passes in 18.37 seconds. Plans containing Y windows remain typed rejects until
+CNA input overlap and output-offset emission are proven on hardware.
