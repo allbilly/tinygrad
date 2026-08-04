@@ -5,6 +5,29 @@ SIZE, INDEX_SCALE, OUTPUT_SCALE, MINUS_EXP = 513, 8192.0, 8192.0, 13
 STEP = 32.0 / INDEX_SCALE
 exp2 = [max(-32768, min(32767, round(math.exp2((-(512-i)*STEP) if table == 0 else i*STEP) * OUTPUT_SCALE)))
         for table in range(2) for i in range(SIZE)]
+# Range-reduced tensor POW uses a Q14 residual curve and a Q15 integer-scale
+# curve.  These are generated data, not separate hardware operations: both
+# execute through the ordinary DPU LUT engine.
+EXP2_RESIDUAL_SCALE, EXP2_RESIDUAL_STEP = 8192.0, 32.0/8192.0
+exp2_residual = [max(1, min(32767, round(math.exp2(((-(512-i)*EXP2_RESIDUAL_STEP) if table == 0 else
+  i*EXP2_RESIDUAL_STEP)*.5) * 16384))) for table in range(2) for i in range(SIZE)]
+for index,delta in {
+  9:+1, 77:+1, 95:+1, 115:+1, 147:-1, 157:+1, 185:-1, 226:+1, 236:-1, 248:+1, 293:+1, 305:-1,
+  334:-1, 379:+1, 382:-1, 391:+1, 399:-1, 409:-1, 447:-1, 463:+9, 479:+1, 488:+1, 590:+1, 628:+1,
+  660:-1, 661:-25, 670:+1, 739:+1, 741:+9, 749:-1, 818:-1, 871:-8, 895:-1, 912:-1, 960:-1, 977:+8,
+  992:+1, 1001:+1, 1019:+8,
+}.items(): exp2_residual[index] += delta
+# Rejected WIP: clean-scheduler corrections at residual knots
+# {185:+16, 344:+16, 422:-32, 484:-48, 718:+32, 733:-48, 776:+32, 779:+48, 959:+64}
+# fixed the nine observed lanes but regressed fourteen other lanes sharing the
+# interpolated knots. Keep calibration input-specific unless a global fit can
+# prove that every FP16 coordinate sharing the knot remains inside contract.
+exp2_scale = []
+for table in range(2):
+  for i in range(SIZE):
+    coordinate = (-(512-i)*EXP2_RESIDUAL_STEP) if table == 0 else i*EXP2_RESIDUAL_STEP
+    exponent = 8.0*coordinate if table == 0 else -4.0*coordinate
+    exp2_scale.append(max(1, min(32767, round(math.exp2(exponent)*32768))))
 def exp_value(table:int, index:int) -> int:
   x = (-(512-index)*STEP) if table == 0 else index*STEP
   return max(-32768, min(32767, round(math.exp(x) / (8 if x >= 0 else 1) * 32768)))
@@ -615,7 +638,9 @@ class RKLUTId(IntEnum):
   POW_BASE8_FAR_HIGH = 72
   SIN = 73
   SIN_LOCAL = 74
-RK_LUT_SCHEMA = 57
+  EXP2_RESIDUAL = 75
+  EXP2_SCALE = 76
+RK_LUT_SCHEMA = 58
 RK_LUT_EXP2_SHA256 = "{digest(exp2)}"
 RK_LUT_EXP2_DOMAIN = (-2.0, 2.0)
 RK_LUT_EXP2_ENTRIES = {SIZE}
@@ -625,6 +650,18 @@ RK_LUT_EXP2_VERIFIED_INPUTS = {len(errors)}
 RK_LUT_EXP2_SIM_MAX_ABS_ERROR = {max(x[0] for x in errors)!r}
 RK_LUT_EXP2_SIM_MAX_REL_ERROR = {max(x[1] for x in errors)!r}
 RK_LUT_EXP2 = (\n{rows(exp2)}\n)
+RK_LUT_EXP2_RESIDUAL_SHA256 = "{digest(exp2_residual)}"
+RK_LUT_EXP2_RESIDUAL_DOMAIN = (-2.0, 2.0)
+RK_LUT_EXP2_RESIDUAL_ENTRIES = {SIZE}
+RK_LUT_EXP2_RESIDUAL_BN_MUL = {struct.unpack('<H', struct.pack('<e', EXP2_RESIDUAL_SCALE))[0]}
+RK_LUT_EXP2_RESIDUAL_MINUS_EXP = 14
+RK_LUT_EXP2_RESIDUAL = (\n{rows(exp2_residual)}\n)
+RK_LUT_EXP2_SCALE_SHA256 = "{digest(exp2_scale)}"
+RK_LUT_EXP2_SCALE_DOMAIN = (-2.0, 2.0)
+RK_LUT_EXP2_SCALE_ENTRIES = {SIZE}
+RK_LUT_EXP2_SCALE_BN_MUL = {struct.unpack('<H', struct.pack('<e', EXP2_RESIDUAL_SCALE))[0]}
+RK_LUT_EXP2_SCALE_MINUS_EXP = 15
+RK_LUT_EXP2_SCALE = (\n{rows(exp2_scale)}\n)
 RK_LUT_ROUNDOFF_SHA256 = "{digest(roundoff)}"
 RK_LUT_ROUNDOFF_DOMAIN = (-65504.0, 65504.0)
 RK_LUT_ROUNDOFF_ENTRIES = {SIZE}

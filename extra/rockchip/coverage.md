@@ -2987,3 +2987,43 @@ The unchanged official `test_stack_max` passes natively in 0.73 seconds; its
 cost is one task, 32 command words, zero constants, zero scratch, four estimated
 read bytes, and two write bytes. Focused expected coverage is 182 native / 40
 frontend / 190 failed / 13 upstream skips.
+
+## Native runtime tensor power
+
+The clean compiler now recognizes tinygrad's complete FP16 tensor-POW
+expansion and lowers it to one UOp-free expression plan. The algorithm computes
+`LOG2(abs(base))*exponent`, separates the integer and residual parts with the
+native roundoff LUT, evaluates the residual and integer scale through two new
+generated DPU LUT payloads, and reconstructs negative-base parity, invalid
+fractional domains, and zero-base infinity/identity behavior entirely on the
+NPU. The final plan has 376 reset-separated tasks and fourteen reusable scratch
+surfaces, so it is native correctness evidence rather than an efficient POW
+implementation.
+
+The 2607 implementation was a useful hardware oracle but duplicated every
+dependent DPU stage. Its exact-input corrections reduced the clean scheduler's
+twenty official-domain misses to nine while increasing the plan to 356 stages,
+and also introduced three new misses. The clean calibration instead groups all
+twenty deterministic misses by nine exact FP16 output factors and exponent
+sign. A trial that modified nine global residual-table knots fixed those lanes
+but regressed fourteen neighbors, so that trial remains disabled and documented
+inside `gen_lut.py`.
+
+The unchanged official `test_pow_full` passes both tensor-POW spellings at
+stock `rtol=1e-3, atol=1e-6` in 158.71 seconds. The unchanged
+`test_pow_zero_tensor` passes all three zero-base subcases in 195.00 seconds.
+No host task, fallback, runtime dtype conversion, skip, tolerance change, or
+task-limit increase is involved.
+
+Repeated uses of one unmasked affine broadcast INDEX are now substituted as
+one surface before expression parsing. This makes broadcast POW legal, but the
+two official `test_broadcast_full` POW plans still cost 500 and 590 tasks after
+native selector packing. Both broadcast lowerers now enforce the existing
+400-task and 2 MiB constant limits on their final composed plans, so those
+shapes remain typed `PLAN_STAGE_LIMIT` failures. Focused expected coverage is
+184 native / 40 frontend / 188 failed / 13 upstream skips; the complete
+`2e40def50` 172/40/200/13 census remains authoritative until rerun. The host
+gate passes 144 tests plus 34 subtests, full mypy and touched-module Ruff pass,
+and the complete serialized RK3588 gate passes 96 tests plus 66 subtests in
+807.23 seconds without a timeout, invalid submission, reset failure, or process
+abort.

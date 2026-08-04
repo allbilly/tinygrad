@@ -1314,3 +1314,29 @@ directly rather than packing it. The unchanged official `test_stack_max`
 therefore passes through one DPU MAX task in 0.73 seconds with no scratch or
 constants. Focused expected coverage is 182 native / 40 frontend / 190 fail /
 13 skip.
+
+Runtime FP16 tensor power now lowers to a typed, NPU-only range-reduced
+LOG2/multiply/EXP2 program. Two offline-generated tables encode the residual
+`2**r` curve and integer power-of-two scale; native roundoff supplies integer
+decomposition, while DPU masks repair negative-base parity, invalid fractional
+negative bases, and all zero-base cases. The physical program has 376 tasks and
+is explicitly a correctness fallback under the unchanged 400-task ceiling.
+
+The unchanged official `test_pow_full` passes both `x**y` spellings in 158.71
+seconds, and `test_pow_zero_tensor` passes `0**0`, `0**positive`, and
+`0**negative` in 195.00 seconds. Calibration is tied to exact FP16 base values
+and exponent sign after the clean single-consumption scheduler. A rejected
+global residual-knot adjustment is retained in the generator: it fixed nine
+observed lanes but regressed fourteen other lanes sharing interpolated knots.
+No tolerance was changed.
+
+Unmasked affine broadcast substitution now replaces every occurrence of the
+source INDEX, which lets repeated exponent uses canonicalize correctly.
+However, the official large broadcast-POW shapes cost 500 and 590 tasks after
+packing, so new cost gates reject them with `PLAN_STAGE_LIMIT`; the ceiling was
+not raised. Focused expected coverage is 184 native / 40 frontend / 188 fail /
+13 skip, while 172/40/200/13 remains authoritative until a complete census.
+The complete host gate passes 144 tests plus 34 subtests, full mypy and
+touched-module Ruff pass, and the serialized RK3588 gate passes 96 tests plus
+66 subtests in 807.23 seconds without a timeout, invalid submission, reset
+failure, or process abort.

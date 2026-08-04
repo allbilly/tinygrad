@@ -723,7 +723,7 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"broadcast surface is {count} from {src_count}", Ops.INDEX)
 
   canonical = source_index.replace(src=(source_index.src[0], output_index))
-  root = _parse_alu(stored.substitute({surface:canonical}), output_index, {})
+  root = _parse_alu(stored.substitute({source_index if condition is None else surface:canonical}), output_index, {})
   if not isinstance(root, (_ALUExpr, _MaskExpr, _LUTExpr)):
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast expression is not legal DPU arithmetic", stored.op)
   old_arg, expanded = RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot), RKArg(RKBufferKind.SCRATCH, 0)
@@ -793,8 +793,11 @@ def lower_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   output = RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot)
   if (scheduled:=_schedule_expr(root, output, count, tuple(scratch))) is None:
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "broadcast stage source is not materializable", stored.op)
-  scratch_tuple = scheduled.scratch
-  return _native(_finish_program([*steps, scheduled], scratch_tuple))
+  completed = _finish_program([*steps, scheduled], scheduled.scratch)
+  cost = plan_cost(completed)
+  return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+    f"broadcast expression needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", stored.op) \
+    if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES else _native(completed)
 
 def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   """Materialize multiple static affine FP16 broadcasts, then schedule one generic DPU expression."""
@@ -841,7 +844,7 @@ def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
     if packed is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "multi-broadcast selector exceeds plan limits", Ops.INDEX)
     steps.extend(packed.steps)
     scratch = packed.scratch
-    substitutions[surface] = source_index.replace(src=(source_index.src[0], output_index))
+    substitutions[source_index if condition is None else surface] = source_index.replace(src=(source_index.src[0], output_index))
     remaps[RKArg(RKBufferKind.ARG, source_index.src[0].arg.slot)] = expanded
   root = _parse_alu(stored.substitute(substitutions), output_index, {})
   def remap(value:_Value) -> _Value:
@@ -853,8 +856,12 @@ def lower_multi_broadcast_alu_result(sink:UOp) -> RKLowerResult:
   if not isinstance(root, (_ALUExpr,_MaskExpr,_LUTExpr)):
     return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "multi-broadcast expression is not legal DPU arithmetic", stored.op)
   scheduled = _schedule_expr(cast(_Expr, remap(root)), RKArg(RKBufferKind.ARG, store.src[0].src[0].arg.slot), count, scratch)
-  return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "multi-broadcast expression is not materializable", stored.op) if scheduled is None else \
-    _native(_finish_program([*steps,scheduled], scheduled.scratch))
+  if scheduled is None: return _unsupported(RKRejectKind.UNSUPPORTED_ALU, "multi-broadcast expression is not materializable", stored.op)
+  completed = _finish_program([*steps,scheduled], scheduled.scratch)
+  cost = plan_cost(completed)
+  return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+    f"multi-broadcast expression needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", stored.op) \
+    if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES else _native(completed)
 
 def lower_add_reduce_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP16 global sum through aligned DPU block trees and one CMAC tail."""

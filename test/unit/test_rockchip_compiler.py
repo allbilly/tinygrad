@@ -822,6 +822,28 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(sum(isinstance(stage, RKLUTStage) and stage.lut is rklut.RKLUTId.ROUNDOFF for stage in plan.stages), 1)
     self.assertFalse(contains_uop(plan))
 
+  def test_tensor_pow_uses_range_reduced_generated_luts(self):
+    for name in ("EXP2_RESIDUAL", "EXP2_SCALE"):
+      table = getattr(rklut, f"RK_LUT_{name}")
+      self.assertEqual(hashlib.sha256(struct.pack(f"<{len(table)}h", *table)).hexdigest(), getattr(rklut, f"RK_LUT_{name}_SHA256"))
+    base, exponent = Tensor.empty(16,dtype=dtypes.half), Tensor.empty(16,dtype=dtypes.half)
+    plan = lower_dpu(sink(base**exponent))
+    self.assertIsInstance(plan, RKDPUProgram)
+    self.assertTrue({rklut.RKLUTId.LOG2, rklut.RKLUTId.LOG2_LOCAL, rklut.RKLUTId.EXP2_RESIDUAL,
+                     rklut.RKLUTId.EXP2_SCALE, rklut.RKLUTId.ROUNDOFF}.issubset(
+                       {stage.lut for stage in plan.stages if isinstance(stage, RKLUTStage)}))
+    self.assertLessEqual(len(plan.stages), 400)
+    self.assertFalse(contains_uop(plan))
+
+  def test_tensor_pow_reuses_one_unmasked_broadcast_surface(self):
+    base, exponent = Tensor.empty(8,dtype=dtypes.half), Tensor.empty(1,dtype=dtypes.half)
+    result = lower_broadcast_alu_result(sink(base**exponent))
+    self.assertEqual(result.kind, RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan, RKProgram)
+    assert isinstance(result.plan, RKProgram)
+    self.assertLessEqual(plan_cost(result.plan).stage_count, 400)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_pow8_uses_generated_two_level_lut(self):
     for name in ("POW8", "POW8_HIGH"):
       table = getattr(rklut, f"RK_LUT_{name}")

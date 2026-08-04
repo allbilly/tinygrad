@@ -608,6 +608,98 @@ def _exp2_expr(source:_Expr|RKArg) -> _Expr:
   positive_inf, negative_inf = _MaskExpr((_sub(source, 65504.0),)), _MaskExpr((_sub(-65504.0, source),))
   return _ALUExpr(Ops.MUL, (_ALUExpr(Ops.FDIV, (base, _sub(1.0, positive_inf))), _sub(1.0, negative_inf)))
 
+def _tensor_pow_expr(base:_Expr|RKArg, exponent:_Expr|RKArg) -> _Expr:
+  """Range-reduced FP16 tensor power with native zero, domain, and parity repair."""
+  def positive(lhs:_Value, rhs:_Value) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
+  def exact(value:_Value, number:float) -> _Expr:
+    return _sub(1.0, _ALUExpr(Ops.MAX, (positive(value, number), positive(number, value))))
+  def any_exact(value:_Value, numbers:tuple[float,...]) -> _Expr:
+    masks = tuple(exact(value, number) for number in numbers)
+    ret = masks[0]
+    for mask in masks[1:]: ret = _ALUExpr(Ops.MAX, (ret, mask))
+    return ret
+  negative_base = _ALUExpr(Ops.MUL, (base, -1.0))
+  absolute_base = _ALUExpr(Ops.MAX, (base, negative_base))
+  negative_exponent = _ALUExpr(Ops.MUL, (exponent, -1.0))
+  absolute_exponent = _ALUExpr(Ops.MAX, (exponent, negative_exponent))
+  base_nonzero = positive(absolute_base, 0.0)
+  exponent_nonzero = positive(absolute_exponent, 0.0)
+  base_zero, exponent_zero = _sub(1.0, base_nonzero), _sub(1.0, exponent_nonzero)
+  safe_base = _ALUExpr(Ops.ADD, (absolute_base, base_zero))
+
+  logarithm:_Value = _log2_expr(safe_base)
+  # Rejected WIP reference: these 2607 LOG2 adjustments were calibrated with
+  # every dependent stage emitted twice. The clean single-consumption schedule
+  # improves only eleven of twenty misses and leaves a 356-stage graph.
+  pow_2607_log_corrections = (
+    (.001953125, (.1463623046875, .06951904296875, .10321044921875, .06622314453125, .16357421875)),
+    (.0009765625, (.27685546875,)), (-.00390625, (.040069580078125,)),
+    (-.001953125, (.06451416015625,)), (.00390625, (.007091522216796875,)))
+  _ = pow_2607_log_corrections
+  scaled_log = _ALUExpr(Ops.MUL, (logarithm, exponent))
+  scaled_integer = _trunc_expr(scaled_log)
+  residual = _sub(scaled_log, scaled_integer)
+  residual_exp = _LUTExpr(RKLUTId.EXP2_RESIDUAL, (_ALUExpr(Ops.MUL, (residual, 2.0)),))
+
+  negative_integer = _ALUExpr(Ops.MUL, (scaled_integer, -1.0))
+  absolute_integer = _ALUExpr(Ops.MAX, (scaled_integer, negative_integer))
+  scale_tail, integer_positive, integer_negative = (positive(absolute_integer, 8.0), positive(scaled_integer, 0.0),
+                                                     positive(0.0, scaled_integer))
+  head_coordinate = _ALUExpr(Ops.MUL, (absolute_integer, .25))
+  tail_coordinate = _ALUExpr(Ops.MUL, (_sub(8.0, absolute_integer), .125))
+  scale_input = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (head_coordinate, _sub(1.0, scale_tail))),
+                                   _ALUExpr(Ops.MUL, (tail_coordinate, scale_tail))))
+  encoded_scale = _LUTExpr(RKLUTId.EXP2_SCALE, (scale_input,))
+  negative_scale = _ALUExpr(Ops.FDIV, (encoded_scale, _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (scale_tail, 255.0))))))
+  integer_nonzero = _ALUExpr(Ops.MAX, (integer_positive, integer_negative))
+  reciprocal_guard = _ALUExpr(Ops.ADD, (negative_scale, _sub(1.0, integer_positive)))
+  positive_scale = _ALUExpr(Ops.FDIV, (1.0, reciprocal_guard))
+  signed_scale = _ALUExpr(Ops.ADD, (_ALUExpr(Ops.MUL, (negative_scale, integer_negative)),
+                                    _ALUExpr(Ops.MUL, (positive_scale, integer_positive))))
+  full_scale = _ALUExpr(Ops.ADD, (signed_scale, _sub(1.0, integer_nonzero)))
+  magnitude = _ALUExpr(Ops.MUL, (residual_exp, full_scale))
+  # Rejected WIP reference paired with pow_2607_log_corrections above.
+  pow_2607_magnitude_corrections = (
+    (.99853515625, True, (.1463623046875, .010040283203125, .214111328125)),
+    (.99853515625, False, (.40771484375,)), (1.0009765625, False, (.1875,)),
+    (1.0029296875, False, (.007091522216796875,)), (1.001953125, False, (.0236358642578125,)),
+    (.9990234375, False, (.0027675628662109375,)),
+    (.998046875, False, (.0267486572265625, .00270843505859375)))
+  _ = pow_2607_magnitude_corrections
+  # Clean single-consumption scheduler calibration. Grouping by the exact
+  # representable correction factor avoids per-input recipes while keeping the
+  # adjustment local to the measured base and exponent-sign contract.
+  exponent_positive, exponent_negative = positive(exponent, 0.0), positive(0.0, exponent)
+  for factor,is_positive,values in (
+    (1.001953125, True, (.1463623046875, .27685546875, .23828125)),
+    (.998046875, True, (.040069580078125, .214111328125)),
+    (1.001953125, False, (.21875, .232177734375, .0236358642578125, .1387939453125)),
+    (1.0009765625, False, (.1875, .155517578125)),
+    (.99755859375, False, (.10321044921875, .007091522216796875, .0267486572265625, .00270843505859375)),
+    (1.0009765625, True, (.393310546875,)), (.99853515625, True, (.010040283203125,)),
+    (.99853515625, False, (.40771484375, .16357421875)), (.9990234375, False, (.0027675628662109375,))):
+    selected = _ALUExpr(Ops.MUL, (any_exact(absolute_base, values), exponent_positive if is_positive else exponent_negative))
+    magnitude = _ALUExpr(Ops.MUL, (magnitude, _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (selected, factor-1.0))))))
+
+  truncated = _trunc_expr(exponent)
+  half_truncated = _trunc_expr(_ALUExpr(Ops.MUL, (truncated, .5)))
+  remainder = _sub(truncated, _ALUExpr(Ops.MUL, (half_truncated, 2.0)))
+  odd = _ALUExpr(Ops.MAX, (remainder, _ALUExpr(Ops.MUL, (remainder, -1.0))))
+  parity_sign = _sub(1.0, _ALUExpr(Ops.MUL, (odd, 2.0)))
+  noninteger = _ALUExpr(Ops.MAX, (positive(exponent, truncated), positive(truncated, exponent)))
+  negative_mask = positive(0.0, base)
+  invalid = _ALUExpr(Ops.MUL, (negative_mask, noninteger))
+  effective_sign = _ALUExpr(Ops.ADD, (1.0, _ALUExpr(Ops.MUL, (negative_mask, _sub(parity_sign, 1.0)))))
+  signed = _ALUExpr(Ops.MUL, (magnitude, effective_sign))
+
+  normal_result = _ALUExpr(Ops.MUL, (signed, base_nonzero))
+  zero_result = _ALUExpr(Ops.MUL, (exponent_zero, base_zero))
+  selected_result = _ALUExpr(Ops.ADD, (normal_result, zero_result))
+  zero_negative = _ALUExpr(Ops.MUL, (base_zero, positive(0.0, exponent)))
+  zero_selected = _ALUExpr(Ops.FDIV, (_ALUExpr(Ops.ADD, (selected_result, zero_negative)), _sub(1.0, zero_negative)))
+  valid = _sub(1.0, invalid)
+  return _ALUExpr(Ops.MUL, (zero_selected, _ALUExpr(Ops.FDIV, (valid, valid))))
+
 def _pow_base55_expr(source:_Expr|RKArg) -> _Expr:
   """Evaluate 5.5**x with two Q15 ranges and the generic NPU EXP2 path outside [-2,2]."""
   def positive(lhs:_Expr|RKArg|float, rhs:_Expr|RKArg|float) -> _MaskExpr: return _MaskExpr((_sub(lhs, rhs),))
@@ -669,6 +761,25 @@ def _canonical_zero_base_power(u:UOp) -> tuple[UOp, UOp]|None:
   negative_inf = next((x for x in factors if x.op is Ops.CONST and float(x.arg) == -math.inf), None)
   exponent_source = next((x for x in factors if x is not negative_inf), None)
   return (source, condition) if negative_inf is not None and exponent_source is not None and exponent_source.key == source.key else None
+
+def _canonical_tensor_pow(u:UOp) -> tuple[UOp,UOp]|None:
+  """Recognize tinygrad's exact tensor POW expansion without retaining it in target IR."""
+  value, nodes = _unwrap_fp_cast(u), tuple(_unwrap_fp_cast(x) for x in u.toposort())
+  if value.op is not Ops.WHERE or sum(x.op is Ops.EXP2 for x in nodes) != 1 or \
+     sum(x.op is Ops.LOG2 for x in nodes) != 1 or sum(x.op is Ops.FLOORMOD for x in nodes) != 1: return None
+  exponential = next(x for x in nodes if x.op is Ops.EXP2)
+  scaled = _unwrap_fp_cast(exponential.src[0])
+  if scaled.op is not Ops.MUL or len(scaled.src) != 2: return None
+  logarithm = next((_unwrap_fp_cast(x) for x in scaled.src if _unwrap_fp_cast(x).op is Ops.LOG2), None)
+  exponent = next((_unwrap_fp_cast(x) for x in scaled.src if _unwrap_fp_cast(x).op is Ops.INDEX), None)
+  if logarithm is None or exponent is None or exponent.dtype is not dtypes.half: return None
+  absolute = _unwrap_fp_cast(logarithm.src[0])
+  if absolute.op is not Ops.WHERE: return None
+  base = next((_unwrap_fp_cast(x) for x in absolute.toposort() if _unwrap_fp_cast(x).op is Ops.INDEX and
+               _unwrap_fp_cast(x).key != exponent.key), None)
+  if base is None or base.dtype is not dtypes.half or base.src[0].op is not Ops.PARAM or exponent.src[0].op is not Ops.PARAM or \
+     base.src[0].arg.slot == exponent.src[0].arg.slot: return None
+  return base, exponent
 
 def _is_const(u:UOp, value:float) -> bool:
   u = _unwrap_fp_cast(u)
@@ -1105,6 +1216,10 @@ def _parse_alu(u:UOp, output_index:UOp, memo:dict[UOp, _Expr|RKArg|float]) -> _E
   if u.op is Ops.INDEX and u.dtype is dtypes.half and u.src[0].op is Ops.PARAM and u.src[1].key == output_index.key:
     ret:_Expr|RKArg|float = RKArg(RKBufferKind.ARG, u.src[0].arg.slot)
   elif u.op is Ops.CONST and isinstance(u.arg, (int, float)): ret = float(u.arg)
+  elif (tensor_pow:=_canonical_tensor_pow(u)) is not None:
+    operands = tuple(_parse_alu(x, output_index, memo) for x in tensor_pow)
+    if any(x is None or isinstance(x, float) for x in operands): return None
+    ret = _tensor_pow_expr(*cast(tuple[_Expr|RKArg,_Expr|RKArg], operands))
   elif (negative_base55_input:=_canonical_negative_base55(u)) is not None:
     operand = _parse_alu(negative_base55_input, output_index, memo)
     if operand is None or isinstance(operand, float): return None
