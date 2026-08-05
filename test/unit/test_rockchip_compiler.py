@@ -1297,10 +1297,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(dynamic.kind,RKLowerKind.NATIVE)
     assert isinstance(dynamic.plan,RKProgram)
     self.assertLessEqual(plan_cost(dynamic.plan).task_count,400)
-    too_wide = lower_tiled_contract_result(sink(Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,99,dtype=dtypes.half)))
-    self.assertIs(too_wide.kind,RKLowerKind.UNSUPPORTED)
-    assert too_wide.reject is not None
-    self.assertIs(too_wide.reject.kind,RKRejectKind.PLAN_STAGE_LIMIT)
+    unaligned_n = lower_tiled_contract_result(sink(Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,99,dtype=dtypes.half)))
+    self.assertIs(unaligned_n.kind,RKLowerKind.NATIVE)
+    assert isinstance(unaligned_n.plan,RKProgram)
+    unaligned_cost = plan_cost(unaligned_n.plan)
+    self.assertLessEqual(unaligned_cost.task_count,205)
+    self.assertLessEqual(unaligned_cost.constant_bytes,400*1024)
+    self.assertEqual(sum(isinstance(stage,RKStridedAtomGatherStage) for step in unaligned_n.plan.steps
+                         if isinstance(step,RKDPUProgram) for stage in step.stages),13)
+    self.assertFalse(contains_uop(unaligned_n.plan))
 
   def test_dense_square_contraction_uses_direct_lhs_rows(self):
     result = lower_tiled_contract_result(sink(Tensor.empty(64,64,dtype=dtypes.half)@Tensor.empty(64,64,dtype=dtypes.half)))

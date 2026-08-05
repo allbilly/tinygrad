@@ -5303,7 +5303,7 @@ itself cannot be disabled by a coverage mode. Sixteen runtime/fallback tests,
 the mapped native-host-native coherence test, and the strided-gather hardware
 test pass; mypy and Ruff are clean.
 
-## Rejected unaligned row-major RHS padding
+## Unaligned row-major RHS padding
 
 The direct broad CMAC task is not the blocker for `1x64 @ 64x99`: the existing
 selector path rejects at 402 tasks, while an experimental row-padding plan
@@ -5314,13 +5314,26 @@ row before applying the proven strided-gather transpose.
 RK3588 hardware rejected the required premise. DPU source bases are interpreted
 at a 16-byte FP16-atom boundary. For requested logical row starts
 `0, 99, 198, 297`, the device read from elements `0, 96, 192, 296`. The resulting
-matvec mismatched all 99 outputs, so the row-padding path remains disabled and
-the 402-task family continues to reject before submission. The behavior is
+matvec mismatched all 99 outputs, so that DPU row-padding path remains disabled. The behavior is
 reproducible with `PYTHONPATH=. python extra/rockchip/probe_dpu_unaligned_row_copy.py`.
 
 The BS/BN/EW pipeline does not change this address contract. It can fuse several
 arithmetic operands in one task, as already used by mask/WHERE handling and the
 fused lerp stages, but it cannot shift an unaligned source row into a new lane
-position. A clean N=99 implementation therefore needs an engine-native aligned
-surface conversion (or another explicitly proven gather layout), not one DPU
-copy per unaligned row and not CPU packing.
+position.
+
+The accepted replacement uses bounded CMAC row selectors. Each logical row is
+selected from one aligned source window into a compact 128-value scratch row;
+the existing strided gather and 32x8 block transpose then produce the canonical
+CMAC weight stream. The standalone `64x99 -> 64x128` padding surface is exact,
+including zero padding, in 128 tasks and 262,400 constant bytes. The complete
+`1x64 @ 64x99` plan costs 199 tasks, 396,752 constant bytes, and one broad CMAC
+compute task, versus the former 402-task rejection.
+
+The permanent hardware regression and the unchanged `TestOps.test_matmul` are
+bit-exact against their FP32-accumulated FP16 references. The complete compiler
+suite passes 173 tests plus 78 subtests, and six focused contraction hardware
+tests pass with seven subtests. This adds one expected strict-native method
+without CPU packing, host fallback, a task-limit increase, or a tolerance
+change; a complete uncached strict census is still required before replacing
+the authoritative method totals.

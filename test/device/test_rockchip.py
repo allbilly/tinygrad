@@ -48,6 +48,17 @@ class TestRockchip(unittest.TestCase):
     expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
     np.testing.assert_equal(actual,expected)
 
+  def test_row_major_matvec_unaligned_n_native_pack(self):
+    for n in (9,99,127):
+      with self.subTest(n=n):
+        rng = np.random.default_rng(64000+n)
+        lhs = rng.uniform(-.125,.125,(1,64)).astype(np.float16)
+        rhs = rng.uniform(-.125,.125,(64,n)).astype(np.float16)
+        actual = (Tensor(lhs,device="ROCKCHIP",dtype=dtypes.half) @
+                  Tensor(rhs,device="ROCKCHIP",dtype=dtypes.half)).realize().numpy()
+        expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
+        np.testing.assert_equal(actual,expected)
+
   def test_static_two_tap_linear_interpolation_native_cmac(self):
     rng = np.random.default_rng(0)
     for align_corners in (False,True):

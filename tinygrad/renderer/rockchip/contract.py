@@ -19,12 +19,30 @@ from tinygrad.renderer.rockchip.limits import (RK_MAX_CONSTANT_BYTES, RK_MAX_PRO
 from tinygrad.renderer.rockchip.lower import native as _native, not_applicable as _not_applicable, unsupported as _unsupported
 from tinygrad.renderer.rockchip.reduce import _finish_reduction_epilogue
 from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dense_half_ref, _cmac_weight_ref, _cmac_selection_payload,
-  _selector_program, _finish_program)
+  _windowed_cmac_pipeline, _selector_program, _finish_program)
 
 def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) -> \
     tuple[list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], tuple[RKScratch, ...], RKArg]:
   """Gather and batch-transpose one aligned row-major KxN RHS into the proven blocked CMAC weight stream."""
-  if not 8 <= n <= 256 or n%8 or not 1 <= k <= 256: raise ValueError(f"unsupported row-major RHS N={n},K={k}")
+  if not 8 <= n <= 256 or (n%8 and n > 128) or not 1 <= k <= 256:
+    raise ValueError(f"unsupported row-major RHS N={n},K={k}")
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+  src_row_stride = n
+  if n%8:
+    # DPU bases round down to a 16-byte atom, so an unaligned row cannot be copied independently. Select each bounded row
+    # through CMAC into a proven compact surface instead; the following gather/transpose path then sees one aligned stride.
+    src_row_stride = (n+31)&-32
+    padded_rhs = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(k*src_row_stride*2),)
+    rhs_capacity = ((k*n*2+4095)&-4096)//2
+    for row in range(k):
+      rows = [[row*n+column] for column in range(n)]+[[] for _ in range(src_row_stride-n)]
+      padded = _windowed_cmac_pipeline(RKArg(padded_rhs.kind,padded_rhs.index,row*src_row_stride*2),rhs,rows,
+        scratch=scratch,direct_count=rhs_capacity,max_window=256,max_outputs=128)
+      if padded is None: raise ValueError(f"unaligned row-major RHS N={n},K={k} exceeds the compact row contract")
+      steps.extend(padded.steps)
+      scratch = padded.scratch
+    rhs = padded_rhs
   align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
   packed = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(align_out*align_in*2),)
@@ -35,11 +53,12 @@ def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) 
     lhs_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
     out_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
     weight = _cmac_weight_ref(0,256,256,RKBufferKind.CONSTANT,256)
-    legacy_steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+    legacy_steps = steps
     if k < align_in:
       legacy_steps.append(RKDPUProgram((RKALUStage(Ops.ADD,RKArg(gathered.kind,gathered.index,k*8*2),0.0,0.0,(align_in-k)*8),),scratch))
     for n_start in range(0,n,8):
-      legacy_steps.append(RKDPUProgram((RKStridedAtomGatherStage(gathered,RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),k,n),),scratch))
+      legacy_steps.append(RKDPUProgram((RKStridedAtomGatherStage(gathered,RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),
+        k,src_row_stride),),scratch))
       for k_start in range(0,align_in,32):
         packed_offset = (((n_start//16)*(align_in//32)+k_start//32)*512+(n_start%16//8)*256)*2
         legacy_steps.append(RKCMACTask(RKTensorRef(RKArg(packed.kind,packed.index,packed_offset),out_layout),
@@ -53,10 +72,9 @@ def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) 
   lhs_layout = RKLayout((tiles,256),(tiles,256),(512,2),dtypes.half)
   out_layout = RKLayout((tiles,256),(tiles,256),(1024,4),dtypes.float)
   weight = _cmac_weight_ref(0,256,256,RKBufferKind.CONSTANT,256)
-  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
   for n_index,n_start in enumerate(range(0,n,8)):
     steps.append(RKDPUProgram((RKStridedAtomGatherStage(RKArg(gathered.kind,gathered.index,n_index*k*8*2),
-      RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),k,n),),scratch))
+      RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),k,src_row_stride),),scratch))
   steps.append(RKCMACTask(RKTensorRef(transposed,out_layout),RKTensorRef(gathered,lhs_layout),weight,0,transpose))
   casts:list[RKCastStage] = []
   for tile in range(tiles):
@@ -1068,7 +1086,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
                                      for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_count
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
-  direct_row_major_rhs = 8 <= n <= 256 and n%8 == 0 and 1 <= k <= 256 and rhs_count == n*k and \
+  direct_row_major_rhs = 8 <= n <= 256 and (n%8 == 0 or n <= 128) and 1 <= k <= 256 and rhs_count == n*k and \
     lhs_parsed[1] is None and rhs_parsed[1] is None and \
     rhs_columns == [tuple(red*n+channel for red in range(k)) for channel in range(n)]
   row_ids = {row:index for index,row in enumerate(lhs_rows)}
