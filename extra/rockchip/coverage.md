@@ -7,13 +7,13 @@ evidence but do not replace a complete uncached census.
 <!-- BEGIN GENERATED COVERAGE -->
 ## Generated current census
 
-Generated from `test_ops_hybrid_7d6646a0f.json` at `2026-08-05T18:55:49.278862+00:00` for commit `7d6646a0f2cdd81ba2ec72d26647e57491b7e208`.
+Generated from `test_ops_hybrid_42c0fa400.json` at `2026-08-05T21:56:38.294808+00:00` for commit `42c0fa40088c4f2b391778b56e898b4dda879840`.
 
 | Method outcome | Count |
 | --- | --- |
-| PASS_NATIVE | 213 |
-| PASS_MIXED | 39 |
-| PASS_FALLBACK | 120 |
+| PASS_NATIVE | 214 |
+| PASS_MIXED | 40 |
+| PASS_FALLBACK | 118 |
 | PASS_FRONTEND | 40 |
 | SKIP_UPSTREAM | 13 |
 | FAIL | 0 |
@@ -22,14 +22,14 @@ Total methods: **425**. Subcases: **126** (PASS_FALLBACK=61, PASS_NATIVE=65).
 
 | Kernel lane | Count |
 | --- | --- |
-| HOST | 1423 |
+| HOST | 1421 |
 | RK_CMAC | 32 |
 | RK_DPU | 340 |
-| RK_MIXED | 383 |
+| RK_MIXED | 385 |
 
 | Native quality | Count |
 | --- | --- |
-| CORRECTNESS_FALLBACK | 88 |
+| CORRECTNESS_FALLBACK | 90 |
 | EFFICIENT | 667 |
 
 First recorded native rejection among fallback-using methods:
@@ -39,8 +39,8 @@ First recorded native rejection among fallback-using methods:
 | unsupported_output_dtype | 69 |
 | unsupported_input_dtype | 24 |
 | unsupported_layout | 17 |
-| plan_stage_limit | 15 |
 | none | 14 |
+| plan_stage_limit | 14 |
 | unsupported_alu | 8 |
 | numerical_contract | 5 |
 | requires_reformat | 4 |
@@ -51,6 +51,22 @@ Hardware: `rockchip,rk3588s-orangepi-5,rockchip,rk3588`, kernel `6.1.99-rockchip
 
 Failures: **0**.
 <!-- END GENERATED COVERAGE -->
+
+This complete uncached hybrid census is the current semantic gate: 412
+non-skipped methods pass, all 13 skips are upstream skips, and all 126 subtests
+pass. Pytest completed in 3,926.24 seconds without a numerical mismatch, NPU
+timeout, invalid submission, reset failure, process abort, or unclassified
+failure. Relative to `7d6646a0f`, `test_matmul` moves from fallback to fully
+native execution and `test_dot` moves from fallback to mixed execution. The
+native portion contains 667 efficient and 90 correctness-fallback kernels;
+selector-heavy packing therefore remains visible rather than being treated as
+an efficient implementation.
+
+The durable artifacts are
+`/home/orangepi/rk_results/test_ops_hybrid_42c0fa400.json` and `.xml`. Their
+SHA-256 values are respectively
+`f114c5b39bcd209b374f32519688363d1704165c92443a428d0f37cee4cd7f7c` and
+`ec58716c6dac0056f6c657f03376a4bfed9802286b44a97c78294629256de437`.
 
 The first post-hybrid native replacement probe produced no coverage transition.
 A direct logical-identity alias plus a non-aligned periodic DPU tail corrupted a
@@ -68,10 +84,12 @@ were diverted. The run was stopped at 66 pass / 4 skip / 2 fail. The active
 renderer rejects this mode; cost remains quality telemetry, while HOST remains
 legal only after a typed native rejection.
 
-All authoritative runs use `ROCKCHIP_FALLBACK=0`. The optional `RKPY` research
-envelope invokes tinygrad's Python UOps emulator over mapped GEM buffers and is
-therefore CPU semantic execution; it is excluded from pass counts. Likewise,
-the 425-green `rockchip-2607` result cannot be treated as all-NPU proof because
+All authoritative **native** census runs use `ROCKCHIP_FALLBACK=0`. The hybrid
+semantic gate uses one explicit generic CLANG UOp lane after a typed native
+rejection; those methods are classified `PASS_MIXED` or `PASS_FALLBACK` and are
+never counted as native coverage. The optional `RKPY` research envelope is also
+CPU semantic execution and is excluded from native pass counts. Likewise, the
+425-green `rockchip-2607` result cannot be treated as all-NPU proof because
 that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
