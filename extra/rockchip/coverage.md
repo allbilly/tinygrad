@@ -5355,3 +5355,38 @@ The full typed implementation and compiler regression are preserved at
 (SHA-256 `231ec8b6d32625288f707411b419b6926d28ac6846e7fff219ae26dc2a2cbab7`).
 The active compiler continues to reject cumulative MIN; no pass count,
 tolerance, resource ceiling, or fallback classification changes.
+
+## PPU value-and-index output characterization
+
+RK3588 PPU `INDEX_EN` is a real second-output path, but its companion
+`INDEX_ADD` field must be programmed in the documented bits 31:4.  The first
+probe reused the value-only experiment's inert bits-31:16 encoding; once
+`INDEX_EN` made that field live, the resulting enormous DMA offset timed out.
+The corrected probe uses the same encoding as the local vendor register
+helpers: `PPU_DATA_FORMAT_INDEX_ADD(atoms) == atoms << 4`.
+
+For one global 4x4 HWC8 reduction, both PPU MAX and the previously unused PPU
+MIN mode produce bit-exact FP16 values and an adjacent `uint16` index plane.
+The index is the position inside the hardware kernel, encoded as
+`kernel_y*8 + kernel_x`.  Random inputs match that contract in every lane, and
+equal finite values select the first kernel position.  The value and index
+planes each occupy one 16-byte atom per output position; `INDEX_ADD=1` places
+the index atom immediately after the value atom.
+
+The contract is not promoted into the compiler yet.  Sliding 2x2 output values
+remain bit-exact, but the unqualified index configuration only matches the
+first output row and then disagrees in 384 of 768 lanes.  Enabling
+`MC_SURF_OUT`/`SURF_LEN` changes or truncates the value layout instead of
+repairing the index rows.  Signed-zero tie behavior is also operation-specific:
+PPU MAX selects positive zero and its position, while PPU MIN selects negative
+zero and its position, independent of which zero occurred first.  Finally,
+TestOps exposes pool/cumulative indices as int32 and often requires global
+source indices, whereas this PPU plane is `uint16` and kernel-local.
+
+The durable probe is
+`extra/rockchip/probe_ppu_sliding_channels.py --case 10 --index` (add
+`--minimum`, `--ties`, or `--signed-zero` for the characterized variants).
+This is positive hardware evidence for a future typed global-pool value/index
+plan, while preserving exact rejection for sliding indices, signed-zero cases,
+and missing native `uint16 -> int32` conversion.  No method total, tolerance,
+resource ceiling, or fallback classification changes in this milestone.
