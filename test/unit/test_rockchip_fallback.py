@@ -1,4 +1,5 @@
-import unittest
+import os, unittest
+from unittest.mock import patch
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer.rockchip import RockchipRenderer
@@ -39,5 +40,11 @@ class TestRockchipFallback(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "RKPLAN_REJECT"):
       x, y = Tensor.empty(7,dtype=dtypes.float), Tensor.empty(7,dtype=dtypes.float)
       RockchipRenderer(Target("ROCKCHIP")).native_program(sink(x+y))
+
+  def test_host_mode_bypasses_native_lowering(self):
+    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"HOST"}):
+      program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(Tensor.empty(7, dtype=dtypes.half)+1))
+    assert program is not None
+    self.assertEqual(program.src[3].arg[:4], RKHC_MAGIC)
 
 if __name__ == "__main__": unittest.main()

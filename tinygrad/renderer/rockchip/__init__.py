@@ -463,6 +463,10 @@ class RockchipRenderer(Renderer):
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half, dtypes.int, dtypes.float}
   def native_program(self, ast:UOp) -> UOp|None:
+    fallback = os.getenv("ROCKCHIP_FALLBACK", "0").upper()
+    if fallback == "HOST":
+      from tinygrad.runtime.rockchip_fallback import build_rkhc_program
+      return build_rkhc_program(ast, self.target)
     info = ProgramInfo.from_sink(ast, self.target)
     params = tuple(sorted((u for u in ast.toposort() if u.op is Ops.PARAM and u.arg.slot >= 0), key=lambda u:u.arg.slot))
     result = lower_native(ast)
@@ -473,11 +477,10 @@ class RockchipRenderer(Renderer):
         fingerprint_digest=dict(reject.fingerprint)["graph"],
         signature=[{"slot": u.arg.slot, "dtype": u.dtype.name,
                     "shape": [x if isinstance(x, int) else str(x) for x in u.shape]} for u in params])
-      fallback = os.getenv("ROCKCHIP_FALLBACK", "0").upper()
       if fallback == "PYTHON":
         from tinygrad.runtime.rockchip_fallback import build_rkpy_program
         return build_rkpy_program(ast, self.target)
-      if fallback in ("CLANG", "HOST"):
+      if fallback == "CLANG":
         from tinygrad.runtime.rockchip_fallback import build_rkhc_program
         return build_rkhc_program(ast, self.target)
       if fallback not in ("", "0"): raise RuntimeError(f"invalid ROCKCHIP_FALLBACK={fallback!r}")

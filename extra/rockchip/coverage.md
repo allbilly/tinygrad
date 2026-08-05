@@ -5146,3 +5146,13 @@ complete without interpreter timeout. Two independent numerical contracts
 remain before the hybrid inventory can be green: mixed native intermediates
 make `test_nll_loss_ignore_index` inaccurate, and causal SDPA also misses the
 Torch reference on the ordinary CPU backend under `DEFAULT_FLOAT=HALF`.
+
+`ROCKCHIP_FALLBACK=HOST` is an all-generic diagnostic companion to native-first
+`CLANG`. Running the 31 native-first failures with every kernel on `RKHC`
+leaves 24 failed methods, proving that both mixed native intermediates and
+ordinary tinygrad/Torch FP16 differences contribute. Forcing all FP16 UOps
+through generic FP32 ALU lowers that to 15, but regresses ordinary broadcast
+MUL/DIV and triggers a dtype-decomposition verifier failure in softmin. That
+overbroad experiment is rejected. Future precision work must be structural at
+the UOp level—for example reduction products or transcendental operations—not
+global widening and not method-name dispatch.

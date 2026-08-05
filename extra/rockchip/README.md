@@ -2765,3 +2765,10 @@ The original `RKPY` interpreter remains available for debugging, but a
 compiled envelope completes that method in 2.71 seconds and passes a locked
 `RK_DPU -> HOST -> RK_DPU` coherence test. Strict native counts and resource
 ceilings are unchanged.
+
+`ROCKCHIP_FALLBACK=HOST` sends every kernel through the same compiled envelope
+and is used only to distinguish mixed-plan errors from generic FP16 semantic
+gaps. It does not contribute native coverage. A rejected global FP16-to-FP32
+ALU experiment fixed some reductions but changed ordinary elementwise rounding
+and broke softmin verification, so the production host lane preserves the
+lowered UOp dtypes exactly.
