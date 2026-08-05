@@ -2418,11 +2418,11 @@ not native coverage.
 
 Standard dynamic tinygrad matmul still needs an NPU-resident transform from
 row-major RHS to the blocked weight stream and a physical-output compaction.
-The existing scalar strided-DPU experiment does not provide that transform:
-unaligned column offsets are atom-aligned and tested notch values do not change
-the observed eight-lane stride. The backend therefore keeps selector-CMAC as a
-bounded correctness fallback and does not raise resource limits or copy the
-references' CPU packing.
+The corrected DPU surface probe now proves one important part of that transform:
+one task gathers 32 aligned eight-lane atoms from 128-element-stride rows into
+a contiguous surface. It does not transpose each 32x8 tile, so the backend
+still keeps selector-CMAC as the bounded final transpose and does not raise
+resource limits or copy the references' CPU packing.
 
 Within that fallback, dense unmasked contractions up to 64 physical output
 channels use the already-proven 64-output compact selector. This reduces the

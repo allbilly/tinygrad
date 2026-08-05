@@ -24,7 +24,11 @@ def _replace(stage:RKStage, target:int, reg:int, value:int) -> RKStage:
 
 def _set(stage:RKStage, target:int, reg:int, value:int) -> RKStage:
   if any(command>>48 == target and command&0xffff == reg for command in stage.commands): return _replace(stage,target,reg,value)
-  return RKStage(stage.engine,(*stage.commands,_command(target,reg,value)),stage.relocs,stage.flags)
+  commands = list(stage.commands)
+  trigger = next((index for index,command in enumerate(commands)
+                  if command>>48 == 0x81 and command&0xffff == rk.REG_PC_OPERATION_ENABLE),len(commands))
+  commands.insert(trigger,_command(target,reg,value))
+  return RKStage(stage.engine,tuple(commands),stage.relocs,stage.flags)
 
 def image(rows:int, stride:int, column:int, line_notch:int, nonalign:bool=False,
           transpose:bool=False, regroup:int=0, surf_len:int=0, original:bool=False, channels:int=0,
@@ -42,7 +46,7 @@ def image(rows:int, stride:int, column:int, line_notch:int, nonalign:bool=False,
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,rows-1), (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,channels),
     (_RDMA,_RDMA_SRC_DMA_CFG,line_notch<<19),
     (_RDMA,_RDMA_SURF_NOTCH,((stride*2 if surface_notch is None else surface_notch)&0x0fffffff)<<4))
-  for target,reg,value in regs: stage = _replace(stage,target,reg,value)
+  for target,reg,value in regs: stage = _set(stage,target,reg,value)
   return RKImage(RKTarget.RK3588,(stage,),base.scratch,base.constants)
 
 def vendor_transpose_image() -> RKImage:
@@ -72,7 +76,29 @@ def main() -> None:
   parser.add_argument("--row-stride",type=int,default=8,help="physical FP16 row stride used by --matrix")
   parser.add_argument("--surface-notch",type=int,help="signed decoded MRDMA surface-notch field")
   parser.add_argument("--vendor-transpose",action="store_true",help="replay the Toolkit2 one-task NC1HWC2 transpose geometry")
+  parser.add_argument("--strided-atom-gather",action="store_true",
+                      help="prove one task gathers 32 aligned FP16 atoms from 128-element rows")
   args = parser.parse_args()
+  if args.strided_atom_gather:
+    rows, stride = 32, 128
+    values = np.arange(rows*stride,dtype=np.float16).reshape(rows,stride)
+    expected = values[:,:8].reshape(-1)
+    dev = RockchipDevice("ROCKCHIP")
+    src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(expected.nbytes)
+    try:
+      ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
+      ctypes.memset(int(out.va_addr),0,expected.nbytes)
+      program = RockchipProgram(dev,TinyELF(encode_image(image(rows,stride,0,stride//8-1,
+        channels=7,surface_notch=0)),"dpu_strided_atom_gather",Target("ROCKCHIP"),()))
+      program(out,src,wait=True)
+      actual = np.frombuffer(ctypes.string_at(int(out.va_addr),expected.nbytes),dtype=np.float16).copy()
+      mismatch = np.flatnonzero(actual != expected)
+      print(f"strided_atom_gather exact={not mismatch.size} mismatches={mismatch.size} first={mismatch[:16].tolist()}")
+      assert not mismatch.size
+    finally:
+      dev._gpu_free(src)
+      dev._gpu_free(out)
+    return
   if args.vendor_transpose:
     values = np.arange(512,dtype=np.float16)
     expected = values.reshape(8,8,8).transpose(1,0,2).reshape(-1)

@@ -4679,11 +4679,21 @@ vendor model's NC1HWC2 physical-layout reinterpretation, with surrounding
 tasks realizing the public layout conversion. The raw replay is retained as a
 reproducible boundary test rather than promoted into compiler legalization.
 
-Consequently neither direct DPU transpose nor dynamic CMAC-weight packing is
-enabled. The result narrows the physical-layout search: use compact ordinary
-DPU surface schedules or another proven engine path, while retaining
-selector-CMAC as the bounded correctness fallback. No TestOps coverage,
-limits, or tolerances change.
+The original probe helper appended registers missing from the base image after
+`PC_OPERATION_ENABLE`; those writes could not affect the task which had already
+started. The corrected helper inserts every missing register before the trigger.
+Safe `TP_EN` still preserves identity and `TP_ORG_EN` still times out, so no
+transpose path is enabled. The corrected notch path, however, proves a useful
+separate primitive: one DPU task gathers 32 aligned eight-lane FP16 atoms from
+rows whose logical stride is 128 elements into one contiguous 256-value
+surface, with zero mismatches. `--strided-atom-gather` asserts this contract.
+
+This does not itself produce blocked CMAC weights, but it removes the expensive
+global gather from each bounded transpose tile. A clean K=128 matvec pack can
+now gather each eight-column RHS block once, transpose its 32x8 subtiles with
+the already-proven 256-output compact CMAC selector, and reuse one immutable
+selector payload. No TestOps coverage, limits, or tolerances change in this
+hardware-characterization milestone.
 
 ## Live Toolkit2 surface-task capture
 
@@ -4721,10 +4731,11 @@ CPU-free NCHW-to-NC1HWC2 legalizer.
 
 The corrected raw probe now encodes `RDMA_SURF_NOTCH` at its documented
 four-bit field shift and accepts signed notch values and explicit row strides.
-Even with the live vendor notch formulas, ordinary linear FP16 rows remain a
-contiguous atom stream in the tested mode. No reformat path is enabled from
-this result; it prevents mistaking vendor physical-layout metadata for a
-general dynamic transpose engine.
+The corrected command ordering changes the interpretation of the notch field:
+an aligned eight-lane atom can be gathered from each strided row exactly. The
+live vendor task remains only a physical-layout reinterpretation, not a general
+transpose, but the row-gather primitive is now available for a bounded native
+weight pack.
 
 ## FP32 CMAC output footprint
 
