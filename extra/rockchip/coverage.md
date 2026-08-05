@@ -75,6 +75,28 @@ have no native rejection event at either level and are explicitly classified
 `host_without_native_reject`; the report does not invent a compiler reason for
 work routed to HOST before `native_program` records a rejection.
 
+## Rejected IC8/IC16 pointwise CONV promotion
+
+The fused channel-bias probe now sweeps input channels 4, 8, and 16 against
+every characterized output width from 1 through 16, both with and without
+ReLU. The existing IC4 HWC family remains bit-exact for all 40 combinations.
+Simply applying the current C1HWC2 pointwise registers to IC8 or IC16 is not a
+legal promotion: every tested unrectified result disagrees, with maximum
+absolute errors from 3.94 through 10.32 on the deterministic random matrix.
+
+The local `allbilly/rk3588` oracle does not close this gap. Its nominal
+`conv2d_8x8_1x1_5x5` case also fails its own reference (`max_diff=16`). Matching
+its `CNA_CVT_CON5=input_pack_c2-1` and pointwise feature-grain formula did not
+repair the clean probe, so those speculative register changes were removed.
+IC16 spatial convolution remains separately proven; this result is specific to
+the attempted direct pointwise family. The active lowerer therefore keeps IC8
+out of direct CONV and does not misclassify the selector-heavy biased-conv path
+as an efficient hardware task.
+
+The durable probe log is
+`/home/orangepi/rk_results/probe_conv_channel_bias_ic8_ic16_original_7b6578833.log`
+(SHA-256 `04f32ed1dfe99108c0a3d8addc1286bd3dc3520c5ae7c86e5e05643743422fca`).
+
 The first post-hybrid native replacement probe produced no coverage transition.
 A direct logical-identity alias plus a non-aligned periodic DPU tail corrupted a
 previously native variance subcase; unit-weight two-level reduction followed by

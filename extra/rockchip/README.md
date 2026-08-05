@@ -27,6 +27,13 @@ a measured input-packing primitive, not a claim that the complete M4 1x1
 convolution is native: its block transpose and output-layout conversion remain
 to be legalized without host packing.
 
+Direct IC8/IC16 pointwise CONV was also tested rather than inferred from the
+working IC4 and spatial-IC16 families. A deterministic fused-bias/ReLU sweep
+finds incorrect results for every tested wide-input output width; the nominal
+IC8 case in the local `allbilly/rk3588` oracle likewise misses its own reference.
+The compiler consequently keeps IC8 pointwise work on its existing classified
+correctness path and does not promote an unproven one-task register family.
+
 A post-census DPU destination-stride probe is intentionally retained as a
 negative hardware boundary. The programmed destination surface stride did not
 scatter eight-lane atoms; the NPU wrote the exact compact atom sequence instead.
