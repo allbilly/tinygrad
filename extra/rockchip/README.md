@@ -2088,3 +2088,19 @@ rejects until a per-spatial FP32 accumulation contract is proven.
 This is a hardware-capability milestone, not a TestOps count change. The
 authoritative census remains `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL /
 13 SKIP_UPSTREAM`, with no relaxed tolerance or CPU semantic path.
+
+## Rejected FP32-accumulator output scaling
+
+The DPU output converter cannot apply its integer multiplier, right shift, or
+`MINUS_EXP` fields while `FP32TOFP16_EN` converts a flying CMAC accumulator.
+`extra/rockchip/probe_cmac_fp32_output_scale.py` compares seven register
+encodings: unit conversion, `1 >> 3`, `29127 >> 18`, `MINUS_EXP=3`, and the
+same three shift forms with `CVT_TYPE=1`. Every variant produces byte-identical
+FP16 output to unit conversion. This closes the apparent route for applying
+non-exact average reciprocals after FP32 accumulation.
+
+The previously proven FP32 CMAC epilogue remains useful for exact accumulator
+continuation. Non-exact two-level average scales still reject with
+`NUMERICAL_CONTRACT`; the compiler does not round the reciprocal, retry on the
+CPU, or relax the official tolerance. This negative hardware milestone does
+not change the authoritative `204/40/168/13` census.

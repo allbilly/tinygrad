@@ -4146,3 +4146,28 @@ available only through `ROCKCHIP_UNSAFE_CONV_ACCUM=1` in
 Thus the new CMAC contract is retained, while K-split CONV accumulation remains
 a typed stage-limit rejection. No test status, cost ceiling, dtype claim, or
 numerical tolerance changes; the authoritative count stays `204/40/168/13`.
+
+## Rejected FP32 CMAC output-converter scaling
+
+The remaining output-converter interpretation was tested after proving FP32
+CMAC continuation. With `FP32TOFP16_EN=1`, changing the 16-bit output scale,
+the 12-bit integer shift, `MINUS_EXP`, and `CVT_TYPE` has no effect on the
+stored FP16 values. The following encodings all produce byte-identical output:
+
+```text
+scale=1,     shift=0
+scale=1,     shift=3
+scale=29127, shift=18
+scale=1,     minus_exp=3
+scale=1,     cvt_type=1, shift=3
+scale=29127, cvt_type=1, shift=18
+scale=1,     cvt_type=1, minus_exp=3
+```
+
+`extra/rockchip/probe_cmac_fp32_output_scale.py` is the reproducible hardware
+probe. Together with the earlier disabled-FP32-conversion result (all zeros),
+this establishes that the quantized integer output converter is not a hidden
+high-precision reciprocal for an FP32-to-FP16 CMAC result. Exact FP32
+accumulator epilogues remain enabled, while 1/9, 1/6, and other non-FP16-exact
+two-level scales retain their pre-submission `NUMERICAL_CONTRACT` rejection.
+No method status changes and the authoritative census remains `204/40/168/13`.
