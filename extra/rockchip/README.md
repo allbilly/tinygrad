@@ -2038,3 +2038,24 @@ continues with `(20,30)` and `(20,30,40)` scans; the first 600-output by
 `PLAN_STAGE_LIMIT`. No task, constant, compiler-work, or numerical tolerance
 ceiling changed. The authoritative tally therefore remains
 `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
+
+## Rejected int8 PPU boolean reduction
+
+The next boolean-reduction probe tested the hardware path directly instead of
+adding a CPU bool pack. PPU spatial MAX accepts an int8 HWC16 input and submits
+without error, but its output is one int16 lane per channel: reading the raw
+surface as public byte bool produces `1,0,1,0,...` for an all-true vector. This
+matches NVDLA PDP's documented use of int16 internal storage for int8 pooling.
+
+A typed follow-up kept that int16 surface in scratch and configured DPU MRDMA
+for int16 input with int8 processing/output. RK3588 timed out at the second
+stage before producing the public bool result. The device recovered and the
+unchanged wide FP16 DPU regression passed immediately afterward. Both compiler
+experiments were removed; the exact WIP is preserved as
+`wip-ppu-int8-reduce-int16-output-dpu-cast-timeout-20260805.patch` with SHA-256
+`18dfaedc00bcfe54ea04aa7dffc549089be1f7bd9345d02e9f7263b728bb1964`.
+
+Consequently `all`/`any` remain typed output-dtype rejects. A future native
+implementation needs a proven PPU/DPU int16-to-int8 writeback contract or a
+different byte-output engine; it must not reinterpret the two-byte PPU surface
+or pack it on the CPU. The authoritative census remains `204/40/168/13`.

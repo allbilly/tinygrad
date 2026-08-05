@@ -4102,3 +4102,21 @@ gain. After its scalar and 20-element cases, it requests a 600-output by
 bounded selector implementation and reject with `PLAN_STAGE_LIMIT`; solving
 them requires a direct strided/physical-layout scan rather than a higher task
 ceiling. The authoritative census remains `204/40/168/13`.
+
+## Rejected PPU bool-output conversion
+
+An RK3588 probe established a narrower hardware contract for boolean
+reductions. PPU spatial MAX consumes an int8 HWC16 surface successfully, but
+emits int16 lanes; an all-true result appears as alternating `1,0` bytes when
+misread as the requested public bool surface. A second typed stage attempted
+the NVDLA-style int16-to-int8 DPU conversion and timed out at stage 2/2. The
+unchanged wide FP16 fill passed after the timeout, confirming device recovery.
+
+No part of this path is active. Its exact compiler/IR/emitter patch is archived
+at `wip-ppu-int8-reduce-int16-output-dpu-cast-timeout-20260805.patch`
+(`18dfaedc00bcfe54ea04aa7dffc549089be1f7bd9345d02e9f7263b728bb1964`).
+The result explains why the already proven public int8 DPU fill/copy/ALU paths
+do not automatically make `all` or `any` native: the reduction engine's output
+representation still needs a hardware conversion. Those methods continue to
+reject before submission, and the authoritative census remains
+`204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
