@@ -2533,3 +2533,18 @@ states. It is not yet a public transpose-convolution contract: 3x3 weight
 orientation, padding, output padding, and channel-role legalization remain to
 be characterized. The standalone probe is retained so those follow-up shapes
 can be compared against one exact register baseline.
+
+## One-task 256x256x256 GEMM
+
+`allbilly/rk3588/examples/gemm.py` and the Rockchip emitter use the same broad
+GEMM formulas. A 256x256x256 surface needs four input CBUF banks and four weight
+banks, so the hardware compute fits one task. The local RKImage probe confirms
+that exact geometry on RK3588 with a maximum FP16 result difference of
+0.000488281, inside the official big-GEMM tolerance.
+
+The reference obtains that result after NumPy packs dynamic B into
+`[N/16,K/32,N-lane,K-lane]` and later gathers the gapped multi-row FP16 output.
+Those two host transformations are deliberately not ported. `test_big_gemm`
+therefore remains a typed layout/resource reject until equivalent NPU-native
+packing and output legalization exist; increasing the 400-task ceiling would
+not address the missing physical-layout capability.

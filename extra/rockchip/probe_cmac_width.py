@@ -67,7 +67,7 @@ def fp32_image(compact:bool=False) -> RKImage:
 def main() -> None:
   dev = RockchipDevice("ROCKCHIP")
   rng = np.random.default_rng(2608)
-  for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64),(8,16,32),(1,128,128)):
+  for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64),(8,16,32),(1,128,128),(256,256,256)):
     align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
     lhs, rhs = rng.uniform(-.25,.25,(m,k)).astype(np.float16), rng.uniform(-.25,.25,(k,n)).astype(np.float16)
     packed_lhs = np.zeros((m,align_in),dtype=np.float16)
@@ -87,6 +87,7 @@ def main() -> None:
       expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
       print(f"GEMM M={m} N={n} K={k} tasks=1 exact={np.array_equal(actual,expected)} "
             f"max_abs={np.max(np.abs(actual.astype(np.float32)-expected.astype(np.float32))):.6g}")
+      np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-4)
     finally:
       dev._gpu_free(out)
       dev._gpu_free(lhs_buf)

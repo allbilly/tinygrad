@@ -4764,6 +4764,27 @@ RKImage runtime. This is a hardware-register milestone only: kernel flipping,
 padding, output padding, channel roles, and full transpose-convolution geometry
 must be proven before adding a compiler lowerer or changing TestOps coverage.
 
+## One-task 256x256x256 GEMM
+
+The local `allbilly/rk3588` `examples/gemm.py` at `40fae7b` confirms that broad
+GEMM uses the same register geometry already present in `emit_cmac_task`:
+32-channel K/N alignment, paired-bank feature grains, simultaneous feature and
+weight CBUF pressure, capped line/notch groups, and M-only tiling when the input
+surface exceeds its bank budget. For 256x256x256, the input consumes four CBUF
+banks and the 128 KiB packed weights require four of the eight remaining banks,
+so one task is legal. The 414 versus 424 square boundary in the reference is
+also explained by weight pressure: aligned 416 needs eleven weight banks after
+one data bank, while aligned 448 needs thirteen.
+
+The in-tree raw CMAC probe now independently executes 256x256x256 through one
+RKImage task. Its maximum absolute difference from FP32 accumulation rounded to
+FP16 is 0.000488281, within `test_big_gemm`'s `rtol=1e-3, atol=1e-4` contract.
+The compiler still rejects that method because the reference packs dynamic B
+and unpacks the gapped multi-row FP16 output with NumPy. Those host operations
+are hardware-ABI characterization, not acceptable native lowering. The next
+required capabilities remain a bounded NPU weight transform and native output
+layout legalization; the compute task itself is no longer in question.
+
 ## Live Toolkit2 surface-task capture
 
 `dump_rknn_submit.gdb` captures a vendor submission without patching its task
