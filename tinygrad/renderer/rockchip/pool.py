@@ -6,7 +6,8 @@ from typing import cast
 from tinygrad.dtype import dtypes, Invalid
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.renderer.rockchip.affine import affine as _affine
-from tinygrad.renderer.rockchip.analysis import strip_casts as _strip_casts, static_index_selected as _static_index_selected
+from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, static_index_selected as _static_index_selected,
+  static_linear_form as _static_linear_form, conditional_index_affine as _conditional_index_affine)
 from tinygrad.renderer.rockchip.cost import plan_cost
 from tinygrad.renderer.rockchip.ir import (RKBufferKind, RKLayoutKind, RKArg, RKALUStage, RKScratch, RKDPUProgram, RKLayout, RKTensorRef,
   RKCMACTask, RKConvTask, RKReduce, RKPool, RKProgram, RKRejectKind, RKLowerResult)
@@ -14,7 +15,7 @@ from tinygrad.renderer.rockchip.limits import (RK_MAX_CONSTANT_BYTES, RK_MAX_AFF
   RK_MAX_AFFINE_WINDOW, RK_MAX_CMAC_SELECTOR_WINDOW)
 from tinygrad.renderer.rockchip.lower import native as _native, not_applicable as _not_applicable, unsupported as _unsupported
 from tinygrad.renderer.rockchip.selector import (_dense_half_ref, _cmac_weight_ref, _cmac_selection_payload, _sparse_cmac_pipeline,
-  _windowed_cmac_pipeline, _selector_program, _finish_program)
+  _windowed_cmac_pipeline, _selector_program, _best_partitioned_selector_program, _finish_program)
 
 _PPU_BAD_SPLITS = frozenset({(3,6),(6,3),(12,12)})
 
@@ -176,7 +177,7 @@ def _scalar_affine_max_program(output:RKArg, source:RKArg, selectors:list[list[i
   return _finish_program(steps, scratch)
 
 def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
-  """Pack dense planar valid-pool surfaces once, then run one sliding PPU task per HWC8 group."""
+  """Pack dense planar pool surfaces once, then run one sliding PPU task per HWC8 group."""
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
@@ -184,15 +185,17 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
      store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _not_applicable()
   value = _strip_casts(reduce.src[0])
-  if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half: return _not_applicable()
-  out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
-  if out_aff is None or src_aff is None or out_aff[1] or src_aff[1] or len(out_aff[0]) != 3:
+  indexes = tuple(u for u in value.toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.dtype is dtypes.half)
+  if len(indexes) != 1: return _not_applicable()
+  value_index = indexes[0]
+  out_aff, src_aff = _affine(store.src[0].src[1]), _conditional_index_affine(value_index)
+  if out_aff is None or src_aff is None or out_aff[1] or len(out_aff[0]) != 3:
     return _not_applicable()
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
   if len(red_axes) != 2 or any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
-  match:tuple[int,int,int,int,int,int,int,int,int]|None = None
+  match:tuple[int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
   for plane_axis,out_y_axis,out_x_axis in permutations(out_axes):
     planes, out_h, out_w = (ranges[x] for x in (plane_axis,out_y_axis,out_x_axis))
     for kernel_y_axis,kernel_x_axis in permutations(red_axes):
@@ -203,17 +206,35 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
       stride_y_coeff, stride_x = src_aff[0].get(out_y_axis,0), src_aff[0].get(out_x_axis,0)
       if stride_y_coeff <= 0 or stride_y_coeff%in_w: continue
       stride_y = stride_y_coeff//in_w
+      if src_aff[1] > 0: continue
+      pad_top, pad_left = divmod(-src_aff[1],in_w)
+      pad_bottom = next((pad for pad in range(8) if (in_h+pad_top+pad-kernel_h)//stride_y+1 == out_h),-1)
+      pad_right = next((pad for pad in range(8) if (in_w+pad_left+pad-kernel_w)//stride_x+1 == out_w),-1)
       if out_aff[0] != {plane_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1} or \
          src_aff[0] != {plane_axis:in_h*in_w,out_y_axis:stride_y*in_w,out_x_axis:stride_x,
-                        kernel_y_axis:in_w,kernel_x_axis:1}: continue
-      input_count, output_count = int(value.src[0].src[0].arg), int(store.src[0].src[0].src[0].arg)
+                        kernel_y_axis:in_w,kernel_x_axis:1} or min(pad_bottom,pad_right) < 0 or max(pad_top,pad_left) > 7: continue
+      input_count, output_count = int(value_index.src[0].src[0].arg), int(store.src[0].src[0].src[0].arg)
       if (input_count,output_count) != (planes*in_h*in_w,planes*out_h*out_w) or \
-         out_h != (in_h-kernel_h)//stride_y+1 or out_w != (in_w-kernel_w)//stride_x+1: continue
-      match = planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x
+         out_h != (in_h+pad_top+pad_bottom-kernel_h)//stride_y+1 or \
+         out_w != (in_w+pad_left+pad_right-kernel_w)//stride_x+1: continue
+      valid = True
+      for coordinates in product(*(range(ranges[axis]) for axis in (*out_axes,*red_axes))):
+        point = dict(zip((*out_axes,*red_axes),coordinates))
+        iy = point[out_y_axis]*stride_y+point[kernel_y_axis]-pad_top
+        ix = point[out_x_axis]*stride_x+point[kernel_x_axis]-pad_left
+        expected = point[plane_axis]*in_h*in_w+iy*in_w+ix
+        form = _static_linear_form(value,point,value_index.src[0])
+        if 0 <= iy < in_h and 0 <= ix < in_w:
+          valid &= form == (0.0,{expected:1.0})
+        else:
+          valid &= form is not None and form[0] == -math.inf and not form[1]
+        if not valid: break
+      if not valid: continue
+      match = planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,pad_top,pad_bottom,pad_left,pad_right
       break
     if match is not None: break
   if match is None: return _not_applicable()
-  planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x = match
+  planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,pad_top,pad_bottom,pad_left,pad_right = match
   if not 1 <= planes <= 32 or not 2 <= max(kernel_h,kernel_w) <= 8 or min(kernel_h,kernel_w) < 2 or \
      max(in_h,in_w) > 256 or max(stride_y,stride_x) > 8:
     return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION,
@@ -227,8 +248,11 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
   scratch:tuple[RKScratch, ...] = ()
   packed_input = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(len(input_rows)*2),)
-  input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,value.src[0].arg.slot),planes*in_h*in_w,input_rows,scratch,
+  input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,value_index.src[0].arg.slot),planes*in_h*in_w,input_rows,scratch,
     direct_capacity=((planes*in_h*in_w*2+4095)&-4096)//2,max_window=RK_MAX_CMAC_SELECTOR_WINDOW,max_outputs=128)
+  if input_plan is None:
+    input_plan = _best_partitioned_selector_program(packed_input,RKArg(RKBufferKind.ARG,value_index.src[0].arg.slot),
+      planes*in_h*in_w,input_rows,scratch)
   if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"sliding PPU input pack exceeds plan limits",Ops.INDEX)
   scratch, steps = input_plan.scratch, list(input_plan.steps)
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
@@ -238,7 +262,7 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
   for group in range(groups):
     steps.append(RKPool(RKTensorRef(RKArg(packed_output.kind,packed_output.index,group*output_tile_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,group*input_tile_count*2),input_layout),Ops.MAX,red_axes[0],
-      kernel_h,kernel_w,stride_y,stride_x))
+      kernel_h,kernel_w,stride_y,stride_x,pad_top,pad_bottom,pad_left,pad_right))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
     groups*output_tile_count,output_rows,scratch,direct_capacity=groups*output_tile_count,max_outputs=128)
   if unpack is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"sliding PPU output unpack exceeds plan limits",Ops.INDEX)

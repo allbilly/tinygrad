@@ -4506,3 +4506,27 @@ the existing typed layout rejection. Commit `8de5763d5` and
 `0275-WIP-probe-asymmetric-PPU-max-padding.patch` (SHA-256
 `c87b76403b34311d1c47a1dd73078a1f3d51524a9ded552fb0c5ba8e7508dc47`)
 preserve the exact experiment.
+
+## Native padded sliding-MAX milestone
+
+The proven four-sided PPU padding register is now part of the typed `RKPool`
+contract. Sliding-MAX recognition accepts a single guarded FP16 input, derives
+the static padding from its affine address, and exhaustively proves that every
+in-bounds coordinate selects exactly that tensor element while every padding
+coordinate selects negative infinity. The emitter validates each padding side
+against the three-bit hardware fields before writing register `0x6040`.
+
+The official `(4,2,11,28)` `test_max_pool2d_padding` family now completes in
+native-only focused testing at unchanged tolerances. Its representative 3x3,
+padding-one plan has 150 tasks: one PPU pooling task plus bounded selector-CMAC
+layout preparation and compaction. It is therefore a correctness fallback,
+not yet an efficient NCHW-to-HWC8 implementation. A partitioned selector is
+used only after the cheaper ordinary selector cannot satisfy the source-window
+contract; the 400-task and 2 MiB ceilings remain unchanged.
+
+The direct device regression is bit-exact. All compiler/image/telemetry tests,
+full-tree Mypy, and full-tree Ruff pass. This focused gain predicts
+`205 PASS_NATIVE / 40 PASS_FRONTEND / 167 NATIVE_REJECT / 13 SKIP_UPSTREAM`,
+but `204/40/168/13` remains authoritative until the next uncached full census.
+The much larger asymmetric `(4,2,111,28)` family remains an 826-task layout
+rejection; native PPU padding alone does not hide that physical-layout blocker.

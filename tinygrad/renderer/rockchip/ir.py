@@ -317,6 +317,10 @@ class RKPool(RKReduce):
   kernel_width: int
   stride_y: int
   stride_x: int
+  pad_top: int = 0
+  pad_bottom: int = 0
+  pad_left: int = 0
+  pad_right: int = 0
 
 @dataclass(frozen=True)
 class RKReformatPlan:

@@ -2384,3 +2384,18 @@ inputs still require a native conversion to the PPU's HWC8 external layout;
 the current selector schedule would require 826 tasks. The compiler therefore
 continues to reject that layout before submission instead of raising resource
 ceilings or using CPU packing.
+
+## Native padded sliding MAX
+
+`RKPool` now carries four explicit padding sides. The sliding-pool lowerer
+derives those sides from the affine guarded load and proves every coordinate:
+real input points must select the unique FP16 source load, while padding points
+must select negative infinity. Emission validates the three-bit fields and
+writes the characterized PPU padding register directly.
+
+The official `test_max_pool2d_padding` method passes in focused native-only
+testing. A representative plan uses one PPU task inside a 150-task bounded
+selector schedule, so it remains classified as a correctness fallback until a
+direct NCHW-to-HWC8 conversion exists. No CPU packing, tolerance relaxation, or
+resource-limit increase is used. Expected coverage is `205/40/167/13`; the
+last full-census result remains authoritative at `204/40/168/13`.

@@ -262,6 +262,24 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_padded_max_pool_uses_sliding_ppu_padding(self):
+    result = lower_sliding_max_result(sink(Tensor.empty(4,2,11,28,dtype=dtypes.half).max_pool2d((3,3),padding=1)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    pools = tuple(step for step in result.plan.steps if isinstance(step,RKPool))
+    self.assertEqual(len(pools),1)
+    # The lower padding is unused by this floor-mode geometry and is simplified away before native lowering.
+    self.assertEqual((pools[0].pad_top,pools[0].pad_bottom,pools[0].pad_left,pools[0].pad_right),(1,0,1,1))
+    image, cost = emit_program(result.plan), plan_cost(result.plan)
+    self.assertEqual(sum(stage.engine is RKEngine.PPU for stage in image.stages),1)
+    padding_commands = [command for stage in image.stages for command in stage.commands
+                        if command>>48 == 0x4001 and command&0xffff == 0x6040]
+    self.assertEqual([command>>16&0xffffffff for command in padding_commands],[0x111])
+    self.assertLessEqual(cost.task_count,200)
+    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_dense_row_max_uses_direct_ppu_width_tree(self):
     result = lower_dense_row_max_result(sink(Tensor.empty(256,256,dtype=dtypes.half).max(axis=1)))
     self.assertIs(result.kind,RKLowerKind.NATIVE)

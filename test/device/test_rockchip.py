@@ -216,6 +216,24 @@ class TestRockchip(unittest.TestCase):
     kernels = [event for event in drain() if event["kind"] == "kernel"]
     self.assertTrue(any(event.get("engine_counts",{}).get("PPU") == 1 for event in kernels))
 
+  def test_padded_sliding_max_uses_ppu(self):
+    rng = np.random.default_rng(32)
+    x = rng.uniform(-8,8,(4,2,11,28)).astype(np.float16)
+    old_telemetry = os.environ.get("ROCKCHIP_TELEMETRY")
+    os.environ["ROCKCHIP_TELEMETRY"] = "memory"
+    clear()
+    try: actual = Tensor(x,device="ROCKCHIP").max_pool2d((3,3),padding=1).realize().numpy()
+    finally:
+      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY",None)
+      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+    padded = np.pad(x,((0,0),(0,0),(1,1),(1,1)),constant_values=-np.inf)
+    expected = np.empty((4,2,4,10),dtype=np.float16)
+    for y in range(4):
+      for x0 in range(10): expected[:,:,y,x0] = padded[:,:,y*3:y*3+3,x0*3:x0*3+3].max(axis=(2,3))
+    np.testing.assert_equal(actual,expected)
+    kernels = [event for event in drain() if event["kind"] == "kernel"]
+    self.assertTrue(any(event.get("engine_counts",{}).get("PPU") == 1 for event in kernels))
+
   def test_channel16_direct_spatial_conv_uses_cna(self):
     rng = np.random.default_rng(18)
     x = rng.uniform(-1,1,(1,16,9,9)).astype(np.float16)

@@ -220,8 +220,9 @@ def _partitioned_selector_program(output:RKArg, source:RKArg, input_count:int, r
       if position: steps.append(RKDPUProgram((RKALUStage(Ops.ADD,target,target,partial,len(tile)),),scratch))
   return _finish_program(steps,scratch)
 
-def _best_partitioned_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]]) -> RKProgram|None:
-  candidates = tuple(_partitioned_selector_program(output,source,input_count,rows,max_outputs=width)
+def _best_partitioned_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],
+                                       scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
+  candidates = tuple(_partitioned_selector_program(output,source,input_count,rows,scratch,max_outputs=width)
                      for width in range(64,129,8))
   legal = tuple((cost,plan) for plan in candidates if plan is not None and (cost:=plan_cost(plan)).stage_count <= RK_MAX_PROGRAM_STAGES and
                 cost.constant_bytes <= RK_MAX_CONSTANT_BYTES)

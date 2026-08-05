@@ -13,6 +13,7 @@ from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, R
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
 _TARGET_CNA, _TARGET_CORE = 0x201, 0x801
 _TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
+_REG_PPU_POOLING_PADDING_CFG = 0x6040
 _REG_DPU_RDMA_BRDMA_CFG, _REG_DPU_RDMA_BS_BASE_ADDR = 0x501c, 0x5020
 _REG_DPU_RDMA_NRDMA_CFG, _REG_DPU_RDMA_BN_BASE_ADDR, _REG_DPU_RDMA_WEIGHT = 0x5028, 0x502c, 0x5068
 _EW_BASE = 0x108002c0
@@ -538,9 +539,11 @@ def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
   ih, iw, channels = plan.src.layout.logical_shape
   oh, ow, out_channels = plan.out.layout.logical_shape
   kh, kw, sy, sx = plan.kernel_height, plan.kernel_width, plan.stride_y, plan.stride_x
+  pt, pb, pl, pr = plan.pad_top, plan.pad_bottom, plan.pad_left, plan.pad_right
   if channels != 8 or out_channels != 8 or not 2 <= ih <= 256 or not 2 <= iw <= 256 or \
      not 1 <= kh <= 8 or not 1 <= kw <= 8 or kh == kw == 1 or not 1 <= sy <= 8 or not 1 <= sx <= 8 or \
-     oh != (ih-kh)//sy+1 or ow != (iw-kw)//sx+1 or min(oh,ow) < 1:
+     min(pt,pb,pl,pr) < 0 or max(pt,pb,pl,pr) > 7 or \
+     oh != (ih+pt+pb-kh)//sy+1 or ow != (iw+pl+pr-kw)//sx+1 or min(oh,ow) < 1:
     raise ValueError("unsupported sliding-MAX PPU contract")
   h, w, c, out_h, out_w = ih-1, iw-1, channels-1, oh-1, ow-1
   output_index_add = iw*oh
@@ -551,6 +554,7 @@ def emit_pool(plan:RKPool, target:RKTarget=RKTarget.RK3588) -> RKImage:
     (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_HEIGHT, out_h), (_TARGET_PPU, rk.REG_PPU_DATA_CUBE_OUT_CHANNEL, c),
     (_TARGET_PPU, rk.REG_PPU_OPERATION_MODE_CFG, 0x11),
     (_TARGET_PPU, rk.REG_PPU_POOLING_KERNEL_CFG, ((sy-1)<<20)|((sx-1)<<16)|((kh-1)<<8)|(kw-1)),
+    (_TARGET_PPU, _REG_PPU_POOLING_PADDING_CFG, (pb<<12)|(pr<<8)|(pt<<4)|pl),
     (_TARGET_PPU, rk.REG_PPU_DST_SURF_STRIDE, output_index_add),
     (_TARGET_PPU, rk.REG_PPU_DATA_FORMAT, (output_index_add<<16)|2), (_TARGET_PPU, rk.REG_PPU_MISC_CTRL, 3),
     (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_WIDTH, w), (_TARGET_PPU_RDMA, rk.REG_PPU_RDMA_CUBE_IN_HEIGHT, h),
