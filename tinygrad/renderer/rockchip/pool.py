@@ -214,7 +214,7 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
     if match is not None: break
   if match is None: return _not_applicable()
   planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x = match
-  if not 1 <= planes <= 32 or not 2 <= max(kernel_h,kernel_w) <= 8 or min(kernel_h,kernel_w) < 2 or \
+  if not 1 <= planes <= 64 or not 2 <= max(kernel_h,kernel_w) <= 8 or min(kernel_h,kernel_w) < 2 or \
      max(in_h,in_w) > 256 or max(stride_y,stride_x) > 8:
     return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION,
       f"sliding PPU MAX is C={planes},H={in_h},W={in_w},K={kernel_h}x{kernel_w},S={stride_y}x{stride_x}",reduce.op)
@@ -502,4 +502,3 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"affine PPU MAX needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
   return _native(program)
-
