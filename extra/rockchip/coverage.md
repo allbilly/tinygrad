@@ -5504,9 +5504,12 @@ layout, and the emitter applies it inside the CNA/CORE/DPU task.  This avoids a
 post-writeback FP16 addition and its different rounding boundary.
 
 Focused strict testing keeps `test_simple_conv2d_bias`, `test_simple_conv2d`,
-and the nested `test_biased_conv2d` exact.  The single biased convolution drops
-from 199 tasks and 21.26 seconds to 30 tasks and 3.20 seconds.  Its physical
-composition changes from `140 CMAC + 59 DPU` to `17 CMAC + 12 DPU + 1 CONV`;
-constant payload grows from 399,008 to 476,576 bytes, which remains visible in
-cost telemetry.  This is a native-quality improvement, not a method-count gain.
-No test tolerance, fallback rule, task ceiling, or constant ceiling changes.
+and the nested `test_biased_conv2d` exact.  The initial typed epilogue reduced
+the single biased convolution from 199 tasks to 30.  Removing its unnecessary
+selector and converting the contiguous FP16 bias directly in four-lane DPU
+groups reduces it again to 19 tasks and 2.03 seconds.  Its current physical
+composition is `15 CMAC + 3 DPU + 1 CONV`, compared with the old
+`140 CMAC + 59 DPU`; constant payload is 472,400 versus 399,008 bytes, which
+remains visible in cost telemetry.  This is a native-quality improvement, not a
+method-count gain.  No test tolerance, fallback rule, task ceiling, or constant
+ceiling changes.

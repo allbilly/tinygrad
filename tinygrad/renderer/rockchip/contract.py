@@ -963,17 +963,10 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
       if coefficient == 1 and ranges.get(axis) == out_c and out_aff[0].get(axis) == out_h*out_w)
     if len(channel_axes) != 1 or len(bias_aff[0]) != 1 or bias_count != out_c:
       return _unsupported(RKRejectKind.REQUIRES_REFORMAT,"CONV bias is not one direct value per output channel",bias.op)
-    bias_half = RKArg(RKBufferKind.SCRATCH,len(scratch))
-    scratch += (RKScratch(64),)
-    bias_rows:list[list[int]] = [[] for _ in range(32)]
-    for channel in range(out_c): bias_rows[channel] = [channel]
-    bias_plan = _selector_program(bias_half,RKArg(RKBufferKind.ARG,bias.src[0].arg.slot),bias_count,bias_rows,scratch,max_outputs=32)
-    if bias_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"CONV bias pack exceeds plan limits",bias.op)
-    steps, scratch = [*steps,*bias_plan.steps], bias_plan.scratch
     bias_float = RKArg(RKBufferKind.SCRATCH,len(scratch))
     scratch += (RKScratch(128),)
     steps.append(RKDPUProgram(tuple(RKALUStage(Ops.ADD,RKArg(bias_float.kind,bias_float.index,start*4),
-      RKArg(bias_half.kind,bias_half.index,start*2),0.0,4,dtypes.float) for start in range(0,32,4)),scratch))
+      RKArg(RKBufferKind.ARG,bias.src[0].arg.slot,start*2),0.0,min(4,out_c-start),dtypes.float) for start in range(0,out_c,4)),scratch))
     conv_epilogue = RKEpilogue(RKTensorRef(bias_float,RKLayout((out_c,),(32,),(4,),dtypes.float,padding=((0,32-out_c),))),relu)
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(batch*output_batch_count*2),)

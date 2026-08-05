@@ -2901,11 +2901,15 @@ into the proven 32-lane FP32 BRDMA surface, and keeps that epilogue attached
 through CBUF legalization.  The emitter selects BS ADD plus optional ReLU and
 enables the CNA/CORE/DPU/RDMA pipeline in the same physical task.
 
-On the official `test_simple_conv2d_bias`, the exact native schedule falls from
-199 tasks (`140 CMAC + 59 DPU`) to 30 (`17 CMAC + 12 DPU + 1 CONV`).  The focused
-RK3588 duration falls from 21.26 seconds in the authoritative hybrid artifact to
-3.20 seconds; generated constants rise from 399,008 to 476,576 bytes because the
-direct CNA input/weight pack is currently larger.  The method remains native,
-so this is an efficiency milestone rather than a coverage transition.  The
-nested two-convolution bias test also remains exact.  No resource ceiling or
-tolerance changes.
+On the official `test_simple_conv2d_bias`, the first typed epilogue reduced the
+exact native schedule from 199 tasks (`140 CMAC + 59 DPU`) to 30.  CONV's bias
+layout is contiguous, so a follow-up removes its unnecessary selector and
+converts the logical FP16 bias directly into the FP32 operand in four-lane DPU
+groups.  The current schedule is 19 tasks (`15 CMAC + 3 DPU + 1 CONV`), only one
+more task than the unbiased convolution.  Focused RK3588 duration falls from
+21.26 seconds in the authoritative hybrid artifact to 2.03 seconds.  Generated
+constants are 472,400 bytes versus the old 399,008 because the direct CNA
+input/weight pack is currently larger.  The method remains native, so this is
+an efficiency milestone rather than a coverage transition.  The nested
+two-convolution bias test also remains exact.  No resource ceiling or tolerance
+changes.
