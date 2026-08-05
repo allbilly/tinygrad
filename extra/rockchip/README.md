@@ -6,17 +6,13 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `2fb47ca2b` is 202 native,
-40 frontend-only, 170 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed in 3,452.89 seconds without an NPU timeout,
+The current authoritative uncached strict census at `2385767d1` is 204 native,
+40 frontend-only, 168 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed in 3,375.14 seconds without an NPU timeout,
 reset failure, invalid submission, process abort, numerical mismatch, or
-unclassified failure. Relative to `92846845f`, only `test_dilated_conv2d`
-changes from typed rejection to native pass and no method regresses. Coverage
-details, the checkout-local pytest-plugin invocation, reject Pareto, plan-cost
-histograms, and durable artifact hashes are recorded in `coverage.md`.
-Focused native-only validation after that census makes `test_multicat` pass,
-so the expected tally is `203/40/169/13`; `202/40/170/13` remains authoritative
-until the next complete uncached run.
+unclassified failure. Coverage details, the checkout-local pytest-plugin
+invocation, reject Pareto, plan-cost histograms, and durable artifact hashes
+are recorded in `coverage.md`.
 
 The PPU layout contract now names the actual `PPU_HWC` format and accepts every
 hardware-characterized FP16 channel count from two through eight. This follows
@@ -2121,3 +2117,25 @@ The substitution is disabled and preserved as
 its pre-submission `LUT_DOMAIN_UNPROVEN` rejection. A future solution needs a
 more accurate range-reduced exponential or fused normalization, not a broader
 domain claim for the current tables.
+
+## Proven flying-CONV ERDMA surface accumulation
+
+`extra/rockchip/probe_conv_erdma_accumulate.py` proves that ERDMA can supply a
+full FP16 per-spatial surface to the elementwise ADD following a flying CNA
+convolution. For a one-channel, eight-position output, the accepted contract
+uses DPU EW ADD `0x108202c0`, `ERDMA_CFG=0x40000008`, channel `15`, cube width
+`2*N-1`, feature mode `0x17850`, and PC enable mask `0x1d`. The operand's live
+FP16 value occupies every second 16-byte atom. Three consecutive submissions
+were bit-exact against FP32 convolution-plus-add followed by one FP16 rounding,
+and the known-good wide FP16 DPU fill passed immediately afterward.
+
+This is distinct from the rejected BRDMA continuation probe: its proven mode
+broadcasts one channel value across spatial positions, whereas this ERDMA mode
+consumes the complete spatial operand. It is not yet a compiler path. Splitting
+input channels would still round every convolution partial to FP16 before the
+next addition, while the official convolution reference may require one FP32
+accumulation. The compiler also lacks a first-class accumulator physical layout
+and direct output compaction for this schedule. Those contracts must be proven
+before promoting channel-split convolution; no CPU packing, tolerance change,
+or task-limit increase is permitted. The authoritative census remains
+`204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.

@@ -12,45 +12,43 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `2fb47ca2b` contains exactly 425 telemetry method
-records: 202 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 170 `FAIL`, and 13
+The complete uncached run at `2385767d1` contains exactly 425 telemetry method
+records: 204 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 168 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set
 throughout, with `FORWARD_ONLY=1` and `DEFAULT_FLOAT=HALF`. Raw pytest reports
-197 failed methods/subtests, 252 passed, 89 passing subtests, and 13 skipped in
-3,452.89 seconds. No NPU timeout, invalid submission, reset failure, process
-abort, fallback execution, or test-context warning occurred.
+3,375.14 seconds. No NPU timeout, invalid submission, reset failure, process
+abort, fallback execution, or unclassified failure occurred.
 
-Relative to `92846845f`, one method changes from failure to native pass and none
-regresses: `test_dilated_conv2d`. Every one of the 170 failures is a
-typed native reject with a retained method-level first reject;
-there are no numerical mismatches, device failures, or unclassified failures.
-Their first-reject Pareto is 53 unsupported-output-dtype, 34 plan-stage-limit,
-27 unsupported-input-dtype, 18 unsupported-layout, 18 numerical-contract,
-12 unsupported-ALU, six requires-reformat, and two unaligned-row.
+Relative to the preceding 202-pass census, exactly `test_multicat` and
+`test_where` change from failure to native pass and none regress. Every one of
+the 168 failures is a typed native reject with a retained method-level first
+reject. Their first-reject Pareto is 53 unsupported-output-dtype, 33
+plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 18
+numerical-contract, 12 unsupported-ALU, five requires-reformat, two
+unaligned-row, and one LUT-domain-unproven.
 
-The 549 successful kernels belonging to fully native methods contain 500
-`EFFICIENT` and 49 `CORRECTNESS_FALLBACK` plans. Task-count buckets are 104 at
-one task, 238 at 2--8, 87 at 9--32, 73 at 33--64, nine at 65--128, 23 at
-129--256, and 15 at 257--400. The maximum remains 399 tasks; no task or
-constant ceiling changed. The worst single-kernel wall time is 42.63 seconds,
-and the largest generated constant payload is 1,819,392 bytes. These costs
-remain visible rather than being hidden by the native pass count.
+The 653 successful kernels belonging to fully native methods contain 590
+`EFFICIENT` and 63 `CORRECTNESS_FALLBACK` plans. At method level, 169 are fully
+efficient and 35 contain a correctness fallback. The maximum remains 399
+tasks; no task or constant ceiling changed. The worst single-kernel wall time
+is 42.64 seconds, and the largest generated constant payload is 1,819,392
+bytes. These costs remain visible rather than being hidden by the native pass
+count.
 
-The durable artifacts are
-`~/rk2608_backups/census-atrous-2fb47ca2b-20260805/junit.xml` (SHA-256
-`ea12b7403eab76d42f555cbcee0d975f44cb2500713dfc72180ede93736edc50`) and
-`~/rk2608_backups/census-atrous-2fb47ca2b-20260805/test_ops_coverage.json`
-(SHA-256
-`84da48e03bf39ff886581fc95f19a3963220d7ee36fbad69a0a28d6b1bb464d7`). The
+The durable artifacts are under
+`~/rk2608_backups/census-negative-max-2385767d1-20260805/`. The JUnit SHA-256
+is `1a89c93b75e5952c59960d229f5e0e86a423ebcfd11eedbe7a63ac2e19fc905f` and
+the telemetry JSON SHA-256 is
+`fddc4fc0fe64d5229481ef6d7695cf9e72d9199b8186be6718f1a7983f701cc1`. The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through native atrous convolution are now
-authoritative. The chronological sections below retain the individual focused
-evidence and their then-current estimates for debugging history.
+All focused milestones through native negative row-MAX are now authoritative.
+The chronological sections below retain the individual focused evidence and
+their then-current estimates for debugging history.
 
 Focused work after that census makes `TestOps.test_simple_conv2d_nhwc` pass
 natively without changing its `atol=1e-5`. The generic affine matcher derives
@@ -4190,3 +4188,33 @@ Softmin's largest absolute mismatch is `6.104e-05`; ordinary EXP reaches
 `wip-full-domain-exp2-softmin-official-mismatch-20260805.patch` (SHA-256
 `c44c769d345e89b3d633c76cf45684908403c119582b88b17f0d31f79ecf559a`) for future LUT
 or fused-normalization work. The authoritative census remains `204/40/168/13`.
+
+## Proven flying-CONV ERDMA surface accumulation
+
+The standalone `probe_conv_erdma_accumulate.py` establishes that a flying CNA
+convolution can consume an independent FP16 value for every spatial output
+through ERDMA and DPU EW ADD. The working eight-position stream is encoded as:
+
+```text
+DPU_EW_CFG                 = 0x108202c0  # ADD
+ERDMA_CFG                  = 0x40000008
+RDMA_DATA_CUBE_CHANNEL     = 15
+RDMA_DATA_CUBE_WIDTH       = 2*N-1
+RDMA_FEATURE_MODE_CFG      = 0x17850
+PC_OPERATION_ENABLE        = 0x1d
+operand physical placement = one FP16 value every second 16-byte atom
+```
+
+Three consecutive locked hardware runs returned exactly the FP16 result of an
+FP32 convolution-plus-prior calculation followed by one final conversion. A
+wide FP16 DPU fill passed immediately afterward, confirming the device remained
+healthy. Earlier variants with channel 7 or `COMB_USE=5` timed out; data size 1
+produced NaNs; plain width `N` consumed alternating values and stopped halfway.
+
+This proves a per-spatial FP16 continuation that the BRDMA bias-broadcast mode
+cannot express. It does not yet prove an official TestOps convolution schedule:
+channel splitting would round each partial before ERDMA accumulation, and the
+compiler still needs typed accumulator-layout and output-compaction support.
+The probe is therefore retained as a hardware oracle only. No method status,
+cost ceiling, or numerical tolerance changes, and the authoritative count stays
+`204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
