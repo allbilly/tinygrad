@@ -4525,11 +4525,12 @@ used only after the cheaper ordinary selector cannot satisfy the source-window
 contract; the 400-task and 2 MiB ceilings remain unchanged.
 
 The direct device regression is bit-exact. All compiler/image/telemetry tests,
-full-tree Mypy, and full-tree Ruff pass. This focused gain predicts
-`205 PASS_NATIVE / 40 PASS_FRONTEND / 167 NATIVE_REJECT / 13 SKIP_UPSTREAM`,
-but `204/40/168/13` remains authoritative until the next uncached full census.
-The much larger asymmetric `(4,2,111,28)` family remains an 826-task layout
-rejection; native PPU padding alone does not hide that physical-layout blocker.
+full-tree Mypy, and full-tree Ruff pass. A later comparison against the complete
+`2385767d1` telemetry established that this method was already included in its
+204 native passes, so the earlier predicted `205/40/167/13` tally was a
+bookkeeping error rather than a new method-level gain. The much larger
+asymmetric `(4,2,111,28)` family remains an 826-task layout rejection; native
+PPU padding alone does not hide that physical-layout blocker.
 
 ## Broad one-task physical GEMM contract
 
@@ -4568,8 +4569,7 @@ legalization. Row-major `B[K,N]` must become the blocked order
 `[N/16,K/32,16,32]`, and FP16 CMAC output must be compacted from its gapped
 physical surface. Selector-CMAC remains the honest fallback until a bounded
 NPU-native transform is proven. No CPU packing, task-limit increase, or new
-native pass is claimed, so the authoritative census remains `204/40/168/13`
-and the focused padded-pool expectation remains `205/40/167/13`.
+native pass is claimed, so the authoritative census remains `204/40/168/13`.
 
 ## Dense RHS packing uses proven 64-output selector tiles
 
@@ -4586,3 +4586,28 @@ does not reduce its 399 tasks and increases constant storage. The 64x64 device
 regression and the unchanged `test_matmul_simple`, `test_matmul_batched`, and
 `test_matmul_batched_vector` methods all pass at official tolerances. This is a
 native-quality improvement, not a new method pass, and no global limit changes.
+
+## Unpadded large-stride PPU regression fix
+
+The complete uncached census at `3efbb9820` reported 203 native, 40 frontend,
+169 failed, and 13 upstream-skipped methods in 3,634 seconds. It exposed one
+method-level regression relative to `2385767d1`:
+`test_max_pool2d_bigger_stride`. Three of its four stride families timed out at
+the final PPU task after 146 mixed DPU/CMAC packing tasks. No other method
+changed classification.
+
+The cause was the padded-pooling milestone's partitioned selector fallback.
+It also made an unpadded sliding-pool candidate legal, displacing the older
+interleaved affine PPU schedule. The partitioned whole-surface pack is now
+limited to surfaces with real nonzero padding. Unpadded cases whose ordinary
+selector exceeds the cost contract reject from the sliding lowerer and proceed
+to the proven affine PPU lowerer.
+
+Strict serialized hardware testing passes `test_max_pool2d_bigger_stride`, its
+dilation variant, and `test_max_pool2d_padding`. The integer-output padding
+method remains an honest `unsupported_output_dtype` rejection. The complete
+compiler suite passes 163 tests plus 67 subtests; Mypy passes all 236 tinygrad
+source files and full-tree Ruff is clean. This focused fix restores the expected
+`204/40/168/13` result without changing limits or tolerances. The authoritative
+complete green census remains the earlier `2385767d1` run until the fixed head
+is rerun uncached.

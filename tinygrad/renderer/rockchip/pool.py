@@ -250,7 +250,9 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
   scratch += (RKScratch(len(input_rows)*2),)
   input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,value_index.src[0].arg.slot),planes*in_h*in_w,input_rows,scratch,
     direct_capacity=((planes*in_h*in_w*2+4095)&-4096)//2,max_window=RK_MAX_CMAC_SELECTOR_WINDOW,max_outputs=128)
-  if input_plan is None:
+  # Partitioning is needed for real padded surfaces. For an unpadded surface, prefer the already-proven interleaved affine
+  # PPU lowering rather than placing one PPU task after a long mixed-engine packing prefix, which can time out on hardware.
+  if input_plan is None and any((pad_top,pad_bottom,pad_left,pad_right)):
     input_plan = _best_partitioned_selector_program(packed_input,RKArg(RKBufferKind.ARG,value_index.src[0].arg.slot),
       planes*in_h*in_w,input_rows,scratch)
   if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"sliding PPU input pack exceeds plan limits",Ops.INDEX)

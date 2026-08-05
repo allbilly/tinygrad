@@ -280,6 +280,19 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
     self.assertFalse(contains_uop(result.plan))
 
+  def test_guarded_unpadded_bigger_stride_keeps_interleaved_affine_ppu(self):
+    for stride in ((2,3),(3,2),2,3):
+      with self.subTest(stride=stride):
+        expression = sink(Tensor.empty(4,2,11,28,dtype=dtypes.half).max_pool2d((2,2),stride=stride))
+        self.assertIs(lower_sliding_max_result(expression).kind,RKLowerKind.UNSUPPORTED)
+        result = lower_native(expression)
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        self.assertGreater(sum(isinstance(step,RKReduce) for step in result.plan.steps),1)
+        self.assertLessEqual(plan_cost(result.plan).task_count,200)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_dense_row_max_uses_direct_ppu_width_tree(self):
     result = lower_dense_row_max_result(sink(Tensor.empty(256,256,dtype=dtypes.half).max(axis=1)))
     self.assertIs(result.kind,RKLowerKind.NATIVE)
