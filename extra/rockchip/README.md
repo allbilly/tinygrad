@@ -2216,3 +2216,18 @@ of 320 outputs, up to `0.0009765625` absolute and `0.005554` relative.
 inputs. The active pre-submission numerical rejection remains correct. A future
 implementation needs a narrower second-level logarithm/softplus LUT or another
 measured fused recipe; canonicalization alone cannot make this method pass.
+
+## Selector planner module boundary
+
+Static selector construction, CMAC payload packing, bounded window/two-level
+planning, program composition, and semantic-reformat legalization now live in
+`renderer/rockchip/selector.py`; shared compiler limits live in `limits.py`.
+The public lowering module falls from 3,320 to 3,038 physical lines. This is a
+mechanical extraction: plan selection, cost ordering, constants, scratch,
+command words, and RKImage bytes are unchanged.
+
+The full compiler/image/telemetry suite passes 171 tests plus 59 subtests.
+Mypy passes all thirteen Rockchip renderer modules and Ruff is clean. Four
+serialized hardware regressions cover selector reformat, ordered DPU+CMAC sum,
+K65-to-K96 contraction, and direct CONV; all pass with eleven subtests. This
+milestone changes no coverage result, execution lane, limit, or tolerance.

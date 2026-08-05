@@ -4298,3 +4298,18 @@ reproducible. This rules out a canonicalization-only fix. The next valid route
 is a characterized narrower logarithm/softplus table or fused recipe, while the
 current `NUMERICAL_CONTRACT` rejection stays active. No tolerance, execution
 lane, or census status changes.
+
+## Mechanical selector-planner extraction
+
+The 289-line `renderer/rockchip/selector.py` now owns static selector payloads,
+windowed/two-level/partitioned plan construction, cost-based candidate choice,
+program resource finalization, and semantic reformat legalization. The 13-line
+`limits.py` centralizes the unchanged compiler fences. The main lowering module
+drops from 3,320 to 3,038 physical lines without hiding handwritten code under
+`autogen/`.
+
+All 171 compiler/image/telemetry tests plus 59 subtests pass, including existing
+image goldens. Mypy and Ruff pass, and representative RK3588 selector-reformat,
+sum, K65 contraction, and CONV tests pass with eleven subtests in 42.57 seconds.
+There is no native-coverage or schedule claim; the authoritative census remains
+`204/40/168/13`.
