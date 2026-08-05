@@ -32,17 +32,17 @@ Total methods: **425**. Subcases: **126** (PASS_FALLBACK=61, PASS_NATIVE=65).
 | CORRECTNESS_FALLBACK | 90 |
 | EFFICIENT | 667 |
 
-First recorded native rejection among fallback-using methods:
+First recorded native rejection or routing classification among fallback-using methods:
 
 | Reject kind | Methods |
 | --- | --- |
-| unsupported_output_dtype | 69 |
+| unsupported_output_dtype | 72 |
 | unsupported_input_dtype | 24 |
-| unsupported_layout | 17 |
-| none | 14 |
-| plan_stage_limit | 14 |
+| unsupported_layout | 19 |
+| plan_stage_limit | 17 |
 | unsupported_alu | 8 |
-| numerical_contract | 5 |
+| numerical_contract | 7 |
+| host_without_native_reject | 4 |
 | requires_reformat | 4 |
 | unaligned_row | 3 |
 
@@ -67,6 +67,13 @@ The durable artifacts are
 SHA-256 values are respectively
 `f114c5b39bcd209b374f32519688363d1704165c92443a428d0f37cee4cd7f7c` and
 `ec58716c6dac0056f6c657f03376a4bfed9802286b44a97c78294629256de437`.
+
+The generated reject Pareto now selects the earliest rejection across both the
+method record and all unittest subcases. This recovers ten precise nested
+rejections that were previously displayed as `none`. Four fallback methods
+have no native rejection event at either level and are explicitly classified
+`host_without_native_reject`; the report does not invent a compiler reason for
+work routed to HOST before `native_program` records a rejection.
 
 The first post-hybrid native replacement probe produced no coverage transition.
 A direct logical-identity alias plus a non-aligned periodic DPU tail corrupted a

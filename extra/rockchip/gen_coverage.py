@@ -12,6 +12,10 @@ def _table(headers:tuple[str, ...], rows:list[tuple[object, ...]]) -> list[str]:
   return ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |",
           *("| " + " | ".join(map(str,row)) + " |" for row in rows)]
 
+def _first_reject(method:dict[str, Any]) -> dict[str, Any]:
+  rejects = [*method.get("rejects",()), *(reject for subcase in method.get("subcases",()) for reject in subcase.get("rejects",()))]
+  return min(rejects,key=lambda reject:reject.get("sequence",float("inf")),default={})
+
 def render_coverage(report:dict[str, Any], source_name:str) -> str:
   if report.get("schema_version") != 2: raise ValueError(f"unsupported telemetry schema {report.get('schema_version')!r}")
   methods = report.get("methods")
@@ -25,17 +29,17 @@ def render_coverage(report:dict[str, Any], source_name:str) -> str:
   native = [kernel for kernel in kernels if str(kernel.get("lane","")).startswith("RK_")]
   quality_counts = Counter(kernel.get("native_quality","UNKNOWN") for kernel in native)
   fallback_methods = [method for method in methods if method.get("outcome") in ("PASS_MIXED","PASS_FALLBACK")]
-  reject_counts = Counter((method.get("rejects") or [{}])[0].get("reject_kind","none") for method in fallback_methods)
+  reject_counts = Counter(_first_reject(method).get("reject_kind","host_without_native_reject") for method in fallback_methods)
   failures = [method.get("test",method.get("nodeid","UNKNOWN")) for method in methods if method.get("outcome") == "FAIL"]
   environment, hardware = report.get("environment",{}), report.get("hardware",{})
   lines = ["## Generated current census", "",
     f"Generated from `{source_name}` at `{report.get('generated_at','unknown')}` for commit `{report.get('commit','unknown')}`.", "",
     *_table(("Method outcome","Count"), [(outcome,method_counts[outcome]) for outcome in METHOD_OUTCOMES]),
-    f"", f"Total methods: **{len(methods)}**. Subcases: **{len(subcases)}** " +
+    "", f"Total methods: **{len(methods)}**. Subcases: **{len(subcases)}** " +
     "(" + ", ".join(f"{key}={value}" for key,value in sorted(subcase_counts.items())) + ").", "",
     *_table(("Kernel lane","Count"), [(lane,lane_counts[lane]) for lane in sorted(lane_counts)]), "",
     *_table(("Native quality","Count"), [(quality,quality_counts[quality]) for quality in sorted(quality_counts)]), "",
-    "First recorded native rejection among fallback-using methods:", "",
+    "First recorded native rejection or routing classification among fallback-using methods:", "",
     *_table(("Reject kind","Methods"), sorted(reject_counts.items(),key=lambda item:(-item[1],item[0]))), "",
     f"Environment: `DEV={environment.get('DEV','unknown')}` `FORWARD_ONLY={environment.get('FORWARD_ONLY','unknown')}` " +
     f"`DEFAULT_FLOAT={environment.get('DEFAULT_FLOAT','unknown')}` `ROCKCHIP_FALLBACK={environment.get('ROCKCHIP_FALLBACK','unknown')}`.",

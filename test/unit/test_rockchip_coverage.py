@@ -13,10 +13,14 @@ class TestRockchipCoverage(unittest.TestCase):
          "kernels":[{"lane":"RK_DPU","native_quality":"EFFICIENT"}]},
         {"test":"mixed","outcome":"PASS_MIXED","subcases":[],"rejects":[{"reject_kind":"unsupported_layout"}],
          "kernels":[{"lane":"RK_DPU","native_quality":"CORRECTNESS_FALLBACK"},{"lane":"HOST"}]},
+        {"test":"subcase_fallback","outcome":"PASS_FALLBACK","rejects":[],"kernels":[{"lane":"HOST"}],
+         "subcases":[{"outcome":"PASS_FALLBACK","rejects":[{"reject_kind":"numerical_contract","sequence":3}]}]},
+        {"test":"pre_renderer","outcome":"PASS_FALLBACK","rejects":[],"subcases":[],"kernels":[{"lane":"HOST"}]},
         {"test":"failed","outcome":"FAIL","subcases":[],"rejects":[],"kernels":[]}]}
     summary = render_coverage(report,"result.json")
-    for expected in ("PASS_NATIVE | 1", "PASS_MIXED | 1", "FAIL | 1", "RK_DPU | 2", "HOST | 1",
-                     "unsupported_layout | 1", "- `failed`"): self.assertIn(expected,summary)
+    for expected in ("PASS_NATIVE | 1", "PASS_MIXED | 1", "PASS_FALLBACK | 2", "FAIL | 1", "RK_DPU | 2", "HOST | 3",
+                     "unsupported_layout | 1", "numerical_contract | 1", "host_without_native_reject | 1", "- `failed`"):
+      self.assertIn(expected,summary)
 
   def test_marked_file_update_and_check(self):
     with tempfile.TemporaryDirectory() as directory:
