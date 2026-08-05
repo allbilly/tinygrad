@@ -14,7 +14,7 @@ from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipProgram
 from tinygrad.uop.ops import Ops
 
-_PPU, _PPU_RDMA = 0x4001, 0x8001
+_PPU, _PPU_RDMA, _REG_PPU_POOLING_PADDING_CFG = 0x4001, 0x8001, 0x6040
 
 def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
@@ -23,8 +23,10 @@ def _replace(stage:RKStage, target:int, reg:int, value:int) -> RKStage:
   commands = tuple(_command(target,reg,value) if command>>48 == target and command&0xffff == reg else command for command in stage.commands)
   return RKStage(stage.engine,commands,stage.relocs,stage.flags)
 
-def image(ih:int, iw:int, channels:int, kh:int, kw:int, sy:int, sx:int) -> RKImage:
+def image(ih:int, iw:int, channels:int, kh:int, kw:int, sy:int, sx:int,
+          padding:tuple[int,int,int,int]=(0,0,0,0)) -> RKImage:
   """Start from a proven HWC8 task, then alter only characterized PPU geometry fields."""
+  pt,pb,pl,pr = padding
   base_kh, base_kw = min(2,ih), min(8,iw)
   base_oh, base_ow = ih-base_kh+1, iw-base_kw+1
   src = RKTensorRef(RKArg(RKBufferKind.ARG,1),
@@ -32,7 +34,7 @@ def image(ih:int, iw:int, channels:int, kh:int, kw:int, sy:int, sx:int) -> RKIma
   out = RKTensorRef(RKArg(RKBufferKind.ARG,0),
     RKLayout((base_oh,base_ow,8),(base_oh,base_ow,8),(base_ow*16,16,2),dtypes.half,kind=RKLayoutKind.PPU_HWC))
   stage = emit_pool(RKPool(out,src,Ops.MAX,0,base_kh,base_kw,1,1)).stages[0]
-  oh, ow, c = (ih-kh)//sy+1, (iw-kw)//sx+1, channels-1
+  oh, ow, c = (ih+pt+pb-kh)//sy+1, (iw+pl+pr-kw)//sx+1, channels-1
   line_stride, output_index_add = iw*channels*2, iw*oh
   fields = ((_PPU,rk.REG_PPU_DATA_CUBE_IN_WIDTH,iw-1),(_PPU,rk.REG_PPU_DATA_CUBE_IN_HEIGHT,ih-1),
     (_PPU,rk.REG_PPU_DATA_CUBE_IN_CHANNEL,c),(_PPU,rk.REG_PPU_DATA_CUBE_OUT_WIDTH,ow-1),
@@ -43,9 +45,15 @@ def image(ih:int, iw:int, channels:int, kh:int, kw:int, sy:int, sx:int) -> RKIma
     (_PPU_RDMA,rk.REG_PPU_RDMA_CUBE_IN_CHANNEL,c),(_PPU_RDMA,rk.REG_PPU_RDMA_SRC_LINE_STRIDE,line_stride),
     (_PPU_RDMA,rk.REG_PPU_RDMA_SRC_SURF_STRIDE,ih*line_stride))
   for target,reg,value in fields: stage = _replace(stage,target,reg,value)
+  padding_cfg = (pb<<12)|(pr<<8)|(pt<<4)|pl
+  stage = RKStage(stage.engine,(*stage.commands[:-1],_command(_PPU,_REG_PPU_POOLING_PADDING_CFG,padding_cfg),stage.commands[-1]),
+                  stage.relocs,stage.flags)
   return RKImage(RKTarget.RK3588,(stage,))
 
-def reference(values:np.ndarray, kh:int, kw:int, sy:int, sx:int) -> np.ndarray:
+def reference(values:np.ndarray, kh:int, kw:int, sy:int, sx:int,
+              padding:tuple[int,int,int,int]=(0,0,0,0)) -> np.ndarray:
+  pt,pb,pl,pr = padding
+  values = np.pad(values,((pt,pb),(pl,pr),(0,0)),constant_values=-np.inf)
   oh, ow = (values.shape[0]-kh)//sy+1, (values.shape[1]-kw)//sx+1
   return np.stack(tuple(values[y*sy:y*sy+kh,x*sx:x*sx+kw].max(axis=(0,1))
                         for y in range(oh) for x in range(ow))).reshape(oh,ow,values.shape[2])
@@ -53,22 +61,26 @@ def reference(values:np.ndarray, kh:int, kw:int, sy:int, sx:int) -> np.ndarray:
 _CASES = ((9,13,2,2,2,1,1),(17,2,2,1,2,1,2),(9,17,4,1,16,1,1),
           (9,17,8,1,8,1,1),(256,32,8,1,8,1,8),(256,4,8,1,4,1,4),
           (9,17,8,1,16,1,1),(17,32,2,1,16,1,16))
+_PAD_CASES = ((11,28,8,5,5,5,5,1,0,1,0),(11,28,8,5,5,5,5,2,1,2,1),(11,28,8,3,2,3,2,1,1,0,1))
 
 def main() -> None:
   parser = argparse.ArgumentParser()
-  parser.add_argument("--case",type=int,choices=range(len(_CASES)),required=True,
-                      help="run one geometry in a fresh process; cases 1, 2, 6, and 7 are known-bad or timeout probes")
+  group = parser.add_mutually_exclusive_group(required=True)
+  group.add_argument("--case",type=int,choices=range(len(_CASES)),
+                     help="run one geometry in a fresh process; cases 1, 2, 6, and 7 are known-bad or timeout probes")
+  group.add_argument("--padding-case",type=int,choices=range(len(_PAD_CASES)),help="run one asymmetric-padding geometry")
   args = parser.parse_args()
   dev, rng = RockchipDevice("ROCKCHIP"), np.random.default_rng(42)
-  for ih,iw,channels,kh,kw,sy,sx in (_CASES[args.case],):
+  case = _CASES[args.case]+(0,0,0,0) if args.case is not None else _PAD_CASES[args.padding_case]
+  for ih,iw,channels,kh,kw,sy,sx,pt,pb,pl,pr in (case,):
     values = rng.uniform(-8,8,(ih,iw,channels)).astype(np.float16)
-    expected = reference(values,kh,kw,sy,sx)
+    expected = reference(values,kh,kw,sy,sx,(pt,pb,pl,pr))
     src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(expected.nbytes)
     try:
       ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
       ctypes.memset(int(out.va_addr),0,expected.nbytes)
-      name = f"ppu_max_hwc{channels}_{ih}x{iw}_k{kh}x{kw}_s{sy}x{sx}"
-      RockchipProgram(dev,TinyELF(encode_image(image(ih,iw,channels,kh,kw,sy,sx)),name,Target("ROCKCHIP"),()))(out,src,wait=True)
+      name = f"ppu_max_hwc{channels}_{ih}x{iw}_k{kh}x{kw}_s{sy}x{sx}_p{pt}_{pb}_{pl}_{pr}"
+      RockchipProgram(dev,TinyELF(encode_image(image(ih,iw,channels,kh,kw,sy,sx,(pt,pb,pl,pr))),name,Target("ROCKCHIP"),()))(out,src,wait=True)
       actual = np.frombuffer(ctypes.string_at(int(out.va_addr),expected.nbytes),dtype=np.float16).copy().reshape(expected.shape)
       print(f"{name} exact={np.array_equal(actual,expected)} mismatches={np.count_nonzero(actual != expected)}/{actual.size} "
             f"actual_head={actual.reshape(-1)[:8].tolist()} expected_head={expected.reshape(-1)[:8].tolist()}")
