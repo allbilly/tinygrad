@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from tinygrad import Tensor
-import tinygrad.renderer.rockchip as rockchip
+import tinygrad.renderer.rockchip.elementwise as rk_elementwise
 
 _REJECT = "unreduced BCE LUT composition exceeds the FP16 relative-error contract"
 
@@ -16,8 +16,8 @@ def _stats(actual:np.ndarray, expected:np.ndarray) -> tuple[int,float,float]:
   return int(np.count_nonzero(failed)),float(difference[failed].max(initial=0)),float(relative[failed].max(initial=0))
 
 def main() -> None:
-  original = rockchip._numerical_contract
-  rockchip._numerical_contract = lambda u: None if original(u) == _REJECT else original(u)
+  original = rk_elementwise._numerical_contract
+  rk_elementwise._numerical_contract = lambda u: None if original(u) == _REJECT else original(u)
   np.random.seed(0)
   x,y = (np.random.uniform(-2,2,(32,10)).astype(np.float16) for _ in range(2))
   tx,ty = torch.from_numpy(x),torch.from_numpy(y)

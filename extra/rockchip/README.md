@@ -84,7 +84,7 @@ honest native passes but are kept visible for replacement by direct engine paths
 The current serialized device contract passes 96 tests plus 66 subtests in
 807.11 seconds with fallback disabled.
 
-Lowering uses twenty-one named ordered strategies grouped into elementwise,
+Lowering uses named ordered strategies grouped into elementwise,
 movement/reformat, sum/product/MAX reduction, and contraction families. Every
 strategy returns exactly one of `NATIVE`, `NOT_APPLICABLE`, or `UNSUPPORTED`: unrelated passes
 cannot overwrite a useful reject, while applicable failures are ranked by
@@ -95,10 +95,11 @@ The compiler is split by responsibility under `renderer/rockchip/`:
 canonicalization, `affine.py` owns affine maps and reject fingerprints,
 `access.py` owns compact semantic identity, affine, padding, periodic,
 piecewise-affine, and final static-selector access maps,
-`emit.py` owns DPU/CMAC/CONV/PPU register emission, and `image.py` owns the versioned
-image codec and relocations. The package entry contains resource planning,
-ordered legalization, and renderer integration. Register emission imports no
-UOp definitions and cannot recover source-graph semantics.
+`elementwise.py` owns contiguous and broadcast DPU lowering, `emit.py` owns
+DPU/CMAC/CONV/PPU register emission, and `image.py` owns the versioned image
+codec and relocations. The package entry retains public re-exports, the ordered
+lowerer registry, and renderer integration. Register emission imports no UOp
+definitions and cannot recover source-graph semantics.
 
 The frozen `rockchip-2607` branch is a behavioral and register oracle, not
 evidence that all of its 425 passing methods ran on the NPU. Its later runtime
@@ -2380,6 +2381,22 @@ and below the 500-line organization goal. No handwritten code moved into
 and representative CMAC/CONV hardware paths remain green. Coverage is unchanged
 at the authoritative `204/40/168/13`.
 
+## Elementwise lowering module
+
+Contiguous DPU arithmetic, native wide fills, fused lerp, and single- and
+multi-source broadcast expressions now live in
+`renderer/rockchip/elementwise.py`. The public package entry keeps their
+compatibility exports and exact lowerer order but no longer owns their selector,
+scratch, or numerical-contract implementation. It falls from 501 to 132
+physical lines; no handwritten implementation moved into `autogen/`.
+
+The complete compiler/image/telemetry/fallback unit suite passes with 196 tests
+and 81 subtests, full-tree Mypy and Ruff are clean, and strict RK3588 WHERE,
+lerp, broadcast-add, and broadcast-simple methods pass with the same required
+`DEFAULT_FLOAT=HALF` test context. This is a behavior-preserving module split;
+the current hybrid semantic census remains 214 native, 40 mixed, 118 generic
+compiled-host fallback, 40 frontend-only, and 13 upstream-skipped methods.
+
 ## Rejected wide planar PPU packing
 
 Two preserved WIP commits prove that the `(32,2,11,28)` `test_max_pool2d`
@@ -2805,8 +2822,8 @@ surface. This keeps the small contraction native and moves the old 399-task
 `1x64 @ 64x99` correctness path to a typed stage-limit rejection in strict
 mode and visible `HOST` execution in hybrid mode.
 
-The authoritative native-first hybrid TestOps census at `7d6646a0f` is now
-zero-failure: 213 native methods, 39 mixed methods, 120 generic compiled-host
+The authoritative native-first hybrid TestOps census at `42c0fa400` is
+zero-failure: 214 native methods, 40 mixed methods, 118 generic compiled-host
 fallback methods, 40 frontend-only methods, and 13 upstream skips. Pytest
 reports 412 passed methods plus 126 passing subtests. This is semantic coverage,
 not a claim that HOST work is native; strict and hybrid telemetry remain
