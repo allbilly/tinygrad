@@ -4749,6 +4749,21 @@ contract. Focused `test_gemm`, `test_gemm_fp16`, `test_9_gemm`, and `test_matmul
 all remain native with fallback disabled. This is an efficiency milestone, not
 a method-level census transition; the authoritative total remains 206 native.
 
+## CNA deconvolution stride contract
+
+A standalone task now proves the RK3588 CNA deconvolution controls rather than
+inferring them from the decomposed transpose-convolution UOps. Starting from a
+known-good packed 1x1 CONV task, the probe enables `CNA_CONV_CON1.DE_CONV` and
+sets both `CNA_CONV_CON3.DE_CONV_*_STRIDE` fields to one, matching the TRM's
+definition as the number of zeros inserted between adjacent source pixels.
+
+With source `[[1,2],[3,4]]` and an identity weight, one native task writes the
+exact 3x3 result `[[1,0,2],[0,0,0],[3,0,4]]`. Input, weight, and output are
+ordinary mapped GEM allocations, and execution uses the existing blocking
+RKImage runtime. This is a hardware-register milestone only: kernel flipping,
+padding, output padding, channel roles, and full transpose-convolution geometry
+must be proven before adding a compiler lowerer or changing TestOps coverage.
+
 ## Live Toolkit2 surface-task capture
 
 `dump_rknn_submit.gdb` captures a vendor submission without patching its task

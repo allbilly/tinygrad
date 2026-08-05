@@ -2519,3 +2519,17 @@ proven 64-output selector because the independent destination-stride probe
 demonstrates that the candidate DPU fields leave atom writes compact. No task,
 constant, or numerical limit changes, and the authoritative census remains
 `206/40/166/13`.
+
+## CNA deconvolution stride contract
+
+The first direct deconvolution probe is exact. A known-good packed 1x1 CNA task
+with `DE_CONV=1` and both deconvolution inserted-pad fields set to one expands a
+2x2 identity convolution into the expected stride-2 3x3 surface in one hardware
+task. The zeros are produced by CNA; no selector matrix or host tensor operation
+participates.
+
+This establishes that the fields encode inserted zeros (`stride-1`), as the TRM
+states. It is not yet a public transpose-convolution contract: 3x3 weight
+orientation, padding, output padding, and channel-role legalization remain to
+be characterized. The standalone probe is retained so those follow-up shapes
+can be compared against one exact register baseline.
