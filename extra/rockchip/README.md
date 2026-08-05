@@ -2332,3 +2332,17 @@ tests and the complete compiler/image/telemetry suite pass; full-tree Mypy and
 Ruff are clean. RK3588 tests cover direct global and sliding PPU work plus
 CMAC-prepared padded and batched affine MAX. This is a byte-preserving module
 split, so native coverage remains `204/40/168/13`.
+
+## Arithmetic reduction lowering module
+
+The SUM/mean, nested SUM, MUL/product, masked prefix, multi-source, pointwise,
+and general affine reduction lowerers now live in
+`renderer/rockchip/reduce.py`. Their shared epilogue construction stays with
+the schedules it finishes, while the direct contraction lowerer imports that
+typed helper. The exact-FP16 constant predicate is shared through the pure
+analysis module.
+
+The public compiler module falls from 2,039 to 1,291 physical lines. Frozen
+images, the complete compiler/image/telemetry suite, full-tree Mypy/Ruff, and
+representative RK3588 SUM, product, prefix, and variance paths all remain
+green. No capability or limit changes, so coverage stays `204/40/168/13`.

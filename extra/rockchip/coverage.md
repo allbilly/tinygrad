@@ -4419,3 +4419,19 @@ global PPU MAX, sliding PPU pooling, padded CMAC+PPU pooling, and batched affine
 MAX; all pass with three subtests in 7.85 seconds. This mechanical move changes
 no schedule, cost, tolerance, or census result, so `204/40/168/13` remains the
 authoritative tally.
+
+## Mechanical arithmetic-reduction extraction
+
+SUM, mean, nested SUM, product, masked product, multi-source SUM, pointwise
+affine reduction, and general affine reduction now live in the 771-line
+`renderer/rockchip/reduce.py`. The shared exact-FP16 predicate moves to the pure
+analysis module so DPU and reduction lowering use one implementation. The
+public compiler module drops from 2,039 to 1,291 physical lines while retaining
+the explicit pass registry and contraction family.
+
+All 171 compiler/image/telemetry tests plus 59 subtests pass, including frozen
+images. Full Mypy covers 236 source files and full-tree Ruff is clean. Five
+serialized RK3588 methods cover row SUM, nested SUM, affine product, masked
+prefix SUM, and pointwise variance; all pass with seven subtests in 21.60
+seconds. This move changes no task schedule, cost, tolerance, or coverage
+classification; the authoritative census remains `204/40/168/13`.

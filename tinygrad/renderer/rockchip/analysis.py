@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math
+import math, struct
 from itertools import product
 from typing import cast
 
@@ -7,6 +7,11 @@ from tinygrad.dtype import dtypes, Invalid
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.renderer.rockchip.affine import affine as _affine
 from tinygrad.renderer.rockchip.limits import RK_MAX_AFFINE_VISITS
+
+def fp16_exact(value:float) -> bool:
+  try: rounded = struct.unpack("<e", struct.pack("<e", value))[0]
+  except OverflowError: return False
+  return math.isnan(value) and math.isnan(rounded) or rounded == value
 
 def strip_casts(u:UOp) -> UOp:
   while u.op is Ops.CAST: u = u.src[0]
