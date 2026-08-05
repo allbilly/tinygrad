@@ -5010,3 +5010,32 @@ with fallback disabled. The compiler suite passes 170 tests plus 78 subtests.
 gapped FP16 CMAC surface; packing RHS was only one side of the problem. A
 native multi-row output-layout conversion is still required, so the complete
 census remains `213/40/159/13`.
+
+## Dense FP32 CMAC rows and wide BS writeback
+
+The conclusion above is superseded by a precision-specific route suggested by
+`allbilly/rk3588/examples/gemm.py`. FP16 CMAC rows remain gapped, but FP32 CMAC
+accumulation is dense. A locked `M=64,N=256,K=256` identity probe writes all
+16,384 FP32 cells contiguously and preserves an immediately following canary.
+This is promoted as the physical accumulator layout for regular broad GEMM.
+
+The existing WHERE path already demonstrates that BS/BN are reusable DPU
+lanes. A reduced BS-only probe accepts a dense external FP32 vector and writes
+FP16 correctly for tested finite nonzero values, infinity, and NaN at counts
+through 8,192. It normalizes negative zero and therefore is not advertised as
+a general bit-exact cast. Count 16,384 wraps at lane 8,192; multi-row and width
+geometries repeat or overlap atoms. The typed stage is consequently bounded to
+one flat 1--8,192-value accumulator writeback, with complete atoms after the
+first eight values.
+
+K256 square GEMM now bypasses the 16.7-million-coordinate generic affine
+enumeration and produces a 297-task native program: 32 gathers, 256 proven
+transpose tasks, one broad CMAC, and eight wide BS writebacks. Plan cost is
+13,214 command words, 151,552 constant bytes, 397,312 scratch bytes, and
+33,554,432 estimated MACs. No resource ceiling changes.
+
+The unchanged locked `test_big_gemm` passes with `ROCKCHIP_FALLBACK=0` in
+34.85 seconds. `matmul_simple`, `small_gemm`, `9_gemm`, `gemm_fp16`, `gemm`,
+`matvecmat`, and `matvec` also pass together after the topology change. This is
+focused evidence only: the authoritative census remains `213 PASS_NATIVE / 40
+PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM` pending a complete uncached run.

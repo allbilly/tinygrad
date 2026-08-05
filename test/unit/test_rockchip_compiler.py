@@ -1202,6 +1202,14 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(image.stages[0].relocs),4)
     data_format = next(command>>16&0xffffffff for command in image.stages[0].commands if command&0xffff == 0x4010)
     self.assertEqual(data_format>>29,5)
+    rows, channels = 64, 256
+    dense_out = RKTensorRef(RKArg(RKBufferKind.ARG,0),
+      RKLayout((rows,channels),(rows,channels),(channels*4,4),dtypes.float))
+    dense_lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),
+      RKLayout((rows,channels),(rows,channels),(channels*2,2),dtypes.half))
+    dense_rhs = RKTensorRef(RKArg(RKBufferKind.ARG,2),
+      RKLayout((channels,channels),(channels,channels),(channels*2,2),dtypes.half,kind=RKLayoutKind.CMAC_WEIGHT))
+    self.assertEqual(len(emit_cmac_task(RKCMACTask(dense_out,dense_lhs,dense_rhs,0)).stages),1)
 
   def test_logical_contraction_legalizes_to_byte_identical_cmac_task(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
@@ -1306,8 +1314,8 @@ class TestDPUCompiler(unittest.TestCase):
     cost = plan_cost(result.plan)
     self.assertEqual(sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
                          if isinstance(step,RKDPUProgram) for stage in step.stages),8)
-    self.assertEqual(len(contractions),81)
-    self.assertLessEqual(cost.task_count,89)
+    self.assertEqual(len(contractions),2)
+    self.assertLessEqual(cost.task_count,27)
     self.assertLessEqual(cost.constant_bytes,150*1024)
     self.assertFalse(contains_uop(result.plan))
 
@@ -1322,9 +1330,24 @@ class TestDPUCompiler(unittest.TestCase):
                       if isinstance(step,RKDPUProgram) for stage in step.stages)
         contracts = sum(isinstance(step,RKCMACTask) for step in result.plan.steps)
         self.assertEqual(gathers,n//8)
-        self.assertEqual(contracts,(n//8)*(k//32)+1+(0 if m == 1 else (m*n)//64))
+        self.assertEqual(contracts,257 if k == 256 else 2)
         self.assertLessEqual(plan_cost(result.plan).constant_bytes,150*1024)
         self.assertFalse(contains_uop(result.plan))
+
+  def test_k256_square_gemm_uses_broad_compute_and_wide_bs_writeback(self):
+    result = lower_tiled_contract_result(sink(Tensor.empty(256,256,dtype=dtypes.half)@Tensor.empty(256,256,dtype=dtypes.half)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask))
+    casts = tuple(stage for step in result.plan.steps if isinstance(step,RKDPUProgram)
+                  for stage in step.stages if isinstance(stage,RKCastStage))
+    broad = tuple(step for step in contracts if step.lhs.layout.logical_shape == (256,256) and
+                  step.rhs.layout.logical_shape == (256,256))
+    self.assertEqual((len(broad),broad[0].out.layout.dtype,broad[0].out.layout.physical_shape),(1,dtypes.float,(256,256)))
+    self.assertEqual((len(casts),tuple(stage.count for stage in casts)),(8,(8192,)*8))
+    self.assertLessEqual(plan_cost(result.plan).task_count,297)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):
     x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)
@@ -2061,8 +2084,8 @@ class TestDPUCompiler(unittest.TestCase):
     cost = plan_cost(result.plan)
     self.assertEqual(sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
                          if isinstance(step,RKDPUProgram) for stage in step.stages),16)
-    self.assertEqual(sum(isinstance(step,RKCMACTask) for step in result.plan.steps),65)
-    self.assertLessEqual(cost.task_count,82)
+    self.assertEqual(sum(isinstance(step,RKCMACTask) for step in result.plan.steps),2)
+    self.assertLessEqual(cost.task_count,83)
     self.assertLessEqual(cost.constant_bytes,131*1024)
     self.assertFalse(contains_uop(result.plan))
 

@@ -74,6 +74,16 @@ def row_layout_image(dst_stride:int, surface_add:int, notch:int, group_line_off:
   stage = _replace(stage,_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,(notch<<16)|notch)
   return RKImage(RKTarget.RK3588,(stage,),base.scratch,base.constants)
 
+def fp32_row_layout_image(rows:int=4, channels:int=64) -> RKImage:
+  """Replay the broad-GEMM geometry with the contiguous FP32 WDMA contract from allbilly/rk3588 examples/gemm.py."""
+  base = image(channels,False,rows)
+  stage = base.stages[0]
+  stage = _replace(stage,_DPU,rk.REG_DPU_DATA_FORMAT,(5<<29)|(2<<26)|2)
+  stage = _replace(stage,_DPU,rk.REG_DPU_BS_OW_CFG,0x36e)
+  stage = _replace(stage,_DPU,rk.REG_DPU_OUT_CVT_SCALE,0)
+  stage = _replace(stage,_DPU,rk.REG_DPU_SURFACE_ADD,0x40)
+  return RKImage(RKTarget.RK3588,(stage,),base.scratch,base.constants)
+
 def probe_row_layout(dst_stride:int, surface_add:int, notch:int, expect_compact:bool, group_line_off:bool=False) -> None:
   """Locate every unique identity result so overlapping or gapped rows cannot look like a valid compact surface."""
   dev, rows, channels = RockchipDevice("ROCKCHIP"), 4, 64
@@ -102,6 +112,32 @@ def probe_row_layout(dst_stride:int, surface_add:int, notch:int, expect_compact:
     dev._gpu_free(lhs_buf)
     dev._gpu_free(rhs)
 
+def probe_fp32_row_layout(rows:int=4, channels:int=64) -> None:
+  dev = RockchipDevice("ROCKCHIP")
+  lhs = np.arange(1,rows*channels+1,dtype=np.float16).reshape(rows,channels)
+  weight = np.eye(channels,dtype=np.float16)
+  packed = weight.reshape(channels//16,16,channels//32,32).transpose(0,2,1,3).ravel()
+  out, lhs_buf, rhs = dev._gpu_alloc(rows*channels*4+256), dev._gpu_alloc(lhs.nbytes), dev._gpu_alloc(packed.nbytes)
+  try:
+    ctypes.memmove(int(lhs_buf.va_addr),lhs.ctypes.data,lhs.nbytes)
+    ctypes.memmove(int(rhs.va_addr),packed.ctypes.data,packed.nbytes)
+    initial = np.full(rows*channels+64,np.float32(12345.0),dtype=np.float32)
+    ctypes.memmove(int(out.va_addr),initial.ctypes.data,initial.nbytes)
+    RockchipProgram(dev,TinyELF(encode_image(fp32_row_layout_image(rows,channels)),
+      f"cmac_fp32_rows_{rows}_{channels}",Target("ROCKCHIP"),()))(
+      out,lhs_buf,rhs,wait=True)
+    physical = np.frombuffer(ctypes.string_at(int(out.va_addr),initial.nbytes),dtype=np.float32).copy()
+    expected = lhs.astype(np.float32).ravel()
+    mismatch = np.flatnonzero(physical[:expected.size] != expected)
+    tail_untouched = np.array_equal(physical[expected.size:],initial[expected.size:])
+    print(f"FP32 rows={rows} channels={channels} exact={not mismatch.size} mismatches={mismatch[:16].tolist()} "
+          f"tail_untouched={tail_untouched} row_starts={physical[:expected.size].reshape(rows,channels)[:,0].tolist()}")
+    assert mismatch.size == 0 and tail_untouched
+  finally:
+    dev._gpu_free(out)
+    dev._gpu_free(lhs_buf)
+    dev._gpu_free(rhs)
+
 def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--row-layout",nargs=3,metavar=("DST_STRIDE","SURFACE_ADD","NOTCH"),
@@ -109,7 +145,13 @@ def main() -> None:
   parser.add_argument("--expect-compact",action="store_true")
   parser.add_argument("--group-line-off",action="store_true")
   parser.add_argument("--compact-width",type=int,help="probe one compact FP16 identity row at this width")
+  parser.add_argument("--fp32-rows",nargs="*",metavar="DIM",help="probe contiguous FP32 output; optional ROWS CHANNELS")
   args = parser.parse_args()
+  if args.fp32_rows is not None:
+    dims = tuple(map(int,args.fp32_rows))
+    if len(dims) not in (0,2): parser.error("--fp32-rows accepts zero or two dimensions")
+    probe_fp32_row_layout(*(dims or (4,64)))
+    return
   if args.row_layout is not None:
     probe_row_layout(*(int(value,0) for value in args.row_layout),args.expect_compact,args.group_line_off)
     return

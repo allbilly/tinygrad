@@ -122,8 +122,11 @@ class RKCastStage:
   src_dtype: DType
   dst_dtype: DType
   def __post_init__(self):
-    if (self.src_dtype,self.dst_dtype) != (dtypes.bool,dtypes.half) or not 0 < self.count <= 8:
-      raise ValueError("RK native cast supports one bool-to-FP16 atom")
+    bool_to_half = (self.src_dtype,self.dst_dtype) == (dtypes.bool,dtypes.half) and 0 < self.count <= 8
+    cmac_to_half = (self.src_dtype,self.dst_dtype) == (dtypes.float,dtypes.half) and 0 < self.count <= 8192 and \
+      (self.count <= 8 or self.count%8 == 0)
+    if not (bool_to_half or cmac_to_half):
+      raise ValueError("RK native cast supports one bool atom or one bounded FP32 accumulator row to FP16")
 
 @dataclass(frozen=True)
 class RKMaskStage:

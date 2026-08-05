@@ -2674,3 +2674,35 @@ task and RHS pack are now proven, but multi-row FP16 CMAC output retains a
 padded channel layout. Legalizing that output without host gathering or more
 than 400 selector tasks remains the `test_big_gemm` blocker. The authoritative
 census stays `213/40/159/13`.
+
+## Direct K256 square GEMM writeback
+
+The WHERE/mask implementation already exercises the DPU BS and BN pipeline;
+the relevant new fact is a wider proven use of that physical pipeline rather
+than a new semantic operator. `allbilly/rk3588/examples/gemm.py` writes
+multi-row CMAC accumulation as dense FP32. A locked raw identity task confirms
+the same ABI under this runtime at `M=64,N=256,K=256`: all 16,384 FP32 values
+are contiguous, every row starts at the expected offset, and the following
+canary is untouched.
+
+External FP32 through BS converts to FP16 in one compact channel task through
+8,192 values. Every tested nonzero finite value, infinity, and NaN agrees with
+ordinary FP32-to-FP16 conversion; negative zero is normalized to positive
+zero. A 16,384-channel request wraps after 8,192 and is rejected by the typed
+contract. Multi-row and width-shaped variants repeat or overlap eight-lane
+atoms, so this remains one flat accumulator writeback rather than general FP32
+DPU input support. FP32 ERDMA modes and the full BS/BN/EW cast-shaped pipeline
+remain rejected experiments.
+
+Regular K128/K256 GEMM is recognized from three affine strides before the
+generic per-multiply selector census. The native K256 square schedule is 32
+strided eight-column gathers, 256 proven 32x8 transpose CMAC tasks, one broad
+256x256x256 CMAC task with dense FP32 output, and eight BS writebacks of 8,192
+values. That is 297 tasks, 13,214 command words, 151,552 constant bytes, and
+397,312 scratch bytes under the unchanged limits. The host never reads, packs,
+or converts a dynamic tensor.
+
+The unchanged native-only `TestOps.test_big_gemm` passes in 34.85 seconds;
+seven existing GEMM and matvec methods pass together in 44.24 seconds. The
+last authoritative full census remains `213/40/159/13`; focused evidence
+predicts one fewer stage-limit reject until the next complete uncached census.

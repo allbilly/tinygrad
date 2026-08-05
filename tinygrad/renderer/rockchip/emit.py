@@ -236,22 +236,30 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
       stages.append(RKStage(RKEngine.DPU,tuple(cmds),tuple(relocs),RK_STAGE_RESET))
       continue
     if isinstance(plan,RKCastStage):
-      # A bool surface is one byte per lane. This proven mixed-precision mode consumes one eight-lane int8 atom and writes FP16.
-      regs = ((rk.REG_DPU_S_POINTER,0xe),(rk.REG_DPU_FEATURE_MODE_CFG,0x1e5),(rk.REG_DPU_DATA_FORMAT,0x40000000),
-        (rk.REG_DPU_DATA_CUBE_WIDTH,0),(rk.REG_DPU_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
-        (rk.REG_DPU_DATA_CUBE_CHANNEL,0x70007),(rk.REG_DPU_BS_CFG,0x53),(rk.REG_DPU_BN_CFG,0x53),
+      # Bool consumes one int8 atom directly. FP32 accumulator writeback uses the proven external BS ALU path with
+      # an FP16 zero main operand and one FP16 WDMA conversion.
+      fp32 = plan.src_dtype is dtypes.float
+      channels, cast_source = (plan.count, materialize(0.0,plan.count)) if fp32 else (8,plan.src)
+      regs = ((rk.REG_DPU_S_POINTER,0xe),(rk.REG_DPU_FEATURE_MODE_CFG,0x1e5),
+        (rk.REG_DPU_DATA_FORMAT,0x48000002 if fp32 else 0x40000000),(rk.REG_DPU_DATA_CUBE_WIDTH,0),
+        (rk.REG_DPU_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
+        (rk.REG_DPU_DATA_CUBE_CHANNEL,((channels-1)<<16)|(channels-1)),
+        (rk.REG_DPU_BS_CFG,(2<<16)|0x150 if fp32 else 0x53),(rk.REG_DPU_BN_CFG,0x53),
         (rk.REG_DPU_BS_ALU_CFG,0),(rk.REG_DPU_BS_MUL_CFG,0),(rk.REG_DPU_BS_OW_CFG,2),
-        (rk.REG_DPU_WDMA_SIZE_0,7),(rk.REG_DPU_WDMA_SIZE_1,0),(rk.REG_DPU_BN_MUL_CFG,0),
+        (rk.REG_DPU_WDMA_SIZE_0,channels-1),(rk.REG_DPU_WDMA_SIZE_1,0),(rk.REG_DPU_BN_MUL_CFG,0),
         (rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(rk.REG_DPU_EW_CFG,0x383),(rk.REG_DPU_EW_CVT_SCALE_VALUE,1),
         (rk.REG_DPU_OUT_CVT_OFFSET,0),(rk.REG_DPU_OUT_CVT_SCALE,0x10001),(rk.REG_DPU_OUT_CVT_SHIFT,0),
-        (rk.REG_DPU_SURFACE_ADD,0x40))
-      rdma = ((rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
-        (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),
-        (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,1),(rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,0x7801))
-      cmds = [_command(_TARGET_DPU,*x) for x in regs]+[_command(_TARGET_DPU_RDMA,*x) for x in rdma]
+        (rk.REG_DPU_SURFACE_ADD,0x10 if fp32 else 0x40))
+      cast_rdma = [(rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
+        (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,channels-1),
+        (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,1),(rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,0x17849 if fp32 else 0x7801)]
+      if fp32: cast_rdma += [(_REG_DPU_RDMA_BRDMA_CFG,2),(_REG_DPU_RDMA_WEIGHT,0x01010101)]
+      cmds = [_command(_TARGET_DPU,*x) for x in regs]+[_command(_TARGET_DPU_RDMA,*x) for x in cast_rdma]
       relocs = []
-      for target_id,reg,arg in ((_TARGET_DPU,rk.REG_DPU_DST_BASE_ADDR,plan.dst),
-                                (_TARGET_DPU_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,plan.src)):
+      addresses = [(_TARGET_DPU,rk.REG_DPU_DST_BASE_ADDR,plan.dst),
+                   (_TARGET_DPU_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,cast_source)]
+      if fp32: addresses.append((_TARGET_DPU_RDMA,_REG_DPU_RDMA_BS_BASE_ADDR,plan.src))
+      for target_id,reg,arg in addresses:
         cmds.append(_command(target_id,reg,0))
         relocs.append(RKReloc(stage_idx,len(cmds)-1,arg.kind,arg.index,arg.addend))
       cmds.append(_command(_TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18))
@@ -349,8 +357,10 @@ def emit_cmac_task(plan:RKCMACTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
     raise ValueError(f"CMAC output tile must be 32..{_MAX_CMAC_CHANNELS} physical channels")
   fp32_out = plan.out.layout.dtype is dtypes.float
   if plan.out.layout.dtype not in (dtypes.half,dtypes.float): raise ValueError("CMAC output must be FP16 or FP32")
-  if fp32_out and (m != 1 or plan.out.layout.physical_shape != (1,64) or plan.out.layout.strides_bytes != (256,4)):
-    raise ValueError("CMAC FP32 output requires one proven 32-lane tile")
+  fp32_dense = plan.out.layout.physical_shape == (m,align_out) and plan.out.layout.strides_bytes == (align_out*4,4)
+  fp32_legacy = m == 1 and align_out == 32 and plan.out.layout.physical_shape == (1,64) and plan.out.layout.strides_bytes == (256,4)
+  if fp32_out and not (fp32_dense or fp32_legacy):
+    raise ValueError("CMAC FP32 output requires one dense row-major accumulator surface")
   if plan.compact_output and (fp32_out or m != 1 or plan.out.layout.physical_shape != (1,align_out) or
                               plan.out.layout.strides_bytes != (align_out*2,2)):
     raise ValueError("compact CMAC output requires one dense FP16 row")

@@ -64,6 +64,21 @@ def multiply_cast_image(mul_src:int) -> RKImage:
   stage = _replace(stage,_RDMA,_BRDMA_CFG,0)
   return RKImage(RKTarget.RK3588,(stage,))
 
+def ew_cast_image(mode:int) -> RKImage:
+  """Read FP32 through ERDMA, add FP16 negative zero in EW, and request FP16 writeback."""
+  base = image(2,False)
+  stage = _replace(base.stages[0],_DPU,rk.REG_DPU_BS_CFG,0x53)
+  stage = _replace(stage,_DPU,rk.REG_DPU_BN_CFG,0x53)
+  stage = _replace(stage,_DPU,rk.REG_DPU_EW_CFG,0x10c202c0)
+  stage = _replace(stage,_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(mode<<30)|0x0c)
+  commands = list(stage.commands)
+  relocs = list(stage.relocs)
+  bs_reloc = next(index for index,reloc in enumerate(relocs) if commands[reloc.word]&0xffff == _BS_BASE)
+  word = relocs[bs_reloc].word
+  commands[word] = _command(_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,0)
+  relocs[bs_reloc] = RKReloc(0,word,RKBufferKind.ARG,4)
+  return RKImage(RKTarget.RK3588,(RKStage(stage.engine,tuple(commands),tuple(relocs),stage.flags),))
+
 def main() -> None:
   x = np.array([-3, -1, -.25, 0, .5, 1, 2, 4], dtype=np.float16)
   y = np.array([4, 2, .75, -.5, 1.5, -2, 3, -1], dtype=np.float16)
@@ -104,6 +119,21 @@ def main() -> None:
             f"nan={np.isnan(signed_half[~finite]).all()} actual={signed_half.tolist()}")
       assert np.flatnonzero(finite & (signed_half.view(np.uint16) != expected_half.view(np.uint16))).tolist() == [2]
       assert np.isnan(signed_half[-1])
+      ctypes.memset(int(signed_buffers[0].va_addr),0,16)
+      RockchipProgram(dev,TinyELF(encode_image(image(2,False)),"bs_add_fp32_to_fp16_signed_zero",Target("ROCKCHIP"),()))(
+        *signed_buffers,wait=True)
+      bs_half = np.frombuffer(ctypes.string_at(int(signed_buffers[0].va_addr),16),dtype=np.float16).copy()
+      print(f"BS ADD FP32->FP16 bit_exact={np.array_equal(bs_half.view(np.uint16),expected_half.view(np.uint16))} "
+            f"actual={bs_half.tolist()}")
+      if (ew_mode:=os.getenv("ROCKCHIP_UNSAFE_EW_FP32")) is not None:
+        ctypes.memset(int(signed_buffers[0].va_addr),0,16)
+        ctypes.memmove(int(signed_buffers[2].va_addr),negative_zero.ctypes.data,negative_zero.nbytes)
+        mode = int(ew_mode)
+        RockchipProgram(dev,TinyELF(encode_image(ew_cast_image(mode)),f"ew_fp32_to_fp16_mode_{mode}",Target("ROCKCHIP"),()))(
+          *signed_buffers,wait=True)
+        ew_half = np.frombuffer(ctypes.string_at(int(signed_buffers[0].va_addr),16),dtype=np.float16).copy()
+        print(f"EW FP32->FP16 mode={mode} bit_exact="
+              f"{np.array_equal(ew_half.view(np.uint16),expected_half.view(np.uint16))} actual={ew_half.tolist()}")
       if os.getenv("ROCKCHIP_UNSAFE_BS_MUL") == "1":
         ctypes.memmove(int(signed_buffers[2].va_addr),ones.ctypes.data,ones.nbytes)
         ctypes.memmove(int(signed_buffers[4].va_addr),fp32.ctypes.data,fp32.nbytes)
