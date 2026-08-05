@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, glob, mmap, os, time
+import ctypes, fcntl, glob, mmap, os, time
 from dataclasses import dataclass
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, mv_address, suppress_finalizing, to_mv
@@ -11,6 +11,7 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 
 _TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300), RKEngine.PPU:(1, 0x60, 0xc00),
          RKEngine.CONV:(0, 0x0d, 0x300)}
+_RKNPU_LOCKS:dict[str,int] = {}
 
 @dataclass(frozen=True)
 class RKHostMemory:
@@ -22,6 +23,17 @@ def _rknpu_device() -> str:
     driver = os.path.basename(os.path.realpath(f"{node}/device/driver")).lower()
     if driver in ("rknpu", "rocket"): return f"/dev/dri/{os.path.basename(node)}"
   raise RuntimeError("no DRM device bound to the RKNPU/Rocket driver; set ROCKCHIP_DEVICE explicitly")
+
+def _acquire_rknpu_lock() -> int:
+  lock_path = os.path.join(os.getenv("ROCKCHIP_LOCK_DIR", "/run/lock"), "tinygrad-rknpu.lock")
+  if (lock_fd:=_RKNPU_LOCKS.get(lock_path)) is not None: return lock_fd
+  lock_fd = os.open(lock_path, os.O_RDWR|os.O_CREAT|os.O_CLOEXEC, 0o666)
+  try: fcntl.flock(lock_fd, fcntl.LOCK_EX)
+  except BaseException:
+    os.close(lock_fd)
+    raise
+  _RKNPU_LOCKS[lock_path] = lock_fd
+  return lock_fd
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
@@ -142,6 +154,7 @@ class RockchipProgram(Program['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(_rknpu_device(), os.O_RDWR)
+    self.lock_fd = _acquire_rknpu_lock()
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
 
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:

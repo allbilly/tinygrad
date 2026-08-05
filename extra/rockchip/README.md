@@ -2798,3 +2798,9 @@ not a claim that HOST work is native; strict and hybrid telemetry remain
 separate. The next coverage phase replaces HOST and selector-heavy families
 with direct RK3588 layouts and engine schedules while keeping this hybrid suite
 green.
+
+Rockchip device processes are serialized by an exclusive
+`/run/lock/tinygrad-rknpu.lock` flock. This is process-global and shared by
+multiple `RockchipDevice` objects in one process, preventing concurrent test
+workers or terminals from submitting overlapping RK3588 jobs. Set
+`ROCKCHIP_LOCK_DIR` only to relocate the lock for isolated runtime tests.

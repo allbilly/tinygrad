@@ -5226,3 +5226,15 @@ The previous strict `214/40/158/13` census predates the initialized-padding
 guard; a new strict run is required before replacing that native-only
 baseline. The hybrid report shows 213 completely native methods at the current
 head because the former 399-task matmul now rejects safely.
+
+## Cross-process RK3588 serialization
+
+Every `RockchipDevice` process now acquires `/run/lock/tinygrad-rknpu.lock`
+before it can submit work. Multiple device objects inside one process share the
+same descriptor, while another process blocks until the owner exits. This
+closes the coverage-plan requirement exposed by earlier overlapping censuses,
+where two submitters produced invalid jobs and state pollution. The lock path
+directory is overrideable with `ROCKCHIP_LOCK_DIR` for isolated tests; the lock
+itself cannot be disabled by a coverage mode. Sixteen runtime/fallback tests,
+the mapped native-host-native coherence test, and the strided-gather hardware
+test pass; mypy and Ruff are clean.
