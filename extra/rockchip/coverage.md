@@ -4327,3 +4327,18 @@ All 171 compiler/image/telemetry tests plus 59 subtests pass. Four representativ
 RK3588 tests cover every consumer family and pass with eleven subtests in 42.50
 seconds. The authoritative census remains `204/40/168/13` because this is a
 mechanical module-boundary milestone, not a coverage claim.
+
+## Rejected parallel-prefix cumulative product
+
+`probe_cumprod_parallel.py` characterizes the tempting logarithmic native scan
+before compiler implementation. It uses the exact TestOps RNG seed, FP16 input,
+per-stage FP16 rounding, and unchanged comparison tolerance. A 20-element scan
+has no failures, but `(20,30)` scans fail 65/600 and 68/600 outputs on axes zero
+and one; `(20,30,40)` last-axis scans fail 1,766/24,000. The largest finite
+absolute differences are respectively 0.1875, 0.0234375, and 4.0.
+
+NumPy's linear FP16 accumulation itself fails 23/600, 55/600, and 2,111/24,000
+outputs on the larger shapes. The compiler does not add the parallel schedule,
+raise its cost ceiling, or relax tolerance. Larger cumulative products retain
+their typed rejection pending a native higher-precision accumulation path with
+the required rounding contract.

@@ -2245,3 +2245,20 @@ The compiler/image/telemetry suite again passes 171 tests plus 59 subtests.
 Representative serialized RK3588 reformat, reduction, K65 contraction, and
 direct-convolution tests pass with eleven subtests. This mechanical prerequisite
 for splitting whole lowerer families changes no coverage or numerical contract.
+
+## Rejected logarithmic cumulative-product schedule
+
+A Hillis-Steele-style prefix product would reduce native task growth from one
+materialized selector per prefix to logarithmic DPU multiply passes. The
+deterministic `probe_cumprod_parallel.py` applies FP16 rounding after every
+pass to the unchanged seeded TestOps shapes and compares at `rtol=1e-3,
+atol=1e-6`.
+
+The 20-element vector happens to pass, but the `(20,30)` axes miss 65 and 68
+of 600 outputs, and the 40-element last-axis scan misses 1,766 of 24,000.
+This is an offline numerical rejection before hardware submission. NumPy's
+linear FP16 accumulator also misses 23/600, 55/600, and 2,111/24,000 outputs,
+showing that simply preserving left-to-right FP16 association is insufficient
+for Torch's contract on the larger shapes. The active proven 20-element tiled
+implementation remains, and larger scans continue to reject instead of using
+either inaccurate FP16 schedule.
