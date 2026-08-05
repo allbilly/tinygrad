@@ -1334,6 +1334,20 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertLessEqual(plan_cost(result.plan).constant_bytes,150*1024)
         self.assertFalse(contains_uop(result.plan))
 
+  def test_row_major_rhs_pack_zeroes_unaligned_k_tail(self):
+    result = lower_tiled_contract_result(sink(Tensor.empty(1,65,dtype=dtypes.half)@Tensor.empty(65,104,dtype=dtypes.half)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    gathers = sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
+                  if isinstance(step,RKDPUProgram) for stage in step.stages)
+    contracts = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask))
+    self.assertEqual((gathers,len(contracts)),(13,53))
+    self.assertTrue(any(isinstance(step,RKDPUProgram) and any(isinstance(stage,RKALUStage) and stage.count == 504
+                                                             for stage in step.stages) for step in result.plan.steps))
+    self.assertLessEqual(plan_cost(result.plan).task_count,68)
+    self.assertFalse(contains_uop(result.plan))
+
   def test_k256_square_gemm_uses_broad_compute_and_wide_bs_writeback(self):
     result = lower_tiled_contract_result(sink(Tensor.empty(256,256,dtype=dtypes.half)@Tensor.empty(256,256,dtype=dtypes.half)))
     self.assertIs(result.kind,RKLowerKind.NATIVE)
@@ -2159,7 +2173,7 @@ class TestDPUCompiler(unittest.TestCase):
     renderer = RockchipRenderer(Target("ROCKCHIP"))
     cases = ((Tensor.empty(16,dtype=dtypes.float)+Tensor.empty(16,dtype=dtypes.float), "unsupported_input_dtype"),
                  (Tensor.empty(4,4,dtype=dtypes.float).T.contiguous(), "unaligned_row"),
-                 (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,128,dtype=dtypes.half), "plan_stage_limit"))
+                 (Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,129,dtype=dtypes.half), "plan_stage_limit"))
     for expression, reason in cases:
       with self.assertRaisesRegex(RuntimeError, f"RKPLAN_REJECT:{reason}"): renderer.native_program(sink(expression))
 

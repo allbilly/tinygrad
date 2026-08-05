@@ -38,6 +38,15 @@ class TestRockchip(unittest.TestCase):
         if size == 128: np.testing.assert_equal(actual,expected)
         else: np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
 
+  def test_row_major_matvec_unaligned_k_tail(self):
+    rng = np.random.default_rng(65104)
+    lhs = rng.uniform(-.125,.125,(1,65)).astype(np.float16)
+    rhs = rng.uniform(-.125,.125,(65,104)).astype(np.float16)
+    actual = (Tensor(lhs,device="ROCKCHIP",dtype=dtypes.half) @
+              Tensor(rhs,device="ROCKCHIP",dtype=dtypes.half)).realize().numpy()
+    expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
+    np.testing.assert_equal(actual,expected)
+
   def test_static_two_tap_linear_interpolation_native_cmac(self):
     rng = np.random.default_rng(0)
     for align_corners in (False,True):

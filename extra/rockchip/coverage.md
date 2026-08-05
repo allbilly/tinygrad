@@ -4888,6 +4888,30 @@ future interpolation and scalar/vector output legalization while retaining
 the strict `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`
 census.
 
+## Aligned-N row-major packing with a physical K tail
+
+The direct row-major RHS pack no longer requires logical K to be divisible by
+32. For aligned N, it allocates the normal blocked `align_out x align_in`
+weight surface, clears the unused K lanes once, gathers each eight-column atom
+from every logical row, and applies the established 32x8 transpose payload to
+all physical K blocks. `1x65 @ 65x104` is bit-exact on RK3588 and costs 68
+tasks, 13 gathers, and 53 CMAC tasks including the broad GEMM.
+
+The same generalization exposed and fixed a separate physical-layout mistake
+for N greater than K. The batched transpose assumes `physical_K == logical_K`;
+when `N=128,K=64`, physical K is 128 because the output-channel pressure also
+sets the shared CMAC alignment. That geometry now uses the tail-clearing path
+and is bit-exact rather than placing the second output block at the wrong
+offset.
+
+The official K=65 dot family has N=100, which is not an aligned source row.
+The raw DPU probe shows that a source addend of 100 FP16 values reads from the
+preceding aligned atom (96--103), and the corresponding width-100 strided-row
+task times out. The compiler therefore retains a typed layout/stage rejection
+for that family. BS/BN remains useful for WHERE/mask arithmetic, fused lerp and
+dense accumulator conversion; it is not an unaligned gather or shuffle unit.
+The authoritative census remains `213 PASS_NATIVE / 40 PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM`.
+
 ## Rejected fused FP32-to-FP16 conversion
 
 The proven lerp pipeline was reduced to an apparent cast using FP16 zero as

@@ -74,6 +74,8 @@ def main() -> None:
   parser.add_argument("--original",action="store_true")
   parser.add_argument("--matrix",action="store_true",help="probe an 8x8 FP16 matrix with eight channels")
   parser.add_argument("--row-stride",type=int,default=8,help="physical FP16 row stride used by --matrix")
+  parser.add_argument("--column",type=int,default=0,help="first FP16 lane within each --matrix row")
+  parser.add_argument("--line-notch",type=int,help="probe one RDMA line-notch value instead of the default sweep")
   parser.add_argument("--surface-notch",type=int,help="signed decoded MRDMA surface-notch field")
   parser.add_argument("--vendor-transpose",action="store_true",help="replay the Toolkit2 one-task NC1HWC2 transpose geometry")
   parser.add_argument("--strided-atom-gather",action="store_true",
@@ -169,7 +171,7 @@ def main() -> None:
       dev._gpu_free(src)
       dev._gpu_free(out)
     return
-  rows, stride, column = (8,args.row_stride,0) if args.matrix else (8,5,2)
+  rows, stride, column = (8,args.row_stride,args.column) if args.matrix else (8,5,2)
   values = np.arange(rows*stride,dtype=np.float16).reshape(rows,stride)
   dev = RockchipDevice("ROCKCHIP")
   src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(256)
@@ -177,14 +179,14 @@ def main() -> None:
     ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
     modes = (False,True) if os.getenv("ROCKCHIP_UNSAFE_NONALIGN") == "1" else (False,)
     for nonalign in modes:
-      for notch in dict.fromkeys((0,1,2,stride-1,stride)):
+      for notch in ((args.line_notch,) if args.line_notch is not None else dict.fromkeys((0,1,2,stride-1,stride))):
         ctypes.memset(int(out.va_addr),0,256)
         program = RockchipProgram(dev,TinyELF(encode_image(image(rows,stride,column,notch,nonalign,args.transpose,args.regroup,
           args.surf_len,args.original,7 if args.matrix else 0,args.surface_notch)),
           f"dpu_gather_n{notch}_{'nonalign' if nonalign else 'aligned'}",Target("ROCKCHIP"),()))
         program(out,src,wait=True)
         actual = np.frombuffer(ctypes.string_at(int(out.va_addr),256),dtype=np.float16).copy()
-        matrix_values = values[:,:8]
+        matrix_values = values[:,column:column+8]
         expected = matrix_values.T.reshape(-1) if args.matrix and args.transpose else (matrix_values.reshape(-1) if args.matrix else values[:,column])
         positions = [int(index) for index in np.flatnonzero(np.isin(actual,expected))]
         exact = np.array_equal(actual[:expected.size],expected)

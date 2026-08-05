@@ -24,21 +24,24 @@ from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dens
 def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) -> \
     tuple[list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], tuple[RKScratch, ...], RKArg]:
   """Gather and batch-transpose one aligned row-major KxN RHS into the proven blocked CMAC weight stream."""
-  if n%32 or k%32 or not 32 <= n <= k <= 256: raise ValueError(f"unsupported row-major RHS N={n},K={k}")
+  if not 8 <= n <= 256 or n%8 or not 1 <= k <= 256: raise ValueError(f"unsupported row-major RHS N={n},K={k}")
+  align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
   packed = RKArg(RKBufferKind.SCRATCH,len(scratch))
-  scratch += (RKScratch(n*k*2),)
+  scratch += (RKScratch(align_out*align_in*2),)
   gathered = RKArg(RKBufferKind.SCRATCH,len(scratch))
-  if k == 256:
-    scratch += (RKScratch(k*8*2),)
+  if n%32 or k%32 or align_in != k or k == 256:
+    scratch += (RKScratch(align_in*8*2),)
     transpose = _cmac_selection_payload([[k_lane*8+n_lane] for n_lane in range(8) for k_lane in range(32)],256,256,1.0)
     lhs_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
     out_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
     weight = _cmac_weight_ref(0,256,256,RKBufferKind.CONSTANT,256)
     legacy_steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+    if k < align_in:
+      legacy_steps.append(RKDPUProgram((RKALUStage(Ops.ADD,RKArg(gathered.kind,gathered.index,k*8*2),0.0,0.0,(align_in-k)*8),),scratch))
     for n_start in range(0,n,8):
       legacy_steps.append(RKDPUProgram((RKStridedAtomGatherStage(gathered,RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),k,n),),scratch))
-      for k_start in range(0,k,32):
-        packed_offset = (((n_start//16)*(k//32)+k_start//32)*512+(n_start%16//8)*256)*2
+      for k_start in range(0,align_in,32):
+        packed_offset = (((n_start//16)*(align_in//32)+k_start//32)*512+(n_start%16//8)*256)*2
         legacy_steps.append(RKCMACTask(RKTensorRef(RKArg(packed.kind,packed.index,packed_offset),out_layout),
           RKTensorRef(RKArg(gathered.kind,gathered.index,k_start*8*2),lhs_layout),weight,0,transpose,compact_output=True))
     return legacy_steps,scratch,packed
@@ -994,8 +997,9 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
   wide_lhs_rows, wide_rhs_columns = divmod(lhs_count,k), divmod(rhs_count,k)
-  wide_matvec_candidate = k in (128,256) and wide_lhs_rows[1] == wide_rhs_columns[1] == 0 and \
-    1 <= wide_lhs_rows[0] <= 512 and 1 <= wide_rhs_columns[0] <= 256 and output_count == wide_lhs_rows[0]*wide_rhs_columns[0]
+  wide_matvec_candidate = 1 <= k <= 256 and wide_lhs_rows[1] == wide_rhs_columns[1] == 0 and \
+    1 <= wide_lhs_rows[0] <= 512 and 1 <= wide_rhs_columns[0] <= 256 and output_count == wide_lhs_rows[0]*wide_rhs_columns[0] and \
+    (k in (128,256) or output_count*k <= 2_000_000)
   if (not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS) and \
      not wide_matvec_candidate:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
@@ -1065,7 +1069,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
                                      for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
-  direct_row_major_rhs = direct_lhs and n%32 == 0 and k%32 == 0 and 32 <= n <= k <= 256 and rhs_count == n*k and \
+  direct_row_major_rhs = 8 <= n <= 256 and n%8 == 0 and 1 <= k <= 256 and rhs_count == n*k and \
     lhs_parsed[1] is None and rhs_parsed[1] is None and \
     rhs_columns == [tuple(red*n+channel for red in range(k)) for channel in range(n)]
   row_ids = {row:index for index,row in enumerate(lhs_rows)}
@@ -1152,7 +1156,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     reduced = RKArg(RKBufferKind.SCRATCH, len(scratch))
     scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
   cmac_out = RKArg(RKBufferKind.SCRATCH, len(scratch))
-  fp32_writeback = direct_dense_output and not compact_output
+  # The flat BS cast is valid only when consecutive logical rows have no padded output channels between them.
+  fp32_writeback = direct_dense_output and not compact_output and n == align_out
   scratch += (RKScratch(m*align_out*(4 if fp32_writeback else (2 if compact_output else 4))),)
   rhs_layout = RKLayout((n,k), (align_out,align_in), (align_in*2,2), dtypes.half,
                         padding=((0,align_out-n),(0,align_in-k)), kind=RKLayoutKind.CMAC_WEIGHT)

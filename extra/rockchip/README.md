@@ -2649,6 +2649,26 @@ inputs. It therefore remains a numerical experiment rather than production
 scan lowering. No TestOps status or resource ceiling changes in this hardware
 milestone.
 
+## Row-major GEMM K-tail packing and the unaligned-row boundary
+
+The bounded row-major RHS pack now accepts an aligned `N` with a non-32-aligned
+reduction extent. It gathers each eight-column strip, clears the physical K
+tail once, and transposes every aligned 32x8 tile into the existing blocked
+CMAC weight surface. Locked RK3588 testing proves `1x65 @ 65x104` bit-exact
+against FP32 accumulation followed by FP16 conversion. The plan uses 13 DPU
+gathers, 52 transpose CMAC tasks, one broad CMAC task, one tail clear, and one
+compact writeback: 68 tasks without host tensor packing.
+
+This does not legalize the official `N=100` dot surface. A raw DPU probe with
+the second 100-element row as its source base returned lanes 96--103: the base
+is aligned down to the preceding eight-lane atom. A width-100 strided-row
+writeback also timed out. The unsafe commands remain only in the probe; the
+typed production gather continues to require aligned source bases and strides.
+Static offsets and tile geometry remain compiler work, but a dynamic unaligned
+surface still needs a genuinely legal reformat, an explicitly mixed path, or a
+typed rejection. It is not converted into selector work merely to claim a new
+pass. The strict census remains `213/40/159/13` pending a complete rerun.
+
 ## Native K=256 row-major matvec packing
 
 The DPU strided-atom probe now covers 256 rows at a 256-value FP16 row stride.
