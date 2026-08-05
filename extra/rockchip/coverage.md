@@ -4664,3 +4664,44 @@ enabled. The result narrows the physical-layout search: use compact ordinary
 DPU surface schedules or another proven engine path, while retaining
 selector-CMAC as the bounded correctness fallback. No TestOps coverage,
 limits, or tolerances change.
+
+## Live Toolkit2 surface-task capture
+
+`dump_rknn_submit.gdb` captures a vendor submission without patching its task
+descriptors or register commands. When the kernel-mapped task GEM is not
+readable through GDB's process mapping, it opens the exported task and command
+GEMs through the existing `allbilly/npu` dump utility. This exposes the live
+relocations that are absent from an offline `.rknn` command scan.
+
+For a `1x8x4x6` ADD -> H/W transpose -> MUL model, Toolkit2 submits nine task
+descriptors referencing six unique 69-register DPU blocks. The two arithmetic
+blocks use ordinary `6x4x8` NC1HWC2 surfaces. The apparent transpose/output
+block reads the same internal surface at `0xe47fc000` and writes the native
+output allocation with this geometry:
+
+```text
+DPU:       width=0 height=3 channel=47, WDMA=(size_c=5, channel=47, width=3)
+            dst_stride=4, surface_add=4
+DPU MRDMA: width=0 height=3 channel=47, line_notch=5, surface_notch=-18
+```
+
+The task's 48 channels are the flattened `6*8` source width/channel plane; the
+WDMA fields describe the reshaped `6x4x8` native output. Replaying this block
+against a normal linear allocation remains byte-order identity. The public
+logical layout is therefore not produced by a standalone transpose task; it
+depends on the vendor NC1HWC2 tensor contract and its output conversion path.
+
+Changing `rknn_input.fmt` between NHWC and NCHW produces an identical relocated
+NPU command stream (SHA-256
+`f3912692aaabd4a3521848298a072d49ea9c6c2271230f88a22dff4e27cb1bd0` after
+address-prefix normalization). Input-format conversion is consequently not a
+new device task that can be copied into the native backend. It is handled
+outside this submitted command stream, and cannot be used as evidence for a
+CPU-free NCHW-to-NC1HWC2 legalizer.
+
+The corrected raw probe now encodes `RDMA_SURF_NOTCH` at its documented
+four-bit field shift and accepts signed notch values and explicit row strides.
+Even with the live vendor notch formulas, ordinary linear FP16 rows remain a
+contiguous atom stream in the tested mode. No reformat path is enabled from
+this result; it prevents mistaking vendor physical-layout metadata for a
+general dynamic transpose engine.

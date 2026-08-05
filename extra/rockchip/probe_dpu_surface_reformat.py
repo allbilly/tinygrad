@@ -27,7 +27,8 @@ def _set(stage:RKStage, target:int, reg:int, value:int) -> RKStage:
   return RKStage(stage.engine,(*stage.commands,_command(target,reg,value)),stage.relocs,stage.flags)
 
 def image(rows:int, stride:int, column:int, line_notch:int, nonalign:bool=False,
-          transpose:bool=False, regroup:int=0, surf_len:int=0, original:bool=False, channels:int=0) -> RKImage:
+          transpose:bool=False, regroup:int=0, surf_len:int=0, original:bool=False, channels:int=0,
+          surface_notch:int|None=None) -> RKImage:
   base = emit_dpu(RKDPUProgram((RKALUStage(Ops.ADD,RKArg(RKBufferKind.ARG,0),
     RKArg(RKBufferKind.ARG,1,column*2),0.0,rows),)))
   stage = base.stages[0]
@@ -39,7 +40,8 @@ def image(rows:int, stride:int, column:int, line_notch:int, nonalign:bool=False,
     (_DPU,rk.REG_DPU_WDMA_SIZE_0,channels), (_DPU,rk.REG_DPU_WDMA_SIZE_1,(rows-1)<<16),
     (_DPU,rk.REG_DPU_SURFACE_ADD,0x10), (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,rows-1), (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,channels),
-    (_RDMA,_RDMA_SRC_DMA_CFG,line_notch<<19), (_RDMA,_RDMA_SURF_NOTCH,stride*2))
+    (_RDMA,_RDMA_SRC_DMA_CFG,line_notch<<19),
+    (_RDMA,_RDMA_SURF_NOTCH,((stride*2 if surface_notch is None else surface_notch)&0x0fffffff)<<4))
   for target,reg,value in regs: stage = _replace(stage,target,reg,value)
   return RKImage(RKTarget.RK3588,(stage,),base.scratch,base.constants)
 
@@ -67,6 +69,8 @@ def main() -> None:
   parser.add_argument("--surf-len",type=int,default=0,choices=range(1<<16))
   parser.add_argument("--original",action="store_true")
   parser.add_argument("--matrix",action="store_true",help="probe an 8x8 FP16 matrix with eight channels")
+  parser.add_argument("--row-stride",type=int,default=8,help="physical FP16 row stride used by --matrix")
+  parser.add_argument("--surface-notch",type=int,help="signed decoded MRDMA surface-notch field")
   parser.add_argument("--vendor-transpose",action="store_true",help="replay the Toolkit2 one-task NC1HWC2 transpose geometry")
   args = parser.parse_args()
   if args.vendor_transpose:
@@ -86,7 +90,7 @@ def main() -> None:
       dev._gpu_free(src)
       dev._gpu_free(out)
     return
-  rows, stride, column = (8,8,0) if args.matrix else (8,5,2)
+  rows, stride, column = (8,args.row_stride,0) if args.matrix else (8,5,2)
   values = np.arange(rows*stride,dtype=np.float16).reshape(rows,stride)
   dev = RockchipDevice("ROCKCHIP")
   src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(256)
@@ -94,14 +98,15 @@ def main() -> None:
     ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
     modes = (False,True) if os.getenv("ROCKCHIP_UNSAFE_NONALIGN") == "1" else (False,)
     for nonalign in modes:
-      for notch in (0,stride-1,stride):
+      for notch in dict.fromkeys((0,1,2,stride-1,stride)):
         ctypes.memset(int(out.va_addr),0,256)
         program = RockchipProgram(dev,TinyELF(encode_image(image(rows,stride,column,notch,nonalign,args.transpose,args.regroup,
-          args.surf_len,args.original,7 if args.matrix else 0)),
+          args.surf_len,args.original,7 if args.matrix else 0,args.surface_notch)),
           f"dpu_gather_n{notch}_{'nonalign' if nonalign else 'aligned'}",Target("ROCKCHIP"),()))
         program(out,src,wait=True)
         actual = np.frombuffer(ctypes.string_at(int(out.va_addr),256),dtype=np.float16).copy()
-        expected = values.T.reshape(-1) if args.matrix and args.transpose else (values.reshape(-1) if args.matrix else values[:,column])
+        matrix_values = values[:,:8]
+        expected = matrix_values.T.reshape(-1) if args.matrix and args.transpose else (matrix_values.reshape(-1) if args.matrix else values[:,column])
         positions = [int(index) for index in np.flatnonzero(np.isin(actual,expected))]
         exact = np.array_equal(actual[:expected.size],expected)
         print(f"transpose={args.transpose} regroup={args.regroup} surf_len={args.surf_len} original={args.original} "

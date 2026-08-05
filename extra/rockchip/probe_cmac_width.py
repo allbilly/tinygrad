@@ -107,6 +107,7 @@ def main() -> None:
         exact = np.array_equal(actual,lhs[:,:channels])
         print(f"M={rows} N={channels} compact={compact} exact={exact} "
               f"mismatches={np.count_nonzero(actual != lhs[:,:channels])} first={actual.ravel()[:8].tolist()}")
+        if compact and not exact: print(f"  compact physical first192={physical[:min(192,physical.size)].tolist()}")
     finally:
       dev._gpu_free(out)
       dev._gpu_free(lhs_buf)
