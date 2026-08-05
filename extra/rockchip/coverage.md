@@ -4769,9 +4769,24 @@ the exact 5x5 tinygrad transpose-convolution reference in one task. The
 unreversed/pad-zero observation exactly matches a cropped correlation, so this
 is a measured orientation contract rather than an inferred convention.
 
-This remains a hardware-register milestone: output padding, dilation, channel
-roles, groups/batches, requested-output cropping, and compiler recognition must
-be proven before changing TestOps coverage.
+This remains a hardware-register milestone: output padding, channel roles,
+groups/batches, requested-output cropping, and compiler recognition must be
+proven before changing TestOps coverage.
+
+The probe now additionally executes the asymmetric 3x3 kernel with transpose
+strides 1x1, 2x1, 1x2, and 2x2, and with dilation 2x2. Every result is exact.
+The measured general full-output rule is:
+
+```text
+CNA_CONV_CON1.DE_CONV       = 1
+CNA_CONV_CON3.DE_CONV_*     = transpose_stride - 1
+CNA_CONV_CON3.ATROUS_*      = dilation - 1
+CNA_PAD_CON0 top/left       = (kernel_size - 1) * dilation
+packed spatial weight       = original weight reversed in Y and X
+```
+
+Output padding/cropping and grouped/batched channel surfaces remain compiler
+work, but stride and dilation no longer require speculative register behavior.
 
 ## One-task 256x256x256 GEMM
 

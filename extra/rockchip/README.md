@@ -2535,8 +2535,14 @@ to `kernel_size-1`. With those settings, source `[[1,2],[3,4]]` and kernel
 `[[1,2,3],[4,5,6],[7,8,9]]` produce the exact 5x5 reference in one task.
 
 This proves stride-two, full-output 1x1 and 3x3 geometry. Public lowering still
-needs output-padding, dilation, channel-role, grouped/batched packing, and
-requested-output cropping contracts; the probe remains the register baseline.
+needs output-padding, channel-role, grouped/batched packing, and requested-output
+cropping contracts; the probe remains the register baseline.
+
+The same asymmetric kernel is also exact for transpose strides 1x1, 2x1, and
+1x2, plus dilation 2x2. CNA's deconvolution inserted-zero fields and ordinary
+atrous fields therefore compose: program `deconv_stride = transpose_stride-1`,
+`atrous = dilation-1`, and top/left padding `(kernel_size-1)*dilation` for the
+uncropped full output.
 
 ## One-task 256x256x256 GEMM
 
