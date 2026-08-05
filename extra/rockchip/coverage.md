@@ -4530,3 +4530,43 @@ full-tree Mypy, and full-tree Ruff pass. This focused gain predicts
 but `204/40/168/13` remains authoritative until the next uncached full census.
 The much larger asymmetric `(4,2,111,28)` family remains an 826-task layout
 rejection; native PPU padding alone does not hide that physical-layout blocker.
+
+## Broad one-task physical GEMM contract
+
+The `rockchip_addmul`, `rockchip-2607`, `allbilly/npu`, and `allbilly/rk3588`
+references were compared again. They all agree on the important boundary:
+once FP16 operands are in the CNA activation and 16-output-by-32-input blocked
+weight surfaces, a broad GEMM is one CNA/CORE/DPU task. Their general runtime
+paths pack dynamic operands on the CPU, so that part is evidence only and is
+not imported into this backend.
+
+The clean emitter already contained the same broad register geometry. The
+logical contraction legalizer now states the full already-packed contract
+instead of the obsolete `M=1, K=32, 4<=N<=16` subset. It validates aligned LHS,
+blocked RHS, and the gapped FP16 CMAC output surface before producing exactly
+one `RKCMACTask`.
+
+The raw hardware probe pre-packs inputs solely to characterize this physical
+ABI; it is not a runtime path and does not count as TestOps coverage. Five real
+matrix products are bit-exact against FP32 accumulation followed by FP16 cast:
+
+```text
+M=16 N=16 K=16: one task, zero mismatch
+M=32 N=32 K=32: one task, zero mismatch
+M=64 N=64 K=32: one task, zero mismatch
+M=16 N=16 K=64: one task, zero mismatch
+M=8  N=16 K=32: one task, zero mismatch
+```
+
+The existing strided-DPU probe was also rerun. A five-element row stride and
+two-element base offset do not gather the requested column: the base is atom
+aligned and the observed stream advances by eight FP16 lanes regardless of the
+tested notch values. This is not a native row-major-to-weight transpose.
+
+The remaining standard-matmul cost is therefore precisely dynamic layout
+legalization. Row-major `B[K,N]` must become the blocked order
+`[N/16,K/32,16,32]`, and FP16 CMAC output must be compacted from its gapped
+physical surface. Selector-CMAC remains the honest fallback until a bounded
+NPU-native transform is proven. No CPU packing, task-limit increase, or new
+native pass is claimed, so the authoritative census remains `204/40/168/13`
+and the focused padded-pool expectation remains `205/40/167/13`.

@@ -45,8 +45,44 @@ def selector_image(span:int, indexes:list[int]) -> RKImage:
     padding=((0,32-len(indexes)),(0,align-span)),kind=RKLayoutKind.CMAC_WEIGHT))
   return emit_cmac_task(RKCMACTask(out,lhs,rhs,0,packed.tobytes()))
 
+def gemm_image(m:int, n:int, k:int) -> RKImage:
+  align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
+  out = RKTensorRef(RKArg(RKBufferKind.ARG,0),RKLayout((m,n),(m,align_out*2),(align_out*4,2),dtypes.half,
+    padding=((0,0),(0,align_out*2-n))))
+  lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((m,k),(m,align_in),(align_in*2,2),dtypes.half,
+    padding=((0,0),(0,align_in-k)),kind=RKLayoutKind.CMAC_ACTIVATION,padding_value=0))
+  rhs = RKTensorRef(RKArg(RKBufferKind.ARG,2),RKLayout((n,k),(align_out,align_in),(align_in*2,2),dtypes.half,
+    padding=((0,align_out-n),(0,align_in-k)),kind=RKLayoutKind.CMAC_WEIGHT,padding_value=0))
+  return emit_cmac_task(RKCMACTask(out,lhs,rhs,0))
+
 def main() -> None:
   dev = RockchipDevice("ROCKCHIP")
+  rng = np.random.default_rng(2608)
+  for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64),(8,16,32)):
+    align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
+    lhs, rhs = rng.uniform(-.25,.25,(m,k)).astype(np.float16), rng.uniform(-.25,.25,(k,n)).astype(np.float16)
+    packed_lhs = np.zeros((m,align_in),dtype=np.float16)
+    packed_lhs[:,:k] = lhs
+    weight = np.zeros((align_out,align_in),dtype=np.float16)
+    weight[:n,:k] = rhs.T
+    packed_rhs = weight.reshape(align_out//16,16,align_in//32,32).transpose(0,2,1,3).ravel()
+    out, lhs_buf, rhs_buf = dev._gpu_alloc(m*align_out*4), dev._gpu_alloc(packed_lhs.nbytes), dev._gpu_alloc(packed_rhs.nbytes)
+    try:
+      ctypes.memmove(int(lhs_buf.va_addr),packed_lhs.ctypes.data,packed_lhs.nbytes)
+      ctypes.memmove(int(rhs_buf.va_addr),packed_rhs.ctypes.data,packed_rhs.nbytes)
+      ctypes.memset(int(out.va_addr),0,m*align_out*4)
+      RockchipProgram(dev,TinyELF(encode_image(gemm_image(m,n,k)),f"cmac_gemm_{m}_{n}_{k}",Target("ROCKCHIP"),()))(
+        out,lhs_buf,rhs_buf,wait=True)
+      physical = np.frombuffer(ctypes.string_at(int(out.va_addr),m*align_out*4),dtype=np.float16).reshape(m,-1)
+      actual = physical[:,[(channel//16)*32+channel%16 for channel in range(n)]]
+      expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
+      print(f"GEMM M={m} N={n} K={k} tasks=1 exact={np.array_equal(actual,expected)} "
+            f"max_abs={np.max(np.abs(actual.astype(np.float32)-expected.astype(np.float32))):.6g}")
+    finally:
+      dev._gpu_free(out)
+      dev._gpu_free(lhs_buf)
+      dev._gpu_free(rhs_buf)
+
   # One 32-KiB feature bank leaves eleven weight banks. Square FP16 selectors
   # therefore stop at 416 aligned channels: 416*416*2 <= 11*32 KiB.
   for channels in (16,20,24,28,32,40,64,96,99,128,160,256,384,416):

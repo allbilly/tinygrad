@@ -2399,3 +2399,27 @@ selector schedule, so it remains classified as a correctness fallback until a
 direct NCHW-to-HWC8 conversion exists. No CPU packing, tolerance relaxation, or
 resource-limit increase is used. Expected coverage is `205/40/167/13`; the
 last full-census result remains authoritative at `204/40/168/13`.
+
+## One-task GEMM: compute is proven, packing is the blocker
+
+The broad GEMM schedules in `rockchip_addmul`, `rockchip-2607`,
+`allbilly/npu`, and `allbilly/rk3588` were compared with the clean emitter.
+They use the same physical contract already understood here: an aligned CNA
+activation surface, a weight stream blocked as
+`[output/16,input/32,output_lane,input_lane]`, and the gapped FP16 CMAC output
+surface. The clean logical legalizer now accepts that complete already-packed
+contract and emits one `RKCMACTask`.
+
+`probe_cmac_width.py` verifies actual one-task GEMMs at 16x16x16, 32x32x32,
+64x64x32, 16x16x64, and 8x16x32. Every output is bit-exact against FP32 matrix
+multiplication rounded once to FP16. Probe-side NumPy packing is hardware ABI
+characterization only; it is never invoked by the compiler or runtime and is
+not native coverage.
+
+Standard dynamic tinygrad matmul still needs an NPU-resident transform from
+row-major RHS to the blocked weight stream and a physical-output compaction.
+The existing scalar strided-DPU experiment does not provide that transform:
+unaligned column offsets are atom-aligned and tested notch values do not change
+the observed eight-lane stride. The backend therefore keeps selector-CMAC as a
+bounded correctness fallback and does not raise resource limits or copy the
+references' CPU packing.

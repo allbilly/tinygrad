@@ -1164,6 +1164,22 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(emit_cmac_task(legalized),emit_cmac_task(physical))
     self.assertFalse(contains_uop(semantic) or contains_uop(legalized))
 
+  def test_already_packed_broad_gemm_legalizes_to_one_cmac_task(self):
+    for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64)):
+      with self.subTest(m=m,n=n,k=k):
+        align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
+        lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((m,k),(m,align_in),(align_in*2,2),dtypes.half,
+          padding=((0,0),(0,align_in-k)),kind=RKLayoutKind.CMAC_ACTIVATION,padding_value=0))
+        rhs = RKTensorRef(RKArg(RKBufferKind.ARG,2),RKLayout((n,k),(align_out,align_in),(align_in*2,2),dtypes.half,
+          padding=((0,align_out-n),(0,align_in-k)),kind=RKLayoutKind.CMAC_WEIGHT,padding_value=0))
+        out = RKTensorRef(RKArg(RKBufferKind.ARG,0),RKLayout((m,n),(m,align_out*2),(align_out*4,2),dtypes.half,
+          padding=((0,0),(0,align_out*2-n))))
+        tasks = legalize_contraction_plan(RKContractionPlan(out,lhs,rhs,m,n,k,(0,)))
+        self.assertEqual(len(tasks),1)
+        self.assertEqual((tasks[0].physical_m,tasks[0].physical_n,tasks[0].physical_k),(m,align_out,align_in))
+        self.assertEqual(len(emit_cmac_task(tasks[0]).stages),1)
+        self.assertFalse(contains_uop(tasks[0]))
+
   def test_cmac_output_width_stops_at_cbuf_capacity(self):
     def task(width:int) -> RKCMACTask:
       linear = RKLayout((1,width),(1,width),(width*2,2),dtypes.half)

@@ -22,18 +22,26 @@ from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dens
   _selector_program, _finish_program)
 
 def legalize_contraction_plan(plan:RKContractionPlan) -> tuple[RKCMACTask, ...]:
-  """Legalize the currently proven direct dense contraction into one physical CMAC task."""
+  """Legalize one already-packed dense contraction into one physical CMAC task."""
   plan.lhs.layout.validate_for(RKEngine.CMAC)
   plan.rhs.layout.validate_for(RKEngine.CMAC)
   plan.out.layout.validate_for(RKEngine.CMAC)
   if plan.rhs.layout.kind is not RKLayoutKind.CMAC_WEIGHT:
     raise ValueError("RK contraction RHS is not in CMAC weight layout")
-  if plan.logical_m != 1 or plan.logical_k != 32 or not 4 <= plan.logical_n <= 16:
-    raise ValueError("RK direct contraction is outside the proven M=1, K=32, 4<=N<=16 contract")
   if plan.lhs.layout.logical_shape != (plan.logical_m,plan.logical_k) or \
      plan.rhs.layout.logical_shape != (plan.logical_n,plan.logical_k) or \
      plan.out.layout.logical_shape != (plan.logical_m,plan.logical_n):
     raise ValueError("RK direct contraction layouts do not match logical geometry")
+  align_out, align_in = max(32,(plan.logical_n+31)&-32), max(32,(plan.logical_n+31)&-32,(plan.logical_k+31)&-32)
+  if plan.lhs.layout.physical_shape != (plan.logical_m,align_in) or plan.lhs.layout.strides_bytes != (align_in*2,2):
+    raise ValueError("RK direct contraction LHS is not in the proven aligned row surface")
+  if plan.rhs.layout.physical_shape != (align_out,align_in) or plan.rhs.layout.strides_bytes != (align_in*2,2):
+    raise ValueError("RK direct contraction RHS is not in the proven 16x32 blocked weight surface")
+  compact = plan.logical_m == 1 and plan.logical_n <= 16 and plan.out.layout.physical_shape == (1,plan.logical_n) and \
+    plan.out.layout.strides_bytes == (plan.logical_n*2,2)
+  padded = plan.out.layout.physical_shape == (plan.logical_m,align_out*2) and plan.out.layout.strides_bytes == (align_out*4,2)
+  if not compact and not padded:
+    raise ValueError("RK direct contraction output is not in the proven FP16 CMAC surface")
   return (RKCMACTask(plan.out,plan.lhs,plan.rhs,plan.reduction_axes[0],plan.constants,plan.epilogue),)
 
 def lower_contract_result(sink:UOp) -> RKLowerResult:
