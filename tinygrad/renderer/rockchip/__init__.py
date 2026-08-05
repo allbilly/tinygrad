@@ -1,8 +1,7 @@
 from __future__ import annotations
 import math, os, struct
-from dataclasses import dataclass
 from itertools import permutations, product
-from typing import Callable, cast
+from typing import cast
 from tinygrad.dtype import dtypes, Invalid
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
@@ -16,7 +15,7 @@ from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKE
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan as RKConvPlan,
   RKConvSplit as RKConvSplit, RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan as RKReformatPlan,
   RKMultiSourceReformatPlan, RKLegalizedReformat, RKProgram, RKPlanCost as RKPlanCost,
-  RKRejectKind, RKReject, RKLowerKind, RKLowerResult)
+  RKRejectKind, RKReject as RKReject, RKLowerKind, RKLowerResult)
 from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, RKReloc as RKReloc, RKStage as RKStage, RKImage as RKImage,
   encode_image, decode_image as decode_image,
   patch_image as patch_image, validate_image as validate_image)
@@ -33,6 +32,8 @@ from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, st
   conditional_index_affine as _conditional_index_affine, conv_zero_padding as _conv_zero_padding,
   static_index_selected as _static_index_selected, static_selected_index as _static_selected_index,
   relu_source as _relu_source, contract_bias_epilogue as _contract_bias_epilogue)
+from tinygrad.renderer.rockchip.lower import (RKLowerer, native as _native, not_applicable as _not_applicable,
+  unsupported as _unsupported, has_reduction as _has_reduction, select_lowering)
 
 from tinygrad.renderer.rockchip.limits import (RK_MAX_CONSTANT_BYTES, RK_MAX_AFFINE_VISITS, RK_MAX_STATIC_MASK_VISITS,
   RK_MAX_PROGRAM_STAGES, RK_MAX_AFFINE_WINDOW, RK_MAX_CMAC_SELECTOR_WINDOW, RK_MAX_TILED_CMAC_SELECTOR_WINDOW,
@@ -47,12 +48,6 @@ def _fp16_exact(value:float) -> bool:
   try: rounded = struct.unpack("<e", struct.pack("<e", value))[0]
   except OverflowError: return False
   return math.isnan(value) and math.isnan(rounded) or rounded == value
-
-def _native(plan:RKDPUProgram|RKCMACTask|RKConvTask|RKReduce|RKLegalizedReformat|RKProgram) -> RKLowerResult:
-  return RKLowerResult(RKLowerKind.NATIVE, plan=plan)
-def _not_applicable() -> RKLowerResult: return RKLowerResult(RKLowerKind.NOT_APPLICABLE)
-def _unsupported(kind:RKRejectKind, detail:str, node_op:Ops|None=None) -> RKLowerResult:
-  return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(kind, detail, node_op))
 
 from tinygrad.renderer.rockchip.expr import (_ALUExpr, _MaskExpr, _LUTExpr, _Expr, _Value, _parse_alu, _unwrap_same_cast,
   _canonical_lerp, _canonical_tensor_pow, _numerical_contract)
@@ -2796,16 +2791,6 @@ def lower_affine_max_result(sink:UOp) -> RKLowerResult:
       f"affine PPU MAX needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes", reduce.op)
   return _native(program)
 
-@dataclass(frozen=True)
-class RKLowerer:
-  name: str
-  applies: Callable[[tuple[UOp, ...]], bool]
-  lower: Callable[[UOp], RKLowerResult]
-
-def _has_reduction(nodes:tuple[UOp, ...], op:Ops|None=None) -> bool:
-  reductions = tuple(u for u in nodes if u.op is Ops.REDUCE)
-  return bool(reductions) and (op is None or all(u.arg[0] is op for u in reductions))
-
 _LOWERERS = (
   RKLowerer("dpu", lambda nodes:not _has_reduction(nodes), lower_dpu_result),
   RKLowerer("multi_source_reformat", lambda nodes:not _has_reduction(nodes), lower_multi_source_reformat_result),
@@ -2839,25 +2824,8 @@ _LOWERERS = (
   RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),
 )
 
-_REJECT_PRIORITY = {
-  RKRejectKind.NUMERICAL_CONTRACT:90, RKRejectKind.LUT_DOMAIN_UNPROVEN:85, RKRejectKind.PLAN_STAGE_LIMIT:80,
-  RKRejectKind.UNSUPPORTED_INPUT_DTYPE:70, RKRejectKind.UNSUPPORTED_OUTPUT_DTYPE:70,
-  RKRejectKind.UNALIGNED_ROW:60, RKRejectKind.REQUIRES_REFORMAT:60, RKRejectKind.UNSUPPORTED_DYNAMIC_PACK:60,
-  RKRejectKind.UNSUPPORTED_LAYOUT:50, RKRejectKind.UNSUPPORTED_BROADCAST:50,
-  RKRejectKind.UNSUPPORTED_REDUCTION:40, RKRejectKind.UNSUPPORTED_CONTRACTION:40, RKRejectKind.UNSUPPORTED_ALU:30,
-}
-
 def lower_native(sink:UOp) -> RKLowerResult:
-  nodes, rejects = tuple(sink.toposort()), []
-  for lowerer in _LOWERERS:
-    result = lowerer.lower(sink) if lowerer.applies(nodes) else _not_applicable()
-    if result.kind is RKLowerKind.NATIVE: return result
-    if result.kind is RKLowerKind.UNSUPPORTED:
-      assert result.reject is not None
-      rejects.append(result.reject)
-  if not rejects: rejects.append(RKReject(RKRejectKind.UNSUPPORTED_ALU, "no Rockchip lowerer applies", sink.op))
-  reject = max(enumerate(rejects), key=lambda item:(_REJECT_PRIORITY[item[1].kind], item[0]))[1]
-  return RKLowerResult(RKLowerKind.UNSUPPORTED, reject=RKReject(reject.kind, reject.detail, reject.node_op, rk_fingerprint(sink)))
+  return select_lowering(sink, _LOWERERS)
 
 from tinygrad.renderer.rockchip.emit import (emit_dpu as emit_dpu, emit_cmac_task as emit_cmac_task, emit_spatial_conv as emit_spatial_conv,
   emit_program as emit_program, emit_reduce as emit_reduce, emit_pool as emit_pool, emit_reformat as emit_reformat)

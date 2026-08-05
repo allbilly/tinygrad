@@ -2277,3 +2277,19 @@ output. RK3588's direct FP32 DPU input path is already proven to time out, so
 the first-kernel improvement cannot honestly complete the operation. The active
 compiler is restored; the exact experiment is commit `90adfa2cb` and patch
 `0263-WIP-probe-fp32-weighted-interpolation.patch`.
+
+## Ordered lowering orchestration
+
+The generic native/not-applicable/unsupported constructors, reduction-family
+applicability predicate, rejection-priority policy, and ordered pass-selection
+loop now live in `renderer/rockchip/lower.py`. Concrete lowerers and their
+explicit registry remain in the public compiler module, so ordering is still
+visible while the common typed orchestration no longer depends on any engine
+implementation.
+
+The extraction preserves rejection fingerprints, physical schedules, cost
+ceilings, and RKImage bytes. The full compiler/image/telemetry suite, full-tree
+Mypy and Ruff, and representative serialized reformat, reduction, K65
+contraction, and direct-CONV hardware tests pass. Coverage remains the
+authoritative `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 NATIVE_REJECT / 13
+SKIP_UPSTREAM` because no lowering rule changed.

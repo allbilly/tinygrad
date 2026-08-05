@@ -4358,3 +4358,18 @@ FP32-input conversion path that timed out in direct hardware probes. The WIP is
 preserved in `0263-WIP-probe-fp32-weighted-interpolation.patch` (SHA-256
 `5da100c32a1e840c694a75911803e5bbff78c2054105c7d4021781019f4baf5a`).
 The active code is restored, with no coverage, ABI, limit, or tolerance change.
+
+## Ordered-lowering module boundary
+
+Typed result construction, lowerer applicability, rejection priority, and the
+ordered native-selection loop now live in `renderer/rockchip/lower.py`. The
+public lowering module retains only the concrete pass registry and delegates
+selection to this shared 45-line implementation. Pass order, rejection
+fingerprints, target plans, cost limits, and emitted images are unchanged; the
+main module falls from 2,896 to 2,864 physical lines.
+
+The complete compiler/image/telemetry suite passes 171 tests plus 59 subtests.
+Mypy passes all 233 tinygrad source files and full-tree Ruff is clean. Four
+serialized RK3588 regressions cover selector reformat, ordered DPU+CMAC sum,
+K65-to-K96 contraction, and direct CONV. This is a mechanical milestone, so the
+authoritative census remains `204/40/168/13`.
