@@ -5410,3 +5410,34 @@ indices remain uncharacterized, hardware positions are kernel-local, and MAX
 or MIN deliberately choose the positive- or negative-zero occurrence instead
 of preserving first-occurrence signed-zero semantics.  Compiler lowering stays
 disabled until those legality conditions or repairs are explicit.
+
+## Post-padding contraction layout audit
+
+The committed unaligned-RHS milestone makes the ordinary dynamic
+`1x64 @ 64x99` TestOps matmul exact through one broad CMAC compute task and a
+bounded native row reformat.  It does not make the batched K=65 dot family a
+direct hardware surface.  Fresh fallback-disabled runs at `b3bf90058` retain
+these exact typed rejects:
+
+| method | first remaining blocker |
+| --- | --- |
+| `test_broadcastdot` | tiled-CMAC lhs selector exceeds the plan contract |
+| `test_dot` | batched surfaces are `out=36000,lhs=23400,rhs=52000,K=65` |
+| `test_dot_1d` | lhs selector lower bound is 755 tasks |
+| `test_multidot` | batched surfaces are `out=20250,lhs=29250,rhs=29250,K=65` |
+
+This confirms that broad GEMM arithmetic is not the blocker.  The remaining
+work is physical input layout and batch traversal.  Re-auditing
+`allbilly/rk3588/examples/gemm.py`, the Rockchip convolution examples,
+`allbilly/npu`, and Mesa Rocket found working CNA inputs in prepacked GEMM,
+NHWC, or NC1HWC2-style surfaces; none proves that ordinary unpadded row-major
+K=65 or planar NCHW can be consumed directly by one descriptor.
+
+BS and BN multiplication, already used by WHERE and fused arithmetic, does not
+change this address contract.  Static address algebra remains compiler work,
+DMA relocation remains runtime work, and regular traversal belongs in engine
+descriptors.  Dynamic layout conversion is accepted as efficient native only
+when a compact hardware surface operation is proven.  Selector-CMAC remains a
+cost-labelled correctness fallback, while dynamic host packing is explicitly
+`MIXED` and cannot contribute to strict native coverage.  No task ceiling,
+fallback rule, tolerance, or compiler legality changes in this audit.
