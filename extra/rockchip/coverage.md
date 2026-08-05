@@ -5466,3 +5466,24 @@ when a compact hardware surface operation is proven.  Selector-CMAC remains a
 cost-labelled correctness fallback, while dynamic host packing is explicitly
 `MIXED` and cannot contribute to strict native coverage.  No task ceiling,
 fallback rule, tolerance, or compiler legality changes in this audit.
+
+## BS/BN/EW channel-broadcast characterization
+
+The DPU can reuse one complete eight-lane FP16 channel atom across spatial
+positions in each external arithmetic input.  The standalone hardware probe
+feeds distinct poison atoms after the first operand atom and observes bit-exact
+reuse through BRDMA/BS, NRDMA/BN, and ERDMA/EW at one, four, and sixteen spatial
+positions.  ERDMA is configured in the TRM's per-channel mode with
+`EW_SURF_STRIDE=1`.
+
+This is an eight-channel-atom contract, not an arbitrary channel-vector
+contract.  Probes at 16, 64, and 256 logical channels disagree beginning at
+lane eight for all three external inputs.  Wider surfaces need separate atom
+tasks and engine-legal main/output strides.  Consequently this result does not
+directly optimize the tightly packed `45x65 + 65` or `45x65 + 45x1` TestOps
+families: their unaligned 130-byte row traversal remains the blocker.
+
+No compiler path is enabled from hardware evidence alone.  The probe records a
+candidate primitive for aligned physical layouts and prevents the broader,
+incorrect conclusion that BS/BN fusion solves arbitrary tinygrad broadcasting.
+The authoritative hybrid census and every resource ceiling remain unchanged.

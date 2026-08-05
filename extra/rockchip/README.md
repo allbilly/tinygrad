@@ -2858,3 +2858,28 @@ task limit, or tolerance changes are claimed by this negative milestone.
 The result reinforces the physical-layout rule: logical identity and logical
 periodicity do not by themselves prove that an ARG surface, selector surface,
 or sub-atom DPU destination are interchangeable.
+
+## BS/BN/EW channel-broadcast hardware boundary
+
+`extra/rockchip/probe_dpu_channel_broadcast.py` isolates the four-input DPU
+pipeline on legal padded FP16 surfaces.  Main MRDMA supplies a dense spatial
+surface while BRDMA feeds BS multiplication, NRDMA feeds BN multiplication,
+and ERDMA feeds EW multiplication.  Each external allocation contains one live
+channel atom followed by distinct poison atoms, so reuse cannot be mistaken for
+ordinary per-pixel reads.
+
+RK3588 repeats one eight-lane channel atom through all three inputs exactly.
+The locked matrix covers one, four, and sixteen spatial positions.  At 16, 64,
+and 256 logical channels, only lanes zero through seven have the broadcast
+contract; wider channel surfaces therefore require one task per eight-channel
+atom and legal main/output surface strides.  ERDMA uses the documented
+per-channel mode with `EW_SURF_STRIDE=1`; BS and BN exhibit the same measured
+channel-atom behavior through BRDMA and NRDMA.
+
+This proves useful arithmetic fusion, not an arbitrary row-major broadcast.
+The official `45x65` broadcast inputs have a tightly packed 130-byte row stride,
+whereas the proven DPU contract traverses complete aligned channel atoms.  No
+production lowerer, method count, task limit, or tolerance changes in this
+milestone.  A future lowering must first prove a direct or bounded physical
+reformat; it must not turn this register result into another unbounded selector
+packing scheme.
