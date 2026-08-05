@@ -60,12 +60,13 @@ average-pool probe in prolonged device wait. Both experiments are fenced, the
 proven selector/aligned-period and numerical-contract guards are restored, and
 `test_var_one_in_axis` passes again on RK3588.
 
-An additional explicit `ROCKCHIP_FALLBACK=COST` mode now lets semantic census
-runs choose the generic compiled HOST lane for an otherwise legal RKImage over
-the unchanged 64-task or 1-MiB correctness-fallback boundary. This does not
-change strict or ordinary native-first coverage; it records
-`hybrid_cost_policy` and is intended to avoid spending hundreds of submissions
-solely to preserve an all-NPU label during semantic testing.
+A blanket `ROCKCHIP_FALLBACK=COST` experiment is also rejected. Although a
+247-task lerp remained coherent through HOST, the partial census failed
+`test_bias_conv_transpose2d` and `test_biased_conv2d`: generic HALF host
+accumulation missed Torch in 19--20% of outputs after their legal native images
+were diverted. The run was stopped at 66 pass / 4 skip / 2 fail. The active
+renderer rejects this mode; cost remains quality telemetry, while HOST remains
+legal only after a typed native rejection.
 
 All authoritative runs use `ROCKCHIP_FALLBACK=0`. The optional `RKPY` research
 envelope invokes tinygrad's Python UOps emulator over mapped GEM buffers and is

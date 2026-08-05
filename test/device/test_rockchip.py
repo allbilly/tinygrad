@@ -844,30 +844,8 @@ class TestRockchip(unittest.TestCase):
       if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY", None)
       else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
 
-  def test_cost_fallback_routes_pathological_native_plan_through_host(self):
-    old_fallback, old_telemetry = os.environ.get("ROCKCHIP_FALLBACK"), os.environ.get("ROCKCHIP_TELEMETRY")
-    os.environ["ROCKCHIP_FALLBACK"], os.environ["ROCKCHIP_TELEMETRY"] = "COST", "memory"
-    try:
-      clear()
-      count = 1575
-      x = Tensor(np.zeros(count,dtype=np.float16),device="ROCKCHIP").realize()
-      y = Tensor(np.ones(count,dtype=np.float16),device="ROCKCHIP").realize()
-      z = Tensor(np.full(count,.5,dtype=np.float16),device="ROCKCHIP").realize()
-      native_before = (x+.25).realize()
-      fallback = native_before.lerp(y,z).realize()
-      actual = (fallback*2).realize().numpy()
-      np.testing.assert_equal(actual,np.full(count,1.25,dtype=np.float16))
-      events = drain()
-      lanes = [event["lane"] for event in events if event["kind"] == "kernel"]
-      self.assertEqual(lanes[-3:],["RK_DPU","HOST","RK_DPU"])
-      policies = [event for event in events if event["kind"] == "reject" and event.get("reject_kind") == "hybrid_cost_policy"]
-      self.assertEqual(len(policies),1)
-      self.assertIn("247 tasks",policies[0]["detail"])
-    finally:
-      if old_fallback is None: os.environ.pop("ROCKCHIP_FALLBACK", None)
-      else: os.environ["ROCKCHIP_FALLBACK"] = old_fallback
-      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY", None)
-      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+  # Rejected WIP: cost-based host diversion was coherent for a 247-task lerp, but changed convolution accumulation
+  # semantics. Legal RKImages must remain native; generic HOST execution begins only after a typed native rejection.
 
   def test_dpu_binary_and_multistage(self):
     rng = np.random.default_rng(1)

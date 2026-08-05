@@ -39,7 +39,7 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
     try: return self.dev._gpu_alloc(size)
     except OSError:
-      if os.getenv("ROCKCHIP_FALLBACK", "0").upper() not in ("CLANG", "COST", "HOST"): raise
+      if os.getenv("ROCKCHIP_FALLBACK", "0").upper() not in ("CLANG", "HOST"): raise
       mapping = mmap.mmap(-1, max(4096, (size+4095)&-4096), flags=mmap.MAP_SHARED, prot=mmap.PROT_READ|mmap.PROT_WRITE)
       return HCQBuffer(mv_address(mapping), size, meta=RKHostMemory(mapping))
   def _copyin(self, dest:HCQBuffer, src:memoryview):

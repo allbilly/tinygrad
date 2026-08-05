@@ -2780,14 +2780,13 @@ ALU experiment fixed some reductions but changed ordinary elementwise rounding
 and broke softmin verification, so the production host lane preserves the
 lowered UOp dtypes exactly.
 
-`ROCKCHIP_FALLBACK=COST` is an explicitly cost-aware hybrid mode. It behaves
-like `CLANG` for typed native rejects, and also routes a legal native candidate
-to the same compiled `HOST` envelope when the RKImage crosses the existing
-correctness-fallback boundary of 64 tasks or 1 MiB of constants. It records a
-`hybrid_cost_policy` event, so this choice cannot inflate native coverage.
-Strict mode and ordinary native-first `CLANG` mode are unchanged. A locked
-`RK_DPU -> HOST -> RK_DPU` regression verifies mapped-buffer coherence for a
-247-task lerp candidate selected by this policy.
+A blanket `ROCKCHIP_FALLBACK=COST` experiment is rejected. It was coherent for
+a 247-task lerp, but a partial full census diverted legal convolution and
+transpose-convolution plans to generic HALF host arithmetic. Those two methods
+then missed Torch in 19--20% of outputs because accumulation semantics changed.
+The run was stopped at 66 passes, four skips, and two failures. The active
+renderer rejects `COST`: task/constant cost classifies native implementation
+quality, but only a typed legality rejection authorizes generic HOST execution.
 
 The hybrid harness uses FP32 only for implicit-default-float methods where the
 ordinary tinygrad CPU backend itself misses the Torch reference under the
