@@ -67,7 +67,7 @@ def fp32_image(compact:bool=False) -> RKImage:
 def main() -> None:
   dev = RockchipDevice("ROCKCHIP")
   rng = np.random.default_rng(2608)
-  for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64),(8,16,32)):
+  for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64),(8,16,32),(1,128,128)):
     align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
     lhs, rhs = rng.uniform(-.25,.25,(m,k)).astype(np.float16), rng.uniform(-.25,.25,(k,n)).astype(np.float16)
     packed_lhs = np.zeros((m,align_in),dtype=np.float16)

@@ -2432,6 +2432,14 @@ rounding, while N=99 keeps the cheaper existing candidate. Official simple,
 batched, and batched-vector matmul tests remain green with no coverage or limit
 change.
 
+The same physical ABI is now proven at `M=1,N=128,K=128`: one broad CMAC task
+is bit-exact. Enabling the corresponding ordinary row-major `test_matvec`
+graph is still not clean, because current selector packing expands the dynamic
+rhs transform to 1,074 tasks. The logical K/source fences and 400-task ceiling
+remain active. This separates the next requirement precisely: implement a
+direct native weight-layout transform rather than split the GEMM or admit a
+larger selector schedule.
+
 ## One-row FP32 CMAC writeback is already compact
 
 The direct CMAC width probe now places a canary after a 32-value FP32 result.

@@ -691,6 +691,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
+  # WIP reference: a prepacked M=1,N=128,K=128 CMAC task is bit-exact, but lowering ordinary row-major operands through
+  # selector-CMAC needs 1,074 tasks. Keep the logical packing fence until a direct native weight-layout transform exists.
   if not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
@@ -742,7 +744,10 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
                                      for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
-  selector_floor = (0 if direct_lhs else (lhs_values+31)//32) + (rhs_values+31)//32 + \
+  # One-row compact CMAC writes are proven through 128 outputs. Keep conditional/padded contractions on the older 32-output
+  # schedule because changing their selector grouping can change the final FP16 accumulation contract.
+  rhs_selector_outputs = 64 if align_out <= 64 and lhs_parsed[1] is None and rhs_parsed[1] is None else 32
+  selector_floor = (0 if direct_lhs else (lhs_values+31)//32) + (rhs_values+rhs_selector_outputs-1)//rhs_selector_outputs + \
     (1 if compact_output else (output_count+31)//32) + \
     (m+(4096//align_in)-1)//(4096//align_in)
   if selector_floor > RK_MAX_PROGRAM_STAGES:
@@ -786,9 +791,6 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   scratch += (RKScratch(_cmac_tiled_output_bytes(len(b_selector))),)
   # Rockchip GEM allocations are page-rounded. Zero-weight selector lanes may read that physical tail without changing semantics.
   rhs_capacity = ((rhs_count*2+4095)&-4096)//2
-  # One-row compact CMAC writes are proven through 128 outputs. Keep conditional/padded contractions on the older 32-output
-  # schedule because changing their selector grouping can change the final FP16 accumulation contract.
-  rhs_selector_outputs = 64 if align_out <= 64 and lhs_parsed[1] is None and rhs_parsed[1] is None else 32
   packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch,
                                rhs_capacity, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, rhs_selector_outputs)
   if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)

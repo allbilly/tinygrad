@@ -4587,6 +4587,23 @@ regression and the unchanged `test_matmul_simple`, `test_matmul_batched`, and
 `test_matmul_batched_vector` methods all pass at official tolerances. This is a
 native-quality improvement, not a new method pass, and no global limit changes.
 
+## K=128 broad CMAC is one task; dynamic packing is not
+
+The broad physical GEMM probe now includes `M=1,N=128,K=128`. With the lhs in
+the aligned CNA activation surface and rhs in the blocked CMAC weight surface,
+one `RKCMACTask` is bit-exact against FP32 accumulation followed by one FP16
+cast. This is distinct from the rejected Kx1 convolution experiment: the latter
+timed out at kernel height 32, while broad CMAC handles K=128 directly.
+
+The production `test_matvec` layout remains rejected. Temporarily widening its
+logical K and source-surface fences showed that selector-CMAC needs 1,074 tasks,
+48,718 command words, 1,007,440 constant bytes, and 36,960 scratch bytes merely
+to transpose/pack the dynamic 128x128 rhs around the one compute task. The
+400-task and 2 MiB ceilings were not raised, and the active K<=96 packing fence
+was restored. A direct native row-major-to-CMAC-weight transform is required;
+the compute task itself is no longer in doubt. The authoritative census remains
+`204/40/168/13`.
+
 ## Unpadded large-stride PPU regression fix
 
 The complete uncached census at `3efbb9820` reported 203 native, 40 frontend,
