@@ -5337,3 +5337,21 @@ tests pass with seven subtests. This adds one expected strict-native method
 without CPU packing, host fallback, a task-limit increase, or a tolerance
 change; a complete uncached strict census is still required before replacing
 the authoritative method totals.
+
+## Rejected cumulative-MIN reuse of affine MAX
+
+The existing affine-MAX plan can mechanically lower tinygrad's
+`MIN(x) == -MAX(-x)` graph: negate the FP16 source, retain the static prefix
+mask, execute the proven MAX reduction, and negate the public result. Random
+finite ten-element cumulative-MIN values are bit-exact on RK3588, and the
+candidate costs ten or fewer physical tasks.
+
+The path is not active because DPU MAX normalizes the sign of zero. For the
+input `[+0, -0, 3, -2, ...]`, ordinary tinygrad produces positive-zero prefix
+results while the candidate produces negative zero. This violates the backend's
+signed-zero contract even though `assert_allclose` considers the values equal.
+The full typed implementation and compiler regression are preserved at
+`/home/orangepi/tinygrad/rockchip-upstream-patches/wip-cummin-negated-max-signed-zero.patch`
+(SHA-256 `231ec8b6d32625288f707411b419b6926d28ac6846e7fff219ae26dc2a2cbab7`).
+The active compiler continues to reject cumulative MIN; no pass count,
+tolerance, resource ceiling, or fallback classification changes.
