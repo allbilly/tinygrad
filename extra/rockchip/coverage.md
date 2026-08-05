@@ -60,6 +60,13 @@ average-pool probe in prolonged device wait. Both experiments are fenced, the
 proven selector/aligned-period and numerical-contract guards are restored, and
 `test_var_one_in_axis` passes again on RK3588.
 
+An additional explicit `ROCKCHIP_FALLBACK=COST` mode now lets semantic census
+runs choose the generic compiled HOST lane for an otherwise legal RKImage over
+the unchanged 64-task or 1-MiB correctness-fallback boundary. This does not
+change strict or ordinary native-first coverage; it records
+`hybrid_cost_policy` and is intended to avoid spending hundreds of submissions
+solely to preserve an all-NPU label during semantic testing.
+
 All authoritative runs use `ROCKCHIP_FALLBACK=0`. The optional `RKPY` research
 envelope invokes tinygrad's Python UOps emulator over mapped GEM buffers and is
 therefore CPU semantic execution; it is excluded from pass counts. Likewise,

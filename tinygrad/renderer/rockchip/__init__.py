@@ -464,6 +464,8 @@ class RockchipRenderer(Renderer):
   def supported_dtypes(self): return {dtypes.half, dtypes.int, dtypes.float}
   def native_program(self, ast:UOp) -> UOp|None:
     fallback = os.getenv("ROCKCHIP_FALLBACK", "0").upper()
+    if fallback not in ("", "0", "PYTHON", "CLANG", "COST", "HOST"):
+      raise RuntimeError(f"invalid ROCKCHIP_FALLBACK={fallback!r}")
     if fallback == "HOST":
       from tinygrad.runtime.rockchip_fallback import build_rkhc_program
       return build_rkhc_program(ast, self.target)
@@ -480,10 +482,9 @@ class RockchipRenderer(Renderer):
       if fallback == "PYTHON":
         from tinygrad.runtime.rockchip_fallback import build_rkpy_program
         return build_rkpy_program(ast, self.target)
-      if fallback == "CLANG":
+      if fallback in ("CLANG", "COST"):
         from tinygrad.runtime.rockchip_fallback import build_rkhc_program
         return build_rkhc_program(ast, self.target)
-      if fallback not in ("", "0"): raise RuntimeError(f"invalid ROCKCHIP_FALLBACK={fallback!r}")
       raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)
     elif isinstance(result.plan, RKCMACTask): image = emit_cmac_task(result.plan)
@@ -493,6 +494,15 @@ class RockchipRenderer(Renderer):
     elif isinstance(result.plan, RKLegalizedReformat): image = emit_reformat(result.plan)
     elif isinstance(result.plan, RKProgram): image = emit_program(result.plan)
     else: raise RuntimeError("invalid Rockchip lowering result")
+    if fallback == "COST" and (len(image.stages) > 64 or len(image.constants) > 1024*1024):
+      fingerprint = rk_fingerprint(ast)
+      record_telemetry("reject", lane="REJECT", program=info.name, reject_kind="hybrid_cost_policy",
+        detail=f"native candidate has {len(image.stages)} tasks and {len(image.constants)} constant bytes",
+        node_op=None, fingerprint=fingerprint, fingerprint_digest=dict(fingerprint)["graph"],
+        signature=[{"slot": u.arg.slot, "dtype": u.dtype.name,
+                    "shape": [x if isinstance(x, int) else str(x) for x in u.shape]} for u in params])
+      from tinygrad.runtime.rockchip_fallback import build_rkhc_program
+      return build_rkhc_program(ast, self.target)
     linear = UOp(Ops.LINEAR, src=tuple(u for u in params if u.addrspace is not AddrSpace.ALU))
     return UOp(Ops.PROGRAM, src=(ast, linear, UOp(Ops.SOURCE, arg=""), UOp(Ops.BINARY, arg=encode_image(image))),
                arg=info)

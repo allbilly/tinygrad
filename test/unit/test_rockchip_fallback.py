@@ -54,11 +54,29 @@ class TestRockchipFallback(unittest.TestCase):
       def _gpu_alloc(self, size): raise OSError("no contiguous DMA surface")
       def _gpu_free(self, buf): raise AssertionError("host memory must not use DRM free")
     allocator = RockchipAllocator(Device())  # type: ignore[arg-type]
-    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"CLANG"}): buf = allocator._alloc(12345, BufferSpec())
-    self.assertIsInstance(buf.meta, RKHostMemory)
-    allocator._as_buffer(buf)[:4] = b"RKHC"
-    self.assertEqual(bytes(allocator._as_buffer(buf)[:4]), b"RKHC")
-    allocator._free(buf, BufferSpec())
+    for mode in ("CLANG","COST"):
+      with self.subTest(mode=mode), patch.dict(os.environ, {"ROCKCHIP_FALLBACK":mode}):
+        buf = allocator._alloc(12345, BufferSpec())
+        self.assertIsInstance(buf.meta, RKHostMemory)
+        allocator._as_buffer(buf)[:4] = b"RKHC"
+        self.assertEqual(bytes(allocator._as_buffer(buf)[:4]), b"RKHC")
+        allocator._free(buf, BufferSpec())
+
+  def test_cost_mode_routes_pathological_native_plan_to_compiled_host(self):
+    x, y, z = (Tensor.empty(1575,dtype=dtypes.half) for _ in range(3))
+    expression = sink(x.lerp(y,z))
+    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"COST"}):
+      program = RockchipRenderer(Target("ROCKCHIP")).native_program(expression)
+    assert program is not None
+    self.assertEqual(program.src[3].arg[:4],RKHC_MAGIC)
+    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"CLANG"}):
+      native = RockchipRenderer(Target("ROCKCHIP")).native_program(expression)
+    assert native is not None
+    self.assertEqual(native.src[3].arg[:4],b"RKIM")
+
+  def test_invalid_fallback_mode_rejects_even_when_graph_is_native(self):
+    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"TYPO"}), self.assertRaisesRegex(RuntimeError,"invalid ROCKCHIP_FALLBACK"):
+      RockchipRenderer(Target("ROCKCHIP")).native_program(sink(Tensor.empty(8,dtype=dtypes.half)+1))
 
   def test_strict_mode_never_falls_back_to_host_allocation(self):
     class Device:
