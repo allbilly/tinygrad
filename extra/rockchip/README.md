@@ -2346,3 +2346,17 @@ The public compiler module falls from 2,039 to 1,291 physical lines. Frozen
 images, the complete compiler/image/telemetry suite, full-tree Mypy/Ruff, and
 representative RK3588 SUM, product, prefix, and variance paths all remain
 green. No capability or limit changes, so coverage stays `204/40/168/13`.
+
+## Contraction lowering module
+
+The direct logical contraction, tiled CMAC, depthwise/grouped convolution,
+NHWC convolution, and general NCHW spatial-convolution lowerers now live in
+`renderer/rockchip/contract.py`. This places recognition, physical packing,
+CBUF tiling, epilogue composition, and `RKCMACTask`/`RKConvTask` construction
+behind one engine-family boundary while leaving emission independent.
+
+The public renderer/compiler entry is now 487 physical lines, down from 1,291
+and below the 500-line organization goal. No handwritten code moved into
+`autogen/`. Frozen images, the full compiler/image/telemetry suite, Mypy, Ruff,
+and representative CMAC/CONV hardware paths remain green. Coverage is unchanged
+at the authoritative `204/40/168/13`.

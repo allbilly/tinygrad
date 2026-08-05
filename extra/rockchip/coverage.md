@@ -4435,3 +4435,19 @@ serialized RK3588 methods cover row SUM, nested SUM, affine product, masked
 prefix SUM, and pointwise variance; all pass with seven subtests in 21.60
 seconds. This move changes no task schedule, cost, tolerance, or coverage
 classification; the authoritative census remains `204/40/168/13`.
+
+## Mechanical contraction-family extraction
+
+Logical contraction legalization, direct CMAC, depthwise/grouped/NHWC/NCHW
+spatial convolution, and general tiled contraction now live together in the
+845-line `renderer/rockchip/contract.py`. The module directly owns the existing
+`RKContractionPlan → RKCMACTask` boundary and consumes the separate CBUF
+convolution planner. The public renderer/compiler entry falls from 1,291 to 487
+physical lines, below the 500-line organization target without moving code to
+`autogen/` or hiding handwritten logic.
+
+All 171 compiler/image/telemetry tests plus 59 subtests pass, including frozen
+images. Full Mypy remains clean over 236 source files and full-tree Ruff passes.
+Representative direct NCHW, channel-16, NHWC split-CBUF, K65-to-K96 CMAC, and
+tiled-M hardware paths remain green. No pass order, image, cost, tolerance, or
+coverage classification changes; `204/40/168/13` remains authoritative.
