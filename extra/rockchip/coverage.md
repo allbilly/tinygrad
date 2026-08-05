@@ -4236,3 +4236,19 @@ reference. This rejects the tempting 16-CNA-task plus FP16-ERDMA design before
 it enters lowering. The remaining valid directions are direct physical input
 layout legalization for one unsplit convolution or a proven per-spatial FP32
 accumulator continuation.
+
+## Rejected unaligned int32/FP32 atom copies
+
+The DPU raw-word bypass can copy aligned int32 and FP32 atoms, but a hardware
+probe shows it cannot address individual words within an atom. A 25-stage
+ordered-overwrite attempt at a 5x5 int32 transpose sets each task's source and
+destination relocation to a four-byte offset and asks for one word. The engine
+instead masks both offsets down to 16-byte boundaries and writes the complete
+four-word atom. The observed output is exactly the simulation of those aligned
+down accesses and not the requested transpose. Device recovery is clean.
+
+This closes a declaration-only solution for `test_where_permute`,
+`test_slice_negative_strides`, and `test_stack`. The current atom-alignment
+rejects remain correct. Native support needs a hardware word-shuffle path or a
+layout algorithm whose intermediate surfaces remain atom-aligned; the runtime
+must not repair the words on the CPU.

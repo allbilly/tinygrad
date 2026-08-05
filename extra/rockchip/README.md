@@ -2149,3 +2149,20 @@ misses 3,761 and 2,269 respectively. Therefore, the compiler must not use the
 proven FP16 ERDMA continuation for this TestOps contraction. It needs a flying
 FP32 per-spatial continuation, a single unsplit CNA accumulation over a legal
 input layout, or another schedule with equivalent accumulation semantics.
+
+## Rejected unaligned 32-bit DPU copy
+
+`extra/rockchip/probe_unaligned_word_copy.py` tests the apparent low-cost path
+for int32 `where_permute` and the remaining FP32 word movements: emit ordered,
+overlapping four-lane DPU copies whose relocations begin at arbitrary four-byte
+offsets. RK3588 ignores the low two word-index bits. Both source and destination
+addresses behave as though rounded down to a 16-byte atom, so the final 5x5
+transpose contains aligned source groups rather than the desired individual
+words. The probe asserts this exact aligned-down result, and the known-good FP16
+DPU fill passes immediately afterward.
+
+Consequently, adding int32 to the compiler's FP32 atom-copy allowlist would
+only move `test_where_permute` from a dtype reject to incorrect execution.
+Unaligned FP32 negative slices and multi-source copies have the same physical
+boundary. They require a real word shuffle/packing engine or an aligned staged
+algorithm, not weaker compiler validation or CPU movement.
