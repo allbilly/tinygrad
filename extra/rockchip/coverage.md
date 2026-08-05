@@ -4313,3 +4313,17 @@ image goldens. Mypy and Ruff pass, and representative RK3588 selector-reformat,
 sum, K65 contraction, and CONV tests pass with eleven subtests in 42.57 seconds.
 There is no native-coverage or schedule claim; the authoritative census remains
 `204/40/168/13`.
+
+## Mechanical shared-analysis extraction
+
+The new `renderer/rockchip/analysis.py` owns eleven pure compile-time helpers
+previously embedded in the main lowering module: cast normalization, scalar and
+linear-form evaluation, conditional-index recovery, static selection, exact CNA
+padding proofs, ReLU recognition, and contraction-bias matching. Reformat,
+reduction, CMAC, and CONV lowerers import these helpers without changing their
+selection order, target plans, task programs, or emitted command images.
+
+All 171 compiler/image/telemetry tests plus 59 subtests pass. Four representative
+RK3588 tests cover every consumer family and pass with eleven subtests in 42.50
+seconds. The authoritative census remains `204/40/168/13` because this is a
+mechanical module-boundary milestone, not a coverage claim.

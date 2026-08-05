@@ -2231,3 +2231,17 @@ Mypy passes all thirteen Rockchip renderer modules and Ruff is clean. Four
 serialized hardware regressions cover selector reformat, ordered DPU+CMAC sum,
 K65-to-K96 contraction, and direct CONV; all pass with eleven subtests. This
 milestone changes no coverage result, execution lane, limit, or tolerance.
+
+## Shared lowering-analysis module boundary
+
+The compile-time UOp helpers shared by reformat, reduction, contraction, and
+convolution lowering now live in `renderer/rockchip/analysis.py`. The module
+contains cast stripping, scalar coordinate evaluation, static linear-form and
+conditional-index analysis, convolution-padding proofs, and epilogue matching.
+It reads no tensor data and produces no target task; lowerers retain the same
+typed results and physical schedules.
+
+The compiler/image/telemetry suite again passes 171 tests plus 59 subtests.
+Representative serialized RK3588 reformat, reduction, K65 contraction, and
+direct-convolution tests pass with eleven subtests. This mechanical prerequisite
+for splitting whole lowerer families changes no coverage or numerical contract.
