@@ -2423,3 +2423,11 @@ unaligned column offsets are atom-aligned and tested notch values do not change
 the observed eight-lane stride. The backend therefore keeps selector-CMAC as a
 bounded correctness fallback and does not raise resource limits or copy the
 references' CPU packing.
+
+Within that fallback, dense unmasked contractions up to 64 physical output
+channels use the already-proven 64-output compact selector. This reduces the
+64x64 plan from 305 to 217 tasks and `1x64 @ 64x40` from 83 to 43. Conditional
+and padded contractions stay at 32 outputs to preserve their characterized
+rounding, while N=99 keeps the cheaper existing candidate. Official simple,
+batched, and batched-vector matmul tests remain green with no coverage or limit
+change.

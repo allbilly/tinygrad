@@ -786,8 +786,11 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   scratch += (RKScratch(_cmac_tiled_output_bytes(len(b_selector))),)
   # Rockchip GEM allocations are page-rounded. Zero-weight selector lanes may read that physical tail without changing semantics.
   rhs_capacity = ((rhs_count*2+4095)&-4096)//2
+  # One-row compact CMAC writes are proven through 128 outputs. Keep conditional/padded contractions on the older 32-output
+  # schedule because changing their selector grouping can change the final FP16 accumulation contract.
+  rhs_selector_outputs = 64 if align_out <= 64 and lhs_parsed[1] is None and rhs_parsed[1] is None else 32
   packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch,
-                               rhs_capacity, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, 32)
+                               rhs_capacity, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, rhs_selector_outputs)
   if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
   steps.extend(packed_b.steps)
   scratch = packed_b.scratch

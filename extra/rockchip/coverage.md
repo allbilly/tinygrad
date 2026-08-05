@@ -4570,3 +4570,19 @@ physical surface. Selector-CMAC remains the honest fallback until a bounded
 NPU-native transform is proven. No CPU packing, task-limit increase, or new
 native pass is claimed, so the authoritative census remains `204/40/168/13`
 and the focused padded-pool expectation remains `205/40/167/13`.
+
+## Dense RHS packing uses proven 64-output selector tiles
+
+The one-row compact CMAC contract also improves the remaining native packing
+without pretending it is the final layout engine. Unmasked dense contractions
+whose physical output group is at most 64 channels now pack RHS values in
+64-output selector tiles. Conditional and padded contractions retain the
+previous 32-output grouping because an earlier unrestricted change altered
+their FP16 accumulation contract.
+
+The dense 64x64 plan falls from 305 to 217 tasks and `1x64 @ 64x40` falls from
+83 to 43. N=99 stays on the existing 32-output schedule: the wider candidate
+does not reduce its 399 tasks and increases constant storage. The 64x64 device
+regression and the unchanged `test_matmul_simple`, `test_matmul_batched`, and
+`test_matmul_batched_vector` methods all pass at official tolerances. This is a
+native-quality improvement, not a new method pass, and no global limit changes.

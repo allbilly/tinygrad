@@ -1254,7 +1254,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(main),1)
     self.assertIs(main[0].lhs.buffer.kind,RKBufferKind.ARG)
     cost = plan_cost(result.plan)
-    self.assertLessEqual(cost.task_count,320)
+    self.assertLessEqual(cost.task_count,220)
     self.assertLessEqual(cost.constant_bytes,2*1024*1024)
     self.assertFalse(contains_uop(result.plan))
 
