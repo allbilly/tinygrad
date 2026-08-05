@@ -4724,3 +4724,21 @@ milestone. It identifies a possible non-overlapping 32-lane FP32 CMAC tile for
 future interpolation and scalar/vector output legalization while retaining
 the strict `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`
 census.
+
+## Rejected fused FP32-to-FP16 conversion
+
+The proven lerp pipeline was reduced to an apparent cast using FP16 zero as
+MRDMA/EW input, FP32 data through BRDMA subtraction, and an external `-1`
+multiplier. It reproduces all tested finite nonzero values, both infinities,
+and NaN, but loses the sign of negative zero. Replacing the zero addends with
+negative zero does not change that result.
+
+A second experiment routes BRDMA through the BS multiplier instead of its ALU.
+`BS_MUL_SRC=0` completes with an all-zero vector; `BS_MUL_SRC=1` times out. The
+unsafe variants remain available only with `ROCKCHIP_UNSAFE_BS_MUL=1`; the
+known-good six-fill recovery selection passes afterward.
+
+This closes the tempting interpolation continuation for now. BRDMA's FP32
+operand contract remains valid inside the exact fused lerp recipe, but it is
+not a general signed FP32-to-FP16 cast. No production lowering or coverage
+classification changes.

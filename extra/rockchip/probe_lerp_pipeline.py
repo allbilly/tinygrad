@@ -5,12 +5,12 @@ This is a hardware-research probe, not part of the renderer. It deliberately use
 MRDMA -> BS(subtract BRDMA) -> BN(multiply NRDMA) -> EW(add ERDMA) in one task.
 """
 from __future__ import annotations
-import ctypes
+import ctypes, os
 import numpy as np
 
 from tinygrad.device import Target, TinyELF
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKImage, RKReloc, RKStage, encode_image
-from tinygrad.renderer.rockchip.ir import RKALUStage, RKArg, RKBufferKind, RKDPUProgram, RKEngine, RKTarget
+from tinygrad.renderer.rockchip.ir import RKALUStage, RKFusedALUStage, RKArg, RKBufferKind, RKDPUProgram, RKEngine, RKTarget
 from tinygrad.renderer.rockchip.emit import emit_dpu
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops
@@ -56,6 +56,14 @@ def image(bs_algo:int, full:bool=True, count:int=8) -> RKImage:
   commands.append(_command(_PC, rk.REG_PC_OPERATION_ENABLE, 0x18))
   return RKImage(RKTarget.RK3588, (RKStage(RKEngine.DPU, tuple(commands), tuple(relocs), RK_STAGE_RESET),))
 
+def multiply_cast_image(mul_src:int) -> RKImage:
+  """Route the external FP32 BRDMA operand through BS multiplication by FP16 one."""
+  base = image(2,False)
+  stage = _replace(base.stages[0],_DPU,rk.REG_DPU_BS_CFG,0x42)
+  stage = _replace(stage,_DPU,rk.REG_DPU_BS_MUL_CFG,mul_src)
+  stage = _replace(stage,_RDMA,_BRDMA_CFG,0)
+  return RKImage(RKTarget.RK3588,(stage,))
+
 def main() -> None:
   x = np.array([-3, -1, -.25, 0, .5, 1, 2, 4], dtype=np.float16)
   y = np.array([4, 2, .75, -.5, 1.5, -2, 3, -1], dtype=np.float16)
@@ -63,6 +71,53 @@ def main() -> None:
   dev = RockchipDevice("ROCKCHIP")
   buffers = [dev._gpu_alloc(size) for size in (16,16,16,16,32,32)]
   try:
+    fp32 = np.array([-65504.0,-3.25,-0.0,0.0,.333251953125,17.5,np.inf,np.nan],dtype=np.float32)
+    expected_half = fp32.astype(np.float16)
+    cast_buffers = [dev._gpu_alloc(size) for size in (16,16,32)]
+    try:
+      ctypes.memset(int(cast_buffers[0].va_addr),0,16)
+      ctypes.memset(int(cast_buffers[1].va_addr),0,16)
+      ctypes.memmove(int(cast_buffers[2].va_addr),fp32.ctypes.data,fp32.nbytes)
+      cast = emit_dpu(RKDPUProgram((RKFusedALUStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),Ops.SUB,
+        RKArg(RKBufferKind.ARG,2),Ops.MUL,-1.0,Ops.ADD,RKArg(RKBufferKind.ARG,1),8),)))
+      RockchipProgram(dev,TinyELF(encode_image(cast),"fused_fp32_to_fp16",Target("ROCKCHIP"),()))(*cast_buffers,wait=True)
+      actual_half = np.frombuffer(ctypes.string_at(int(cast_buffers[0].va_addr),16),dtype=np.float16).copy()
+      finite = ~np.isnan(expected_half)
+      print(f"fused FP32->FP16 finite_exact={np.array_equal(actual_half[finite].view(np.uint16),expected_half[finite].view(np.uint16))} "
+            f"nan={np.isnan(actual_half[~finite]).all()} actual={actual_half.tolist()}")
+      assert np.flatnonzero(finite & (actual_half.view(np.uint16) != expected_half.view(np.uint16))).tolist() == [2]
+      assert np.isnan(actual_half[-1])
+    finally:
+      for buf in cast_buffers: dev._gpu_free(buf)
+    signed_buffers = [dev._gpu_alloc(size) for size in (16,16,16,16,32,16)]
+    try:
+      negative_zero = np.full(8,np.float16(-0.0),dtype=np.float16)
+      ones = np.ones(8,dtype=np.float16)
+      for buf,value in zip(signed_buffers[1:],(negative_zero,negative_zero,ones,fp32,ones)):
+        ctypes.memmove(int(buf.va_addr),value.ctypes.data,value.nbytes)
+      RockchipProgram(dev,TinyELF(encode_image(image(2)),"fused_fp32_to_fp16_signed_zero",Target("ROCKCHIP"),()))(
+        *signed_buffers,wait=True)
+      signed_half = np.frombuffer(ctypes.string_at(int(signed_buffers[0].va_addr),16),dtype=np.float16).copy()
+      finite = ~np.isnan(expected_half)
+      print(f"fused signed FP32->FP16 finite_exact="
+            f"{np.array_equal(signed_half[finite].view(np.uint16),expected_half[finite].view(np.uint16))} "
+            f"nan={np.isnan(signed_half[~finite]).all()} actual={signed_half.tolist()}")
+      assert np.flatnonzero(finite & (signed_half.view(np.uint16) != expected_half.view(np.uint16))).tolist() == [2]
+      assert np.isnan(signed_half[-1])
+      if os.getenv("ROCKCHIP_UNSAFE_BS_MUL") == "1":
+        ctypes.memmove(int(signed_buffers[2].va_addr),ones.ctypes.data,ones.nbytes)
+        ctypes.memmove(int(signed_buffers[4].va_addr),fp32.ctypes.data,fp32.nbytes)
+        for mul_src in (0,1):
+          ctypes.memset(int(signed_buffers[0].va_addr),0,16)
+          RockchipProgram(dev,TinyELF(encode_image(multiply_cast_image(mul_src)),
+            f"bs_mul_fp32_to_fp16_{mul_src}",Target("ROCKCHIP"),()))(*signed_buffers,wait=True)
+          multiplied = np.frombuffer(ctypes.string_at(int(signed_buffers[0].va_addr),16),dtype=np.float16).copy()
+          finite = ~np.isnan(expected_half)
+          print(f"BS multiply FP32->FP16 src={mul_src} finite_exact="
+                f"{np.array_equal(multiplied[finite].view(np.uint16),expected_half[finite].view(np.uint16))} "
+                f"nan={np.isnan(multiplied[~finite]).all()} actual={multiplied.tolist()}")
+    finally:
+      for buf in signed_buffers: dev._gpu_free(buf)
     x_operand, z_operand = x.astype(np.float32), z
     for buf, value in zip(buffers[1:], (x,y,z,x_operand,z_operand)):
       ctypes.memmove(int(buf.va_addr), value.ctypes.data, value.nbytes)

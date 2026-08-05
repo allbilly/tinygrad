@@ -2450,3 +2450,18 @@ tiles, including weighted interpolation. It does not yet enable a compiler
 path: the legalizer must first construct those tiles without overlapping
 writes and prove the official FP32 accumulation contract. Coverage remains
 `204/40/168/13`.
+
+## Rejected auxiliary FP32-to-FP16 cast
+
+The fused lerp datapath proves that BRDMA can supply an FP32 operand to BS even
+though direct FP32 MRDMA input times out. Reusing that path as
+`(0 - x) * -1 + 0` converts finite values, infinity, and NaN correctly, but it
+turns negative zero into positive zero. Supplying negative-zero addends does
+not repair the sign.
+
+The alternative BS multiply route was also tested behind
+`ROCKCHIP_UNSAFE_BS_MUL=1`. External multiplier source zero emits all zeros;
+source one times out. The ordinary wide FP16 fill suite passes after runtime
+recovery. A generic cast therefore remains unsupported: the working auxiliary
+path is valid for the specific fused lerp expression, not a bit-complete FP32
+input conversion contract.
