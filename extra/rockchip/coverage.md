@@ -5302,3 +5302,25 @@ directory is overrideable with `ROCKCHIP_LOCK_DIR` for isolated tests; the lock
 itself cannot be disabled by a coverage mode. Sixteen runtime/fallback tests,
 the mapped native-host-native coherence test, and the strided-gather hardware
 test pass; mypy and Ruff are clean.
+
+## Rejected unaligned row-major RHS padding
+
+The direct broad CMAC task is not the blocker for `1x64 @ 64x99`: the existing
+selector path rejects at 402 tasks, while an experimental row-padding plan
+compiled to 135 tasks, 134,608 constant bytes, and one broad CMAC compute task.
+That experiment copied each logical 99-value RHS row into a 104-value scratch
+row before applying the proven strided-gather transpose.
+
+RK3588 hardware rejected the required premise. DPU source bases are interpreted
+at a 16-byte FP16-atom boundary. For requested logical row starts
+`0, 99, 198, 297`, the device read from elements `0, 96, 192, 296`. The resulting
+matvec mismatched all 99 outputs, so the row-padding path remains disabled and
+the 402-task family continues to reject before submission. The behavior is
+reproducible with `PYTHONPATH=. python extra/rockchip/probe_dpu_unaligned_row_copy.py`.
+
+The BS/BN/EW pipeline does not change this address contract. It can fuse several
+arithmetic operands in one task, as already used by mask/WHERE handling and the
+fused lerp stages, but it cannot shift an unaligned source row into a new lane
+position. A clean N=99 implementation therefore needs an engine-native aligned
+surface conversion (or another explicitly proven gather layout), not one DPU
+copy per unaligned row and not CPU packing.
