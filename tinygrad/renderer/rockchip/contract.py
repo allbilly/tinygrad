@@ -38,7 +38,7 @@ def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) 
     for row in range(k):
       rows = [[row*n+column] for column in range(n)]+[[] for _ in range(src_row_stride-n)]
       padded = _windowed_cmac_pipeline(RKArg(padded_rhs.kind,padded_rhs.index,row*src_row_stride*2),rhs,rows,
-        scratch=scratch,direct_count=rhs_capacity,max_window=256,max_outputs=128)
+        scratch=scratch,direct_count=rhs_capacity,max_window=256,max_outputs=128,clear_empty=False)
       if padded is None: raise ValueError(f"unaligned row-major RHS N={n},K={k} exceeds the compact row contract")
       steps.extend(padded.steps)
       scratch = padded.scratch

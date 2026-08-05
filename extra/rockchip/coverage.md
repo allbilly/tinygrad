@@ -5326,8 +5326,8 @@ The accepted replacement uses bounded CMAC row selectors. Each logical row is
 selected from one aligned source window into a compact 128-value scratch row;
 the existing strided gather and 32x8 block transpose then produce the canonical
 CMAC weight stream. The standalone `64x99 -> 64x128` padding surface is exact,
-including zero padding, in 128 tasks and 262,400 constant bytes. The complete
-`1x64 @ 64x99` plan costs 199 tasks, 396,752 constant bytes, and one broad CMAC
+including zero padding, in 64 tasks and 262,400 constant bytes. The complete
+`1x64 @ 64x99` plan costs 135 tasks, 396,752 constant bytes, and one broad CMAC
 compute task, versus the former 402-task rejection.
 
 The permanent hardware regression and the unchanged `TestOps.test_matmul` are

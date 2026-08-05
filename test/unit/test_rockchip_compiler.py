@@ -1301,7 +1301,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(unaligned_n.kind,RKLowerKind.NATIVE)
     assert isinstance(unaligned_n.plan,RKProgram)
     unaligned_cost = plan_cost(unaligned_n.plan)
-    self.assertLessEqual(unaligned_cost.task_count,205)
+    self.assertLessEqual(unaligned_cost.task_count,140)
     self.assertLessEqual(unaligned_cost.constant_bytes,400*1024)
     self.assertEqual(sum(isinstance(stage,RKStridedAtomGatherStage) for step in unaligned_n.plan.steps
                          if isinstance(step,RKDPUProgram) for stage in step.stages),13)
