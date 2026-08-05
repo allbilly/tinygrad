@@ -4705,3 +4705,22 @@ Even with the live vendor notch formulas, ordinary linear FP16 rows remain a
 contiguous atom stream in the tested mode. No reformat path is enabled from
 this result; it prevents mistaking vendor physical-layout metadata for a
 general dynamic transpose engine.
+
+## FP32 CMAC output footprint
+
+`probe_cmac_width.py` now characterizes one-row FP32 writeback with an
+untouched canary after the logical result. The production `SURFACE_ADD=0x40`
+mode writes exactly 32 contiguous FP32 channels and leaves the following 32
+words unchanged. Thus the proven one-task FP32 result footprint is 128 bytes,
+even though the current conservative target layout reserves 256 bytes.
+
+Applying the FP16 compact value `SURFACE_ADD=0x20` is incorrect for FP32. The
+observed vector contains logical channels 0--7 followed by 16--31; output
+words 24--31 retain the canary. The probe asserts this exact negative result,
+so the value cannot be accidentally promoted as a generic compaction control.
+
+No production layout or TestOps status changes in this characterization
+milestone. It identifies a possible non-overlapping 32-lane FP32 CMAC tile for
+future interpolation and scalar/vector output legalization while retaining
+the strict `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`
+census.

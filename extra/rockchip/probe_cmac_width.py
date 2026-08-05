@@ -55,6 +55,15 @@ def gemm_image(m:int, n:int, k:int) -> RKImage:
     padding=((0,align_out-n),(0,align_in-k)),kind=RKLayoutKind.CMAC_WEIGHT,padding_value=0))
   return emit_cmac_task(RKCMACTask(out,lhs,rhs,0))
 
+def fp32_image(compact:bool=False) -> RKImage:
+  """Probe whether the proven one-row CMAC compaction mode also packs FP32 channels."""
+  out = RKTensorRef(RKArg(RKBufferKind.ARG,0),RKLayout((1,32),(1,64),(256,4),dtypes.float,padding=((0,0),(0,32))))
+  lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((1,32),(1,32),(64,2),dtypes.half))
+  rhs = RKTensorRef(RKArg(RKBufferKind.ARG,2),RKLayout((32,32),(32,32),(64,2),dtypes.half,kind=RKLayoutKind.CMAC_WEIGHT))
+  base = emit_cmac_task(RKCMACTask(out,lhs,rhs,0))
+  if not compact: return base
+  return RKImage(RKTarget.RK3588,(_replace(base.stages[0],_DPU,rk.REG_DPU_SURFACE_ADD,0x20),),base.scratch,base.constants)
+
 def main() -> None:
   dev = RockchipDevice("ROCKCHIP")
   rng = np.random.default_rng(2608)
@@ -82,6 +91,34 @@ def main() -> None:
       dev._gpu_free(out)
       dev._gpu_free(lhs_buf)
       dev._gpu_free(rhs_buf)
+
+  lhs = np.linspace(-2,2,32,dtype=np.float16)
+  weight = np.eye(32,dtype=np.float16)
+  packed = weight.reshape(2,16,1,32).transpose(0,2,1,3).ravel()
+  expected, canary = lhs.astype(np.float32), np.float32(12345.0)
+  out, lhs_buf, rhs = dev._gpu_alloc(256), dev._gpu_alloc(lhs.nbytes), dev._gpu_alloc(packed.nbytes)
+  try:
+    ctypes.memmove(int(lhs_buf.va_addr),lhs.ctypes.data,lhs.nbytes)
+    ctypes.memmove(int(rhs.va_addr),packed.ctypes.data,packed.nbytes)
+    for compact in (False,True):
+      initial = np.full(64,canary,dtype=np.float32)
+      ctypes.memmove(int(out.va_addr),initial.ctypes.data,initial.nbytes)
+      RockchipProgram(dev,TinyELF(encode_image(fp32_image(compact)),
+        f"cmac_fp32_{'compact' if compact else 'normal'}",Target("ROCKCHIP"),()))(out,lhs_buf,rhs,wait=True)
+      physical = np.frombuffer(ctypes.string_at(int(out.va_addr),256),dtype=np.float32).copy()
+      mismatch = np.flatnonzero(physical[:32] != expected)
+      print(f"FP32 compact={compact} exact={mismatch.size == 0} mismatches={mismatch.tolist()} "
+            f"tail_untouched={np.array_equal(physical[32:],initial[32:])} values={physical[:32].tolist()}")
+      assert np.array_equal(physical[32:],initial[32:])
+      if not compact: assert mismatch.size == 0
+      else:
+        assert mismatch.tolist() == list(range(8,32))
+        assert np.array_equal(physical[:24],expected[np.r_[0:8,16:32]])
+        assert np.array_equal(physical[24:32],initial[24:32])
+  finally:
+    dev._gpu_free(out)
+    dev._gpu_free(lhs_buf)
+    dev._gpu_free(rhs)
 
   # One 32-KiB feature bank leaves eleven weight banks. Square FP16 selectors
   # therefore stop at 416 aligned channels: 416*416*2 <= 11*32 KiB.

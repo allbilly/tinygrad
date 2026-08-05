@@ -2431,3 +2431,22 @@ and padded contractions stay at 32 outputs to preserve their characterized
 rounding, while N=99 keeps the cheaper existing candidate. Official simple,
 batched, and batched-vector matmul tests remain green with no coverage or limit
 change.
+
+## One-row FP32 CMAC writeback is already compact
+
+The direct CMAC width probe now places a canary after a 32-value FP32 result.
+With the production `SURFACE_ADD=0x40` setting, one physical task writes the
+32 FP32 channels contiguously and leaves every following canary word untouched.
+The existing `(1,64)` layout declaration is therefore conservative physical
+allocation metadata, not an observed 64-word output footprint.
+
+The FP16 compact setting `SURFACE_ADD=0x20` must not be reused for FP32. It
+writes channels 0--7 followed by channels 16--31 and leaves the final eight
+words untouched. This is a precision-dependent address-generator contract,
+not a generic byte-stride control.
+
+This result creates a possible direct destination for 32-output FP32 CMAC
+tiles, including weighted interpolation. It does not yet enable a compiler
+path: the legalizer must first construct those tiles without overlapping
+writes and prove the official FP32 accumulation contract. Coverage remains
+`204/40/168/13`.
