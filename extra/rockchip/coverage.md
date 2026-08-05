@@ -4649,6 +4649,16 @@ none sets `TP_EN`. The vendor compiler therefore does not supply a missing
 known-good transpose register contract for this shape and instead decomposes
 the movement into ordinary surface tasks.
 
+The probe also replays the apparent central vendor task with its exact DPU and
+MRDMA geometry (`DATA_FORMAT=0x24000001`, `ERDMA_CFG=1`,
+`FEATURE_MODE_CFG=0xf821`, surface notch, cube dimensions, and strides). On a
+linear 1x8x8x8 FP16 surface it completes but preserves all 512 values in input
+order; 448 values differ from a logical H/W transpose. This proves the task is
+not a standalone linear-buffer transpose. It likely participates in the
+vendor model's NC1HWC2 physical-layout reinterpretation, with surrounding
+tasks realizing the public layout conversion. The raw replay is retained as a
+reproducible boundary test rather than promoted into compiler legalization.
+
 Consequently neither direct DPU transpose nor dynamic CMAC-weight packing is
 enabled. The result narrows the physical-layout search: use compact ordinary
 DPU surface schedules or another proven engine path, while retaining
