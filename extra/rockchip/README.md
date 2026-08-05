@@ -2789,3 +2789,12 @@ logical allocation; shorter values are packed into an explicitly zeroed native
 surface. This keeps the small contraction native and moves the old 399-task
 `1x64 @ 64x99` correctness path to a typed stage-limit rejection in strict
 mode and visible `HOST` execution in hybrid mode.
+
+The authoritative native-first hybrid TestOps census at `7d6646a0f` is now
+zero-failure: 213 native methods, 39 mixed methods, 120 generic compiled-host
+fallback methods, 40 frontend-only methods, and 13 upstream skips. Pytest
+reports 412 passed methods plus 126 passing subtests. This is semantic coverage,
+not a claim that HOST work is native; strict and hybrid telemetry remain
+separate. The next coverage phase replaces HOST and selector-heavy families
+with direct RK3588 layouts and engine schedules while keeping this hybrid suite
+green.

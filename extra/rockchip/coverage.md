@@ -5193,3 +5193,36 @@ therefore executes visibly as `HOST` in hybrid mode instead of raising the
 400-stage ceiling. Full compiler tests pass 173 tests plus 78 subtests; mypy
 and Ruff are clean. A fresh complete hybrid census is required for the final
 zero-failure claim.
+
+## Complete zero-failure hybrid census
+
+The complete uncached native-first hybrid census at `7d6646a0f` reaches the
+declared semantic target:
+
+```text
+PASS_NATIVE       213
+PASS_MIXED         39
+PASS_FALLBACK     120
+PASS_FRONTEND      40
+SKIP_UPSTREAM      13
+FAIL                0
+TOTAL             425
+```
+
+Pytest reports 412 passed methods, 13 upstream skips, and 126 passing subtests
+in 3,870.27 seconds. No tolerance changed and no skip was added for compiler
+incompleteness. `CLANG` remains native-first: 755 kernels executed on RK3588
+engines and 1,423 rejected kernels executed through the one generic compiled
+host-UOp lane. Native kernels split into 667 `EFFICIENT` and 88
+`CORRECTNESS_FALLBACK` plans. HOST, mixed, frontend, and native outcomes remain
+separate in telemetry and HOST does not contribute strict native coverage.
+
+The durable artifacts are
+`/home/orangepi/rk_results/test_ops_hybrid_7d6646a0f.json` (SHA-256
+`4c21c935f5af1e8988b2cfc83c0462b822e629446378e5e89402281f99a79dd3`)
+and `/home/orangepi/rk_results/test_ops_hybrid_7d6646a0f.xml` (SHA-256
+`37cec26fdda9910b24874b7766148d2c906cd08e920f706ce85cb80b96b6ad1b`).
+The previous strict `214/40/158/13` census predates the initialized-padding
+guard; a new strict run is required before replacing that native-only
+baseline. The hybrid report shows 213 completely native methods at the current
+head because the former 399-task matmul now rejects safely.
