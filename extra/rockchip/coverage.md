@@ -12,41 +12,44 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `2385767d1` contains exactly 425 telemetry method
+The complete uncached run at `68c4d8272` contains exactly 425 telemetry method
 records: 204 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 168 `FAIL`, and 13
-`SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0`, `CACHELEVEL=0`, and `SCACHE=0` were set
-throughout, with `FORWARD_ONLY=1` and `DEFAULT_FLOAT=HALF`. Raw pytest reports
-3,375.14 seconds. No NPU timeout, invalid submission, reset failure, process
-abort, fallback execution, or unclassified failure occurred.
+`SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0` and `CACHELEVEL=0` were set throughout,
+with `DEV=ROCKCHIP`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`. Raw pytest
+reports 3,488.50 seconds. No NPU timeout, invalid submission, reset failure,
+process abort, fallback execution, or unclassified failure occurred.
 
-Relative to the preceding 202-pass census, exactly `test_multicat` and
-`test_where` change from failure to native pass and none regress. Every one of
+The result exactly preserves the preceding 204-pass method census after the
+one-task K=128 GEMM characterization; no method changes status. Every one of
 the 168 failures is a typed native reject with a retained method-level first
-reject. Their first-reject Pareto is 53 unsupported-output-dtype, 33
-plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 18
+reject. Their first-reject Pareto is 53 unsupported-output-dtype, 35
+plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 16
 numerical-contract, 12 unsupported-ALU, five requires-reformat, two
 unaligned-row, and one LUT-domain-unproven.
 
-The 653 successful kernels belonging to fully native methods contain 590
-`EFFICIENT` and 63 `CORRECTNESS_FALLBACK` plans. At method level, 169 are fully
-efficient and 35 contain a correctness fallback. The maximum remains 399
+Across passing and partially passing methods, 654 successful native kernels
+contain 590 `EFFICIENT` and 64 `CORRECTNESS_FALLBACK` plans. The 204 fully
+native methods contain 560 kernels: 506 efficient and 54 correctness
+fallbacks. At method level, 169 are fully efficient and 35 contain a
+correctness fallback. The maximum remains 399
 tasks; no task or constant ceiling changed. The worst single-kernel wall time
 is 42.64 seconds, and the largest generated constant payload is 1,819,392
 bytes. These costs remain visible rather than being hidden by the native pass
 count.
 
-The durable artifacts are under
-`~/rk2608_backups/census-negative-max-2385767d1-20260805/`. The JUnit SHA-256
-is `1a89c93b75e5952c59960d229f5e0e86a423ebcfd11eedbe7a63ac2e19fc905f` and
-the telemetry JSON SHA-256 is
-`fddc4fc0fe64d5229481ef6d7695cf9e72d9199b8186be6718f1a7983f701cc1`. The
+The durable artifacts are `/home/orangepi/rk_results/test_ops_68c4d8272.log`,
+`.xml`, and `.json`. Their SHA-256 values are respectively
+`15ebf673a0db46f084c68d3bf1d39702fd3edd2792fa62b2c202fac0e8e847ef`,
+`8336ef4f6bfc82bf38bc8cab5c75dd066631be4bc5f16eb61de7420caa003577`, and
+`ef19a451a6146cb88bb282c3f11791b4490a38c0c8309a34da0964c56a451606`. The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through native negative row-MAX are now authoritative.
+All focused milestones through the one-task K=128 GEMM boundary are now
+authoritative.
 The chronological sections below retain the individual focused evidence and
 their then-current estimates for debugging history.
 

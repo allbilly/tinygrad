@@ -2473,3 +2473,21 @@ source one times out. The ordinary wide FP16 fill suite passes after runtime
 recovery. A generic cast therefore remains unsupported: the working auxiliary
 path is valid for the specific fused lerp expression, not a bit-complete FP32
 input conversion contract.
+
+## K=128 boundary census
+
+The complete uncached strict census at `68c4d8272` confirms that the one-task
+prepacked `M=1,N=128,K=128` characterization changes no existing method
+behavior: 204 methods pass natively, 40 are frontend-only, 168 fail with typed
+native rejects, and 13 retain upstream skips. All 168 failures retain a
+method-level first reject; no fallback execution, numerical mismatch, timeout,
+invalid submission, reset failure, process abort, or unclassified failure
+occurred during the 3,488.50-second run.
+
+The exact first-reject distribution is 53 unsupported-output-dtype, 35
+plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 16
+numerical-contract, 12 unsupported-ALU, five requires-reformat, two
+unaligned-row, and one LUT-domain-unproven. This makes the next matvec milestone
+unambiguous: preserve the proven one-task broad CMAC compute and replace the
+1,074-task generic row-major-to-weight transform with a bounded device-native
+block pack. No resource ceiling or numerical tolerance is increased.
