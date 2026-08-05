@@ -2054,6 +2054,12 @@ unchanged wide FP16 DPU regression passed immediately afterward. Both compiler
 experiments were removed; the exact WIP is preserved as
 `wip-ppu-int8-reduce-int16-output-dpu-cast-timeout-20260805.patch` with SHA-256
 `18dfaedc00bcfe54ea04aa7dffc549089be1f7bd9345d02e9f7263b728bb1964`.
+The follow-up also set DPU `IN_PRECISION=int16` while retaining int8
+processing/output, as required by the NVDLA converter model; it timed out at
+the same stage. That one-line delta is preserved as
+`wip-ppu-int16-to-int8-corrected-in-precision-timeout-20260805.patch` with
+SHA-256 `5b5d467c6ce792d255832b25fbb76db331b2e210d068df7faa43b290bc2013ab`
+and applies after the first WIP patch.
 
 Consequently `all`/`any` remain typed output-dtype rejects. A future native
 implementation needs a proven PPU/DPU int16-to-int8 writeback contract or a

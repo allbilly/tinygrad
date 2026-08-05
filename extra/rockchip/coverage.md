@@ -4115,6 +4115,11 @@ unchanged wide FP16 fill passed after the timeout, confirming device recovery.
 No part of this path is active. Its exact compiler/IR/emitter patch is archived
 at `wip-ppu-int8-reduce-int16-output-dpu-cast-timeout-20260805.patch`
 (`18dfaedc00bcfe54ea04aa7dffc549089be1f7bd9345d02e9f7263b728bb1964`).
+An explicit follow-up advertised the incoming surface as int16 in both RDMA
+and DPU data format while keeping int8 processing/output; it timed out at the
+same DPU stage. The delta after the first WIP is archived as
+`wip-ppu-int16-to-int8-corrected-in-precision-timeout-20260805.patch`
+(`5b5d467c6ce792d255832b25fbb76db331b2e210d068df7faa43b290bc2013ab`).
 The result explains why the already proven public int8 DPU fill/copy/ALU paths
 do not automatically make `all` or `any` native: the reduction engine's output
 representation still needs a hardware conversion. Those methods continue to
