@@ -2202,3 +2202,17 @@ reject. Existing all-int8 bool fill/copy/AND/OR/NOT and bounded bool-WHERE paths
 stay enabled because they use independently proven contracts. No method count,
 resource ceiling, or tolerance changes; the authoritative census remains
 `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
+
+## Unreduced BCE needs a narrower numerical recipe
+
+The probability-BCE guard was disabled only inside a serialized probe process
+and the existing staged LUT expression was compared at the official
+`rtol=1e-3, atol=1e-6`. It misses 39 of 320 outputs, with maximum absolute and
+relative errors `0.001953125` and `0.00434`. Rewriting the same inputs to the
+standard logits BCE expression is not sufficient: that native recipe misses 39
+of 320 outputs, up to `0.0009765625` absolute and `0.005554` relative.
+
+`probe_bce_unreduced.py` reproduces both measurements with the seeded TestOps
+inputs. The active pre-submission numerical rejection remains correct. A future
+implementation needs a narrower second-level logarithm/softplus LUT or another
+measured fused recipe; canonicalization alone cannot make this method pass.

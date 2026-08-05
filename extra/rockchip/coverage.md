@@ -4283,3 +4283,18 @@ obvious DPU geometry without weakening the existing typed rejection. Public
 bool materialization from FP16 still needs another hardware block or a proven
 native conversion path; no CPU packing is introduced. The authoritative tally
 remains `204/40/168/13`.
+
+## Rejected unreduced BCE recipes
+
+With only the explicit compiler guard disabled in-process, the active
+probability-BCE composition misses 39/320 seeded TestOps outputs at the
+unchanged `rtol=1e-3, atol=1e-6`; maximum absolute and relative errors are
+`0.001953125` and `0.00434`. The algebraically equivalent logits recipe also
+fails, with 39/320 mismatches, maximum absolute error `0.0009765625`, and
+maximum relative error `0.005554`.
+
+The deterministic `probe_bce_unreduced.py` keeps this numerical evidence
+reproducible. This rules out a canonicalization-only fix. The next valid route
+is a characterized narrower logarithm/softplus table or fused recipe, while the
+current `NUMERICAL_CONTRACT` rejection stays active. No tolerance, execution
+lane, or census status changes.
