@@ -2920,3 +2920,27 @@ input/weight pack is currently larger.  The method remains native, so this is
 an efficiency milestone rather than a coverage transition.  The nested
 two-convolution bias test also remains exact.  No resource ceiling or tolerance
 changes.
+
+## Access legalization remains distinct from broad compute
+
+Focused strict audits at `e98e2b3d4` confirm that several remaining
+stage-limit methods already reach the correct semantic recognizer but lack a
+compact physical-layout conversion.  The large `cat` materialization is the
+split-axis transpose `[3,45,585] -> [45,3,585]`; an aligned-alias selector
+candidate costs 851 tasks and 20,760,288 constant bytes, so it was removed.
+The `16x16` pointwise convolution is recognized as one direct CNA operation,
+but its planar 16x32x32 NCHW input cannot yet become the interleaved CNA surface
+within the native plan limits.
+
+This is the intended boundary.  The compiler computes static affine forms,
+tile offsets, strides, and relocatable addends.  Fixed-function address
+generators perform regular traversal.  Dynamic irregular packing is not forced
+onto CMAC merely to increase the strict-native count: an over-limit selector
+plan remains an explicit mixed fallback or a typed rejection.  Constant
+packing remains ordinary compile-time work.
+
+The PPU global MAX/MIN index plane is likewise not enabled just because the
+official `argmax` examples are finite.  Its signed-zero tie winner differs from
+tinygrad's first-occurrence rule, and its kernel-local `uint16` plane still
+needs a proven public-int32 extraction.  The production compiler therefore
+retains the exact semantic rejection until both conditions are solved.

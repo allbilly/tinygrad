@@ -5535,3 +5535,38 @@ composition is `15 CMAC + 3 DPU + 1 CONV`, compared with the old
 remains visible in cost telemetry.  This is a native-quality improvement, not a
 method-count gain.  No test tolerance, fallback rule, task ceiling, or constant
 ceiling changes.
+
+## Access-bound stage-limit audit after broad-compute bring-up
+
+Three focused strict failures were rechecked at `e98e2b3d4` before adding any
+more selector legalization.  All three are physical-access failures around an
+already-understood compute engine, not missing arithmetic.
+
+`test_cat` first builds its native three-source result, then materializes the
+split-axis view `[3,45,585] -> [45,3,585]`.  The exact output/source affine
+forms are respectively `a*585+b+c*1755` and `c*585+b+a*26325`.  Treating the
+three source planes as aligned aliases does not make the existing selector
+schedule bounded: it produces 851 tasks and 20,760,288 constant bytes.  The
+experiment was removed.  This method remains mixed instead of manufacturing a
+pathological strict-native pass.
+
+`test_simple_conv2d_1x1_m4` is recognized by the spatial lowerer as
+`B=1, IC=16, OC=16, H=W=32, K=1x1`.  It rejects before the direct CONV task
+because the ordinary NCHW input contains 16 planar 32x32 channels while CNA
+needs an interleaved activation surface.  The rejected generic contraction
+reports `out=16384,lhs=16384,rhs=256,K=16`; the missing capability is a compact
+NCHW-to-CNA conversion, not convolution geometry.
+
+Finally, the committed PPU index-plane probe is structurally relevant to the
+actual `argmax`/`argmin` UOps: both contain one FP16 MAX and one int32 MAX
+reduction.  It is still not promoted.  PPU MAX/MIN choose a sign-specific zero
+occurrence rather than tinygrad's first equal occurrence, and the kernel-local
+`uint16` index plane requires a proven bounded extraction into the public
+int32 output.  Accepting only the finite TestOps examples would weaken the
+runtime-input contract.
+
+These results keep the scheduling policy explicit: broad GEMM/CONV compute is
+tried directly, compact native layout conversion is preferred when proven,
+selector-CMAC remains a bounded correctness fallback, and an over-limit
+dynamic reformat stays `MIXED` or rejected.  No resource ceiling, tolerance,
+fallback classification, or authoritative census changes in this audit.
