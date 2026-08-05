@@ -4480,3 +4480,29 @@ patches `0272-WIP-probe-64-plane-sliding-PPU-pool.patch` (SHA-256
 The active 32-plane contract is restored. This family needs a native
 NCHW-to-HWC8 layout conversion, not a larger selector or program-stage limit;
 the authoritative census remains `204/40/168/13`.
+
+## Exact asymmetric PPU MAX padding probe
+
+The raw `probe_ppu_sliding_channels.py` hardware program now accepts three
+explicit four-sided padding geometries and writes the PPU padding register at
+`0x6040`. All three FP16 MAX cases are bit-exact on RK3588:
+
+```text
+input 11x28, kernel 5x5, stride 5x5, padding 1/0/1/0: 0/80 mismatches
+input 11x28, kernel 5x5, stride 5x5, padding 2/1/2/1: 0/96 mismatches
+input 11x28, kernel 3x2, stride 3x2, padding 1/1/0/1: 0/448 mismatches
+```
+
+The probe does not read or transform runtime tensors on the CPU. It constructs
+the already-characterized HWC8 input surface, submits one PPU task, and checks
+the device result against the scalar reference. No additional padding-value
+register is required for these MAX cases.
+
+This result does not yet change TestOps coverage. The asymmetric padded family
+is recognized by the sliding lowerer, but its large NCHW surface still needs an
+unavailable native NCHW-to-HWC8 conversion; selector legalization estimates
+826 tasks. The probe therefore proves the PPU padding contract while preserving
+the existing typed layout rejection. Commit `8de5763d5` and
+`0275-WIP-probe-asymmetric-PPU-max-padding.patch` (SHA-256
+`c87b76403b34311d1c47a1dd73078a1f3d51524a9ded552fb0c5ba8e7508dc47`)
+preserve the exact experiment.

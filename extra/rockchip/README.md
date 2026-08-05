@@ -2371,3 +2371,16 @@ the resulting transpose exceeds the existing planner bounds. The local RK3588
 reference performs the same conversion on the CPU, which this backend does not
 adopt. Active legality is restored unchanged: future work needs a native
 NCHW-to-HWC8 conversion path rather than a higher 400-task ceiling.
+
+## PPU asymmetric MAX padding hardware contract
+
+The raw sliding-PPU probe now covers independent four-sided padding. Three
+FP16 MAX geometries using 5x5 and 3x2 kernels, nonuniform strides, and asymmetric
+top/bottom/left/right padding are bit-exact on RK3588 with zero mismatches over
+624 outputs. The PPU padding register alone is sufficient for these MAX cases.
+
+This is hardware-contract evidence, not a new TestOps pass. Large padded NCHW
+inputs still require a native conversion to the PPU's HWC8 external layout;
+the current selector schedule would require 826 tasks. The compiler therefore
+continues to reject that layout before submission instead of raising resource
+ceilings or using CPU packing.
