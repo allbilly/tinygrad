@@ -74,16 +74,17 @@ class TestDPUCompiler(unittest.TestCase):
     with self.assertRaises(ValueError): RKFusedMulStage(*args,257)
 
   def test_strided_atom_gather_emits_proven_surface_geometry(self):
-    plan = RKDPUProgram((RKStridedAtomGatherStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),128,128),))
+    plan = RKDPUProgram((RKStridedAtomGatherStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),16,1024),))
     image = emit_dpu(plan)
     self.assertEqual(len(image.stages),1)
     commands = {(command>>48,command&0xffff):(command>>16)&0xffffffff for command in image.stages[0].commands}
-    self.assertEqual(commands[(0x1001,rk.REG_DPU_DATA_CUBE_HEIGHT)],127)
-    self.assertEqual(commands[(0x1001,rk.REG_DPU_WDMA_SIZE_1)],127<<16)
-    self.assertEqual(commands[(0x2001,0x5048)],15<<19)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_DATA_CUBE_HEIGHT)],15)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_WDMA_SIZE_1)],15<<16)
+    self.assertEqual(commands[(0x2001,0x5048)],127<<19)
     self.assertEqual(commands[(0x2001,0x504c)],0)
     self.assertEqual(commands[(0x81,rk.REG_PC_OPERATION_ENABLE)],0x18)
     self.assertFalse(contains_uop(plan))
+    with self.assertRaises(ValueError): RKStridedAtomGatherStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),16,1032)
 
   def test_layout_contracts_are_executable_and_conservative(self):
     dense = RKLayout((2,3),(2,3),(6,2),dtypes.half)

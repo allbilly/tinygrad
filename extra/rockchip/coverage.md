@@ -5107,3 +5107,18 @@ typed reject. Dynamic CPU packing may only be introduced as an explicitly
 reported mixed-execution experiment; it cannot contribute to `PASS_NATIVE`.
 No mixed path, host dynamic pack, task-limit increase, or constant-limit
 increase participates in the `c8d19c240` census.
+
+## NCHW channel-plane gather boundary
+
+The DPU strided-atom address generator is now characterized at a 1,024-value
+FP16 source-row stride. One task gathers sixteen aligned eight-lane atoms from
+sixteen channel planes exactly, matching the channel-plane spacing of the
+`1x16x32x32` input in `test_simple_conv2d_1x1_m4`. The typed stage admits only
+the measured aligned range through 1,024 values; 1,032 is rejected before
+submission.
+
+This is one physical packing primitive, not a method transition. CNA already
+accepts the convolution as one unsplit compute task, but the compiler still
+needs a bounded 16x8 block transpose into `CNA_ACTIVATION` and a native
+`CONV_OUTPUT`-to-NCHW conversion with the official FP32-accumulation rounding
+contract. The authoritative census remains `214/40/158/13`.

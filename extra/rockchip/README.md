@@ -14,6 +14,12 @@ unclassified failure. Coverage details, the checkout-local pytest-plugin
 invocation, reject Pareto, plan-cost histograms, and durable artifact hashes
 are recorded in `coverage.md`.
 
+The strided DPU atom gather is independently exact at a 1,024-value FP16 row
+stride, covering the channel-plane spacing of a 16x32x32 NCHW surface. This is
+a measured input-packing primitive, not a claim that the complete M4 1x1
+convolution is native: its block transpose and output-layout conversion remain
+to be legalized without host packing.
+
 A post-census DPU destination-stride probe is intentionally retained as a
 negative hardware boundary. The programmed destination surface stride did not
 scatter eight-lane atoms; the NPU wrote the exact compact atom sequence instead.
