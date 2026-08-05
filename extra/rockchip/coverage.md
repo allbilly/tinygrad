@@ -4404,3 +4404,18 @@ and `0267-WIP-probe-K128-tiled-contraction.patch` (SHA-256
 `403f3703e9862a1e5bebddcfc67ccd5bfe2f7495cae45bb3173d952cec0788cc`).
 The next valid conv3d route needs direct 3D layout/engine legalization or a
 tile-proportional schedule, not a wider selector-CMAC allowance.
+
+## Mechanical MAX/pooling extraction
+
+Direct PPU global MAX, sliding pooling, dense-row MAX, and affine MAX lowering
+now live in the 505-line `renderer/rockchip/pool.py`. This module owns the
+characterized PPU geometry exclusions and the bounded CMAC-to-HWC preparation
+used by those paths. The explicit pass registry remains in the public compiler,
+whose size drops from 2,522 to 2,039 physical lines.
+
+All 171 compiler/image/telemetry tests plus 59 subtests pass. Full Mypy covers
+235 source files and full-tree Ruff is clean. Four RK3588 methods exercise
+global PPU MAX, sliding PPU pooling, padded CMAC+PPU pooling, and batched affine
+MAX; all pass with three subtests in 7.85 seconds. This mechanical move changes
+no schedule, cost, tolerance, or census result, so `204/40/168/13` remains the
+authoritative tally.

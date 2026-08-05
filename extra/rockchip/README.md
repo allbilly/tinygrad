@@ -2319,3 +2319,16 @@ The K96 legality bound therefore remains active. Commit `a19d43fa0` and patch
 `0267-WIP-probe-K128-tiled-contraction.patch` preserve the experiment. Future
 conv3d work must use direct 3D physical layouts or another tile-proportional NPU
 schedule; increasing the selector task ceiling would only hide the blocker.
+
+## MAX and pooling lowering module
+
+The PPU global-MAX, sliding-pool, dense-row-MAX, and general affine-MAX
+lowerers now live in `renderer/rockchip/pool.py`. Their shared PPU geometry
+guards, CMAC/HWC preparation, scratch planning, and typed rejection paths move
+together, while the ordered registry remains visible in the public compiler.
+
+The main compiler module falls from 2,522 to 2,039 physical lines. Frozen image
+tests and the complete compiler/image/telemetry suite pass; full-tree Mypy and
+Ruff are clean. RK3588 tests cover direct global and sliding PPU work plus
+CMAC-prepared padded and batched affine MAX. This is a byte-preserving module
+split, so native coverage remains `204/40/168/13`.
