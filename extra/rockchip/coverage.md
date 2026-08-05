@@ -4627,3 +4627,30 @@ usable FP32 accumulation path, and the known-good native max-pool regression
 passes afterward. Therefore average mode cannot replace the current numerical
 rejections, and no compiler path or tolerance changes. The probe remains as
 reproducible hardware evidence rather than being hidden in inactive lowering.
+
+## Rejected direct DPU transpose/regroup path
+
+The RK3588 TRM exposes DPU `FEATURE_MODE_CFG.TP_EN`, `RGP_TYPE`, and
+`SURF_LEN`, together with `BS_OW_CFG.TP_ORG_EN` and `RGP_CNTER`. The raw DPU
+surface probe now exposes those fields so the undocumented reformat datapath
+can be characterized without adding an unproven compiler path.
+
+The safe `RGP_TYPE=0, SURF_LEN=0` setting does not change the observable
+scalar-row result: both ordinary and `TP_EN` programs emit atom-head values at
+output atom boundaries. It also does not transpose an 8x8 FP16 matrix: with
+eight channels the output remains the original 0--63 order. The apparently
+natural `RGP_TYPE=3` (16-element cut) configurations time out, both with and
+without `TP_ORG_EN`; the known-good native max-pool regression passes afterward.
+
+An independent RKNN-Toolkit2 2.3.2 model containing ADD, an 8x8 spatial
+transpose, and MUL was inspected as an offline compiler oracle. Its embedded
+command stream uses eight ordinary DPU tasks with `FEATURE_MODE_CFG=0x1e5`;
+none sets `TP_EN`. The vendor compiler therefore does not supply a missing
+known-good transpose register contract for this shape and instead decomposes
+the movement into ordinary surface tasks.
+
+Consequently neither direct DPU transpose nor dynamic CMAC-weight packing is
+enabled. The result narrows the physical-layout search: use compact ordinary
+DPU surface schedules or another proven engine path, while retaining
+selector-CMAC as the bounded correctness fallback. No TestOps coverage,
+limits, or tolerances change.
