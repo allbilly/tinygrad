@@ -2944,3 +2944,13 @@ official `argmax` examples are finite.  Its signed-zero tie winner differs from
 tinygrad's first-occurrence rule, and its kernel-local `uint16` plane still
 needs a proven public-int32 extraction.  The production compiler therefore
 retains the exact semantic rejection until both conditions are solved.
+
+Semantic access maps now validate structurally rather than expanding one index
+per output inside `RKReformatPlan`.  Single-source maps expose exact output
+counts, bounds proofs, streamed values, and affine runs; multi-source grids
+prove bounds from their extents and selector metadata.  Billion-element
+periodic and multi-source regression plans construct without materializing a
+mapping, frozen image hashes are unchanged, 174 compiler tests plus 78 subtests
+pass, and five strict RK3588 movement families remain native.  This is an IR
+scalability milestone and does not change the authoritative `214/40/158/13`
+strict census or any resource/tolerance limit.

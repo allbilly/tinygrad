@@ -1,14 +1,37 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Iterator
+from itertools import chain, repeat
 import math
+
+def _validate_affine_bounds(base:int, stride:int, count:int, source_count:int) -> None:
+  if source_count < 0: raise ValueError("negative RK access source extent")
+  if not count: return
+  end = base+stride*(count-1)
+  if base == -1 and stride == 0: return
+  if min(base,end) < 0 or max(base,end) >= source_count: raise ValueError("RK access map is outside its source")
+
+def _iter_affine_runs(values:tuple[int, ...]) -> Iterator[RKAffineSegment]:
+  start = 0
+  while start < len(values):
+    stride = values[start+1]-values[start] if start+1 < len(values) and values[start] >= 0 and values[start+1] >= 0 else 0
+    end = start+1
+    while end < len(values) and values[end] == values[start]+stride*(end-start) and (values[start] >= 0 or values[end] == -1): end += 1
+    yield RKAffineSegment(values[start],stride,end-start)
+    start = end
 
 @dataclass(frozen=True)
 class RKIdentityMap:
   count: int
   def __post_init__(self):
     if self.count < 0: raise ValueError("negative RK identity extent")
-  def expand(self) -> tuple[int, ...]: return tuple(range(self.count))
+  @property
+  def output_count(self) -> int: return self.count
+  def validate_bounds(self, source_count:int) -> None: _validate_affine_bounds(0,1,self.count,source_count)
+  def values(self) -> Iterator[int]: return iter(range(self.count))
+  def iter_runs(self) -> Iterator[RKAffineSegment]:
+    if self.count: yield RKAffineSegment(0,1,self.count)
+  def expand(self) -> tuple[int, ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
 class RKAffineMap:
@@ -18,7 +41,13 @@ class RKAffineMap:
   def __post_init__(self):
     if self.count < 0 or self.base < -1 or self.base == -1 and self.stride:
       raise ValueError("invalid RK affine access map")
-  def expand(self) -> tuple[int, ...]: return tuple(self.base+self.stride*index for index in range(self.count))
+  @property
+  def output_count(self) -> int: return self.count
+  def validate_bounds(self, source_count:int) -> None: _validate_affine_bounds(self.base,self.stride,self.count,source_count)
+  def values(self) -> Iterator[int]: return (self.base+self.stride*index for index in range(self.count))
+  def iter_runs(self) -> Iterator[RKAffineSegment]:
+    if self.count: yield RKAffineSegment(self.base,self.stride,self.count)
+  def expand(self) -> tuple[int, ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
 class RKPadMap:
@@ -29,8 +58,17 @@ class RKPadMap:
   def __post_init__(self):
     if min(self.prefix,self.source_start,self.source_count,self.suffix) < 0:
       raise ValueError("invalid RK padding access map")
-  def expand(self) -> tuple[int, ...]:
-    return (-1,)*self.prefix+tuple(range(self.source_start,self.source_start+self.source_count))+(-1,)*self.suffix
+  @property
+  def output_count(self) -> int: return self.prefix+self.source_count+self.suffix
+  def validate_bounds(self, source_count:int) -> None:
+    _validate_affine_bounds(self.source_start,1,self.source_count,source_count)
+  def values(self) -> Iterator[int]:
+    return chain(repeat(-1,self.prefix),range(self.source_start,self.source_start+self.source_count),repeat(-1,self.suffix))
+  def iter_runs(self) -> Iterator[RKAffineSegment]:
+    if self.prefix: yield RKAffineSegment(-1,0,self.prefix)
+    if self.source_count: yield RKAffineSegment(self.source_start,1,self.source_count)
+    if self.suffix: yield RKAffineSegment(-1,0,self.suffix)
+  def expand(self) -> tuple[int, ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
 class RKPeriodicMap:
@@ -38,7 +76,14 @@ class RKPeriodicMap:
   repeats: int
   def __post_init__(self):
     if not self.pattern or self.repeats < 2: raise ValueError("invalid RK periodic access map")
-  def expand(self) -> tuple[int, ...]: return self.pattern*self.repeats
+  @property
+  def output_count(self) -> int: return len(self.pattern)*self.repeats
+  def validate_bounds(self, source_count:int) -> None:
+    if any(value < -1 or value >= source_count for value in self.pattern): raise ValueError("RK periodic map is outside its source")
+  def values(self) -> Iterator[int]: return (value for _ in range(self.repeats) for value in self.pattern)
+  def iter_runs(self) -> Iterator[RKAffineSegment]:
+    for _ in range(self.repeats): yield from _iter_affine_runs(self.pattern)
+  def expand(self) -> tuple[int, ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
 class RKAffineSegment:
@@ -48,18 +93,32 @@ class RKAffineSegment:
   def __post_init__(self):
     if self.count <= 0 or self.base < -1 or self.base == -1 and self.stride:
       raise ValueError("invalid RK piecewise-affine segment")
-  def expand(self) -> tuple[int, ...]: return tuple(self.base+self.stride*index for index in range(self.count))
+  def validate_bounds(self, source_count:int) -> None: _validate_affine_bounds(self.base,self.stride,self.count,source_count)
+  def values(self) -> Iterator[int]: return (self.base+self.stride*index for index in range(self.count))
+  def expand(self) -> tuple[int, ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
 class RKPiecewiseAffineMap:
   segments: tuple[RKAffineSegment, ...]
   def __post_init__(self):
     if not self.segments: raise ValueError("empty RK piecewise-affine access map")
-  def expand(self) -> tuple[int, ...]: return tuple(value for segment in self.segments for value in segment.expand())
+  @property
+  def output_count(self) -> int: return sum(segment.count for segment in self.segments)
+  def validate_bounds(self, source_count:int) -> None:
+    for segment in self.segments: segment.validate_bounds(source_count)
+  def values(self) -> Iterator[int]: return (value for segment in self.segments for value in segment.values())
+  def iter_runs(self) -> Iterator[RKAffineSegment]: return iter(self.segments)
+  def expand(self) -> tuple[int, ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
 class RKStaticSelectorMap:
   indexes: tuple[int, ...]
+  @property
+  def output_count(self) -> int: return len(self.indexes)
+  def validate_bounds(self, source_count:int) -> None:
+    if any(value < -1 or value >= source_count for value in self.indexes): raise ValueError("RK selector map is outside its source")
+  def values(self) -> Iterator[int]: return iter(self.indexes)
+  def iter_runs(self) -> Iterator[RKAffineSegment]: return _iter_affine_runs(self.indexes)
   def expand(self) -> tuple[int, ...]: return self.indexes
 
 RKAccessMap = RKIdentityMap|RKAffineMap|RKPadMap|RKPeriodicMap|RKPiecewiseAffineMap|RKStaticSelectorMap
@@ -74,6 +133,9 @@ class RKMultiSourceAffineSegment:
     if self.source < 0 or self.base < 0 or self.count <= 0: raise ValueError("invalid RK multi-source affine segment")
   def values(self) -> Iterator[tuple[int,int]]:
     return ((self.source,self.base+self.stride*index) for index in range(self.count))
+  def validate_bounds(self, source_counts:tuple[int, ...]) -> None:
+    if self.source >= len(source_counts): raise ValueError("RK multi-source segment selects an unknown source")
+    _validate_affine_bounds(self.base,self.stride,self.count,source_counts[self.source])
 
 @dataclass(frozen=True)
 class RKMultiSourceAccessMap:
@@ -84,6 +146,8 @@ class RKMultiSourceAccessMap:
   def count(self) -> int: return sum(segment.count for segment in self.segments)
   def values(self) -> Iterator[tuple[int,int]]:
     return (value for segment in self.segments for value in segment.values())
+  def validate_bounds(self, source_counts:tuple[int, ...]) -> None:
+    for segment in self.segments: segment.validate_bounds(source_counts)
   def expand(self) -> tuple[tuple[int,int], ...]: return tuple(self.values())
 
 @dataclass(frozen=True)
@@ -113,6 +177,13 @@ class RKMultiSourceAffineGridMap:
       selector = coordinates[self.selector_axis]
       source_index = self.selector_bases[selector]+sum(coordinate*stride for coordinate,stride in zip(coordinates,self.source_strides))
       yield self.selector_sources[selector],source_index
+  def validate_bounds(self, source_counts:tuple[int, ...]) -> None:
+    other_max = sum((extent-1)*stride for axis,(extent,stride) in enumerate(zip(self.extents,self.source_strides))
+                    if axis != self.selector_axis)
+    selector_stride = self.source_strides[self.selector_axis]
+    for coordinate,(source,base) in enumerate(zip(self.selector_sources,self.selector_bases)):
+      if source >= len(source_counts) or base+coordinate*selector_stride+other_max >= source_counts[source]:
+        raise ValueError("RK multi-source grid is outside its source")
   def expand(self) -> tuple[tuple[int,int], ...]: return tuple(self.values())
 
 RKMultiSourceMap = RKMultiSourceAccessMap|RKMultiSourceAffineGridMap

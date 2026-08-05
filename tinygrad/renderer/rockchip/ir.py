@@ -373,9 +373,9 @@ class RKReformatPlan:
   fill: float = 0.0
   def __post_init__(self):
     out_count, src_count = math.prod(self.out.layout.logical_shape), math.prod(self.src.layout.logical_shape)
-    mapping = self.access.expand()
-    if len(mapping) != out_count or any(index < -1 or index >= src_count for index in mapping):
+    if self.access.output_count != out_count:
       raise ValueError("RKReformatPlan mapping is outside its logical surfaces")
+    self.access.validate_bounds(src_count)
   @property
   def mapping(self) -> tuple[int, ...]: return self.access.expand()
 
@@ -388,9 +388,7 @@ class RKMultiSourceReformatPlan:
   def __post_init__(self):
     if not self.sources or self.access.count != math.prod(self.out.layout.logical_shape):
       raise ValueError("RK multi-source reformat has an invalid output map")
-    if any(source < 0 or source >= len(self.sources) or index < 0 or
-           index >= math.prod(self.sources[source].layout.logical_shape) for source,index in self.access.values()):
-      raise ValueError("RK multi-source reformat mapping is outside its logical surfaces")
+    self.access.validate_bounds(tuple(math.prod(source.layout.logical_shape) for source in self.sources))
   @property
   def mapping(self) -> tuple[tuple[int,int], ...]: return self.access.expand()
 

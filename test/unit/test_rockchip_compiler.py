@@ -9,8 +9,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContractionPlan, RKCMACTask, RKConvTask, RKDeconvTask, RKConvPlan,
   RKCopyStage, RKCastStage, RKDPUProgram,
   RKEpilogue, RKEngine,
-  RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
-  RKMultiSourceAffineGridMap,
+  RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKIdentityMap, RKAffineMap, RKPadMap, RKPeriodicMap,
+  RKAffineSegment, RKPiecewiseAffineMap, RKStaticSelectorMap, RKMultiSourceAffineGridMap,
   RKFusedALUStage, RKFusedMulStage, RKStridedAtomGatherStage, RKLowerKind, RKProgram, RKReduce, RKPool,
   RKReformatPlan, RKMultiSourceReformatPlan,
   RKLegalizedReformat,
@@ -1843,6 +1843,33 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertIsInstance(legalized.plan.access,access_type)
         self.assertEqual(len(legalized.plan.mapping),math.prod(legalized.plan.out.layout.logical_shape))
         self.assertFalse(contains_uop(legalized))
+
+  def test_semantic_access_maps_validate_structurally(self):
+    billion = 1_000_000_000
+    source = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((4,),(4,),(2,),dtypes.half))
+    output = RKTensorRef(RKArg(RKBufferKind.ARG,0),RKLayout((4*billion,),(4*billion,),(2,),dtypes.half))
+    access = RKPeriodicMap((0,1,2,3),billion)
+    plan = RKReformatPlan(output,source,access)
+    self.assertEqual(plan.access.output_count,4*billion)
+    run = next(access.iter_runs())
+    self.assertEqual((run.base,run.stride,run.count),(0,1,4))
+    with self.assertRaises(ValueError):
+      RKReformatPlan(RKTensorRef(output.buffer,RKLayout((2,),(2,),(2,),dtypes.half)),source,RKAffineMap(3,1,2))
+    with self.assertRaises(ValueError):
+      RKReformatPlan(RKTensorRef(output.buffer,RKLayout((1,),(1,),(2,),dtypes.half)),source,RKStaticSelectorMap((4,)))
+
+    grid = RKMultiSourceAffineGridMap((3,billion),(1,3),(0,1),0,(0,1,2),(0,0,0))
+    sources = tuple(RKTensorRef(RKArg(RKBufferKind.ARG,index+1),RKLayout((billion,),(billion,),(2,),dtypes.half))
+                    for index in range(3))
+    multi = RKMultiSourceReformatPlan(
+      RKTensorRef(output.buffer,RKLayout((3,billion),(3,billion),(billion*2,2),dtypes.half)),sources,grid)
+    self.assertEqual(multi.access.count,3*billion)
+    short_sources = (*sources[:2],RKTensorRef(sources[2].buffer,RKLayout((billion-1,),(billion-1,),(2,),dtypes.half)))
+    with self.assertRaises(ValueError): RKMultiSourceReformatPlan(multi.out,short_sources,grid)
+
+    self.assertEqual([tuple((run.base,run.stride,run.count) for run in mapping.iter_runs()) for mapping in
+      (RKIdentityMap(4),RKPadMap(2,1,2,3),RKPiecewiseAffineMap((RKAffineSegment(3,-1,4),)))],
+      [((0,1,4),),((-1,0,2),(1,1,2),(-1,0,3)),((3,-1,4),)])
 
   def test_windowed_reformat_uses_one_compact_64_output_contract(self):
     result = lower_reformat_result(sink(Tensor.empty(8,8,dtype=dtypes.half).T.contiguous()))

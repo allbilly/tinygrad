@@ -5570,3 +5570,27 @@ tried directly, compact native layout conversion is preferred when proven,
 selector-CMAC remains a bounded correctness fallback, and an over-limit
 dynamic reformat stays `MIXED` or rejected.  No resource ceiling, tolerance,
 fallback classification, or authoritative census changes in this audit.
+
+## Structural compact-access validation
+
+Semantic reformat plans no longer expand compact access maps merely to validate
+their output extent and source bounds.  Identity, affine, padding, periodic,
+piecewise-affine, and static-selector maps now expose a common structural
+contract: `output_count`, `validate_bounds`, streamed values, and affine-run
+iteration.  Multi-source affine segments and grids likewise prove their source
+bounds from segment endpoints and grid extents instead of visiting every output.
+
+The regression constructs valid periodic and three-source grid plans containing
+four and three billion logical outputs respectively.  Construction and bounds
+checking remain constant in the number of structural segments; no tensor data
+or element-per-output tuple is allocated.  Explicit `mapping` expansion remains
+available only as a debugging/test oracle and selector legalization continues
+to expand bounded tiles when it actually needs individual coordinates.
+
+Frozen reformat RKImage hashes are unchanged.  The complete compiler suite
+passes 174 tests plus 78 subtests, repository Ruff and full tinygrad mypy are
+clean, and strict fallback-disabled RK3588 checks for transpose, permute, pad,
+repeat, and multi-source concatenation pass in 127.97 seconds.  This is an IR
+scalability milestone; it changes no coverage classification, task ceiling,
+constant ceiling, tolerance, or fallback rule.  The authoritative strict census
+remains `214 PASS_NATIVE / 40 PASS_FRONTEND / 158 FAIL / 13 SKIP_UPSTREAM`.
