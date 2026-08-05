@@ -2104,3 +2104,20 @@ continuation. Non-exact two-level average scales still reject with
 `NUMERICAL_CONTRACT`; the compiler does not round the reciprocal, retry on the
 CPU, or relax the official tolerance. This negative hardware milestone does
 not change the authoritative `204/40/168/13` census.
+
+## Rejected full-domain EXP2 substitution for Softmin
+
+The generated full-domain EXP2 range reducer can replace the bounded EXP
+recipe mechanically, and doing so makes the final multi-broadcast Softmin
+kernel compile natively. It does not meet the existing numerical contract.
+The unchanged ordinary EXP method misses 81 of 2,925 FP16 outputs with maximum
+relative error `0.001703`; Softmin misses 516 of 2,925 with maximum relative
+error `0.00321`. The official limits remain `rtol=0.001` (and Softmin
+`atol=1e-7`).
+
+The substitution is disabled and preserved as
+`wip-full-domain-exp2-softmin-official-mismatch-20260805.patch` (SHA-256
+`c44c769d345e89b3d633c76cf45684908403c119582b88b17f0d31f79ecf559a`). Softmin keeps
+its pre-submission `LUT_DOMAIN_UNPROVEN` rejection. A future solution needs a
+more accurate range-reduced exponential or fused normalization, not a broader
+domain claim for the current tables.

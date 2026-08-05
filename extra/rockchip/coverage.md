@@ -4171,3 +4171,22 @@ high-precision reciprocal for an FP32-to-FP16 CMAC result. Exact FP32
 accumulator epilogues remain enabled, while 1/9, 1/6, and other non-FP16-exact
 two-level scales retain their pre-submission `NUMERICAL_CONTRACT` rejection.
 No method status changes and the authoritative census remains `204/40/168/13`.
+
+## Rejected full-domain EXP2 replacement for Softmin
+
+Replacing the existing bounded EXP construction with
+`EXP2_RANGE_REDUCED(x * log2(e))` removes the compile-time domain rejection and
+executes the complete Softmin graph on RK3588. The hardware result is not
+accurate enough at the unchanged official tolerances:
+
+| method | mismatches | outputs | max relative error |
+|---|---:|---:|---:|
+| `test_exp` | 81 | 2,925 | 0.001703 |
+| `test_softmin` | 516 | 2,925 | 0.00321 |
+
+Softmin's largest absolute mismatch is `6.104e-05`; ordinary EXP reaches
+`0.007812`. No tolerance was relaxed and the active bounded EXP recipe and
+`LUT_DOMAIN_UNPROVEN` guard are restored. The exact experiment is archived as
+`wip-full-domain-exp2-softmin-official-mismatch-20260805.patch` (SHA-256
+`c44c769d345e89b3d633c76cf45684908403c119582b88b17f0d31f79ecf559a`) for future LUT
+or fused-normalization work. The authoritative census remains `204/40/168/13`.
