@@ -12,43 +12,44 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `68c4d8272` contains exactly 425 telemetry method
-records: 204 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 168 `FAIL`, and 13
+The complete uncached run at `ad42acf8f` contains exactly 425 telemetry method
+records: 206 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 166 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0` and `CACHELEVEL=0` were set throughout,
 with `DEV=ROCKCHIP`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`. Raw pytest
-reports 3,488.50 seconds. No NPU timeout, invalid submission, reset failure,
+reports 3,515.87 seconds. No NPU timeout, invalid submission, reset failure,
 process abort, fallback execution, or unclassified failure occurred.
 
-The result exactly preserves the preceding 204-pass method census after the
-one-task K=128 GEMM characterization; no method changes status. Every one of
-the 168 failures is a typed native reject with a retained method-level first
-reject. Their first-reject Pareto is 53 unsupported-output-dtype, 35
+The result confirms exactly two transitions from the preceding 204-pass method
+census: `test_matvec` and `test_matvecmat` are now native through the bounded
+row-major K128 pack and the proven one-task broad CMAC compute. Every one of
+the 166 failures is a typed native reject with a retained method-level first
+reject. Their first-reject Pareto is 53 unsupported-output-dtype, 33
 plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 16
 numerical-contract, 12 unsupported-ALU, five requires-reformat, two
 unaligned-row, and one LUT-domain-unproven.
 
-Across passing and partially passing methods, 654 successful native kernels
-contain 590 `EFFICIENT` and 64 `CORRECTNESS_FALLBACK` plans. The 204 fully
-native methods contain 560 kernels: 506 efficient and 54 correctness
-fallbacks. At method level, 169 are fully efficient and 35 contain a
+Across passing and partially passing methods, 657 successful native kernels
+contain 590 `EFFICIENT` and 67 `CORRECTNESS_FALLBACK` plans. The 206 fully
+native methods contain 563 kernels: 506 efficient and 57 correctness
+fallbacks. At method level, 169 are fully efficient and 37 contain a
 correctness fallback. The maximum remains 399
 tasks; no task or constant ceiling changed. The worst single-kernel wall time
-is 42.64 seconds, and the largest generated constant payload is 1,819,392
+is 42.63 seconds, and the largest generated constant payload is 1,819,392
 bytes. These costs remain visible rather than being hidden by the native pass
 count.
 
-The durable artifacts are `/home/orangepi/rk_results/test_ops_68c4d8272.log`,
+The durable artifacts are `/home/orangepi/rk_results/test_ops_ad42acf8f.log`,
 `.xml`, and `.json`. Their SHA-256 values are respectively
-`15ebf673a0db46f084c68d3bf1d39702fd3edd2792fa62b2c202fac0e8e847ef`,
-`8336ef4f6bfc82bf38bc8cab5c75dd066631be4bc5f16eb61de7420caa003577`, and
-`ef19a451a6146cb88bb282c3f11791b4490a38c0c8309a34da0964c56a451606`. The
+`68f6279ebc89466d2ffb10b2d1ccb871691cdd9c18adae8e02098fe38645bf4d`,
+`489c76e27616ef29dd964d93c4c6ee6dafc4b8d05c2a1f8daedd85fef7c437cf`, and
+`908d32d05d61c8447f0464c0d75c2ae9467399c0a29548bbd9805ea4ad704b77`. The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through the one-task K=128 GEMM boundary are now
+All focused milestones through the native row-major K128 matvec pack are now
 authoritative.
 The chronological sections below retain the individual focused evidence and
 their then-current estimates for debugging history.

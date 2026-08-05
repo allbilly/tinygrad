@@ -6,9 +6,9 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `2385767d1` is 204 native,
-40 frontend-only, 168 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed in 3,375.14 seconds without an NPU timeout,
+The current authoritative uncached strict census at `ad42acf8f` is 206 native,
+40 frontend-only, 166 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed in 3,515.87 seconds without an NPU timeout,
 reset failure, invalid submission, process abort, numerical mismatch, or
 unclassified failure. Coverage details, the checkout-local pytest-plugin
 invocation, reject Pareto, plan-cost histograms, and durable artifact hashes
