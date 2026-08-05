@@ -78,6 +78,19 @@ class RKFusedALUStage:
     if not 0 < self.count <= 8: raise ValueError("RK fused DPU arithmetic needs one eight-channel atom")
 
 @dataclass(frozen=True)
+class RKFusedMulStage:
+  """Multiply four compact FP16 channel vectors through BS, BN, and EW; WDMA writes whole eight-channel atoms."""
+  dst: RKArg
+  main: RKArg
+  bs: RKArg
+  bn: RKArg
+  ew: RKArg
+  count: int
+  def __post_init__(self):
+    if not 0 < self.count <= 256: raise ValueError("RK fused DPU multiply requires 1..256 channels")
+    if self.count > 8 and self.count%8: raise ValueError("RK fused DPU multiply requires complete atoms after the first eight channels")
+
+@dataclass(frozen=True)
 class RKStridedAtomGatherStage:
   """Gather one aligned eight-lane FP16 atom from each strided source row."""
   dst: RKArg
@@ -125,7 +138,7 @@ class RKLUTStage:
   src: RKArg
   count: int
 
-RKDPUStage = RKALUStage|RKFusedALUStage|RKStridedAtomGatherStage|RKCopyStage|RKCastStage|RKMaskStage|RKLUTStage
+RKDPUStage = RKALUStage|RKFusedALUStage|RKFusedMulStage|RKStridedAtomGatherStage|RKCopyStage|RKCastStage|RKMaskStage|RKLUTStage
 
 @dataclass(frozen=True)
 class RKScratch:

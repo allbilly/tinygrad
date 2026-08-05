@@ -4964,3 +4964,27 @@ a general full-row concatenate/transpose engine.
 The complete compiler regression has 169 tests plus 77 subtests passing with
 `-n12`. The full 425-method census remains `213/40/159/13`; this milestone does
 not claim a new TestOps pass.
+
+## Fused BS/BN/EW multiplication boundary
+
+WHERE already exercises BS and BN as part of the DPU mask pipeline. A new
+typed physical stage isolates the broader hardware capability described by
+`allbilly/rk3588`: main MRDMA data can be multiplied by independent BRDMA,
+NRDMA, and ERDMA FP16 surfaces in one task. The emitted geometry is one row of
+compact channels with external BS/BN multipliers, EW MUL, and
+`SURFACE_ADD=0x10`.
+
+The locked hardware matrix is exact against a four-way FP32 product rounded
+once to FP16 at counts 1, 7, 8, 16, 64, and 256. WDMA writes full eight-channel
+atoms, so the first three cases intentionally verify that memory after the
+rounded physical atom remains untouched. A multi-atom partial tail is not
+legal: count 15 timed out and is now rejected by `RKFusedMulStage` before
+submission. Count 256 is the largest accepted contract; earlier raw probes of
+511 and 1,022 channels also timed out.
+
+The compiler regression is now 170 tests plus 77 subtests. Ruff and full mypy
+are clean. Base-4 prefix-product simulation is retained as negative numerical
+evidence: despite fewer mismatches than base-2, it still fails official
+tolerance on general multidimensional FP16 inputs. Consequently this commit
+adds no cumulative-product pass and leaves the authoritative census at
+`213/40/159/13`.

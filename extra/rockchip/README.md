@@ -2623,3 +2623,28 @@ and several pooling paths use host NumPy or host materialization. Only the
 hardware formulas and decompositions are reusable; the CPU execution paths are
 not valid native backend implementations. The authoritative census is now
 `213 PASS_NATIVE / 40 PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM`.
+
+## Fused BS/BN/EW multiplication
+
+The existing WHERE/mask emitter already uses the DPU's BS and BN pipeline to
+shape a comparison mask. The Rockchip README/TRM evidence goes further: BRDMA
+can supply an external BS multiplier, NRDMA can supply an external BN
+multiplier, and ERDMA can supply an EW multiplier in the same task. A typed
+`RKFusedMulStage` now records that reusable physical operation separately from
+WHERE semantics.
+
+Locked RK3588 probes prove one compact task computes
+`main * bs * bn * ew`, with one FP16 write after the internal FP32 pipeline,
+for 1--8 channels and complete eight-channel atoms through 256 channels. WDMA
+writes the complete first atom for sub-eight logical counts. Counts greater
+than eight that are not divisible by eight are illegal: the raw 15-channel
+task timed out, so the typed IR rejects it and requires compiler padding.
+
+The probe covers counts 1, 7, 8, 16, 64, and 256, checks the exact FP32-once
+result, and protects the allocation after the rounded physical atom with a
+canary. This capability does not by itself make cumulative product legal. A
+modeled base-4 prefix scan reduces the error versus the older pairwise scan,
+but still misses the unchanged TestOps tolerance on multidimensional random
+inputs. It therefore remains a numerical experiment rather than production
+scan lowering. No TestOps status or resource ceiling changes in this hardware
+milestone.

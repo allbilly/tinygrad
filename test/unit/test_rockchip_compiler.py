@@ -11,7 +11,8 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
   RKMultiSourceAffineGridMap,
-  RKFusedALUStage, RKStridedAtomGatherStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan,
+  RKFusedALUStage, RKFusedMulStage, RKStridedAtomGatherStage, RKLowerKind, RKProgram, RKReduce, RKPool,
+  RKReformatPlan, RKMultiSourceReformatPlan,
   RKLegalizedReformat,
   RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_cmac_task, emit_dpu, emit_program, emit_reduce,
@@ -50,6 +51,28 @@ def contains_uop(obj) -> bool:
   return False
 
 class TestDPUCompiler(unittest.TestCase):
+  def test_fused_bs_bn_ew_multiply_emits_compact_256_channel_task(self):
+    args = tuple(RKArg(RKBufferKind.ARG,index) for index in range(5))
+    stage = RKFusedMulStage(args[0],args[1],args[2],args[3],args[4],256)
+    program = RKProgram((RKDPUProgram((stage,)),))
+    image = emit_program(program)
+    self.assertEqual(len(image.stages),1)
+    commands = {(command>>48,command&0xffff):(command>>16)&0xffffffff for command in image.stages[0].commands}
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_DATA_CUBE_WIDTH)],0)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_DATA_CUBE_CHANNEL)],0xff00ff)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_BS_CFG)],0x42)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_BN_CFG)],0x42)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_SURFACE_ADD)],0x10)
+    self.assertEqual((commands[(0x2001,0x501c)],commands[(0x2001,0x5028)]),(8,8))
+    self.assertEqual({reloc.word for reloc in image.stages[0].relocs},
+                     {index for index,command in enumerate(image.stages[0].commands) if command&0xffff in
+                      (rk.REG_DPU_DST_BASE_ADDR,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,0x5020,0x502c,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR)})
+    cost = plan_cost(program)
+    self.assertEqual((cost.task_count,cost.estimated_read_bytes,cost.estimated_write_bytes,cost.estimated_macs),(1,2048,512,768))
+    self.assertFalse(contains_uop(program))
+    with self.assertRaises(ValueError): RKFusedMulStage(*args,15)
+    with self.assertRaises(ValueError): RKFusedMulStage(*args,257)
+
   def test_strided_atom_gather_emits_proven_surface_geometry(self):
     plan = RKDPUProgram((RKStridedAtomGatherStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),128,128),))
     image = emit_dpu(plan)
