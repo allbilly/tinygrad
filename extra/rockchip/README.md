@@ -2139,3 +2139,13 @@ and direct output compaction for this schedule. Those contracts must be proven
 before promoting channel-split convolution; no CPU packing, tolerance change,
 or task-limit increase is permitted. The authoritative census remains
 `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
+
+The deterministic offline follow-up
+`extra/rockchip/probe_conv_ic_split_rounding.py` closes that immediate compiler
+route for `test_simple_conv2d_1x1_m4`. Using the test's seeded FP16 tensors and
+official `rtol=1e-3, atol=1e-6`, sequential one-channel partials miss 4,458 of
+16,384 outputs and four-channel partials miss 2,286. A balanced tree still
+misses 3,761 and 2,269 respectively. Therefore, the compiler must not use the
+proven FP16 ERDMA continuation for this TestOps contraction. It needs a flying
+FP32 per-spatial continuation, a single unsplit CNA accumulation over a legal
+input layout, or another schedule with equivalent accumulation semantics.

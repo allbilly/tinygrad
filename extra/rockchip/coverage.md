@@ -4218,3 +4218,21 @@ compiler still needs typed accumulator-layout and output-compaction support.
 The probe is therefore retained as a hardware oracle only. No method status,
 cost ceiling, or numerical tolerance changes, and the authoritative count stays
 `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
+
+The exact `test_simple_conv2d_1x1_m4` input distribution was then evaluated
+offline before adding any compiler path. Every channel-split schedule that
+stores FP16 partials violates the official `rtol=1e-3, atol=1e-6` contract:
+
+| channels per CNA partial | accumulation | mismatches / 16,384 | max abs |
+|---:|---|---:|---:|
+| 1 | sequential | 4,458 | 0.0234375 |
+| 1 | balanced | 3,761 | 0.015625 |
+| 4 | sequential | 2,286 | 0.015625 |
+| 4 | balanced | 2,269 | 0.015625 |
+
+`probe_conv_ic_split_rounding.py` reproduces the complete 1/2/4/8-channel
+table using the seeded TestOps tensors and PyTorch's HALF convolution as the
+reference. This rejects the tempting 16-CNA-task plus FP16-ERDMA design before
+it enters lowering. The remaining valid directions are direct physical input
+layout legalization for one unsplit convolution or a proven per-spatial FP32
+accumulator continuation.
