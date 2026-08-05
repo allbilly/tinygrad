@@ -105,6 +105,7 @@ def main() -> None:
   parser.add_argument("--mc-surf-out",action="store_true",help="enable PPU multiple-surface output")
   parser.add_argument("--ties",action="store_true",help="fill the input with equal values to characterize index tie-breaking")
   parser.add_argument("--signed-zero",action="store_true",help="characterize positive/negative-zero values and indices")
+  parser.add_argument("--int32-pairs",action="store_true",help="force odd lanes to index zero and decode index pairs as int32")
   args = parser.parse_args()
   dev, rng = RockchipDevice("ROCKCHIP"), np.random.default_rng(42)
   case = _CASES[args.case]+(0,0,0,0) if args.case is not None else _PAD_CASES[args.padding_case]
@@ -114,6 +115,9 @@ def main() -> None:
       values.fill(0)
       values.reshape(-1,channels)[0] = np.array([0 if channel%2 == 0 else -0.0 for channel in range(channels)],dtype=np.float16)
       values.reshape(-1,channels)[1] = np.array([-0.0 if channel%2 == 0 else 0 for channel in range(channels)],dtype=np.float16)
+    if args.int32_pairs:
+      values[...,1::2] = 100 if args.minimum else -100
+      values.reshape(-1,channels)[0,1::2] = -100 if args.minimum else 100
     expected = reference(values,kh,kw,sy,sx,(pt,pb,pl,pr),args.average,args.minimum)
     output_bytes = max(expected.nbytes*(4 if args.index else 1),4096 if args.index else expected.nbytes)
     src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(output_bytes)
@@ -153,6 +157,11 @@ def main() -> None:
               f"expected_local_head={expected_local[:16].tolist()} mismatch_positions={index_mismatches[:16].tolist()} "
               f"mismatch_actual={actual_index[index_mismatches[:16]].tolist()} "
               f"mismatch_expected={expected_hw[index_mismatches[:16]].tolist()} row_matches={row_matches}")
+        if args.int32_pairs:
+          actual_i32 = index_plane.view(np.uint32)[:expected_local.size//2]
+          expected_i32 = expected_hw.reshape(-1,2)[:,0].astype(np.uint32)
+          print(f"int32_exact={np.array_equal(actual_i32,expected_i32)} actual_i32={actual_i32.tolist()} "
+                f"expected_i32={expected_i32.tolist()}")
     finally:
       dev._gpu_free(src)
       dev._gpu_free(out)

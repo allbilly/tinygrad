@@ -5390,3 +5390,23 @@ This is positive hardware evidence for a future typed global-pool value/index
 plan, while preserving exact rejection for sliding indices, signed-zero cases,
 and missing native `uint16 -> int32` conversion.  No method total, tolerance,
 resource ceiling, or fallback classification changes in this milestone.
+
+### Native int32 index packing without a cast task
+
+PPU process precision five is not a wider index-output mode: even the proven
+one-output global MAX geometry times out when `PROC_PRECISION=5`.  The ordinary
+FP16 PPU plane can nevertheless form public int32 indices by construction.
+Each desired reduction occupies an even HWC8 lane, and its adjacent odd guard
+lane is forced to win at kernel position zero.  The PPU consequently writes
+the `uint16` pair `[desired_index, 0]`; on little-endian RK3588 that same four
+bytes are the exact nonnegative int32 index.
+
+`--case 10 --index --int32-pairs` proves four simultaneous MAX indices, and
+adding `--minimum` proves the same representation for MIN.  Both retain
+bit-exact FP16 values and exact kernel positions.  This removes the need for
+the already-rejected DPU int16 conversion when a compiler plan can arrange the
+guard lanes.  It is not yet a general argmax/cumulative contract: sliding-row
+indices remain uncharacterized, hardware positions are kernel-local, and MAX
+or MIN deliberately choose the positive- or negative-zero occurrence instead
+of preserving first-occurrence signed-zero semantics.  Compiler lowering stays
+disabled until those legality conditions or repairs are explicit.
