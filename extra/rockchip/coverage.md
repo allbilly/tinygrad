@@ -5487,3 +5487,26 @@ No compiler path is enabled from hardware evidence alone.  The probe records a
 candidate primitive for aligned physical layouts and prevents the broader,
 incorrect conclusion that BS/BN fusion solves arbitrary tinygrad broadcasting.
 The authoritative hybrid census and every resource ceiling remain unchanged.
+
+## Direct CONV bias/ReLU before FP16 writeback
+
+Convolution output is the first aligned physical surface that can consume the
+measured channel-broadcast primitive without another reformat.  A standalone
+RK3588 probe applies a contiguous FP32 bias through BRDMA/BS to flying
+pointwise convolutions with every output-channel count from one through sixteen;
+all are bit-exact with both BS ReLU disabled and enabled.  The probe rejects the
+tempting CMAC-style grouped bias arrangement for channels above four and thereby
+records CONV's distinct contiguous operand layout.
+
+The typed convolution plan/task now carries `RKEpilogue`.  The NCHW spatial
+lowerer packs a direct channel bias into the established 32-lane FP32 operand
+layout, and the emitter applies it inside the CNA/CORE/DPU task.  This avoids a
+post-writeback FP16 addition and its different rounding boundary.
+
+Focused strict testing keeps `test_simple_conv2d_bias`, `test_simple_conv2d`,
+and the nested `test_biased_conv2d` exact.  The single biased convolution drops
+from 199 tasks and 21.26 seconds to 30 tasks and 3.20 seconds.  Its physical
+composition changes from `140 CMAC + 59 DPU` to `17 CMAC + 12 DPU + 1 CONV`;
+constant payload grows from 399,008 to 476,576 bytes, which remains visible in
+cost telemetry.  This is a native-quality improvement, not a method-count gain.
+No test tolerance, fallback rule, task ceiling, or constant ceiling changes.

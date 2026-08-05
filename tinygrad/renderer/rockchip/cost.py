@@ -49,6 +49,8 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
     elif isinstance(step, RKConvTask):
       reads += math.prod(step.src.layout.logical_shape)*step.src.layout.dtype.itemsize
       reads += math.prod(step.weight.layout.logical_shape)*step.weight.layout.dtype.itemsize
+      if step.epilogue is not None and step.epilogue.bias is not None:
+        reads += math.prod(step.epilogue.bias.layout.logical_shape)*step.epilogue.bias.layout.dtype.itemsize
       writes += step.out_channels*step.output_height*step.output_width*2
       macs += step.out_channels*step.output_height*step.output_width*step.in_channels*step.kernel_height*step.kernel_width
     elif isinstance(step, RKLegalizedReformat):

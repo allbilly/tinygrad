@@ -547,13 +547,35 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
     matches = tuple(i for i,command in enumerate(commands) if command>>48 == target and command&0xffff == register)
     if len(matches) != 1: raise ValueError(f"expected one relocation command for register 0x{register:x}")
     return matches[0]
-  relocs = (RKReloc(0,command_word(_TARGET_CNA,rk.REG_CNA_FEATURE_DATA_ADDR),plan.src.buffer.kind,plan.src.buffer.index,
+  relocs = [RKReloc(0,command_word(_TARGET_CNA,rk.REG_CNA_FEATURE_DATA_ADDR),plan.src.buffer.kind,plan.src.buffer.index,
                     plan.src.buffer.addend+plan.src.layout.base_offset),
             RKReloc(0,command_word(_TARGET_CNA,rk.REG_CNA_DCOMP_ADDR0),plan.weight.buffer.kind,plan.weight.buffer.index,
                     plan.weight.buffer.addend+plan.weight.layout.base_offset),
             RKReloc(0,command_word(_TARGET_DPU,rk.REG_DPU_DST_BASE_ADDR),plan.out.buffer.kind,plan.out.buffer.index,
-                    plan.out.buffer.addend+plan.out.layout.base_offset))
-  return RKImage(target, (RKStage(RKEngine.CONV, commands, relocs, RK_STAGE_RESET),))
+                    plan.out.buffer.addend+plan.out.layout.base_offset)]
+  if plan.epilogue is not None:
+    bias = plan.epilogue.bias
+    if bias is None or bias.layout.dtype is not dtypes.float or bias.layout.physical_shape != (32,) or bias.layout.strides_bytes != (4,):
+      raise ValueError("CONV fused bias must be one 32-channel FP32 surface")
+    mutable = list(commands)
+    if mutable[-1] != _command(_TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0xd): raise ValueError("CONV operation enable is not last")
+    mutable.pop()
+    mutable = [_command(_TARGET_DPU,rk.REG_DPU_BS_CFG,0x20110 if plan.epilogue.relu else 0x20150)
+               if command>>48 == _TARGET_DPU and command&0xffff == rk.REG_DPU_BS_CFG else command for command in mutable]
+    mutable.extend(_command(_TARGET_DPU,reg,value) for reg,value in ((rk.REG_DPU_BS_ALU_CFG,0),(rk.REG_DPU_BS_MUL_CFG,0)))
+    mutable.extend(_command(_TARGET_DPU_RDMA,reg,value) for reg,value in (
+      (rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,ow-1),
+      (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,oh-1),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,15),
+      (_REG_DPU_RDMA_BRDMA_CFG,2)))
+    bias_word = len(mutable)
+    mutable.append(_command(_TARGET_DPU_RDMA,_REG_DPU_RDMA_BS_BASE_ADDR,0))
+    relocs.append(RKReloc(0,bias_word,bias.buffer.kind,bias.buffer.index,bias.buffer.addend+bias.layout.base_offset))
+    mutable.extend(_command(_TARGET_DPU_RDMA,reg,value) for reg,value in (
+      (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,1),(rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,0x2f850),
+      (_REG_DPU_RDMA_WEIGHT,0x01010101)))
+    mutable.append(_command(_TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x1d))
+    commands = tuple(mutable)
+  return RKImage(target, (RKStage(RKEngine.CONV, commands, tuple(relocs), RK_STAGE_RESET),))
 
 def emit_program(plan:RKProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
   """Compose arbitrary typed engine steps into one ordered sequential image."""

@@ -794,9 +794,11 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
   stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
+  stored = _strip_casts(store.src[1])
+  fused_epilogue = None if stored.key == reduce.key else _contract_bias_epilogue(stored,reduce)
   if reduce.arg[0] is not Ops.ADD or len(reduce.src) not in (2,4) or store.src[0].op is not Ops.INDEX or \
      store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
-     _strip_casts(store.src[1]).key != reduce.key:
+     (stored.key != reduce.key and fused_epilogue is None):
     return _not_applicable()
   body = _strip_casts(reduce.src[0])
   if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in reduce.src[1:]): return _not_applicable()
@@ -950,6 +952,29 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
                                   direct_capacity=((int(weight.src[0].src[0].arg)*2+4095)&-4096)//2)
   if weight_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"direct convolution weight pack exceeds plan limits",Ops.INDEX)
   scratch, steps = weight_plan.scratch, [*steps,*weight_plan.steps]
+  conv_epilogue:RKEpilogue|None = None
+  if fused_epilogue is not None:
+    bias,relu = fused_epilogue
+    bias_aff = _affine(bias.src[1])
+    bias_count = int(bias.src[0].src[0].arg)
+    if bias_aff is None or bias_aff[1]:
+      return _unsupported(RKRejectKind.REQUIRES_REFORMAT,"CONV bias is not one direct value per output channel",bias.op)
+    channel_axes = tuple(axis for axis,coefficient in bias_aff[0].items()
+      if coefficient == 1 and ranges.get(axis) == out_c and out_aff[0].get(axis) == out_h*out_w)
+    if len(channel_axes) != 1 or len(bias_aff[0]) != 1 or bias_count != out_c:
+      return _unsupported(RKRejectKind.REQUIRES_REFORMAT,"CONV bias is not one direct value per output channel",bias.op)
+    bias_half = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(64),)
+    bias_rows:list[list[int]] = [[] for _ in range(32)]
+    for channel in range(out_c): bias_rows[channel] = [channel]
+    bias_plan = _selector_program(bias_half,RKArg(RKBufferKind.ARG,bias.src[0].arg.slot),bias_count,bias_rows,scratch,max_outputs=32)
+    if bias_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"CONV bias pack exceeds plan limits",bias.op)
+    steps, scratch = [*steps,*bias_plan.steps], bias_plan.scratch
+    bias_float = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(128),)
+    steps.append(RKDPUProgram(tuple(RKALUStage(Ops.ADD,RKArg(bias_float.kind,bias_float.index,start*4),
+      RKArg(bias_half.kind,bias_half.index,start*2),0.0,4,dtypes.float) for start in range(0,32,4)),scratch))
+    conv_epilogue = RKEpilogue(RKTensorRef(bias_float,RKLayout((out_c,),(32,),(4,),dtypes.float,padding=((0,32-out_c),))),relu)
   packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(batch*output_batch_count*2),)
   if in_c <= 4:
@@ -973,7 +998,7 @@ def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
     conv_plan = RKConvPlan(RKTensorRef(RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2),output_layout),
       RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),RKTensorRef(packed_weight,weight_layout),
       in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x,input_width_stride,output_width_stride,tiling,
-      pt,pb,pl,pr,dilation_y,dilation_x)
+      pt,pb,pl,pr,dilation_y,dilation_x,conv_epilogue)
     steps.extend(legalize_conv_plan(conv_plan))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
                              batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,

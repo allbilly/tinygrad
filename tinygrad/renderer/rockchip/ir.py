@@ -279,6 +279,7 @@ class RKConvTask:
   pad_right: int = 0
   dilation_y: int = 1
   dilation_x: int = 1
+  epilogue: RKEpilogue|None = None
 
 @dataclass(frozen=True)
 class RKDeconvTask(RKConvTask):
@@ -339,6 +340,7 @@ class RKConvPlan:
   pad_right: int = 0
   dilation_y: int = 1
   dilation_x: int = 1
+  epilogue: RKEpilogue|None = None
 
 @dataclass(frozen=True)
 class RKReduce:

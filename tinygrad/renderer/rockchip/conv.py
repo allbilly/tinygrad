@@ -130,5 +130,5 @@ def legalize_conv_plan(plan:RKConvPlan) -> tuple[RKConvTask, ...]:
       plan.kernel_height,plan.kernel_width,tile.output_height,plan.output_width,plan.stride_y,plan.stride_x,
       plan.input_width_stride,plan.output_width_stride,
       tile.data_banks if use_planned_banks else None,tile.weight_banks if use_planned_banks else None,
-      plan.pad_top,plan.pad_bottom,plan.pad_left,plan.pad_right,plan.dilation_y,plan.dilation_x))
+      plan.pad_top,plan.pad_bottom,plan.pad_left,plan.pad_right,plan.dilation_y,plan.dilation_x,plan.epilogue))
   return tuple(tasks)

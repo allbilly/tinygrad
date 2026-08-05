@@ -1639,13 +1639,13 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertLessEqual(len(image.constants), 128*1024)
     self.assertFalse(contains_uop(result.plan))
 
-  def test_contraction_bias_and_relu_fuse_before_fp16_writeback(self):
-    x, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((1,8,5,5), (8,8,1,1), (8,)))
+  def test_convolution_bias_and_relu_fuse_before_fp16_writeback(self):
+    x, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((1,4,9,9), (4,4,3,3), (4,)))
     result = lower_native(sink(x.conv2d(weight,bias).relu()))
     self.assertIs(result.kind, RKLowerKind.NATIVE)
     self.assertIsInstance(result.plan, RKProgram)
     assert isinstance(result.plan, RKProgram)
-    fused = [step for step in result.plan.steps if isinstance(step, RKCMACTask) and step.epilogue is not None]
+    fused = [step for step in result.plan.steps if isinstance(step, RKConvTask) and step.epilogue is not None]
     self.assertEqual(len(fused), 1)
     self.assertIsInstance(fused[0].epilogue, RKEpilogue)
     assert fused[0].epilogue is not None and fused[0].epilogue.bias is not None
@@ -1653,6 +1653,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIs(fused[0].epilogue.bias.layout.dtype, dtypes.float)
     image = emit_program(result.plan)
     self.assertTrue(any(command & 0xffff == 0x5020 for stage in image.stages for command in stage.commands))
+    self.assertLessEqual(plan_cost(result.plan).task_count,40)
     self.assertFalse(contains_uop(result.plan))
 
   def test_masked_affine_prefix_sum_uses_empty_selector_entries(self):

@@ -2883,3 +2883,29 @@ production lowerer, method count, task limit, or tolerance changes in this
 milestone.  A future lowering must first prove a direct or bounded physical
 reformat; it must not turn this register result into another unbounded selector
 packing scheme.
+
+## Flying convolution channel-bias epilogue
+
+The first production consumer of the channel-broadcast contract is a surface
+that is already legal: the HWC8-style output flying from CNA/CORE into DPU.  A
+locked probe runs pointwise convolution with every output-channel count from one
+through sixteen and an FP32 BRDMA bias, verifying bit-exact output both with and without fused ReLU.  Bias addition
+therefore occurs before the single FP16 writeback, preserving the contraction
+accumulation contract rather than adding to an already-rounded output.
+
+The probe also distinguishes the physical operand layouts: CONV BRDMA consumes
+contiguous FP32 channels, unlike the grouped bias arrangement used by the CMAC
+epilogue.  `RKConvPlan` and `RKConvTask` carry the existing typed `RKEpilogue`.  Spatial
+convolution lowering recognizes one direct channel bias, packs its FP16 values
+into the proven 32-lane FP32 BRDMA surface, and keeps that epilogue attached
+through CBUF legalization.  The emitter selects BS ADD plus optional ReLU and
+enables the CNA/CORE/DPU/RDMA pipeline in the same physical task.
+
+On the official `test_simple_conv2d_bias`, the exact native schedule falls from
+199 tasks (`140 CMAC + 59 DPU`) to 30 (`17 CMAC + 12 DPU + 1 CONV`).  The focused
+RK3588 duration falls from 21.26 seconds in the authoritative hybrid artifact to
+3.20 seconds; generated constants rise from 399,008 to 476,576 bytes because the
+direct CNA input/weight pack is currently larger.  The method remains native,
+so this is an efficiency milestone rather than a coverage transition.  The
+nested two-convolution bias test also remains exact.  No resource ceiling or
+tolerance changes.
