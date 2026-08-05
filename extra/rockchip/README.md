@@ -2262,3 +2262,18 @@ showing that simply preserving left-to-right FP16 association is insufficient
 for Torch's contract on the larger shapes. The active proven 20-element tiled
 implementation remains, and larger scans continue to reject instead of using
 either inaccurate FP16 schedule.
+
+## Rejected FP32 weighted-interpolation output
+
+The static weighted-CMAC planner was generalized experimentally to emit the
+proven 32-lane FP32 CMAC surface and to accept up to eight affine interpolation
+taps. All three first bilinear kernels became native in 72, 47, and 23 tasks,
+with 65,632, 10,336, and 20,608 constant bytes.
+
+The complete unchanged method still rejects immediately afterward. Tinygrad's
+interpolation schedule stores that FP32 affine result in an internal surface,
+then launches a separate noncontiguous FP32-to-FP16 kernel for the public half
+output. RK3588's direct FP32 DPU input path is already proven to time out, so
+the first-kernel improvement cannot honestly complete the operation. The active
+compiler is restored; the exact experiment is commit `90adfa2cb` and patch
+`0263-WIP-probe-fp32-weighted-interpolation.patch`.

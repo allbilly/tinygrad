@@ -217,12 +217,11 @@ def lower_dpu(sink:UOp) -> RKDPUProgram|None:
   return cast(RKDPUProgram|None, lower_dpu_result(sink).plan)
 
 def lower_static_two_tap_result(sink:UOp) -> RKLowerResult:
-  """Lower a bounded dense FP32 affine blend of statically indexed FP16 values through CMAC."""
+  """Lower a dense FP32 convex blend of at most two statically indexed FP16 values through CMAC."""
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
   if len(stores) != 1: return _not_applicable()
   store = stores[0]
-  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or \
-     store.src[0].dtype not in (dtypes.half,dtypes.float):
+  if store.src[0].op is not Ops.INDEX or store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half:
     return _not_applicable()
   output_index,stored = store.src[0].src[1],_strip_casts(store.src[1])
   if stored.dtype is not dtypes.float: return _not_applicable()
@@ -242,16 +241,15 @@ def lower_static_two_tap_result(sink:UOp) -> RKLowerResult:
     if not isinstance(dst,int) or isinstance(dst,bool) or not 0 <= dst < count or rows[dst] is not None or form is None:
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static two-tap transform does not cover one dense output",Ops.INDEX)
     constant,terms = form
-    term_limit = 8 if store.src[0].dtype is dtypes.float else 2
-    if constant != 0.0 or not 1 <= len(terms) <= term_limit or any(not 0 <= index < source_count for index in terms) or \
+    if constant != 0.0 or not 1 <= len(terms) <= 2 or any(not 0 <= index < source_count for index in terms) or \
        not math.isclose(sum(terms.values()),1.0,rel_tol=0.0,abs_tol=1e-12):
-      return _unsupported(RKRejectKind.UNSUPPORTED_ALU,"static transform is not a bounded zero-bias affine blend",stored.op)
+      return _unsupported(RKRejectKind.UNSUPPORTED_ALU,"static transform is not a zero-bias two-tap blend",stored.op)
     ordered = sorted(terms.items())
-    if store.src[0].dtype is dtypes.half and len(ordered) == 2 and ordered[1][0] != ordered[0][0]+1:
+    if len(ordered) == 2 and ordered[1][0] != ordered[0][0]+1:
       return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static two-tap sources are not adjacent",Ops.INDEX)
     high = struct.unpack("<e",struct.pack("<e",ordered[-1][1]))[0]
     rounded = [(ordered[0][0],struct.unpack("<e",struct.pack("<e",1.0-high))[0]),(ordered[1][0],high)] if len(ordered) == 2 else \
-      [(index,struct.unpack("<e",struct.pack("<e",weight))[0]) for index,weight in ordered]
+      [(ordered[0][0],struct.unpack("<e",struct.pack("<e",ordered[0][1]))[0])]
     if any(not math.isfinite(weight) or not 0.0 <= weight <= 1.0 for _,weight in rounded):
       return _unsupported(RKRejectKind.NUMERICAL_CONTRACT,"static two-tap coefficients do not fit FP16",stored.op)
     rows[dst] = rounded
@@ -259,8 +257,7 @@ def lower_static_two_tap_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.UNSUPPORTED_LAYOUT,"static two-tap transform has output holes",Ops.INDEX)
   output = RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot)
   source_arg = RKArg(RKBufferKind.ARG,source.arg.slot)
-  program = _windowed_weighted_cmac_pipeline(output,source_arg,cast(list[list[tuple[int,float]]],rows),direct_count=source_count,
-                                             out_dtype=store.src[0].dtype)
+  program = _windowed_weighted_cmac_pipeline(output,source_arg,cast(list[list[tuple[int,float]]],rows),direct_count=source_count)
   if program is None:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"static two-tap transform exceeds native plan limits",stored.op)
   cost = plan_cost(program)

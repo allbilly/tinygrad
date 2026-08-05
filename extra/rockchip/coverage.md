@@ -4342,3 +4342,19 @@ outputs on the larger shapes. The compiler does not add the parallel schedule,
 raise its cost ceiling, or relax tolerance. Larger cumulative products retain
 their typed rejection pending a native higher-precision accumulation path with
 the required rounding contract.
+
+## Rejected FP32 weighted interpolation
+
+A bounded extension of the weighted CMAC planner successfully lowers each
+first bilinear interpolation kernel to FP32 CMAC output. The three unchanged
+geometries cost 72/47/23 tasks and 65,632/10,336/20,608 constant bytes. This
+independently proves that four-tap affine recognition and FP32 CMAC writeback
+are not the remaining method blocker.
+
+Each graph then schedules a second kernel that reads the intermediate FP32
+surface, applies the final noncontiguous layout, and stores public FP16. That
+kernel retains `UNSUPPORTED_LAYOUT`; accepting it would also require the native
+FP32-input conversion path that timed out in direct hardware probes. The WIP is
+preserved in `0263-WIP-probe-fp32-weighted-interpolation.patch` (SHA-256
+`5da100c32a1e840c694a75911803e5bbff78c2054105c7d4021781019f4baf5a`).
+The active code is restored, with no coverage, ABI, limit, or tolerance change.
