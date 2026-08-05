@@ -24,7 +24,7 @@ from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dens
 def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) -> \
     tuple[list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], tuple[RKScratch, ...], RKArg]:
   """Gather and transpose one aligned row-major KxN RHS into the proven blocked CMAC weight stream."""
-  if n%32 or k%32 or not 32 <= n <= k <= 128: raise ValueError(f"unsupported row-major RHS N={n},K={k}")
+  if n%32 or k%32 or not 32 <= n <= k <= 256: raise ValueError(f"unsupported row-major RHS N={n},K={k}")
   packed = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(n*k*2),)
   gathered = RKArg(RKBufferKind.SCRATCH,len(scratch))
@@ -941,8 +941,9 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
-  k128_candidate = (k,lhs_count,rhs_count,output_count) == (128,128,128*128,128)
-  if (not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS) and not k128_candidate:
+  wide_matvec_candidate = k in (128,256) and lhs_count == k and rhs_count == k*output_count and output_count <= 256
+  if (not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS) and \
+     not wide_matvec_candidate:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
@@ -983,7 +984,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   m, n = len(lhs_rows), len(rhs_columns)
   align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
   if len(records) != output_count or {output for output,_,_ in records} != set(range(output_count)): return _not_applicable()
-  if not 1 <= m <= 512 or not 1 <= n <= 128:
+  if not 1 <= m <= 512 or not 1 <= n <= 256:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC contraction is M={m},N={n},K={k}", reduce.op)
   lhs_values = sum(source >= 0 for row in lhs_rows for source in row)
   rhs_values = sum(source >= 0 for column in rhs_columns for source in column)
@@ -993,7 +994,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
                                      for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
-  direct_row_major_rhs = direct_lhs and n%32 == 0 and k%32 == 0 and 32 <= n <= k <= 128 and rhs_count == n*k and \
+  direct_row_major_rhs = direct_lhs and n%32 == 0 and k%32 == 0 and 32 <= n <= k <= 256 and rhs_count == n*k and \
     lhs_parsed[1] is None and rhs_parsed[1] is None and \
     rhs_columns == [tuple(red*n+channel for red in range(k)) for channel in range(n)]
   # One-row compact CMAC writes are proven through 128 outputs. Keep conditional/padded contractions on the older 32-output

@@ -1312,7 +1312,7 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertFalse(contains_uop(result.plan))
 
   def test_aligned_rectangular_contraction_packs_row_major_rhs(self):
-    for m,k,n in ((4,64,32),(4,96,64)):
+    for m,k,n in ((4,64,32),(4,96,64),(1,256,256)):
       with self.subTest(m=m,k=k,n=n):
         result = lower_tiled_contract_result(sink(Tensor.empty(m,k,dtype=dtypes.half)@Tensor.empty(k,n,dtype=dtypes.half)))
         self.assertIs(result.kind,RKLowerKind.NATIVE)
@@ -1322,7 +1322,7 @@ class TestDPUCompiler(unittest.TestCase):
                       if isinstance(step,RKDPUProgram) for stage in step.stages)
         contracts = sum(isinstance(step,RKCMACTask) for step in result.plan.steps)
         self.assertEqual(gathers,n//8)
-        self.assertEqual(contracts,(n//8)*(k//32)+1+(m*n)//64)
+        self.assertEqual(contracts,(n//8)*(k//32)+1+(0 if m == 1 else (m*n)//64))
         self.assertLessEqual(plan_cost(result.plan).constant_bytes,150*1024)
         self.assertFalse(contains_uop(result.plan))
 

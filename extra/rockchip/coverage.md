@@ -4988,3 +4988,25 @@ evidence: despite fewer mismatches than base-2, it still fails official
 tolerance on general multidimensional FP16 inputs. Consequently this commit
 adds no cumulative-product pass and leaves the authoritative census at
 `213/40/159/13`.
+
+## K=256 row-major matvec boundary
+
+The raw DPU surface probe proves one strided-atom task can gather 256 aligned
+eight-lane atoms from a dynamic FP16 matrix whose row stride is 256 values.
+The result is exact. Production `RKStridedAtomGatherStage` now admits exactly
+that measured row/stride range, and the aligned row-major RHS legalizer accepts
+complete 32-channel blocks through `N=K=256`.
+
+For `1x256 @ 256x256`, the clean native schedule is 290 tasks: 32 gathers, 256
+bounded 32x8 block transposes, one broad CMAC GEMM, and one compact output copy.
+No NumPy packing, host tensor transformation, task ceiling change, or constant
+ceiling change participates. The hardware result has one subnormal lane one
+quantum (`5.9604645e-8`) away from FP32 accumulation rounded to FP16 and passes
+the standard `rtol=1e-3, atol=1e-6` contract; K=128 remains exact.
+
+Focused `matmul_simple`, `small_gemm`, `9_gemm`, and `gemm_fp16` TestOps pass
+with fallback disabled. The compiler suite passes 170 tests plus 78 subtests.
+`test_big_gemm` remains rejected because its 256 output rows use the proven
+gapped FP16 CMAC surface; packing RHS was only one side of the problem. A
+native multi-row output-layout conversion is still required, so the complete
+census remains `213/40/159/13`.

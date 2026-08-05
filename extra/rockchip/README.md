@@ -2648,3 +2648,29 @@ but still misses the unchanged TestOps tolerance on multidimensional random
 inputs. It therefore remains a numerical experiment rather than production
 scan lowering. No TestOps status or resource ceiling changes in this hardware
 milestone.
+
+## Native K=256 row-major matvec packing
+
+The DPU strided-atom probe now covers 256 rows at a 256-value FP16 row stride.
+One task gathers the first aligned eight-lane atom from every row with zero
+mismatches. The typed gather contract is expanded from 128 to this measured
+256-row/256-stride boundary; no larger geometry is inferred.
+
+That primitive extends the existing CPU-free row-major RHS pack to aligned
+`N,K <= 256`. A dynamic `1x256 @ 256x256` matvec now uses 32 DPU atom gathers,
+256 bounded CMAC transpose tasks with one deduplicated selector payload, one
+broad CMAC compute task, and one compact DPU copy: 290 native tasks total,
+below the unchanged 400-task and 2 MiB limits. The host never reads or packs
+either dynamic operand.
+
+The locked RK3588 result satisfies the unchanged TestOps contract. One of 256
+lanes differs from FP32 accumulation rounded to FP16 by `5.9604645e-8`
+(relative error `7.53e-4`), below `rtol=1e-3, atol=1e-6`; the established K=128
+case remains bit-exact. Four focused TestOps GEMM methods pass and the compiler
+suite is 170 tests plus 78 subtests.
+
+This does not make square 256x256 GEMM native end to end. The broad compute
+task and RHS pack are now proven, but multi-row FP16 CMAC output retains a
+padded channel layout. Legalizing that output without host gathering or more
+than 400 selector tasks remains the `test_big_gemm` blocker. The authoritative
+census stays `213/40/159/13`.

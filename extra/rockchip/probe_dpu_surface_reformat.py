@@ -78,6 +78,8 @@ def main() -> None:
   parser.add_argument("--vendor-transpose",action="store_true",help="replay the Toolkit2 one-task NC1HWC2 transpose geometry")
   parser.add_argument("--strided-atom-gather",action="store_true",
                       help="prove one task gathers 32 aligned FP16 atoms from 128-element rows")
+  parser.add_argument("--gather-rows",type=int,default=32,help="row count used by --strided-atom-gather")
+  parser.add_argument("--gather-stride",type=int,default=128,help="FP16 row stride used by --strided-atom-gather")
   parser.add_argument("--strided-atom-scatter",action="store_true",
                       help="probe gathered atoms written to 64-element-stride destination rows")
   parser.add_argument("--strided-row-gather",type=int,metavar="CHANNELS",
@@ -131,7 +133,7 @@ def main() -> None:
       dev._gpu_free(out)
     return
   if args.strided_atom_gather:
-    rows, stride = 32, 128
+    rows, stride = args.gather_rows, args.gather_stride
     values = np.arange(rows*stride,dtype=np.float16).reshape(rows,stride)
     expected = values[:,:8].reshape(-1)
     dev = RockchipDevice("ROCKCHIP")
