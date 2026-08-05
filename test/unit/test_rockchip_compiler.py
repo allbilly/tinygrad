@@ -6,7 +6,7 @@ from tinygrad import Tensor, dtypes
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
-from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan,
+from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContractionPlan, RKCMACTask, RKConvTask, RKDeconvTask, RKConvPlan,
   RKCopyStage, RKCastStage, RKDPUProgram,
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
@@ -23,7 +23,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   lower_reformat_result,
   lower_static_two_tap_result,
   lower_static_selector_reformat_result,
-  lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
+  lower_deconv_result, lower_spatial_contract_result, lower_nhwc_spatial_contract_result,
   lower_depthwise_spatial_contract_result, lower_grouped_spatial_contract_result, lower_tiled_contract_result, plan_cost,
   plan_conv_cbuf, legalize_conv_plan, legalize_contraction_plan, rk_fingerprint)
 from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
@@ -1887,6 +1887,34 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertEqual(atrous,[((expected[0]-1)<<21)|((expected[1]-1)<<16)|9]*4)
         self.assertLessEqual(plan_cost(result.plan).task_count,limit)
         self.assertFalse(contains_uop(result.plan))
+
+  def test_transpose_convolution_uses_staged_cna_rounding_contract(self):
+    cases = (
+      ({}, (1,1), (0,0), 4),
+      ({"padding":2}, (1,1), (0,0), 4),
+      ({"stride":(2,1)}, (2,1), (0,0), 4),
+      ({"dilation":(2,1)}, (1,1), (0,0), 4),
+      ({"groups":2}, (1,1), (0,0), 8),
+    )
+    for kwargs,transpose_stride,first_padding,out_channels in cases:
+      with self.subTest(kwargs=kwargs):
+        source = Tensor.empty(2,4,9,9,dtype=dtypes.half)
+        weight = Tensor.empty(4,4,3,3,dtype=dtypes.half)
+        result = lower_deconv_result(sink(source.conv_transpose2d(weight,**kwargs)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        assert isinstance(result.plan,RKProgram)
+        tasks = tuple(step for step in result.plan.steps if isinstance(step,RKDeconvTask))
+        self.assertEqual(len(tasks),18)
+        self.assertTrue(all((task.kernel_height,task.kernel_width,task.out_channels) == (1,1,out_channels) for task in tasks))
+        self.assertEqual({(task.transpose_stride_y,task.transpose_stride_x) for task in tasks},{transpose_stride})
+        self.assertEqual((tasks[0].hardware_pad_top,tasks[0].hardware_pad_left),first_padding)
+        self.assertFalse(contains_uop(result.plan))
+        image = emit_program(result.plan)
+        first = next(stage for stage in image.stages if stage.engine is RKEngine.CONV)
+        commands = {(command>>48,command&0xffff):(command>>16)&0xffffffff for command in first.commands}
+        self.assertTrue(commands[(0x201,rk.REG_CNA_CONV_CON1)]&(1<<16))
+        self.assertEqual((commands[(0x201,rk.REG_CNA_CONV_CON3)]>>8)&0x3f,
+                         ((transpose_stride[0]-1)<<3)|(transpose_stride[1]-1))
 
   def test_pointwise_convolution_uses_direct_cna_task(self):
     for channels,size in ((4,9),(16,8)):

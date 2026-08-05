@@ -265,6 +265,16 @@ class RKConvTask:
   dilation_x: int = 1
 
 @dataclass(frozen=True)
+class RKDeconvTask(RKConvTask):
+  """One fully legalized FP16 CNA deconvolution task over packed RK3588 surfaces."""
+  transpose_stride_y: int = 1
+  transpose_stride_x: int = 1
+  output_padding_y: int = 0
+  output_padding_x: int = 0
+  hardware_pad_top: int|None = None
+  hardware_pad_left: int|None = None
+
+@dataclass(frozen=True)
 class RKConvTile:
   y_start: int
   input_y_start: int

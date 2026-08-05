@@ -2564,3 +2564,28 @@ channels exceed 384 it forces `m_tile=1`, and otherwise derives the M tile from
 ten 32-KiB input banks. Its PC chain can place several such tasks in one DRM
 submission, but that is not one hardware task. Consequently, older reports of
 large shapes passing this example are not by themselves one-task evidence.
+
+## Staged native transpose convolution
+
+The CNA deconvolution geometry is now part of production lowering for simple,
+padded, strided, dilated, and grouped FP16 2D transpose convolution. The
+recognizer exhaustively validates every output/reduction coordinate against
+the decomposed feature mask and spatially reversed weight index. A fully
+cropped transpose is also accepted when simplification removes its redundant
+bounds predicate; the address proof, rather than predicate presence, is the
+legality contract.
+
+One broad CNA deconvolution task computes a more FP32-like result than PyTorch
+CPU half and misses the unchanged TestOps tolerance. Production therefore
+packs the input and block-diagonal grouped weights once, emits one 1x1 CNA
+deconvolution task per source kernel coordinate, and accumulates those tasks
+through FP16 DPU ADD in source-weight order. This reproduces the framework's
+per-kernel-position rounding without CPU execution or tolerance relaxation.
+
+Locked RK3588 tests pass all five methods plus an ordinary convolution
+regression. The plans span 77--121 tasks, 899,936--1,917,472 constant bytes,
+and remain explicitly classified as correctness fallbacks. The complete
+compiler file passes 167 tests plus 75 subtests. Expected coverage is
+`211/40/161/13`; the last complete uncached census remains authoritative at
+`206/40/166/13`. Bias, output-padding, and 3D transpose convolution are the
+remaining family members.

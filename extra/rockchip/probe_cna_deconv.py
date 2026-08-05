@@ -26,7 +26,7 @@ def _mutate(stage:RKStage, values:dict[tuple[int,int],int]) -> RKStage:
   return RKStage(stage.engine,commands,stage.relocs,stage.flags)
 
 def image(kernel_size:int, output_height:int, output_width:int, output_stride:int,
-          stride:tuple[int,int], dilation:tuple[int,int]) -> RKImage:
+          stride:tuple[int,int], dilation:tuple[int,int], hardware_padding:tuple[int,int]|None=None) -> RKImage:
   src = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((2,2,1),(2,2,1),(4,2,2),dtypes.half,
     kind=RKLayoutKind.CNA_ACTIVATION))
   weight = RKTensorRef(RKArg(RKBufferKind.ARG,2),RKLayout((kernel_size,kernel_size,1,1),(kernel_size,kernel_size,1,8),
@@ -40,10 +40,11 @@ def image(kernel_size:int, output_height:int, output_width:int, output_stride:in
                                      pad_top=pad_y,pad_bottom=pad_y,pad_left=pad_x,pad_right=pad_x,
                                      dilation_y=dilation[0],dilation_x=dilation[1]))
   registers = {(command>>48,command&0xffff):(command>>16)&0xffffffff for command in base.stages[0].commands}
+  hardware_pad_y, hardware_pad_x = hardware_padding or ((kernel_size-1)*dilation[0],(kernel_size-1)*dilation[1])
   values = {
     (_CNA,rk.REG_CNA_CONV_CON1):registers[(_CNA,rk.REG_CNA_CONV_CON1)]|(1<<16),
     (_CNA,rk.REG_CNA_CONV_CON3):registers[(_CNA,rk.REG_CNA_CONV_CON3)]|((stride[0]-1)<<11)|((stride[1]-1)<<8),
-    (_CNA,rk.REG_CNA_PAD_CON0):((kernel_size-1)*dilation[1]<<4)|((kernel_size-1)*dilation[0]),
+    (_CNA,rk.REG_CNA_PAD_CON0):(hardware_pad_x<<4)|hardware_pad_y,
     (_CNA,rk.REG_CNA_DATA_SIZE2):output_width,
     (_CNA,rk.REG_CNA_DATA_SIZE3):output_height*output_width,
     (_CORE,rk.REG_CORE_DATAOUT_SIZE_0):((output_height-1)<<16)|(output_width-1),
@@ -100,5 +101,27 @@ def main() -> None:
   kernel = np.array([[1,2,3],[4,5,6],[7,8,9]],dtype=np.float16)
   for stride,dilation in (((1,1),(1,1)),((2,1),(1,1)),((1,2),(1,1)),((2,2),(1,1)),((1,1),(2,2))):
     _run(dev,source,kernel,stride,dilation)
+  output_height, output_width, output_stride = 3, 4, 12
+  output_nbytes = 2*output_stride*8*2
+  out_buf,src_buf,weight_buf = dev._gpu_alloc(output_nbytes),dev._gpu_alloc(source.nbytes),dev._gpu_alloc(16)
+  try:
+    ctypes.memset(int(out_buf.va_addr),0,output_nbytes)
+    ctypes.memmove(int(src_buf.va_addr),source.ctypes.data,source.nbytes)
+    weight = np.zeros(8,dtype=np.float16)
+    weight[0] = 1
+    ctypes.memmove(int(weight_buf.va_addr),weight.ctypes.data,weight.nbytes)
+    shifted = image(1,output_height,output_width,output_stride,(1,1),(1,1),(1,2))
+    RockchipProgram(dev,TinyELF(encode_image(shifted),"cna_deconv_1x1_shift",Target("ROCKCHIP"),()))(
+      out_buf,src_buf,weight_buf,wait=True)
+    physical = np.frombuffer(ctypes.string_at(int(out_buf.va_addr),output_nbytes),dtype=np.float16).reshape(2,output_stride,8)
+    actual = physical[0,:output_height*output_width,0].reshape(output_height,output_width)
+    expected = np.zeros((output_height,output_width),dtype=np.float16)
+    expected[1:,2:] = source
+    print(f"CNA deconv 1x1 shift direct={np.array_equal(actual,expected)} actual={actual.tolist()}")
+    np.testing.assert_equal(actual,expected)
+  finally:
+    dev._gpu_free(out_buf)
+    dev._gpu_free(src_buf)
+    dev._gpu_free(weight_buf)
 
 if __name__ == "__main__": main()

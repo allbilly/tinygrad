@@ -14,7 +14,7 @@ from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKE
   RKALUStage, RKFusedALUStage as RKFusedALUStage, RKStridedAtomGatherStage as RKStridedAtomGatherStage, RKCopyStage, RKCastStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue as RKEpilogue, RKContractionPlan as RKContractionPlan,
-  RKCMACTask, RKConvTask, RKConvPlan as RKConvPlan,
+  RKCMACTask, RKConvTask, RKDeconvTask as RKDeconvTask, RKConvPlan as RKConvPlan,
   RKConvSplit as RKConvSplit, RKConvTile as RKConvTile, RKConvTiling as RKConvTiling, RKReduce, RKPool, RKReformatPlan as RKReformatPlan,
   RKMultiSourceReformatPlan as RKMultiSourceReformatPlan, RKLegalizedReformat, RKProgram, RKPlanCost as RKPlanCost,
   RKRejectKind, RKReject as RKReject, RKLowerKind, RKLowerResult)
@@ -31,7 +31,8 @@ from tinygrad.renderer.rockchip.contract import (legalize_contraction_plan as le
   lower_contract_result as lower_contract_result, lower_depthwise_spatial_contract_result as lower_depthwise_spatial_contract_result,
   lower_grouped_spatial_contract_result as lower_grouped_spatial_contract_result,
   lower_nhwc_spatial_contract_result as lower_nhwc_spatial_contract_result,
-  lower_spatial_contract_result as lower_spatial_contract_result, lower_tiled_contract_result as lower_tiled_contract_result,
+  lower_deconv_result as lower_deconv_result, lower_spatial_contract_result as lower_spatial_contract_result,
+  lower_tiled_contract_result as lower_tiled_contract_result,
   lower_contract as lower_contract)
 from tinygrad.renderer.rockchip.cost import plan_cost as plan_cost
 from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, static_scalar as _static_scalar,
@@ -442,6 +443,7 @@ _LOWERERS = (
   RKLowerer("depthwise_spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_depthwise_spatial_contract_result),
   RKLowerer("grouped_spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_grouped_spatial_contract_result),
   RKLowerer("nhwc_spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_nhwc_spatial_contract_result),
+  RKLowerer("deconvolution", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_deconv_result),
   RKLowerer("spatial_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_spatial_contract_result),
   RKLowerer("tiled_contract", lambda nodes:_has_reduction(nodes, Ops.ADD), lower_tiled_contract_result),
   RKLowerer("contract", lambda nodes:_has_reduction(nodes) and not _has_reduction(nodes, Ops.MAX), lower_contract_result),

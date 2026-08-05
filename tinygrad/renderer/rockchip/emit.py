@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
 from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKStridedAtomGatherStage,
-  RKCopyStage, RKCastStage, RKDPUStage, RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKCMACTask, RKConvTask, RKReduce,
+  RKCopyStage, RKCastStage, RKDPUStage, RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKCMACTask, RKConvTask, RKDeconvTask, RKReduce,
   RKPool, RKLegalizedReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
@@ -404,11 +404,29 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
   dy, dx = plan.dilation_y, plan.dilation_x
   pt, pb, pl, pr = plan.pad_top, plan.pad_bottom, plan.pad_left, plan.pad_right
   effective_h, effective_w = (kh-1)*dy+1, (kw-1)*dx+1
+  if isinstance(plan,RKDeconvTask):
+    deconv, transpose_sy, transpose_sx = True, plan.transpose_stride_y, plan.transpose_stride_x
+    output_py, output_px = plan.output_padding_y, plan.output_padding_x
+    hardware_pad_top, hardware_pad_left = plan.hardware_pad_top, plan.hardware_pad_left
+    staged_deconv = hardware_pad_top is not None and hardware_pad_left is not None
+  else:
+    deconv, transpose_sy, transpose_sx, output_py, output_px = False, 1, 1, 0, 0
+    hardware_pad_top, hardware_pad_left = None, None
+  if deconv:
+    hardware_pt = hardware_pad_top if hardware_pad_top is not None else effective_h-1-pt
+    hardware_pl = hardware_pad_left if hardware_pad_left is not None else effective_w-1-pl
+  else: hardware_pt, hardware_pl, staged_deconv = pt, pl, False
   tall_vector_contract = ic == oc == kw == oh == 1 and ih == kh and 4 <= kh <= 31 and 4 <= iw == ow <= 256 and \
                          sy == sx == 1 and not any((pt,pb,pl,pr))
   if not 1 <= ic <= 16 or not 1 <= oc <= 16 or (not tall_vector_contract and (not 1 <= kh <= 3 or not 1 <= kw <= 3)) or \
-     min(pt,pb,pl,pr) < 0 or max(pt,pb,pl,pr) > 15 or \
-     oh != (ih+pt+pb-effective_h)//sy+1 or ow != (iw+pl+pr-effective_w)//sx+1 or \
+     min(pt,pb,pl,pr,hardware_pt,hardware_pl) < 0 or max(hardware_pt,hardware_pl) > 15 or \
+     (deconv and ((not staged_deconv and (oh != (ih-1)*transpose_sy-pt-pb+effective_h+output_py or
+                                           ow != (iw-1)*transpose_sx-pl-pr+effective_w+output_px)) or
+                  (staged_deconv and (oh < (ih-1)*transpose_sy+1+hardware_pt or
+                                      ow < (iw-1)*transpose_sx+1+hardware_pl)) or sy != 1 or sx != 1 or
+                  not 1 <= transpose_sy <= 8 or not 1 <= transpose_sx <= 8 or
+                  not 0 <= output_py < transpose_sy or not 0 <= output_px < transpose_sx)) or \
+     (not deconv and (oh != (ih+pt+pb-effective_h)//sy+1 or ow != (iw+pl+pr-effective_w)//sx+1)) or \
      not 1 <= sy <= 7 or not 1 <= sx <= 7 or not 1 <= dy <= 32 or not 1 <= dx <= 32 or \
      (not tall_vector_contract and (not 1 <= ih <= 32 or not 1 <= iw <= 32)):
     raise ValueError("unsupported direct spatial-convolution contract")
@@ -440,9 +458,10 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
                 ((width_stride*(backing_height-4))&0xffffffff if not use_nhwc else 0)
   commands = (
     _command(_TARGET_DPU, rk.REG_DPU_S_POINTER, 0xe),
-    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON1, (0x60000000|((7+ic)<<12) if use_nhwc else 0)|0x120),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON1, (0x60000000|((7+ic)<<12) if use_nhwc else 0)|0x120|(0x10000 if deconv else 0)),
     _command(_TARGET_CNA, rk.REG_CNA_CONV_CON2, feature_grains<<4),
-    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, ((dy-1)<<21)|((dx-1)<<16)|(sy<<3)|sx),
+    _command(_TARGET_CNA, rk.REG_CNA_CONV_CON3, ((dy-1)<<21)|((dx-1)<<16)|
+             ((transpose_sy-1)<<11)|((transpose_sx-1)<<8)|(sy<<3)|sx),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE0, (width_stride<<16)|ih),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE1, ((ic-1)<<16)|align_ic),
     _command(_TARGET_CNA, rk.REG_CNA_DATA_SIZE2, ow),
@@ -452,10 +471,10 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
     _command(_TARGET_CNA, rk.REG_CNA_WEIGHT_SIZE2, (kw<<24)|(kh<<16)|oc),
     _command(_TARGET_CNA, rk.REG_CNA_CBUF_CON0, ((12-data_banks)<<4)|data_banks),
     _command(_TARGET_CNA, rk.REG_CNA_CBUF_CON1, cbuf_entries),
-    _command(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 0xb if is_spatial else 1),
+    _command(_TARGET_CNA, rk.REG_CNA_CVT_CON0, 1 if deconv else 0xb if is_spatial else 1),
     *(_command(_TARGET_CNA, reg, 0x10000) for reg in
       (rk.REG_CNA_CVT_CON1,rk.REG_CNA_CVT_CON2,rk.REG_CNA_CVT_CON3,rk.REG_CNA_CVT_CON4)),
-    _command(_TARGET_CNA, rk.REG_CNA_PAD_CON0, (pl<<4)|pt),
+    _command(_TARGET_CNA, rk.REG_CNA_PAD_CON0, (hardware_pl<<4)|hardware_pt),
     _command(_TARGET_CNA, rk.REG_CNA_FEATURE_DATA_ADDR, 0),
     _command(_TARGET_CNA, rk.REG_CNA_DMA_CON0, 0xf000f),
     _command(_TARGET_CNA, rk.REG_CNA_DMA_CON1, dma_line),

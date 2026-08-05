@@ -3,7 +3,7 @@ import math, struct
 from itertools import permutations, product
 from typing import cast
 
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, Invalid
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.renderer.rockchip.affine import affine as _affine
 from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, static_scalar as _static_scalar,
@@ -12,7 +12,7 @@ from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, st
 from tinygrad.renderer.rockchip.conv import plan_conv_cbuf, legalize_conv_plan
 from tinygrad.renderer.rockchip.cost import plan_cost
 from tinygrad.renderer.rockchip.ir import (RKEngine, RKBufferKind, RKLayoutKind, RKArg, RKALUStage, RKStridedAtomGatherStage, RKScratch,
-  RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan, RKConvSplit, RKReduce,
+  RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContractionPlan, RKCMACTask, RKConvTask, RKDeconvTask, RKConvPlan, RKConvSplit, RKReduce,
   RKRejectKind, RKLowerResult)
 from tinygrad.renderer.rockchip.limits import (RK_MAX_CONSTANT_BYTES, RK_MAX_PROGRAM_STAGES,
   RK_MAX_AFFINE_WINDOW, RK_MAX_CMAC_SELECTOR_WINDOW, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, RK_MAX_TILED_CONTRACT_VISITS)
@@ -485,6 +485,187 @@ def lower_nhwc_spatial_contract_result(sink:UOp) -> RKLowerResult:
   if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"direct NHWC convolution needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
+  return _native(program)
+
+def _deconv_source(parsed:tuple[UOp,UOp|None,bool], point:dict[int,int]) -> int|None:
+  index, condition, select_true = parsed
+  predicate = True if condition is None else _static_scalar(condition,point)
+  if predicate is None: return None
+  if bool(predicate) is not select_true: return -1
+  source = _static_scalar(index.src[1],point)
+  return source if isinstance(source,int) and not isinstance(source,bool) else None
+
+def _deconv_dimensions(input_size:int, output_size:int, kernel_size:int) -> tuple[tuple[int,int,int], ...]:
+  """Return transpose-stride, dilation, symmetric-padding candidates with no output padding."""
+  return tuple((stride,dilation,padding) for stride in range(1,9) for dilation in range(1,33) for padding in range(16)
+               if output_size == (input_size-1)*stride-2*padding+(kernel_size-1)*dilation+1 and
+                  padding <= (kernel_size-1)*dilation)
+
+def lower_deconv_result(sink:UOp) -> RKLowerResult:
+  """Recognize decomposed FP16 transpose convolution and preserve its per-kernel-position FP16 accumulation."""
+  stores, reductions = [u for u in sink.toposort() if u.op is Ops.STORE], [u for u in sink.toposort() if u.op is Ops.REDUCE]
+  if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
+  store, reduce = stores[0], reductions[0]
+  if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 4 or store.src[0].op is not Ops.INDEX or \
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
+     _strip_casts(store.src[1]).key != reduce.key: return _not_applicable()
+  body = _strip_casts(reduce.src[0])
+  if body.op is Ops.WHERE:
+    branches = tuple(_strip_casts(x) for x in body.src[1:])
+    real = tuple(x for x in branches if not (x.op is Ops.CONST and x.arg is Invalid))
+    if len(real) == 1: body = real[0]
+  if body.op is not Ops.MUL or any(red.op is not Ops.RANGE for red in reduce.src[1:]): return _not_applicable()
+  operands = tuple(_conditional_index(_strip_casts(value)) for value in body.src)
+  if any(parsed is None or parsed[0].dtype is not dtypes.half or parsed[0].src[0].op is not Ops.PARAM for parsed in operands):
+    return _not_applicable()
+  parsed_operands = cast(tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool]],operands)
+  out_aff = _affine(store.src[0].src[1])
+  if out_aff is None or out_aff[1] or len(out_aff[0]) not in (4,5): return _not_applicable()
+  ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
+  out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
+  if len(red_axes) != 3 or any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
+
+  match:tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool],int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
+  for feature_parsed,weight_parsed in (parsed_operands,tuple(reversed(parsed_operands))):
+    feature, weight = feature_parsed[0], weight_parsed[0]
+    # A fully cropped transpose can simplify every feature coordinate in bounds, removing the WHERE predicate.
+    # The exhaustive source/weight address validation below still distinguishes it from an ordinary contraction.
+    if weight_parsed[1] is not None: continue
+    feature_count, weight_count, output_count = (int(x.src[0].src[0].arg) for x in (feature,weight,store.src[0]))
+    output_candidates = tuple((b,None,oc,y,x) for b,oc,y,x in permutations(out_axes)) if len(out_axes) == 4 else \
+      tuple(permutations(out_axes))
+    for batch_axis,group_axis,out_channel_axis,out_y_axis,out_x_axis in output_candidates:
+      batch,out_c_group,out_h,out_w = (ranges[x] for x in (batch_axis,out_channel_axis,out_y_axis,out_x_axis))
+      explicit_groups = 1 if group_axis is None else ranges[group_axis]
+      out_c = explicit_groups*out_c_group
+      expected_output = {batch_axis:out_c*out_h*out_w,out_channel_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1}
+      if group_axis is not None: expected_output[group_axis] = out_c_group*out_h*out_w
+      if out_aff[0] != expected_output or output_count != batch*out_c*out_h*out_w: continue
+      for in_channel_axis,kernel_y_axis,kernel_x_axis in permutations(red_axes):
+        in_c_group,kernel_h,kernel_w = (ranges[x] for x in (in_channel_axis,kernel_y_axis,kernel_x_axis))
+        if not 1 <= kernel_h <= 3 or not 1 <= kernel_w <= 3 or weight_count != in_c_group*out_c*kernel_h*kernel_w: continue
+        group_candidates = (explicit_groups,) if group_axis is not None else tuple(group for group in range(1,out_c+1) if out_c%group == 0)
+        for groups in group_candidates:
+          in_c, out_c_group = in_c_group*groups, out_c//groups
+          if feature_count%(batch*in_c): continue
+          spatial = feature_count//(batch*in_c)
+          for in_h in range(1,min(32,spatial)+1):
+            if spatial%in_h or spatial//in_h > 32: continue
+            in_w = spatial//in_h
+            for stride_y,dilation_y,pad_y in _deconv_dimensions(in_h,out_h,kernel_h):
+              for stride_x,dilation_x,pad_x in _deconv_dimensions(in_w,out_w,kernel_w):
+                valid = True
+                for b,oc,oy,ox,icg,ky,kx in product(range(batch),range(out_c),range(out_h),range(out_w),
+                                                      range(in_c_group),range(kernel_h),range(kernel_w)):
+                  point = {batch_axis:b,out_channel_axis:oc,out_y_axis:oy,out_x_axis:ox,
+                           in_channel_axis:icg,kernel_y_axis:ky,kernel_x_axis:kx}
+                  if group_axis is not None:
+                    point[group_axis], point[out_channel_axis] = oc//out_c_group, oc%out_c_group
+                  iy_num = oy+pad_y-(kernel_h-1-ky)*dilation_y
+                  ix_num = ox+pad_x-(kernel_w-1-kx)*dilation_x
+                  group, source = oc//out_c_group, -1
+                  if iy_num%stride_y == 0 and ix_num%stride_x == 0:
+                    iy, ix = iy_num//stride_y, ix_num//stride_x
+                    if 0 <= iy < in_h and 0 <= ix < in_w:
+                      source = b*in_c*in_h*in_w+(group*in_c_group+icg)*in_h*in_w+iy*in_w+ix
+                  weight_source = (group*in_c_group+icg)*out_c_group*kernel_h*kernel_w+\
+                    (oc%out_c_group)*kernel_h*kernel_w+(kernel_h-1-ky)*kernel_w+(kernel_w-1-kx)
+                  if _deconv_source(feature_parsed,point) != source or _deconv_source(weight_parsed,point) != weight_source:
+                    valid = False
+                    break
+                if valid:
+                  match = (feature_parsed,weight_parsed,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,
+                           stride_y,stride_x,dilation_y,dilation_x,pad_y,pad_x,groups)
+                  break
+              if match is not None: break
+            if match is not None: break
+          if match is not None: break
+        if match is not None: break
+      if match is not None: break
+    if match is not None: break
+  if match is None: return _not_applicable()
+
+  feature_parsed,weight_parsed,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,\
+    stride_y,stride_x,dilation_y,dilation_x,pad_y,pad_x,groups = match
+  feature, weight = feature_parsed[0], weight_parsed[0]
+  if in_c not in (1,2,3,4,16) or not 1 <= out_c <= 16 or batch > 4:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
+      f"direct deconvolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w}",reduce.op)
+  align_in, input_c2 = (8,in_c) if in_c <= 4 else (16,8)
+  width_alignment = max(1,(16+align_in-1)//align_in)
+  full_h, full_w = out_h+2*pad_y, out_w+2*pad_x
+  input_width_stride = ((in_w+width_alignment-1)//width_alignment)*width_alignment
+  output_width_stride = (full_h*full_w+3)&-4
+  input_surface_count = in_h*input_width_stride*in_c
+  input_batch_count, output_batch_count = (input_surface_count+7)&-8, 2*output_width_stride*8
+  input_rows:list[list[int]] = []
+  if in_c <= 4:
+    for b in range(batch):
+      input_rows.extend([[b*in_c*in_h*in_w+c*in_h*in_w+y*in_w+x] if x < in_w else []
+                         for y in range(in_h) for x in range(input_width_stride) for c in range(input_c2)])
+      input_rows.extend([[] for _ in range(input_batch_count-input_surface_count)])
+  else:
+    for b in range(batch):
+      input_rows.extend([[b*in_c*in_h*in_w+(c1*input_c2+c2)*in_h*in_w+y*in_w+x] if x < in_w else []
+                         for c1 in range(in_c//input_c2) for y in range(in_h)
+                         for x in range(input_width_stride) for c2 in range(input_c2)])
+      input_rows.extend([[] for _ in range(input_batch_count-input_surface_count)])
+  in_c_group = in_c//groups
+  # Each output group consumes one contiguous input-channel group.
+  out_c_group = out_c//groups
+  weight_rows = [[c*out_c_group*kernel_h*kernel_w+(oc%out_c_group)*kernel_h*kernel_w+ky*kernel_w+kx]
+                  if oc//out_c_group*in_c_group <= c < (oc//out_c_group+1)*in_c_group else []
+                 for ky in range(kernel_h) for kx in range(kernel_w) for oc in range(out_c) for c in range(align_in)]
+  output_rows = [[b*output_batch_count+(oc//8)*output_width_stride*8+((y+pad_y)*full_w+x+pad_x)*8+oc%8]
+                 for b in range(batch) for oc in range(out_c) for y in range(out_h) for x in range(out_w)]
+  scratch:tuple[RKScratch, ...] = ()
+  packed_input = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(len(input_rows)*2),)
+  input_plan = _selector_program(packed_input,RKArg(RKBufferKind.ARG,feature.src[0].arg.slot),feature_count,input_rows,scratch,
+    direct_capacity=((feature_count*2+4095)&-4096)//2,max_window=RK_MAX_CMAC_SELECTOR_WINDOW,max_outputs=64)
+  if input_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"deconvolution input pack exceeds plan limits",Ops.INDEX)
+  scratch, steps = input_plan.scratch, list(input_plan.steps)
+  packed_weight = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(len(weight_rows)*2),)
+  weight_plan = _selector_program(packed_weight,RKArg(RKBufferKind.ARG,weight.src[0].arg.slot),weight_count,weight_rows,scratch,
+    direct_capacity=((weight_count*2+4095)&-4096)//2,max_outputs=64)
+  if weight_plan is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"deconvolution weight pack exceeds plan limits",Ops.INDEX)
+  scratch, steps = weight_plan.scratch, [*steps,*weight_plan.steps]
+  packed_output = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(batch*output_batch_count*2),)
+  contribution = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(output_batch_count*2),)
+  input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
+                          padding=((0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0) if in_c <= 4 else \
+    RKLayout((in_c//input_c2,in_h,in_w,input_c2),(in_c//input_c2,in_h,input_width_stride,input_c2),
+      (in_h*input_width_stride*input_c2*2,input_width_stride*input_c2*2,input_c2*2,2),dtypes.half,
+      padding=((0,0),(0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
+  weight_layout = RKLayout((1,1,out_c,in_c),(1,1,out_c,align_in),(out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,
+    padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
+  output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
+                           kind=RKLayoutKind.CONV_OUTPUT)
+  for b in range(batch):
+    accumulator = RKArg(packed_output.kind,packed_output.index,b*output_batch_count*2)
+    for ky in range(kernel_h):
+      for kx in range(kernel_w):
+        first = ky == kx == 0
+        task_output = accumulator if first else contribution
+        weight_offset = (ky*kernel_w+kx)*out_c*align_in*2
+        steps.append(RKDeconvTask(RKTensorRef(task_output,output_layout),
+          RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
+          RKTensorRef(RKArg(packed_weight.kind,packed_weight.index,weight_offset),weight_layout),
+          in_c,out_c,in_h,in_w,1,1,full_h,full_w,1,1,input_width_stride,output_width_stride,
+          transpose_stride_y=stride_y,transpose_stride_x=stride_x,
+          hardware_pad_top=ky*dilation_y,hardware_pad_left=kx*dilation_x))
+        if not first: steps.append(RKDPUProgram((RKALUStage(Ops.ADD,accumulator,accumulator,contribution,output_batch_count),),scratch))
+  unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
+    batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,max_outputs=64)
+  if unpack is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"deconvolution output unpack exceeds plan limits",Ops.INDEX)
+  program = _finish_program([*steps,*unpack.steps],unpack.scratch)
+  cost = plan_cost(program)
+  if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"direct deconvolution needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",reduce.op)
   return _native(program)
 
 def lower_spatial_contract_result(sink:UOp) -> RKLowerResult:
