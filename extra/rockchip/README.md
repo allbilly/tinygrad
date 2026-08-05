@@ -14,6 +14,13 @@ unclassified failure. Coverage details, the checkout-local pytest-plugin
 invocation, reject Pareto, plan-cost histograms, and durable artifact hashes
 are recorded in `coverage.md`.
 
+The current summary at the top of `coverage.md` is generated from one
+schema-v2 telemetry artifact rather than edited by hand. Regenerate it with
+`python extra/rockchip/gen_coverage.py RESULTS.json`; CI or review scripts can
+use the same command with `--check` to reject stale summaries. The recorded
+environment identifies whether the artifact is strict native-only or the
+separate hybrid semantic census.
+
 The strided DPU atom gather is independently exact at a 1,024-value FP16 row
 stride, covering the channel-plane spacing of a 16x32x32 NCHW surface. This is
 a measured input-packing primitive, not a claim that the complete M4 1x1

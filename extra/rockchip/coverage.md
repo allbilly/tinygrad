@@ -4,6 +4,54 @@ The completion target is every non-skipped forward case in the 425-method
 `test/backend/test_ops.py` inventory. Focused tests are recorded as milestone
 evidence but do not replace a complete uncached census.
 
+<!-- BEGIN GENERATED COVERAGE -->
+## Generated current census
+
+Generated from `test_ops_hybrid_7d6646a0f.json` at `2026-08-05T18:55:49.278862+00:00` for commit `7d6646a0f2cdd81ba2ec72d26647e57491b7e208`.
+
+| Method outcome | Count |
+| --- | --- |
+| PASS_NATIVE | 213 |
+| PASS_MIXED | 39 |
+| PASS_FALLBACK | 120 |
+| PASS_FRONTEND | 40 |
+| SKIP_UPSTREAM | 13 |
+| FAIL | 0 |
+
+Total methods: **425**. Subcases: **126** (PASS_FALLBACK=61, PASS_NATIVE=65).
+
+| Kernel lane | Count |
+| --- | --- |
+| HOST | 1423 |
+| RK_CMAC | 32 |
+| RK_DPU | 340 |
+| RK_MIXED | 383 |
+
+| Native quality | Count |
+| --- | --- |
+| CORRECTNESS_FALLBACK | 88 |
+| EFFICIENT | 667 |
+
+First recorded native rejection among fallback-using methods:
+
+| Reject kind | Methods |
+| --- | --- |
+| unsupported_output_dtype | 69 |
+| unsupported_input_dtype | 24 |
+| unsupported_layout | 17 |
+| plan_stage_limit | 15 |
+| none | 14 |
+| unsupported_alu | 8 |
+| numerical_contract | 5 |
+| requires_reformat | 4 |
+| unaligned_row | 3 |
+
+Environment: `DEV=ROCKCHIP` `FORWARD_ONLY=1` `DEFAULT_FLOAT=HALF` `ROCKCHIP_FALLBACK=CLANG`.
+Hardware: `rockchip,rk3588s-orangepi-5,rockchip,rk3588`, kernel `6.1.99-rockchip-rk3588`, RKNPU `0.9.8`.
+
+Failures: **0**.
+<!-- END GENERATED COVERAGE -->
+
 All authoritative runs use `ROCKCHIP_FALLBACK=0`. The optional `RKPY` research
 envelope invokes tinygrad's Python UOps emulator over mapped GEM buffers and is
 therefore CPU semantic execution; it is excluded from pass counts. Likewise,
