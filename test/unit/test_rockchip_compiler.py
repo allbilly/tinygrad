@@ -1280,9 +1280,27 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(len(main),1)
     self.assertIs(main[0].lhs.buffer.kind,RKBufferKind.ARG)
     cost = plan_cost(result.plan)
-    self.assertLessEqual(cost.task_count,220)
-    self.assertLessEqual(cost.constant_bytes,2*1024*1024)
+    self.assertEqual(sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
+                         if isinstance(step,RKDPUProgram) for stage in step.stages),8)
+    self.assertEqual(len(contractions),81)
+    self.assertLessEqual(cost.task_count,89)
+    self.assertLessEqual(cost.constant_bytes,150*1024)
     self.assertFalse(contains_uop(result.plan))
+
+  def test_aligned_rectangular_contraction_packs_row_major_rhs(self):
+    for m,k,n in ((4,64,32),(4,96,64)):
+      with self.subTest(m=m,k=k,n=n):
+        result = lower_tiled_contract_result(sink(Tensor.empty(m,k,dtype=dtypes.half)@Tensor.empty(k,n,dtype=dtypes.half)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        self.assertIsInstance(result.plan,RKProgram)
+        assert isinstance(result.plan,RKProgram)
+        gathers = sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
+                      if isinstance(step,RKDPUProgram) for stage in step.stages)
+        contracts = sum(isinstance(step,RKCMACTask) for step in result.plan.steps)
+        self.assertEqual(gathers,n//8)
+        self.assertEqual(contracts,(n//8)*(k//32)+1+(m*n)//64)
+        self.assertLessEqual(plan_cost(result.plan).constant_bytes,150*1024)
+        self.assertFalse(contains_uop(result.plan))
 
   def test_plan_cost_accounts_for_commands_resets_traffic_and_macs(self):
     x, y = Tensor.empty(8,8,dtype=dtypes.half), Tensor.empty(8,8,dtype=dtypes.half)

@@ -4724,6 +4724,31 @@ complete uncached census is still required before changing the top-level total.
 All other K128 maps keep their typed resource fences, and no resource limit or
 numerical tolerance changes.
 
+## Aligned row-major RHS packing
+
+The K128 pack now applies to regular row-major RHS surfaces when N and K are
+both multiples of 32, `32 <= N <= K <= 128`, and the logical dimensions are
+already the complete physical surface. Each eight-column group uses one typed
+strided gather, each 32x8 tile uses the same immutable transpose payload, and
+the resulting blocked weights feed one broad CMAC task. Shapes needing padded
+or conditional RHS lanes keep the existing selector path rather than relying
+on uninitialized scratch padding.
+
+For dense `64x64 @ 64x64`, this reduces the complete native plan from 217 to
+89 tasks and from 1,044,304 to 148,480 constant bytes. The new schedule is eight
+DPU gathers, 16 transpose CMAC tasks, one broad compute task, and 64 proven-width
+output-selector tasks. It emits 4,006 command words and uses 25,600 scratch
+bytes. The rejected destination-stride probe means output compaction cannot yet
+be replaced by a strided DPU scatter.
+
+Strict RK3588 tests cover `4x64 @ 64x32`, `4x96 @ 96x64`, `64x64 @ 64x64`, and
+the existing `1x128 @ 128x128` path at the official `rtol=1e-3, atol=1e-6`
+contract. The deterministic square test differs from NumPy FP32 accumulation
+rounded to FP16 at only two outputs by one ULP and remains inside that official
+contract. Focused `test_gemm`, `test_gemm_fp16`, `test_9_gemm`, and `test_matmul`
+all remain native with fallback disabled. This is an efficiency milestone, not
+a method-level census transition; the authoritative total remains 206 native.
+
 ## Live Toolkit2 surface-task capture
 
 `dump_rknn_submit.gdb` captures a vendor submission without patching its task

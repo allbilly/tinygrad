@@ -21,22 +21,23 @@ from tinygrad.renderer.rockchip.reduce import _finish_reduction_epilogue
 from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dense_half_ref, _cmac_weight_ref, _cmac_selection_payload,
   _selector_program, _finish_program)
 
-def _pack_k128_row_major_rhs(rhs:RKArg, scratch:tuple[RKScratch, ...]) -> \
+def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) -> \
     tuple[list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], tuple[RKScratch, ...], RKArg]:
-  """Gather and transpose one row-major 128x128 RHS into the proven blocked CMAC weight stream."""
+  """Gather and transpose one aligned row-major KxN RHS into the proven blocked CMAC weight stream."""
+  if n%32 or k%32 or not 32 <= n <= k <= 128: raise ValueError(f"unsupported row-major RHS N={n},K={k}")
   packed = RKArg(RKBufferKind.SCRATCH,len(scratch))
-  scratch += (RKScratch(128*128*2),)
+  scratch += (RKScratch(n*k*2),)
   gathered = RKArg(RKBufferKind.SCRATCH,len(scratch))
-  scratch += (RKScratch(128*8*2),)
+  scratch += (RKScratch(k*8*2),)
   transpose = _cmac_selection_payload([[k_lane*8+n_lane] for n_lane in range(8) for k_lane in range(32)],256,256,1.0)
   lhs_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
   out_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
   weight = _cmac_weight_ref(0,256,256,RKBufferKind.CONSTANT,256)
   steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
-  for n_start in range(0,128,8):
-    steps.append(RKDPUProgram((RKStridedAtomGatherStage(gathered,RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),128,128),),scratch))
-    for k_start in range(0,128,32):
-      packed_offset = (((n_start//16)*4+k_start//32)*512+(n_start%16//8)*256)*2
+  for n_start in range(0,n,8):
+    steps.append(RKDPUProgram((RKStridedAtomGatherStage(gathered,RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),k,n),),scratch))
+    for k_start in range(0,k,32):
+      packed_offset = (((n_start//16)*(k//32)+k_start//32)*512+(n_start%16//8)*256)*2
       steps.append(RKCMACTask(RKTensorRef(RKArg(packed.kind,packed.index,packed_offset),out_layout),
         RKTensorRef(RKArg(gathered.kind,gathered.index,k_start*8*2),lhs_layout),weight,0,transpose,compact_output=True))
   return steps,scratch,packed
@@ -763,16 +764,16 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
                                      for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
-  direct_k128_rhs = k128_candidate and direct_lhs and m == 1 and n == 128 and compact_output and \
+  direct_row_major_rhs = direct_lhs and n%32 == 0 and k%32 == 0 and 32 <= n <= k <= 128 and rhs_count == n*k and \
     lhs_parsed[1] is None and rhs_parsed[1] is None and \
-    rhs_columns == [tuple(red*128+channel for red in range(128)) for channel in range(128)]
+    rhs_columns == [tuple(red*n+channel for red in range(k)) for channel in range(n)]
   # One-row compact CMAC writes are proven through 128 outputs. Keep conditional/padded contractions on the older 32-output
   # schedule because changing their selector grouping can change the final FP16 accumulation contract.
   rhs_selector_outputs = 64 if align_out <= 64 and lhs_parsed[1] is None and rhs_parsed[1] is None else 32
   selector_floor = (0 if direct_lhs else (lhs_values+31)//32) + (rhs_values+rhs_selector_outputs-1)//rhs_selector_outputs + \
     (1 if compact_output else (output_count+31)//32) + \
     (m+(4096//align_in)-1)//(4096//align_in)
-  if selector_floor > RK_MAX_PROGRAM_STAGES and not direct_k128_rhs:
+  if selector_floor > RK_MAX_PROGRAM_STAGES and not direct_row_major_rhs:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC selector lower bound is {selector_floor} tasks", reduce.op)
   if fused_epilogue is not None and align_out != 32:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "wide CMAC bias epilogue is not yet legalized", fused_epilogue[0].op)
@@ -790,7 +791,7 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
                 [[] for _ in range(align_in-k)])]
   b_selector:list[list[int]] = []
-  if not direct_k128_rhs:
+  if not direct_row_major_rhs:
     for out_block in range(align_out//16):
       for in_block in range(align_in//32):
         for out_lane in range(16):
@@ -810,8 +811,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     if packed_a is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC lhs selector exceeds plan limits", reduce.op)
     steps.extend(packed_a.steps)
     scratch = packed_a.scratch
-  if direct_k128_rhs:
-    packed_steps,scratch,b_arg = _pack_k128_row_major_rhs(RKArg(RKBufferKind.ARG,rhs.src[0].arg.slot),scratch)
+  if direct_row_major_rhs:
+    packed_steps,scratch,b_arg = _pack_row_major_rhs(RKArg(RKBufferKind.ARG,rhs.src[0].arg.slot),n,k,scratch)
     steps.extend(packed_steps)
   else:
     b_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
@@ -866,7 +867,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     for out_index,row,rhs_key in records:
       channel = channel_ids[rhs_key]
       unpack[out_index] = [lhs_rows.index(row)*align_out*2+(channel//16)*32+channel%16]
-    dense = _selector_program(reduced, cmac_out, m*align_out*2, unpack, scratch, max_outputs=32)
+    dense = _selector_program(reduced, cmac_out, m*align_out*2, unpack, scratch,
+                              max_outputs=64 if direct_row_major_rhs else 32)
     if dense is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC output selector exceeds plan limits", reduce.op)
     steps.extend(dense.steps)
     scratch = dense.scratch

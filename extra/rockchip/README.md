@@ -2502,3 +2502,20 @@ unaligned-row, and one LUT-domain-unproven. This makes the next matvec milestone
 unambiguous: preserve the proven one-task broad CMAC compute and replace the
 1,074-task generic row-major-to-weight transform with a bounded device-native
 block pack. No resource ceiling or numerical tolerance is increased.
+
+## Aligned row-major RHS packing
+
+The proven K128 transform is now parameterized for complete row-major RHS
+surfaces with 32-aligned N and K, `32 <= N <= K <= 128`. It keeps each access
+map compact: N/8 DPU gathers collect aligned atoms from the K rows, and
+`N/8 * K/32` CMAC tasks transpose the bounded 32x8 tiles with one deduplicated
+payload. Padded and conditional surfaces do not enter this path.
+
+The dense 64x64 contraction falls from 217 tasks and 1,044,304 constant bytes
+to 89 tasks and 148,480 bytes. RK3588 regressions cover square and rectangular
+64/96/128 geometries at the official tolerance, while the strict GEMM TestOps
+families remain native with fallback disabled. Output compaction still uses the
+proven 64-output selector because the independent destination-stride probe
+demonstrates that the candidate DPU fields leave atom writes compact. No task,
+constant, or numerical limit changes, and the authoritative census remains
+`206/40/166/13`.
