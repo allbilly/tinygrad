@@ -54,6 +54,15 @@ authoritative.
 The chronological sections below retain the individual focused evidence and
 their then-current estimates for debugging history.
 
+The first post-census destination-stride probe is a negative hardware result.
+The DPU gathered 64 eight-lane FP16 atoms from 128-element-stride source rows
+exactly, but programming `DPU_DST_SURF_STRIDE` and `DPU_SURFACE_ADD` for a
+64-element destination row did not scatter them. The output remained the exact
+compact sequence of 64 adjacent atoms, producing the predicted 952 differences
+from the requested strided surface. Therefore the existing typed stage remains
+source-stride-only, no compiler output-scatter claim is added, and dense GEMM
+output compaction still needs another native layout mechanism.
+
 Focused work after that census makes `TestOps.test_simple_conv2d_nhwc` pass
 natively without changing its `atol=1e-5`. The generic affine matcher derives
 NHWC input, HWIO weight, batch, channel, kernel, spatial, and stride roles and

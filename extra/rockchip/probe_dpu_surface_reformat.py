@@ -32,17 +32,17 @@ def _set(stage:RKStage, target:int, reg:int, value:int) -> RKStage:
 
 def image(rows:int, stride:int, column:int, line_notch:int, nonalign:bool=False,
           transpose:bool=False, regroup:int=0, surf_len:int=0, original:bool=False, channels:int=0,
-          surface_notch:int|None=None) -> RKImage:
+          surface_notch:int|None=None, dst_stride:int=8) -> RKImage:
   base = emit_dpu(RKDPUProgram((RKALUStage(Ops.ADD,RKArg(RKBufferKind.ARG,0),
     RKArg(RKBufferKind.ARG,1,column*2),0.0,rows),)))
   stage = base.stages[0]
   feature_mode = 0x1e5 | ((1<<25) if nonalign else 0) | ((1<<30)|(regroup<<26)|(surf_len<<9) if transpose else 0)
   regs = ((_DPU,rk.REG_DPU_FEATURE_MODE_CFG,feature_mode),
-    (_DPU,rk.REG_DPU_DST_SURF_STRIDE,0x10), (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,0),
+    (_DPU,rk.REG_DPU_DST_SURF_STRIDE,(dst_stride//8)<<4), (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,0),
     (_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,rows-1), (_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(channels<<16)|channels),
     (_DPU,rk.REG_DPU_BS_OW_CFG,2 | ((1<<27) if original else 0)),
     (_DPU,rk.REG_DPU_WDMA_SIZE_0,channels), (_DPU,rk.REG_DPU_WDMA_SIZE_1,(rows-1)<<16),
-    (_DPU,rk.REG_DPU_SURFACE_ADD,0x10), (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
+    (_DPU,rk.REG_DPU_SURFACE_ADD,(dst_stride//8)<<4), (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,rows-1), (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,channels),
     (_RDMA,_RDMA_SRC_DMA_CFG,line_notch<<19),
     (_RDMA,_RDMA_SURF_NOTCH,((stride*2 if surface_notch is None else surface_notch)&0x0fffffff)<<4))
@@ -78,7 +78,35 @@ def main() -> None:
   parser.add_argument("--vendor-transpose",action="store_true",help="replay the Toolkit2 one-task NC1HWC2 transpose geometry")
   parser.add_argument("--strided-atom-gather",action="store_true",
                       help="prove one task gathers 32 aligned FP16 atoms from 128-element rows")
+  parser.add_argument("--strided-atom-scatter",action="store_true",
+                      help="probe gathered atoms written to 64-element-stride destination rows")
   args = parser.parse_args()
+  if args.strided_atom_scatter:
+    rows, src_stride, dst_stride = 64, 128, 64
+    values = np.arange(rows*src_stride,dtype=np.float16).reshape(rows,src_stride)
+    expected = np.zeros((rows,dst_stride),dtype=np.float16)
+    expected[:,:8] = values[:,:8]
+    dev = RockchipDevice("ROCKCHIP")
+    src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(expected.nbytes)
+    try:
+      ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
+      ctypes.memset(int(out.va_addr),0,expected.nbytes)
+      program = RockchipProgram(dev,TinyELF(encode_image(image(rows,src_stride,0,src_stride//8-1,
+        channels=7,surface_notch=0,dst_stride=dst_stride)),"dpu_strided_atom_scatter",Target("ROCKCHIP"),()))
+      program(out,src,wait=True)
+      actual = np.frombuffer(ctypes.string_at(int(out.va_addr),expected.nbytes),dtype=np.float16).reshape(rows,dst_stride).copy()
+      mismatch = np.flatnonzero(actual != expected)
+      compact = np.zeros(rows*dst_stride,dtype=np.float16)
+      compact[:rows*8] = values[:,:8].reshape(-1)
+      compact = compact.reshape(rows,dst_stride)
+      compact_mismatch = np.flatnonzero(actual != compact)
+      print(f"strided_atom_scatter requested_exact={not mismatch.size} mismatches={mismatch.size} "
+            f"compact_exact={not compact_mismatch.size} first={mismatch[:16].tolist()}")
+      assert mismatch.size == 952 and not compact_mismatch.size
+    finally:
+      dev._gpu_free(src)
+      dev._gpu_free(out)
+    return
   if args.strided_atom_gather:
     rows, stride = 32, 128
     values = np.arange(rows*stride,dtype=np.float16).reshape(rows,stride)

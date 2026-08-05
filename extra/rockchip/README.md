@@ -14,6 +14,12 @@ unclassified failure. Coverage details, the checkout-local pytest-plugin
 invocation, reject Pareto, plan-cost histograms, and durable artifact hashes
 are recorded in `coverage.md`.
 
+A post-census DPU destination-stride probe is intentionally retained as a
+negative hardware boundary. The programmed destination surface stride did not
+scatter eight-lane atoms; the NPU wrote the exact compact atom sequence instead.
+The typed gather consequently keeps only its proven source-row stride, and no
+GEMM output-compaction capability is inferred from those destination fields.
+
 The PPU layout contract now names the actual `PPU_HWC` format and accepts every
 hardware-characterized FP16 channel count from two through eight. This follows
 the variable `align_c` register contract in the local `allbilly/rk3588`
