@@ -69,8 +69,10 @@ def _sparse_cmac_pipeline(output:RKArg, source:RKArg, input_count:int, rows:list
 
 def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[tuple[int,float]]],
                                      scratch:tuple[RKScratch, ...]=(), direct_count:int=0, max_window:int=512,
-                                     max_outputs:int=64, clear_empty:bool=True) -> RKProgram|None:
+                                     max_outputs:int=64, clear_empty:bool=True, out_dtype:DType=dtypes.half) -> RKProgram|None:
   """Apply consecutive static weighted rows from bounded, atom-aligned source windows."""
+  if out_dtype not in (dtypes.half,dtypes.float): return None
+  if out_dtype is dtypes.float: max_outputs = min(max_outputs,32)
   chunks:list[tuple[int, int, int, int, list[list[tuple[int,float]]], bytes]] = []
   start = 0
   while start < len(rows):
@@ -101,7 +103,7 @@ def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[
      (1 if any(not row for row in rows) else 0)+sum(1 if safe else 3 for safe in direct) > RK_MAX_PROGRAM_STAGES: return None
   packed = RKArg(RKBufferKind.SCRATCH, len(scratch))
   if not all(direct): scratch += (RKScratch(max((chunk[3] for chunk,safe in zip(chunks,direct) if not safe), default=32)*2),)
-  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows)),))]
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = ([RKDPUProgram((RKALUStage(Ops.ADD, output, 0.0, 0.0, len(rows),out_dtype),))]
                                                   if clear_empty and any(not row for row in rows) else [])
   for (start,base,end,align_in,tile,payload),safe in zip(chunks,direct):
     span, align_out = end-base, max(32, (len(tile)+31)&-32)
@@ -113,9 +115,10 @@ def _windowed_weighted_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[
         RKALUStage(Ops.ADD, packed, RKArg(source.kind, source.index, source.addend+base*2), 0.0, span)), scratch))
       lhs = _dense_half_ref(packed.index, (1,align_in), RKBufferKind.SCRATCH)
     valid = len(tile)
-    out_layout = RKLayout((1,valid), (1,align_out), (align_out*2,2), dtypes.half, padding=((0,0),(0,align_out-valid)))
-    steps.append(RKCMACTask(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*2), out_layout),
-      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, align_out), 0, payload, compact_output=True))
+    physical, strides = ((1,64),(256,4)) if out_dtype is dtypes.float else ((1,align_out),(align_out*2,2))
+    out_layout = RKLayout((1,valid), physical, strides, out_dtype, padding=((0,0),(0,physical[1]-valid)))
+    steps.append(RKCMACTask(RKTensorRef(RKArg(output.kind, output.index, output.addend+start*out_dtype.itemsize), out_layout),
+      lhs, _cmac_weight_ref(0, valid, align_in, RKBufferKind.CONSTANT, align_out), 0, payload, compact_output=out_dtype is dtypes.half))
   return RKProgram(tuple(steps), scratch)
 
 def _windowed_cmac_pipeline(output:RKArg, source:RKArg, rows:list[list[int]], scale:float=1.0,
