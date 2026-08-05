@@ -1,11 +1,31 @@
-import glob, math, os, unittest
+import ctypes, glob, math, os, unittest
 import numpy as np
 from tinygrad import Tensor, dtypes
+from tinygrad.device import Target, TinyELF
+from tinygrad.renderer.rockchip import (RKArg, RKBufferKind, RKDPUProgram, RKStridedAtomGatherStage, emit_dpu, encode_image)
+from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipProgram
 from tinygrad.runtime.support.rockchip_telemetry import clear, drain
 
 @unittest.skipUnless(any(os.path.basename(os.path.realpath(f"{node}/device/driver")).lower() in ("rknpu", "rocket")
                          for node in glob.glob("/sys/class/drm/card[0-9]*")), "no RK3588 NPU")
 class TestRockchip(unittest.TestCase):
+  def test_strided_fp16_atom_gather(self):
+    rows, stride = 128, 128
+    values = np.arange(rows*stride,dtype=np.float16).reshape(rows,stride)
+    expected = values[:,:8].reshape(-1)
+    dev = RockchipDevice("ROCKCHIP")
+    src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(expected.nbytes)
+    try:
+      ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
+      ctypes.memset(int(out.va_addr),0,expected.nbytes)
+      image = emit_dpu(RKDPUProgram((RKStridedAtomGatherStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),rows,stride),)))
+      RockchipProgram(dev,TinyELF(encode_image(image),"dpu_strided_atom_gather",Target("ROCKCHIP"),()))(out,src,wait=True)
+      actual = np.frombuffer(ctypes.string_at(int(out.va_addr),expected.nbytes),dtype=np.float16).copy()
+      np.testing.assert_equal(actual,expected)
+    finally:
+      dev._gpu_free(src)
+      dev._gpu_free(out)
+
   def test_static_two_tap_linear_interpolation_native_cmac(self):
     rng = np.random.default_rng(0)
     for align_corners in (False,True):

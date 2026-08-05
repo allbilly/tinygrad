@@ -10,7 +10,8 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   RKCopyStage, RKCastStage, RKDPUProgram,
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
-  RKFusedALUStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan, RKLegalizedReformat,
+  RKFusedALUStage, RKStridedAtomGatherStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan,
+  RKLegalizedReformat,
   RKReformatKind, RK_STAGE_RESET,
   RKRejectKind, RKScratch, RKLUTStage, RKMaskStage, RockchipRenderer, decode_image, emit_cmac_task, emit_dpu, emit_program, emit_reduce,
   emit_reformat,
@@ -48,6 +49,18 @@ def contains_uop(obj) -> bool:
   return False
 
 class TestDPUCompiler(unittest.TestCase):
+  def test_strided_atom_gather_emits_proven_surface_geometry(self):
+    plan = RKDPUProgram((RKStridedAtomGatherStage(RKArg(RKBufferKind.ARG,0),RKArg(RKBufferKind.ARG,1),128,128),))
+    image = emit_dpu(plan)
+    self.assertEqual(len(image.stages),1)
+    commands = {(command>>48,command&0xffff):(command>>16)&0xffffffff for command in image.stages[0].commands}
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_DATA_CUBE_HEIGHT)],127)
+    self.assertEqual(commands[(0x1001,rk.REG_DPU_WDMA_SIZE_1)],127<<16)
+    self.assertEqual(commands[(0x2001,0x5048)],15<<19)
+    self.assertEqual(commands[(0x2001,0x504c)],0)
+    self.assertEqual(commands[(0x81,rk.REG_PC_OPERATION_ENABLE)],0x18)
+    self.assertFalse(contains_uop(plan))
+
   def test_layout_contracts_are_executable_and_conservative(self):
     dense = RKLayout((2,3),(2,3),(6,2),dtypes.half)
     reshaped = RKLayout((6,),(6,),(2,),dtypes.half)

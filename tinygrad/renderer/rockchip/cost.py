@@ -3,8 +3,8 @@ import math
 
 from tinygrad.renderer.rockchip.emit import emit_program
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET
-from tinygrad.renderer.rockchip.ir import (RKALUStage, RKArg, RKCopyStage, RKCastStage, RKDPUProgram, RKFusedALUStage, RKLegalizedReformat,
-  RKLUTStage, RKMaskStage, RKCMACTask, RKConvTask, RKPlanCost, RKPool, RKProgram, RKReduce)
+from tinygrad.renderer.rockchip.ir import (RKALUStage, RKArg, RKCopyStage, RKCastStage, RKDPUProgram, RKFusedALUStage,
+  RKStridedAtomGatherStage, RKLegalizedReformat, RKLUTStage, RKMaskStage, RKCMACTask, RKConvTask, RKPlanCost, RKPool, RKProgram, RKReduce)
 
 def plan_cost(plan:RKProgram) -> RKPlanCost:
   """Estimate physical work after all semantic plans have been legalized."""
@@ -21,6 +21,9 @@ def plan_cost(plan:RKProgram) -> RKPlanCost:
           reads += stage.count*(2+4+2) + (stage.count*2 if isinstance(stage.bn,RKArg) else 0)
           writes += stage.count*2
           macs += stage.count*3
+        elif isinstance(stage, RKStridedAtomGatherStage):
+          reads += stage.rows*8*2
+          writes += stage.rows*8*2
         elif isinstance(stage, RKCopyStage):
           reads += stage.count*stage.dtype.itemsize
           writes += stage.count*stage.dtype.itemsize

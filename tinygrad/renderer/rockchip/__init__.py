@@ -11,7 +11,7 @@ from tinygrad.uop.ops import AddrSpace, Ops, ProgramInfo, UOp
 
 from tinygrad.renderer.rockchip.ir import (RKTarget as RKTarget, RKEngine as RKEngine, RKBufferKind, RKLayoutKind as RKLayoutKind,
   RKReformatKind as RKReformatKind, RKArg,
-  RKALUStage, RKFusedALUStage as RKFusedALUStage, RKCopyStage, RKCastStage,
+  RKALUStage, RKFusedALUStage as RKFusedALUStage, RKStridedAtomGatherStage as RKStridedAtomGatherStage, RKCopyStage, RKCastStage,
   RKMaskStage as RKMaskStage, RKLUTStage as RKLUTStage, RKDPUStage,
   RKScratch, RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue as RKEpilogue, RKContractionPlan as RKContractionPlan,
   RKCMACTask, RKConvTask, RKConvPlan as RKConvPlan,

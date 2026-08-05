@@ -78,6 +78,20 @@ class RKFusedALUStage:
     if not 0 < self.count <= 8: raise ValueError("RK fused DPU arithmetic needs one eight-channel atom")
 
 @dataclass(frozen=True)
+class RKStridedAtomGatherStage:
+  """Gather one aligned eight-lane FP16 atom from each strided source row."""
+  dst: RKArg
+  src: RKArg
+  rows: int
+  src_row_stride: int
+  def __post_init__(self):
+    if not 1 <= self.rows <= 128: raise ValueError("RK strided atom gather supports 1..128 rows")
+    if not 8 <= self.src_row_stride <= 128 or self.src_row_stride % 8:
+      raise ValueError("RK strided atom gather row stride must be 8..128 aligned FP16 values")
+    if self.dst.addend % 16 or self.src.addend % 16:
+      raise ValueError("RK strided atom gather surfaces must be 16-byte aligned")
+
+@dataclass(frozen=True)
 class RKCopyStage:
   dst: RKArg
   src: RKArg|bool
@@ -111,7 +125,7 @@ class RKLUTStage:
   src: RKArg
   count: int
 
-RKDPUStage = RKALUStage|RKFusedALUStage|RKCopyStage|RKCastStage|RKMaskStage|RKLUTStage
+RKDPUStage = RKALUStage|RKFusedALUStage|RKStridedAtomGatherStage|RKCopyStage|RKCastStage|RKMaskStage|RKLUTStage
 
 @dataclass(frozen=True)
 class RKScratch:

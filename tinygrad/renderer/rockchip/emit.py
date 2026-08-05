@@ -6,8 +6,9 @@ from tinygrad.runtime.autogen import rockchip as rk, rockchip_lut as rklut
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
 
-from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKCopyStage, RKCastStage, RKDPUStage,
-  RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKCMACTask, RKConvTask, RKReduce, RKPool, RKLegalizedReformat, RKProgram)
+from tinygrad.renderer.rockchip.ir import (RKTarget, RKEngine, RKBufferKind, RKArg, RKALUStage, RKFusedALUStage, RKStridedAtomGatherStage,
+  RKCopyStage, RKCastStage, RKDPUStage, RKMaskStage, RKLUTStage, RKDPUProgram, RKLayoutKind, RKCMACTask, RKConvTask, RKReduce,
+  RKPool, RKLegalizedReformat, RKProgram)
 from tinygrad.renderer.rockchip.image import RK_STAGE_RESET, RKReloc, RKStage, RKImage
 
 _TARGET_DPU, _TARGET_DPU_RDMA, _TARGET_PC = 0x1001, 0x2001, 0x81
@@ -16,6 +17,7 @@ _TARGET_PPU, _TARGET_PPU_RDMA = 0x4001, 0x8001
 _REG_PPU_POOLING_PADDING_CFG = 0x6040
 _REG_DPU_RDMA_BRDMA_CFG, _REG_DPU_RDMA_BS_BASE_ADDR = 0x501c, 0x5020
 _REG_DPU_RDMA_NRDMA_CFG, _REG_DPU_RDMA_BN_BASE_ADDR, _REG_DPU_RDMA_WEIGHT = 0x5028, 0x502c, 0x5068
+_REG_DPU_RDMA_SRC_DMA_CFG, _REG_DPU_RDMA_SURF_NOTCH = 0x5048, 0x504c
 _EW_BASE = 0x108002c0
 _ERDMA_FP16 = 0x40000008
 _CBUF_BANKS, _CBUF_BANK_BYTES, _MAX_CMAC_CHANNELS = 12, 32768, 416
@@ -180,6 +182,31 @@ def emit_dpu(program:RKDPUProgram, target:RKTarget=RKTarget.RK3588) -> RKImage:
         fused_relocs.append(RKReloc(stage_idx, len(fused_cmds)-1, arg.kind, arg.index, arg.addend))
       fused_cmds.append(_command(_TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18))
       stages.append(RKStage(RKEngine.DPU, tuple(fused_cmds), tuple(fused_relocs), RK_STAGE_RESET))
+      continue
+    if isinstance(plan, RKStridedAtomGatherStage):
+      zero = materialize(0.0, plan.rows*8)
+      gather_dpu_regs = ((rk.REG_DPU_S_POINTER,0xe),(rk.REG_DPU_FEATURE_MODE_CFG,0x1e5),(rk.REG_DPU_DATA_FORMAT,0x48000002),
+        (rk.REG_DPU_DST_SURF_STRIDE,0x10),(rk.REG_DPU_DATA_CUBE_WIDTH,0),(rk.REG_DPU_DATA_CUBE_HEIGHT,plan.rows-1),
+        (rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(rk.REG_DPU_DATA_CUBE_CHANNEL,0x70007),(rk.REG_DPU_BS_CFG,0x53),
+        (rk.REG_DPU_BN_CFG,0x53),(rk.REG_DPU_BS_ALU_CFG,0),(rk.REG_DPU_BS_MUL_CFG,0),(rk.REG_DPU_BS_OW_CFG,2),
+        (rk.REG_DPU_WDMA_SIZE_0,7),(rk.REG_DPU_WDMA_SIZE_1,(plan.rows-1)<<16),(rk.REG_DPU_BN_MUL_CFG,0),
+        (rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(rk.REG_DPU_EW_CFG,_EW_CFG[Ops.ADD]),(rk.REG_DPU_EW_CVT_SCALE_VALUE,1),
+        (rk.REG_DPU_OUT_CVT_OFFSET,0),(rk.REG_DPU_OUT_CVT_SCALE,0x10001),(rk.REG_DPU_OUT_CVT_SHIFT,0),
+        (rk.REG_DPU_SURFACE_ADD,0x10))
+      gather_rdma_regs = ((rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
+        (rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,plan.rows-1),(rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),
+        (rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,_ERDMA_FP16),
+        (_REG_DPU_RDMA_SRC_DMA_CFG,(plan.src_row_stride//8-1)<<19),(_REG_DPU_RDMA_SURF_NOTCH,0),
+        (rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,0x17849))
+      cmds = [_command(_TARGET_DPU,*x) for x in gather_dpu_regs]+[_command(_TARGET_DPU_RDMA,*x) for x in gather_rdma_regs]
+      relocs = []
+      for target_id,reg,arg in ((_TARGET_DPU,rk.REG_DPU_DST_BASE_ADDR,plan.dst),
+        (_TARGET_DPU_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,plan.src),
+        (_TARGET_DPU_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,zero)):
+        cmds.append(_command(target_id,reg,0))
+        relocs.append(RKReloc(stage_idx,len(cmds)-1,arg.kind,arg.index,arg.addend))
+      cmds.append(_command(_TARGET_PC,rk.REG_PC_OPERATION_ENABLE,0x18))
+      stages.append(RKStage(RKEngine.DPU,tuple(cmds),tuple(relocs),RK_STAGE_RESET))
       continue
     if isinstance(plan,RKCastStage):
       # A bool surface is one byte per lane. This proven mixed-precision mode consumes one eight-lane int8 atom and writes FP16.
