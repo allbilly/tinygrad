@@ -2726,3 +2726,21 @@ The unchanged native-only `TestOps.test_big_gemm` passes in 34.85 seconds;
 seven existing GEMM and matvec methods pass together in 44.24 seconds. The
 last authoritative full census remains `213/40/159/13`; focused evidence
 predicts one fewer stage-limit reject until the next complete uncached census.
+
+## Rejected three-factor CMAC average scale
+
+The WHERE comparison path proves that BS and BN multiplication can coexist in
+one DPU task. A raw CMAC probe now applies one FP16 weight factor followed by
+independent BS and BN register factors. Their ordered FP32 product is exactly
+the float32 encoding of `1/9`, and a simple 32-term hardware vector produces
+the expected FP16 result exactly.
+
+That coefficient identity is insufficient for average pooling. The weight
+factor multiplies every term before CMAC accumulation, whereas PyTorch sums
+the FP16 inputs in FP32 and applies the reciprocal afterward. The unchanged
+`test_avg_pool2d` sweep misses 23.5--27.2% of outputs by one ULP for 3x3, 3x2,
+5x5, and 5x1 kernels. Production therefore retains the typed
+`NUMERICAL_CONTRACT` rejection. The complete inactive implementation is
+archived as `wip-three-factor-cmac-average-still-one-ulp.patch`; the positive
+register probe remains for future operations whose semantics permit per-term
+scaling.

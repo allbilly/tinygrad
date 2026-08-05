@@ -5063,3 +5063,18 @@ The unchanged locked `test_big_gemm` passes with `ROCKCHIP_FALLBACK=0` in
 `matvecmat`, and `matvec` also pass together after the topology change. This is
 focused evidence only: the authoritative census remains `213 PASS_NATIVE / 40
 PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM` pending a complete uncached run.
+
+## BS and BN post-multipliers do not repair average semantics
+
+A new raw CMAC experiment confirms that the same BS/BN blocks already used by
+WHERE can both multiply the flying accumulator. Together with one FP16 CMAC
+weight factor, the ordered FP32 coefficient equals float32 `1/9` exactly. The
+simple 32-term hardware probe is exact.
+
+The official average-pool contract still fails because the first factor is
+applied per input term before accumulation. Four unchanged kernel families
+miss 23.5--27.2% of outputs by one ULP at `rtol=1e-5, atol=1e-6`, with maximum
+absolute error 0.000977. The production scale fence is restored and now cites
+this precise failure mode. Full WIP SHA-256:
+`d6e551378e644b277f6702ff4e411aeb5246c90a925901b9d20cd6f5b16edb11`.
+No native count, tolerance, fallback policy, or resource ceiling changes.
