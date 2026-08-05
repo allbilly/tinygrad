@@ -2433,12 +2433,17 @@ batched, and batched-vector matmul tests remain green with no coverage or limit
 change.
 
 The same physical ABI is now proven at `M=1,N=128,K=128`: one broad CMAC task
-is bit-exact. Enabling the corresponding ordinary row-major `test_matvec`
-graph is still not clean, because current selector packing expands the dynamic
-rhs transform to 1,074 tasks. The logical K/source fences and 400-task ceiling
-remain active. This separates the next requirement precisely: implement a
-direct native weight-layout transform rather than split the GEMM or admit a
-larger selector schedule.
+is bit-exact. The ordinary row-major path now uses the typed strided-atom
+gather plus one reusable 256x256 selector payload to transpose bounded 32x8
+tiles into that weight stream. Its complete schedule is 16 DPU gathers, 64
+CMAC transposes, one broad CMAC, and one output copy: 82 tasks and 133,376
+constant bytes instead of the rejected 1,074-task generic selector plan.
+
+`test_matvec` and `test_matvecmat` both pass strict focused native-only testing.
+The direct deterministic hardware regression is bit-exact against FP32 matrix
+multiplication rounded once to FP16. This path is deliberately limited to the
+proven row-major `M=1,N=K=128` geometry; other K128 layouts retain typed fences,
+and neither the 400-task nor 2 MiB constant ceiling changes.
 
 ## One-row FP32 CMAC writeback is already compact
 

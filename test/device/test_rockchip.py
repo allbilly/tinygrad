@@ -26,6 +26,15 @@ class TestRockchip(unittest.TestCase):
       dev._gpu_free(src)
       dev._gpu_free(out)
 
+  def test_k128_row_major_matvec_native_pack(self):
+    rng = np.random.default_rng(128)
+    lhs = rng.uniform(-.25,.25,(1,128)).astype(np.float16)
+    rhs = rng.uniform(-.25,.25,(128,128)).astype(np.float16)
+    actual = (Tensor(lhs,device="ROCKCHIP",dtype=dtypes.half) @
+              Tensor(rhs,device="ROCKCHIP",dtype=dtypes.half)).realize().numpy()
+    expected = (lhs.astype(np.float32)@rhs.astype(np.float32)).astype(np.float16)
+    np.testing.assert_equal(actual,expected)
+
   def test_static_two_tap_linear_interpolation_native_cmac(self):
     rng = np.random.default_rng(0)
     for align_corners in (False,True):

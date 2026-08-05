@@ -11,15 +11,35 @@ from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, st
   conv_zero_padding as _conv_zero_padding, contract_bias_epilogue as _contract_bias_epilogue)
 from tinygrad.renderer.rockchip.conv import plan_conv_cbuf, legalize_conv_plan
 from tinygrad.renderer.rockchip.cost import plan_cost
-from tinygrad.renderer.rockchip.ir import (RKEngine, RKBufferKind, RKLayoutKind, RKArg, RKALUStage, RKScratch, RKDPUProgram,
-  RKLayout, RKTensorRef, RKEpilogue, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan, RKConvSplit, RKReduce,
+from tinygrad.renderer.rockchip.ir import (RKEngine, RKBufferKind, RKLayoutKind, RKArg, RKALUStage, RKStridedAtomGatherStage, RKScratch,
+  RKDPUProgram, RKLayout, RKTensorRef, RKEpilogue, RKContractionPlan, RKCMACTask, RKConvTask, RKConvPlan, RKConvSplit, RKReduce,
   RKRejectKind, RKLowerResult)
 from tinygrad.renderer.rockchip.limits import (RK_MAX_CONSTANT_BYTES, RK_MAX_PROGRAM_STAGES,
   RK_MAX_AFFINE_WINDOW, RK_MAX_CMAC_SELECTOR_WINDOW, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, RK_MAX_TILED_CONTRACT_VISITS)
 from tinygrad.renderer.rockchip.lower import native as _native, not_applicable as _not_applicable, unsupported as _unsupported
 from tinygrad.renderer.rockchip.reduce import _finish_reduction_epilogue
-from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dense_half_ref, _cmac_weight_ref,
+from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dense_half_ref, _cmac_weight_ref, _cmac_selection_payload,
   _selector_program, _finish_program)
+
+def _pack_k128_row_major_rhs(rhs:RKArg, scratch:tuple[RKScratch, ...]) -> \
+    tuple[list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce], tuple[RKScratch, ...], RKArg]:
+  """Gather and transpose one row-major 128x128 RHS into the proven blocked CMAC weight stream."""
+  packed = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(128*128*2),)
+  gathered = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  scratch += (RKScratch(128*8*2),)
+  transpose = _cmac_selection_payload([[k_lane*8+n_lane] for n_lane in range(8) for k_lane in range(32)],256,256,1.0)
+  lhs_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
+  out_layout = RKLayout((1,256),(1,256),(512,2),dtypes.half)
+  weight = _cmac_weight_ref(0,256,256,RKBufferKind.CONSTANT,256)
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
+  for n_start in range(0,128,8):
+    steps.append(RKDPUProgram((RKStridedAtomGatherStage(gathered,RKArg(rhs.kind,rhs.index,rhs.addend+n_start*2),128,128),),scratch))
+    for k_start in range(0,128,32):
+      packed_offset = (((n_start//16)*4+k_start//32)*512+(n_start%16//8)*256)*2
+      steps.append(RKCMACTask(RKTensorRef(RKArg(packed.kind,packed.index,packed_offset),out_layout),
+        RKTensorRef(RKArg(gathered.kind,gathered.index,k_start*8*2),lhs_layout),weight,0,transpose,compact_output=True))
+  return steps,scratch,packed
 
 def legalize_contraction_plan(plan:RKContractionPlan) -> tuple[RKCMACTask, ...]:
   """Legalize one already-packed dense contraction into one physical CMAC task."""
@@ -691,9 +711,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
      any(axis not in ranges for axis in out_axes): return _not_applicable()
   k = math.prod(ranges[axis] for axis in red_axes)
   lhs_count, rhs_count, output_count = (int(x.src[0].src[0].arg) for x in (lhs,rhs,store.src[0]))
-  # WIP reference: a prepacked M=1,N=128,K=128 CMAC task is bit-exact, but lowering ordinary row-major operands through
-  # selector-CMAC needs 1,074 tasks. Keep the logical packing fence until a direct native weight-layout transform exists.
-  if not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS:
+  k128_candidate = (k,lhs_count,rhs_count,output_count) == (128,128,128*128,128)
+  if (not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS) and not k128_candidate:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
@@ -744,13 +763,16 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
                                      for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
+  direct_k128_rhs = k128_candidate and direct_lhs and m == 1 and n == 128 and compact_output and \
+    lhs_parsed[1] is None and rhs_parsed[1] is None and \
+    rhs_columns == [tuple(red*128+channel for red in range(128)) for channel in range(128)]
   # One-row compact CMAC writes are proven through 128 outputs. Keep conditional/padded contractions on the older 32-output
   # schedule because changing their selector grouping can change the final FP16 accumulation contract.
   rhs_selector_outputs = 64 if align_out <= 64 and lhs_parsed[1] is None and rhs_parsed[1] is None else 32
   selector_floor = (0 if direct_lhs else (lhs_values+31)//32) + (rhs_values+rhs_selector_outputs-1)//rhs_selector_outputs + \
     (1 if compact_output else (output_count+31)//32) + \
     (m+(4096//align_in)-1)//(4096//align_in)
-  if selector_floor > RK_MAX_PROGRAM_STAGES:
+  if selector_floor > RK_MAX_PROGRAM_STAGES and not direct_k128_rhs:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, f"tiled CMAC selector lower bound is {selector_floor} tasks", reduce.op)
   if fused_epilogue is not None and align_out != 32:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION, "wide CMAC bias epilogue is not yet legalized", fused_epilogue[0].op)
@@ -768,13 +790,14 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   a_selector = [entry for row in lhs_rows for entry in (([[source] if source >= 0 else [] for source in row]) +
                 [[] for _ in range(align_in-k)])]
   b_selector:list[list[int]] = []
-  for out_block in range(align_out//16):
-    for in_block in range(align_in//32):
-      for out_lane in range(16):
-        for in_lane in range(32):
-          out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
-          source = rhs_columns[out_channel][reduction_index] if out_channel < n and reduction_index < k else -1
-          b_selector.append([source] if source >= 0 else [])
+  if not direct_k128_rhs:
+    for out_block in range(align_out//16):
+      for in_block in range(align_in//32):
+        for out_lane in range(16):
+          for in_lane in range(32):
+            out_channel, reduction_index = out_block*16+out_lane, in_block*32+in_lane
+            source = rhs_columns[out_channel][reduction_index] if out_channel < n and reduction_index < k else -1
+            b_selector.append([source] if source >= 0 else [])
   steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
   scratch:tuple[RKScratch, ...] = ()
   if direct_lhs:
@@ -787,15 +810,19 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
     if packed_a is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC lhs selector exceeds plan limits", reduce.op)
     steps.extend(packed_a.steps)
     scratch = packed_a.scratch
-  b_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
-  scratch += (RKScratch(_cmac_tiled_output_bytes(len(b_selector))),)
-  # Rockchip GEM allocations are page-rounded. Zero-weight selector lanes may read that physical tail without changing semantics.
-  rhs_capacity = ((rhs_count*2+4095)&-4096)//2
-  packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch,
-                               rhs_capacity, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, rhs_selector_outputs)
-  if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
-  steps.extend(packed_b.steps)
-  scratch = packed_b.scratch
+  if direct_k128_rhs:
+    packed_steps,scratch,b_arg = _pack_k128_row_major_rhs(RKArg(RKBufferKind.ARG,rhs.src[0].arg.slot),scratch)
+    steps.extend(packed_steps)
+  else:
+    b_arg = RKArg(RKBufferKind.SCRATCH, len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(len(b_selector))),)
+    # Rockchip GEM allocations are page-rounded. Zero-weight selector lanes may read that physical tail without changing semantics.
+    rhs_capacity = ((rhs_count*2+4095)&-4096)//2
+    packed_b = _selector_program(b_arg, RKArg(RKBufferKind.ARG, rhs.src[0].arg.slot), rhs_count, b_selector, scratch,
+                                 rhs_capacity, RK_MAX_TILED_CMAC_SELECTOR_WINDOW, rhs_selector_outputs)
+    if packed_b is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT, "tiled CMAC rhs selector exceeds plan limits", reduce.op)
+    steps.extend(packed_b.steps)
+    scratch = packed_b.scratch
   contract_epilogue:RKEpilogue|None = None
   if fused_epilogue is not None:
     assert channel_bias is not None

@@ -4695,6 +4695,25 @@ the already-proven 256-output compact CMAC selector, and reuse one immutable
 selector payload. No TestOps coverage, limits, or tolerances change in this
 hardware-characterization milestone.
 
+## Native row-major K128 matvec pack
+
+The typed gather is now composed with the proven compact CMAC selector for the
+exact ordinary row-major `M=1,N=K=128` contraction. Each eight-column RHS block
+is gathered once from 128 strided rows; four 32x8 subtiles are transposed into
+the blocked `[N/16,K/32,N-lane,K-lane]` weight stream. All 64 transpose tasks
+reuse one immutable 128 KiB payload. One broad CMAC task then consumes the
+packed surface and one DPU task copies its compact result.
+
+The resulting schedule has 82 tasks and 133,376 constant bytes, versus the
+rejected 1,074-task generic selector schedule. A deterministic end-to-end
+hardware test has zero mismatches against FP32 matrix multiplication rounded
+once to FP16. Strict focused TestOps records both `test_matvec` and
+`test_matvecmat` as `PASS_NATIVE` with `ROCKCHIP_FALLBACK=0`. These are two
+focused method transitions beyond the authoritative 204-native census; a new
+complete uncached census is still required before changing the top-level total.
+All other K128 maps keep their typed resource fences, and no resource limit or
+numerical tolerance changes.
+
 ## Live Toolkit2 surface-task capture
 
 `dump_rknn_submit.gdb` captures a vendor submission without patching its task

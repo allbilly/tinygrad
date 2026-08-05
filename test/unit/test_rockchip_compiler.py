@@ -1950,10 +1950,16 @@ class TestDPUCompiler(unittest.TestCase):
 
   def test_k128_matvec_keeps_native_packing_budget(self):
     result = lower_tiled_contract_result(sink(Tensor.empty(1,128,dtype=dtypes.half)@Tensor.empty(128,128,dtype=dtypes.half)))
-    self.assertIs(result.kind,RKLowerKind.UNSUPPORTED)
-    self.assertIsNotNone(result.reject)
-    assert result.reject is not None
-    self.assertIs(result.reject.kind,RKRejectKind.PLAN_STAGE_LIMIT)
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    cost = plan_cost(result.plan)
+    self.assertEqual(sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
+                         if isinstance(step,RKDPUProgram) for stage in step.stages),16)
+    self.assertEqual(sum(isinstance(step,RKCMACTask) for step in result.plan.steps),65)
+    self.assertLessEqual(cost.task_count,82)
+    self.assertLessEqual(cost.constant_bytes,131*1024)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):
     source = Tensor.empty(4,8,dtype=dtypes.half).realize()
