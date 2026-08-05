@@ -2307,3 +2307,15 @@ while reducing the public compiler module from 2,864 to 2,522 physical lines.
 Frozen image tests, the complete compiler/image/telemetry suite, full-tree
 Mypy/Ruff, and representative RK3588 hardware methods remain green. The
 authoritative native census is unchanged at `204/40/168/13`.
+
+## Rejected K128 conv3d selector path
+
+Allowing the generic tiled-CMAC lowerer to accept K=108 does not solve the
+remaining conv3d methods. The unchanged `test_simple_conv3d` geometry reaches
+the wider planner, which computes a minimum of 1,226 selector tasks before
+payload generation. The existing ceiling is 400 tasks.
+
+The K96 legality bound therefore remains active. Commit `a19d43fa0` and patch
+`0267-WIP-probe-K128-tiled-contraction.patch` preserve the experiment. Future
+conv3d work must use direct 3D physical layouts or another tile-proportional NPU
+schedule; increasing the selector task ceiling would only hide the blocker.

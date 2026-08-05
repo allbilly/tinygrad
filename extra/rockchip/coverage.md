@@ -4389,3 +4389,18 @@ image regressions. Full Mypy covers 234 source files, full-tree Ruff is clean,
 and representative serialized RK3588 reformat, reduction, K65 contraction, and
 direct-CONV methods pass. No planner choice, task cost, limit, tolerance, or
 coverage outcome changes; the authoritative census remains `204/40/168/13`.
+
+## Rejected K128 selector contraction for conv3d
+
+The tiled-CMAC recognizer was temporarily widened from logical K96 to K128 to
+test the K=108 `test_simple_conv3d` graph. The graph passes the K-width gate,
+but the planner proves a lower bound of 1,226 selector tasks before building
+payloads. This is already more than three times the unchanged 400-task ceiling;
+raising the K gate cannot make the method practical or legal under the existing
+cost contract.
+
+The active K96 bound is restored. The exact experiment is commit `a19d43fa0`
+and `0267-WIP-probe-K128-tiled-contraction.patch` (SHA-256
+`403f3703e9862a1e5bebddcfc67ccd5bfe2f7495cae45bb3173d952cec0788cc`).
+The next valid conv3d route needs direct 3D layout/engine legalization or a
+tile-proportional schedule, not a wider selector-CMAC allowance.
