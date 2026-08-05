@@ -24,7 +24,9 @@ from tinygrad.renderer.rockchip.image import (RK_STAGE_RESET as RK_STAGE_RESET, 
 from tinygrad.renderer.rockchip.affine import affine as _affine, rk_fingerprint as rk_fingerprint
 from tinygrad.renderer.rockchip.access import (RKAccessMap as RKAccessMap, RKIdentityMap as RKIdentityMap, RKAffineMap as RKAffineMap,
   RKPadMap as RKPadMap, RKPeriodicMap as RKPeriodicMap, RKAffineSegment as RKAffineSegment,
-  RKPiecewiseAffineMap as RKPiecewiseAffineMap, RKStaticSelectorMap as RKStaticSelectorMap)
+  RKPiecewiseAffineMap as RKPiecewiseAffineMap, RKStaticSelectorMap as RKStaticSelectorMap,
+  RKMultiSourceAffineSegment as RKMultiSourceAffineSegment, RKMultiSourceAccessMap as RKMultiSourceAccessMap,
+  RKMultiSourceAffineGridMap as RKMultiSourceAffineGridMap)
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 from tinygrad.renderer.rockchip.conv import plan_conv_cbuf as plan_conv_cbuf, legalize_conv_plan as legalize_conv_plan
 from tinygrad.renderer.rockchip.contract import (legalize_contraction_plan as legalize_contraction_plan,

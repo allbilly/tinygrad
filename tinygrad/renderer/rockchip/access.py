@@ -1,5 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from collections.abc import Iterator
+import math
 
 @dataclass(frozen=True)
 class RKIdentityMap:
@@ -61,6 +63,73 @@ class RKStaticSelectorMap:
   def expand(self) -> tuple[int, ...]: return self.indexes
 
 RKAccessMap = RKIdentityMap|RKAffineMap|RKPadMap|RKPeriodicMap|RKPiecewiseAffineMap|RKStaticSelectorMap
+
+@dataclass(frozen=True)
+class RKMultiSourceAffineSegment:
+  source: int
+  base: int
+  stride: int
+  count: int
+  def __post_init__(self):
+    if self.source < 0 or self.base < 0 or self.count <= 0: raise ValueError("invalid RK multi-source affine segment")
+  def values(self) -> Iterator[tuple[int,int]]:
+    return ((self.source,self.base+self.stride*index) for index in range(self.count))
+
+@dataclass(frozen=True)
+class RKMultiSourceAccessMap:
+  segments: tuple[RKMultiSourceAffineSegment, ...]
+  def __post_init__(self):
+    if not self.segments: raise ValueError("empty RK multi-source access map")
+  @property
+  def count(self) -> int: return sum(segment.count for segment in self.segments)
+  def values(self) -> Iterator[tuple[int,int]]:
+    return (value for segment in self.segments for value in segment.values())
+  def expand(self) -> tuple[tuple[int,int], ...]: return tuple(self.values())
+
+@dataclass(frozen=True)
+class RKMultiSourceAffineGridMap:
+  """A dense output grid selecting one source by one axis while preserving an affine source layout."""
+  extents: tuple[int, ...]
+  output_strides: tuple[int, ...]
+  source_strides: tuple[int, ...]
+  selector_axis: int
+  selector_sources: tuple[int, ...]
+  selector_bases: tuple[int, ...]
+  def __post_init__(self):
+    if not self.extents or len(self.extents) != len(self.output_strides) or len(self.extents) != len(self.source_strides) or \
+       not 0 <= self.selector_axis < len(self.extents) or self.extents[self.selector_axis] != len(self.selector_sources) or \
+       len(self.selector_sources) != len(self.selector_bases) or min(*self.extents,*self.output_strides,*self.source_strides,
+       *self.selector_sources,*self.selector_bases) < 0:
+      raise ValueError("invalid RK multi-source affine grid")
+    stride = 1
+    for axis in sorted(range(len(self.extents)),key=self.output_strides.__getitem__):
+      if self.output_strides[axis] != stride: raise ValueError("RK multi-source output grid is not dense")
+      stride *= self.extents[axis]
+  @property
+  def count(self) -> int: return math.prod(self.extents)
+  def values(self) -> Iterator[tuple[int,int]]:
+    for linear in range(self.count):
+      coordinates = tuple(linear//stride%extent for extent,stride in zip(self.extents,self.output_strides))
+      selector = coordinates[self.selector_axis]
+      source_index = self.selector_bases[selector]+sum(coordinate*stride for coordinate,stride in zip(coordinates,self.source_strides))
+      yield self.selector_sources[selector],source_index
+  def expand(self) -> tuple[tuple[int,int], ...]: return tuple(self.values())
+
+RKMultiSourceMap = RKMultiSourceAccessMap|RKMultiSourceAffineGridMap
+
+def compact_multi_source_map(indexes:tuple[tuple[int,int], ...]) -> RKMultiSourceAccessMap:
+  """Compress consecutive selections from one source into affine segments."""
+  if not indexes: raise ValueError("empty RK multi-source mapping")
+  segments:list[RKMultiSourceAffineSegment] = []
+  start = 0
+  while start < len(indexes):
+    source,base = indexes[start]
+    stride = indexes[start+1][1]-base if start+1 < len(indexes) and indexes[start+1][0] == source else 0
+    end = start+1
+    while end < len(indexes) and indexes[end] == (source,base+stride*(end-start)): end += 1
+    segments.append(RKMultiSourceAffineSegment(source,base,stride,end-start))
+    start = end
+  return RKMultiSourceAccessMap(tuple(segments))
 
 def _period(values:tuple[int, ...]) -> int:
   """Return the minimal exact period using the KMP prefix table."""

@@ -10,6 +10,7 @@ from tinygrad.renderer.rockchip import (RKALUStage, RKArg, RKBufferKind, RKContr
   RKCopyStage, RKCastStage, RKDPUProgram,
   RKEpilogue, RKEngine,
   RKLayout, RKLayoutKind, RKTensorRef, RKConvSplit, RKConvTiling, RKAffineMap, RKPadMap, RKPeriodicMap, RKPiecewiseAffineMap,
+  RKMultiSourceAffineGridMap,
   RKFusedALUStage, RKStridedAtomGatherStage, RKLowerKind, RKProgram, RKReduce, RKPool, RKReformatPlan, RKMultiSourceReformatPlan,
   RKLegalizedReformat,
   RKReformatKind, RK_STAGE_RESET,
@@ -1727,6 +1728,19 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertEqual(len(result.plan.plan.mapping),270)
         self.assertLessEqual(plan_cost(result.plan.program).task_count,9)
         self.assertFalse(contains_uop(result.plan))
+
+  def test_large_dense_concat_keeps_compact_source_segments(self):
+    sources = tuple(Tensor.empty(45,65,9,dtype=dtypes.half).realize() for _ in range(3))
+    result = lower_native(sink(sources[0].cat(*sources[1:],dim=0)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKLegalizedReformat)
+    assert isinstance(result.plan,RKLegalizedReformat) and isinstance(result.plan.plan,RKMultiSourceReformatPlan)
+    self.assertIsInstance(result.plan.plan.access,RKMultiSourceAffineGridMap)
+    assert isinstance(result.plan.plan.access,RKMultiSourceAffineGridMap)
+    self.assertEqual(tuple(sorted(result.plan.plan.access.selector_sources)),(0,1,2))
+    self.assertEqual(result.plan.plan.access.count,3*45*65*9)
+    self.assertLessEqual(plan_cost(result.plan.program).task_count,400)
+    self.assertFalse(contains_uop(result.plan))
 
   def test_semantic_reformat_split_preserves_frozen_images(self):
     cases = (

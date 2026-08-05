@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probe direct RK3588 CMAC output widths above the original 16-channel contract."""
 from __future__ import annotations
-import ctypes
+import argparse, ctypes
 import numpy as np
 
 from tinygrad.device import Target, TinyELF
@@ -12,7 +12,7 @@ from tinygrad.renderer.rockchip.image import RKStage
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.ops_rockchip import RockchipDevice, RockchipProgram
 
-_DPU = 0x1001
+_CNA, _DPU = 0x0201, 0x1001
 
 def _command(target:int, reg:int, value:int) -> int:
   return ((target & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
@@ -64,7 +64,78 @@ def fp32_image(compact:bool=False) -> RKImage:
   if not compact: return base
   return RKImage(RKTarget.RK3588,(_replace(base.stages[0],_DPU,rk.REG_DPU_SURFACE_ADD,0x20),),base.scratch,base.constants)
 
+def row_layout_image(dst_stride:int, surface_add:int, notch:int, group_line_off:bool=False) -> RKImage:
+  """Vary the coupled CNA/DPU address-generator fields used by historical broad-GEMM implementations."""
+  base = image(64,False,4)
+  stage = base.stages[0]
+  if group_line_off: stage = _replace(stage,_CNA,rk.REG_CNA_CONV_CON1,0x120)
+  stage = _replace(stage,_DPU,rk.REG_DPU_DST_SURF_STRIDE,dst_stride)
+  stage = _replace(stage,_DPU,rk.REG_DPU_SURFACE_ADD,surface_add)
+  stage = _replace(stage,_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,(notch<<16)|notch)
+  return RKImage(RKTarget.RK3588,(stage,),base.scratch,base.constants)
+
+def probe_row_layout(dst_stride:int, surface_add:int, notch:int, expect_compact:bool, group_line_off:bool=False) -> None:
+  """Locate every unique identity result so overlapping or gapped rows cannot look like a valid compact surface."""
+  dev, rows, channels = RockchipDevice("ROCKCHIP"), 4, 64
+  lhs = np.arange(1,rows*channels+1,dtype=np.float16).reshape(rows,channels)
+  weight = np.eye(channels,dtype=np.float16)
+  packed = weight.reshape(channels//16,16,channels//32,32).transpose(0,2,1,3).ravel()
+  out, lhs_buf, rhs = dev._gpu_alloc(8192), dev._gpu_alloc(lhs.nbytes), dev._gpu_alloc(packed.nbytes)
+  try:
+    ctypes.memmove(int(lhs_buf.va_addr),lhs.ctypes.data,lhs.nbytes)
+    ctypes.memmove(int(rhs.va_addr),packed.ctypes.data,packed.nbytes)
+    ctypes.memset(int(out.va_addr),0,8192)
+    name = f"cmac_row_dst{dst_stride:x}_surf{surface_add:x}_notch{notch:x}_glo{int(group_line_off)}"
+    RockchipProgram(dev,TinyELF(encode_image(row_layout_image(dst_stride,surface_add,notch,group_line_off)),name,Target("ROCKCHIP"),()))(
+      out,lhs_buf,rhs,wait=True)
+    physical = np.frombuffer(ctypes.string_at(int(out.va_addr),8192),dtype=np.float16)
+    positions:list[int] = []
+    for value in lhs.ravel():
+      found = np.flatnonzero(physical == value)
+      positions.append(int(found[0]) if found.size == 1 else -1)
+    compact = positions == list(range(rows*channels))
+    print(f"{name} compact={compact} complete={-1 not in positions} positions_by_row="
+          f"{[positions[row*channels:(row+1)*channels] for row in range(rows)]}")
+    if expect_compact: assert compact
+  finally:
+    dev._gpu_free(out)
+    dev._gpu_free(lhs_buf)
+    dev._gpu_free(rhs)
+
 def main() -> None:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--row-layout",nargs=3,metavar=("DST_STRIDE","SURFACE_ADD","NOTCH"),
+                      help="run one isolated multi-row FP16 address-generator probe")
+  parser.add_argument("--expect-compact",action="store_true")
+  parser.add_argument("--group-line-off",action="store_true")
+  parser.add_argument("--compact-width",type=int,help="probe one compact FP16 identity row at this width")
+  args = parser.parse_args()
+  if args.row_layout is not None:
+    probe_row_layout(*(int(value,0) for value in args.row_layout),args.expect_compact,args.group_line_off)
+    return
+  if args.compact_width is not None:
+    channels = args.compact_width
+    align = max(32,(channels+31)&-32)
+    dev = RockchipDevice("ROCKCHIP")
+    lhs = np.arange(1,channels+1,dtype=np.float16)
+    weight = np.eye(align,dtype=np.float16)
+    packed = weight.reshape(align//16,16,align//32,32).transpose(0,2,1,3).ravel()
+    out,lhs_buf,rhs = dev._gpu_alloc(align*4),dev._gpu_alloc(align*2),dev._gpu_alloc(packed.nbytes)
+    try:
+      ctypes.memset(int(lhs_buf.va_addr),0,align*2)
+      ctypes.memmove(int(lhs_buf.va_addr),lhs.ctypes.data,lhs.nbytes)
+      ctypes.memmove(int(rhs.va_addr),packed.ctypes.data,packed.nbytes)
+      ctypes.memset(int(out.va_addr),0,align*4)
+      base = image(channels,True)
+      RockchipProgram(dev,TinyELF(encode_image(base),f"cmac_compact_{channels}",Target("ROCKCHIP"),()))(out,lhs_buf,rhs,wait=True)
+      actual = np.frombuffer(ctypes.string_at(int(out.va_addr),channels*2),dtype=np.float16)
+      mismatch = np.flatnonzero(actual != lhs)
+      print(f"compact_width={channels} exact={not mismatch.size} mismatches={mismatch.size} first={mismatch[:16].tolist()}")
+    finally:
+      dev._gpu_free(out)
+      dev._gpu_free(lhs_buf)
+      dev._gpu_free(rhs)
+    return
   dev = RockchipDevice("ROCKCHIP")
   rng = np.random.default_rng(2608)
   for m,n,k in ((16,16,16),(32,32,32),(64,64,32),(16,16,64),(8,16,32),(1,128,128),(256,256,256)):

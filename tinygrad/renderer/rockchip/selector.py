@@ -1,9 +1,10 @@
 from __future__ import annotations
 import struct
+from itertools import islice
 
 from tinygrad.dtype import dtypes, DType
 from tinygrad.uop.ops import Ops
-from tinygrad.renderer.rockchip.access import compact_access_map
+from tinygrad.renderer.rockchip.access import compact_access_map, RKMultiSourceMap
 from tinygrad.renderer.rockchip.cost import plan_cost
 from tinygrad.renderer.rockchip.ir import (RKBufferKind, RKLayoutKind, RKReformatKind, RKArg, RKALUStage, RKDPUProgram, RKScratch,
   RKLayout, RKTensorRef, RKCMACTask, RKConvTask, RKReduce, RKReformatPlan, RKLegalizedReformat, RKProgram)
@@ -172,24 +173,25 @@ def _selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[lis
     plan_cost(two_level).constant_bytes <= RK_MAX_CONSTANT_BYTES else None
 
 def _multi_source_windowed_program(output:RKArg, sources:tuple[RKArg, ...], source_counts:tuple[int, ...],
-                                   mapping:tuple[tuple[int,int], ...], max_outputs:int=128) -> RKProgram|None:
+                                   access:RKMultiSourceMap, max_outputs:int=128, max_window:int=512) -> RKProgram|None:
   """Select aligned output tiles directly from their source surfaces, combining only tiles which cross a source boundary."""
   scratch:tuple[RKScratch, ...] = (RKScratch(_cmac_tiled_output_bytes(max_outputs)),)
   partial = RKArg(RKBufferKind.SCRATCH, 0)
   steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
-  for start in range(0,len(mapping),max_outputs):
-    tile = mapping[start:start+max_outputs]
+  values, start = access.values(), 0
+  while tile := tuple(islice(values,max_outputs)):
     target = RKArg(output.kind,output.index,output.addend+start*2)
     source_ids = tuple(dict.fromkeys(sid for sid,_ in tile))
     for position,sid in enumerate(source_ids):
       rows = [[src] if row_sid == sid else [] for row_sid,src in tile]
       selected = _windowed_cmac_pipeline(target if position == 0 else partial,sources[sid],rows,scratch=scratch,
-                                         direct_count=source_counts[sid],max_outputs=max_outputs)
+                                         direct_count=source_counts[sid],max_outputs=max_outputs,max_window=max_window)
       if selected is None: return None
       steps.extend(selected.steps)
       scratch = selected.scratch
       if position:
         steps.append(RKDPUProgram((RKALUStage(Ops.ADD,target,target,partial,len(tile)),),scratch))
+    start += len(tile)
   return _finish_program(steps,scratch)
 
 def _partitioned_selector_program(output:RKArg, source:RKArg, input_count:int, rows:list[list[int]],

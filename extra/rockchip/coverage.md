@@ -12,54 +12,47 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `ad42acf8f` contains exactly 425 telemetry method
-records: 206 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 166 `FAIL`, and 13
+The complete uncached run at `20bd6418e` contains exactly 425 telemetry method
+records: 213 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 159 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0` and `CACHELEVEL=0` were set throughout,
 with `DEV=ROCKCHIP`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`. Raw pytest
-reports 3,515.87 seconds. No NPU timeout, invalid submission, reset failure,
+reports 3,685.44 seconds. No NPU timeout, invalid submission, reset failure,
 process abort, fallback execution, or unclassified failure occurred.
 
-The result confirms exactly two transitions from the preceding 204-pass method
-census: `test_matvec` and `test_matvecmat` are now native through the bounded
-row-major K128 pack and the proven one-task broad CMAC compute. Every one of
-the 166 failures is a typed native reject with a retained method-level first
-reject. Their first-reject Pareto is 53 unsupported-output-dtype, 33
+The result confirms all seven focused 2D transpose-convolution transitions:
+simple, padded, strided, dilated, grouped, bias, and output-padding. Every one
+of the 159 failures is a typed native reject with a retained method-level first
+reject. Their first-reject Pareto is 53 unsupported-output-dtype, 26
 plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 16
 numerical-contract, 12 unsupported-ALU, five requires-reformat, two
 unaligned-row, and one LUT-domain-unproven.
 
-Across passing and partially passing methods, 657 successful native kernels
-contain 590 `EFFICIENT` and 67 `CORRECTNESS_FALLBACK` plans. The 206 fully
-native methods contain 563 kernels: 506 efficient and 57 correctness
-fallbacks. At method level, 169 are fully efficient and 37 contain a
+Across passing and partially passing methods, 674 successful native kernels
+contain 592 `EFFICIENT` and 82 `CORRECTNESS_FALLBACK` plans. The 213 fully
+native methods contain 580 kernels: 508 efficient and 72 correctness
+fallbacks. At method level, 169 are fully efficient and 44 contain a
 correctness fallback. The maximum remains 399
 tasks; no task or constant ceiling changed. The worst single-kernel wall time
-is 42.63 seconds, and the largest generated constant payload is 1,819,392
+is 42.64 seconds, and the largest generated constant payload is 1,917,472
 bytes. These costs remain visible rather than being hidden by the native pass
 count.
 
-The durable artifacts are `/home/orangepi/rk_results/test_ops_ad42acf8f.log`,
-`.xml`, and `.json`. Their SHA-256 values are respectively
-`68f6279ebc89466d2ffb10b2d1ccb871691cdd9c18adae8e02098fe38645bf4d`,
-`489c76e27616ef29dd964d93c4c6ee6dafc4b8d05c2a1f8daedd85fef7c437cf`, and
-`908d32d05d61c8447f0464c0d75c2ae9467399c0a29548bbd9805ea4ad704b77`. The
+The durable artifacts are `/home/orangepi/rk_results/test_ops_20bd6418e.xml`
+and `.json`. Their SHA-256 values are respectively
+`a6fdfc5a5140956218be9e131adc037d4609936aeb9aa01a629c6a1cb4ac4cdc` and
+`5c92f21716012a19582dd77c1bc0d25daf2ab1a1d5197c4d0130d1e4583781ab`. The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through the native row-major K128 matvec pack are now
+All focused milestones through native 2D transpose convolution are now
 authoritative.
 The chronological sections below retain the individual focused evidence and
 their then-current estimates for debugging history.
 
-Focused work after that census now makes all seven 2D transpose-convolution
-methods native: simple, padded, strided, dilated, grouped, bias, and
-output-padding. The expected tally is therefore `213 PASS_NATIVE / 40
-PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM`, but `206/40/166/13` remains
-authoritative until the next complete uncached census. The 3D variant remains
-rejected.
+The 3D transpose-convolution variant remains rejected.
 
 The legalizer recognizes the decomposed affine transpose exactly, packs
 dynamic feature and weight surfaces on the NPU, and emits one 1x1 CNA
@@ -4912,3 +4905,62 @@ This closes the tempting interpolation continuation for now. BRDMA's FP32
 operand contract remains valid inside the exact fused lerp recipe, but it is
 not a general signed FP32-to-FP16 cast. No production lowering or coverage
 classification changes.
+
+## Remaining stage-limit audit
+
+The `20bd6418e` census has 26 method-level first rejects at the unchanged
+400-task or 2 MiB constant limits. They fall into these compiler families:
+
+- contraction and attention: `big_gemm`, `dot`, `dot_1d`, `broadcastdot`,
+  `multidot`, both `einsum` methods, and the four SDPA variants;
+- convolution: large and nested 2D, the M=4 1x1 case, two ordinary 3D cases,
+  and 3D transpose convolution;
+- pooling: padded average, ordinary/asymmetrically padded MAX, and MAX unpool;
+- scans: both cumulative products and cumulative MAX;
+- movement/loss: concatenation and 3D NLL loss.
+
+Most of these method names were green on `rockchip-2607`, but that is not proof
+that a clean native implementation already exists. The reusable boundary is:
+
+| family | reusable native evidence | old result that is not portable |
+|---|---|---|
+| GEMM, dot, einsum | broad CNA/CMAC geometry, CBUF formulas, register words, direct N/K tiling | NumPy/dynamic host packing and the large `np.einsum` runner |
+| CONV2D/3D | CNA geometry, bank-pressure tiling, padding and task ordering | host im2col, feature/weight packing, and output extraction |
+| attention | operation ordering and contraction shapes | generic NumPy elementwise/reduction execution |
+| pooling/unpool | PPU and FP16 scatter/register experiments | FP32 host average/argmax/scatter implementations |
+| cumulative | Hillis--Steele/scan decomposition and hardware ordering | typed host movement/reduction subtasks |
+| concatenation | no missing arithmetic; it identifies layout conversion | host memmove/scatter materialization |
+| NLL loss | graph semantics only | `_run_host_nll` NumPy execution |
+
+Thus the old branches are hardware and algorithm oracles, not code to copy into
+the native runtime. The immediate clean reuse remains one-task broad GEMM/CONV
+compute combined with new NPU-native layout preparation and output legalization.
+
+## Compact multi-source access maps
+
+`RKMultiSourceReformatPlan` now retains a typed compact access map instead of
+requiring an element-per-output tuple. Consecutive affine selections compress
+into `RKMultiSourceAffineSegment` objects; large dense concatenations use an
+`RKMultiSourceAffineGridMap` that preserves the source-selecting axis and source
+strides. Selector legalization consumes the map as a stream and expands only
+one bounded output tile at a time.
+
+The first large flat concatenation kernel, three `45x65x9` FP16 inputs along
+the outer axis, now compiles as a 323-task correctness fallback with 764,576
+constant bytes rather than rejecting at 78,975 compiler coordinate visits.
+This is an IR/compiler-memory milestone, not a method transition. The complete
+`test_cat` graph subsequently requests a different dense permutation: current
+selector schedules need 851 or 2,478 tasks depending on the concatenation axis,
+so the method retains its typed stage-limit reject. No limit changed.
+
+Hardware probes close two tempting shortcuts. FP16 CMAC one-row compact output
+is exact through 320 and 384 logical channels, while 512 exceeds the emitter's
+established 416-channel physical contract. No tested multi-row register setting
+removes FP16 row padding. A DPU strided-row gather copies exactly one eight-lane
+atom per row; asking it to gather 16 or 32 values preserves only the first atom,
+and 64--256-value variants time out. Therefore neither primitive is promoted as
+a general full-row concatenate/transpose engine.
+
+The complete compiler regression has 169 tests plus 77 subtests passing with
+`-n12`. The full 425-method census remains `213/40/159/13`; this milestone does
+not claim a new TestOps pass.

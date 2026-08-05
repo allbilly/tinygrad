@@ -6,18 +6,35 @@ from typing import cast
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.renderer.rockchip.affine import affine as _affine
+from tinygrad.renderer.rockchip.access import (RKMultiSourceAffineSegment, RKMultiSourceAccessMap, RKMultiSourceAffineGridMap,
+  RKMultiSourceMap, compact_multi_source_map)
 from tinygrad.renderer.rockchip.analysis import (strip_casts as _strip_casts, static_scalar as _static_scalar,
   static_linear_form as _static_linear_form, static_selected_index as _static_selected_index)
 from tinygrad.renderer.rockchip.cost import plan_cost
 from tinygrad.renderer.rockchip.expr import _ALUExpr
 from tinygrad.renderer.rockchip.ir import (RKBufferKind, RKReformatKind, RKArg, RKALUStage, RKCopyStage, RKDPUStage, RKScratch,
   RKDPUProgram, RKLayout, RKTensorRef, RKMultiSourceReformatPlan, RKLegalizedReformat, RKProgram, RKRejectKind, RKLowerResult)
-from tinygrad.renderer.rockchip.limits import RK_MAX_CONSTANT_BYTES, RK_MAX_AFFINE_VISITS, RK_MAX_PROGRAM_STAGES
+from tinygrad.renderer.rockchip.limits import (RK_MAX_CONSTANT_BYTES, RK_MAX_AFFINE_VISITS, RK_MAX_PROGRAM_STAGES,
+  RK_MAX_TILED_CMAC_SELECTOR_WINDOW)
 from tinygrad.renderer.rockchip.lower import native as _native, not_applicable as _not_applicable, unsupported as _unsupported
 from tinygrad.renderer.rockchip.schedule import schedule_expr as _schedule_expr
 from tinygrad.renderer.rockchip.selector import (_cmac_tiled_output_bytes, _dense_ref, _dense_half_ref,
   _windowed_weighted_cmac_pipeline, _selector_program, _multi_source_windowed_program, _best_partitioned_selector_program,
   _finish_program, _legalized_reformat, _periodic_selector_program)
+
+def _range_affine(u:UOp) -> tuple[dict[UOp,int],int]|None:
+  """Preserve split RANGE identities instead of collapsing their shared logical axis id."""
+  if u.op is Ops.RANGE: return ({u:1},0)
+  if u.op is Ops.CONST: return ({},int(u.arg))
+  if u.op is Ops.ADD:
+    lhs,rhs = _range_affine(u.src[0]),_range_affine(u.src[1])
+    if lhs is None or rhs is None: return None
+    return ({axis:lhs[0].get(axis,0)+rhs[0].get(axis,0) for axis in lhs[0].keys()|rhs[0].keys()},lhs[1]+rhs[1])
+  if u.op is Ops.MUL:
+    constant,value = (u.src[0],u.src[1]) if u.src[0].op is Ops.CONST else (u.src[1],u.src[0])
+    if constant.op is not Ops.CONST or (parsed:=_range_affine(value)) is None: return None
+    return ({axis:coefficient*int(constant.arg) for axis,coefficient in parsed[0].items()},parsed[1]*int(constant.arg))
+  return None
 
 def lower_static_two_tap_result(sink:UOp) -> RKLowerResult:
   """Lower a dense FP32 convex blend of at most two statically indexed FP16 values through CMAC."""
@@ -251,10 +268,70 @@ def lower_multi_source_reformat_result(sink:UOp) -> RKLowerResult:
   ranges = tuple(dict.fromkeys(u for root in (store.src[0].src[1],store.src[1]) for u in root.toposort()
                                if u.op is Ops.RANGE and u.src[0].op is Ops.CONST))
   visits = math.prod(int(u.src[0].arg) for u in ranges)
-  if visits > RK_MAX_AFFINE_VISITS:
-    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,f"multi-source reformat needs {visits} coordinate visits",Ops.RANGE)
   source_id = {param.key:index for index,param in enumerate(params)}
   source_counts = tuple(int(param.src[0].arg) for param in params)
+  # A concatenation of complete dense surfaces simplifies to one outer selector and one full-surface inner range.
+  # Prove that compact structure directly so large concatenations never require an element-per-output compiler map.
+  concat_access:RKMultiSourceMap|None = None
+  exact_out = _range_affine(store.src[0].src[1])
+  source_indexes = tuple(u for u in store.src[1].toposort() if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM)
+  conditions = tuple(u.src[0] for u in store.src[1].toposort() if u.op is Ops.WHERE)
+  condition_ranges = {u for condition in conditions for u in condition.toposort() if u.op is Ops.RANGE}
+  exact_sources = tuple(_range_affine(index.src[1]) for index in source_indexes)
+  if exact_out is not None and not exact_out[1] and set(exact_out[0]) == set(ranges) and len(condition_ranges) == 1 and \
+     all(parsed is not None and not parsed[1] for parsed in exact_sources):
+    selector = next(iter(condition_ranges))
+    source_coefficients = cast(tuple[tuple[dict[UOp,int],int], ...],exact_sources)
+    common_source = source_coefficients[0][0]
+    if all(parsed[0] == common_source for parsed in source_coefficients) and selector not in common_source and \
+       set(common_source) == set(ranges)-{selector}:
+      points:list[int] = []
+      zero_point = {axis:0 for axis in ranges}
+      for coordinate in range(int(selector.src[0].arg)):
+        point = {**zero_point,selector:coordinate}
+        selected = _static_selected_index(store.src[1],point)
+        if selected is None or selected.src[0].key not in source_id or _static_scalar(selected.src[1],point) != 0:
+          points = []
+          break
+        points.append(source_id[selected.src[0].key])
+      if points:
+        concat_access = RKMultiSourceAffineGridMap(tuple(int(axis.src[0].arg) for axis in ranges),
+          tuple(exact_out[0][axis] for axis in ranges),tuple(common_source.get(axis,0) for axis in ranges),ranges.index(selector),
+          tuple(points),(0,)*len(points))
+  out_aff = _affine(store.src[0].src[1])
+  if concat_access is None and out_aff is not None and not out_aff[1] and len(ranges) == 2 and len(out_aff[0]) == 2:
+    inner = next((axis for axis in ranges if out_aff[0].get(axis.arg[0]) == 1),None)
+    outer = next((axis for axis in ranges if inner is not None and axis is not inner),None)
+    if inner is not None and outer is not None:
+      inner_count, outer_count = int(inner.src[0].arg), int(outer.src[0].arg)
+      dense_sources = source_counts and all(count == inner_count for count in source_counts) and all(
+        _affine(index.src[1]) == ({inner.arg[0]:1},0) for index in source_indexes)
+      outer_only = all({u.arg[0] for u in condition.toposort() if u.op is Ops.RANGE} <= {outer.arg[0]} for condition in conditions)
+      if dense_sources and outer_only and out_aff == ({outer.arg[0]:inner_count,inner.arg[0]:1},0) and \
+         output_count == outer_count*inner_count:
+        segments:list[RKMultiSourceAffineSegment] = []
+        for coordinate in range(outer_count):
+          selected = _static_selected_index(store.src[1],{outer:coordinate,inner:0})
+          if selected is None or selected.src[0].key not in source_id or _static_scalar(selected.src[1],{outer:coordinate,inner:0}) != 0:
+            segments = []
+            break
+          segments.append(RKMultiSourceAffineSegment(source_id[selected.src[0].key],0,1,inner_count))
+        if segments: concat_access = RKMultiSourceAccessMap(tuple(segments))
+  if concat_access is not None and visits > RK_MAX_AFFINE_VISITS:
+    out_ref = _dense_ref(store.src[0].src[0].arg.slot,(output_count,),dtype)
+    source_refs = tuple(_dense_ref(param.arg.slot,(count,),dtype) for param,count in zip(params,source_counts))
+    semantic = RKMultiSourceReformatPlan(out_ref,source_refs,concat_access)
+    direct = _multi_source_windowed_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),
+      tuple(RKArg(RKBufferKind.ARG,param.arg.slot) for param in params),source_counts,concat_access,max_outputs=256,
+      max_window=RK_MAX_TILED_CMAC_SELECTOR_WINDOW)
+    if direct is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"dense concatenation exceeds native window limits",Ops.WHERE)
+    cost = plan_cost(direct)
+    if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+        f"dense concatenation needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes",Ops.WHERE)
+    return _native(RKLegalizedReformat(semantic,RKReformatKind.SELECTOR_CMAC,direct))
+  if visits > RK_MAX_AFFINE_VISITS:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,f"multi-source reformat needs {visits} coordinate visits",Ops.RANGE)
   mapping:list[tuple[int,int]|None] = [None]*output_count
   for coordinates in product(*(range(int(u.src[0].arg)) for u in ranges)):
     point = dict(zip(ranges,coordinates))
@@ -273,7 +350,8 @@ def lower_multi_source_reformat_result(sink:UOp) -> RKLowerResult:
   typed_mapping = cast(tuple[tuple[int,int], ...],tuple(mapping))
   out_ref = _dense_ref(store.src[0].src[0].arg.slot,(output_count,),dtype)
   source_refs = tuple(_dense_ref(param.arg.slot,(count,),dtype) for param,count in zip(params,source_counts))
-  semantic = RKMultiSourceReformatPlan(out_ref,source_refs,typed_mapping)
+  access = compact_multi_source_map(typed_mapping)
+  semantic = RKMultiSourceReformatPlan(out_ref,source_refs,access)
   if dtype is dtypes.float:
     runs:list[tuple[int,int,int,int]] = []
     for dst,(sid,src) in enumerate(typed_mapping):
@@ -289,7 +367,7 @@ def lower_multi_source_reformat_result(sink:UOp) -> RKLowerResult:
       RKArg(RKBufferKind.ARG,params[sid].arg.slot,src*4),count,dtypes.float) for dst,sid,src,count in runs)
     return _native(RKLegalizedReformat(semantic,RKReformatKind.COALESCED_DPU,RKProgram((RKDPUProgram(stages),))))
   sources = tuple(RKArg(RKBufferKind.ARG,param.arg.slot) for param in params)
-  direct = _multi_source_windowed_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),sources,source_counts,typed_mapping)
+  direct = _multi_source_windowed_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),sources,source_counts,access)
   bases, packed_count = [], 0
   for source_count in source_counts:
     bases.append(packed_count)
@@ -362,5 +440,3 @@ def lower_static_selector_reformat_result(sink:UOp) -> RKLowerResult:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"static selector reformat exceeds the native cost contract",Ops.INDEX)
   return _native(_legalized_reformat(_dense_half_ref(output.index,(count,)),_dense_half_ref(source_arg.index,(src_count,)),tuple(mapping),
     0.0,RKReformatKind.SELECTOR_CMAC,implementation))
-
-

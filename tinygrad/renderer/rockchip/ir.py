@@ -6,7 +6,7 @@ from enum import Enum, IntEnum
 from tinygrad.dtype import dtypes, DType
 from tinygrad.runtime.autogen.rockchip_lut import RKLUTId
 from tinygrad.uop.ops import Ops
-from tinygrad.renderer.rockchip.access import RKAccessMap
+from tinygrad.renderer.rockchip.access import RKAccessMap, RKMultiSourceMap
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum):
@@ -366,13 +366,15 @@ class RKMultiSourceReformatPlan:
   """One logical static transform selecting every output from one of several surfaces."""
   out: RKTensorRef
   sources: tuple[RKTensorRef, ...]
-  mapping: tuple[tuple[int, int], ...]
+  access: RKMultiSourceMap
   def __post_init__(self):
-    if not self.sources or len(self.mapping) != math.prod(self.out.layout.logical_shape):
+    if not self.sources or self.access.count != math.prod(self.out.layout.logical_shape):
       raise ValueError("RK multi-source reformat has an invalid output map")
     if any(source < 0 or source >= len(self.sources) or index < 0 or
-           index >= math.prod(self.sources[source].layout.logical_shape) for source,index in self.mapping):
+           index >= math.prod(self.sources[source].layout.logical_shape) for source,index in self.access.values()):
       raise ValueError("RK multi-source reformat mapping is outside its logical surfaces")
+  @property
+  def mapping(self) -> tuple[tuple[int,int], ...]: return self.access.expand()
 
 RKProgramStep = RKDPUProgram|RKCMACTask|RKConvTask|RKReduce
 

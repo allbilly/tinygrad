@@ -80,7 +80,30 @@ def main() -> None:
                       help="prove one task gathers 32 aligned FP16 atoms from 128-element rows")
   parser.add_argument("--strided-atom-scatter",action="store_true",
                       help="probe gathered atoms written to 64-element-stride destination rows")
+  parser.add_argument("--strided-row-gather",type=int,metavar="CHANNELS",
+                      help="probe one-task compaction of complete rows from a two-row-stride CMAC surface")
   args = parser.parse_args()
+  if args.strided_row_gather is not None:
+    rows, channels = 4, args.strided_row_gather
+    stride = 2*channels
+    values = np.zeros((rows,stride),dtype=np.float16)
+    values[:,:channels] = np.arange(1,rows*channels+1,dtype=np.float16).reshape(rows,channels)
+    expected = values[:,:channels].reshape(-1)
+    dev = RockchipDevice("ROCKCHIP")
+    src, out = dev._gpu_alloc(values.nbytes), dev._gpu_alloc(expected.nbytes)
+    try:
+      ctypes.memmove(int(src.va_addr),values.ctypes.data,values.nbytes)
+      ctypes.memset(int(out.va_addr),0,expected.nbytes)
+      program = RockchipProgram(dev,TinyELF(encode_image(image(rows,stride,0,stride//8-1,
+        channels=channels-1,surface_notch=0,dst_stride=channels)),"dpu_strided_row_gather",Target("ROCKCHIP"),()))
+      program(out,src,wait=True)
+      actual = np.frombuffer(ctypes.string_at(int(out.va_addr),expected.nbytes),dtype=np.float16).copy()
+      mismatch = np.flatnonzero(actual != expected)
+      print(f"strided_row_gather exact={not mismatch.size} mismatches={mismatch.size} first={mismatch[:16].tolist()}")
+    finally:
+      dev._gpu_free(src)
+      dev._gpu_free(out)
+    return
   if args.strided_atom_scatter:
     rows, src_stride, dst_stride = 64, 128, 64
     values = np.arange(rows*src_stride,dtype=np.float16).reshape(rows,src_stride)

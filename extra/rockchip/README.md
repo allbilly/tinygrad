@@ -6,9 +6,9 @@ reported separately and unsupported kernels rejected before submission.
 The frozen `rockchip-pr`, `rockchip-2608`, and `rockchip-2607` branches remain
 minimal, architectural, and behavioral/register-programming references.
 
-The current authoritative uncached strict census at `ad42acf8f` is 206 native,
-40 frontend-only, 166 failed, and 13 upstream-skipped methods across the exact
-425-method inventory. It completed in 3,515.87 seconds without an NPU timeout,
+The current authoritative uncached strict census at `20bd6418e` is 213 native,
+40 frontend-only, 159 failed, and 13 upstream-skipped methods across the exact
+425-method inventory. It completed in 3,685.44 seconds without an NPU timeout,
 reset failure, invalid submission, process abort, numerical mismatch, or
 unclassified failure. Coverage details, the checkout-local pytest-plugin
 invocation, reject Pareto, plan-cost histograms, and durable artifact hashes
@@ -2595,3 +2595,31 @@ and remain explicitly classified as correctness fallbacks. The complete
 compiler file passes 168 tests plus 77 subtests. Expected coverage is
 `213/40/159/13`; the last complete uncached census remains authoritative at
 `206/40/166/13`. Only 3D transpose convolution remains in this family.
+
+## Compact multi-source maps and remaining stage limits
+
+Multi-source semantic reformats no longer require one stored `(source,index)`
+pair per output. Affine runs use compact segments, and dense concatenation
+grids retain their output extents, strides, selector axis, source identities,
+and source bases. Physical selector legalization streams this representation
+in bounded tiles. The compatibility `mapping` property exists for inspection;
+the normal large-map planner does not build it.
+
+This makes the flat three-source `45x65x9` concatenation kernel legal at 323
+tasks and 764,576 constant bytes. It deliberately does not make the complete
+`test_cat` method pass: its later output permutation still needs 851 or 2,478
+selector tasks. A direct physical row/layout conversion is required instead of
+raising the 400-task ceiling.
+
+The related raw probes establish that compact one-row FP16 CMAC output works at
+320 and 384 channels, but no tested multi-row configuration removes the padded
+row stride. DPU row gather remains an eight-lane-atom primitive, not a full-row
+copy. Those negative results are compiler legality boundaries.
+
+The 26 remaining stage-limit methods are not all unsolved historically. Older
+branches contain valuable direct GEMM/CONV register geometry and scan/PPU
+experiments, but their green attention, large einsum, NLL, cumulative, cat,
+and several pooling paths use host NumPy or host materialization. Only the
+hardware formulas and decompositions are reusable; the CPU execution paths are
+not valid native backend implementations. The authoritative census is now
+`213 PASS_NATIVE / 40 PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM`.
