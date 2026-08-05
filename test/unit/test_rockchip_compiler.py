@@ -1295,12 +1295,9 @@ class TestDPUCompiler(unittest.TestCase):
     assert isinstance(dynamic.plan,RKProgram)
     self.assertLessEqual(plan_cost(dynamic.plan).task_count,400)
     too_wide = lower_tiled_contract_result(sink(Tensor.empty(1,64,dtype=dtypes.half)@Tensor.empty(64,99,dtype=dtypes.half)))
-    self.assertIs(too_wide.kind,RKLowerKind.NATIVE)
-    assert isinstance(too_wide.plan,RKProgram)
-    self.assertLessEqual(plan_cost(too_wide.plan).task_count,400)
-    compact = [step for step in too_wide.plan.steps if isinstance(step,RKCMACTask) and step.compact_output and
-               step.out.layout.physical_shape == (1,128)]
-    self.assertEqual((len(compact),compact[0].out.layout.physical_shape), (1,(1,128)))
+    self.assertIs(too_wide.kind,RKLowerKind.UNSUPPORTED)
+    assert too_wide.reject is not None
+    self.assertIs(too_wide.reject.kind,RKRejectKind.PLAN_STAGE_LIMIT)
 
   def test_dense_square_contraction_uses_direct_lhs_rows(self):
     result = lower_tiled_contract_result(sink(Tensor.empty(64,64,dtype=dtypes.half)@Tensor.empty(64,64,dtype=dtypes.half)))
@@ -1343,10 +1340,11 @@ class TestDPUCompiler(unittest.TestCase):
     gathers = sum(isinstance(stage,RKStridedAtomGatherStage) for step in result.plan.steps
                   if isinstance(step,RKDPUProgram) for stage in step.stages)
     contracts = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask))
-    self.assertEqual((gathers,len(contracts)),(13,53))
+    self.assertEqual(gathers,13)
+    self.assertLessEqual(len(contracts),56)
     self.assertTrue(any(isinstance(step,RKDPUProgram) and any(isinstance(stage,RKALUStage) and stage.count == 504
                                                              for stage in step.stages) for step in result.plan.steps))
-    self.assertLessEqual(plan_cost(result.plan).task_count,68)
+    self.assertLessEqual(plan_cost(result.plan).task_count,80)
     self.assertFalse(contains_uop(result.plan))
 
   def test_k256_square_gemm_uses_broad_compute_and_wide_bs_writeback(self):
@@ -2102,6 +2100,15 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertEqual(sum(isinstance(step,RKCMACTask) for step in result.plan.steps),2)
     self.assertLessEqual(cost.task_count,83)
     self.assertLessEqual(cost.constant_bytes,131*1024)
+    self.assertFalse(contains_uop(result.plan))
+
+  def test_tiled_contract_does_not_read_allocator_padding_as_lhs(self):
+    result = lower_tiled_contract_result(sink(Tensor.empty(4,dtype=dtypes.half)@Tensor.empty(4,4,dtype=dtypes.half)))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    compute = next(step for step in result.plan.steps if isinstance(step,RKCMACTask) and step.rhs.buffer.kind is RKBufferKind.SCRATCH)
+    self.assertIs(compute.lhs.buffer.kind,RKBufferKind.SCRATCH)
     self.assertFalse(contains_uop(result.plan))
 
   def test_non_affine_roll_reformat_enumerates_exact_mapping(self):

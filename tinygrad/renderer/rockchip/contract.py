@@ -1064,9 +1064,8 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   lhs_values = sum(source >= 0 for row in lhs_rows for source in row)
   rhs_values = sum(source >= 0 for column in rhs_columns for source in column)
   lhs_base = lhs_rows[0][0] if lhs_rows and lhs_rows[0] else -1
-  lhs_capacity = ((lhs_count*2+4095)&-4096)//2
   direct_lhs = lhs_base >= 0 and all(row == tuple(range(lhs_base+index*align_in,lhs_base+index*align_in+k))
-                                     for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_capacity
+                                     for index,row in enumerate(lhs_rows)) and lhs_base+m*align_in <= lhs_count
   channel_ids = {column:index for index,column in enumerate(rhs_columns)}
   compact_output = m == 1 and all(out_index == channel_ids[rhs_key] for out_index,_,rhs_key in records)
   direct_row_major_rhs = 8 <= n <= 256 and n%8 == 0 and 1 <= k <= 256 and rhs_count == n*k and \

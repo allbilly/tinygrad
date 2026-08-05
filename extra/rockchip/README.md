@@ -2780,3 +2780,12 @@ subcases are unchanged. Mixed modes may also allocate a non-DMA host surface
 when DRM cannot provide a large contiguous GEM; native RKImage execution
 rejects such a surface. This is required for the 12.4 MiB ellipsis-einsum
 fallback and is never enabled in strict mode.
+
+Direct CMAC inputs may not use the allocator's page-rounded tail as implicit
+tensor padding. A complete hybrid prefix reproducibly corrupted the otherwise
+correct 4x4 matmul when its four-value lhs was treated as a 32-lane physical
+surface. Direct legality now requires the padded span to fit the initialized
+logical allocation; shorter values are packed into an explicitly zeroed native
+surface. This keeps the small contraction native and moves the old 399-task
+`1x64 @ 64x99` correctness path to a typed stage-limit rejection in strict
+mode and visible `HOST` execution in hybrid mode.

@@ -5173,3 +5173,23 @@ host memory. Such a buffer has no DMA metadata; any RKImage binding rejects it.
 The 12.4 MiB case then passes in 2.00 seconds. The complete former failure set
 passes 39 methods plus 39 subtests in 43.53 seconds. A complete 425-method
 hybrid census is still required before claiming the semantic target.
+
+The first complete native-first hybrid census at `55425ec48` reports 411
+passes, 13 upstream skips, 126 passing subtests, and one reproducible
+post-execution failure in `matmul_simple`. The five-task 4x4 contraction was
+correct alone and after ten repetitions of the preceding 399-task contraction,
+but failed at the same sequence number in two complete-prefix runs. Its lhs
+legality check admitted a four-value allocation as a 32-lane CMAC surface by
+using the page-rounded GEM capacity. That made correctness depend on 28 lanes
+outside the initialized logical allocation remaining harmless under zero
+weights.
+
+Direct lhs surfaces now require the complete padded span to reside inside the
+declared logical allocation. Short inputs use the existing zero-initialized
+native selector pack. The affected 4x4 path remains native; focused
+`matmul_simple`, batched matmul, small GEMM, 9x9 GEMM, and FP16 GEMM all pass.
+The former 399-task `1x64 @ 64x99` plan becomes a typed 402-stage rejection and
+therefore executes visibly as `HOST` in hybrid mode instead of raising the
+400-stage ceiling. Full compiler tests pass 173 tests plus 78 subtests; mypy
+and Ruff are clean. A fresh complete hybrid census is required for the final
+zero-failure claim.
