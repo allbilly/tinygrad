@@ -12,42 +12,45 @@ that branch dispatches many families through NumPy-backed `_run_host_*` tasks.
 
 ## Current strict census
 
-The complete uncached run at `20bd6418e` contains exactly 425 telemetry method
-records: 213 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 159 `FAIL`, and 13
+The complete uncached run at `c8d19c240` contains exactly 425 telemetry method
+records: 214 `PASS_NATIVE`, 40 `PASS_FRONTEND`, 158 `FAIL`, and 13
 `SKIP_UPSTREAM`. `ROCKCHIP_FALLBACK=0` and `CACHELEVEL=0` were set throughout,
 with `DEV=ROCKCHIP`, `FORWARD_ONLY=1`, and `DEFAULT_FLOAT=HALF`. Raw pytest
-reports 3,685.44 seconds. No NPU timeout, invalid submission, reset failure,
+reports 3,762.42 seconds. No NPU timeout, invalid submission, reset failure,
 process abort, fallback execution, or unclassified failure occurred.
 
-The result confirms all seven focused 2D transpose-convolution transitions:
-simple, padded, strided, dilated, grouped, bias, and output-padding. Every one
-of the 159 failures is a typed native reject with a retained method-level first
-reject. Their first-reject Pareto is 53 unsupported-output-dtype, 26
-plan-stage-limit, 26 unsupported-input-dtype, 18 unsupported-layout, 16
-numerical-contract, 12 unsupported-ALU, five requires-reformat, two
+Relative to `20bd6418e`, the only method transition is `test_big_gemm` from a
+typed stage-limit reject to `PASS_NATIVE`. The direct 256x256x256 CMAC compute
+is one broad task, while its clean row-major physical-layout preparation and
+dense FP32 accumulator writeback make the whole kernel a visible 297-task
+correctness fallback. Every one of the 158 failures is a typed native reject
+with a retained method-level first reject. Their first-reject Pareto is 53
+unsupported-output-dtype, 26 unsupported-input-dtype, 25 plan-stage-limit,
+18 unsupported-layout, 16 numerical-contract, 12 unsupported-ALU, five
+requires-reformat, two
 unaligned-row, and one LUT-domain-unproven.
 
-Across passing and partially passing methods, 674 successful native kernels
-contain 592 `EFFICIENT` and 82 `CORRECTNESS_FALLBACK` plans. The 213 fully
-native methods contain 580 kernels: 508 efficient and 72 correctness
-fallbacks. At method level, 169 are fully efficient and 44 contain a
+Across passing and partially passing methods, 676 successful native kernels
+contain 594 `EFFICIENT` and 82 `CORRECTNESS_FALLBACK` plans. The 214 fully
+native methods contain 581 kernels: 510 efficient and 71 correctness
+fallbacks. At method level, 171 are fully efficient and 43 contain a
 correctness fallback. The maximum remains 399
 tasks; no task or constant ceiling changed. The worst single-kernel wall time
-is 42.64 seconds, and the largest generated constant payload is 1,917,472
+is 42.60 seconds, and the largest generated constant payload is 1,917,472
 bytes. These costs remain visible rather than being hidden by the native pass
 count.
 
-The durable artifacts are `/home/orangepi/rk_results/test_ops_20bd6418e.xml`
+The durable artifacts are `/home/orangepi/rk_results/test_ops_c8d19c240.xml`
 and `.json`. Their SHA-256 values are respectively
-`a6fdfc5a5140956218be9e131adc037d4609936aeb9aa01a629c6a1cb4ac4cdc` and
-`5c92f21716012a19582dd77c1bc0d25daf2ab1a1d5197c4d0130d1e4583781ab`. The
+`d161cae32df3bb247672d02ea0df9eea63bb6b377eb3eda7cb0ae1e21923fc12` and
+`a03f1a9f3731d627167c2b795406ac9dac4dc7767badf3174fd99e039ccf2f96`. The
 checkout-local context hook was loaded with
 `PYTHONPATH=$PWD/test/rockchip -p conftest_rockchip`; it uses tinygrad's
 supported `Context(DEFAULT_FLOAT=...)` boundary for the explicitly declared
 FP32 CPU-reference gaps and never changes device execution. The frozen 2607
 plugin is incompatible with this checkout and must not be used.
 
-All focused milestones through native 2D transpose convolution are now
+All focused milestones through wide BS broad-GEMM writeback are now
 authoritative.
 The chronological sections below retain the individual focused evidence and
 their then-current estimates for debugging history.
@@ -5078,3 +5081,29 @@ absolute error 0.000977. The production scale fence is restored and now cites
 this precise failure mode. Full WIP SHA-256:
 `d6e551378e644b277f6702ff4e411aeb5246c90a925901b9d20cd6f5b16edb11`.
 No native count, tolerance, fallback policy, or resource ceiling changes.
+
+## Static addressing versus dynamic layout work
+
+The strict native contract does not require the NPU to calculate static
+addresses. The compiler owns affine-index analysis, layout selection, base
+addends, row and surface strides, tile origins, padding geometry, CBUF
+allocation, and compile-time packing of immutable constants. The runtime owns
+DMA allocation lookup, view offsets, relocation addends, command patching, and
+submission. Fixed-function address generators own repeated regular row,
+surface, channel, kernel-window, and tile traversal.
+
+This is distinct from rearranging dynamic tensor values. A compact strided
+gather or engine-native surface conversion is a legitimate native task. A
+selector-CMAC schedule remains a bounded native correctness oracle because the
+host only constructs static selector constants and the NPU moves the runtime
+values. It is not automatically an efficient final implementation: the K=256
+square GEMM uses one broad compute task but 296 preparation/writeback tasks,
+and is therefore classified as `CORRECTNESS_FALLBACK`.
+
+Future lowering candidates use this preference order: an already legal
+surface, metadata-only view, compact hardware stride/window descriptor,
+coalesced DPU copy, direct engine reformat, bounded selector fallback, then a
+typed reject. Dynamic CPU packing may only be introduced as an explicitly
+reported mixed-execution experiment; it cannot contribute to `PASS_NATIVE`.
+No mixed path, host dynamic pack, task-limit increase, or constant-limit
+increase participates in the `c8d19c240` census.
