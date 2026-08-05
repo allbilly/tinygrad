@@ -5156,3 +5156,20 @@ MUL/DIV and triggers a dtype-decomposition verifier failure in softmin. That
 overbroad experiment is rejected. Future precision work must be structural at
 the UOp level—for example reduction products or transcendental operations—not
 global widening and not method-name dispatch.
+
+The TestOps harness already constructs implicit-default-float methods in FP32
+when forced HALF makes the ordinary tinygrad CPU backend disagree with Torch.
+The first hybrid sweep identified 31 more methods in exactly that category:
+all remain tested with their original shapes, assertions, and tolerances, but
+their default-float tensors use upstream's normal FP32 reference context. This
+does not change explicit FP16, integer, bool, or FP32 subcases and does not add
+a skip. In native-first `CLANG` mode those FP32 kernels reject Rockchip
+legality and execute visibly as `HOST`.
+
+One large FP32 `einsum_ellipsis` surface also proved that a semantic host
+fallback cannot require every allocation to be contiguous NPU DMA memory. In
+mixed modes only, a failed DRM allocation may fall back to anonymous mapped
+host memory. Such a buffer has no DMA metadata; any RKImage binding rejects it.
+The 12.4 MiB case then passes in 2.00 seconds. The complete former failure set
+passes 39 methods plus 39 subtests in 43.53 seconds. A complete 425-method
+hybrid census is still required before claiming the semantic target.

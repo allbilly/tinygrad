@@ -1,8 +1,10 @@
 import os, unittest
 from unittest.mock import patch
 from tinygrad import Tensor, dtypes
+from tinygrad.device import BufferSpec
 from tinygrad.helpers import Target
 from tinygrad.renderer.rockchip import RockchipRenderer
+from tinygrad.runtime.ops_rockchip import RKHostMemory, RockchipAllocator
 from tinygrad.runtime.rockchip_fallback import (RKHC_MAGIC, RKPY_MAGIC, build_rkhc_program, build_rkpy_program,
                                                decode_rkhc, decode_rkpy, encode_rkhc, encode_rkpy)
 from tinygrad.uop.ops import KernelInfo, Ops
@@ -46,5 +48,23 @@ class TestRockchipFallback(unittest.TestCase):
       program = RockchipRenderer(Target("ROCKCHIP")).native_program(sink(Tensor.empty(7, dtype=dtypes.half)+1))
     assert program is not None
     self.assertEqual(program.src[3].arg[:4], RKHC_MAGIC)
+
+  def test_mixed_mode_can_fall_back_to_non_dma_host_allocation(self):
+    class Device:
+      def _gpu_alloc(self, size): raise OSError("no contiguous DMA surface")
+      def _gpu_free(self, buf): raise AssertionError("host memory must not use DRM free")
+    allocator = RockchipAllocator(Device())  # type: ignore[arg-type]
+    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"CLANG"}): buf = allocator._alloc(12345, BufferSpec())
+    self.assertIsInstance(buf.meta, RKHostMemory)
+    allocator._as_buffer(buf)[:4] = b"RKHC"
+    self.assertEqual(bytes(allocator._as_buffer(buf)[:4]), b"RKHC")
+    allocator._free(buf, BufferSpec())
+
+  def test_strict_mode_never_falls_back_to_host_allocation(self):
+    class Device:
+      def _gpu_alloc(self, size): raise OSError("no contiguous DMA surface")
+    allocator = RockchipAllocator(Device())  # type: ignore[arg-type]
+    with patch.dict(os.environ, {"ROCKCHIP_FALLBACK":"0"}), self.assertRaises(OSError):
+      allocator._alloc(12345, BufferSpec())
 
 if __name__ == "__main__": unittest.main()

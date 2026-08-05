@@ -22,7 +22,17 @@ def pytest_collection_modifyitems(items):
 def pytest_runtest_call(item):
   """Construct known CPU-reference gaps in FP32 without mutating the read-only dtype registry."""
   needs_fp32_reference = item.path.name == "test_ops.py" and item.name in (
-    "test_arange", "test_bitcast", "test_avg_pool3d", "test_cos",
+    "test_arange", "test_bitcast", "test_avg_pool2d_ceil_mode", "test_avg_pool2d_ceil_mode_padding_not_counted",
+    "test_avg_pool2d_padding_not_counted", "test_avg_pool3d", "test_binary_crossentropy_reductions",
+    "test_broadcast_full", "test_broadcast_partial", "test_cos", "test_cross_entropy_class_indices",
+    "test_cross_entropy_class_probabilities", "test_cross_entropy_reductions", "test_cross_entropy_smoothing", "test_cumprod",
+    "test_einsum", "test_einsum_ellipsis", "test_fmod", "test_max_unpool2d_inf",
+    "test_nll_loss", "test_nll_loss_3d", "test_nll_loss_3d_weight", "test_nll_loss_ignore_index",
+    "test_nll_loss_reductions", "test_nll_loss_weight",
+    "test_scaled_dot_product_attention", "test_scaled_dot_product_attention_causal", "test_scaled_dot_product_attention_gqa",
+    "test_scaled_dot_product_attention_mismatch_ls", "test_simple_conv_transpose3d", "test_softmin",
+    "test_sparse_categorical_crossentropy", "test_sparse_categorical_crossentropy_ignore_index",
+    "test_sparse_categorical_crossentropy_label_smoothing", "test_sparse_categorical_crossentropy_reductions",
     "test_softmax", "test_softmax_argmax", "test_softmax_other_axis",
     "test_interpolate_trilinear", "test_interpolate_trilinear_corners_aligned",
     "test_isclose", "test_linspace", "test_log", "test_log_softmax", "test_log_softmax_other_axis",

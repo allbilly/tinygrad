@@ -2772,3 +2772,11 @@ gaps. It does not contribute native coverage. A rejected global FP16-to-FP32
 ALU experiment fixed some reductions but changed ordinary elementwise rounding
 and broke softmin verification, so the production host lane preserves the
 lowered UOp dtypes exactly.
+
+The hybrid harness uses FP32 only for implicit-default-float methods where the
+ordinary tinygrad CPU backend itself misses the Torch reference under the
+project's forced `DEFAULT_FLOAT=HALF`. Test tolerances and explicit dtype
+subcases are unchanged. Mixed modes may also allocate a non-DMA host surface
+when DRM cannot provide a large contiguous GEM; native RKImage execution
+rejects such a surface. This is required for the 12.4 MiB ellipsis-einsum
+fallback and is never enabled in strict mode.

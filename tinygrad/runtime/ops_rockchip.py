@@ -1,7 +1,8 @@
 from __future__ import annotations
 import ctypes, glob, mmap, os, time
+from dataclasses import dataclass
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
-from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
+from tinygrad.helpers import from_mv, mv_address, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RKImage, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.rockchip_fallback import RKHC_MAGIC, RKPY_MAGIC, RKHostProgram, RKPythonProgram, decode_rkhc, decode_rkpy
@@ -11,6 +12,10 @@ from tinygrad.runtime.support.rockchip_telemetry import record as record_telemet
 _TASK = {RKEngine.DPU:(4, 0x18, 0x300), RKEngine.CMAC:(0, 0x0d, 0x300), RKEngine.PPU:(1, 0x60, 0xc00),
          RKEngine.CONV:(0, 0x0d, 0x300)}
 
+@dataclass(frozen=True)
+class RKHostMemory:
+  mapping:mmap.mmap
+
 def _rknpu_device() -> str:
   if path := os.getenv("ROCKCHIP_DEVICE"): return path
   for node in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
@@ -19,7 +24,12 @@ def _rknpu_device() -> str:
   raise RuntimeError("no DRM device bound to the RKNPU/Rocket driver; set ROCKCHIP_DEVICE explicitly")
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
-  def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
+  def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
+    try: return self.dev._gpu_alloc(size)
+    except OSError:
+      if os.getenv("ROCKCHIP_FALLBACK", "0").upper() not in ("CLANG", "HOST"): raise
+      mapping = mmap.mmap(-1, max(4096, (size+4095)&-4096), flags=mmap.MAP_SHARED, prot=mmap.PROT_READ|mmap.PROT_WRITE)
+      return HCQBuffer(mv_address(mapping), size, meta=RKHostMemory(mapping))
   def _copyin(self, dest:HCQBuffer, src:memoryview):
     ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
     # Rejected WIP: allocator-wide 16-byte tail clearing perturbed established CMAC/CONV rounding in seven device regressions.
@@ -27,7 +37,9 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _copyout(self, dest:memoryview, src:HCQBuffer): ctypes.memmove(from_mv(dest), int(src.va_addr), dest.nbytes)
   def _as_buffer(self, src:HCQBuffer): return to_mv(int(src.va_addr), src.size)
   def _offset(self, buf:HCQBuffer, size:int, offset:int): return buf.offset(offset, size)
-  def _free(self, buf:HCQBuffer, options:BufferSpec): self.dev._gpu_free(buf)
+  def _free(self, buf:HCQBuffer, options:BufferSpec):
+    if isinstance(buf.meta, RKHostMemory): buf.meta.mapping.close()
+    else: self.dev._gpu_free(buf)
 
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
@@ -69,7 +81,7 @@ class RockchipProgram(Program['RockchipDevice']):
     if self.constants is not None: self.dev._gpu_free(self.constants)
 
   def _dma(self, buf:HCQBuffer) -> int:
-    if buf.meta is None: raise RuntimeError("Rockchip program requires an NPU DMA buffer")
+    if buf.meta is None or isinstance(buf.meta, RKHostMemory): raise RuntimeError("Rockchip program requires an NPU DMA buffer")
     return int(buf.meta.dma_addr) + int(buf.va_addr) - int(buf.base.va_addr)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
