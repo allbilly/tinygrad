@@ -4373,3 +4373,19 @@ Mypy passes all 233 tinygrad source files and full-tree Ruff is clean. Four
 serialized RK3588 regressions cover selector reformat, ordered DPU+CMAC sum,
 K65-to-K96 contraction, and direct CONV. This is a mechanical milestone, so the
 authoritative census remains `204/40/168/13`.
+
+## Mechanical reformat-lowerer extraction
+
+The four static movement lowerers now live in the 366-line
+`renderer/rockchip/reformat.py`: convex two-tap transforms, single-source
+reformatting, multi-source reformatting, and static selector expressions. They
+consume the existing compact access analysis and shared selector planner, and
+return the same typed `RKLegalizedReformat` results. The public compiler module
+drops from 2,864 to 2,522 physical lines; pass ordering remains explicit in its
+registry.
+
+All 171 compiler/image/telemetry tests plus 59 subtests pass, including frozen
+image regressions. Full Mypy covers 234 source files, full-tree Ruff is clean,
+and representative serialized RK3588 reformat, reduction, K65 contraction, and
+direct-CONV methods pass. No planner choice, task cost, limit, tolerance, or
+coverage outcome changes; the authoritative census remains `204/40/168/13`.

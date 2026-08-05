@@ -2293,3 +2293,17 @@ Mypy and Ruff, and representative serialized reformat, reduction, K65
 contraction, and direct-CONV hardware tests pass. Coverage remains the
 authoritative `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 NATIVE_REJECT / 13
 SKIP_UPSTREAM` because no lowering rule changed.
+
+## Reformat lowering module
+
+Static convex two-tap, single-source, multi-source, and selector-expression
+movement lowering now lives in `renderer/rockchip/reformat.py`. The module
+turns static UOp address relationships into typed semantic reformat plans and
+uses the shared selector planner only during physical legalization. It does not
+read runtime tensor data or add a new execution lane.
+
+The move preserves the concrete lowerer order and every target-plan decision,
+while reducing the public compiler module from 2,864 to 2,522 physical lines.
+Frozen image tests, the complete compiler/image/telemetry suite, full-tree
+Mypy/Ruff, and representative RK3588 hardware methods remain green. The
+authoritative native census is unchanged at `204/40/168/13`.
