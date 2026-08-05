@@ -244,6 +244,8 @@ def _periodic_selector_program(output:RKArg, source:RKArg, input_count:int, rows
                                scratch:tuple[RKScratch, ...]=()) -> RKProgram|None:
   """Materialize one aligned repeated-map period, then duplicate it through direct DPU copies."""
   count = len(rows)
+  # Rejected WIP: permitting a partial final period corrupted a previously native variance subcase. DPU sub-atom writes
+  # do not provide the logical tail-copy contract this geometric schedule would require.
   period = next((candidate for candidate in range(8,min(count,32769),8) if count%candidate == 0 and
                  all(rows[index] == rows[index%candidate] for index in range(candidate,count))), None)
   if period is None: return None

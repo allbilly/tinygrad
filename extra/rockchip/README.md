@@ -2811,3 +2811,25 @@ Rockchip device processes are serialized by an exclusive
 multiple `RockchipDevice` objects in one process, preventing concurrent test
 workers or terminals from submitting overlapping RK3588 jobs. Set
 `ROCKCHIP_LOCK_DIR` only to relocate the lock for isolated runtime tests.
+
+## Rejected large-variance access shortcuts
+
+The hybrid reject Pareto identified the 13,125-element global variance family
+as a possible access-legalization target. Two generic shortcuts were tested and
+rejected on RK3588. First, bypassing selector materialization for a logically
+identity input changed the physical surface contract expected by the pointwise
+scheduler. Allowing a periodic DPU expansion to write a non-eight-lane final
+tail then corrupted an already-native `test_var_one_in_axis` subcase. Restoring
+the aligned-period requirement and selector surface restores that method.
+
+A second experiment reduced with unit CMAC weights and applied a non-FP16
+coefficient after the reduction, preserving the graph boundary instead of
+scaling every term. The 13,125-term mean still had no bounded plan; an
+average-pool schedule that did compile entered a prolonged device wait after
+hundreds of reset/submission cycles. The process was terminated and the
+existing pre-submission numerical-contract rejection restored. No coverage,
+task limit, or tolerance changes are claimed by this negative milestone.
+
+The result reinforces the physical-layout rule: logical identity and logical
+periodicity do not by themselves prove that an ARG surface, selector surface,
+or sub-atom DPU destination are interchangeable.

@@ -429,6 +429,9 @@ class TestDPUCompiler(unittest.TestCase):
     lhs, rhs = Tensor.empty(4,4,dtype=dtypes.half), Tensor.empty(4,4,dtype=dtypes.half)
     self.assertIs(lower_pointwise_affine_reduce_result(sink(lhs@rhs)).kind,RKLowerKind.NOT_APPLICABLE)
 
+  # Rejected WIP: direct identity aliasing plus a partial periodic tail compiled a large variance plan, but changed the
+  # selector's physical-surface contract and corrupted an existing native variance case on RK3588.
+
   def test_zero_base_power_repairs_inactive_exp2_input(self):
     result = lower_native(sink(0**Tensor.empty(6,dtype=dtypes.half)))
     self.assertIs(result.kind, RKLowerKind.NATIVE)

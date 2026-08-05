@@ -52,6 +52,14 @@ Hardware: `rockchip,rk3588s-orangepi-5,rockchip,rk3588`, kernel `6.1.99-rockchip
 Failures: **0**.
 <!-- END GENERATED COVERAGE -->
 
+The first post-hybrid native replacement probe produced no coverage transition.
+A direct logical-identity alias plus a non-aligned periodic DPU tail corrupted a
+previously native variance subcase; unit-weight two-level reduction followed by
+a non-FP16 scale did not bound the 13,125-term mean and left a compiled
+average-pool probe in prolonged device wait. Both experiments are fenced, the
+proven selector/aligned-period and numerical-contract guards are restored, and
+`test_var_one_in_axis` passes again on RK3588.
+
 All authoritative runs use `ROCKCHIP_FALLBACK=0`. The optional `RKPY` research
 envelope invokes tinygrad's Python UOps emulator over mapped GEM buffers and is
 therefore CPU semantic execution; it is excluded from pass counts. Likewise,

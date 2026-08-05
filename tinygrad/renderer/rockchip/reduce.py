@@ -608,6 +608,8 @@ def lower_pointwise_affine_reduce_result(sink:UOp) -> RKLowerResult:
   steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = []
   memo:dict[UOp,_Expr|RKArg|float] = {}
   for index,mapping in mappings.items():
+    # Rejected WIP: a logically identity map is not enough to alias the ARG here. The selector's physical output layout
+    # is part of the pointwise scheduler contract; bypassing it corrupted a previously native variance subcase.
     expanded = RKArg(RKBufferKind.SCRATCH,len(scratch))
     scratch += (RKScratch(_cmac_tiled_output_bytes(visit_count)),)
     packed = _selector_program(expanded,RKArg(RKBufferKind.ARG,index.src[0].arg.slot),int(index.src[0].src[0].arg),
@@ -759,8 +761,8 @@ def lower_affine_reduce_result(sink:UOp) -> RKLowerResult:
     input_count <= 512 and output_count <= 128 else (None if fp32_out else _windowed_cmac_pipeline(
       reduced, source, selectors, scale, initial_scratch, direct_count=input_count,
       max_window=RK_MAX_PREFIX_WINDOW if prefix_scan else 512))
-  # Rejected WIP: weight*BS*BN can make the ordered FP32 coefficient exactly 1/9, but the weight scales each term before
-  # accumulation. Official average-pool outputs still miss by one ULP, so non-FP16 two-level scales remain illegal.
+  # Rejected WIP: reducing with unit weights and applying a non-FP16 coefficient afterward submitted hundreds of tasks,
+  # then left the average-pool hardware probe blocked in device wait. Per-term scaling also misses the official rounding.
   if program is None and struct.unpack("<e", struct.pack("<e", scale))[0] != scale:
     return _unsupported(RKRejectKind.NUMERICAL_CONTRACT, f"two-level affine scale {scale} is not exactly FP16", stored.op)
   if program is None: program = _two_level_selector_program(reduced, source, input_count, selectors, initial_scratch, scale)
