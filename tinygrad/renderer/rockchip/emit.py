@@ -294,8 +294,8 @@ def emit_cmac_task(plan:RKCMACTask, target:RKTarget=RKTarget.RK3588) -> RKImage:
     raise ValueError(f"CMAC output tile must be 32..{_MAX_CMAC_CHANNELS} physical channels")
   fp32_out = plan.out.layout.dtype is dtypes.float
   if plan.out.layout.dtype not in (dtypes.half,dtypes.float): raise ValueError("CMAC output must be FP16 or FP32")
-  if fp32_out and (m != 1 or plan.out.layout.physical_shape != (1,64) or plan.out.layout.strides_bytes != (256,4) or
-                   plan.epilogue is not None): raise ValueError("CMAC FP32 output requires one proven 32-lane tile")
+  if fp32_out and (m != 1 or plan.out.layout.physical_shape != (1,64) or plan.out.layout.strides_bytes != (256,4)):
+    raise ValueError("CMAC FP32 output requires one proven 32-lane tile")
   if plan.compact_output and (fp32_out or m != 1 or plan.out.layout.physical_shape != (1,align_out) or
                               plan.out.layout.strides_bytes != (align_out*2,2)):
     raise ValueError("compact CMAC output requires one dense FP16 row")
@@ -376,11 +376,13 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
   dy, dx = plan.dilation_y, plan.dilation_x
   pt, pb, pl, pr = plan.pad_top, plan.pad_bottom, plan.pad_left, plan.pad_right
   effective_h, effective_w = (kh-1)*dy+1, (kw-1)*dx+1
-  if not 1 <= ic <= 16 or not 1 <= oc <= 16 or not 1 <= kh <= 3 or not 1 <= kw <= 3 or \
+  tall_vector_contract = ic == oc == kw == oh == 1 and ih == kh and 4 <= kh <= 31 and 4 <= iw == ow <= 256 and \
+                         sy == sx == 1 and not any((pt,pb,pl,pr))
+  if not 1 <= ic <= 16 or not 1 <= oc <= 16 or (not tall_vector_contract and (not 1 <= kh <= 3 or not 1 <= kw <= 3)) or \
      min(pt,pb,pl,pr) < 0 or max(pt,pb,pl,pr) > 15 or \
      oh != (ih+pt+pb-effective_h)//sy+1 or ow != (iw+pl+pr-effective_w)//sx+1 or \
      not 1 <= sy <= 7 or not 1 <= sx <= 7 or not 1 <= dy <= 32 or not 1 <= dx <= 32 or \
-     not 1 <= ih <= 32 or not 1 <= iw <= 32:
+     (not tall_vector_contract and (not 1 <= ih <= 32 or not 1 <= iw <= 32)):
     raise ValueError("unsupported direct spatial-convolution contract")
   align_ic, use_nhwc = (8,True) if ic <= 4 else (16,False)
   input_shape = plan.src.layout.physical_shape

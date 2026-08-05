@@ -4125,3 +4125,24 @@ do not automatically make `all` or `any` native: the reduction engine's output
 representation still needs a hardware conversion. Those methods continue to
 reject before submission, and the authoritative census remains
 `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
+
+## Proven FP32 CMAC continuation, rejected spatial CONV continuation
+
+A one-row, 32-lane CMAC task now accepts an FP32 `RKEpilogue` surface. Hardware
+executes FP16 CMAC, adds the FP32 BRDMA operand before writeback, and emits FP32
+again. The deterministic probe's maximum absolute difference from an FP32
+matrix-product-plus-bias reference is `2.3841858e-7`; a compiler regression
+checks the output precision and four typed relocations.
+
+The same investigation tested the archived K31 vector-matrix-as-CONV route.
+Tall one-channel CNA convolution can emit each partial as exact FP32, stored as
+one value per 16-byte output atom. The known BRDMA channel-bias mode cannot add
+that per-spatial surface: 16-channel configuration broadcasts the first value,
+and 4/8-channel configurations time out. The device recovered after each
+timeout and the known-good wide FP16 DPU fill passed. The unsafe cases are
+available only through `ROCKCHIP_UNSAFE_CONV_ACCUM=1` in
+`probe_conv_fp32_partial.py`; they are not reachable from lowering.
+
+Thus the new CMAC contract is retained, while K-split CONV accumulation remains
+a typed stage-limit rejection. No test status, cost ceiling, dtype claim, or
+numerical tolerance changes; the authoritative count stays `204/40/168/13`.

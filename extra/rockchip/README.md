@@ -2065,3 +2065,26 @@ Consequently `all`/`any` remain typed output-dtype rejects. A future native
 implementation needs a proven PPU/DPU int16-to-int8 writeback contract or a
 different byte-output engine; it must not reinterpret the two-byte PPU surface
 or pack it on the CPU. The authoritative census remains `204/40/168/13`.
+
+## FP32 CMAC accumulator epilogue
+
+RK3588 CMAC can preserve a partial accumulator in memory without first
+rounding it to FP16. A direct hardware probe uses FP16 activation and weight
+surfaces, adds a 32-lane FP32 BRDMA bias to the flying CMAC accumulator, and
+writes the result as FP32. The result agrees with the FP32 reference within
+`2.3841858e-7`. The typed emitter therefore permits the already-bounded
+one-row, 32-lane FP32 CMAC output contract to carry `RKEpilogue`; the image has
+an explicit fourth relocation for the FP32 accumulator surface.
+
+`extra/rockchip/probe_cmac_fp32_accumulate.py` reproduces the accepted
+contract. `extra/rockchip/probe_conv_fp32_partial.py` records the related CNA
+boundary: a tall one-channel convolution writes exact FP32 partials, but the
+proven BRDMA mode broadcasts one channel value over spatial positions. Using
+4- or 8-channel RDMA geometry times out, while 16 channels submit but add only
+the first partial value everywhere. That unsafe continuation probe is opt-in;
+no compiler path uses it. K-split vector-matrix convolution consequently still
+rejects until a per-spatial FP32 accumulation contract is proven.
+
+This is a hardware-capability milestone, not a TestOps count change. The
+authoritative census remains `204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL /
+13 SKIP_UPSTREAM`, with no relaxed tolerance or CPU semantic path.

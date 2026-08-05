@@ -1124,6 +1124,17 @@ class TestDPUCompiler(unittest.TestCase):
     self.assertIsNone(lower_contract(sink(a@Tensor.empty(32,8,dtype=dtypes.half))))
     self.assertIsNone(lower_contract(sink((a@packed_b.T).sigmoid())))
 
+  def test_cmac_fp32_output_accepts_fp32_bias_accumulator(self):
+    out = RKTensorRef(RKArg(RKBufferKind.ARG,0),RKLayout((1,32),(1,64),(256,4),dtypes.float,padding=((0,0),(0,32))))
+    lhs = RKTensorRef(RKArg(RKBufferKind.ARG,1),RKLayout((1,32),(1,32),(64,2),dtypes.half))
+    rhs = RKTensorRef(RKArg(RKBufferKind.ARG,2),RKLayout((32,32),(32,32),(64,2),dtypes.half,kind=RKLayoutKind.CMAC_WEIGHT))
+    bias = RKTensorRef(RKArg(RKBufferKind.ARG,3),RKLayout((32,),(32,),(4,),dtypes.float))
+    image = emit_cmac_task(RKCMACTask(out,lhs,rhs,0,epilogue=RKEpilogue(bias)))
+    self.assertEqual(len(image.stages),1)
+    self.assertEqual(len(image.stages[0].relocs),4)
+    data_format = next(command>>16&0xffffffff for command in image.stages[0].commands if command&0xffff == 0x4010)
+    self.assertEqual(data_format>>29,5)
+
   def test_logical_contraction_legalizes_to_byte_identical_cmac_task(self):
     a, packed_b = Tensor.empty(1,32,dtype=dtypes.half), Tensor.empty(8,32,dtype=dtypes.half)
     physical = lower_contract(sink(a@packed_b.T))
