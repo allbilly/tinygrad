@@ -2528,11 +2528,15 @@ with `DE_CONV=1` and both deconvolution inserted-pad fields set to one expands a
 task. The zeros are produced by CNA; no selector matrix or host tensor operation
 participates.
 
-This establishes that the fields encode inserted zeros (`stride-1`), as the TRM
-states. It is not yet a public transpose-convolution contract: 3x3 weight
-orientation, padding, output padding, and channel-role legalization remain to
-be characterized. The standalone probe is retained so those follow-up shapes
-can be compared against one exact register baseline.
+The same task now runs an asymmetric 3x3 kernel exactly. CNA correlates the
+zero-inserted feature surface, so tinygrad transpose-convolution semantics need
+the packed kernel reversed in both spatial axes and `CNA_PAD_CON0` top/left set
+to `kernel_size-1`. With those settings, source `[[1,2],[3,4]]` and kernel
+`[[1,2,3],[4,5,6],[7,8,9]]` produce the exact 5x5 reference in one task.
+
+This proves stride-two, full-output 1x1 and 3x3 geometry. Public lowering still
+needs output-padding, dilation, channel-role, grouped/batched packing, and
+requested-output cropping contracts; the probe remains the register baseline.
 
 ## One-task 256x256x256 GEMM
 
@@ -2548,3 +2552,9 @@ Those two host transformations are deliberately not ported. `test_big_gemm`
 therefore remains a typed layout/resource reject until equivalent NPU-native
 packing and output legalization exist; increasing the 400-task ceiling would
 not address the missing physical-layout capability.
+
+The reference's task policy has an important boundary: when aligned input
+channels exceed 384 it forces `m_tile=1`, and otherwise derives the M tile from
+ten 32-KiB input banks. Its PC chain can place several such tasks in one DRM
+submission, but that is not one hardware task. Consequently, older reports of
+large shapes passing this example are not by themselves one-task evidence.

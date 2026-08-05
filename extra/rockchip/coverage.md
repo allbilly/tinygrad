@@ -4760,9 +4760,18 @@ definition as the number of zeros inserted between adjacent source pixels.
 With source `[[1,2],[3,4]]` and an identity weight, one native task writes the
 exact 3x3 result `[[1,0,2],[0,0,0],[3,0,4]]`. Input, weight, and output are
 ordinary mapped GEM allocations, and execution uses the existing blocking
-RKImage runtime. This is a hardware-register milestone only: kernel flipping,
-padding, output padding, channel roles, and full transpose-convolution geometry
-must be proven before adding a compiler lowerer or changing TestOps coverage.
+RKImage runtime.
+
+An asymmetric 3x3 follow-up identifies the remaining full-output rules. CNA
+correlates the zero-inserted feature surface. Reversing the packed kernel in
+both spatial axes and programming top/left padding to `kernel_size-1` produces
+the exact 5x5 tinygrad transpose-convolution reference in one task. The
+unreversed/pad-zero observation exactly matches a cropped correlation, so this
+is a measured orientation contract rather than an inferred convention.
+
+This remains a hardware-register milestone: output padding, dilation, channel
+roles, groups/batches, requested-output cropping, and compiler recognition must
+be proven before changing TestOps coverage.
 
 ## One-task 256x256x256 GEMM
 
@@ -4772,9 +4781,14 @@ GEMM uses the same register geometry already present in `emit_cmac_task`:
 weight CBUF pressure, capped line/notch groups, and M-only tiling when the input
 surface exceeds its bank budget. For 256x256x256, the input consumes four CBUF
 banks and the 128 KiB packed weights require four of the eight remaining banks,
-so one task is legal. The 414 versus 424 square boundary in the reference is
-also explained by weight pressure: aligned 416 needs eleven weight banks after
-one data bank, while aligned 448 needs thirteen.
+so one task is legal.
+
+The file does not prove every larger reported shape is one task. Its runner
+forces `m_tile=1` whenever aligned input channels exceed 384; below that it
+derives M tiles from a ten-bank input budget and PC-chains multiple tasks into
+one DRM submission. One submission and one hardware task must therefore remain
+separate telemetry facts. The older 414/424 observations remain useful shape
+boundaries, but not one-task square-GEMM evidence from this runner.
 
 The in-tree raw CMAC probe now independently executes 256x256x256 through one
 RKImage task. Its maximum absolute difference from FP32 accumulation rounded to
