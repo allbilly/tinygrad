@@ -4611,3 +4611,19 @@ source files and full-tree Ruff is clean. This focused fix restores the expected
 `204/40/168/13` result without changing limits or tolerances. The authoritative
 complete green census remains the earlier `2385767d1` run until the fixed head
 is rerun uncached.
+
+## Rejected direct PPU average pooling
+
+The local `allbilly/npu`, `allbilly/rk3588`, TRM, and generated register
+definitions confirm that PPU pooling method zero is average pooling and that
+registers `0x6038/0x603c` hold the reciprocal kernel dimensions. The existing
+sliding-PPU probe now emits this mode through the clean runtime and compares it
+against PyTorch's FP16 average-pool contract.
+
+FP16 processing executes reliably but rounds during PPU accumulation. A 2x2
+HWC8 sweep misses 245 of 768 outputs at `rtol=1e-5, atol=1e-6`; a 3x3 sweep
+misses 71 of 96. PPU process precision five times out instead of providing a
+usable FP32 accumulation path, and the known-good native max-pool regression
+passes afterward. Therefore average mode cannot replace the current numerical
+rejections, and no compiler path or tolerance changes. The probe remains as
+reproducible hardware evidence rather than being hidden in inactive lowering.
