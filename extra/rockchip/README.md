@@ -2166,3 +2166,17 @@ only move `test_where_permute` from a dtype reject to incorrect execution.
 Unaligned FP32 negative slices and multi-source copies have the same physical
 boundary. They require a real word shuffle/packing engine or an aligned staged
 algorithm, not weaker compiler validation or CPU movement.
+
+## Rejected 415-task padded transposed convolution
+
+The first `test_padded_conv_transpose2d` subcase was characterized by raising
+the 400-task ceiling to 500 only inside a one-off process. The existing
+selector-CMAC plan then submitted all 415 tasks, but missed 101 output values at
+the unchanged `rtol=1e-3, atol=1e-6`; maximum absolute error was `0.0234375`.
+The known-good DPU fill passed afterward.
+
+This means the case is not a fifteen-task optimization away from a valid pass.
+The active 400-task rejection remains correct, and no ceiling changes. A native
+solution needs a direct transposed-convolution/layout schedule that also
+preserves the reference accumulation semantics; merely shrinking or admitting
+the current selector schedule is insufficient.

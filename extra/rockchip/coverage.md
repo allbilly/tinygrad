@@ -4252,3 +4252,18 @@ This closes a declaration-only solution for `test_where_permute`,
 rejects remain correct. Native support needs a hardware word-shuffle path or a
 layout algorithm whose intermediate surfaces remain atom-aligned; the runtime
 must not repair the words on the CPU.
+
+## Rejected over-limit padded transposed-convolution schedule
+
+`test_padded_conv_transpose2d` first rejects because its selector-CMAC plan
+needs 415 tasks. A one-process diagnostic raised `RK_MAX_PROGRAM_STAGES` to 500
+without changing source and executed only the first `(padding=(1,2))` subcase.
+The schedule completed without a device error, but 101 outputs failed the
+official `rtol=1e-3, atol=1e-6` comparison and maximum absolute error reached
+`0.0234375`. The device remained healthy.
+
+Therefore the 400-task limit is not hiding a numerically conformant plan. No
+limit increase or tolerance change is justified, and deleting fifteen tasks
+from the same accumulation structure would not by itself solve the case. The
+required work is a direct transposed-convolution or layout path with a proven
+accumulation contract.
