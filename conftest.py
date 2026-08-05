@@ -19,7 +19,7 @@ def _coverage_outcome(failed:bool, skipped:bool, kernels:list[dict]) -> str:
   if skipped: return "SKIP_UPSTREAM"
   if not kernels: return "PASS_FRONTEND"
   lanes = {x["lane"] for x in kernels}
-  native, fallback = any(x.startswith("RK_") for x in lanes), "PYTHON" in lanes
+  native, fallback = any(x.startswith("RK_") for x in lanes), bool(lanes & {"PYTHON", "HOST"})
   if native and not fallback: return "PASS_NATIVE"
   if fallback and not native: return "PASS_FALLBACK"
   return "PASS_MIXED"

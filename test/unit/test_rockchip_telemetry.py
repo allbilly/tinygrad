@@ -49,3 +49,7 @@ def test_coverage_promotes_only_failed_subcase_events():
   kernels, rejects = _failure_events(method, False)
   assert kernels == [] and rejects == [failed_reject]
   assert _first_reject(rejects) == failed_reject
+
+def test_coverage_classifies_compiled_host_lane_as_fallback():
+  assert conftest._coverage_outcome(False, False, [{"lane":"HOST"}]) == "PASS_FALLBACK"
+  assert conftest._coverage_outcome(False, False, [{"lane":"RK_DPU"}, {"lane":"HOST"}]) == "PASS_MIXED"

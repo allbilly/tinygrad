@@ -2750,3 +2750,18 @@ the FP16 inputs in FP32 and applies the reciprocal afterward. The unchanged
 archived as `wip-three-factor-cmac-average-still-one-ulp.patch`; the positive
 register probe remains for future operations whose semantics permit per-term
 scaling.
+
+## Explicit generic mixed execution
+
+Strict coverage still uses `ROCKCHIP_FALLBACK=0`. For the separate semantic
+census, `ROCKCHIP_FALLBACK=CLANG` wraps any typed native rejection in a
+versioned `RKHC` binary and runs the same generic UOps through the host Clang
+renderer over mapped GEM buffers. This is intentionally reported as `HOST`,
+never as an RK engine. It is one generic compiled lane rather than a collection
+of named CPU implementations.
+
+The original `RKPY` interpreter remains available for debugging, but a
+320-element masked-select workload exceeded the five-minute watchdog. The
+compiled envelope completes that method in 2.71 seconds and passes a locked
+`RK_DPU -> HOST -> RK_DPU` coherence test. Strict native counts and resource
+ceilings are unchanged.

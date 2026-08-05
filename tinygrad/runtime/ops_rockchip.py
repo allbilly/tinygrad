@@ -4,7 +4,7 @@ from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RKEngine, RKImage, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.runtime.rockchip_fallback import RKPY_MAGIC, RKPythonProgram, decode_rkpy
+from tinygrad.runtime.rockchip_fallback import RKHC_MAGIC, RKPY_MAGIC, RKHostProgram, RKPythonProgram, decode_rkhc, decode_rkpy
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 from tinygrad.runtime.support.rockchip_telemetry import record as record_telemetry
 
@@ -34,6 +34,7 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev, self.name = dev, obj.name
     self.image:RKImage|None = None
     self.fallback:RKPythonProgram|None = None
+    self.host_fallback:RKHostProgram|None = None
     self.scratch:tuple[HCQBuffer, ...] = ()
     self.constants:HCQBuffer|None = None
     signature = [{"name": name, "slot": slot, "dtype": dtype.name,
@@ -42,6 +43,10 @@ class RockchipProgram(Program['RockchipDevice']):
       self.fallback = RKPythonProgram(dev, obj, decode_rkpy(obj.lib))
       self.telemetry = {"lane": "PYTHON", "program": self.name, "signature": signature,
                         "uop_count": self.fallback.uop_count}
+      return
+    if obj.lib[:4] == RKHC_MAGIC:
+      self.host_fallback = RKHostProgram(obj, decode_rkhc(obj.lib))
+      self.telemetry = {"lane": "HOST", "program": self.name, "signature": signature}
       return
     self.image = decode_image(obj.lib)
     engines = {stage.engine.name for stage in self.image.stages}
@@ -68,9 +73,11 @@ class RockchipProgram(Program['RockchipDevice']):
     return int(buf.meta.dma_addr) + int(buf.va_addr) - int(buf.base.va_addr)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
-    if self.fallback is not None:
+    if self.fallback is not None or self.host_fallback is not None:
       start = time.perf_counter()
-      try: elapsed = self.fallback(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=True, **kwargs)
+      fallback = self.fallback if self.fallback is not None else self.host_fallback
+      assert fallback is not None
+      try: elapsed = fallback(*bufs, global_size=global_size, local_size=local_size, vals=vals, wait=True, **kwargs)
       except Exception as exc:
         record_telemetry("kernel", **self.telemetry, outcome="FAIL", duration_ms=(time.perf_counter()-start)*1e3,
                          error_class=type(exc).__name__, error=str(exc))

@@ -825,6 +825,25 @@ class TestRockchip(unittest.TestCase):
       if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY", None)
       else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
 
+  def test_host_fallback_mapped_buffer_coherence(self):
+    old_fallback, old_telemetry = os.environ.get("ROCKCHIP_FALLBACK"), os.environ.get("ROCKCHIP_TELEMETRY")
+    os.environ["ROCKCHIP_FALLBACK"], os.environ["ROCKCHIP_TELEMETRY"] = "CLANG", "memory"
+    try:
+      clear()
+      data = np.linspace(-1, 1, 17, dtype=np.float16)
+      x = Tensor(data, device="ROCKCHIP").realize()
+      native_before = (x+0.25).realize()
+      fallback = native_before.cos().realize()
+      actual = (fallback*2).realize().numpy()
+      np.testing.assert_allclose(actual, (np.cos(data+0.25)*2).astype(np.float16), rtol=2e-3, atol=2e-3)
+      lanes = [event["lane"] for event in drain() if event["kind"] == "kernel"]
+      self.assertEqual(lanes[-3:], ["RK_DPU", "HOST", "RK_DPU"])
+    finally:
+      if old_fallback is None: os.environ.pop("ROCKCHIP_FALLBACK", None)
+      else: os.environ["ROCKCHIP_FALLBACK"] = old_fallback
+      if old_telemetry is None: os.environ.pop("ROCKCHIP_TELEMETRY", None)
+      else: os.environ["ROCKCHIP_TELEMETRY"] = old_telemetry
+
   def test_dpu_binary_and_multistage(self):
     rng = np.random.default_rng(1)
     values = [rng.uniform(-2, 2, 16).astype(np.float16) for _ in range(4)]

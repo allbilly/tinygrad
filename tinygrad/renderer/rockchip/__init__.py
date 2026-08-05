@@ -477,6 +477,9 @@ class RockchipRenderer(Renderer):
       if fallback == "PYTHON":
         from tinygrad.runtime.rockchip_fallback import build_rkpy_program
         return build_rkpy_program(ast, self.target)
+      if fallback in ("CLANG", "HOST"):
+        from tinygrad.runtime.rockchip_fallback import build_rkhc_program
+        return build_rkhc_program(ast, self.target)
       if fallback not in ("", "0"): raise RuntimeError(f"invalid ROCKCHIP_FALLBACK={fallback!r}")
       raise RuntimeError(f"RKPLAN_REJECT:{reject.kind.value}:{reject.detail}")
     if isinstance(result.plan, RKDPUProgram): image = emit_dpu(result.plan)

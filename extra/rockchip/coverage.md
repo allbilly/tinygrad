@@ -5122,3 +5122,27 @@ accepts the convolution as one unsplit compute task, but the compiler still
 needs a bounded 16x8 block transpose into `CNA_ACTIVATION` and a native
 `CONV_OUTPUT`-to-NCHW conversion with the official FP32-accumulation rounding
 contract. The authoritative census remains `214/40/158/13`.
+
+## Generic compiled-host mixed lane
+
+The existing `ROCKCHIP_FALLBACK=PYTHON` envelope is a useful executable UOp
+oracle, but it is not fast enough for the complete semantic inventory:
+`test_masked_select` remained in `PythonProgram.exec_alu` until the five-minute
+test watchdog aborted the process. It did not expose an NPU failure.
+
+`ROCKCHIP_FALLBACK=CLANG` now uses a second explicit, versioned `RKHC` envelope.
+The rejected early-simplified sink is compiled once through tinygrad's generic
+Clang UOps renderer and executes directly over the CPU-mapped Rockchip GEM
+buffers. It has no Tensor-operation catalogue, NumPy semantic runner, dynamic
+packing rule, or implicit dtype conversion. Telemetry reports this lane as
+`HOST`, so it contributes only to `PASS_FALLBACK` or `PASS_MIXED` and can never
+increase `PASS_NATIVE`.
+
+The locked native-to-host-to-native coherence test reports exactly
+`RK_DPU -> HOST -> RK_DPU`. The former five-minute `test_masked_select` blocker
+now completes in 2.71 seconds with six `HOST` kernels and `PASS_FALLBACK`.
+Representative dtype, indexing, reduction, convolution, and attention methods
+complete without interpreter timeout. Two independent numerical contracts
+remain before the hybrid inventory can be green: mixed native intermediates
+make `test_nll_loss_ignore_index` inaccurate, and causal SDPA also misses the
+Torch reference on the ordinary CPU backend under `DEFAULT_FLOAT=HALF`.
