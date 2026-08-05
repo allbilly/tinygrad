@@ -4267,3 +4267,19 @@ limit increase or tolerance change is justified, and deleting fifteen tasks
 from the same accumulation structure would not by itself solve the case. The
 required work is a direct transposed-convolution or layout path with a proven
 accumulation contract.
+
+## Rejected channel-packed FP16 mask to public int8
+
+`extra/rockchip/probe_fp16_mask_int8_channel.py` tests the channel-oriented
+alternative to the earlier failed linear mask conversion. Sixteen FP16 mask
+lanes are presented as one spatial position with channel 15; the DPU retains
+FP16 input/processing precision while WDMA is configured for one sixteen-byte
+int8 output atom. The submission times out with errno 110. The runtime reset is
+effective: a known-good 32-lane FP16 fill passes immediately afterward.
+
+The local Mesa Rocket reference confirms only an all-int8 quantized output
+contract, not FP16 processing followed by int8 storage. This closes the second
+obvious DPU geometry without weakening the existing typed rejection. Public
+bool materialization from FP16 still needs another hardware block or a proven
+native conversion path; no CPU packing is introduced. The authoritative tally
+remains `204/40/168/13`.

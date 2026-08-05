@@ -2180,3 +2180,25 @@ The active 400-task rejection remains correct, and no ceiling changes. A native
 solution needs a direct transposed-convolution/layout schedule that also
 preserves the reference accumulation semantics; merely shrinking or admitting
 the current selector schedule is insufficient.
+
+## Rejected channel-packed FP16 mask output
+
+The earlier public-bool experiment used the ordinary linear FP16 geometry:
+eight processing lanes per spatial position and int8 WDMA. A second probe now
+tests the other plausible layout directly: one spatial position with sixteen
+FP16 input/processing channels and one sixteen-byte int8 output atom. It sets
+FP16 input and processing precision, int8 output precision, channel 15 in DPU
+and MRDMA, width zero, and a sixteen-lane WDMA write.
+
+That submission also times out with errno 110. The runtime reset recovers the
+device and a 32-lane FP16 fill passes immediately afterward. Mesa Rocket's
+quantized output converter does not provide a missing configuration here: its
+working path uses int8 input, processing, and output throughout, rather than
+FP16 processing followed by int8 storage. The reproducible experiment is
+`probe_fp16_mask_int8_channel.py`.
+
+Public bool results derived from FP16 therefore remain a typed pre-submission
+reject. Existing all-int8 bool fill/copy/AND/OR/NOT and bounded bool-WHERE paths
+stay enabled because they use independently proven contracts. No method count,
+resource ceiling, or tolerance changes; the authoritative census remains
+`204 PASS_NATIVE / 40 PASS_FRONTEND / 168 FAIL / 13 SKIP_UPSTREAM`.
