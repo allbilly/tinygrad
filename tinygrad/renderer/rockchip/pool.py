@@ -186,27 +186,26 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
   value = _strip_casts(reduce.src[0])
   if value.op is not Ops.INDEX or value.src[0].op is not Ops.PARAM or value.dtype is not dtypes.half: return _not_applicable()
   out_aff, src_aff = _affine(store.src[0].src[1]), _affine(value.src[1])
-  if out_aff is None or src_aff is None or out_aff[1] or src_aff[1] or len(out_aff[0]) < 3:
+  if out_aff is None or src_aff is None or out_aff[1] or src_aff[1] or len(out_aff[0]) != 3:
     return _not_applicable()
   ranges = {u.arg[0]:int(u.src[0].arg) for u in sink.toposort() if u.op is Ops.RANGE and u.src[0].op is Ops.CONST}
   out_axes, red_axes = tuple(out_aff[0]), tuple(red.arg[0] for red in reduce.src[1:])
   if len(red_axes) != 2 or any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
   match:tuple[int,int,int,int,int,int,int,int,int]|None = None
-  for ordered_out_axes in permutations(out_axes):
-    *plane_axes,out_y_axis,out_x_axis = ordered_out_axes
-    planes, out_h, out_w = math.prod(ranges[x] for x in plane_axes), ranges[out_y_axis], ranges[out_x_axis]
+  for plane_axis,out_y_axis,out_x_axis in permutations(out_axes):
+    planes, out_h, out_w = (ranges[x] for x in (plane_axis,out_y_axis,out_x_axis))
     for kernel_y_axis,kernel_x_axis in permutations(red_axes):
       kernel_h, kernel_w = ranges[kernel_y_axis], ranges[kernel_x_axis]
       in_w = src_aff[0].get(kernel_y_axis,0)
-      if in_w <= 0 or not plane_axes or src_aff[0].get(plane_axes[-1],0)%in_w: continue
-      in_h = src_aff[0][plane_axes[-1]]//in_w
+      if in_w <= 0 or src_aff[0].get(plane_axis,0)%in_w: continue
+      in_h = src_aff[0][plane_axis]//in_w
       stride_y_coeff, stride_x = src_aff[0].get(out_y_axis,0), src_aff[0].get(out_x_axis,0)
       if stride_y_coeff <= 0 or stride_y_coeff%in_w: continue
       stride_y = stride_y_coeff//in_w
-      expected_src = {axis:coefficient*in_h*in_w for axis,coefficient in _dense_axis_coefficients(tuple(plane_axes),ranges).items()}
-      expected_src.update({out_y_axis:stride_y*in_w,out_x_axis:stride_x,kernel_y_axis:in_w,kernel_x_axis:1})
-      if out_aff[0] != _dense_axis_coefficients(ordered_out_axes,ranges) or src_aff[0] != expected_src: continue
+      if out_aff[0] != {plane_axis:out_h*out_w,out_y_axis:out_w,out_x_axis:1} or \
+         src_aff[0] != {plane_axis:in_h*in_w,out_y_axis:stride_y*in_w,out_x_axis:stride_x,
+                        kernel_y_axis:in_w,kernel_x_axis:1}: continue
       input_count, output_count = int(value.src[0].src[0].arg), int(store.src[0].src[0].src[0].arg)
       if (input_count,output_count) != (planes*in_h*in_w,planes*out_h*out_w) or \
          out_h != (in_h-kernel_h)//stride_y+1 or out_w != (in_w-kernel_w)//stride_x+1: continue
@@ -215,7 +214,7 @@ def lower_sliding_max_result(sink:UOp) -> RKLowerResult:
     if match is not None: break
   if match is None: return _not_applicable()
   planes,in_h,in_w,kernel_h,kernel_w,out_h,out_w,stride_y,stride_x = match
-  if not 1 <= planes <= 64 or not 2 <= max(kernel_h,kernel_w) <= 8 or min(kernel_h,kernel_w) < 2 or \
+  if not 1 <= planes <= 32 or not 2 <= max(kernel_h,kernel_w) <= 8 or min(kernel_h,kernel_w) < 2 or \
      max(in_h,in_w) > 256 or max(stride_y,stride_x) > 8:
     return _unsupported(RKRejectKind.UNSUPPORTED_REDUCTION,
       f"sliding PPU MAX is C={planes},H={in_h},W={in_w},K={kernel_h}x{kernel_w},S={stride_y}x{stride_x}",reduce.op)

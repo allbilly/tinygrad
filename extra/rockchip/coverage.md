@@ -4451,3 +4451,32 @@ images. Full Mypy remains clean over 236 source files and full-tree Ruff passes.
 Representative direct NCHW, channel-16, NHWC split-CBUF, K65-to-K96 CMAC, and
 tiled-M hardware paths remain green. No pass order, image, cost, tolerance, or
 coverage classification changes; `204/40/168/13` remains authoritative.
+
+## Rejected 64-plane sliding-PPU pooling
+
+`test_max_pool2d` uses `(32,2,11,28)` NCHW input, which early simplification
+flattens to 64 logical planes. A bounded WIP first widened the dedicated
+sliding-PPU recognizer from 32 to 64 planes, then generalized its affine match
+to accept multiple leading axes. The resulting exact compiler geometry is:
+
+```text
+output affine  plane*70 + y*14 + x
+input affine   plane*308 + (2*y+ky)*28 + (2*x+kx)
+planes         64
+```
+
+The graph then reaches the intended sliding-Pool lowerer, but its required
+19,712-element NCHW-to-HWC8 input transpose exceeds the unchanged bounded
+selector planner before hardware submission. The local RK3588 pool reference
+confirms that PPU external memory is HWC8 and explicitly performs this packing
+on the CPU; that reference behavior is not an acceptable native backend path.
+The generic affine fallback remains 688--1,024 tasks for the larger subcases.
+
+Both experiments are preserved as commits `4b5b1a363` and `ac77584da`, and as
+patches `0272-WIP-probe-64-plane-sliding-PPU-pool.patch` (SHA-256
+`7408aa8bc678e8e8f09fee86117436952558365b4649747d53fe2f6788c919b0`) and
+`0273-WIP-flatten-leading-axes-in-sliding-PPU-pool.patch` (SHA-256
+`28f1e9374eb9c3cab6b6705c701b36879265c0dbb82a426d805efcbdf00fc760`).
+The active 32-plane contract is restored. This family needs a native
+NCHW-to-HWC8 layout conversion, not a larger selector or program-stage limit;
+the authoritative census remains `204/40/168/13`.

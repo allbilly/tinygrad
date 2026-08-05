@@ -2360,3 +2360,14 @@ and below the 500-line organization goal. No handwritten code moved into
 `autogen/`. Frozen images, the full compiler/image/telemetry suite, Mypy, Ruff,
 and representative CMAC/CONV hardware paths remain green. Coverage is unchanged
 at the authoritative `204/40/168/13`.
+
+## Rejected wide planar PPU packing
+
+Two preserved WIP commits prove that the `(32,2,11,28)` `test_max_pool2d`
+family can be recognized as one 64-plane sliding pooling operation, but cannot
+be legalized efficiently with the current selector-CMAC reformatter. The
+logical input has 19,712 contiguous NCHW elements; PPU requires HWC8 atoms, and
+the resulting transpose exceeds the existing planner bounds. The local RK3588
+reference performs the same conversion on the CPU, which this backend does not
+adopt. Active legality is restored unchanged: future work needs a native
+NCHW-to-HWC8 conversion path rather than a higher 400-task ceiling.
