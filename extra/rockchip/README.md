@@ -2567,8 +2567,9 @@ large shapes passing this example are not by themselves one-task evidence.
 
 ## Staged native transpose convolution
 
-The CNA deconvolution geometry is now part of production lowering for simple,
-padded, strided, dilated, and grouped FP16 2D transpose convolution. The
+The CNA deconvolution geometry is now part of production lowering for all
+seven FP16 2D TestOps methods: simple, padded, strided, dilated, grouped,
+bias, and output-padding transpose convolution. The
 recognizer exhaustively validates every output/reduction coordinate against
 the decomposed feature mask and spatially reversed weight index. A fully
 cropped transpose is also accepted when simplification removes its redundant
@@ -2582,10 +2583,15 @@ deconvolution task per source kernel coordinate, and accumulates those tasks
 through FP16 DPU ADD in source-weight order. This reproduces the framework's
 per-kernel-position rounding without CPU execution or tolerance relaxation.
 
-Locked RK3588 tests pass all five methods plus an ordinary convolution
-regression. The plans span 77--121 tasks, 899,936--1,917,472 constant bytes,
+Bias is expanded through the native selector and added after the rounded
+kernel sum. A direct 1x1 hardware probe proves that the inserted-zero fields
+implement stride two, while the value encoding stride three is ignored. The
+output-padding tests therefore use native zero expansion only on their
+stride-three axis, then retain direct stride one or two on the other axis.
+
+Locked RK3588 tests pass all seven methods plus an ordinary convolution
+regression. The plans span 77--176 tasks, 529,040--1,917,472 constant bytes,
 and remain explicitly classified as correctness fallbacks. The complete
-compiler file passes 167 tests plus 75 subtests. Expected coverage is
-`211/40/161/13`; the last complete uncached census remains authoritative at
-`206/40/166/13`. Bias, output-padding, and 3D transpose convolution are the
-remaining family members.
+compiler file passes 168 tests plus 77 subtests. Expected coverage is
+`213/40/159/13`; the last complete uncached census remains authoritative at
+`206/40/166/13`. Only 3D transpose convolution remains in this family.

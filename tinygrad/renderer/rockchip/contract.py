@@ -495,10 +495,11 @@ def _deconv_source(parsed:tuple[UOp,UOp|None,bool], point:dict[int,int]) -> int|
   source = _static_scalar(index.src[1],point)
   return source if isinstance(source,int) and not isinstance(source,bool) else None
 
-def _deconv_dimensions(input_size:int, output_size:int, kernel_size:int) -> tuple[tuple[int,int,int], ...]:
-  """Return transpose-stride, dilation, symmetric-padding candidates with no output padding."""
-  return tuple((stride,dilation,padding) for stride in range(1,9) for dilation in range(1,33) for padding in range(16)
-               if output_size == (input_size-1)*stride-2*padding+(kernel_size-1)*dilation+1 and
+def _deconv_dimensions(input_size:int, output_size:int, kernel_size:int) -> tuple[tuple[int,int,int,int], ...]:
+  """Return transpose-stride, dilation, symmetric-padding, and output-padding candidates."""
+  return tuple((stride,dilation,padding,output_padding) for stride in range(1,9) for dilation in range(1,33)
+               for padding in range(16) for output_padding in range(stride)
+               if output_size == (input_size-1)*stride-2*padding+(kernel_size-1)*dilation+1+output_padding and
                   padding <= (kernel_size-1)*dilation)
 
 def lower_deconv_result(sink:UOp) -> RKLowerResult:
@@ -507,8 +508,10 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
   if len(stores) != 1 or len(reductions) != 1: return _not_applicable()
   store, reduce = stores[0], reductions[0]
   if reduce.arg[0] is not Ops.ADD or len(reduce.src) != 4 or store.src[0].op is not Ops.INDEX or \
-     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half or \
-     _strip_casts(store.src[1]).key != reduce.key: return _not_applicable()
+     store.src[0].src[0].op is not Ops.PARAM or store.src[0].dtype is not dtypes.half: return _not_applicable()
+  stored = _strip_casts(store.src[1])
+  bias_epilogue = None if stored.key == reduce.key else _contract_bias_epilogue(stored,reduce)
+  if stored.key != reduce.key and bias_epilogue is None: return _not_applicable()
   body = _strip_casts(reduce.src[0])
   if body.op is Ops.WHERE:
     branches = tuple(_strip_casts(x) for x in body.src[1:])
@@ -526,6 +529,7 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
   if len(red_axes) != 3 or any(axis not in ranges for axis in (*out_axes,*red_axes)): return _not_applicable()
 
   match:tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool],int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int]|None = None
+  matched_bias_rows:list[list[int]]|None = None
   for feature_parsed,weight_parsed in (parsed_operands,tuple(reversed(parsed_operands))):
     feature, weight = feature_parsed[0], weight_parsed[0]
     # A fully cropped transpose can simplify every feature coordinate in bounds, removing the WHERE predicate.
@@ -552,8 +556,8 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
           for in_h in range(1,min(32,spatial)+1):
             if spatial%in_h or spatial//in_h > 32: continue
             in_w = spatial//in_h
-            for stride_y,dilation_y,pad_y in _deconv_dimensions(in_h,out_h,kernel_h):
-              for stride_x,dilation_x,pad_x in _deconv_dimensions(in_w,out_w,kernel_w):
+            for stride_y,dilation_y,pad_y,_output_pad_y in _deconv_dimensions(in_h,out_h,kernel_h):
+              for stride_x,dilation_x,pad_x,_output_pad_x in _deconv_dimensions(in_w,out_w,kernel_w):
                 valid = True
                 for b,oc,oy,ox,icg,ky,kx in product(range(batch),range(out_c),range(out_h),range(out_w),
                                                       range(in_c_group),range(kernel_h),range(kernel_w)):
@@ -573,9 +577,24 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
                   if _deconv_source(feature_parsed,point) != source or _deconv_source(weight_parsed,point) != weight_source:
                     valid = False
                     break
+                candidate_bias_rows:list[list[int]]|None = None
+                if valid and bias_epilogue is not None:
+                  bias, _relu = bias_epilogue
+                  bias_count = int(bias.src[0].src[0].arg)
+                  candidate_bias_rows = []
+                  for b,oc,oy,ox in product(range(batch),range(out_c),range(out_h),range(out_w)):
+                    point = {batch_axis:b,out_channel_axis:oc,out_y_axis:oy,out_x_axis:ox}
+                    if group_axis is not None:
+                      point[group_axis], point[out_channel_axis] = oc//out_c_group, oc%out_c_group
+                    bias_source = _static_scalar(bias.src[1],point)
+                    if not isinstance(bias_source,int) or isinstance(bias_source,bool) or not 0 <= bias_source < bias_count:
+                      valid = False
+                      break
+                    candidate_bias_rows.append([bias_source])
                 if valid:
                   match = (feature_parsed,weight_parsed,batch,in_c,out_c,in_h,in_w,kernel_h,kernel_w,out_h,out_w,
                            stride_y,stride_x,dilation_y,dilation_x,pad_y,pad_x,groups)
+                  matched_bias_rows = candidate_bias_rows
                   break
               if match is not None: break
             if match is not None: break
@@ -591,23 +610,35 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
   if in_c not in (1,2,3,4,16) or not 1 <= out_c <= 16 or batch > 4:
     return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
       f"direct deconvolution is B={batch},IC={in_c},OC={out_c},H={in_h},W={in_w},K={kernel_h}x{kernel_w}",reduce.op)
+  # The characterized CNA inserted-zero fields implement strides one and two. For a wider axis, materialize the
+  # zero-inserted feature surface through the existing native selector and leave that CNA axis at stride one.
+  expand_y, expand_x = stride_y > 2, stride_x > 2
+  hardware_in_h = (in_h-1)*stride_y+1 if expand_y else in_h
+  hardware_in_w = (in_w-1)*stride_x+1 if expand_x else in_w
+  hardware_stride_y, hardware_stride_x = (1 if expand_y else stride_y), (1 if expand_x else stride_x)
+  if hardware_in_h > 32 or hardware_in_w > 32:
+    return _unsupported(RKRejectKind.UNSUPPORTED_CONTRACTION,
+      f"deconvolution zero-inserted CNA surface is {hardware_in_h}x{hardware_in_w}",reduce.op)
   align_in, input_c2 = (8,in_c) if in_c <= 4 else (16,8)
   width_alignment = max(1,(16+align_in-1)//align_in)
   full_h, full_w = out_h+2*pad_y, out_w+2*pad_x
-  input_width_stride = ((in_w+width_alignment-1)//width_alignment)*width_alignment
+  input_width_stride = ((hardware_in_w+width_alignment-1)//width_alignment)*width_alignment
   output_width_stride = (full_h*full_w+3)&-4
-  input_surface_count = in_h*input_width_stride*in_c
+  input_surface_count = hardware_in_h*input_width_stride*in_c
   input_batch_count, output_batch_count = (input_surface_count+7)&-8, 2*output_width_stride*8
   input_rows:list[list[int]] = []
   if in_c <= 4:
     for b in range(batch):
-      input_rows.extend([[b*in_c*in_h*in_w+c*in_h*in_w+y*in_w+x] if x < in_w else []
-                         for y in range(in_h) for x in range(input_width_stride) for c in range(input_c2)])
+      input_rows.extend([[b*in_c*in_h*in_w+c*in_h*in_w+(y//stride_y if expand_y else y)*in_w+(x//stride_x if expand_x else x)]
+                         if x < hardware_in_w and (not expand_y or y%stride_y == 0) and (not expand_x or x%stride_x == 0) else []
+                         for y in range(hardware_in_h) for x in range(input_width_stride) for c in range(input_c2)])
       input_rows.extend([[] for _ in range(input_batch_count-input_surface_count)])
   else:
     for b in range(batch):
-      input_rows.extend([[b*in_c*in_h*in_w+(c1*input_c2+c2)*in_h*in_w+y*in_w+x] if x < in_w else []
-                         for c1 in range(in_c//input_c2) for y in range(in_h)
+      input_rows.extend([[b*in_c*in_h*in_w+(c1*input_c2+c2)*in_h*in_w+
+                          (y//stride_y if expand_y else y)*in_w+(x//stride_x if expand_x else x)]
+                         if x < hardware_in_w and (not expand_y or y%stride_y == 0) and (not expand_x or x%stride_x == 0) else []
+                         for c1 in range(in_c//input_c2) for y in range(hardware_in_h)
                          for x in range(input_width_stride) for c2 in range(input_c2)])
       input_rows.extend([[] for _ in range(input_batch_count-input_surface_count)])
   in_c_group = in_c//groups
@@ -635,11 +666,13 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
   scratch += (RKScratch(batch*output_batch_count*2),)
   contribution = RKArg(RKBufferKind.SCRATCH,len(scratch))
   scratch += (RKScratch(output_batch_count*2),)
-  input_layout = RKLayout((in_h,in_w,in_c),(in_h,input_width_stride,in_c),(input_width_stride*in_c*2,in_c*2,2),dtypes.half,
-                          padding=((0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0) if in_c <= 4 else \
-    RKLayout((in_c//input_c2,in_h,in_w,input_c2),(in_c//input_c2,in_h,input_width_stride,input_c2),
-      (in_h*input_width_stride*input_c2*2,input_width_stride*input_c2*2,input_c2*2,2),dtypes.half,
-      padding=((0,0),(0,0),(0,input_width_stride-in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
+  input_layout = RKLayout((hardware_in_h,hardware_in_w,in_c),(hardware_in_h,input_width_stride,in_c),
+                          (input_width_stride*in_c*2,in_c*2,2),dtypes.half,
+                          padding=((0,0),(0,input_width_stride-hardware_in_w),(0,0)),
+                          kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0) if in_c <= 4 else \
+    RKLayout((in_c//input_c2,hardware_in_h,hardware_in_w,input_c2),(in_c//input_c2,hardware_in_h,input_width_stride,input_c2),
+      (hardware_in_h*input_width_stride*input_c2*2,input_width_stride*input_c2*2,input_c2*2,2),dtypes.half,
+      padding=((0,0),(0,0),(0,input_width_stride-hardware_in_w),(0,0)),kind=RKLayoutKind.CNA_ACTIVATION,padding_value=0)
   weight_layout = RKLayout((1,1,out_c,in_c),(1,1,out_c,align_in),(out_c*align_in*2,out_c*align_in*2,align_in*2,2),dtypes.half,
     padding=((0,0),(0,0),(0,0),(0,align_in-in_c)),kind=RKLayoutKind.CNA_WEIGHT,padding_value=0)
   output_layout = RKLayout((2,output_width_stride,8),(2,output_width_stride,8),(output_width_stride*16,16,2),dtypes.half,
@@ -654,14 +687,29 @@ def lower_deconv_result(sink:UOp) -> RKLowerResult:
         steps.append(RKDeconvTask(RKTensorRef(task_output,output_layout),
           RKTensorRef(RKArg(packed_input.kind,packed_input.index,b*input_batch_count*2),input_layout),
           RKTensorRef(RKArg(packed_weight.kind,packed_weight.index,weight_offset),weight_layout),
-          in_c,out_c,in_h,in_w,1,1,full_h,full_w,1,1,input_width_stride,output_width_stride,
-          transpose_stride_y=stride_y,transpose_stride_x=stride_x,
+          in_c,out_c,hardware_in_h,hardware_in_w,1,1,full_h,full_w,1,1,input_width_stride,output_width_stride,
+          transpose_stride_y=hardware_stride_y,transpose_stride_x=hardware_stride_x,
           hardware_pad_top=ky*dilation_y,hardware_pad_left=kx*dilation_x))
         if not first: steps.append(RKDPUProgram((RKALUStage(Ops.ADD,accumulator,accumulator,contribution,output_batch_count),),scratch))
   unpack = _selector_program(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),packed_output,
     batch*output_batch_count,output_rows,scratch,direct_capacity=batch*output_batch_count,max_outputs=64)
   if unpack is None: return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"deconvolution output unpack exceeds plan limits",Ops.INDEX)
-  program = _finish_program([*steps,*unpack.steps],unpack.scratch)
+  steps, scratch = [*steps,*unpack.steps], unpack.scratch
+  if bias_epilogue is not None:
+    bias, relu = bias_epilogue
+    assert matched_bias_rows is not None
+    expanded_bias = RKArg(RKBufferKind.SCRATCH,len(scratch))
+    scratch += (RKScratch(_cmac_tiled_output_bytes(output_count)),)
+    bias_plan = _selector_program(expanded_bias,RKArg(RKBufferKind.ARG,bias.src[0].arg.slot),int(bias.src[0].src[0].arg),
+                                  matched_bias_rows,scratch,max_outputs=64)
+    if bias_plan is None:
+      return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"deconvolution bias broadcast exceeds plan limits",bias.op)
+    scratch, steps = bias_plan.scratch, [*steps,*bias_plan.steps]
+    output = RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot)
+    epilogue_stages = [RKALUStage(Ops.ADD,output,output,expanded_bias,output_count)]
+    if relu: epilogue_stages.append(RKALUStage(Ops.MAX,output,output,0.0,output_count))
+    steps.append(RKDPUProgram(tuple(epilogue_stages),scratch))
+  program = _finish_program(steps,scratch)
   cost = plan_cost(program)
   if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,

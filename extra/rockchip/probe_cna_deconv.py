@@ -64,7 +64,7 @@ def _reference(source:np.ndarray, kernel:np.ndarray, stride:tuple[int,int], dila
   return output
 
 def _run(dev:RockchipDevice, source:np.ndarray, kernel:np.ndarray, stride:tuple[int,int]=(2,2),
-         dilation:tuple[int,int]=(1,1)) -> None:
+         dilation:tuple[int,int]=(1,1), direct:bool=True) -> None:
   output_height = (source.shape[0]-1)*stride[0]+(kernel.shape[0]-1)*dilation[0]+1
   output_width = (source.shape[1]-1)*stride[1]+(kernel.shape[1]-1)*dilation[1]+1
   output_stride = (output_height*output_width+3)&-4
@@ -85,10 +85,12 @@ def _run(dev:RockchipDevice, source:np.ndarray, kernel:np.ndarray, stride:tuple[
     physical = np.frombuffer(ctypes.string_at(int(out_buf.va_addr),output_nbytes),dtype=np.float16).reshape(2,output_stride,8)
     actual = physical[0,:output_height*output_width,0].reshape(output_height,output_width)
     flipped = _reference(source,kernel[::-1,::-1],stride,dilation)
+    exact = np.array_equal(actual,expected)
     print(f"CNA deconv {kernel.shape[0]}x{kernel.shape[1]} stride={stride} dilation={dilation} "
-          f"direct={np.array_equal(actual,expected)} "
+          f"direct={exact} "
           f"flipped={np.array_equal(actual,flipped)} actual={actual.tolist()}")
-    np.testing.assert_equal(actual,expected)
+    if direct: np.testing.assert_equal(actual,expected)
+    else: assert not exact, "uncharacterized wider deconvolution stride unexpectedly became direct"
   finally:
     dev._gpu_free(out_buf)
     dev._gpu_free(src_buf)
@@ -101,6 +103,7 @@ def main() -> None:
   kernel = np.array([[1,2,3],[4,5,6],[7,8,9]],dtype=np.float16)
   for stride,dilation in (((1,1),(1,1)),((2,1),(1,1)),((1,2),(1,1)),((2,2),(1,1)),((1,1),(2,2))):
     _run(dev,source,kernel,stride,dilation)
+  _run(dev,source,np.ones((1,1),dtype=np.float16),(3,1),(1,1),direct=False)
   output_height, output_width, output_stride = 3, 4, 12
   output_nbytes = 2*output_stride*8*2
   out_buf,src_buf,weight_buf = dev._gpu_alloc(output_nbytes),dev._gpu_alloc(source.nbytes),dev._gpu_alloc(16)

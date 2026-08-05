@@ -1916,6 +1916,28 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertEqual((commands[(0x201,rk.REG_CNA_CONV_CON3)]>>8)&0x3f,
                          ((transpose_stride[0]-1)<<3)|(transpose_stride[1]-1))
 
+  def test_transpose_convolution_bias_and_output_padding_stay_native(self):
+    source, weight, bias = (Tensor.empty(*shape,dtype=dtypes.half) for shape in ((2,4,6,5),(4,4,3,3),(4,)))
+    biased = lower_deconv_result(sink(Tensor.empty(2,4,9,9,dtype=dtypes.half).conv_transpose2d(weight,bias)))
+    self.assertIs(biased.kind,RKLowerKind.NATIVE)
+    assert isinstance(biased.plan,RKProgram)
+    self.assertLessEqual(plan_cost(biased.plan).task_count,140)
+    self.assertFalse(contains_uop(biased.plan))
+    for output_padding,stride,hardware_input,hardware_stride in (
+      ((1,1),(2,3),(6,13),(2,1)),
+      ((2,1),(3,2),(16,5),(1,2)),
+    ):
+      with self.subTest(output_padding=output_padding,stride=stride):
+        result = lower_deconv_result(sink(source.conv_transpose2d(weight,bias,output_padding=output_padding,stride=stride)))
+        self.assertIs(result.kind,RKLowerKind.NATIVE)
+        assert isinstance(result.plan,RKProgram)
+        tasks = tuple(step for step in result.plan.steps if isinstance(step,RKDeconvTask))
+        self.assertEqual(len(tasks),18)
+        self.assertEqual({(task.input_height,task.input_width) for task in tasks},{hardware_input})
+        self.assertEqual({(task.transpose_stride_y,task.transpose_stride_x) for task in tasks},{hardware_stride})
+        self.assertLessEqual(plan_cost(result.plan).task_count,180)
+        self.assertFalse(contains_uop(result.plan))
+
   def test_pointwise_convolution_uses_direct_cna_task(self):
     for channels,size in ((4,9),(16,8)):
       with self.subTest(channels=channels,size=size):

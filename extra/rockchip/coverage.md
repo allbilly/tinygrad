@@ -54,21 +54,25 @@ authoritative.
 The chronological sections below retain the individual focused evidence and
 their then-current estimates for debugging history.
 
-Focused work after that census now makes five previously rejected 2D
-transpose-convolution methods native: simple, padded, strided, dilated, and
-grouped. The expected tally is therefore `211 PASS_NATIVE / 40 PASS_FRONTEND /
-161 FAIL / 13 SKIP_UPSTREAM`, but `206/40/166/13` remains authoritative until
-the next complete uncached census. Bias, output-padding, and the 3D variant
-remain rejected.
+Focused work after that census now makes all seven 2D transpose-convolution
+methods native: simple, padded, strided, dilated, grouped, bias, and
+output-padding. The expected tally is therefore `213 PASS_NATIVE / 40
+PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM`, but `206/40/166/13` remains
+authoritative until the next complete uncached census. The 3D variant remains
+rejected.
 
 The legalizer recognizes the decomposed affine transpose exactly, packs
 dynamic feature and weight surfaces on the NPU, and emits one 1x1 CNA
 deconvolution task per source kernel coordinate. DPU FP16 additions preserve
 PyTorch's per-kernel-position rounding contract; the earlier single broad CNA
 task was mathematically closer to FP32 but failed the official FP16 tolerance.
-Plans remain bounded at 77--121 tasks and 899,936--1,917,472 constant bytes.
-They are correctness fallbacks pending direct physical layout conversion, and
-neither resource ceiling changed.
+Bias is broadcast on the NPU after the rounded kernel sum. A raw probe proves
+that CNA's inserted-zero fields implement strides one and two but not three;
+the output-padding cases therefore materialize only their stride-three axis
+through a bounded native zero-expansion before CNA. Plans remain bounded at
+77--176 tasks and 529,040--1,917,472 constant bytes. They are correctness
+fallbacks pending direct physical layout conversion, and neither resource
+ceiling changed.
 
 The first post-census destination-stride probe is a negative hardware result.
 The DPU gathered 64 eight-lane FP16 atoms from 128-element-stride source rows
