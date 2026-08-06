@@ -5652,3 +5652,26 @@ one-hot routes. CBUF-bank reduction breaks the workload, while the tested
 feature-grain variant remains exact. Consequently there is no evidence that
 the proposed hybrid triplet fixes a production failure, and the emitter is
 unchanged. This negative probe changes no coverage or legality contract.
+
+## Submission-arena reliability after the K65 gain
+
+The first uncached full census at `b6f1ddf19` is intentionally not counted. It
+reached roughly 29% before the `dot` region triggered kernel CMA allocation
+failures (`2` pages and `207` pages) and pytest entered uninterruptible
+`msleep`. The partial JSON is diagnostic only. A fresh process had already
+proved the 350-task batch-eight result exact, identifying per-stage allocation
+churn as the full-suite-specific variable.
+
+`RockchipProgram` now builds two immutable invocation-scoped GEM objects: one
+contains every aligned command stream and one contains every task descriptor.
+Each blocking submission still executes exactly one selected descriptor with
+its prior reset policy. No command or descriptor range is reused or mutated
+during the invocation. This reduces a 350-stage call from 700 transient GEM
+objects to two without adopting the previously rejected overwrite/reuse model.
+
+Hardware regression results are unchanged: complete strict `test_dot_1d`
+passes in 107.02 seconds, including the exact 350-stage batch-eight subcase;
+representative DPU, CMAC, PPU, CONV, and mixed-engine device tests also pass.
+The compiler suite is `175 passed / 78 subtests`, Ruff is clean, and mypy is
+clean across 237 source files. A new complete census is still required before
+promoting the expected `215/40/157/13` tally.

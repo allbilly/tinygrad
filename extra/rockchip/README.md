@@ -3005,3 +3005,28 @@ surface-contract error, not evidence for changing the three production
 registers. `emit_spatial_conv` therefore remains unchanged; the raw and
 compiler-packed experiments are retained in
 `extra/rockchip/probe_conv_wide_pointwise_modes.py`.
+
+## Immutable per-invocation submission arenas
+
+The first complete strict census after the 350-task batched K65 schedule did
+not reach an authoritative result. At the `dot` family, the kernel logged CMA
+allocation failures for two-page command objects and a 207-page allocation;
+pytest then blocked in `msleep`. The same schedule was exact in a fresh focused
+process, so this was submission-resource pressure rather than a contraction
+error.
+
+The runtime previously allocated and destroyed one command GEM and one task
+GEM for every physical stage. It now allocates one immutable command arena and
+one immutable descriptor array for the invocation. Every stage retains a
+distinct command range and descriptor, and `task_start` selects that descriptor
+for the same one-task blocking ioctl. Per-stage reset, task order, engine masks,
+register words, and scratch/constants are unchanged; no mapped memory is
+overwritten while a submitted task can still reference it. This is therefore
+different from the rejected single-buffer overwrite experiment.
+
+The arena passes DPU-only, CMAC, PPU, CONV, mixed-engine, and the complete
+350-stage `test_dot_1d` hardware paths. That official test remains exact and
+finishes in 107.02 seconds. The compiler suite passes 175 tests plus 78
+subtests, and Ruff plus full tinygrad mypy are clean. This fixes the observed
+CMA allocation churn but does not make the selector-heavy schedule efficient;
+direct row-major-to-CMAC packing remains required.
