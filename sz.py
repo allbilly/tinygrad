@@ -22,6 +22,8 @@ def gen_stats(base_path="."):
       if any(s in path.replace('\\', '/') for s in ['tinygrad/runtime/autogen', 'tinygrad/viz/assets']): continue
       filepath = os.path.join(path, name)
       relfilepath = os.path.relpath(filepath, base_path).replace('\\', '/')
+      # reference-only old python rockchip backend; keep on disk but exclude from size
+      if relfilepath in ('tinygrad/runtime/ops_python_rockchip.py', 'tinygrad/runtime/support/rockchip.py'): continue
       if name.endswith(".js"):
         with open(filepath) as file_: lines = [line.strip() for line in file_.readlines()]
         token_count, line_count = sum(len(line.split()) for line in lines if is_js_token(line)), sum(1 for line in lines if is_js_token(line))
