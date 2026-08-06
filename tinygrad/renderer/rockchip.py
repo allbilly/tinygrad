@@ -8,7 +8,7 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
 RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 3, 1
 _HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHIIII")
@@ -141,10 +141,15 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       len({p.arg.slot for p in outs}) != 1): raise RuntimeError("RKPLAN_REJECT:unsupported_graph")  # type: ignore[union-attr]
   out = outs[0]; assert out is not None
   count, oslot = int(out.src[0].arg), out.arg.slot
+  # Pure half EW only: reject CAST / float ALU / REDUCE (stops matmul ACC-loop false-accept as EW MUL).
+  if any(u.op is Ops.CAST or u.op is Ops.REDUCE or
+         (u.op in GroupOp.ALU and u.dtype.scalar() in (dtypes.float, dtypes.float32, dtypes.float64)) for u in uops):
+    raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
   if any(u.op in _FORBIDDEN and u.dtype.scalar() is dtypes.half for u in uops):
     raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
   ew_ops = {u.op for u in uops if u.op in _EW and u.dtype.scalar() is dtypes.half}
-  if len(ew_ops) != 1: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+  # After float→half demote, unrolled matmul is half MUL+ADD MAC tree (not a single EW op).
+  if len(ew_ops) != 1: raise RuntimeError(f"RKPLAN_REJECT:mixed_ew_ops:{sorted(o.name for o in ew_ops)}")
   op = next(iter(ew_ops))
   # Contiguous same-shape vector LOADs; optional ConstFloat scalar operand (test_scalar_mul / mul_naninf).
   ins:list[int] = []
@@ -168,9 +173,29 @@ def lower_ew(uops:list[UOp]) -> RKImage:
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
+# Other branch demotes float ALU→half via PatternMatcher. Apply here (post-SPEC) so WHERE/float graphs stay valid through verify.
+_pm_fp32_to_fp16 = PatternMatcher([
+  (UPat(Ops.ADD, dtypes.float, name="x"),
+   lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
+  (UPat(Ops.MAX, dtypes.float, name="x"),
+   lambda x: x.src[0].cast(dtypes.half).alu(Ops.MAX, x.src[1].cast(dtypes.half))),
+  (UPat(Ops.NEG, dtypes.float, name="x"),
+   lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
+  (UPat(Ops.EXP2, dtypes.float, name="x"),
+   lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
+  # Fold ACC cast noise: half ← float ← half MUL/ADD; half ← half.
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)),
+   lambda x: x),
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+])
+
+def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
+  sink = next(u for u in uops if u.op is Ops.SINK)
+  return list(graph_rewrite(sink, _pm_fp32_to_fp16, name="rockchip float→half").toposort())
+
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
-  def render(self, uops:list[UOp]) -> str: return base64.b64encode(encode_image(lower_ew(uops))).decode()
+  def render(self, uops:list[UOp]) -> str: return base64.b64encode(encode_image(lower_ew(_fp16_rewrite(uops)))).decode()
