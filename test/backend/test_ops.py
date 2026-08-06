@@ -4,6 +4,7 @@ from typing import List, Callable
 import torch
 from tinygrad.helpers import getenv, DEBUG, DEV, IMAGE, Context
 from tinygrad import Tensor, Device, dtypes
+from tinygrad.dtype import _to_torch_dtype
 from tinygrad.tensor import _to_np_dtype
 from tinygrad.renderer.nir import NIRRenderer
 
@@ -12,6 +13,7 @@ if TINY_BACKEND:
   import tinygrad.nn.torch # noqa: F401 # pylint: disable=unused-import
   torch.set_default_device("tiny")
 
+if (td:=_to_torch_dtype(dtypes.default_float)) is not None: torch.set_default_dtype(td)
 warnings.filterwarnings("ignore", message="Non-empty compiler output encountered")
 
 FORWARD_ONLY = getenv("FORWARD_ONLY", 0)
