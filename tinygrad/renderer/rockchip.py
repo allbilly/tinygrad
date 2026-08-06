@@ -79,20 +79,23 @@ def patch_image(image:RKImage, address:Callable[[RKBufferKind,int],int]) -> tupl
       patched[r.stage][r.word] = (w & ~0xffffffff0000) | (((v & ~fm) | ((field<<r.field_shift)&fm)) << 16)
   return tuple(map(tuple, patched))
 
-_DPU, _RDMA, _PC, _EW_ADD = 0x1001, 0x2001, 0x81, 0x108002c0|(2<<16)
-# Non-ADD half ALU / mask ops → reject (broadcast/pad/logaddexp must not false-accept).
-_FORBIDDEN = {Ops.MUL, Ops.SUB, Ops.FDIV, Ops.MAX, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
+_DPU, _RDMA, _PC = 0x1001, 0x2001, 0x81
+# EW_CFG from allbilly/rk3588 examples/elementwise.py
+_EW = {Ops.ADD: 0x108002c0 | (2 << 16), Ops.MUL: 0x108002c0 | (1 << 2) | (1 << 8)}
+# Non-EW half ALU / mask ops → reject (broadcast/pad/logaddexp must not false-accept).
+_FORBIDDEN = {Ops.SUB, Ops.FDIV, Ops.MAX, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
               Ops.AND, Ops.OR, Ops.XOR, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT}
 def _cmd(t,r,v): return ((t&0xffff)<<48)|((v&0xffffffff)<<16)|(r&0xffff)
 
-def emit_add_stage(stage:int, dst:RKArg, lhs:RKArg, rhs:RKArg, count:int) -> RKStage:
+def emit_ew_stage(stage:int, dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
+  """DPU elementwise binary stage (ADD/MUL); same body as ADD with EW_CFG from elementwise.py."""
   w = (count+7)//8-1
   regs = ((_DPU,rk.REG_DPU_S_POINTER,0xe),(_DPU,rk.REG_DPU_FEATURE_MODE_CFG,0x1e5),
     (_DPU,rk.REG_DPU_DATA_FORMAT,(2<<29)|(2<<26)|2),(_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,w),
     (_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),(_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,0x70007),
     (_DPU,rk.REG_DPU_BS_CFG,0x53),(_DPU,rk.REG_DPU_BN_CFG,0x53),(_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),
     (_DPU,rk.REG_DPU_BS_OW_CFG,2),(_DPU,rk.REG_DPU_WDMA_SIZE_0,7),(_DPU,rk.REG_DPU_WDMA_SIZE_1,w),
-    (_DPU,rk.REG_DPU_BN_MUL_CFG,0),(_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(_DPU,rk.REG_DPU_EW_CFG,_EW_ADD),
+    (_DPU,rk.REG_DPU_BN_MUL_CFG,0),(_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(_DPU,rk.REG_DPU_EW_CFG,ew_cfg),
     (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),(_DPU,rk.REG_DPU_OUT_CVT_SCALE,0x10001),
     (_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,0x40),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,w),
@@ -105,22 +108,25 @@ def emit_add_stage(stage:int, dst:RKArg, lhs:RKArg, rhs:RKArg, count:int) -> RKS
   cmds += [_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849), _cmd(_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
   return RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), RK_STAGE_RESET)
 
-def emit_add(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int) -> RKImage:
-  return RKImage(RKTarget.RK3588, (emit_add_stage(0, dst, lhs, rhs, count),))
-
-def emit_add_chain(out:RKArg, inputs:tuple[RKArg, ...], count:int) -> RKImage:
-  """Reduce N same-shape half buffers with N-1 DPU ADD stages; intermediates use scratch."""
-  if len(inputs) < 2: raise ValueError("ADD chain needs at least two inputs")
-  nbytes = ((count+7)//8*8)*2  # atom-pad FP16 surface
+def emit_ew_chain(out:RKArg, inputs:tuple[RKArg, ...], count:int, ew_cfg:int) -> RKImage:
+  """Reduce N same-shape half buffers with N-1 DPU EW stages; intermediates use scratch."""
+  if len(inputs) < 2: raise ValueError("EW chain needs at least two inputs")
+  nbytes = ((count + 7) // 8 * 8) * 2  # atom-pad FP16 surface
   scratch = tuple(RKScratch(nbytes) for _ in range(max(0, len(inputs)-2)))
   stages:list[RKStage] = []
   acc = inputs[0]
   for i, rhs in enumerate(inputs[1:]):
     last = i == len(inputs)-2
     dst = out if last else RKArg(RKBufferKind.SCRATCH, i)
-    stages.append(emit_add_stage(i, dst, acc, rhs, count))
+    stages.append(emit_ew_stage(i, dst, acc, rhs, count, ew_cfg))
     acc = dst
   return RKImage(RKTarget.RK3588, tuple(stages), scratch)
+
+def emit_ew_const(out:RKArg, vec:RKArg, count:int, ew_cfg:int, const_val:float) -> RKImage:
+  """vector ⊗ scalar: splat const into scratch[0] (value in image.constants as one fp16)."""
+  nbytes = ((count + 7) // 8 * 8) * 2
+  return RKImage(RKTarget.RK3588, (emit_ew_stage(0, out, vec, RKArg(RKBufferKind.SCRATCH, 0), count, ew_cfg),),
+                 (RKScratch(nbytes),), struct.pack("<e", const_val))
 
 def _root_param(u:UOp) -> UOp|None:
   while u.op is not Ops.PARAM:
@@ -128,7 +134,7 @@ def _root_param(u:UOp) -> UOp|None:
     u = u.src[0]
   return u
 
-def lower_add(uops:list[UOp]) -> RKImage:
+def lower_ew(uops:list[UOp]) -> RKImage:
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
   if (not stores or any(p is None or p.dtype.scalar() is not dtypes.half or p.src[0].op is not Ops.CONST for p in outs) or
@@ -137,17 +143,27 @@ def lower_add(uops:list[UOp]) -> RKImage:
   count, oslot = int(out.src[0].arg), out.arg.slot
   if any(u.op in _FORBIDDEN and u.dtype.scalar() is dtypes.half for u in uops):
     raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-  # Contiguous same-shape inputs only: each half LOAD's PARAM size must match the output count.
+  ew_ops = {u.op for u in uops if u.op in _EW and u.dtype.scalar() is dtypes.half}
+  if len(ew_ops) != 1: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+  op = next(iter(ew_ops))
+  # Contiguous same-shape vector LOADs; optional ConstFloat scalar operand (test_scalar_mul / mul_naninf).
   ins:list[int] = []
+  const_vals:list[float] = []
   for u in uops:
+    if u.op is op and u.dtype.scalar() is dtypes.half:
+      for s in u.src:
+        if s.op is Ops.CONST: const_vals.append(float(s.arg))
     if u.op is not Ops.LOAD: continue
     p = _root_param(u)
     if p is None or p.dtype.scalar() is not dtypes.half or p.arg.slot == oslot: continue
     if p.src[0].op is not Ops.CONST or int(p.src[0].arg) != count: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
     if p.arg.slot not in ins: ins.append(p.arg.slot)
-  if count <= 0 or len(ins) < 2 or not any(u.op is Ops.ADD and u.dtype.scalar() is dtypes.half for u in uops):
-    raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-  return emit_add_chain(RKArg(RKBufferKind.ARG, oslot), tuple(RKArg(RKBufferKind.ARG, s) for s in ins), count)
+  if count <= 0: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+  out_arg = RKArg(RKBufferKind.ARG, oslot)
+  if len(ins) >= 2: return emit_ew_chain(out_arg, tuple(RKArg(RKBufferKind.ARG, s) for s in ins), count, _EW[op])
+  if len(ins) == 1 and const_vals:
+    return emit_ew_const(out_arg, RKArg(RKBufferKind.ARG, ins[0]), count, _EW[op], const_vals[0])
+  raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
 
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
@@ -157,4 +173,4 @@ class RockchipRenderer(Renderer):
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
-  def render(self, uops:list[UOp]) -> str: return base64.b64encode(encode_image(lower_add(uops))).decode()
+  def render(self, uops:list[UOp]) -> str: return base64.b64encode(encode_image(lower_ew(uops))).decode()

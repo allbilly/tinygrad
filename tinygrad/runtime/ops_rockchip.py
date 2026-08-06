@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, mmap, os, time
+import ctypes, mmap, os, struct, time
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
@@ -23,6 +23,7 @@ class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
     self.scratch = tuple(dev._gpu_alloc(x.size) for x in self.image.scratch)
+    self.submit_count = 0  # DRM_IOCTL_RKNPU_SUBMIT calls for this program
   @suppress_finalizing
   def __del__(self):
     for buf in getattr(self, "scratch", ()): self.dev._gpu_free(buf)
@@ -61,9 +62,16 @@ class RockchipProgram(Program['RockchipDevice']):
         task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
         core_mask=1, fence_fd=-1, subcore_task=(rk.struct_rknpu_subcore_task*5)(
           rk.struct_rknpu_subcore_task(0, n), rk.struct_rknpu_subcore_task(n, 0), rk.struct_rknpu_subcore_task(n, 0)))
+      self.submit_count += 1
+      self.dev.submit_count += 1
     finally: self.dev._gpu_free(cmd); self.dev._gpu_free(task)
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
+    # Scalar EW: image.constants holds one fp16; splat into scratch[0] (const operand buffer).
+    if self.image.constants and self.scratch:
+      val = struct.unpack_from("<e", self.image.constants, 0)[0]
+      n = self.scratch[0].size // 2
+      ctypes.memmove(int(self.scratch[0].va_addr), struct.pack("<e", val) * n, n * 2)
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
@@ -80,6 +88,7 @@ class RockchipProgram(Program['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
+    self.submit_count = 0  # total DRM_IOCTL_RKNPU_SUBMIT ioctls on this device
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
