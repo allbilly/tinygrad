@@ -5609,11 +5609,29 @@ summation.
 | `360x65 @ 65` | bit-exact finite sweep | 339 | 247,952 B |
 | `3x33x65 @ 65` | official-tolerance device regression | bounded | bounded |
 
-The reverse `65 @ 8x65x45` form remains rejected. A single packed batch is
-exact, but composition corrupts output channels 40--44 across independent
-output surfaces. Wider three-/four-row selector packing does not repair it and
-can exceed one MiB of constants. The rejected implementation is retained as
-WIP rather than enabled through a test-specific exception.
+The reverse `65 @ 8x65x45` form is now native after isolating two physical
+faults in the initial experiment. Later logical batches began at unaligned DMA
+bases (`65*45*2 = 5,850` bytes), and selector packing was interleaved with the
+broad CMAC family. Each later region is exact in isolation, and repeated broad
+CMAC tasks are exact; only the invalid base and cross-family ordering failed.
+
+The production schedule uses one allocation-aligned selector map for all RHS
+rows, four-row/256-output padding groups, all transpose packs before all broad
+computes, 128-byte physical result rows, and one global N64-to-N45 compaction.
+The hardware boundary matrix is exact:
+
+| batch | tasks | constants | mismatches |
+| ---: | ---: | ---: | ---: |
+| 1 | 50 | 341,776 B | 0 |
+| 2 | 93 | 372,496 B | 0 |
+| 4 | 178 | 370,448 B | 0 |
+| 8 | 350 | 411,408 B | 0 |
+
+The unchanged strict `test_dot_1d` passes all value and exception subcases in
+106.72 seconds. This is one focused method transition; the expected strict
+tally is `215 PASS_NATIVE / 40 PASS_FRONTEND / 157 FAIL / 13 SKIP_UPSTREAM`
+until a complete uncached census confirms it. No CPU packing, test-specific
+matching, resource-limit increase, or tolerance change participates.
 
 A special-value run does not preserve every selected NaN, so this milestone
 does not claim a full IEEE special-value contraction contract. It adds no

@@ -2142,8 +2142,13 @@ class TestDPUCompiler(unittest.TestCase):
 
     reversed_result = lower_tiled_contract_result(
       sink(Tensor.empty(65,dtype=dtypes.half).matmul(Tensor.empty(8,65,45,dtype=dtypes.half))))
-    self.assertIs(reversed_result.kind,RKLowerKind.UNSUPPORTED)
-    self.assertEqual(reversed_result.reject.kind,RKRejectKind.PLAN_STAGE_LIMIT)
+    self.assertIs(reversed_result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(reversed_result.plan,RKProgram)
+    assert isinstance(reversed_result.plan,RKProgram)
+    reversed_cost = plan_cost(reversed_result.plan)
+    self.assertLessEqual(reversed_cost.task_count,350)
+    self.assertLessEqual(reversed_cost.constant_bytes,420*1024)
+    self.assertFalse(contains_uop(reversed_result.plan))
 
   def test_k128_matvec_keeps_native_packing_budget(self):
     result = lower_tiled_contract_result(sink(Tensor.empty(1,128,dtype=dtypes.half)@Tensor.empty(128,128,dtype=dtypes.half)))

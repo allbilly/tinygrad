@@ -47,6 +47,14 @@ class TestRockchip(unittest.TestCase):
     expected = (matrix.astype(np.float32)@vector.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
 
+  def test_k65_vector_batched_rhs_keeps_batch_offsets_in_selector(self):
+    rng = np.random.default_rng(65045)
+    vector = rng.uniform(-.25,.25,65).astype(np.float16)
+    matrix = rng.uniform(-.25,.25,(2,65,45)).astype(np.float16)
+    actual = Tensor(vector,device="ROCKCHIP").matmul(Tensor(matrix,device="ROCKCHIP")).realize().numpy()
+    expected = np.einsum("k,bkn->bn",vector.astype(np.float32),matrix.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
+
   def test_row_major_matvec_unaligned_k_tail(self):
     rng = np.random.default_rng(65104)
     lhs = rng.uniform(-.125,.125,(1,65)).astype(np.float16)

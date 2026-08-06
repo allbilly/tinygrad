@@ -2965,15 +2965,24 @@ only the final result is converted to FP16. The locked finite-data probe at
 permanent device regression covers the batched `(3,33,65) @ (65,)` form, and
 the compiler test constrains both resource use and the FP32 continuation type.
 
-This is a bounded correctness schedule, not a general layout claim. A
-`K @ batched(KxN)` experiment produced exact output for one batch but corrupted
-channels 40 through 44 when eight tasks were composed, even with independent
-4 KiB output surfaces. Three- and four-row packing variants either raised the
-N99 selector payload from below 400 KiB to 1.25 MiB or retained the tail
-corruption, so they remain disabled WIP. The reversed official `dot_1d`
-subcase therefore still rejects with `PLAN_STAGE_LIMIT`.
+This is a bounded correctness schedule, not a general layout claim. The first
+`K @ batched(KxN)` experiment was exact for batch zero but corrupted later
+batches. The cause was physical scheduling, not CMAC arithmetic: K65xN45
+batches begin every 5,850 bytes, so placing the logical batch offset in the DMA
+base violated its 16-byte atom contract; interleaving selector packing with
+broad CMAC also crossed a measured engine-state boundary.
 
-The standalone special-value probe also found that this multi-pass CMAC path
+The corrected generic schedule keeps the allocation base aligned, represents
+the batch offset in selector coordinates, pads all KxN rows in one homogeneous
+four-row selector family, transposes all packed surfaces, executes the broad
+CMAC group, and removes N64-to-N45 padding in one global selector compaction.
+Hardware sweeps for batches 1, 2, 4, and 8 are exact. The official
+`65 @ (8,65,45)` kernel uses 350 tasks, 411,408 constant bytes, and 178,464
+scratch bytes; complete strict `test_dot_1d` passes without changing a resource
+ceiling or tolerance. This is one focused native-method gain, so the expected
+strict tally is `215/40/157/13` pending a complete uncached census.
+
+The standalone matrix-vector special-value probe also found that its multi-pass CMAC path
 does not preserve every selected NaN, although ordinary finite TestOps data is
 within the official tolerance. No broader special-value contract, method
 count, task ceiling, constant ceiling, or tolerance change is claimed.
