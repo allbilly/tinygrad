@@ -1,7 +1,7 @@
 from __future__ import annotations
 import ctypes, mmap, os, time
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
-from tinygrad.helpers import from_mv, to_mv
+from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
@@ -17,12 +17,21 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
+    self.scratch = tuple(dev._gpu_alloc(x.size) for x in self.image.scratch)
+  @suppress_finalizing
+  def __del__(self):
+    for buf in getattr(self, "scratch", ()): self.dev._gpu_free(buf)
   def _dma(self, buf:HCQBuffer) -> int: return int(buf.meta.dma_addr)+int(buf.va_addr)-int(buf.base.va_addr)
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
     def address(kind:RKBufferKind, index:int) -> int:
-      if kind is not RKBufferKind.ARG: raise RuntimeError("ADD-only runtime expects ARG buffers")
-      return self._dma(bufs[index])
+      if kind is RKBufferKind.ARG:
+        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
+        return self._dma(bufs[index])
+      if kind is RKBufferKind.SCRATCH:
+        if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
+        return self._dma(self.scratch[index])
+      raise RuntimeError(f"unsupported RKBufferKind {kind}")
     start = time.perf_counter()
     for stage, commands in zip(self.image.stages, patch_image(self.image, address)):
       if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
