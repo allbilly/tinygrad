@@ -5662,16 +5662,25 @@ failures (`2` pages and `207` pages) and pytest entered uninterruptible
 proved the 350-task batch-eight result exact, identifying per-stage allocation
 churn as the full-suite-specific variable.
 
-`RockchipProgram` now builds two immutable invocation-scoped GEM objects: one
-contains every aligned command stream and one contains every task descriptor.
-Each blocking submission still executes exactly one selected descriptor with
-its prior reset policy. No command or descriptor range is reused or mutated
-during the invocation. This reduces a 350-stage call from 700 transient GEM
-objects to two without adopting the previously rejected overwrite/reuse model.
+For programs containing at least 128 stages, `RockchipProgram` now builds two
+immutable invocation-scoped GEM objects: one contains every aligned command
+stream and one contains every task descriptor. Each blocking submission still
+executes exactly one selected descriptor with its prior reset policy. No
+command or descriptor range is reused or mutated during the invocation. This
+reduces a 350-stage call from 700 transient GEM objects to two without adopting
+the previously rejected overwrite/reuse model.
 
-Hardware regression results are unchanged: complete strict `test_dot_1d`
-passes in 107.02 seconds, including the exact 350-stage batch-eight subcase;
-representative DPU, CMAC, PPU, CONV, and mixed-engine device tests also pass.
-The compiler suite is `175 passed / 78 subtests`, Ruff is clean, and mypy is
-clean across 237 source files. A new complete census is still required before
-promoting the expected `215/40/157/13` tally.
+The first universal-arena census completed in 55m48s and crossed the former CMA
+failure point, but it is not authoritative: 12- and 68-stage asymmetric-padding
+kernels each timed out at their final CMAC stage. Its method summary was
+`213 PASS_NATIVE / 40 PASS_FRONTEND / 159 FAIL / 13 SKIP_UPSTREAM`; the exact
+`test_dot_1d` transition was offset by those two device failures. The short
+programs now retain their proven per-stage object lifetime, while only large
+programs use the immutable arena.
+
+Complete strict `test_dot_1d` passes in 107.02 seconds, including the exact
+350-stage batch-eight subcase. Focused DPU, CMAC, PPU, CONV, and mixed-engine
+device tests pass. The compiler suite is `175 passed / 78 subtests`, Ruff is
+clean, and mypy is clean across 237 source files. The authoritative strict
+baseline remains `214/40/158/13`; the focused expected tally remains
+`215/40/157/13` until a clean complete census confirms it.

@@ -124,30 +124,43 @@ class RockchipProgram(Program['RockchipDevice']):
     start = time.perf_counter()
     active_stage = -1
     commands = tuple(patch_image(image, address))
+    use_arena = len(commands) >= 128
     command_offsets:list[int] = []
     command_bytes = 0
-    for stream in commands:
-      command_offsets.append(command_bytes)
-      command_bytes = (command_bytes+len(stream)*8+15)&-16
+    if use_arena:
+      for stream in commands:
+        command_offsets.append(command_bytes)
+        command_bytes = (command_bytes+len(stream)*8+15)&-16
+    else: command_offsets = [0]*len(commands)
     descriptor_size = ctypes.sizeof(rk.struct_rknpu_task)
-    # Keep every submitted command stream and descriptor immutable until the invocation completes. This preserves the
-    # proven reset + blocking-submit contract while avoiding two fresh page-sized GEM allocations for every stage.
-    cmd_arena = self.dev._gpu_alloc(command_bytes)
+    # Large correctness schedules exhausted CMA while allocating two page-sized GEMs per stage. Keep their command and
+    # descriptor ranges immutable. Smaller programs retain the older per-stage object lifetime, which is more reliable
+    # for the short mixed-engine asymmetric-padding families on this driver.
+    cmd_arena = self.dev._gpu_alloc(command_bytes) if use_arena else None
     task_arena:HCQBuffer|None = None
     try:
-      task_arena = self.dev._gpu_alloc(len(commands)*descriptor_size, rk.RKNPU_MEM_KERNEL_MAPPING)
+      if use_arena: task_arena = self.dev._gpu_alloc(len(commands)*descriptor_size, rk.RKNPU_MEM_KERNEL_MAPPING)
       for active_stage,(stage,stream,command_offset) in enumerate(zip(image.stages, commands, command_offsets)):
         if stage.flags & RK_STAGE_RESET: self.dev.reset_npu()
-        ctypes.memmove(int(cmd_arena.va_addr)+command_offset, (ctypes.c_uint64*len(stream))(*stream), len(stream)*8)
-        op_idx, enable_mask, int_mask = _TASK[stage.engine]
-        descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
-          int_status=0, regcfg_amount=len(stream), regcfg_offset=0, regcmd_addr=self._dma(cmd_arena)+command_offset)
-        ctypes.memmove(int(task_arena.va_addr)+active_stage*descriptor_size, ctypes.addressof(descriptor), descriptor_size)
-        rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
-          flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000, task_start=active_stage, task_number=1,
-          task_counter=0, priority=0, task_obj_addr=task_arena.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
-          core_mask=1, fence_fd=-1,
-          subcore_task=(rk.struct_rknpu_subcore_task*5)(rk.struct_rknpu_subcore_task(active_stage,1)))
+        cmd = cmd_arena if use_arena else self.dev._gpu_alloc(len(stream)*8)
+        task = task_arena if use_arena else self.dev._gpu_alloc(descriptor_size, rk.RKNPU_MEM_KERNEL_MAPPING)
+        assert cmd is not None and task is not None
+        task_index = active_stage if use_arena else 0
+        try:
+          ctypes.memmove(int(cmd.va_addr)+command_offset, (ctypes.c_uint64*len(stream))(*stream), len(stream)*8)
+          op_idx, enable_mask, int_mask = _TASK[stage.engine]
+          descriptor = rk.struct_rknpu_task(flags=0, op_idx=op_idx, enable_mask=enable_mask, int_mask=int_mask, int_clear=0x1ffff,
+            int_status=0, regcfg_amount=len(stream), regcfg_offset=0, regcmd_addr=self._dma(cmd)+command_offset)
+          ctypes.memmove(int(task.va_addr)+task_index*descriptor_size, ctypes.addressof(descriptor), descriptor_size)
+          rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
+            flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000, task_start=task_index, task_number=1,
+            task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr, regcfg_obj_addr=0, task_base_addr=0, user_data=0,
+            core_mask=1, fence_fd=-1,
+            subcore_task=(rk.struct_rknpu_subcore_task*5)(rk.struct_rknpu_subcore_task(task_index,1)))
+        finally:
+          if not use_arena:
+            self.dev._gpu_free(cmd)
+            self.dev._gpu_free(task)
     except Exception as exc:
       active_engine = image.stages[active_stage].engine.name if active_stage >= 0 else "none"
       exc.add_note(f"Rockchip image stage {active_stage}/{len(image.stages)} ({active_engine})")
@@ -155,7 +168,7 @@ class RockchipProgram(Program['RockchipDevice']):
                        error_class=type(exc).__name__, error=str(exc), failed_stage=active_stage)
       raise
     finally:
-      self.dev._gpu_free(cmd_arena)
+      if cmd_arena is not None: self.dev._gpu_free(cmd_arena)
       if task_arena is not None: self.dev._gpu_free(task_arena)
     elapsed = time.perf_counter()-start
     record_telemetry("kernel", **self.telemetry, outcome="PASS", duration_ms=elapsed*1e3)

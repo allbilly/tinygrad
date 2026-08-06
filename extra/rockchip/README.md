@@ -3016,17 +3016,23 @@ process, so this was submission-resource pressure rather than a contraction
 error.
 
 The runtime previously allocated and destroyed one command GEM and one task
-GEM for every physical stage. It now allocates one immutable command arena and
-one immutable descriptor array for the invocation. Every stage retains a
-distinct command range and descriptor, and `task_start` selects that descriptor
-for the same one-task blocking ioctl. Per-stage reset, task order, engine masks,
-register words, and scratch/constants are unchanged; no mapped memory is
-overwritten while a submitted task can still reference it. This is therefore
-different from the rejected single-buffer overwrite experiment.
+GEM for every physical stage. Programs with at least 128 stages now allocate
+one immutable command arena and one immutable descriptor array for the
+invocation. Every stage retains a distinct command range and descriptor, and
+`task_start` selects that descriptor for the same one-task blocking ioctl.
+Per-stage reset, task order, engine masks, register words, and
+scratch/constants are unchanged; no mapped memory is overwritten while a
+submitted task can still reference it. This is therefore different from the
+rejected single-buffer overwrite experiment.
 
-The arena passes DPU-only, CMAC, PPU, CONV, mixed-engine, and the complete
-350-stage `test_dot_1d` hardware paths. That official test remains exact and
-finishes in 107.02 seconds. The compiler suite passes 175 tests plus 78
-subtests, and Ruff plus full tinygrad mypy are clean. This fixes the observed
-CMA allocation churn but does not make the selector-heavy schedule efficient;
-direct row-major-to-CMAC packing remains required.
+The initial all-program arena crossed the former CMA boundary and completed a
+55m48s census, but two short asymmetric-padding kernels timed out at their
+final CMAC stages. Those 12- and 68-stage programs therefore retain the older
+per-stage object lifetime. The arena remains enabled only for the large
+correctness schedules which created the measured allocation pressure.
+
+The complete 350-stage `test_dot_1d` hardware path remains exact and finishes
+in 107.02 seconds. The compiler suite passes 175 tests plus 78 subtests, and
+Ruff plus full tinygrad mypy are clean. This fixes the observed large-program
+CMA churn but does not make the selector-heavy schedule efficient; direct
+row-major-to-CMAC packing remains required.
