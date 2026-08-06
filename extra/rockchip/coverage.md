@@ -5594,3 +5594,43 @@ repeat, and multi-source concatenation pass in 127.97 seconds.  This is an IR
 scalability milestone; it changes no coverage classification, task ceiling,
 constant ceiling, tolerance, or fallback rule.  The authoritative strict census
 remains `214 PASS_NATIVE / 40 PASS_FRONTEND / 158 FAIL / 13 SKIP_UPSTREAM`.
+
+## Bounded K65 affine matrix-vector schedule
+
+The affine contraction lowerer now has a bounded `MxK @ K` candidate for
+contiguous matrix rows, `33 <= K <= 96`, and 65--512 outputs. It packs 32-row
+weight tiles, executes K in 32-element CMAC chunks, writes each partial result
+as FP32, and uses the next chunk's BRDMA epilogue to continue accumulation.
+One final DPU conversion writes FP16. This avoids rounding every K chunk before
+summation.
+
+| shape | result | tasks | constants |
+| --- | --- | ---: | ---: |
+| `360x65 @ 65` | bit-exact finite sweep | 339 | 247,952 B |
+| `3x33x65 @ 65` | official-tolerance device regression | bounded | bounded |
+
+The reverse `65 @ 8x65x45` form remains rejected. A single packed batch is
+exact, but composition corrupts output channels 40--44 across independent
+output surfaces. Wider three-/four-row selector packing does not repair it and
+can exceed one MiB of constants. The rejected implementation is retained as
+WIP rather than enabled through a test-specific exception.
+
+A special-value run does not preserve every selected NaN, so this milestone
+does not claim a full IEEE special-value contraction contract. It adds no
+complete TestOps method and does not change the authoritative strict
+`214/40/158/13` census, resource limits, fallback classification, or tolerance.
+
+## Rejected wide-pointwise register split
+
+The IC16 `1x1` hypothesis was tested with a channel-coded `5x5` input and
+one-hot weights. Raw hand-packed surfaces failed under pointwise, spatial, and
+hybrid `CNA_CVT_CON0 / 0x1180 / CORE_MISC_CFG` combinations, but the raw
+surface also failed the known-good IC16 identity operation and was therefore
+not a valid compiler surface.
+
+With ordinary compiler legalization left intact, all three register families
+are bit-exact for IC16/OC16 identity and for each of the sixteen IC16/OC1
+one-hot routes. CBUF-bank reduction breaks the workload, while the tested
+feature-grain variant remains exact. Consequently there is no evidence that
+the proposed hybrid triplet fixes a production failure, and the emitter is
+unchanged. This negative probe changes no coverage or legality contract.

@@ -39,6 +39,14 @@ class TestRockchip(unittest.TestCase):
         if size == 128: np.testing.assert_equal(actual,expected)
         else: np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
 
+  def test_k65_affine_matrix_vector_keeps_split_accumulation_fp32(self):
+    rng = np.random.default_rng(33065)
+    matrix = rng.uniform(-.25,.25,(3,33,65)).astype(np.float16)
+    vector = rng.uniform(-.25,.25,65).astype(np.float16)
+    actual = Tensor(matrix,device="ROCKCHIP").matmul(Tensor(vector,device="ROCKCHIP")).realize().numpy()
+    expected = (matrix.astype(np.float32)@vector.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(actual,expected,rtol=1e-3,atol=1e-6)
+
   def test_row_major_matvec_unaligned_k_tail(self):
     rng = np.random.default_rng(65104)
     lhs = rng.uniform(-.125,.125,(1,65)).astype(np.float16)

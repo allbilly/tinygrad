@@ -2125,6 +2125,26 @@ class TestDPUCompiler(unittest.TestCase):
         self.assertLessEqual(plan_cost(result.plan).task_count,200)
         self.assertFalse(contains_uop(result.plan))
 
+  def test_large_k65_matrix_vector_preserves_fp32_split_k_accumulation(self):
+    result = lower_tiled_contract_result(sink(Tensor.empty(8,45,65,dtype=dtypes.half).matmul(Tensor.empty(65,dtype=dtypes.half))))
+    self.assertIs(result.kind,RKLowerKind.NATIVE)
+    self.assertIsInstance(result.plan,RKProgram)
+    assert isinstance(result.plan,RKProgram)
+    cost, image = plan_cost(result.plan), emit_program(result.plan)
+    continued = tuple(step for step in result.plan.steps if isinstance(step,RKCMACTask) and step.epilogue is not None)
+    self.assertTrue(continued)
+    self.assertTrue(all(step.out.layout.dtype is dtypes.float and step.epilogue is not None and
+                        step.epilogue.bias is not None and step.epilogue.bias.layout.dtype is dtypes.float for step in continued))
+    self.assertLessEqual(cost.task_count,350)
+    self.assertLessEqual(cost.constant_bytes,300*1024)
+    self.assertEqual(len(image.stages),cost.task_count)
+    self.assertFalse(contains_uop(result.plan))
+
+    reversed_result = lower_tiled_contract_result(
+      sink(Tensor.empty(65,dtype=dtypes.half).matmul(Tensor.empty(8,65,45,dtype=dtypes.half))))
+    self.assertIs(reversed_result.kind,RKLowerKind.UNSUPPORTED)
+    self.assertEqual(reversed_result.reject.kind,RKRejectKind.PLAN_STAGE_LIMIT)
+
   def test_k128_matvec_keeps_native_packing_budget(self):
     result = lower_tiled_contract_result(sink(Tensor.empty(1,128,dtype=dtypes.half)@Tensor.empty(128,128,dtype=dtypes.half)))
     self.assertIs(result.kind,RKLowerKind.NATIVE)

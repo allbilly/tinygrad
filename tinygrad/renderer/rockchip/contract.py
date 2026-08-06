@@ -35,6 +35,8 @@ def _pack_row_major_rhs(rhs:RKArg, n:int, k:int, scratch:tuple[RKScratch, ...]) 
     padded_rhs = RKArg(RKBufferKind.SCRATCH,len(scratch))
     scratch += (RKScratch(k*src_row_stride*2),)
     rhs_capacity = ((k*n*2+4095)&-4096)//2
+    # Rejected WIP: grouping three rows/192 outputs reduced tasks, but raised N99 constants from <400 KiB to 1.25 MiB;
+    # grouping four rows/256 outputs also corrupted the N45 tail in a batched sequence.
     for row in range(k):
       rows = [[row*n+column] for column in range(n)]+[[] for _ in range(src_row_stride-n)]
       padded = _windowed_cmac_pipeline(RKArg(padded_rhs.kind,padded_rhs.index,row*src_row_stride*2),rhs,rows,
@@ -109,6 +111,93 @@ def _direct_row_major_gemm(out:RKArg, lhs:RKArg, rhs:RKArg, m:int, n:int, k:int,
   if cost.stage_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"direct row-major GEMM needs {cost.stage_count} stages and {cost.constant_bytes} constant bytes",Ops.REDUCE)
+  return _native(program)
+
+def _direct_batched_vector_rhs(out:RKArg, vector:RKArg, rhs:RKArg, batch:int, n:int, k:int, reduce_axis:int) -> RKLowerResult:
+  """Pack regular batched KxN weights in three-row tasks and execute one broad CMAC task per batch."""
+  align_out, align_in = max(32,(n+31)&-32), max(32,(n+31)&-32,(k+31)&-32)
+  packed_vector = RKArg(RKBufferKind.SCRATCH,0)
+  scratch:tuple[RKScratch, ...] = (RKScratch(_cmac_tiled_output_bytes(align_in)),)
+  vector_rows = [[lane] if lane < k else [] for lane in range(align_in)]
+  vector_plan = _selector_program(packed_vector,vector,k,vector_rows,scratch,max_outputs=32)
+  if vector_plan is None:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"batched vector-RHS input pack exceeds plan limits",Ops.INDEX)
+  scratch = vector_plan.scratch
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = list(vector_plan.steps)
+  vector_layout = RKLayout((1,k),(1,align_in),(align_in*2,2),dtypes.half,padding=((0,0),(0,align_in-k)),padding_value=0)
+  rhs_layout = RKLayout((n,k),(align_out,align_in),(align_in*2,2),dtypes.half,
+                        padding=((0,align_out-n),(0,align_in-k)),kind=RKLayoutKind.CMAC_WEIGHT,padding_value=0)
+  half_rows = RKArg(RKBufferKind.SCRATCH,len(scratch))
+  # Repeated CMAC destinations need separate 4 KiB surfaces: sub-page output addends alias in this multi-task sequence.
+  output_row_bytes = 4096
+  scratch += (RKScratch(batch*output_row_bytes),)
+  for b in range(batch):
+    packed_steps,scratch,packed_rhs = _pack_row_major_rhs(RKArg(rhs.kind,rhs.index,rhs.addend+b*k*n*2),n,k,scratch)
+    steps.extend(packed_steps)
+    out_layout = RKLayout((1,n),(1,align_out),(align_out*2,2),dtypes.half,padding=((0,0),(0,align_out-n)))
+    steps.append(RKCMACTask(RKTensorRef(RKArg(half_rows.kind,half_rows.index,b*output_row_bytes),out_layout),
+      RKTensorRef(packed_vector,vector_layout),RKTensorRef(packed_rhs,rhs_layout),reduce_axis,compact_output=True))
+  for b in range(batch):
+    steps.append(RKDPUProgram((RKALUStage(Ops.ADD,RKArg(out.kind,out.index,out.addend+b*n*2),
+      RKArg(half_rows.kind,half_rows.index,b*output_row_bytes),0.0,n),),scratch))
+  program = _finish_program(steps,scratch)
+  cost = plan_cost(program)
+  if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"batched vector-RHS needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",Ops.REDUCE)
+  return _native(program)
+
+def _direct_affine_matvec(out:RKArg, matrix:RKArg, vector:RKArg, row_bases:tuple[int, ...], red_stride:int,
+                          k:int, reduce_axis:int) -> RKLowerResult:
+  """Pack bounded affine matrix rows, then preserve split-K matrix-vector accumulation in FP32."""
+  m = len(row_bases)
+  chunks = (k+31)//32
+  packed_vector, packed_weight = RKArg(RKBufferKind.SCRATCH,0), RKArg(RKBufferKind.SCRATCH,1)
+  accumulators = (RKArg(RKBufferKind.SCRATCH,2),RKArg(RKBufferKind.SCRATCH,3))
+  half_out = RKArg(RKBufferKind.SCRATCH,4)
+  scratch:tuple[RKScratch, ...] = (RKScratch(chunks*64),RKScratch(2048),RKScratch(256),RKScratch(256),RKScratch(64))
+  vector_stages:list[RKALUStage] = []
+  for chunk in range(chunks):
+    valid = min(32,k-chunk*32)
+    dst = RKArg(packed_vector.kind,packed_vector.index,chunk*64)
+    vector_stages.extend((RKALUStage(Ops.ADD,dst,0.0,0.0,32),
+                          RKALUStage(Ops.ADD,dst,RKArg(vector.kind,vector.index,vector.addend+chunk*64),0.0,valid)))
+  steps:list[RKDPUProgram|RKCMACTask|RKConvTask|RKReduce] = [RKDPUProgram(tuple(vector_stages),scratch)]
+  source_capacity = ((m*k*2+4095)&-4096)//2
+  vector_layout = RKLayout((1,32),(1,32),(64,2),dtypes.half)
+  weight_layout = RKLayout((32,32),(32,32),(64,2),dtypes.half,kind=RKLayoutKind.CMAC_WEIGHT)
+  fp32_out_layout = RKLayout((1,32),(1,64),(256,4),dtypes.float,padding=((0,0),(0,32)))
+  fp32_bias_layout = RKLayout((32,),(32,),(4,),dtypes.float)
+  for row_start in range(0,m,32):
+    valid_rows, current = min(32,m-row_start), 0
+    for chunk in range(chunks):
+      chunk_start, valid_k = chunk*32, min(32,k-chunk*32)
+      mapping = [[row_bases[row_start+out_lane]+(chunk_start+k_lane)*red_stride]
+                 if out_lane < valid_rows and k_lane < valid_k else []
+                 for out_lane in range(32) for k_lane in range(32)]
+      if any(not row for row in mapping):
+        steps.append(RKDPUProgram((RKALUStage(Ops.ADD,packed_weight,0.0,0.0,1024),),scratch))
+      packed = _windowed_cmac_pipeline(packed_weight,matrix,mapping,scratch=scratch,direct_count=source_capacity,
+        max_window=512,max_outputs=128,clear_empty=False)
+      if packed is None:
+        return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,"row-major matrix-vector tile cannot be packed",Ops.INDEX)
+      scratch = packed.scratch
+      steps.extend(packed.steps)
+      accumulator = accumulators[current]
+      epilogue = None if chunk == 0 else RKEpilogue(RKTensorRef(accumulators[1-current],fp32_bias_layout))
+      steps.append(RKCMACTask(RKTensorRef(accumulator,fp32_out_layout),
+        RKTensorRef(RKArg(packed_vector.kind,packed_vector.index,chunk*64),vector_layout),
+        RKTensorRef(packed_weight,weight_layout),reduce_axis,b"",epilogue))
+      current = 1-current
+    final = accumulators[1-current]
+    cast_dst = RKArg(out.kind,out.index,out.addend+row_start*2) if valid_rows == 32 else half_out
+    tail = () if valid_rows == 32 else (RKALUStage(Ops.ADD,RKArg(out.kind,out.index,out.addend+row_start*2),half_out,0.0,valid_rows),)
+    steps.append(RKDPUProgram((RKCastStage(cast_dst,final,32,dtypes.float,dtypes.half),*tail),scratch))
+  program = _finish_program(steps,scratch)
+  cost = plan_cost(program)
+  if cost.task_count > RK_MAX_PROGRAM_STAGES or cost.constant_bytes > RK_MAX_CONSTANT_BYTES:
+    return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
+      f"row-major matrix-vector needs {cost.task_count} stages and {cost.constant_bytes} constant bytes",Ops.REDUCE)
   return _native(program)
 
 def legalize_contraction_plan(plan:RKContractionPlan) -> tuple[RKCMACTask, ...]:
@@ -1036,8 +1125,9 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
   wide_matvec_candidate = 1 <= k <= 256 and wide_lhs_rows[1] == wide_rhs_columns[1] == 0 and \
     1 <= wide_lhs_rows[0] <= 512 and 1 <= wide_rhs_columns[0] <= 256 and output_count == wide_lhs_rows[0]*wide_rhs_columns[0] and \
     (k in (128,256) or output_count*k <= 2_000_000)
+  affine_matvec_candidate = 32 < k <= 96 and 64 < output_count <= 512 and sorted((lhs_count,rhs_count)) == [k,output_count*k]
   if (not 1 <= k <= 96 or lhs_count > 8192 or rhs_count > 8192 or output_count*k > RK_MAX_TILED_CONTRACT_VISITS) and \
-     not wide_matvec_candidate:
+     not wide_matvec_candidate and not affine_matvec_candidate:
     return _unsupported(RKRejectKind.PLAN_STAGE_LIMIT,
       f"tiled CMAC surfaces are out={output_count},lhs={lhs_count},rhs={rhs_count},K={k}", reduce.op)
   # Broad regular GEMM must not fall through the generic per-coordinate selector census: K256 square GEMM contains
@@ -1057,6 +1147,50 @@ def lower_tiled_contract_result(sink:UOp) -> RKLowerResult:
         if lhs_extent != m*k or rhs_extent != k*n: continue
         return _direct_row_major_gemm(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),
           RKArg(RKBufferKind.ARG,lhs_index.src[0].arg.slot),RKArg(RKBufferKind.ARG,rhs_index.src[0].arg.slot),m,n,k,red_axis)
+  # A large affine MxK surface and one K-vector are cheaper as 32-output CMAC tiles than as one selector row per output.
+  # Each K chunk writes FP32 and the next chunk consumes it through the proven CMAC BRDMA epilogue, so only the final result
+  # rounds to FP16. Keep smaller matrices on the existing single-K96 path.
+  if not epilogue and len(red_axes) == 1 and 32 < k <= 96 and output_count > 64 and out_aff[1] == 0:
+    red_axis = red_axes[0]
+    for matrix_parsed,vector_parsed in ((lhs_parsed,rhs_parsed),(rhs_parsed,lhs_parsed)):
+      matrix_index, vector_index = matrix_parsed[0], vector_parsed[0]
+      matrix_aff = _affine(matrix_index.src[1])
+      if matrix_parsed[1] is not None or vector_parsed[1] is not None or \
+         matrix_aff is None or matrix_aff[1] < 0 or set(matrix_aff[0])-set(out_axes)-{red_axis} or \
+         matrix_aff[0].get(red_axis,0) <= 0 or _affine(vector_index.src[1]) != ({red_axis:1},0): continue
+      matrix_extent,vector_extent = (int(index.src[0].src[0].arg) for index in (matrix_index,vector_index))
+      if matrix_extent != output_count*k or vector_extent != k: continue
+      row_bases = [0]*output_count
+      for coordinates in product(*(range(ranges[axis]) for axis in out_axes)):
+        point = dict(zip(out_axes,coordinates))
+        out_offset = out_aff[1]+sum(out_aff[0][axis]*point[axis] for axis in out_axes)
+        if not 0 <= out_offset < output_count: break
+        row_bases[out_offset] = matrix_aff[1]+sum(matrix_aff[0].get(axis,0)*point[axis] for axis in out_axes)
+      else:
+        red_stride = matrix_aff[0][red_axis]
+        if red_stride == 1 and all(0 <= base and base+(k-1)*red_stride < matrix_extent for base in row_bases):
+          return _direct_affine_matvec(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),
+        RKArg(RKBufferKind.ARG,matrix_index.src[0].arg.slot),RKArg(RKBufferKind.ARG,vector_index.src[0].arg.slot),
+        tuple(row_bases),red_stride,k,red_axis)
+    # Vector @ batched KxN is already row-major in each batch. Pack three adjacent K rows per selector task, then run one
+    # broad CMAC task per batch; this avoids expanding the transposed affine view into thousands of selector stages.
+    # Rejected WIP: the intended candidates are ((lhs_parsed,rhs_parsed),(rhs_parsed,lhs_parsed)). Each one-batch task is
+    # exact, but composing eight K65xN45 batches corrupts channels 40..44 even with separate 4 KiB output surfaces.
+    batched_rhs_candidates:tuple[tuple[tuple[UOp,UOp|None,bool],tuple[UOp,UOp|None,bool]], ...] = ()
+    for vector_parsed,matrix_parsed in batched_rhs_candidates:
+      vector_index,matrix_index = vector_parsed[0],matrix_parsed[0]
+      matrix_aff = _affine(matrix_index.src[1])
+      if vector_parsed[1] is not None or matrix_parsed[1] is not None or \
+         _affine(vector_index.src[1]) != ({red_axis:1},0) or matrix_aff is None or matrix_aff[1] != 0: continue
+      column_axes = tuple(axis for axis in out_axes if out_aff[0][axis] == matrix_aff[0].get(axis) == 1)
+      if len(column_axes) != 1: continue
+      column_axis, n = column_axes[0], ranges[column_axes[0]]
+      expected = {red_axis:n,**{axis:(1 if axis == column_axis else coefficient*k) for axis,coefficient in out_aff[0].items()}}
+      vector_extent,matrix_extent = (int(index.src[0].src[0].arg) for index in (vector_index,matrix_index))
+      if matrix_aff[0] != expected or vector_extent != k or matrix_extent != output_count*k or output_count%n: continue
+      return _direct_batched_vector_rhs(RKArg(RKBufferKind.ARG,store.src[0].src[0].arg.slot),
+        RKArg(RKBufferKind.ARG,vector_index.src[0].arg.slot),RKArg(RKBufferKind.ARG,matrix_index.src[0].arg.slot),
+        output_count//n,n,k,red_axis)
   records:list[tuple[int, tuple[int, ...], tuple[int, ...]]] = []
   bias_sources:list[int] = []
   if fused_epilogue is not None and {u.arg[0] for u in fused_epilogue[0].src[1].toposort() if u.op is Ops.RANGE} - set(out_axes):

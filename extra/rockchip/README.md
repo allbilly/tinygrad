@@ -2954,3 +2954,45 @@ mapping, frozen image hashes are unchanged, 174 compiler tests plus 78 subtests
 pass, and five strict RK3588 movement families remain native.  This is an IR
 scalability milestone and does not change the authoritative `214/40/158/13`
 strict census or any resource/tolerance limit.
+
+## Split-K affine matrix-vector continuation
+
+Large contiguous affine `MxK @ K` contractions with `33 <= K <= 96` now use
+32-output CMAC tiles and preserve the split-K accumulator in FP32. Each later
+K chunk consumes the preceding FP32 surface through the proven BRDMA epilogue;
+only the final result is converted to FP16. The locked finite-data probe at
+`M=360, K=65` is bit-exact, with 339 tasks and 247,952 constant bytes. A
+permanent device regression covers the batched `(3,33,65) @ (65,)` form, and
+the compiler test constrains both resource use and the FP32 continuation type.
+
+This is a bounded correctness schedule, not a general layout claim. A
+`K @ batched(KxN)` experiment produced exact output for one batch but corrupted
+channels 40 through 44 when eight tasks were composed, even with independent
+4 KiB output surfaces. Three- and four-row packing variants either raised the
+N99 selector payload from below 400 KiB to 1.25 MiB or retained the tail
+corruption, so they remain disabled WIP. The reversed official `dot_1d`
+subcase therefore still rejects with `PLAN_STAGE_LIMIT`.
+
+The standalone special-value probe also found that this multi-pass CMAC path
+does not preserve every selected NaN, although ordinary finite TestOps data is
+within the official tolerance. No broader special-value contract, method
+count, task ceiling, constant ceiling, or tolerance change is claimed.
+
+## Wide pointwise CONV mode audit
+
+The proposed wide-pointwise hybrid register family was tested rather than
+promoted. A manually packed C1HWC2-looking surface failed identically under
+the pointwise (`CVT_CON0=1`, `1180=0`, `CORE_MISC=0x200`), full-spatial
+(`0xb`, `7`, `0x201`), and hybrid (`0xb`, `0`, `0x200`) families. Crucially,
+the same raw surface also failed the already-proven IC16/OC16 identity case;
+it was not the physical surface produced by compiler legalization.
+
+Keeping the normal compiler-generated packing and patching only those register
+families changes the conclusion: IC16/OC16 identity and all sixteen IC16/OC1
+one-hot channel routes are bit-exact in all three modes. Reducing the CBUF
+allocation to one bank breaks the result, while the tested feature-grain
+change does not distinguish pointwise from hybrid. The original error was a
+surface-contract error, not evidence for changing the three production
+registers. `emit_spatial_conv` therefore remains unchanged; the raw and
+compiler-packed experiments are retained in
+`extra/rockchip/probe_conv_wide_pointwise_modes.py`.

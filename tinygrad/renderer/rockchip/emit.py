@@ -455,6 +455,8 @@ def emit_spatial_conv(plan:RKConvTask, target:RKTarget=RKTarget.RK3588) -> RKIma
   else: hardware_pt, hardware_pl, staged_deconv = pt, pl, False
   tall_vector_contract = ic == oc == kw == oh == 1 and ih == kh and 4 <= kh <= 31 and 4 <= iw == ow <= 256 and \
                          sy == sx == 1 and not any((pt,pb,pl,pr))
+  # Rejected WIP: the symmetric wide-kernel form is exact through K=8, times out at K=32, and wraps K=65 to one tap.
+  # wide_vector_contract = ic == oc == kh == ow == 1 and iw == kw and 4 <= kw <= 31 and 1 <= ih == oh <= 512
   if not 1 <= ic <= 16 or not 1 <= oc <= 16 or (not tall_vector_contract and (not 1 <= kh <= 3 or not 1 <= kw <= 3)) or \
      min(pt,pb,pl,pr,hardware_pt,hardware_pl) < 0 or max(hardware_pt,hardware_pl) > 15 or \
      (deconv and ((not staged_deconv and (oh != (ih-1)*transpose_sy-pt-pb+effective_h+output_py or
