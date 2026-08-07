@@ -471,3 +471,38 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - Ruff: pass.
 - `mypy tinygrad/`: pass (216 source files).
 - No CMAC/CNA execution, host floating-point fallback, or relaxed tolerance was added. Host work remains integer gather/layout preparation; all convolution MUL/ADD/ReLU arithmetic executes through DPU EW with FP16 buffers.
+
+---
+
+## 2026-08-07 — DPU EW binary MAX and FP16 MaxPool2D census
+
+The Rockchip renderer now distinguishes the two uses of the EW MAX datapath. Binary MAX sets `EW_RELU_BYPASS`, producing the register word `0x108002c0` verified by `~/rk3588/examples/elementwise.py` and the upstream research renderer. Native unary ReLU keeps that bypass clear and remains `0x108000c0`. Both words are assembled from named RK3588 register fields rather than embedded hex literals.
+
+Pooling remains a DPU-EW limit experiment. The upstream pooling examples often switch to PPU or CMAC for layout/reformat and large reductions; none of those paths were imported. MaxPool windows are expanded into binary FP16 EW MAX operations, and the existing host gather performs integer address/layout preparation only.
+
+Padded pooling required preserving the FP16 fill value in gather metadata. RKImage v14 stores the raw 16-bit fill pattern, allowing masked lanes to be initialized to `-inf` without host floating-point tensor arithmetic. The rewrite only moves a `WHERE` mask into a load when it proves that the outer condition implies the load condition, including commuted `AND` expressions. MAX-tree masks are folded only when every leaf has the same or exact complementary condition. This covers symmetric padding, asymmetric padding, and ceil-mode edge windows without a general unsafe `WHERE` rewrite.
+
+Every numeric FP16 `test_max_pool2d*` method from `test/backend/test_ops.py` now passes at exactly the `test_gemm_fp16` tolerance ceiling (`atol=rtol=grad_atol=grad_rtol=5e-3`):
+
+- **11 methods passed, 33 subtests passed** in 14.24 s on the NPU.
+- `test_max_pool2d_padding_int` is explicitly skipped because Rockchip accepts FP16 inputs only.
+- `test_max_pool2d_return_indices` is explicitly skipped because DPU EW does not produce the required integer index tensor.
+- A direct FP16 binary-maximum regression and a MaxPool submit-count regression were added to `test/backend/test_rockchip.py`.
+
+Direct cold output-realization profiles all used one `DRM_IOCTL_RKNPU_SUBMIT`:
+
+| Case | Wall time | Submits | Maximum absolute error |
+|---|---:|---:|---:|
+| `(1,1,2,3)`, 2x2 | 0.110 s | 1 | 0 |
+| `(3,2,17,14)`, 5x5 stride 1 | 0.141 s | 1 | 0 |
+| `(4,2,111,28)`, asymmetric-padded 5x5 | 0.474 s | 1 | 0 |
+
+Complete verification after the change:
+
+- `test/backend/test_rockchip.py`: **91 passed, 9 skipped, 70 subtests passed in 44.94 s** with `-n12`.
+- Full Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 445 executable lines, runtime 142; comments and docstrings retained.
+- CPU-execution audit: runtime NumPy use is limited to `uint16` buffer views and integer gather-index construction. There is no host MAX, ADD, MUL, reduction, FP32 conversion, CMAC, or CNA path.
+
+AvgPool2D is the next pooling boundary. Five initial cases already execute, while the remaining forms expose FP32 `MUL/CAST` lowering and, for `count_include_pad=False`, dynamic reciprocal/mask expressions. Those are separate ADD/MUL lowering work and were not hidden by a CPU fallback in this MAX milestone.

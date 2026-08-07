@@ -128,6 +128,16 @@ class TestRockchip(unittest.TestCase):
     self._check(n, a * -math.inf, (a.numpy().astype(np.float32) * np.float32(-np.inf)).astype(np.float16))
     self._check(n, a * math.nan, (a.numpy().astype(np.float32) * np.float32(np.nan)).astype(np.float16))
 
+  # ---- MAX ----
+  def test_maximum_fp16(self):
+    a, b = self._half((45, 65), 17), self._half((45, 65), 18)
+    self._check(_ew_submits(45*65), a.maximum(b), np.maximum(a.numpy(), b.numpy()))
+
+  def test_max_pool2d_simple_submit(self):
+    xn = np.array([[[[-1, 2, 0], [3, -4, 1]]]], dtype=np.float16)
+    ref = torch.nn.functional.max_pool2d(torch.from_numpy(xn), kernel_size=(2, 2)).numpy()
+    self._check(1, Tensor(xn).max_pool2d(kernel_size=(2, 2)), ref)
+
   # ---- GEMM / MATMUL (from test_ops, fp16 tol) ----
   def test_matmul_simple(self):
     helper_test_op([(4), (4,4)], lambda x,y: x.matmul(y), Tensor.dot, **_FP16)
@@ -251,6 +261,28 @@ class TestRockchipConvOps(unittest.TestCase):
 for _name, _test in vars(_test_ops.TestOps).items():
   if _name.startswith("test") and "conv" in _name and _name not in ("test_bias_conv_transpose2d", "test_simple_conv_transpose3d"):
     setattr(TestRockchipConvOps, _name, _test)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipMaxPoolOps(unittest.TestCase):
+  """Every numeric FP16 MaxPool2D case from test_ops at the test_gemm_fp16 tolerance."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  @unittest.skip("Rockchip accepts FP16 inputs only")
+  def test_max_pool2d_padding_int(self): pass
+
+  @unittest.skip("Rockchip DPU EW has no integer index output")
+  def test_max_pool2d_return_indices(self): pass
+
+# Keep the numeric MaxPool2D census synchronized as test_ops grows.
+for _name, _test in vars(_test_ops.TestOps).items():
+  if _name.startswith("test_max_pool2d") and _name not in ("test_max_pool2d_padding_int", "test_max_pool2d_return_indices"):
+    setattr(TestRockchipMaxPoolOps, _name, _test)
 
 if __name__ == "__main__":
   unittest.main()
