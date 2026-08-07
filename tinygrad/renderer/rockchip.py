@@ -113,7 +113,20 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 
 _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
-_EW_CFG = {Ops.ADD: 0x108002c0 | (2 << 16), Ops.MUL: 0x108002c0 | (1 << 2) | (1 << 8)}
+_EW_DATA_MODE_FP16 = 1 << 28
+_EW_EDATA_SIZE_FP16 = 2 << 22
+_EW_ALU_ADD = 2 << 16
+_EW_RELU_BYPASS = 1 << 9
+_EW_OP_CVT_BYPASS = 1 << 8
+_EW_LUT_BYPASS = 1 << 7
+_EW_OP_SRC_DMA = 1 << 6
+_EW_OP_TYPE_MUL = 1 << 2
+_EW_CFG_COMMON = _EW_DATA_MODE_FP16 | _EW_EDATA_SIZE_FP16 | _EW_LUT_BYPASS | _EW_OP_SRC_DMA
+_EW_CFG = {
+  Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
+  Ops.MUL: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_OP_TYPE_MUL,
+  Ops.MAX: _EW_CFG_COMMON,  # Unary native ReLU: ALU pass-through followed by EW_RELU_BYPASS=0.
+}
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 
@@ -247,11 +260,19 @@ def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, sup
     if u.op is Ops.CAST or u.op is Ops.REDUCE or u.op in GroupOp.ALU: bad.append(f"{i}:{u.op.name}")
   return bad
 
-def _mul_reduction_terms(u:UOp) -> list[UOp]|None:
-  if u.op is Ops.MUL and u.dtype.scalar() is dtypes.half: return [u]
-  if u.op is not Ops.ADD or u.dtype.scalar() is not dtypes.half: return None
+def _mul_reduction_terms(u:UOp) -> tuple[list[UOp], int]|None:
+  """Flatten a half ADD tree containing products and optional bias terms."""
+  if u.dtype.scalar() is not dtypes.half: return None
+  if u.op is Ops.MUL: return [u], 1
+  if u.op is not Ops.ADD: return [u], 0
   lhs, rhs = _mul_reduction_terms(u.src[0]), _mul_reduction_terms(u.src[1])
-  return None if lhs is None or rhs is None else lhs + rhs
+  return None if lhs is None or rhs is None else (lhs[0] + rhs[0], lhs[1] + rhs[1])
+
+def _relu_operand(u:UOp) -> UOp|None:
+  if u.op is not Ops.MAX or u.dtype.scalar() is not dtypes.half: return None
+  if u.src[0].op is Ops.CONST and float(u.src[0].arg) == 0.0: return u.src[1]
+  if u.src[1].op is Ops.CONST and float(u.src[1].arg) == 0.0: return u.src[0]
+  return None
 
 def _compensated_mul_sum(terms:list[UOp]) -> UOp:
   """Kahan sum built after symbolic simplification so compensation remains as DPU EW ops."""
@@ -285,14 +306,16 @@ def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
   return total, lhs_error.alu(Ops.ADD, _sub_half(rhs, rhs_virtual, neg_one))
 
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
-  """Recover FP16 product residuals and accumulate a two-half expansion using only DPU EW ops."""
+  """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
   zero, neg_one, splitter = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half), UOp.const(65.0, dtypes.half)
-  products, errors = zip(*(_two_product(term, neg_one, splitter) for term in terms))
-  high, low = products[0], zero
+  products, errors = zip(*((_two_product(term, neg_one, splitter) if term.op is Ops.MUL else (term, zero)) for term in terms))
+  high, middle, low = products[0], zero, zero
   for part in products[1:] + errors:
     high, error = _two_sum(high, part, neg_one)
+    middle, error = _two_sum(middle, error, neg_one)
     low = low.alu(Ops.ADD, error)
-  return high.alu(Ops.ADD, low)
+  middle = middle.alu(Ops.ADD, low)
+  return high.alu(Ops.ADD, middle)
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -313,12 +336,19 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
   if any(u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
+  if any(u.op is Ops.MAX and _relu_operand(u) is None for u in uops):
+    raise RuntimeError("RKPLAN_REJECT:unsupported_graph non-ReLU MAX")
   chain_limit = 512
-  if (terms:=_mul_reduction_terms(val)) is not None:
+  relu_input = _relu_operand(val)
+  reduction = relu_input if relu_input is not None else val
+  if (reduction_info:=_mul_reduction_terms(reduction)) is not None and reduction_info[1]:
+    terms = reduction_info[0]
     reduce_mode = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()
-    if reduce_mode == "kahan": val = _compensated_mul_sum(terms)
-    elif reduce_mode == "twoproduct": val, chain_limit = _precise_mul_sum(terms), 256
+    if reduce_mode == "kahan": reduced = _compensated_mul_sum(terms)
+    elif reduce_mode == "twoproduct": reduced, chain_limit = _precise_mul_sum(terms), 256
     elif reduce_mode != "sequential": raise ValueError(f"invalid ROCKCHIP_EW_REDUCE={reduce_mode!r}")
+    else: reduced = reduction
+    val = reduced.alu(Ops.MAX, val.src[0] if val.src[1] is reduction else val.src[1]) if reduction is not val else reduced
   order:list[UOp] = []
   visited:dict[UOp, bool] = {}
   def visit(u:UOp) -> bool:
@@ -407,6 +437,9 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat(Ops.LOAD, dtypes.half, name="load"), UPat.cvar("zero"))),
    lambda gate,load,zero: load.replace(src=(load.src[0], load.src[1], gate.alu(Ops.AND, load.src[2])))
    if len(load.src) > 2 and float(load.src[1].arg) == 0.0 and float(zero.arg) == 0.0 else None),
+  (UPat(Ops.WHERE, dtypes.half, name="x"), lambda x: x.src[1].alu(Ops.MAX, x.src[2])
+   if x.src[0].op is Ops.CMPLT and x.src[0].src[0] is x.src[2] and x.src[0].src[1] is x.src[1] and
+      x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
 ])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
@@ -414,7 +447,7 @@ def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
-  code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None}
+  code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}

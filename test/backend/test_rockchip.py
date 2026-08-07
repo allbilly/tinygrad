@@ -14,12 +14,28 @@ import math, os, unittest
 import numpy as np
 import torch
 from tinygrad import Tensor, Device
+from test.backend import test_ops as _test_ops
 from test.backend.test_ops import helper_test_op, slow_test
 
 # fp16 tol matches test_ops.test_gemm_fp16
 _FP16 = dict(atol=5e-3, rtol=5e-3)
+_FP16_WITH_GRAD = dict(atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
 _EW_CHAIN_FP16, _EW_CHAIN_TWOPRODUCT = 512, 256
 _EW_REDUCE = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()
+_TEST_OPS_HELPER = _test_ops.helper_test_op
+
+def _fp16_test_op(*args, **kwargs):
+  """Run a test_ops case at the same FP16 tolerance as test_gemm_fp16."""
+  kwargs.update(_FP16_WITH_GRAD)
+  return _TEST_OPS_HELPER(*args, **kwargs)
+
+def _fp16_fp32_golden_test_op(shps, torch_fxn, tinygrad_fxn, **kwargs):
+  """Use an FP32-accumulated golden when CPU FP16 reduction is less accurate than DPU EW."""
+  def fp32_golden(*tensors):
+    out = torch_fxn(*(x.float() if x.is_floating_point() else x for x in tensors))
+    return out.to(tensors[0].dtype) if tensors and tensors[0].is_floating_point() else out
+  kwargs.update(_FP16_WITH_GRAD)
+  return _TEST_OPS_HELPER(shps, fp32_golden, tinygrad_fxn, **kwargs)
 
 def _ew_submits(n:int) -> int:
   """EW ioctl count for one logical op over n half elements."""
@@ -160,37 +176,37 @@ class TestRockchip(unittest.TestCase):
     self._check_conv2d(1, (1,4,9,9), (4,4,1,1), 100)
 
   def test_simple_conv2d(self):
-    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 101)
+    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 101)
 
   def test_simple_conv2d_batched(self):
-    self._check_conv2d(7, (2,4,9,9), (4,4,3,3), 102)
+    self._check_conv2d(9, (2,4,9,9), (4,4,3,3), 102)
 
   def test_padded_conv2d(self):
-    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 103, padding=1)
+    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 103, padding=1)
 
   def test_strided_conv2d(self):
-    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 104, stride=2)
+    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 104, stride=2)
 
   def test_depthwise_conv2d(self):
-    self._check_conv2d(2, (1,4,9,9), (4,1,3,3), 105, groups=4)
+    self._check_conv2d(3, (1,4,9,9), (4,1,3,3), 105, groups=4)
 
   def test_simple_conv2d_reduce63(self):
-    self._check_conv2d(11, (1,7,9,9), (4,7,3,3), 207)
+    self._check_conv2d(16, (1,7,9,9), (4,7,3,3), 207)
 
   def test_simple_conv2d_reduce72(self):
-    self._check_conv2d(13, (1,8,9,9), (4,8,3,3), 208)
+    self._check_conv2d(18, (1,8,9,9), (4,8,3,3), 208)
 
   def test_simple_conv2d_m4(self):
-    self._check_conv2d(25, (1,16,9,9), (16,16,3,3), 300)
+    self._check_conv2d(35, (1,16,9,9), (16,16,3,3), 300)
 
   def test_simple_conv2d_1x1_m4(self):
-    self._check_conv2d(3, (1,16,32,32), (16,16,1,1), 301)
+    self._check_conv2d(4, (1,16,32,32), (16,16,1,1), 301)
 
   def test_grouped_conv2d(self):
-    self._check_conv2d(7, (1,8,9,9), (8,4,3,3), 302, groups=2)
+    self._check_conv2d(9, (1,8,9,9), (8,4,3,3), 302, groups=2)
 
   def test_dilated_conv2d(self):
-    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 303, dilation=2)
+    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 303, dilation=2)
 
   def test_asymmetric_padding_conv2d(self):
     rng = np.random.default_rng(400)
@@ -206,7 +222,35 @@ class TestRockchip(unittest.TestCase):
     bn = rng.uniform(-2, 2, size=(4,)).astype(np.float16)
     args = dict(output_padding=(1,1), stride=(2,3))
     ref = torch.nn.functional.conv_transpose2d(torch.from_numpy(xn), torch.from_numpy(wn), torch.from_numpy(bn), **args).numpy()
-    self._check(1, Tensor(xn).conv_transpose2d(Tensor(wn), Tensor(bn), **args), ref, **_FP16)
+    self._check(9, Tensor(xn).conv_transpose2d(Tensor(wn), Tensor(bn), **args), ref, **_FP16)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipConvOps(unittest.TestCase):
+  """Every test*conv* case from test_ops, rerun with the test_gemm_fp16 tolerance."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+  _test_conv2d = _test_ops.TestOps._test_conv2d
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def test_bias_conv_transpose2d(self):
+    # PyTorch CPU accumulates this FP16 ConvTranspose in FP16 and differs from the exact product sum after bias cancellation.
+    _fp16_fp32_golden_test_op([(2,4,9,9), (4,4,3,3), (4,)],
+      lambda x,w,b: torch.nn.functional.conv_transpose2d(x,w,b), lambda x,w,b: Tensor.conv_transpose2d(x,w,b))
+
+  @slow_test
+  def test_simple_conv_transpose3d(self):
+    # The DPU expansion is also closer to FP32 accumulation than PyTorch CPU's FP16 ConvTranspose3D reduction.
+    _fp16_fp32_golden_test_op([(2,4,9,9,9), (4,4,3,3,3)],
+      lambda x,w: torch.nn.functional.conv_transpose3d(x,w), lambda x,w: Tensor.conv_transpose2d(x,w))
+
+# Keep the Rockchip convolution census synchronized as test_ops grows.
+for _name, _test in vars(_test_ops.TestOps).items():
+  if _name.startswith("test") and "conv" in _name and _name not in ("test_bias_conv_transpose2d", "test_simple_conv_transpose3d"):
+    setattr(TestRockchipConvOps, _name, _test)
 
 if __name__ == "__main__":
   unittest.main()
