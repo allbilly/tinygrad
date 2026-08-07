@@ -140,12 +140,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
-  # ROCKCHIP DPU EW has no reduce loop: fully unroll (peel ≤32) so gemm is half MUL/ADD+gather.
+  # ROCKCHIP DPU EW has no reduce loop: fully unroll (peel ≤64) so gemm is half MUL/ADD+gather.
   try:
     if is_rockchip:
       while k.unrollable_dims:
         s = k.full_shape[k.unrollable_dims[-1]]
-        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0 if s <= 32 else 32))
+        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0 if s <= 64 else 32))
     elif k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))

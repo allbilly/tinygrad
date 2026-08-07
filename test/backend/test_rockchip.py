@@ -119,8 +119,8 @@ class TestRockchip(unittest.TestCase):
   def test_small_gemm(self):
     helper_test_op([(8,8), (8,8)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_medium_gemm(self):
-    # Sequential EW first misses tolerance at N=21; compensated EW reaches the current full-unroll ceiling at N=32.
-    n = 32 if _EW_KAHAN else 20
+    # Sequential EW first misses tolerance at N=21; compensated EW first misses at N=38.
+    n = 37 if _EW_KAHAN else 20
     helper_test_op([(n,n), (n,n)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_9_gemm(self):
     helper_test_op([(9,9), (9,9)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)

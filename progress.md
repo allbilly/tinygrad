@@ -229,3 +229,22 @@ Additional single-ioctl dependent ADD-chain probes passed through 256 tasks. The
 Set the OUT=2 `_EW_CHAIN=256`. The 32×32 compensated `test_medium_gemm` now fits in one ioctl. Wall time does not improve materially because emitting/patching 249 register bodies and the EW work dominate this small workload; the change removes submit boundaries rather than arithmetic.
 
 This does **not** apply to OUT=5 mtx512: a 256-task `test_add` chain timed out. Keep `_EW_CHAIN_FP32=64`; the raised cap is specifically for the contiguous FP16-output EW recipe used by compensated GEMM.
+
+---
+
+## 2026-08-07 — compensated EW advanced one-by-one to 37×37
+
+Rockchip's optimizer now permits full unroll through K=64. Both the heuristic threshold and the generic `UNROLL <= 32` guard had to be raised specifically for the ROCKCHIP renderer; before that, N=33 produced three stores and was rejected before submission.
+
+Each size was run separately with a hard 30-second timeout under `ROCKCHIP_EW_OUT=fp16 ROCKCHIP_EW_REDUCE=kahan`:
+
+| N | Result | Worst tolerance ratio | ioctls | first-run wall |
+|---:|---:|---:|---:|---:|
+| 33 | pass | — | 2 | <1 s |
+| 34 | pass | 0.829 | 2 | 666 ms |
+| 35 | pass | 0.807 | 2 | 875 ms |
+| 36 | pass | 0.852 | 2 | 934 ms |
+| **37** | **pass** | **0.862** | **2** | **877 ms** |
+| 38 | **fail** (1 element) | 1.188 | 2 | 1054 ms |
+
+`test_medium_gemm` is now 37×37 in Kahan mode. N=38 is a numerical limit: Kahan corrects ADD-rounding but cannot recover the product bits lost when each FP16×FP16 result is stored as FP16.
