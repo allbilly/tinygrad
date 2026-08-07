@@ -333,3 +333,40 @@ Caching lowered leaf operands and replacing the quadratic use-count comprehensio
 | named pytest (`-n12`) | 18.62 s | 14.39 s | 4.23 s less wall time |
 
 `test_gemm_fp16` still passes under its hard 30-second timeout. The remaining roughly 1.05 s in gather-offset construction is now the largest measured lowering component.
+
+---
+
+## 2026-08-07 — FP16-only cleanup and CPU-execution audit
+
+The Rockchip backend now exposes only the hardware path under test: contiguous FP16 DPU EW output. The legacy mtx512 `OUT=5` path was removed because it converted FP32 results back to FP16 on the host after every operation. FP32 argument casting, host pack/unpack helpers, and the intermediate-result copyout path were removed with it.
+
+`sz.py` result for executable Rockchip code:
+
+| File | Before | After | Reduction |
+|---|---:|---:|---:|
+| `tinygrad/renderer/rockchip.py` | 438 | 325 | 113 |
+| `tinygrad/runtime/ops_rockchip.py` | 241 | 131 | 110 |
+| **combined** | **679** | **456** | **223 (32.8%)** |
+
+Comments and docstrings were retained because `sz.py` does not count them. Repository total lines fell from 25,730 to 25,507.
+
+### Execution audit
+
+- There is no CMAC/CNA path.
+- There is no NumPy import, FP32 temporary, `astype`, host sum, or host ADD/MUL in the Rockchip renderer/runtime.
+- Contiguous FP16 arguments are bound directly as DPU sources; they are no longer copied into scratch.
+- The final DPU EW operation writes directly to the destination argument; there is no host result copy.
+- Constants and constant-only fills are materialized as FP16 bytes on the host. This is data initialization, not tensor arithmetic.
+- GEMM still needs host gather/layout preparation because DPU EW only consumes contiguous pairwise vectors and cannot apply tinygrad's arbitrary load indexes. Masked padding is represented by `-1` gather entries and zero-filled. Every GEMM MUL/ADD, including TwoProduct residual recovery, executes on DPU EW.
+- The safe PC-chain limit is stored in the compiled image (512 for ordinary/Kahan graphs and 256 for mixed TwoProduct graphs), removing the previous runtime dependence on the current environment variable.
+- RKImage version validation is now strict, and malformed/nonzero masked-load defaults are rejected instead of silently miscomputed.
+
+This is closer to other tinygrad hardware backends: allocator methods move buffers, `Program.__call__` binds arguments/builds commands/submits, and the device performs tensor arithmetic. Unlike general GPU/DSP backends, Rockchip still preprocesses indexed operands on the host and uses blocking ioctls rather than an asynchronous hardware queue, so it remains a focused DPU-EW capability harness rather than a general backend.
+
+Verification after cleanup:
+
+- `test_gemm_fp16`: **1 passed in 13.30 s** with `-n12` and a hard 30 s timeout.
+- Direct 64×64 cold realization: **1.975 s**, 11 ioctls, within the 5e-3/5e-3 tolerance.
+- Non-slow Rockchip census: **18 passed, 5 skipped in 12.16 s**. Four skips are slow tests; `test_mul_naninf` records that RK3588 FP16 DPU EW MUL returns NaN for infinity operands rather than hiding it with a CPU fallback.
+- Full `ruff check .`: pass.
+- Full `mypy tinygrad/`: pass (216 files).
