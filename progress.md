@@ -428,3 +428,16 @@ The next representative 3x3 sweep also passes:
 These cases remain FP16-input, DPU EW-only tests. Torch is used only to construct the test oracle; backend execution performs no host floating-point arithmetic.
 
 The six-test convolution subset passes in **12.21 s** and the complete Rockchip census passes in **18.08 s** (`28 passed, 1 skipped`), both with `-n12` and a hard 30-second timeout. Full Ruff and mypy checks pass.
+
+### Convolution reduction width and layout expansion
+
+The convolution census now also covers both sides of K=64, the larger M4 cases from `test_ops`, grouped convolution, and dilation:
+
+- 3x3 with 7 input channels (K=63): 11 submits, 0.629 s direct cold realization.
+- 3x3 with 8 input channels (K=72): 13 submits, 0.676 s; this proves 64 reduction terms is not the current backend limit.
+- 3x3 with 16 input/output channels (K=144): 25 submits, 1.195 s.
+- 1x1 with 16 input/output channels at 32x32: 3 submits, 0.169 s.
+- Two-group 3x3: 7 submits, 0.471 s.
+- Dilated 3x3: 7 submits, 0.279 s.
+
+All twelve Rockchip convolution tests pass in **13.42 s**. The complete backend census is now **34 passed, 1 skipped in 17.58 s**, still under the hard 30-second timeout.

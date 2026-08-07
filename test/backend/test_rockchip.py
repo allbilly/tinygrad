@@ -174,5 +174,23 @@ class TestRockchip(unittest.TestCase):
   def test_depthwise_conv2d(self):
     self._check_conv2d(2, (1,4,9,9), (4,1,3,3), 105, groups=4)
 
+  def test_simple_conv2d_reduce63(self):
+    self._check_conv2d(11, (1,7,9,9), (4,7,3,3), 207)
+
+  def test_simple_conv2d_reduce72(self):
+    self._check_conv2d(13, (1,8,9,9), (4,8,3,3), 208)
+
+  def test_simple_conv2d_m4(self):
+    self._check_conv2d(25, (1,16,9,9), (16,16,3,3), 300)
+
+  def test_simple_conv2d_1x1_m4(self):
+    self._check_conv2d(3, (1,16,32,32), (16,16,1,1), 301)
+
+  def test_grouped_conv2d(self):
+    self._check_conv2d(7, (1,8,9,9), (8,4,3,3), 302, groups=2)
+
+  def test_dilated_conv2d(self):
+    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 303, dilation=2)
+
 if __name__ == "__main__":
   unittest.main()
