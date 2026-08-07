@@ -290,6 +290,23 @@ def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, sup
       bad.append(f"{i}:{u.op.name}")
   return bad
 
+def _mul_reduction_terms(u:UOp) -> list[UOp]|None:
+  if u.op is Ops.MUL and u.dtype.scalar() is dtypes.half: return [u]
+  if u.op is not Ops.ADD or u.dtype.scalar() is not dtypes.half: return None
+  lhs, rhs = _mul_reduction_terms(u.src[0]), _mul_reduction_terms(u.src[1])
+  return None if lhs is None or rhs is None else lhs + rhs
+
+def _compensated_mul_sum(terms:list[UOp]) -> UOp:
+  """Kahan sum built after symbolic simplification so compensation remains as DPU EW ops."""
+  zero, neg_one = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half)
+  total, correction = terms[0], zero
+  for term in terms[1:]:
+    adjusted = term.alu(Ops.ADD, correction.alu(Ops.MUL, neg_one))
+    updated = total.alu(Ops.ADD, adjusted)
+    correction = updated.alu(Ops.ADD, total.alu(Ops.MUL, neg_one)).alu(Ops.ADD, adjusted.alu(Ops.MUL, neg_one))
+    total = updated
+  return total
+
 def lower_ew(uops:list[UOp]) -> RKImage:
   out_prec = ew_out_precision()
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -315,13 +332,21 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if any(u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
+  if os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower() == "kahan" and (terms:=_mul_reduction_terms(val)) is not None:
+    val = _compensated_mul_sum(terms)
   order:list[UOp] = []
+  visited:dict[UOp, bool] = {}
   def visit(u:UOp) -> bool:
+    if u in visited: return visited[u]
     if u.op in supported and u.dtype.scalar() is dtypes.half:
-      if not all(visit(s) for s in u.src): return False
+      if not all(visit(s) for s in u.src):
+        visited[u] = False
+        return False
       if u not in order: order.append(u)
-      return True
-    return _ew_leaf(u, out_index, count, oslot) is not None
+      visited[u] = True
+      return visited[u]
+    visited[u] = _ew_leaf(u, out_index, count, oslot) is not None
+    return visited[u]
   if not visit(val) or not order or order[-1] is not val:
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
