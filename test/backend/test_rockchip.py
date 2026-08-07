@@ -192,5 +192,21 @@ class TestRockchip(unittest.TestCase):
   def test_dilated_conv2d(self):
     self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 303, dilation=2)
 
+  def test_asymmetric_padding_conv2d(self):
+    rng = np.random.default_rng(400)
+    xn = rng.uniform(-2, 2, size=(1,1,4,4)).astype(np.float16)
+    wn = rng.uniform(-2, 2, size=(1,1,2,2)).astype(np.float16)
+    ref = torch.nn.functional.conv2d(torch.nn.functional.pad(torch.from_numpy(xn), (2,1,2,1)), torch.from_numpy(wn)).numpy()
+    self._check(1, Tensor(xn).conv2d(Tensor(wn), padding=(2,1,2,1)), ref, **_FP16)
+
+  def test_output_padded_conv_transpose2d(self):
+    rng = np.random.default_rng(401)
+    xn = rng.uniform(-2, 2, size=(2,4,6,5)).astype(np.float16)
+    wn = rng.uniform(-2, 2, size=(4,4,3,3)).astype(np.float16)
+    bn = rng.uniform(-2, 2, size=(4,)).astype(np.float16)
+    args = dict(output_padding=(1,1), stride=(2,3))
+    ref = torch.nn.functional.conv_transpose2d(torch.from_numpy(xn), torch.from_numpy(wn), torch.from_numpy(bn), **args).numpy()
+    self._check(1, Tensor(xn).conv_transpose2d(Tensor(wn), Tensor(bn), **args), ref, **_FP16)
+
 if __name__ == "__main__":
   unittest.main()

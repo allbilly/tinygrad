@@ -92,12 +92,14 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
+  is_rockchip = k.ren is not None and k.ren.target.device == "ROCKCHIP"
   where_gate_rngs = {r for u in k.ast.backward_slice if u.op is Ops.WHERE for r in u.src[0].ranges}
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
   for axis in k.upcastable_dims:
     # for Schedule, we check if the range is used in INDEX gates or WHERE gates
     is_masked = k.rngs[axis] in where_gate_rngs
     if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
+      if is_rockchip: continue  # Rockchip EW gather lowering requires one contiguous STORE.
       # upcasting a masked global axis moves that range out of the launch grid into each work-item
       # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
       if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
@@ -110,7 +112,6 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.target.device == "DSP"
-  is_rockchip = k.ren is not None and k.ren.target.device == "ROCKCHIP"
   upcasted_axis: set[int] = set()
   # ROCKCHIP: keep a single contiguous STORE (no MN upcast); EW+gather needs one out index.
   while (not is_rockchip) and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):

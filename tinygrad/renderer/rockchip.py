@@ -6,7 +6,7 @@ from enum import IntEnum
 from typing import Callable
 from tinygrad.device import Compiler
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import Target
+from tinygrad.helpers import Target, cdiv, cmod, floordiv, floormod
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
@@ -150,6 +150,10 @@ def _eval_int(u:UOp, env:dict[UOp, int]) -> int:
   if u.op is Ops.ADD: return _eval_int(u.src[0], env) + _eval_int(u.src[1], env)
   if u.op is Ops.MUL: return _eval_int(u.src[0], env) * _eval_int(u.src[1], env)
   if u.op is Ops.SUB: return _eval_int(u.src[0], env) - _eval_int(u.src[1], env)
+  if u.op is Ops.CDIV: return cdiv(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
+  if u.op is Ops.CMOD: return cmod(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
+  if u.op is Ops.FLOORDIV: return floordiv(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
+  if u.op is Ops.FLOORMOD: return floormod(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
   if u.op is Ops.CMPLT: return int(_eval_int(u.src[0], env) < _eval_int(u.src[1], env))
   if u.op is Ops.CMPNE: return int(_eval_int(u.src[0], env) != _eval_int(u.src[1], env))
   if u.op is Ops.AND: return _eval_int(u.src[0], env) & _eval_int(u.src[1], env)
@@ -399,6 +403,10 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.ADD, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+  # Fold zero padding into the gather mask. This changes only host integer layout; the selected values still feed DPU EW.
+  (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat(Ops.LOAD, dtypes.half, name="load"), UPat.cvar("zero"))),
+   lambda gate,load,zero: load.replace(src=(load.src[0], load.src[1], gate.alu(Ops.AND, load.src[2])))
+   if len(load.src) > 2 and float(load.src[1].arg) == 0.0 and float(zero.arg) == 0.0 else None),
 ])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
