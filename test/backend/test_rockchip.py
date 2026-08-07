@@ -148,5 +148,13 @@ class TestRockchip(unittest.TestCase):
     helper_test_op([(0), (0,8)], lambda x,y: x.matmul(y), Tensor.dot, **_FP16)
     helper_test_op([(0), (0)], lambda x,y: x.matmul(y), Tensor.dot, **_FP16)
 
+  # ---- CONV2D (from test_ops, fp16 tol) ----
+  def test_simple_conv2d_1x1(self):
+    rng = np.random.default_rng(100)
+    xn = rng.uniform(-2, 2, size=(1,4,9,9)).astype(np.float16)
+    wn = rng.uniform(-2, 2, size=(4,4,1,1)).astype(np.float16)
+    ref = torch.nn.functional.conv2d(torch.from_numpy(xn), torch.from_numpy(wn)).numpy()
+    self._check(1, Tensor(xn).conv2d(Tensor(wn)), ref, **_FP16)
+
 if __name__ == "__main__":
   unittest.main()
