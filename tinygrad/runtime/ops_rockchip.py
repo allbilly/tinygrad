@@ -10,7 +10,7 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
 # OUT=2 PC-chain up to `_EW_CHAIN` tasks/ioctl; OUT=5 mtx512 stays at its tested 64-task cap.
 # Regcmd/task scratch floors match allbilly elementwise (64KiB / 16KiB), not 4096.
-_EW_CHAIN = 256
+_EW_CHAIN = 512
 _EW_CHAIN_FP32 = 64
 _PC_TAIL = 4
 _CMD_BUF_MIN = 65536

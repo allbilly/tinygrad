@@ -248,3 +248,14 @@ Each size was run separately with a hard 30-second timeout under `ROCKCHIP_EW_OU
 | 38 | **fail** (1 element) | 1.188 | 2 | 1054 ms |
 
 `test_medium_gemm` is now 37×37 in Kahan mode. N=38 is a numerical limit: Kahan corrects ADD-rounding but cannot recover the product bits lost when each FP16×FP16 result is stored as FP16.
+
+### N=37 merged into one PC chain
+
+Kahan N=37 emits `8*37-7 = 289` dependent FP16 EW tasks, which crossed the previous 256-task cap. Raising the OUT=2 cap to 512 was bit-exact against cap 256 for 10/10 inputs:
+
+| FP16 chain cap | ioctls | warm median wall |
+|---:|---:|---:|
+| 256 | 2 | 70.564 ms |
+| **512** | **1** | **70.013 ms** |
+
+Set `_EW_CHAIN=512` for OUT=2. OUT=5 mtx512 remains separately capped at 64.

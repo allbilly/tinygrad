@@ -4,7 +4,7 @@ Run: FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest test/backen
 
 OUT precision via ROCKCHIP_EW_OUT=fp32|fp16 (default fp32):
   fp32: mtx512 ≤8/chunk, PC-chain 64, host f32→half between stages
-  fp16: contiguous half, PC-chain 256, chain ops without host cvt (fewer ioctls)
+  fp16: contiguous half, PC-chain 512, chain ops without host cvt (fewer ioctls)
 """
 from __future__ import annotations
 import math, os, unittest
@@ -15,7 +15,7 @@ from test.backend.test_ops import helper_test_op, slow_test
 
 # fp16 tol matches test_ops.test_gemm_fp16
 _FP16 = dict(atol=5e-3, rtol=5e-3)
-_EW_CHUNK, _EW_CHAIN_FP32, _EW_CHAIN_FP16 = 8, 64, 256
+_EW_CHUNK, _EW_CHAIN_FP32, _EW_CHAIN_FP16 = 8, 64, 512
 _OUT_FP16 = os.getenv("ROCKCHIP_EW_OUT", "fp32").strip().lower() in ("fp16", "half", "2")
 _EW_KAHAN = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower() == "kahan"
 
