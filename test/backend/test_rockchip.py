@@ -17,6 +17,7 @@ from test.backend.test_ops import helper_test_op, slow_test
 _FP16 = dict(atol=5e-3, rtol=5e-3)
 _EW_CHUNK, _EW_CHAIN = 8, 64
 _OUT_FP16 = os.getenv("ROCKCHIP_EW_OUT", "fp32").strip().lower() in ("fp16", "half", "2")
+_EW_KAHAN = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower() == "kahan"
 
 def _ew_submits(n:int) -> int:
   """EW ioctl count for one logical op over n half elements."""
@@ -118,8 +119,9 @@ class TestRockchip(unittest.TestCase):
   def test_small_gemm(self):
     helper_test_op([(8,8), (8,8)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_medium_gemm(self):
-    # M=K=N stepped from 9; sweep under fp16: 12–17 ok @5e-3, N=18 misses tol
-    helper_test_op([(17,17), (17,17)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
+    # Sequential EW first misses tolerance at N=21; compensated EW reaches the current full-unroll ceiling at N=32.
+    n = 32 if _EW_KAHAN else 20
+    helper_test_op([(n,n), (n,n)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_9_gemm(self):
     helper_test_op([(9,9), (9,9)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_small_gemm_padded(self):

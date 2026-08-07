@@ -117,3 +117,98 @@ Refs: `ref/allbilly-rk3588` / `tinygrad/ref/rk3588` — `experimental/pcchain.md
 | **18** | **tol fail** vs f32 matmul ref (maxabs≈0.0105 > 5e-3) — stopped |
 
 `test_medium_gemm` now `(17,17)@(17,17)`. `test_small_gemm` remains `(8,8)@(8,8)`.
+
+---
+
+## 2026-08-07 — EW `IN_PRECISION=5` (fp32-in) HW probe
+
+TRM (`docs/rk3588_trm.md` / allbilly) lists `in_precision=3'd5` = fp32 as a valid encoding. allbilly/npu working recipes never use it for EW: always `IN=2` + `MRDMA_FP16TOFP32_EN(1)`, even when `OUT=5`.
+
+### What we tried (single EW ADD, n=8, recover via `simple_add.py` each trial)
+
+| Config | Result |
+|--------|--------|
+| `OUT=5 IN=2` mtx (shipped) | **OK** exact |
+| `OUT=2 IN=2` WIDTH (shipped) | **OK** exact (on clean NPU) |
+| `IN=5 OUT=5 PROC∈{2,5}` × `erdma_ds∈{0,1,2,3}` × mtx/WIDTH × fp32 buf | **TimeoutError** every time |
+| `IN=5 OUT=2 PROC=5` mtx | **Timeout** |
+| `IN=5` + `MRDMA_FP16TOFP32_EN` / half buf | **Timeout** |
+| Control: `IN=2 OUT=5 PROC=5` + fp16to32 half | **completes** (not a timeout) |
+
+### Verdict
+
+**No usable EW fp32→fp32 (or fp32→fp16) RDMA path found.** Register space allows `IN=5`; submitting it hangs the job (errno 110). Stay on **half-in** (`IN=2` + widen for ALU). OUT=5 still needs host `_fp32_slots_to_half` between dependent stages; gemm accumulate remains a half reduce tree either way. Prefer `ROCKCHIP_EW_OUT=fp16` for chain/throughput; keep OUT=5 when single-op f32-store then cast matters.
+
+---
+
+## 2026-08-07 — corrected medium GEMM boundary + compensated DPU EW
+
+All results here use DPU EW only: `DEFAULT_FLOAT=HALF`, `ROCKCHIP_EW_OUT=fp16`, FP16 inputs and outputs, no CMAC/CNA and no host sum.
+
+### Correction: 18×18 was not a failure
+
+The earlier sweep stopped at N=18 because `maxabs > 5e-3` was treated as failure. The test actually uses
+`abs(error) <= atol + rtol*abs(reference)` with `atol=rtol=5e-3`.
+
+| Sequential reduction | Result | Worst tolerance ratio |
+|---|---:|---:|
+| 18×18 | pass | 0.747 |
+| 19×19 | pass | 0.769 |
+| 20×20 | pass | 0.815 |
+| **21×21** | **fail** (1 element) | **1.096** |
+
+Thus the stock sequential FP16 EW limit for the deterministic `test_medium_gemm` data is **20×20**, not 17×17. The test now selects N=20 in sequential mode.
+
+### `ROCKCHIP_EW_REDUCE=kahan`
+
+For a fully unrolled ADD tree of MUL terms, the Rockchip lowering can replace the sequential sum with a Kahan-style compensated sum after symbolic simplification. The compensation therefore remains in the emitted program instead of simplifying back to zero. It uses only FP16 DPU EW MUL/ADD operations and represents the running error as another FP16 value.
+
+- EW stages for reduction length K: `K + 7*(K-1) = 8K-7`.
+- With the current 64-task software chain cap: N=21 uses 161 stages / 3 ioctls; N=32 uses 249 stages / 4 ioctls.
+- Every square size N=21–32 passes the same 5e-3/5e-3 tolerance.
+- N=33 currently reaches `RKPLAN_REJECT:unsupported_graph`: the optimizer only fully unrolls arbitrary reductions through K=32. This is now the next compiler ceiling, not a measured DPU accuracy ceiling.
+- `test_medium_gemm` selects N=32 when `ROCKCHIP_EW_REDUCE=kahan`.
+
+The shared compensated DAG also required memoizing `lower_ew.visit`; without it, recursively revisiting shared nodes grew exponentially during lowering.
+
+### 1×1 through 32×32 wall profile
+
+Command configuration: `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_OUT=fp16 ROCKCHIP_EW_REDUCE=kahan`.
+Inputs were realized before timing. `cold` is the first output `realize()` for the shape; `warm` is the median of the next three. Torch reference generation is excluded. All rows passed.
+
+| N | cold ms | warm median ms | ioctls |
+|---:|---:|---:|---:|
+| 1 | 86.461 | 2.026 | 1 |
+| 2 | 59.332 | 2.502 | 1 |
+| 3 | 36.222 | 2.773 | 1 |
+| 4 | 30.944 | 3.051 | 1 |
+| 5 | 45.860 | 3.753 | 1 |
+| 6 | 37.601 | 4.098 | 1 |
+| 7 | 41.426 | 4.439 | 1 |
+| 8 | 45.651 | 5.064 | 1 |
+| 9 | 50.097 | 5.625 | 1 |
+| 10 | 55.050 | 6.269 | 2 |
+| 11 | 60.003 | 7.073 | 2 |
+| 12 | 65.084 | 7.911 | 2 |
+| 13 | 71.397 | 8.643 | 2 |
+| 14 | 77.842 | 9.527 | 2 |
+| 15 | 84.717 | 10.488 | 2 |
+| 16 | 92.066 | 11.719 | 2 |
+| 17 | 119.975 | 13.010 | 2 |
+| 18 | 314.339 | 14.451 | 3 |
+| 19 | 118.008 | 15.753 | 3 |
+| 20 | 127.791 | 17.362 | 3 |
+| 21 | 138.563 | 19.086 | 3 |
+| 22 | 149.768 | 21.145 | 3 |
+| 23 | 160.815 | 22.994 | 3 |
+| 24 | 174.269 | 25.370 | 3 |
+| 25 | 187.882 | 27.323 | 3 |
+| 26 | 202.478 | 29.707 | 4 |
+| 27 | 218.993 | 32.358 | 4 |
+| 28 | 268.390 | 35.380 | 4 |
+| 29 | 256.566 | 38.584 | 4 |
+| 30 | 274.921 | 41.661 | 4 |
+| 31 | 294.521 | 45.336 | 4 |
+| **32** | **312.460** | **49.019** | **4** |
+
+The N=18 cold result is an outlier; warm scaling is monotonic. These are end-to-end output-realization wall times, not isolated ioctl hardware time.
