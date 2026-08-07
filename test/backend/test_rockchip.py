@@ -50,6 +50,13 @@ class TestRockchip(unittest.TestCase):
     np.testing.assert_allclose(got, ref, atol=atol, rtol=rtol, equal_nan=True)
     self.assertEqual(submits, expected_submits, f"{self._testMethodName}: submits={submits} expected={expected_submits}")
 
+  def _check_conv2d(self, expected_submits:int, x_shape:tuple[int, ...], w_shape:tuple[int, ...], seed:int, **kwargs):
+    rng = np.random.default_rng(seed)
+    xn = rng.uniform(-2, 2, size=x_shape).astype(np.float16)
+    wn = rng.uniform(-2, 2, size=w_shape).astype(np.float16)
+    ref = torch.nn.functional.conv2d(torch.from_numpy(xn), torch.from_numpy(wn), **kwargs).numpy()
+    self._check(expected_submits, Tensor(xn).conv2d(Tensor(wn), **kwargs), ref, **_FP16)
+
   # ---- ADD ----
   def test_tiny_add(self):
     a, b = self._half((3,), 1), self._half((3,), 2)
@@ -150,11 +157,22 @@ class TestRockchip(unittest.TestCase):
 
   # ---- CONV2D (from test_ops, fp16 tol) ----
   def test_simple_conv2d_1x1(self):
-    rng = np.random.default_rng(100)
-    xn = rng.uniform(-2, 2, size=(1,4,9,9)).astype(np.float16)
-    wn = rng.uniform(-2, 2, size=(4,4,1,1)).astype(np.float16)
-    ref = torch.nn.functional.conv2d(torch.from_numpy(xn), torch.from_numpy(wn)).numpy()
-    self._check(1, Tensor(xn).conv2d(Tensor(wn)), ref, **_FP16)
+    self._check_conv2d(1, (1,4,9,9), (4,4,1,1), 100)
+
+  def test_simple_conv2d(self):
+    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 101)
+
+  def test_simple_conv2d_batched(self):
+    self._check_conv2d(7, (2,4,9,9), (4,4,3,3), 102)
+
+  def test_padded_conv2d(self):
+    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 103, padding=1)
+
+  def test_strided_conv2d(self):
+    self._check_conv2d(7, (1,4,9,9), (4,4,3,3), 104, stride=2)
+
+  def test_depthwise_conv2d(self):
+    self._check_conv2d(2, (1,4,9,9), (4,1,3,3), 105, groups=4)
 
 if __name__ == "__main__":
   unittest.main()

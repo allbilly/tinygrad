@@ -414,3 +414,17 @@ The named Rockchip `test_big_gemm` now passes in 16.93 s including fresh pytest/
 The generic `TestOps.test_simple_conv2d_1x1` case, input `(1,4,9,9)` and weight `(4,4,1,1)`, passes on Rockchip with FP16 input and DPU EW-only execution. It is now mirrored in `test/backend/test_rockchip.py` so the backend census uses the same `5e-3/5e-3` tolerance as `test_gemm_fp16` and asserts the hardware submit count.
 
 Direct cold realization took **0.193 s**, used **1 ioctl submit**, and had maximum absolute error **1.52588e-05** against the Torch FP16 reference. The generic pytest case passed in **11.34 s** including fresh xdist worker startup.
+
+The next representative 3x3 sweep also passes:
+
+| Case | Output | Cold realization | Ioctl submits | Maximum absolute error |
+|---|---:|---:|---:|---:|
+| unpadded | `(1,4,7,7)` | 0.449 s | 7 | 0.00195312 |
+| batch 2 | `(2,4,7,7)` | 0.293 s | 7 | 0 |
+| padding 1 | `(1,4,9,9)` | 0.491 s | 7 | 1.52588e-05 |
+| stride 2 | `(1,4,4,4)` | 0.295 s | 7 | 0 |
+| depthwise, 4 groups | `(1,4,7,7)` | 0.102 s | 2 | 0 |
+
+These cases remain FP16-input, DPU EW-only tests. Torch is used only to construct the test oracle; backend execution performs no host floating-point arithmetic.
+
+The six-test convolution subset passes in **12.21 s** and the complete Rockchip census passes in **18.08 s** (`28 passed, 1 skipped`), both with `-n12` and a hard 30-second timeout. Full Ruff and mypy checks pass.
