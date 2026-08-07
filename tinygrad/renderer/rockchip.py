@@ -384,8 +384,12 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if not visit(val) or not order or order[-1] is not val:
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
-  uses = {u: sum(s is u for n in order for s in n.src) for u in order}
+  uses = {u: 0 for u in order}
+  for node in order:
+    for src in node.src:
+      if src in uses: uses[src] += 1
   values:dict[UOp, RKArg] = {}
+  leaf_values:dict[UOp, RKArg] = {}
   free:list[int] = []
   const_scratch:dict[bytes, int] = {}
   gather_scratch:dict[tuple[int, tuple[int, ...]], int] = {}
@@ -403,25 +407,29 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   def operand(s:UOp) -> RKArg:
     nonlocal scratch_count
     if s in values: return values[s]
+    if s in leaf_values: return leaf_values[s]
     leaf = _ew_leaf(s, out_index, count, oslot)
     assert leaf is not None
-    if isinstance(leaf, float): return RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", leaf)])
-    if isinstance(leaf, RKArg):
+    if isinstance(leaf, float): ret = RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", leaf)])
+    elif isinstance(leaf, RKArg):
       if leaf.index not in arg_pack:
         arg_pack[leaf.index] = scratch_count
         packs.append(RKPack(leaf.index, scratch_count, count, leaf.itemsize))
         scratch_count += 1
-      return RKArg(RKBufferKind.SCRATCH, arg_pack[leaf.index])
-    p, ix = leaf
-    offsets = _gather_offsets(out_index, ix, count)
-    if max(offsets) >= int(p.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
-    key = (p.arg.slot, offsets)
-    if key not in gather_scratch:
-      gather_scratch[key] = scratch_count
-      itemsize = 4 if p.dtype.scalar() in (dtypes.float, dtypes.float32) else 2
-      gathers.append(RKGather(p.arg.slot, scratch_count, offsets, itemsize))
-      scratch_count += 1
-    return RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
+      ret = RKArg(RKBufferKind.SCRATCH, arg_pack[leaf.index])
+    else:
+      p, ix = leaf
+      offsets = _gather_offsets(out_index, ix, count)
+      if max(offsets) >= int(p.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
+      key = (p.arg.slot, offsets)
+      if key not in gather_scratch:
+        gather_scratch[key] = scratch_count
+        itemsize = 4 if p.dtype.scalar() in (dtypes.float, dtypes.float32) else 2
+        gathers.append(RKGather(p.arg.slot, scratch_count, offsets, itemsize))
+        scratch_count += 1
+      ret = RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
+    leaf_values[s] = ret
+    return ret
   for expr in order:
     lhs, rhs = operand(expr.src[0]), operand(expr.src[1])
     if (reuse:=next((values[x] for x in expr.src if x in values and uses[x] == 1 and

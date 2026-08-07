@@ -317,3 +317,19 @@ Program-call decomposition:
 | └ loop/other | 26.5 ms |
 
 Other excluded measurements: input Tensor construction 3.6 ms, Torch reference 0.9 ms, and final `numpy()` copyout 2.7 ms.
+
+### Cold-lowering optimization
+
+The 7.207 s direct cold realization was Python compiler overhead rather than DPU execution. `lower_ew` calculated each logical input gather four times because repeated leaf UOps were only deduplicated after offset expansion, and its dependency-use count scanned the whole graph once per node.
+
+Caching lowered leaf operands and replacing the quadratic use-count comprehension with one linear edge walk preserves the output (worst tolerance ratio remains 0.145) and changes the cold profile as follows:
+
+| Component | Before | After | Change |
+|---|---:|---:|---:|
+| direct output `realize()` | 7.207 s | 2.732 s | 2.64× faster |
+| `lower_ew` | 6.306 s | 1.762 s | 3.58× faster |
+| gather-offset construction | 4.170 s / 512 calls | 1.054 s / 128 calls | four duplicate calls removed |
+| other lowering work | 2.119 s | 0.691 s | 3.07× faster |
+| named pytest (`-n12`) | 18.62 s | 14.39 s | 4.23 s less wall time |
+
+`test_gemm_fp16` still passes under its hard 30-second timeout. The remaining roughly 1.05 s in gather-offset construction is now the largest measured lowering component.
