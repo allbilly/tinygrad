@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ctypes, mmap, os, struct, time
+import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import RKBufferKind, RK_STAGE_RESET, RockchipRenderer, decode_image, patch_image
@@ -89,7 +90,17 @@ class RockchipProgram(Program['RockchipDevice']):
       raise RuntimeError(f"unsupported RKBufferKind {kind}")
     start = time.perf_counter()
     if any(s.flags & RK_STAGE_RESET for s in self.image.stages): self.dev.reset_npu()
-    self._submit(patch_image(self.image, address))
+    if self.image.stages: self._submit(patch_image(self.image, address))
+    # Gemm ADD reduce: sum half product vectors in float32 into dst (matches torch half matmul acc).
+    if (hs:=self.image.host_sum) is not None:
+      acc = np.zeros(hs.count, dtype=np.float32)
+      for si in hs.srcs:
+        acc += np.frombuffer(to_mv(int(self.scratch[si].va_addr), hs.count * 2), dtype=np.float16).astype(np.float32)
+      out_bits = acc.astype(np.float16).tobytes()
+      if hs.dst.kind is RKBufferKind.ARG:
+        ctypes.memmove(int(bufs[hs.dst.index].va_addr), out_bits, len(out_bits))
+      else:
+        ctypes.memmove(int(self.scratch[hs.dst.index].va_addr), out_bits, len(out_bits))
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):

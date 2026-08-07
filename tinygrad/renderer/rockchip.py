@@ -10,10 +10,11 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 4, 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 5, 1
 _HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHIIII")
 _RELOC, _SCRATCH = struct.Struct("<HHBBIqIH"), struct.Struct("<II")
 _GATHER = struct.Struct("<BBHI")  # src_kind, dst_scratch, src_index, n_offsets
+_HOSTSUM = struct.Struct("<BBHI")  # dst_kind, pad, dst_index, n_srcs; followed by n_srcs u16 scratch idxs + u32 count
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum): DPU = 1
@@ -36,10 +37,15 @@ class RKGather:
   src_index: int; dst_scratch: int; offsets: tuple[int, ...]
 
 @dataclass(frozen=True)
+class RKHostSum:
+  """Sum half scratch vectors in float32 into dst (gemm ADD reduce; half EW ADD loses too much)."""
+  dst: RKArg; srcs: tuple[int, ...]; count: int
+
+@dataclass(frozen=True)
 class RKImage:
   target: RKTarget; stages: tuple[RKStage, ...]
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""; version: int = RKIMAGE_VERSION
-  gathers: tuple[RKGather, ...] = ()
+  gathers: tuple[RKGather, ...] = (); host_sum: RKHostSum|None = None
 
 @dataclass(frozen=True)
 class RKArg: kind: RKBufferKind; index: int; addend: int = 0
@@ -50,18 +56,23 @@ def encode_image(image:RKImage) -> bytes:
     c0, r0 = len(cmds), len(relocs); cmds.extend(s.commands); relocs.extend(s.relocs)
     rows.append((int(s.engine), s.flags, 0, c0, len(s.commands), r0, len(s.relocs)))
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(rows), len(relocs),
-                               len(image.scratch), len(image.gathers), len(cmds), len(image.constants), 0))
+                               len(image.scratch), len(image.gathers), len(cmds), len(image.constants),
+                               1 if image.host_sum is not None else 0))
   for row in rows: out += _STAGE.pack(*row)
   for r in relocs: out += _RELOC.pack(r.stage, r.word, int(r.kind), r.shift, r.index, r.addend, r.mask, r.field_shift)
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in image.gathers:
     out += _GATHER.pack(int(RKBufferKind.ARG), g.dst_scratch, g.src_index, len(g.offsets))
     out += struct.pack(f"<{len(g.offsets)}i", *g.offsets)
+  if image.host_sum is not None:
+    hs = image.host_sum
+    out += _HOSTSUM.pack(int(hs.dst.kind), 0, hs.dst.index, len(hs.srcs))
+    out += struct.pack(f"<{len(hs.srcs)}H", *hs.srcs) + struct.pack("<I", hs.count)
   return bytes(out) + (struct.pack(f"<{len(cmds)}Q", *cmds) if cmds else b"") + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
-  magic, ver, target, nstage, nreloc, nscratch, ngather, ncmd, nconst, res2 = _HEADER.unpack_from(blob)
-  if magic != RKIMAGE_MAGIC or res2: raise ValueError("invalid RKImage header")
+  magic, ver, target, nstage, nreloc, nscratch, ngather, ncmd, nconst, has_hostsum = _HEADER.unpack_from(blob)
+  if magic != RKIMAGE_MAGIC or has_hostsum not in (0, 1): raise ValueError("invalid RKImage header")
   off = _HEADER.size
   rows = [_STAGE.unpack_from(blob, off+i*_STAGE.size) for i in range(nstage)]; off += nstage*_STAGE.size
   relocs = []
@@ -75,14 +86,19 @@ def decode_image(blob:bytes) -> RKImage:
     if src_kind != int(RKBufferKind.ARG): raise ValueError("invalid RKGather src kind")
     offs = struct.unpack_from(f"<{n_off}i", blob, off); off += 4 * n_off
     gathers.append(RKGather(src_index, dst_scratch, offs))
+  host_sum = None
+  if has_hostsum:
+    dst_kind, _, dst_index, n_srcs = _HOSTSUM.unpack_from(blob, off); off += _HOSTSUM.size
+    srcs = struct.unpack_from(f"<{n_srcs}H", blob, off); off += 2 * n_srcs
+    count, = struct.unpack_from("<I", blob, off); off += 4
+    host_sum = RKHostSum(RKArg(RKBufferKind(dst_kind), dst_index), srcs, count)
   if off + ncmd * 8 + nconst != len(blob): raise ValueError("invalid RKImage size")
   cmds = struct.unpack_from(f"<{ncmd}Q", blob, off) if ncmd else (); off += ncmd * 8
   stages = []
   for i,(eng,flags,r0,c0,clen,rstart,rlen) in enumerate(rows):
     if r0 or c0+clen > ncmd or rstart+rlen > nreloc: raise ValueError("invalid RKImage stage")
     stages.append(RKStage(RKEngine(eng), cmds[c0:c0+clen], tuple(relocs[rstart:rstart+rlen]), flags))
-  return RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], ver, tuple(gathers))
-
+  return RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], ver, tuple(gathers), host_sum)
 def patch_image(image:RKImage, address:Callable[[RKBufferKind,int],int]) -> tuple[tuple[int,...],...]:
   patched = [list(s.commands) for s in image.stages]
   for s in image.stages:
@@ -208,6 +224,15 @@ def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, sup
       bad.append(f"{i}:{u.op.name}")
   return bad
 
+def _mul_reduction_muls(u:UOp) -> list[UOp]|None:
+  """If u is an ADD-tree of half MULs, return those MUL nodes (gemm-style); else None."""
+  if u.op is Ops.MUL and u.dtype.scalar() is dtypes.half: return [u]
+  if u.op is Ops.ADD and u.dtype.scalar() is dtypes.half:
+    left, right = _mul_reduction_muls(u.src[0]), _mul_reduction_muls(u.src[1])
+    if left is None or right is None: return None
+    return left + right
+  return None
+
 def lower_ew(uops:list[UOp]) -> RKImage:
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
@@ -238,6 +263,11 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if not visit(val) or not order or order[-1] is not val:
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
+  # Gemm-style Σ MUL: DPU EW for MULs, float32 host sum for the ADD reduce (half ADD misses fp16 tol).
+  mul_red = _mul_reduction_muls(val)
+  host_sum:RKHostSum|None = None
+  if mul_red is not None and len(mul_red) >= 2:
+    order = list(dict.fromkeys(mul_red))  # MULs only, stable unique
   uses = {u: sum(s is u for n in order for s in n.src) for u in order}
   values:dict[UOp, RKArg] = {}
   free:list[int] = []
@@ -269,9 +299,16 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       gathers.append(RKGather(p.arg.slot, scratch_count, offsets))
       scratch_count += 1
     return RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
+  prod_scratches:list[int] = []
   for expr in order:
     lhs, rhs = operand(expr.src[0]), operand(expr.src[1])
-    if expr is val: dst = out
+    if mul_red is not None and len(mul_red) >= 2:
+      # MUL into scratch; host floats-sum writes `out`
+      slot = free.pop() if free else scratch_count
+      if slot == scratch_count: scratch_count += 1
+      dst = RKArg(RKBufferKind.SCRATCH, slot)
+      prod_scratches.append(slot)
+    elif expr is val: dst = out
     elif (reuse:=next((values[x] for x in expr.src if x in values and uses[x] == 1 and
                        values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
     else:
@@ -285,6 +322,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
         uses[dep] -= 1
         arg = values[dep]
         if uses[dep] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
+  if prod_scratches: host_sum = RKHostSum(out, tuple(prod_scratches), count)
   nbytes = ((count + 7) // 8 * 8) * 2
   constants = b""
   if const_scratch:
@@ -292,8 +330,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     constants = b"".join(by[i] if i in by else struct.pack("<e", 0.0)
                          for i in range(max(const_scratch.values()) + 1))
   return RKImage(RKTarget.RK3588, tuple(stages), tuple(RKScratch(nbytes) for _ in range(scratch_count)),
-                 constants, gathers=tuple(gathers))
-
+                 constants, gathers=tuple(gathers), host_sum=host_sum)
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
