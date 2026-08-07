@@ -122,10 +122,6 @@ class TestRockchip(unittest.TestCase):
     helper_test_op([(4,3), (1,3,3,5)], lambda x,y: x.matmul(y), Tensor.dot, **_FP16)
   def test_small_gemm(self):
     helper_test_op([(8,8), (8,8)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
-  def test_medium_gemm(self):
-    # Sequential first misses at N=21; Kahan at N=38; TwoProduct reaches test_gemm_fp16's N=64.
-    n = 64 if _EW_REDUCE == "twoproduct" else 37 if _EW_REDUCE == "kahan" else 20
-    helper_test_op([(n,n), (n,n)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_9_gemm(self):
     helper_test_op([(9,9), (9,9)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_small_gemm_padded(self):

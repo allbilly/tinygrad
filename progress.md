@@ -116,7 +116,7 @@ Refs: `ref/allbilly-rk3588` / `tinygrad/ref/rk3588` — `experimental/pcchain.md
 | 12–17 | ok after 64KiB/16KiB floors (~70–140 ms, 1 ioctl) |
 | **18** | **tol fail** vs f32 matmul ref (maxabs≈0.0105 > 5e-3) — stopped |
 
-`test_medium_gemm` now `(17,17)@(17,17)`. `test_small_gemm` remains `(8,8)@(8,8)`.
+At this point `test_medium_gemm` was `(17,17)@(17,17)`. `test_small_gemm` remains `(8,8)@(8,8)`.
 
 ---
 
@@ -157,7 +157,7 @@ The earlier sweep stopped at N=18 because `maxabs > 5e-3` was treated as failure
 | 20×20 | pass | 0.815 |
 | **21×21** | **fail** (1 element) | **1.096** |
 
-Thus the stock sequential FP16 EW limit for the deterministic `test_medium_gemm` data is **20×20**, not 17×17. The test now selects N=20 in sequential mode.
+Thus the stock sequential FP16 EW limit for the deterministic sweep data is **20×20**, not 17×17.
 
 ### `ROCKCHIP_EW_REDUCE=kahan`
 
@@ -167,7 +167,7 @@ For a fully unrolled ADD tree of MUL terms, the Rockchip lowering can replace th
 - With the current 64-task software chain cap: N=21 uses 161 stages / 3 ioctls; N=32 uses 249 stages / 4 ioctls.
 - Every square size N=21–32 passes the same 5e-3/5e-3 tolerance.
 - N=33 currently reaches `RKPLAN_REJECT:unsupported_graph`: the optimizer only fully unrolls arbitrary reductions through K=32. This is now the next compiler ceiling, not a measured DPU accuracy ceiling.
-- `test_medium_gemm` selects N=32 when `ROCKCHIP_EW_REDUCE=kahan`.
+- The Kahan sweep reaches N=32 under the same deterministic inputs.
 
 The shared compensated DAG also required memoizing `lower_ew.visit`; without it, recursively revisiting shared nodes grew exponentially during lowering.
 
@@ -226,7 +226,7 @@ The prior `_EW_CHAIN=64` was a conservative software cap, not a measured hardwar
 
 Additional single-ioctl dependent ADD-chain probes passed through 256 tasks. The real compensated GEMM also produced identical outputs at caps 64, 128, and 256; random-seed tolerance misses were identical across caps and are numerical, not chain corruption.
 
-Set the OUT=2 `_EW_CHAIN=256`. The 32×32 compensated `test_medium_gemm` now fits in one ioctl. Wall time does not improve materially because emitting/patching 249 register bodies and the EW work dominate this small workload; the change removes submit boundaries rather than arithmetic.
+Set the OUT=2 `_EW_CHAIN=256`. The 32×32 compensated GEMM now fits in one ioctl. Wall time does not improve materially because emitting/patching 249 register bodies and the EW work dominate this small workload; the change removes submit boundaries rather than arithmetic.
 
 This does **not** apply to OUT=5 mtx512: a 256-task `test_add` chain timed out. Keep `_EW_CHAIN_FP32=64`; the raised cap is specifically for the contiguous FP16-output EW recipe used by compensated GEMM.
 
@@ -247,7 +247,7 @@ Each size was run separately with a hard 30-second timeout under `ROCKCHIP_EW_OU
 | **37** | **pass** | **0.862** | **2** | **877 ms** |
 | 38 | **fail** (1 element) | 1.188 | 2 | 1054 ms |
 
-`test_medium_gemm` is now 37×37 in Kahan mode. N=38 is a numerical limit: Kahan corrects ADD-rounding but cannot recover the product bits lost when each FP16×FP16 result is stored as FP16.
+The Kahan sweep reaches 37×37. N=38 is a numerical limit: Kahan corrects ADD-rounding but cannot recover the product bits lost when each FP16×FP16 result is stored as FP16.
 
 ### N=37 merged into one PC chain
 
@@ -289,4 +289,31 @@ Every size was run separately with a hard 30-second timeout. All N=38 through N=
 | 50 | 0.151 | 9 | 5113 | **64** | **0.145** | **11** | **10106** |
 | 51 | 0.150 | 9 | 5281 | | | | |
 
-`test_medium_gemm` selects 64×64 in TwoProduct mode, matching `test_gemm_fp16`. N=64 remains below the 30-second wall cap with substantial numerical margin.
+The authoritative GEMM milestone is now `test_gemm_fp16` at 64×64. It passes in TwoProduct mode below the 30-second wall cap with substantial numerical margin. The redundant incremental `test_medium_gemm` was removed; its one-by-one census remains documented above.
+
+### `test_gemm_fp16` cold wall decomposition
+
+Profile config matches the passing test: `DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_OUT=fp16 ROCKCHIP_EW_REDUCE=twoproduct`. The named pytest passes in **18.62 s** with `-n12`; a directly instrumented cold realization takes **7.207 s**, so approximately **11.4 s** is pytest/xdist worker startup and imports.
+
+| Cold realization component | Wall | Share |
+|---|---:|---:|
+| render + `lower_ew` | 6293 ms | 87.3% |
+| program `__call__` | 404 ms | 5.6% |
+| scheduler/program setup outside those regions | 509 ms | 7.1% |
+| **output `realize()`** | **7207 ms** | **100%** |
+
+The TwoProduct DAG itself is cheap to construct (17.9 ms). Most of the 6.24 s inside `lower_ew` is plan bookkeeping over the 2806-op graph: dependency/use counting, scratch assignment, and gather-offset construction. This is the dominant next optimization target, not ioctl count.
+
+Program-call decomposition:
+
+| Runtime component | Wall |
+|---|---:|
+| gather/setup/final-output work outside EW runner | 276.4 ms |
+| EW runner total | 128.1 ms |
+| ├ command emit (2806 bodies) | 40.6 ms |
+| ├ relocation patch | 17.9 ms |
+| ├ submit CPU construction | 29.1 ms |
+| ├ 11 blocking ioctls | 14.0 ms |
+| └ loop/other | 26.5 ms |
+
+Other excluded measurements: input Tensor construction 3.6 ms, Torch reference 0.9 ms, and final `numpy()` copyout 2.7 ms.
