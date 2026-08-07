@@ -12,6 +12,7 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 # Regcmd/task scratch floors match allbilly elementwise (64KiB / 16KiB), not 4096.
 _EW_CHAIN = 512
 _EW_CHAIN_FP32 = 64
+_EW_CHAIN_TWOPRODUCT = 256
 _PC_TAIL = 4
 _CMD_BUF_MIN = 65536
 _TASK_BUF_MIN = 16384
@@ -151,6 +152,7 @@ class RockchipProgram(Program['RockchipDevice']):
   def _run_ew_ops_fp16(self, address) -> None:
     """OUT=2: contiguous half; chain all ops in one/few ioctls (no host cvt)."""
     bodies:list[tuple[int, ...]] = []
+    chain_limit = _EW_CHAIN_TWOPRODUCT if os.getenv("ROCKCHIP_EW_REDUCE", "").strip().lower() == "twoproduct" else _EW_CHAIN
     def flush() -> None:
       if not bodies: return
       self._submit_pcchain(bodies)
@@ -164,7 +166,7 @@ class RockchipProgram(Program['RockchipDevice']):
           RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend + off),
           RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend + off), n, op.ew_cfg, RKEWOut.FP16)
         bodies.append(patch_image(RKImage(self.image.target, (stage,)), address)[0])
-        if len(bodies) >= _EW_CHAIN: flush()
+        if len(bodies) >= chain_limit: flush()
     flush()
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs

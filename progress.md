@@ -259,3 +259,34 @@ Kahan N=37 emits `8*37-7 = 289` dependent FP16 EW tasks, which crossed the previ
 | **512** | **1** | **70.013 ms** |
 
 Set `_EW_CHAIN=512` for OUT=2. OUT=5 mtx512 remains separately capped at 64.
+
+---
+
+## 2026-08-07 — FP16 TwoProduct EW reaches 64×64
+
+Config: `ROCKCHIP_EW_OUT=fp16 ROCKCHIP_EW_REDUCE=twoproduct`. DPU EW only, no CMAC/CNA and no host arithmetic.
+
+Kahan cannot recover the low product bits after FP16 store. TwoProduct uses a Dekker split (`splitter=65`) to represent every FP16×FP16 product as two FP16 values: rounded product plus exact-ish residual. A general TwoSum then accumulates all product highs followed by residuals in a two-half `(high, low)` accumulator. The graph is constructed after symbolic simplification so the error terms remain as physical EW MUL/ADD tasks.
+
+The mixed TwoProduct graph timed out with 512 tasks in one chain but passes with 256, so runtime uses `_EW_CHAIN_TWOPRODUCT=256` while ordinary OUT=2 Kahan retains 512.
+
+Every size was run separately with a hard 30-second timeout. All N=38 through N=64 passed:
+
+| N | ratio | ioctls | first-run wall ms | N | ratio | ioctls | first-run wall ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 38 | 0.117 | 7 | 2192 | 52 | 0.126 | 9 | 5608 |
+| 39 | 0.115 | 7 | 2576 | 53 | 0.127 | 10 | 5853 |
+| 40 | 0.093 | 7 | 2738 | 54 | 0.173 | 10 | 6194 |
+| 41 | 0.169 | 8 | 3464 | 55 | 0.148 | 10 | 6502 |
+| 42 | 0.106 | 8 | 3125 | 56 | 0.145 | 10 | 6846 |
+| 43 | 0.074 | 8 | 3336 | 57 | 0.152 | 10 | 7182 |
+| 44 | 0.117 | 8 | 3549 | 58 | 0.136 | 10 | 7717 |
+| 45 | 0.120 | 8 | 3895 | 59 | 0.180 | 11 | 7980 |
+| 46 | 0.078 | 8 | 4005 | 60 | 0.158 | 11 | 8350 |
+| 47 | 0.149 | 9 | 4215 | 61 | 0.134 | 11 | 8849 |
+| 48 | 0.105 | 9 | 4494 | 62 | 0.155 | 11 | 9554 |
+| 49 | 0.160 | 9 | 4854 | 63 | 0.144 | 11 | 9888 |
+| 50 | 0.151 | 9 | 5113 | **64** | **0.145** | **11** | **10106** |
+| 51 | 0.150 | 9 | 5281 | | | | |
+
+`test_medium_gemm` selects 64×64 in TwoProduct mode, matching `test_gemm_fp16`. N=64 remains below the 30-second wall cap with substantial numerical margin.

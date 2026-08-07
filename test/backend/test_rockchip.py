@@ -5,6 +5,9 @@ Run: FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest test/backen
 OUT precision via ROCKCHIP_EW_OUT=fp32|fp16 (default fp32):
   fp32: mtx512 ≤8/chunk, PC-chain 64, host f32→half between stages
   fp16: contiguous half, PC-chain 512, chain ops without host cvt (fewer ioctls)
+
+Reduction via ROCKCHIP_EW_REDUCE=sequential|kahan|twoproduct (default sequential).
+TwoProduct uses a conservative 256-task mixed MUL/ADD chain cap.
 """
 from __future__ import annotations
 import math, os, unittest
@@ -15,9 +18,9 @@ from test.backend.test_ops import helper_test_op, slow_test
 
 # fp16 tol matches test_ops.test_gemm_fp16
 _FP16 = dict(atol=5e-3, rtol=5e-3)
-_EW_CHUNK, _EW_CHAIN_FP32, _EW_CHAIN_FP16 = 8, 64, 512
+_EW_CHUNK, _EW_CHAIN_FP32, _EW_CHAIN_FP16, _EW_CHAIN_TWOPRODUCT = 8, 64, 512, 256
 _OUT_FP16 = os.getenv("ROCKCHIP_EW_OUT", "fp32").strip().lower() in ("fp16", "half", "2")
-_EW_KAHAN = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower() == "kahan"
+_EW_REDUCE = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()
 
 def _ew_submits(n:int) -> int:
   """EW ioctl count for one logical op over n half elements."""
@@ -25,7 +28,8 @@ def _ew_submits(n:int) -> int:
     # one contiguous task per op (tiled only above 64k); one op → one ioctl unless tiled
     from tinygrad.renderer.rockchip import _MAX_EW_ELEMS_FP16
     tiles = (n + _MAX_EW_ELEMS_FP16 - 1) // _MAX_EW_ELEMS_FP16
-    return (tiles + _EW_CHAIN_FP16 - 1) // _EW_CHAIN_FP16
+    chain = _EW_CHAIN_TWOPRODUCT if _EW_REDUCE == "twoproduct" else _EW_CHAIN_FP16
+    return (tiles + chain - 1) // chain
   chunks = (n + _EW_CHUNK - 1) // _EW_CHUNK
   return (chunks + _EW_CHAIN_FP32 - 1) // _EW_CHAIN_FP32
 
@@ -119,8 +123,8 @@ class TestRockchip(unittest.TestCase):
   def test_small_gemm(self):
     helper_test_op([(8,8), (8,8)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_medium_gemm(self):
-    # Sequential EW first misses tolerance at N=21; compensated EW first misses at N=38.
-    n = 37 if _EW_KAHAN else 20
+    # Sequential first misses at N=21; Kahan at N=38; TwoProduct reaches test_gemm_fp16's N=64.
+    n = 64 if _EW_REDUCE == "twoproduct" else 37 if _EW_REDUCE == "kahan" else 20
     helper_test_op([(n,n), (n,n)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)
   def test_9_gemm(self):
     helper_test_op([(9,9), (9,9)], lambda x,y: x.matmul(y), lambda x,y: x@y, **_FP16)

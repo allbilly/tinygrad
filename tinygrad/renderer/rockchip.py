@@ -307,6 +307,39 @@ def _compensated_mul_sum(terms:list[UOp]) -> UOp:
     total = updated
   return total
 
+def _sub_half(lhs:UOp, rhs:UOp, neg_one:UOp) -> UOp: return lhs.alu(Ops.ADD, rhs.alu(Ops.MUL, neg_one))
+
+def _split_half(x:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
+  scaled = x.alu(Ops.MUL, splitter)
+  big = _sub_half(scaled, x, neg_one)
+  high = _sub_half(scaled, big, neg_one)
+  return high, _sub_half(x, high, neg_one)
+
+def _two_product(term:UOp, neg_one:UOp, splitter:UOp) -> tuple[UOp, UOp]:
+  lhs_high, lhs_low = _split_half(term.src[0], neg_one, splitter)
+  rhs_high, rhs_low = _split_half(term.src[1], neg_one, splitter)
+  error = _sub_half(lhs_high.alu(Ops.MUL, rhs_high), term, neg_one)
+  error = error.alu(Ops.ADD, lhs_high.alu(Ops.MUL, rhs_low))
+  error = error.alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_high))
+  return term, error.alu(Ops.ADD, lhs_low.alu(Ops.MUL, rhs_low))
+
+def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
+  total = lhs.alu(Ops.ADD, rhs)
+  rhs_virtual = _sub_half(total, lhs, neg_one)
+  lhs_error = _sub_half(lhs, _sub_half(total, rhs_virtual, neg_one), neg_one)
+  rhs_error = _sub_half(rhs, rhs_virtual, neg_one)
+  return total, lhs_error.alu(Ops.ADD, rhs_error)
+
+def _precise_mul_sum(terms:list[UOp]) -> UOp:
+  """Recover FP16 product residuals and accumulate a two-half expansion using only DPU EW ops."""
+  zero, neg_one, splitter = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half), UOp.const(65.0, dtypes.half)
+  products, errors = zip(*(_two_product(term, neg_one, splitter) for term in terms))
+  high, low = products[0], zero
+  for part in products[1:] + errors:
+    high, error = _two_sum(high, part, neg_one)
+    low = low.alu(Ops.ADD, error)
+  return high.alu(Ops.ADD, low)
+
 def lower_ew(uops:list[UOp]) -> RKImage:
   out_prec = ew_out_precision()
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -332,8 +365,9 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if any(u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
-  if os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower() == "kahan" and (terms:=_mul_reduction_terms(val)) is not None:
-    val = _compensated_mul_sum(terms)
+  if (terms:=_mul_reduction_terms(val)) is not None:
+    if (reduce_mode:=os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()) == "kahan": val = _compensated_mul_sum(terms)
+    elif reduce_mode == "twoproduct": val = _precise_mul_sum(terms)
   order:list[UOp] = []
   visited:dict[UOp, bool] = {}
   def visit(u:UOp) -> bool:
