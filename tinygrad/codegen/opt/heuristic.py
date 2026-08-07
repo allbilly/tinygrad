@@ -110,8 +110,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren is not None and k.ren.target.device == "DSP"
+  is_rockchip = k.ren is not None and k.ren.target.device == "ROCKCHIP"
   upcasted_axis: set[int] = set()
-  while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
+  # ROCKCHIP: keep a single contiguous STORE (no MN upcast); EW+gather needs one out index.
+  while (not is_rockchip) and resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
     # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
     for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
@@ -138,8 +140,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if last reduce dim is small(ish), loop unroll the reduce
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
+  # ROCKCHIP DPU EW has no reduce loop: fully unroll (peel ≤32) so gemm is half MUL/ADD+gather.
   try:
-    if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
+    if is_rockchip:
+      while k.unrollable_dims:
+        s = k.full_shape[k.unrollable_dims[-1]]
+        k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0 if s <= 32 else 32))
+    elif k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
       if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
@@ -154,7 +161,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # if nothing at all is upcasted and it's easy to, do an upcast
   for splits in [4]:
-    if not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
+    if (not is_rockchip) and not k.upcasted and k.upcastable_dims and k.full_shape[k.upcastable_dims[-1]] % splits == 0:
       k.apply_opt(Opt(OptOps.UPCAST, k.upcastable_dims[-1], splits))
 
   # **** local groups ****
