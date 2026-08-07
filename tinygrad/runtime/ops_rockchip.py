@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ctypes, mmap, os, time
+import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_image, patch_stage, emit_ew_stage,
@@ -104,10 +105,20 @@ class RockchipProgram(Program['RockchipDevice']):
       count = max((op.count for op in self.image.ew_ops), default=0)
       bits = self.image.constants[i*2:i*2+2] * count
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
+    linear:dict[int, np.ndarray] = {}
     for gather in self.image.gathers:
-      src = to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size).cast("H")
-      dst = to_mv(int(self.scratch[gather.dst_scratch].va_addr), self.scratch[gather.dst_scratch].size).cast("H")
-      for i, offset in enumerate(gather.offsets): dst[i] = 0 if offset < 0 else src[offset]
+      src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
+      dst = np.frombuffer(to_mv(int(self.scratch[gather.dst_scratch].va_addr), self.scratch[gather.dst_scratch].size), dtype=np.uint16)
+      if gather.offsets:
+        index = np.asarray(gather.offsets, dtype=np.intp)
+        valid = index >= 0
+        dst[:gather.count] = 0
+        dst[:gather.count][valid] = src[index[valid]]
+      else:
+        if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
+        index = np.full(gather.count, gather.base, dtype=np.intp)
+        for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
+        dst[:gather.count] = src[index]
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")

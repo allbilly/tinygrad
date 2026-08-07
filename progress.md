@@ -370,3 +370,39 @@ Verification after cleanup:
 - Non-slow Rockchip census: **18 passed, 5 skipped in 12.16 s**. Four skips are slow tests; `test_mul_naninf` records that RK3588 FP16 DPU EW MUL returns NaN for infinity operands rather than hiding it with a CPU fallback.
 - Full `ruff check .`: pass.
 - Full `mypy tinygrad/`: pass (216 files).
+
+---
+
+## 2026-08-07 — 256×256 affine-gather profile and optimization
+
+With a 180-second cap, Rockchip's FP16-tolerance `test_big_gemm` first passed in 110.55 s. The original `TestOps.test_big_gemm` completed in 136.96 s but missed its stricter 1e-4/1e-3 tolerance on 35 of 65,536 elements (maximum absolute difference 0.000977).
+
+The initial direct cold profile took 108.738 s and submitted 88 ioctls:
+
+| Component | Before | Share |
+|---|---:|---:|
+| render/lower | 86.511 s | 79.6% |
+| compile-time gather-offset expansion | 83.235 s | 76.5% |
+| runtime host gather/layout | 13.551 s | 12.5% |
+| other scheduler/program setup | 7.384 s | 6.8% |
+| DPU EW runner | 1.292 s | 1.2% |
+| 88 blocking ioctls | 0.614 s | 0.6% |
+
+The kernel has 11,254 logical EW operations over 65,536 output elements. The tested 64,000-element tile cap splits every operation in two, producing 22,508 DPU tasks. At the TwoProduct 256-task chain cap this is `ceil(22508/256) = 88` submits.
+
+Raising the tile cap is unsafe. A 65,536-element one-ioctl ADD (`WIDTH=8191`) completed with 99.8% wrong values, while 65,528 (`WIDTH=8190`) timed out in the ioctl. The NPU was reset after the probe and `_MAX_EW_ELEMS_FP16` remains 64,000.
+
+Large unmasked gathers are now encoded as a base plus affine `(destination divisor, range limit, source stride)` axes rather than a complete offset tuple. Masked/padded operations keep the general offset fallback. Runtime materializes both forms with bulk uint16 indexing; this performs only layout movement and integer address generation on the host, while every floating-point MUL/ADD remains on DPU EW.
+
+After the change:
+
+| Component | Before | After |
+|---|---:|---:|
+| direct cold realization | 108.738 s | **4.908 s** |
+| render/lower | 86.511 s | **0.229 s** |
+| gather-plan construction | 83.235 s | **0.005 s** |
+| runtime host gather/layout | 13.551 s | **1.664 s** |
+| serialized RKImage | 128 MiB of raw offsets | **475,838 bytes** |
+| DPU tasks / ioctls | 22,508 / 88 | **22,508 / 88** |
+
+The named Rockchip `test_big_gemm` now passes in 16.93 s including fresh pytest/xdist startup. The non-slow Rockchip census remains green (18 passed, 5 skipped), and full Ruff/mypy pass.

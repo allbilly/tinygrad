@@ -11,9 +11,9 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 12
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 13
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
-_SCRATCH, _GATHER = struct.Struct("<II"), struct.Struct("<HHI")
+_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, pad, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, pad, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
@@ -29,8 +29,10 @@ class RKScratch: size: int; alignment: int = 4096
 
 @dataclass(frozen=True)
 class RKGather:
-  """Materialize a compile-time index map into contiguous FP16 scratch before DPU execution."""
-  src_index: int; dst_scratch: int; offsets: tuple[int, ...]
+  """Materialize an affine or fallback index map into contiguous FP16 scratch."""
+  src_index: int; dst_scratch: int; count: int; base: int = 0
+  axes: tuple[tuple[int, int, int], ...] = ()  # dst divisor, range limit, source stride
+  offsets: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class RKFill: dst: RKArg; count: int
@@ -59,8 +61,11 @@ def encode_image(image:RKImage) -> bytes:
                                len(image.ew_ops), len(image.constants), flags))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in image.gathers:
-    out += _GATHER.pack(g.dst_scratch, g.src_index, len(g.offsets))
-    out += struct.pack(f"<{len(g.offsets)}i", *g.offsets)
+    fallback = bool(g.offsets)
+    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, int(fallback), len(g.axes), g.base)
+    if fallback: out += struct.pack(f"<{g.count}i", *g.offsets)
+    else:
+      for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
   for op in image.ew_ops:
     out += _EWOP.pack(int(op.dst.kind), 0, op.dst.index, int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
     out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
@@ -76,9 +81,14 @@ def decode_image(blob:bytes) -> RKImage:
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
   for _ in range(ngather):
-    dst_scratch, src_index, n_off = _GATHER.unpack_from(blob, off); off += _GATHER.size
-    offsets = struct.unpack_from(f"<{n_off}i", blob, off); off += 4*n_off
-    gathers.append(RKGather(src_index, dst_scratch, offsets))
+    dst_scratch, src_index, count, fallback, naxes, base = _GATHER.unpack_from(blob, off); off += _GATHER.size
+    if fallback not in (0, 1) or (fallback and naxes): raise ValueError("invalid RKGather")
+    if fallback:
+      offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
+      gathers.append(RKGather(src_index, dst_scratch, count, offsets=offsets))
+    else:
+      axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
+      gathers.append(RKGather(src_index, dst_scratch, count, base, axes))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, _, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
@@ -164,6 +174,23 @@ def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r: i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
+def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
+  if u.op is Ops.CONST: return int(u.arg), {}
+  if u.op is Ops.RANGE: return 0, {u: 1}
+  if u.op not in (Ops.ADD, Ops.SUB, Ops.MUL): return None
+  lhs, rhs = _affine_index(u.src[0]), _affine_index(u.src[1])
+  if lhs is None or rhs is None: return None
+  if u.op is Ops.MUL:
+    if lhs[1] and rhs[1]: return None
+    scale, affine = (lhs[0], rhs) if not lhs[1] else (rhs[0], lhs)
+    return affine[0]*scale, {r: coeff*scale for r, coeff in affine[1].items()}
+  sign = -1 if u.op is Ops.SUB else 1
+  coeffs = lhs[1].copy()
+  for r, coeff in rhs[1].items():
+    if (merged:=coeffs.get(r, 0) + sign*coeff): coeffs[r] = merged
+    elif r in coeffs: del coeffs[r]
+  return lhs[0] + sign*rhs[0], coeffs
+
 def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
   if any(r not in ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
@@ -176,6 +203,22 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
     if offsets[dst] < -1: raise RuntimeError("RKPLAN_REJECT:gather_index")
   if any(offset == -2 for offset in offsets): raise RuntimeError("RKPLAN_REJECT:gather_index")
   return tuple(offsets)
+
+def _gather_plan(src_index:int, dst_scratch:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> RKGather:
+  out_affine, load_affine = _affine_index(out_index), _affine_index(load_index)
+  if gate is None and out_affine is not None and load_affine is not None and out_affine[0] == 0:
+    expected = 1
+    axes:list[tuple[int, int, int]] = []
+    for r, dst_stride in sorted(out_affine[1].items(), key=lambda item: item[1]):
+      if dst_stride != expected or r.src[0].op is not Ops.CONST: break
+      limit = int(r.src[0].arg)
+      if limit <= 0: break
+      if (src_stride:=load_affine[1].get(r, 0)): axes.append((dst_stride, limit, src_stride))
+      expected *= limit
+    else:
+      if expected == count and all(r in out_affine[1] for r in load_affine[1]):
+        return RKGather(src_index, dst_scratch, count, load_affine[0], tuple(axes))
+  return RKGather(src_index, dst_scratch, count, offsets=_gather_offsets(out_index, load_index, gate, count))
 
 def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int) -> RKArg|float|tuple[UOp, UOp, UOp|None]|None:
   if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half: return _ew_leaf(u.src[0], out_index, count, oslot)
@@ -291,7 +334,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   leaves:dict[UOp, RKArg] = {}
   free:list[int] = []
   const_scratch:dict[bytes, int] = {}
-  gather_scratch:dict[tuple[int, tuple[int, ...]], int] = {}
+  gather_scratch:dict[tuple[int, int, int, tuple[tuple[int, int, int], ...], tuple[int, ...]], int] = {}
   gathers:list[RKGather] = []
   for expr in order:
     for src in expr.src:
@@ -310,12 +353,18 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     elif isinstance(leaf, RKArg): ret = leaf
     else:
       param, index, gate = leaf
-      offsets = _gather_offsets(out_index, index, gate, count)
-      if max(offsets, default=-1) >= int(param.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
-      key = param.arg.slot, offsets
+      plan = _gather_plan(param.arg.slot, 0, out_index, index, gate, count)
+      if plan.offsets: low, high = min(plan.offsets, default=0), max(plan.offsets, default=-1)
+      else:
+        low = high = plan.base
+        for _, limit, stride in plan.axes:
+          if stride < 0: low += (limit-1)*stride
+          else: high += (limit-1)*stride
+      if low < -1 or high >= int(param.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
+      key = param.arg.slot, plan.count, plan.base, plan.axes, plan.offsets
       if key not in gather_scratch:
         gather_scratch[key] = scratch_count
-        gathers.append(RKGather(param.arg.slot, scratch_count, offsets))
+        gathers.append(RKGather(param.arg.slot, scratch_count, plan.count, plan.base, plan.axes, plan.offsets))
         scratch_count += 1
       ret = RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
     leaves[u] = ret
