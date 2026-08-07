@@ -17,7 +17,7 @@ class TestRockchip(unittest.TestCase):
     rng = np.random.default_rng(seed)
     return Tensor(rng.uniform(-2, 2, size=shape).astype(np.float16))
 
-  def _check(self, expected_submits:int, out:Tensor, ref:np.ndarray, atol=1e-2, rtol=1e-2):
+  def _check(self, expected_submits:int, out:Tensor, ref:np.ndarray, atol=1e-6, rtol=1e-3):
     """Realize `out`, compare to `ref`, assert ioctl submit delta."""
     before = self.dev.submit_count
     got = out.realize().numpy()
