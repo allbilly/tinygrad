@@ -212,3 +212,20 @@ Inputs were realized before timing. `cold` is the first output `realize()` for t
 | **32** | **312.460** | **49.019** | **4** |
 
 The N=18 cold result is an outlier; warm scaling is monotonic. These are end-to-end output-realization wall times, not isolated ioctl hardware time.
+
+---
+
+## 2026-08-07 — EW PC-chain cap raised from 64 to 256
+
+The prior `_EW_CHAIN=64` was a conservative software cap, not a measured hardware limit. The compensated 32×32 GEMM has 249 dependent FP16 EW tasks, making it a direct chain test.
+
+| Software cap | ioctls | Median wall (20 inputs) | Result vs cap 64 |
+|---:|---:|---:|---:|
+| 64 | 4 | 50.581 ms | baseline |
+| **256** | **1** | **50.915 ms** | bit-exact 20/20 |
+
+Additional single-ioctl dependent ADD-chain probes passed through 256 tasks. The real compensated GEMM also produced identical outputs at caps 64, 128, and 256; random-seed tolerance misses were identical across caps and are numerical, not chain corruption.
+
+Set the OUT=2 `_EW_CHAIN=256`. The 32×32 compensated `test_medium_gemm` now fits in one ioctl. Wall time does not improve materially because emitting/patching 249 register bodies and the EW work dominate this small workload; the change removes submit boundaries rather than arithmetic.
+
+This does **not** apply to OUT=5 mtx512: a 256-task `test_add` chain timed out. Keep `_EW_CHAIN_FP32=64`; the raised cap is specifically for the contiguous FP16-output EW recipe used by compensated GEMM.

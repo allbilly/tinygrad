@@ -8,9 +8,10 @@ from tinygrad.renderer.rockchip import (RKBufferKind, RKEWOut, RockchipRenderer,
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
-# PC-chain up to `_EW_CHAIN` tasks/ioctl. No soft-reset on hot path.
+# OUT=2 PC-chain up to `_EW_CHAIN` tasks/ioctl; OUT=5 mtx512 stays at its tested 64-task cap.
 # Regcmd/task scratch floors match allbilly elementwise (64KiB / 16KiB), not 4096.
-_EW_CHAIN = 64
+_EW_CHAIN = 256
+_EW_CHAIN_FP32 = 64
 _PC_TAIL = 4
 _CMD_BUF_MIN = 65536
 _TASK_BUF_MIN = 16384
@@ -142,7 +143,7 @@ class RockchipProgram(Program['RockchipDevice']):
         RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend + off),
         RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend + off), n, op.ew_cfg, RKEWOut.FP32)
       bodies.append(patch_image(RKImage(self.image.target, (stage,)), address)[0])
-      if len(bodies) >= _EW_CHAIN: flush()
+      if len(bodies) >= _EW_CHAIN_FP32: flush()
     flush()
     if op.cvt_scratch is not None:
       mv = to_mv(int(self.scratch[op.cvt_scratch].va_addr), self.scratch[op.cvt_scratch].size)
