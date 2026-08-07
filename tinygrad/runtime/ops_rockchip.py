@@ -107,14 +107,16 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
     for gather in self.image.gathers:
-      src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
       dst = np.frombuffer(to_mv(int(self.scratch[gather.dst_scratch].va_addr), self.scratch[gather.dst_scratch].size), dtype=np.uint16)
-      if gather.offsets:
+      if gather.values: dst[:gather.count] = gather.values
+      elif gather.offsets:
+        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
         index = np.asarray(gather.offsets, dtype=np.intp)
         valid = index >= 0
         dst[:gather.count] = gather.fill_bits
         dst[:gather.count][valid] = src[index[valid]]
       else:
+        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
         if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
         index = np.full(gather.count, gather.base, dtype=np.intp)
         for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride

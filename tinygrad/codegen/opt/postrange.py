@@ -157,7 +157,7 @@ class Scheduler:
           "cannot have a GROUP_REDUCE inside another reduce")
 
       if opt.op is OptOps.UNROLL:
-        check(amt <= (64 if self.ren.target.device == "ROCKCHIP" else 32), "unroll exceeds backend limit")
+        check(amt <= (512 if self.ren.target.device == "ROCKCHIP" else 32), "unroll exceeds backend limit")
         check(rng.arg[-1] in {AxisType.GROUP_REDUCE, AxisType.REDUCE}, "unroll is for GROUP_REDUCE/REDUCE")
       if opt.op is OptOps.UPCAST:
         check((self.ren is not None and self.ren.target.device == "DSP") or amt <= 16, "don't upcast more than 16")

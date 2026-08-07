@@ -11,7 +11,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 14
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 15
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBiH"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, pad, dst_index, count
@@ -34,6 +34,10 @@ class RKGather:
   axes: tuple[tuple[int, int, int], ...] = ()  # dst divisor, range limit, source stride
   offsets: tuple[int, ...] = ()
   fill_bits: int = 0
+  values: tuple[int, ...] = ()  # compile-time FP16 vector, no source argument
+
+@dataclass(frozen=True)
+class RKStatic: expr: UOp
 
 @dataclass(frozen=True)
 class RKFill: dst: RKArg; count: int
@@ -62,9 +66,10 @@ def encode_image(image:RKImage) -> bytes:
                                len(image.ew_ops), len(image.constants), flags))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in image.gathers:
-    fallback = bool(g.offsets)
-    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, int(fallback), len(g.axes), g.base, g.fill_bits)
-    if fallback: out += struct.pack(f"<{g.count}i", *g.offsets)
+    kind = 2 if g.values else 1 if g.offsets else 0
+    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, kind, len(g.axes), g.base, g.fill_bits)
+    if kind == 2: out += struct.pack(f"<{g.count}H", *g.values)
+    elif kind == 1: out += struct.pack(f"<{g.count}i", *g.offsets)
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
   for op in image.ew_ops:
@@ -82,9 +87,12 @@ def decode_image(blob:bytes) -> RKImage:
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
   for _ in range(ngather):
-    dst_scratch, src_index, count, fallback, naxes, base, fill_bits = _GATHER.unpack_from(blob, off); off += _GATHER.size
-    if fallback not in (0, 1) or (fallback and naxes): raise ValueError("invalid RKGather")
-    if fallback:
+    dst_scratch, src_index, count, kind, naxes, base, fill_bits = _GATHER.unpack_from(blob, off); off += _GATHER.size
+    if kind not in (0, 1, 2) or (kind and naxes): raise ValueError("invalid RKGather")
+    if kind == 2:
+      values = struct.unpack_from(f"<{count}H", blob, off); off += 2*count
+      gathers.append(RKGather(src_index, dst_scratch, count, fill_bits=fill_bits, values=values))
+    elif kind == 1:
       offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
       gathers.append(RKGather(src_index, dst_scratch, count, offsets=offsets, fill_bits=fill_bits))
     else:
@@ -175,6 +183,28 @@ def _eval_int(u:UOp, env:dict[UOp, int]) -> int:
   if u.op is Ops.OR: return _eval_int(u.src[0], env) | _eval_int(u.src[1], env)
   raise RuntimeError(f"RKPLAN_REJECT:unsupported_index {u.op.name}")
 
+_STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.WHERE,
+               Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.MAX}
+def _is_static_expr(u:UOp) -> bool: return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
+
+def _eval_static(u:UOp, env:dict[UOp, int]) -> float|bool:
+  if u.op is Ops.CONST: return u.arg
+  if u.op is Ops.RANGE: return env[u]
+  if u.op is Ops.CAST: return _eval_static(u.src[0], env)
+  if u.op is Ops.WHERE: return _eval_static(u.src[1] if bool(_eval_static(u.src[0], env)) else u.src[2], env)
+  lhs = _eval_static(u.src[0], env)
+  if u.op is Ops.RECIPROCAL: return 1.0 / float(lhs)
+  rhs = _eval_static(u.src[1], env)
+  if u.op is Ops.ADD: return float(lhs) + float(rhs)
+  if u.op is Ops.MUL: return float(lhs) * float(rhs)
+  if u.op is Ops.SUB: return float(lhs) - float(rhs)
+  if u.op is Ops.MAX: return max(float(lhs), float(rhs))
+  if u.op is Ops.CMPLT: return lhs < rhs
+  if u.op is Ops.CMPNE: return lhs != rhs
+  if u.op is Ops.AND: return bool(lhs) and bool(rhs)
+  if u.op is Ops.OR: return bool(lhs) or bool(rhs)
+  raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+
 def _index_ranges(index:UOp) -> list[UOp]: return [u for u in index.toposort() if u.op is Ops.RANGE]
 
 def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
@@ -192,6 +222,19 @@ def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
     envs = [{**env, r: i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
+
+def _static_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
+  ranges = _index_ranges(out_index)
+  if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
+  values:list[int|None] = [None] * count
+  for env in _iter_range_env(ranges):
+    dst = _eval_int(out_index, env)
+    if not 0 <= dst < count: raise RuntimeError("RKPLAN_REJECT:static_index")
+    bits = struct.unpack("<H", struct.pack("<e", float(_eval_static(expr, env))))[0]
+    if values[dst] is not None and values[dst] != bits: raise RuntimeError("RKPLAN_REJECT:static_index")
+    values[dst] = bits
+  if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")
+  return tuple(x for x in values if x is not None)
 
 def _affine_index(u:UOp) -> tuple[int, dict[UOp, int]]|None:
   if u.op is Ops.CONST: return int(u.arg), {}
@@ -239,7 +282,8 @@ def _gather_plan(src_index:int, dst_scratch:int, out_index:UOp, load_index:UOp, 
         return RKGather(src_index, dst_scratch, count, load_affine[0], tuple(axes))
   return RKGather(src_index, dst_scratch, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
-def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int) -> RKArg|float|tuple[UOp, UOp, UOp|None, int]|None:
+def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int) -> RKArg|RKStatic|float|tuple[UOp, UOp, UOp|None, int]|None:
+  if u.op is Ops.RECIPROCAL and u.dtype.scalar() is dtypes.half and _is_static_expr(u): return RKStatic(u)
   if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half: return _ew_leaf(u.src[0], out_index, count, oslot)
   if u.op is Ops.CONST and u.dtype.scalar() is dtypes.half: return float(u.arg)
   if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM:
@@ -333,11 +377,14 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if val.op is Ops.CONST and val.dtype.scalar() is dtypes.half:
     return RKImage(RKTarget.RK3588, constants=struct.pack("<e", float(val.arg)), fill=RKFill(out, count))
   supported = RockchipRenderer.code_for_op
-  if any(u.op is Ops.REDUCE or (u.op is Ops.CAST and u.dtype.scalar() is not dtypes.half) or
+  static_nodes:set[UOp] = set()
+  for u in uops:
+    if isinstance((leaf:=_ew_leaf(u, out_index, count, oslot)), RKStatic): static_nodes.update(leaf.expr.toposort())
+  if any(u not in static_nodes and (u.op is Ops.REDUCE or (u.op is Ops.CAST and u.dtype.scalar() is not dtypes.half) or
          (u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and _ew_leaf(u, out_index, count, oslot) is None) or
-         (u.op in GroupOp.ALU and u.dtype.scalar() in (dtypes.float, dtypes.float32, dtypes.float64)) for u in uops):
+         (u.op in GroupOp.ALU and u.dtype.scalar() in (dtypes.float, dtypes.float32, dtypes.float64))) for u in uops):
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
-  if any(u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
+  if any(u not in static_nodes and u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
   chain_limit = 512
   relu_input = _relu_operand(val)
@@ -369,6 +416,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   leaves:dict[UOp, RKArg] = {}
   free:list[int] = []
   const_scratch:dict[bytes, int] = {}
+  static_scratch:dict[tuple[int, ...], int] = {}
   gather_scratch:dict[tuple[int, int, int, tuple[tuple[int, int, int], ...], tuple[int, ...], int], int] = {}
   gathers:list[RKGather] = []
   for expr in order:
@@ -385,6 +433,13 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     leaf = _ew_leaf(u, out_index, count, oslot)
     assert leaf is not None
     if isinstance(leaf, float): ret = RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", leaf)])
+    elif isinstance(leaf, RKStatic):
+      static = _static_vector(out_index, leaf.expr, count)
+      if static not in static_scratch:
+        static_scratch[static] = scratch_count
+        gathers.append(RKGather(0, scratch_count, count, values=static))
+        scratch_count += 1
+      ret = RKArg(RKBufferKind.SCRATCH, static_scratch[static])
     elif isinstance(leaf, RKArg): ret = leaf
     else:
       param, index, gate, fill_bits = leaf
@@ -468,6 +523,8 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
 
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.ADD, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
+  (UPat(Ops.MUL, dtypes.float, name="x"), lambda x: x.src[0].cast(dtypes.half).alu(Ops.MUL, x.src[1].cast(dtypes.half))),
+  (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.

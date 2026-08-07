@@ -138,6 +138,12 @@ class TestRockchip(unittest.TestCase):
     ref = torch.nn.functional.max_pool2d(torch.from_numpy(xn), kernel_size=(2, 2)).numpy()
     self._check(1, Tensor(xn).max_pool2d(kernel_size=(2, 2)), ref)
 
+  def test_avg_pool2d_valid_count_submit(self):
+    xn = np.arange(16, dtype=np.float16).reshape(1, 1, 4, 4)
+    args = dict(kernel_size=(3, 3), padding=1, count_include_pad=False)
+    ref = torch.nn.functional.avg_pool2d(torch.from_numpy(xn), **args).numpy()
+    self._check(1, Tensor(xn).avg_pool2d(**args), ref)
+
   # ---- GEMM / MATMUL (from test_ops, fp16 tol) ----
   def test_matmul_simple(self):
     helper_test_op([(4), (4,4)], lambda x,y: x.matmul(y), Tensor.dot, **_FP16)
@@ -283,6 +289,28 @@ class TestRockchipMaxPoolOps(unittest.TestCase):
 for _name, _test in vars(_test_ops.TestOps).items():
   if _name.startswith("test_max_pool2d") and _name not in ("test_max_pool2d_padding_int", "test_max_pool2d_return_indices"):
     setattr(TestRockchipMaxPoolOps, _name, _test)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipAvgPoolOps(unittest.TestCase):
+  """Every FP16 AvgPool case from test_ops at the test_gemm_fp16 tolerance."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def test_avg_pool3d(self):
+    # PyTorch CPU does not implement FP16 AvgPool3D; use its FP32 result cast to the FP16 device contract.
+    _fp16_fp32_golden_test_op([(1,1,16,16,16)],
+      lambda x: torch.nn.functional.avg_pool3d(x, kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False),
+      lambda x: Tensor.avg_pool2d(x, kernel_size=(8,8,8), stride=5, padding=1, count_include_pad=False), forward_only=True)
+
+# Keep the FP16 AvgPool census synchronized as test_ops grows.
+for _name, _test in vars(_test_ops.TestOps).items():
+  if (_name.startswith("test_avg_pool") and _name != "test_avg_pool3d") or _name == "test_global_avg_pool2d":
+    setattr(TestRockchipAvgPoolOps, _name, _test)
 
 if __name__ == "__main__":
   unittest.main()
