@@ -78,5 +78,14 @@ class TestRockchip(unittest.TestCase):
     self._check(1, a * -math.inf, (a.numpy().astype(np.float32) * np.float32(-np.inf)).astype(np.float16))
     self._check(1, a * math.nan, (a.numpy().astype(np.float32) * np.float32(np.nan)).astype(np.float16))
 
+  # ---- GEMM ----
+  def test_small_gemm(self):
+    a, b = self._half((8, 8), 20), self._half((8, 8), 21)
+    An, Bn = a.numpy(), b.numpy()
+    ref = np.zeros((8, 8), dtype=np.float16)
+    for k in range(8):
+      ref = (ref + (An[:, k, None] * Bn[None, k, :])).astype(np.float16)
+    self._check(1, a @ b, ref)
+
 if __name__ == "__main__":
   unittest.main()

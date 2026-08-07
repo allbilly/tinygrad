@@ -67,11 +67,18 @@ class RockchipProgram(Program['RockchipDevice']):
     finally: self.dev._gpu_free(cmd); self.dev._gpu_free(task)
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
-    # Scalar EW: image.constants holds one fp16; splat into scratch[0] (const operand buffer).
+    # Scalar EW: image.constants holds packed fp16s; splat each into scratch[i].
     if self.image.constants and self.scratch:
-      val = struct.unpack_from("<e", self.image.constants, 0)[0]
-      n = self.scratch[0].size // 2
-      ctypes.memmove(int(self.scratch[0].va_addr), struct.pack("<e", val) * n, n * 2)
+      for i in range(len(self.image.constants) // 2):
+        if i >= len(self.scratch): break
+        val = struct.unpack_from("<e", self.image.constants, i * 2)[0]
+        n = self.scratch[i].size // 2
+        ctypes.memmove(int(self.scratch[i].va_addr), struct.pack("<e", val) * n, n * 2)
+    # Gather: scratch[dst][i] = arg[src][offsets[i]] before EW.
+    for g in self.image.gathers:
+      src = to_mv(int(bufs[g.src_index].va_addr), bufs[g.src_index].size).cast('H')
+      dst = to_mv(int(self.scratch[g.dst_scratch].va_addr), self.scratch[g.dst_scratch].size).cast('H')
+      for i, off in enumerate(g.offsets): dst[i] = src[off]
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")

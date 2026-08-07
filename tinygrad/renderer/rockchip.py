@@ -10,9 +10,10 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 3, 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 4, 1
 _HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHIIII")
 _RELOC, _SCRATCH = struct.Struct("<HHBBIqIH"), struct.Struct("<II")
+_GATHER = struct.Struct("<BBHI")  # src_kind, dst_scratch, src_index, n_offsets
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum): DPU = 1
@@ -31,9 +32,14 @@ class RKStage:
   engine: RKEngine; commands: tuple[int, ...]; relocs: tuple[RKReloc, ...] = (); flags: int = 0
 
 @dataclass(frozen=True)
+class RKGather:
+  src_index: int; dst_scratch: int; offsets: tuple[int, ...]
+
+@dataclass(frozen=True)
 class RKImage:
   target: RKTarget; stages: tuple[RKStage, ...]
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""; version: int = RKIMAGE_VERSION
+  gathers: tuple[RKGather, ...] = ()
 
 @dataclass(frozen=True)
 class RKArg: kind: RKBufferKind; index: int; addend: int = 0
@@ -44,17 +50,18 @@ def encode_image(image:RKImage) -> bytes:
     c0, r0 = len(cmds), len(relocs); cmds.extend(s.commands); relocs.extend(s.relocs)
     rows.append((int(s.engine), s.flags, 0, c0, len(s.commands), r0, len(s.relocs)))
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(rows), len(relocs),
-                               len(image.scratch), 0, len(cmds), len(image.constants), 0))
+                               len(image.scratch), len(image.gathers), len(cmds), len(image.constants), 0))
   for row in rows: out += _STAGE.pack(*row)
   for r in relocs: out += _RELOC.pack(r.stage, r.word, int(r.kind), r.shift, r.index, r.addend, r.mask, r.field_shift)
-  for s in image.scratch: out += _SCRATCH.pack(s.size, s.alignment)
+  for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
+  for g in image.gathers:
+    out += _GATHER.pack(int(RKBufferKind.ARG), g.dst_scratch, g.src_index, len(g.offsets))
+    out += struct.pack(f"<{len(g.offsets)}i", *g.offsets)
   return bytes(out) + (struct.pack(f"<{len(cmds)}Q", *cmds) if cmds else b"") + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
-  magic, ver, target, nstage, nreloc, nscratch, res, ncmd, nconst, res2 = _HEADER.unpack_from(blob)
-  if magic != RKIMAGE_MAGIC or res or res2: raise ValueError("invalid RKImage header")
-  if _HEADER.size + nstage*_STAGE.size + nreloc*_RELOC.size + nscratch*_SCRATCH.size + ncmd*8 + nconst != len(blob):
-    raise ValueError("invalid RKImage size")
+  magic, ver, target, nstage, nreloc, nscratch, ngather, ncmd, nconst, res2 = _HEADER.unpack_from(blob)
+  if magic != RKIMAGE_MAGIC or res2: raise ValueError("invalid RKImage header")
   off = _HEADER.size
   rows = [_STAGE.unpack_from(blob, off+i*_STAGE.size) for i in range(nstage)]; off += nstage*_STAGE.size
   relocs = []
@@ -62,12 +69,19 @@ def decode_image(blob:bytes) -> RKImage:
     st, word, kind, shift, index, addend, mask, fshift = _RELOC.unpack_from(blob, off); off += _RELOC.size
     relocs.append(RKReloc(st, word, RKBufferKind(kind), index, addend, shift, mask, fshift))
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
-  cmds = struct.unpack_from(f"<{ncmd}Q", blob, off) if ncmd else (); off += ncmd*8
+  gathers:list[RKGather] = []
+  for _ in range(ngather):
+    src_kind, dst_scratch, src_index, n_off = _GATHER.unpack_from(blob, off); off += _GATHER.size
+    if src_kind != int(RKBufferKind.ARG): raise ValueError("invalid RKGather src kind")
+    offs = struct.unpack_from(f"<{n_off}i", blob, off); off += 4 * n_off
+    gathers.append(RKGather(src_index, dst_scratch, offs))
+  if off + ncmd * 8 + nconst != len(blob): raise ValueError("invalid RKImage size")
+  cmds = struct.unpack_from(f"<{ncmd}Q", blob, off) if ncmd else (); off += ncmd * 8
   stages = []
   for i,(eng,flags,r0,c0,clen,rstart,rlen) in enumerate(rows):
     if r0 or c0+clen > ncmd or rstart+rlen > nreloc: raise ValueError("invalid RKImage stage")
     stages.append(RKStage(RKEngine(eng), cmds[c0:c0+clen], tuple(relocs[rstart:rstart+rlen]), flags))
-  return RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], ver)
+  return RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], ver, tuple(gathers))
 
 def patch_image(image:RKImage, address:Callable[[RKBufferKind,int],int]) -> tuple[tuple[int,...],...]:
   patched = [list(s.commands) for s in image.stages]
@@ -80,11 +94,8 @@ def patch_image(image:RKImage, address:Callable[[RKBufferKind,int],int]) -> tupl
   return tuple(map(tuple, patched))
 
 _DPU, _RDMA, _PC = 0x1001, 0x2001, 0x81
-# EW_CFG from allbilly/rk3588 examples/elementwise.py
-_EW = {Ops.ADD: 0x108002c0 | (2 << 16), Ops.MUL: 0x108002c0 | (1 << 2) | (1 << 8)}
-# Non-EW half ALU / mask ops → reject (broadcast/pad/logaddexp must not false-accept).
-_FORBIDDEN = {Ops.SUB, Ops.FDIV, Ops.MAX, Ops.WHERE, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
-              Ops.AND, Ops.OR, Ops.XOR, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT}
+# DPU EW_CFG for ops listed in RockchipRenderer.code_for_op (allbilly/rk3588 elementwise.py).
+_EW_CFG = {Ops.ADD: 0x108002c0 | (2 << 16), Ops.MUL: 0x108002c0 | (1 << 2) | (1 << 8)}
 def _cmd(t,r,v): return ((t&0xffff)<<48)|((v&0xffffffff)<<16)|(r&0xffff)
 
 def emit_ew_stage(stage:int, dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
@@ -134,41 +145,154 @@ def _root_param(u:UOp) -> UOp|None:
     u = u.src[0]
   return u
 
+def _eval_int(u:UOp, env:dict[UOp, int]) -> int:
+  if u.op is Ops.CONST: return int(u.arg)
+  if u.op is Ops.RANGE: return env[u]
+  if u.op is Ops.ADD: return _eval_int(u.src[0], env) + _eval_int(u.src[1], env)
+  if u.op is Ops.MUL: return _eval_int(u.src[0], env) * _eval_int(u.src[1], env)
+  if u.op is Ops.SUB: return _eval_int(u.src[0], env) - _eval_int(u.src[1], env)
+  raise RuntimeError(f"RKPLAN_REJECT:unsupported_index {u.op.name}")
+
+def _index_ranges(ix:UOp) -> list[UOp]:
+  return [u for u in ix.toposort() if u.op is Ops.RANGE]
+
+def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
+  """Cartesian product of RANGE domains (src[0]=limit CONST; optional parent RANGEs in src[1:])."""
+  if not ranges: return [{}]
+  order:list[UOp] = []
+  seen:set[UOp] = set()
+  def add(r:UOp) -> None:
+    if r in seen: return
+    for s in r.src[1:]:
+      if s.op is Ops.RANGE: add(s)
+    seen.add(r); order.append(r)
+  for r in ranges: add(r)
+  envs:list[dict[UOp, int]] = [{}]
+  for r in order:
+    if r.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:unsupported_index")
+    lim = int(r.src[0].arg)
+    envs = [{**e, r: i} for e in envs for i in range(lim)]
+  return envs
+
+def _gather_offsets(out_index:UOp, load_ix:UOp, count:int) -> tuple[int, ...]:
+  ranges = _index_ranges(out_index)
+  for r in _index_ranges(load_ix):
+    if r not in ranges: raise RuntimeError("RKPLAN_REJECT:gather_index")
+  offsets = [-1] * count
+  for env in _iter_range_env(ranges):
+    dst, src = _eval_int(out_index, env), _eval_int(load_ix, env)
+    if not (0 <= dst < count) or src < 0: raise RuntimeError("RKPLAN_REJECT:gather_index")
+    offsets[dst] = src
+  if any(o < 0 for o in offsets): raise RuntimeError("RKPLAN_REJECT:gather_index")
+  return tuple(offsets)
+
+def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int) -> RKArg|float|tuple[UOp, UOp]|None:
+  if u.op is Ops.CONST and u.dtype.scalar() is dtypes.half: return float(u.arg)
+  if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM:
+    p, ix = u.src[0].src[0], u.src[0].src[1]
+    if p.dtype.scalar() is not dtypes.half or p.arg.slot == oslot or p.src[0].op is not Ops.CONST: return None
+    if ix.key == out_index.key and int(p.src[0].arg) == count: return RKArg(RKBufferKind.ARG, p.arg.slot)
+    return (p, ix)
+  return None
+
+def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, supported:dict) -> list[str]:
+  bad:list[str] = []
+  for i, u in enumerate(uops):
+    if u.op in (Ops.CONST, Ops.PARAM, Ops.RANGE, Ops.END, Ops.SINK, Ops.STORE, Ops.INDEX): continue
+    if u.op in (Ops.ADD, Ops.MUL) and u.dtype.scalar() is dtypes.int: continue  # address math
+    if u.op in supported and u.dtype.scalar() is dtypes.half: continue
+    if u.op is Ops.LOAD:
+      if _ew_leaf(u, out_index, count, oslot) is None: bad.append(f"{i}:{u.op.name}")
+      continue
+    if u.op is Ops.CAST or u.op is Ops.REDUCE or u.op in GroupOp.ALU:
+      bad.append(f"{i}:{u.op.name}")
+  return bad
+
 def lower_ew(uops:list[UOp]) -> RKImage:
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
   if (not stores or any(p is None or p.dtype.scalar() is not dtypes.half or p.src[0].op is not Ops.CONST for p in outs) or
       len({p.arg.slot for p in outs}) != 1): raise RuntimeError("RKPLAN_REJECT:unsupported_graph")  # type: ignore[union-attr]
-  out = outs[0]; assert out is not None
-  count, oslot = int(out.src[0].arg), out.arg.slot
-  # Pure half EW only: reject CAST / float ALU / REDUCE (stops matmul ACC-loop false-accept as EW MUL).
+  out_p = outs[0]; assert out_p is not None
+  count, oslot = int(out_p.src[0].arg), out_p.arg.slot
+  store = stores[0]
+  if store.src[0].op is not Ops.INDEX or count <= 0: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+  out_index, out, val = store.src[0].src[1], RKArg(RKBufferKind.ARG, oslot), store.src[1]
+  # Pure half EW only: reject CAST / float ALU / REDUCE; half ALU must be in code_for_op.
+  supported = RockchipRenderer.code_for_op
   if any(u.op is Ops.CAST or u.op is Ops.REDUCE or
          (u.op in GroupOp.ALU and u.dtype.scalar() in (dtypes.float, dtypes.float32, dtypes.float64)) for u in uops):
-    raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-  if any(u.op in _FORBIDDEN and u.dtype.scalar() is dtypes.half for u in uops):
-    raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-  ew_ops = {u.op for u in uops if u.op in _EW and u.dtype.scalar() is dtypes.half}
-  # After float→half demote, unrolled matmul is half MUL+ADD MAC tree (not a single EW op).
-  if len(ew_ops) != 1: raise RuntimeError(f"RKPLAN_REJECT:mixed_ew_ops:{sorted(o.name for o in ew_ops)}")
-  op = next(iter(ew_ops))
-  # Contiguous same-shape vector LOADs; optional ConstFloat scalar operand (test_scalar_mul / mul_naninf).
-  ins:list[int] = []
-  const_vals:list[float] = []
-  for u in uops:
-    if u.op is op and u.dtype.scalar() is dtypes.half:
-      for s in u.src:
-        if s.op is Ops.CONST: const_vals.append(float(s.arg))
-    if u.op is not Ops.LOAD: continue
-    p = _root_param(u)
-    if p is None or p.dtype.scalar() is not dtypes.half or p.arg.slot == oslot: continue
-    if p.src[0].op is not Ops.CONST or int(p.src[0].arg) != count: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-    if p.arg.slot not in ins: ins.append(p.arg.slot)
-  if count <= 0: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
-  out_arg = RKArg(RKBufferKind.ARG, oslot)
-  if len(ins) >= 2: return emit_ew_chain(out_arg, tuple(RKArg(RKBufferKind.ARG, s) for s in ins), count, _EW[op])
-  if len(ins) == 1 and const_vals:
-    return emit_ew_const(out_arg, RKArg(RKBufferKind.ARG, ins[0]), count, _EW[op], const_vals[0])
-  raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+    bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
+    raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
+  if any(u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
+    bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
+    raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
+  # Schedule half code_for_op tree; leaves = same-index LOAD, gather LOAD, or scalar CONST.
+  order:list[UOp] = []
+  def visit(u:UOp) -> bool:
+    if u.op in supported and u.dtype.scalar() is dtypes.half:
+      if not all(visit(s) for s in u.src): return False
+      if u not in order: order.append(u)
+      return True
+    return _ew_leaf(u, out_index, count, oslot) is not None
+  if not visit(val) or not order or order[-1] is not val:
+    bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
+    raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
+  uses = {u: sum(s is u for n in order for s in n.src) for u in order}
+  values:dict[UOp, RKArg] = {}
+  free:list[int] = []
+  const_scratch:dict[bytes, int] = {}  # fp16 bits key (nan-safe)
+  gather_scratch:dict[tuple[int, tuple[int, ...]], int] = {}
+  gathers:list[RKGather] = []
+  # Const scratches first (runtime splats constants[i] → scratch[i]); gathers after.
+  for expr in order:
+    for s in expr.src:
+      leaf = _ew_leaf(s, out_index, count, oslot)
+      if isinstance(leaf, float):
+        k = struct.pack("<e", leaf)
+        if k not in const_scratch: const_scratch[k] = len(const_scratch)
+  scratch_count = len(const_scratch)
+  stages:list[RKStage] = []
+  def operand(s:UOp) -> RKArg:
+    nonlocal scratch_count
+    if s in values: return values[s]
+    leaf = _ew_leaf(s, out_index, count, oslot)
+    assert leaf is not None
+    if isinstance(leaf, float): return RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", leaf)])
+    if isinstance(leaf, RKArg): return leaf
+    p, ix = leaf
+    offsets = _gather_offsets(out_index, ix, count)
+    if max(offsets) >= int(p.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
+    key = (p.arg.slot, offsets)
+    if key not in gather_scratch:
+      gather_scratch[key] = scratch_count
+      gathers.append(RKGather(p.arg.slot, scratch_count, offsets))
+      scratch_count += 1
+    return RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
+  for expr in order:
+    lhs, rhs = operand(expr.src[0]), operand(expr.src[1])
+    if expr is val: dst = out
+    elif (reuse:=next((values[x] for x in expr.src if x in values and uses[x] == 1 and
+                       values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
+    else:
+      slot = free.pop() if free else scratch_count
+      if slot == scratch_count: scratch_count += 1
+      dst = RKArg(RKBufferKind.SCRATCH, slot)
+    stages.append(emit_ew_stage(len(stages), dst, lhs, rhs, count, _EW_CFG[expr.op]))
+    values[expr] = dst
+    for dep in expr.src:
+      if dep in uses:
+        uses[dep] -= 1
+        arg = values[dep]
+        if uses[dep] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
+  nbytes = ((count + 7) // 8 * 8) * 2
+  constants = b""
+  if const_scratch:
+    by = {slot: bits for bits, slot in const_scratch.items()}
+    constants = b"".join(by[i] if i in by else struct.pack("<e", 0.0)
+                         for i in range(max(const_scratch.values()) + 1))
+  return RKImage(RKTarget.RK3588, tuple(stages), tuple(RKScratch(nbytes) for _ in range(scratch_count)),
+                 constants, gathers=tuple(gathers))
 
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
@@ -195,6 +319,8 @@ def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
+  # Keys feed codegen supported_ops (decomp); must match DPU EW ops in _EW_CFG.
+  code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
