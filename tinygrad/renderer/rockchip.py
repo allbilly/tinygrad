@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, struct
+import base64, os, struct
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable
@@ -10,15 +10,27 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 5, 1
+RKIMAGE_MAGIC, RKIMAGE_VERSION, RK_STAGE_RESET = b"RKIM", 11, 1
 _HEADER, _STAGE = struct.Struct("<4sHHHHHHIII"), struct.Struct("<BBHIIII")
 _RELOC, _SCRATCH = struct.Struct("<HHBBIqIH"), struct.Struct("<II")
-_GATHER = struct.Struct("<BBHI")  # src_kind, dst_scratch, src_index, n_offsets
-_HOSTSUM = struct.Struct("<BBHI")  # dst_kind, pad, dst_index, n_srcs; followed by n_srcs u16 scratch idxs + u32 count
+_GATHER = struct.Struct("<BHHI")  # itemsize, dst_scratch, src_index, n_offsets
+_FILL = struct.Struct("<BBHI")  # dst_kind, pad, dst_index, count
+_PACK = struct.Struct("<BHHI")  # itemsize, dst_scratch, src_index, count
+_HALFOUT = struct.Struct("<HBBHI")  # src_scratch, dst_kind, pad, dst_index, count
+_EWOP = struct.Struct("<BBHIIII")  # dst_kind, pad, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
+_EWOP2 = struct.Struct("<III")  # count, ew_cfg, dst_scratch_for_cvt (-1u32 = none)
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKEngine(IntEnum): DPU = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1; CONSTANT = 2
+# DPU DATA_FORMAT OUT_PRECISION: 2=fp16 out, 5=fp32 out. Env ROCKCHIP_EW_OUT=fp16|fp32 (default fp32).
+class RKEWOut(IntEnum): FP16 = 2; FP32 = 5
+
+def ew_out_precision() -> RKEWOut:
+  v = os.getenv("ROCKCHIP_EW_OUT", "fp32").strip().lower()
+  if v in ("fp16", "half", "2"): return RKEWOut.FP16
+  if v in ("fp32", "float", "5"): return RKEWOut.FP32
+  raise ValueError(f"ROCKCHIP_EW_OUT={v!r}; expected fp16|fp32")
 
 @dataclass(frozen=True)
 class RKReloc:
@@ -35,70 +47,112 @@ class RKStage:
 @dataclass(frozen=True)
 class RKGather:
   src_index: int; dst_scratch: int; offsets: tuple[int, ...]
+  itemsize: int = 2  # 2=half ARG, 4=float ARG (cast to half at use)
 
 @dataclass(frozen=True)
-class RKHostSum:
-  """Sum half scratch vectors in float32 into dst (gemm ADD reduce; half EW ADD loses too much)."""
-  dst: RKArg; srcs: tuple[int, ...]; count: int
+class RKPack:
+  """Copy contiguous half ARG[src] into EW scratch (slot-packed OUT=5 / contig OUT=2)."""
+  src_index: int; dst_scratch: int; count: int
+  itemsize: int = 2
+
+@dataclass(frozen=True)
+class RKFill:
+  dst: RKArg; count: int
+
+@dataclass(frozen=True)
+class RKHalfOut:
+  """Copy EW result scratch → contiguous half ARG."""
+  src_scratch: int; dst: RKArg; count: int
+
+@dataclass(frozen=True)
+class RKEWOp:
+  """One logical EW; runtime expands per image.out_precision."""
+  dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int
+  # OUT=5 only: after chunks, convert this scratch f32→half in-slot.
+  cvt_scratch: int | None = None
 
 @dataclass(frozen=True)
 class RKImage:
-  target: RKTarget; stages: tuple[RKStage, ...]
+  target: RKTarget; stages: tuple[RKStage, ...] = ()
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""; version: int = RKIMAGE_VERSION
-  gathers: tuple[RKGather, ...] = (); host_sum: RKHostSum|None = None
+  gathers: tuple[RKGather, ...] = (); packs: tuple[RKPack, ...] = (); fill: RKFill|None = None
+  ew_ops: tuple[RKEWOp, ...] = (); half_out: RKHalfOut|None = None
+  out_precision: RKEWOut = RKEWOut.FP32
+
+  # legacy alias used by runtime/encode
+  @property
+  def fills(self) -> RKFill|None: return object.__getattribute__(self, "fill")
 
 @dataclass(frozen=True)
-class RKArg: kind: RKBufferKind; index: int; addend: int = 0
+class RKArg: kind: RKBufferKind; index: int; addend: int = 0; itemsize: int = 2
 
 def encode_image(image:RKImage) -> bytes:
-  cmds:list[int] = []; relocs:list[RKReloc] = []; rows:list[tuple] = []
-  for s in image.stages:
-    c0, r0 = len(cmds), len(relocs); cmds.extend(s.commands); relocs.extend(s.relocs)
-    rows.append((int(s.engine), s.flags, 0, c0, len(s.commands), r0, len(s.relocs)))
-  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(rows), len(relocs),
-                               len(image.scratch), len(image.gathers), len(cmds), len(image.constants),
-                               1 if image.host_sum is not None else 0))
-  for row in rows: out += _STAGE.pack(*row)
-  for r in relocs: out += _RELOC.pack(r.stage, r.word, int(r.kind), r.shift, r.index, r.addend, r.mask, r.field_shift)
+  # flags: bit0=fill, bit1=half_out, bits8-15=out_precision (2 or 5)
+  flags = (1 if image.fill is not None else 0) | (2 if image.half_out is not None else 0) | (int(image.out_precision) << 8)
+  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), 0, 0,
+                               len(image.scratch), len(image.gathers), 0, len(image.constants), flags))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in image.gathers:
-    out += _GATHER.pack(int(RKBufferKind.ARG), g.dst_scratch, g.src_index, len(g.offsets))
+    out += _GATHER.pack(g.itemsize, g.dst_scratch, g.src_index, len(g.offsets))
     out += struct.pack(f"<{len(g.offsets)}i", *g.offsets)
-  if image.host_sum is not None:
-    hs = image.host_sum
-    out += _HOSTSUM.pack(int(hs.dst.kind), 0, hs.dst.index, len(hs.srcs))
-    out += struct.pack(f"<{len(hs.srcs)}H", *hs.srcs) + struct.pack("<I", hs.count)
-  return bytes(out) + (struct.pack(f"<{len(cmds)}Q", *cmds) if cmds else b"") + image.constants
+  out += struct.pack("<H", len(image.packs))
+  for p in image.packs: out += _PACK.pack(p.itemsize, p.dst_scratch, p.src_index, p.count)
+  out += struct.pack("<H", len(image.ew_ops))
+  for op in image.ew_ops:
+    out += _EWOP.pack(int(op.dst.kind), 0, op.dst.index, int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
+    out += _EWOP2.pack(op.count, op.ew_cfg, 0xffffffff if op.cvt_scratch is None else op.cvt_scratch)
+    out += struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
+  if image.fill is not None:
+    f = image.fill
+    out += _FILL.pack(int(f.dst.kind), 0, f.dst.index, f.count)
+  if image.half_out is not None:
+    h = image.half_out
+    out += _HALFOUT.pack(h.src_scratch, int(h.dst.kind), 0, h.dst.index, h.count)
+  return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
-  magic, ver, target, nstage, nreloc, nscratch, ngather, ncmd, nconst, has_hostsum = _HEADER.unpack_from(blob)
-  if magic != RKIMAGE_MAGIC or has_hostsum not in (0, 1): raise ValueError("invalid RKImage header")
+  magic, ver, target, nstage, nreloc, nscratch, ngather, ncmd, nconst, flags = _HEADER.unpack_from(blob)
+  out_prec_raw = (flags >> 8) & 0xff
+  out_prec = RKEWOut(out_prec_raw) if out_prec_raw else RKEWOut.FP32
+  if magic != RKIMAGE_MAGIC or flags & ~0xff03 or nstage or nreloc or ncmd: raise ValueError("invalid RKImage header")
+  if out_prec not in (RKEWOut.FP16, RKEWOut.FP32): raise ValueError(f"invalid out_precision {out_prec_raw}")
   off = _HEADER.size
-  rows = [_STAGE.unpack_from(blob, off+i*_STAGE.size) for i in range(nstage)]; off += nstage*_STAGE.size
-  relocs = []
-  for _ in range(nreloc):
-    st, word, kind, shift, index, addend, mask, fshift = _RELOC.unpack_from(blob, off); off += _RELOC.size
-    relocs.append(RKReloc(st, word, RKBufferKind(kind), index, addend, shift, mask, fshift))
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
   for _ in range(ngather):
-    src_kind, dst_scratch, src_index, n_off = _GATHER.unpack_from(blob, off); off += _GATHER.size
-    if src_kind != int(RKBufferKind.ARG): raise ValueError("invalid RKGather src kind")
+    itemsize, dst_scratch, src_index, n_off = _GATHER.unpack_from(blob, off); off += _GATHER.size
+    if itemsize in (0, int(RKBufferKind.ARG)): itemsize = 2
+    if itemsize not in (2, 4): raise ValueError("invalid RKGather itemsize")
     offs = struct.unpack_from(f"<{n_off}i", blob, off); off += 4 * n_off
-    gathers.append(RKGather(src_index, dst_scratch, offs))
-  host_sum = None
-  if has_hostsum:
-    dst_kind, _, dst_index, n_srcs = _HOSTSUM.unpack_from(blob, off); off += _HOSTSUM.size
-    srcs = struct.unpack_from(f"<{n_srcs}H", blob, off); off += 2 * n_srcs
-    count, = struct.unpack_from("<I", blob, off); off += 4
-    host_sum = RKHostSum(RKArg(RKBufferKind(dst_kind), dst_index), srcs, count)
-  if off + ncmd * 8 + nconst != len(blob): raise ValueError("invalid RKImage size")
-  cmds = struct.unpack_from(f"<{ncmd}Q", blob, off) if ncmd else (); off += ncmd * 8
-  stages = []
-  for i,(eng,flags,r0,c0,clen,rstart,rlen) in enumerate(rows):
-    if r0 or c0+clen > ncmd or rstart+rlen > nreloc: raise ValueError("invalid RKImage stage")
-    stages.append(RKStage(RKEngine(eng), cmds[c0:c0+clen], tuple(relocs[rstart:rstart+rlen]), flags))
-  return RKImage(RKTarget(target), tuple(stages), scratch, blob[off:], ver, tuple(gathers), host_sum)
+    gathers.append(RKGather(src_index, dst_scratch, offs, itemsize))
+  npack, = struct.unpack_from("<H", blob, off); off += 2
+  packs:list[RKPack] = []
+  for _ in range(npack):
+    itemsize, dst_scratch, src_index, count = _PACK.unpack_from(blob, off); off += _PACK.size
+    if itemsize in (0, int(RKBufferKind.ARG)): itemsize = 2
+    if itemsize not in (2, 4): raise ValueError("invalid RKPack itemsize")
+    packs.append(RKPack(src_index, dst_scratch, count, itemsize))
+  nop, = struct.unpack_from("<H", blob, off); off += 2
+  ew_ops:list[RKEWOp] = []
+  for _ in range(nop):
+    dk, _, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
+    count, ew_cfg, cvt = _EWOP2.unpack_from(blob, off); off += _EWOP2.size
+    da, la, ra = struct.unpack_from("<iii", blob, off); off += 12
+    ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
+                         RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg,
+                         None if cvt == 0xffffffff else cvt))
+  fill = None
+  if flags & 1:
+    dst_kind, _, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
+    fill = RKFill(RKArg(RKBufferKind(dst_kind), dst_index), count)
+  half_out = None
+  if flags & 2:
+    src_scratch, dst_kind, _, dst_index, count = _HALFOUT.unpack_from(blob, off); off += _HALFOUT.size
+    half_out = RKHalfOut(src_scratch, RKArg(RKBufferKind(dst_kind), dst_index), count)
+  if off + nconst != len(blob): raise ValueError("invalid RKImage size")
+  return RKImage(RKTarget(target), (), scratch, blob[off:], ver, tuple(gathers), tuple(packs), fill,
+                 tuple(ew_ops), half_out, out_prec)
+
 def patch_image(image:RKImage, address:Callable[[RKBufferKind,int],int]) -> tuple[tuple[int,...],...]:
   patched = [list(s.commands) for s in image.stages]
   for s in image.stages:
@@ -109,51 +163,61 @@ def patch_image(image:RKImage, address:Callable[[RKBufferKind,int],int]) -> tupl
       patched[r.stage][r.word] = (w & ~0xffffffff0000) | (((v & ~fm) | ((field<<r.field_shift)&fm)) << 16)
   return tuple(map(tuple, patched))
 
-_DPU, _RDMA, _PC = 0x1001, 0x2001, 0x81
-# DPU EW_CFG for ops listed in RockchipRenderer.code_for_op (allbilly/rk3588 elementwise.py).
+_DPU, _RDMA = 0x1001, 0x2001
+# OUT=5: mtx512 NC1HWC2 C2=4, ≤8 elems/64B slot. OUT=2: contiguous half (elementwise.py).
+_EW_CHUNK, _EW_SLOT_BYTES = 8, 64
+_MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _EW_CFG = {Ops.ADD: 0x108002c0 | (2 << 16), Ops.MUL: 0x108002c0 | (1 << 2) | (1 << 8)}
+_FP32_TILE, _FP32_TILE_BYTES = _EW_CHUNK, _EW_SLOT_BYTES
 def _cmd(t,r,v): return ((t&0xffff)<<48)|((v&0xffffffff)<<16)|(r&0xffff)
+def _scratch_bytes(count:int, out_precision:RKEWOut=RKEWOut.FP32) -> int:
+  if out_precision is RKEWOut.FP16: return max(count * 2, 64)
+  return ((count + _EW_CHUNK - 1) // _EW_CHUNK) * _EW_SLOT_BYTES
 
-def emit_ew_stage(stage:int, dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
-  """DPU elementwise binary stage (ADD/MUL); same body as ADD with EW_CFG from elementwise.py."""
-  w = (count+7)//8-1
+def emit_ew_stage(stage:int, dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
+                  out_precision:RKEWOut=RKEWOut.FP32) -> RKStage:
+  """DPU EW body (no PC tail). OUT=5: mtx512 ≤8. OUT=2: contiguous half WIDTH cube."""
+  if out_precision is RKEWOut.FP16:
+    if not (0 < count <= _MAX_EW_ELEMS_FP16): raise ValueError(f"EW fp16 count {count} out of range")
+    w = (count + 7) // 8 - 1
+    regs = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
+      (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
+      (_DPU,rk.REG_DPU_DATA_FORMAT,(2<<29)|(2<<26)|2),
+      (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,w),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
+      (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(7<<16)|7),
+      (_DPU,rk.REG_DPU_EW_CFG,ew_cfg),(_DPU,rk.REG_DPU_OUT_CVT_SCALE,(1<<16)|1),
+      (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,w),
+      (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),
+      (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|(2<<2)))
+    cmds = [_cmd(*x) for x in regs]; relocs = []
+    for t,r,a in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
+                 (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
+      relocs.append(RKReloc(stage, len(cmds), a.kind, a.index, a.addend)); cmds.append(_cmd(t, r, 0))
+    cmds.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(1<<3)|1))
+    return RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), RK_STAGE_RESET)
+
+  if not (0 < count <= _EW_CHUNK): raise ValueError(f"EW chunk count {count} out of range")
+  ch = count - 1
+  ow = (1 << 8) | (1 << 5) | (1 << 2) | (1 << 1)  # size_e=1
   regs = ((_DPU,rk.REG_DPU_S_POINTER,0xe),(_DPU,rk.REG_DPU_FEATURE_MODE_CFG,0x1e5),
-    (_DPU,rk.REG_DPU_DATA_FORMAT,(2<<29)|(2<<26)|2),(_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,w),
-    (_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),(_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,0x70007),
+    (_DPU,rk.REG_DPU_DATA_FORMAT,(5<<29)|(2<<26)|2),
+    (_DPU,rk.REG_DPU_DST_SURF_STRIDE,1<<4),
+    (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,0),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
+    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(ch<<16)|ch),
     (_DPU,rk.REG_DPU_BS_CFG,0x53),(_DPU,rk.REG_DPU_BN_CFG,0x53),(_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),
-    (_DPU,rk.REG_DPU_BS_OW_CFG,2),(_DPU,rk.REG_DPU_WDMA_SIZE_0,7),(_DPU,rk.REG_DPU_WDMA_SIZE_1,w),
+    (_DPU,rk.REG_DPU_BS_OW_CFG,ow),(_DPU,rk.REG_DPU_WDMA_SIZE_0,ch),(_DPU,rk.REG_DPU_WDMA_SIZE_1,0),
     (_DPU,rk.REG_DPU_BN_MUL_CFG,0),(_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(_DPU,rk.REG_DPU_EW_CFG,ew_cfg),
-    (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),(_DPU,rk.REG_DPU_OUT_CVT_SCALE,0x10001),
-    (_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,0x40),
-    (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,w),
-    (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),
+    (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),(_DPU,rk.REG_DPU_OUT_CVT_SCALE,0),
+    (_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,4<<4),
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,ch),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,0x40000008))
   cmds = [_cmd(*x) for x in regs]; relocs = []
   for t,r,a in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
                (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
     relocs.append(RKReloc(stage, len(cmds), a.kind, a.index, a.addend)); cmds.append(_cmd(t, r, 0))
-  cmds += [_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849), _cmd(_PC, rk.REG_PC_OPERATION_ENABLE, 0x18)]
+  cmds.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, 0x17849))
   return RKStage(RKEngine.DPU, tuple(cmds), tuple(relocs), RK_STAGE_RESET)
-
-def emit_ew_chain(out:RKArg, inputs:tuple[RKArg, ...], count:int, ew_cfg:int) -> RKImage:
-  """Reduce N same-shape half buffers with N-1 DPU EW stages; intermediates use scratch."""
-  if len(inputs) < 2: raise ValueError("EW chain needs at least two inputs")
-  nbytes = ((count + 7) // 8 * 8) * 2  # atom-pad FP16 surface
-  scratch = tuple(RKScratch(nbytes) for _ in range(max(0, len(inputs)-2)))
-  stages:list[RKStage] = []
-  acc = inputs[0]
-  for i, rhs in enumerate(inputs[1:]):
-    last = i == len(inputs)-2
-    dst = out if last else RKArg(RKBufferKind.SCRATCH, i)
-    stages.append(emit_ew_stage(i, dst, acc, rhs, count, ew_cfg))
-    acc = dst
-  return RKImage(RKTarget.RK3588, tuple(stages), scratch)
-
-def emit_ew_const(out:RKArg, vec:RKArg, count:int, ew_cfg:int, const_val:float) -> RKImage:
-  """vector ⊗ scalar: splat const into scratch[0] (value in image.constants as one fp16)."""
-  nbytes = ((count + 7) // 8 * 8) * 2
-  return RKImage(RKTarget.RK3588, (emit_ew_stage(0, out, vec, RKArg(RKBufferKind.SCRATCH, 0), count, ew_cfg),),
-                 (RKScratch(nbytes),), struct.pack("<e", const_val))
 
 def _root_param(u:UOp) -> UOp|None:
   while u.op is not Ops.PARAM:
@@ -173,7 +237,6 @@ def _index_ranges(ix:UOp) -> list[UOp]:
   return [u for u in ix.toposort() if u.op is Ops.RANGE]
 
 def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
-  """Cartesian product of RANGE domains (src[0]=limit CONST; optional parent RANGEs in src[1:])."""
   if not ranges: return [{}]
   order:list[UOp] = []
   seen:set[UOp] = set()
@@ -203,11 +266,14 @@ def _gather_offsets(out_index:UOp, load_ix:UOp, count:int) -> tuple[int, ...]:
   return tuple(offsets)
 
 def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int) -> RKArg|float|tuple[UOp, UOp]|None:
+  if u.op is Ops.CAST and u.dtype.scalar() is dtypes.half: return _ew_leaf(u.src[0], out_index, count, oslot)
   if u.op is Ops.CONST and u.dtype.scalar() is dtypes.half: return float(u.arg)
   if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM:
     p, ix = u.src[0].src[0], u.src[0].src[1]
-    if p.dtype.scalar() is not dtypes.half or p.arg.slot == oslot or p.src[0].op is not Ops.CONST: return None
-    if ix.key == out_index.key and int(p.src[0].arg) == count: return RKArg(RKBufferKind.ARG, p.arg.slot)
+    if p.dtype.scalar() not in (dtypes.half, dtypes.float, dtypes.float32) or p.arg.slot == oslot or p.src[0].op is not Ops.CONST:
+      return None
+    itemsize = 4 if p.dtype.scalar() in (dtypes.float, dtypes.float32) else 2
+    if ix.key == out_index.key and int(p.src[0].arg) == count: return RKArg(RKBufferKind.ARG, p.arg.slot, itemsize=itemsize)
     return (p, ix)
   return None
 
@@ -215,25 +281,17 @@ def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, sup
   bad:list[str] = []
   for i, u in enumerate(uops):
     if u.op in (Ops.CONST, Ops.PARAM, Ops.RANGE, Ops.END, Ops.SINK, Ops.STORE, Ops.INDEX): continue
-    if u.op in (Ops.ADD, Ops.MUL) and u.dtype.scalar() is dtypes.int: continue  # address math
+    if u.op in (Ops.ADD, Ops.MUL) and u.dtype.scalar() is dtypes.int: continue
     if u.op in supported and u.dtype.scalar() is dtypes.half: continue
-    if u.op is Ops.LOAD:
+    if u.op is Ops.LOAD or (u.op is Ops.CAST and u.dtype.scalar() is dtypes.half):
       if _ew_leaf(u, out_index, count, oslot) is None: bad.append(f"{i}:{u.op.name}")
       continue
     if u.op is Ops.CAST or u.op is Ops.REDUCE or u.op in GroupOp.ALU:
       bad.append(f"{i}:{u.op.name}")
   return bad
 
-def _mul_reduction_muls(u:UOp) -> list[UOp]|None:
-  """If u is an ADD-tree of half MULs, return those MUL nodes (gemm-style); else None."""
-  if u.op is Ops.MUL and u.dtype.scalar() is dtypes.half: return [u]
-  if u.op is Ops.ADD and u.dtype.scalar() is dtypes.half:
-    left, right = _mul_reduction_muls(u.src[0]), _mul_reduction_muls(u.src[1])
-    if left is None or right is None: return None
-    return left + right
-  return None
-
 def lower_ew(uops:list[UOp]) -> RKImage:
+  out_prec = ew_out_precision()
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
   if (not stores or any(p is None or p.dtype.scalar() is not dtypes.half or p.src[0].op is not Ops.CONST for p in outs) or
@@ -241,18 +299,22 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   out_p = outs[0]; assert out_p is not None
   count, oslot = int(out_p.src[0].arg), out_p.arg.slot
   store = stores[0]
-  if store.src[0].op is not Ops.INDEX or count <= 0: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+  if store.src[0].op is not Ops.INDEX: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
+  if count <= 0: return RKImage(RKTarget.RK3588, out_precision=out_prec)
   out_index, out, val = store.src[0].src[1], RKArg(RKBufferKind.ARG, oslot), store.src[1]
-  # Pure half EW only: reject CAST / float ALU / REDUCE; half ALU must be in code_for_op.
+  if val.op is Ops.CONST and val.dtype.scalar() is dtypes.half:
+    return RKImage(RKTarget.RK3588, (), (), struct.pack("<e", float(val.arg)), fill=RKFill(out, count),
+                   out_precision=out_prec)
   supported = RockchipRenderer.code_for_op
-  if any(u.op is Ops.CAST or u.op is Ops.REDUCE or
+  if any(u.op is Ops.REDUCE or
+         (u.op is Ops.CAST and u.dtype.scalar() is not dtypes.half) or
+         (u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and _ew_leaf(u, out_index, count, oslot) is None) or
          (u.op in GroupOp.ALU and u.dtype.scalar() in (dtypes.float, dtypes.float32, dtypes.float64)) for u in uops):
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
   if any(u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
-  # Schedule half code_for_op tree; leaves = same-index LOAD, gather LOAD, or scalar CONST.
   order:list[UOp] = []
   def visit(u:UOp) -> bool:
     if u.op in supported and u.dtype.scalar() is dtypes.half:
@@ -263,18 +325,14 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if not visit(val) or not order or order[-1] is not val:
     bad = _unsupported_ew_ops(uops, out_index, count, oslot, supported)
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {bad}")
-  # Gemm-style Σ MUL: DPU EW for MULs, float32 host sum for the ADD reduce (half ADD misses fp16 tol).
-  mul_red = _mul_reduction_muls(val)
-  host_sum:RKHostSum|None = None
-  if mul_red is not None and len(mul_red) >= 2:
-    order = list(dict.fromkeys(mul_red))  # MULs only, stable unique
   uses = {u: sum(s is u for n in order for s in n.src) for u in order}
   values:dict[UOp, RKArg] = {}
   free:list[int] = []
-  const_scratch:dict[bytes, int] = {}  # fp16 bits key (nan-safe)
+  const_scratch:dict[bytes, int] = {}
   gather_scratch:dict[tuple[int, tuple[int, ...]], int] = {}
+  arg_pack:dict[int, int] = {}
   gathers:list[RKGather] = []
-  # Const scratches first (runtime splats constants[i] → scratch[i]); gathers after.
+  packs:list[RKPack] = []
   for expr in order:
     for s in expr.src:
       leaf = _ew_leaf(s, out_index, count, oslot)
@@ -282,59 +340,60 @@ def lower_ew(uops:list[UOp]) -> RKImage:
         k = struct.pack("<e", leaf)
         if k not in const_scratch: const_scratch[k] = len(const_scratch)
   scratch_count = len(const_scratch)
-  stages:list[RKStage] = []
+  ew_ops:list[RKEWOp] = []
   def operand(s:UOp) -> RKArg:
     nonlocal scratch_count
     if s in values: return values[s]
     leaf = _ew_leaf(s, out_index, count, oslot)
     assert leaf is not None
     if isinstance(leaf, float): return RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", leaf)])
-    if isinstance(leaf, RKArg): return leaf
+    if isinstance(leaf, RKArg):
+      if leaf.index not in arg_pack:
+        arg_pack[leaf.index] = scratch_count
+        packs.append(RKPack(leaf.index, scratch_count, count, leaf.itemsize))
+        scratch_count += 1
+      return RKArg(RKBufferKind.SCRATCH, arg_pack[leaf.index])
     p, ix = leaf
     offsets = _gather_offsets(out_index, ix, count)
     if max(offsets) >= int(p.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
     key = (p.arg.slot, offsets)
     if key not in gather_scratch:
       gather_scratch[key] = scratch_count
-      gathers.append(RKGather(p.arg.slot, scratch_count, offsets))
+      itemsize = 4 if p.dtype.scalar() in (dtypes.float, dtypes.float32) else 2
+      gathers.append(RKGather(p.arg.slot, scratch_count, offsets, itemsize))
       scratch_count += 1
     return RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
-  prod_scratches:list[int] = []
   for expr in order:
     lhs, rhs = operand(expr.src[0]), operand(expr.src[1])
-    if mul_red is not None and len(mul_red) >= 2:
-      # MUL into scratch; host floats-sum writes `out`
-      slot = free.pop() if free else scratch_count
-      if slot == scratch_count: scratch_count += 1
-      dst = RKArg(RKBufferKind.SCRATCH, slot)
-      prod_scratches.append(slot)
-    elif expr is val: dst = out
-    elif (reuse:=next((values[x] for x in expr.src if x in values and uses[x] == 1 and
-                       values[x].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
+    if (reuse:=next((values[x] for x in expr.src if x in values and uses[x] == 1 and
+                     values[x].kind is RKBufferKind.SCRATCH), None)) is not None and expr is not val:
+      dst = reuse
     else:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    stages.append(emit_ew_stage(len(stages), dst, lhs, rhs, count, _EW_CFG[expr.op]))
+    cvt = dst.index if out_prec is RKEWOut.FP32 else None
+    ew_ops.append(RKEWOp(dst, lhs, rhs, count, _EW_CFG[expr.op], cvt_scratch=cvt))
     values[expr] = dst
     for dep in expr.src:
       if dep in uses:
         uses[dep] -= 1
         arg = values[dep]
         if uses[dep] == 0 and arg.kind is RKBufferKind.SCRATCH and arg != dst: free.append(arg.index)
-  if prod_scratches: host_sum = RKHostSum(out, tuple(prod_scratches), count)
-  nbytes = ((count + 7) // 8 * 8) * 2
+  half_out = RKHalfOut(values[val].index, out, count)
+  nbytes = _scratch_bytes(count, out_prec)
   constants = b""
   if const_scratch:
     by = {slot: bits for bits, slot in const_scratch.items()}
     constants = b"".join(by[i] if i in by else struct.pack("<e", 0.0)
                          for i in range(max(const_scratch.values()) + 1))
-  return RKImage(RKTarget.RK3588, tuple(stages), tuple(RKScratch(nbytes) for _ in range(scratch_count)),
-                 constants, gathers=tuple(gathers), host_sum=host_sum)
+  return RKImage(RKTarget.RK3588, (), tuple(RKScratch(nbytes) for _ in range(scratch_count)),
+                 constants, gathers=tuple(gathers), packs=tuple(packs), ew_ops=tuple(ew_ops),
+                 half_out=half_out, out_precision=out_prec)
+
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
 
-# Other branch demotes float ALU→half via PatternMatcher. Apply here (post-SPEC) so WHERE/float graphs stay valid through verify.
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.ADD, dtypes.float, name="x"),
    lambda x: x.src[0].cast(dtypes.half).alu(Ops.ADD, x.src[1].cast(dtypes.half))),
@@ -344,19 +403,16 @@ _pm_fp32_to_fp16 = PatternMatcher([
    lambda x: x.src[0].cast(dtypes.half).alu(Ops.NEG)),
   (UPat(Ops.EXP2, dtypes.float, name="x"),
    lambda x: x.src[0].cast(dtypes.half).alu(Ops.EXP2)),
-  # Fold ACC cast noise: half ← float ← half MUL/ADD; half ← half.
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)),
    lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
 ])
-
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
   return list(graph_rewrite(sink, _pm_fp32_to_fp16, name="rockchip float→half").toposort())
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
-  # Keys feed codegen supported_ops (decomp); must match DPU EW ops in _EW_CFG.
   code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
