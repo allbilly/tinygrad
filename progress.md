@@ -797,3 +797,17 @@ Geometry/constant reductions fold where legal. `test_sum_twice` reduces random F
 - No new kernel error signature.
 
 The next source-order method is `test_where`.
+
+---
+
+## 2026-08-08 — Lerp, broadcast ADD, SUB, and negation
+
+Seven FP16 arithmetic methods were admitted and run individually: `test_lerp`, `test_broadcasted_add`, `test_broadcasted_add_2`, `test_sub`, `test_scalar_sub`, `test_scalar_rsub`, and `test_neg`. They reuse DPU EW ADD/MUL and broadcast gathers; no renderer/runtime change was necessary.
+
+- Individual method times: 2.70–3.07 s.
+- Complete incremental source-order group: **34 passed in 9.58 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+`test_where` and the boolean tail of `test_tril` remain unadmitted because their packed-boolean input/int32 output cannot be executed by the FP16-only DPU without a CPU value-selection fallback. They are not skipped or counted as passing.
