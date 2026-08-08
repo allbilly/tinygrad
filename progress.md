@@ -2243,3 +2243,30 @@ The CPU-cheat audit found no runtime or Tinygrad core change. ABS, nonzero class
 all execute on DPU EW; runtime only packs the low byte of NPU-produced 0/1 INT32 lanes into the public bool buffer. The
 renderer inspects only the UOp shape and dtype. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback,
 external non-FP16 input conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — arithmetic FP16 softsign on DPU EW
+
+Upstream `test_softsign` and `test_softsign_exact` now join the Rockchip census. The group covers a 45x65 tensor, a
+rank-zero scalar, and the exact values `[-1, 0, 1]` under the same FP16 tolerance used by `test_gemm_fp16`.
+
+Tinygrad defines softsign as `x / (1 + abs(x))`. The nonconstant cases therefore reuse the already-proven native DPU
+EW ABS, ADD, and FDIV stages rather than adding a special operation. The 45x65 and exact-vector graphs each execute as
+three DPU tasks in one ioctl; the literal rank-zero input folds at compile time without an ioctl. A warm direct profile
+measured **0.150 s** for the matrix and **0.020 s** for the exact vector.
+
+Other Tinygrad branches contain no Rockchip-specific softsign lowering. `~/npu` and `~/rk3588` contain a standalone
+Q0.15 LUT implementation, but it was intentionally not ported because the current scope excludes LUT work and ordinary
+FP16 DPU arithmetic already implements the canonical Tinygrad expression.
+
+- Focused upstream cases: **2 passed**, sequentially (`3.09 s` and `2.68 s` pytest wall times).
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **354 passed, 11 skipped, 180 subtests passed in
+  401.34 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,914/274 executable lines**.
+
+This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change. All
+input-dependent ABS, addition, and division execute on DPU EW; compile-time scalar folding does not inspect a runtime
+tensor buffer. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input
+conversion, or tolerance relaxation.

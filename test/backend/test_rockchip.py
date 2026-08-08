@@ -1197,6 +1197,8 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_hardsigmoid = _test_ops.TestOps.test_hardsigmoid
   test_hardsigmoid_extreme = _test_ops.TestOps.test_hardsigmoid_extreme
   test_hardswish = _test_ops.TestOps.test_hardswish
+  test_softsign = _test_ops.TestOps.test_softsign
+  test_softsign_exact = _test_ops.TestOps.test_softsign_exact
 
 if __name__ == "__main__":
   unittest.main()
