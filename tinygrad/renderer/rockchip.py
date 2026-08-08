@@ -411,38 +411,56 @@ def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cach
     return ret
   if selection_tree(u) != (True, True): return None
   out_ranges = _index_ranges(out_index)
-  fill_bits:int|None = None
-  def selected(x:UOp, env:dict[UOp, int]) -> tuple[int, int]|None:
-    nonlocal fill_bits
+  out_range_set, range_cache = set(out_ranges), {}
+  def index_ranges(x:UOp) -> list[UOp]:
+    if x not in range_cache: range_cache[x] = _index_ranges(x)
+    return range_cache[x]
+  envs = _iter_range_env(out_ranges)
+  vector_env = {r: np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in out_ranges}
+  eval_cache:dict[UOp, np.ndarray] = {}
+  choices:dict[UOp, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+  empty = np.full(len(envs), -1, dtype=np.int64)
+  def selected(x:UOp) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if x in choices: return choices[x]
     if x.op is Ops.CONST and x.dtype.scalar() is dtypes.half:
       bits = struct.unpack("<H", struct.pack("<e", float(x.arg)))[0]
-      if fill_bits is not None and fill_bits != bits: raise ValueError
-      fill_bits = bits
-      return None
-    if x.op is Ops.CAST and x.dtype.scalar() is dtypes.half: return selected(x.src[0], env)
-    if x.op is Ops.WHERE:
+      ret = empty, empty, np.full(len(envs), bits, dtype=np.int64)
+    elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half: ret = selected(x.src[0])
+    elif x.op is Ops.WHERE:
       if not _is_static_expr(x.src[0], static_cache): raise ValueError
-      return selected(x.src[1] if _eval_int(x.src[0], env) else x.src[2], env)
-    if x.op is Ops.ADD:
-      lhs, rhs = selected(x.src[0], env), selected(x.src[1], env)
-      if lhs is not None and rhs is not None: raise ValueError
-      return lhs if lhs is not None else rhs
-    if x.op is not Ops.LOAD or x.src[0].op is not Ops.INDEX or x.src[0].src[0].op is not Ops.PARAM: raise ValueError
-    param, index, gate = x.src[0].src[0], x.src[0].src[1], x.src[2] if len(x.src) > 2 else None
-    if (param.dtype.scalar() is not dtypes.half or param.arg.slot == oslot or param.src[0].op is not Ops.CONST or
-        any(r not in out_ranges for r in _index_ranges(index) + ([] if gate is None else _index_ranges(gate)))): raise ValueError
-    if gate is not None:
-      if not _is_static_expr(gate, static_cache): raise ValueError
-      if not _eval_int(gate, env): return selected(x.src[1], env) if len(x.src) > 1 else None
-    return param.arg.slot, _eval_int(index, env)
+      cond = np.broadcast_to(_eval_vector(x.src[0], vector_env, eval_cache), len(envs)).astype(bool)
+      lhs, rhs = selected(x.src[1]), selected(x.src[2])
+      ret = np.where(cond, lhs[0], rhs[0]), np.where(cond, lhs[1], rhs[1]), np.where(cond, lhs[2], rhs[2])
+    elif x.op is Ops.ADD:
+      lhs, rhs = selected(x.src[0]), selected(x.src[1])
+      if np.any((lhs[0] >= 0) & (rhs[0] >= 0)) or np.any((lhs[2] >= 0) & (rhs[2] >= 0) & (lhs[2] != rhs[2])): raise ValueError
+      use_lhs = lhs[0] >= 0
+      ret = np.where(use_lhs, lhs[0], rhs[0]), np.where(use_lhs, lhs[1], rhs[1]), np.where(lhs[2] >= 0, lhs[2], rhs[2])
+    else:
+      if x.op is not Ops.LOAD or x.src[0].op is not Ops.INDEX or x.src[0].src[0].op is not Ops.PARAM: raise ValueError
+      param, index, gate = x.src[0].src[0], x.src[0].src[1], x.src[2] if len(x.src) > 2 else None
+      if (param.dtype.scalar() is not dtypes.half or param.arg.slot == oslot or param.src[0].op is not Ops.CONST or
+          any(r not in out_range_set for r in index_ranges(index) + ([] if gate is None else index_ranges(gate)))): raise ValueError
+      if gate is not None:
+        if not _is_static_expr(gate, static_cache): raise ValueError
+      enabled = np.ones(len(envs), dtype=bool) if gate is None else \
+        np.broadcast_to(_eval_vector(gate, vector_env, eval_cache), len(envs)).astype(bool)
+      fallback = selected(x.src[1]) if len(x.src) > 1 else (empty, empty, empty)
+      offset = np.broadcast_to(_eval_vector(index, vector_env, eval_cache), len(envs)).astype(np.int64)
+      ret = np.where(enabled, param.arg.slot, fallback[0]), np.where(enabled, offset, fallback[1]), np.where(enabled, -1, fallback[2])
+    choices[x] = ret
+    return ret
   slots, offsets = [-2] * count, [-2] * count
   try:
-    for env in _iter_range_env(out_ranges):
-      dst, choice = _eval_int(out_index, env), selected(u, env)
+    dsts = np.broadcast_to(_eval_vector(out_index, vector_env, eval_cache), len(envs)).astype(np.int64)
+    selected_slots, selected_offsets, selected_fills = selected(u)
+    fill_values = np.unique(selected_fills[selected_fills >= 0])
+    if len(fill_values) > 1: raise ValueError
+    fill_bits = None if not len(fill_values) else int(fill_values[0])
+    for dst,slot,offset in zip(dsts, selected_slots, selected_offsets):
       if not 0 <= dst < count: raise ValueError
-      slot, offset = (-1, -1) if choice is None else choice
       if slots[dst] not in (-2, slot) or offsets[dst] not in (-2, offset): raise ValueError
-      slots[dst], offsets[dst] = slot, offset
+      slots[dst], offsets[dst] = int(slot), int(offset)
   except (RuntimeError, ValueError): return None
   sources = sorted(set(slot for slot in slots if slot >= 0))
   if not sources or any(offset == -2 for offset in offsets): return None

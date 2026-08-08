@@ -1224,3 +1224,29 @@ contains a 13,824-term reduction and remains a dedicated profiling target rather
 
 This milestone changes coverage only and retains the exact FP16 tolerance ceiling. It adds no CPU tensor arithmetic,
 CMAC, CNA, PPU, or shared core change.
+
+---
+
+## 2026-08-08 — FP16 cumulative sums with bounded static selection analysis
+
+Four exact upstream methods now join the Rockchip census: `test_small_cumsum`, `test_simple_cumsum`, `test_cumsum`,
+and `test_cumsum_zero_axis`. Together they cover scalar and empty inputs, 1D lengths through 1,022, and cumulative
+sums across 2D/3D axes. The older `rockchip/post-518-reference` implementation uses specialized CMAC reductions,
+while `~/npu` explicitly lists CumSum as unsupported and `~/rk3588` supplies only the upstream test definitions; none
+was ported because this branch remains DPU-EW-only.
+
+The existing static selection gather already described the cumulative layouts, but interpreted the same shared UOp
+DAG once per output coordinate. The 512-element case remained host-bound for more than 90 seconds. Selection analysis
+now evaluates every static coordinate together with NumPy vectors and memoizes each UOp's slot, raw offset, and fill
+metadata. This changes compiler metadata construction only: runtime still copies raw `uint16` lanes and every prefix
+ADD executes as a DPU EW task.
+
+- `test_simple_cumsum`: **1 passed in 11.80 s**, down from more than 90 seconds of host compilation.
+- Complete cumulative-sum group: **4 passed in 13.95 s**, sequentially in one process.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.38 s.
+- Complete Rockchip census: **262 passed, 11 skipped, 120 subtests passed in 120.32 s**, sequentially.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **896/173 executable lines**.
+
+The CPU-cheat audit found no input decoding or host numeric result computation. NumPy is confined to static integer
+index, source-slot, gate, and FP16-fill-bit planning at compile time. There is no CMAC, CNA, PPU, shared tinygrad core
+change, or tolerance relaxation.
