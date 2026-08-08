@@ -1584,3 +1584,32 @@ The unchanged upstream `test_topk` passes all generated FP16 cases and then reac
 which is external INT32 input and remains outside the NPU contract. Its equivalent FP16 repeated fixture is covered
 above. The CPU-cheat audit found only static address-map construction and raw lane movement; all sorting, stable counting,
 selection, and numeric conversion remain DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — FP16 elementwise maximum and minimum
+
+The FP16 portions of upstream `test_maximum` and `test_minimum` now join the Rockchip census: two `(45,65)` inputs,
+scalars, scalar broadcast, vectors, and infinity/NaN/signed-zero inputs. External integer, boolean, and mixed-dtype
+inputs remain outside the RK3588 FP16-input contract.
+
+`~/rk3588/examples/elementwise.py` and `~/rk3588/test/test_maximum.py` provide the proven binary DPU MAX reference.
+`~/npu/include/rknnops.h` names binary MAX/MIN algorithms, but the native EW ALU-MIN configuration returns NaN for
+infinite operands. Tinygrad canonicalizes minimum as `-max(-x,-y)`; the Rockchip rewrite recognizes that graph and emits
+`0-lhs`, `0-rhs`, DPU MAX, then `0-max`. SUB is required because RK3588 EW MUL with infinity returns NaN. All four
+numeric stages execute on DPU EW.
+
+The native-min tag is also distinguished by the specialized stable-sort matcher, preserving its existing direct
+MAX/MIN compare/swap image. Focused extrema, sort-value, sort-index, and TopK regression groups all pass.
+
+- Focused extrema group: **2 passed in 3.58 s**, sequentially.
+- Extrema plus sort-value regression: **6 passed, 14 subtests passed in 5.83 s**, sequentially.
+- Sort-index plus TopK regression: **12 passed, 8 subtests passed in 107.69 s**, sequentially.
+- Complete Rockchip census: **308 passed, 11 skipped, 200 subtests passed in 305.86 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,617/269 executable lines**.
+
+The CPU-cheat audit found no runtime or host numeric implementation in this milestone: only compile-time UOp recognition
+and DPU command construction changed. The host does not inspect, compare, negate, or select tensor values. There is no
+CMAC, CNA, PPU, tinygrad core change, external non-FP16 input support, or tolerance relaxation beyond the existing
+FP16 contract.

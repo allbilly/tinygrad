@@ -694,6 +694,21 @@ class TestRockchipTopKOps(unittest.TestCase):
     with self.assertRaises((RuntimeError, ValueError)): Tensor(np.zeros(4, dtype=np.float16)).topk(5)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipElementwiseExtremaOps(unittest.TestCase):
+  """FP16 portions of test_ops maximum/minimum; integer and boolean inputs are outside the NPU contract."""
+
+  def _test(self, torch_fxn, tinygrad_fxn):
+    _fp16_test_op([(45,65), (45,65)], torch_fxn, tinygrad_fxn)
+    _fp16_test_op([(), ()], torch_fxn, tinygrad_fxn)
+    _fp16_test_op(None, torch_fxn, tinygrad_fxn, vals=[[1., 0., 3., -4.], 3.])
+    _fp16_test_op(None, torch_fxn, tinygrad_fxn, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
+    _fp16_test_op(None, torch_fxn, tinygrad_fxn,
+                  vals=[[math.inf, -math.inf, math.nan, -0.0], [math.inf, math.inf, 1.0, 0.0]], forward_only=True)
+
+  def test_maximum(self): self._test(torch.maximum, Tensor.maximum)
+  def test_minimum(self): self._test(torch.minimum, Tensor.minimum)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

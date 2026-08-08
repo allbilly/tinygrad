@@ -982,12 +982,17 @@ def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
   if count <= 0: return RKImage(RKTarget.RK3588)
 
   def maximum(root:UOp, negated:bool) -> tuple[UOp, UOp]|None:
-    if root.op is not Ops.MAX: return None
+    if root.op is not Ops.MAX or root.arg is not None: return None
     parsed = [_half_candidate(x) for x in root.src]
     if len(parsed) != 2 or any(x is None or x[1] != negated for x in parsed): return None
     candidates = [x for x in parsed if x is not None]
     return candidates[0][0], candidates[1][0]
   def extreme(root:UOp) -> tuple[bool, tuple[UOp, UOp]]|None:
+    if root.op is Ops.MAX and root.arg == _NATIVE_MIN:
+      parsed = [_half_candidate(x) for x in root.src]
+      if len(parsed) == 2 and all(x is not None and not x[1] for x in parsed):
+        candidates = [x for x in parsed if x is not None]
+        return False, (candidates[0][0], candidates[1][0])
     if (pair:=maximum(root, False)) is not None: return True, pair
     if root.op is Ops.MUL and len(root.src) == 2:
       constants = [x for x in root.src if x.op is Ops.CONST and float(x.arg) == -1.0]
@@ -1467,6 +1472,9 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       if isinstance((leaf:=ew_leaf(src)), float):
         bits = struct.pack("<e", leaf)
         if bits not in const_scratch: const_scratch[bits] = len(const_scratch)
+  if any(expr.op is Ops.MAX and expr.arg == _NATIVE_MIN for expr in order):
+    zero_bits = struct.pack("<e", 0.0)
+    if zero_bits not in const_scratch: const_scratch[zero_bits] = len(const_scratch)
   scratch_count = len(const_scratch)
   ew_ops:list[RKEWOp] = []
   def operand(u:UOp) -> RKArg:
@@ -1522,12 +1530,20 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    cfg = _EW_CFG_MIN if expr.op is Ops.MAX and expr.arg == _NATIVE_MIN else \
-      _EW_CFG_RELU6 if expr.op is Ops.MAX and expr.arg == _NATIVE_RELU6 else \
-      _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
-      _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
-      _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
-    ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg, submit_barrier=sequential_product and expr is val))
+    if expr.op is Ops.MAX and expr.arg == _NATIVE_MIN:
+      zero = RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", 0.0)])
+      neg_lhs, neg_rhs, neg_max = (RKArg(RKBufferKind.SCRATCH, scratch_count+i) for i in range(3))
+      scratch_count += 3
+      ew_ops.extend((RKEWOp(neg_lhs, zero, lhs, count, _EW_CFG[Ops.SUB]),
+                     RKEWOp(neg_rhs, zero, rhs, count, _EW_CFG[Ops.SUB]),
+                     RKEWOp(neg_max, neg_lhs, neg_rhs, count, _EW_CFG[Ops.MAX]),
+                     RKEWOp(dst, zero, neg_max, count, _EW_CFG[Ops.SUB], submit_barrier=sequential_product and expr is val)))
+    else:
+      cfg = _EW_CFG_RELU6 if expr.op is Ops.MAX and expr.arg == _NATIVE_RELU6 else \
+        _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
+        _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
+        _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
+      ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg, submit_barrier=sequential_product and expr is val))
     values[expr] = dst
     for dep in expr.src:
       if dep in uses:
@@ -1634,6 +1650,15 @@ def _fold_abs(x:UOp) -> UOp|None:
       return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
   return None
 
+def _fold_minimum(x:UOp) -> UOp|None:
+  """Recognize -max(-x,-y); native ALU-MIN mishandles infinities, so lowering expands it through SUB and MAX."""
+  outer = _const_operand(x, Ops.MUL, -1.0)
+  if outer is None or outer[0].op is not Ops.MAX: return None
+  operands = [_const_operand(u, Ops.MUL, -1.0) for u in outer[0].src]
+  if len(operands) != 2 or any(u is None for u in operands): return None
+  lhs, rhs = (u for u in operands if u is not None)
+  return _native_min(lhs[0], rhs[0])
+
 def _fold_masked_load(gate:UOp, load:UOp, default:UOp) -> UOp|None:
   if len(load.src) <= 2 or load.src[1].op is not Ops.CONST: return None
   load_gate = load.src[2]
@@ -1688,6 +1713,7 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
   (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
+  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
   (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
   (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
