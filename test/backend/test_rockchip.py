@@ -760,6 +760,28 @@ class TestRockchipLogicalPredicateOps(unittest.TestCase):
   test_isclose_scalar = _test_ops.TestOps.test_isclose_scalar
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipIntegralRoundingOps(unittest.TestCase):
+  """Native FP16 floor/ceil plus DPU-composed truncation; round-to-even still requires a LUT."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_floor = _test_ops.TestOps.test_floor
+  test_ceil = _test_ops.TestOps.test_ceil
+  test_trunc = _test_ops.TestOps.test_trunc
+
+  def test_all_fp16_encodings(self):
+    values = np.arange(1 << 16, dtype=np.uint16).view(np.float16)
+    before = Device["ROCKCHIP"].submit_count
+    with np.errstate(invalid="ignore"):
+      for name in ("floor", "ceil", "trunc"):
+        np.testing.assert_equal(getattr(Tensor(values), name)().numpy(), getattr(np, name)(values))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBooleanReductionOps(unittest.TestCase):
   """ANY/ALL over FP16 inputs; external boolean tensors remain outside the DPU contract."""
 

@@ -2035,3 +2035,35 @@ The CPU-cheat audit found no runtime or Tinygrad core change. Runtime gathers on
 offsets; it never reads, compares, reduces, or branches on tensor values. All nonzero classification and reduction
 arithmetic execute on DPU EW. Static empty identities are constant initialization, not host evaluation of input data.
 There is no LUT, CMAC, CNA, PPU fallback, FP32/boolean external-input conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — native FP16 floor/ceil and no-LUT truncation
+
+The unchanged upstream `test_floor`, `test_ceil`, and `test_trunc` methods now join the Rockchip census. RK3588 TRM
+`RKNN_dpu_ew_cfg` identifies EW ALU algorithms 7 and 8 as Floor and Ceil. The renderer recognizes Tinygrad's canonical
+TRUNC-based WHERE expansions and tags them for those named native configurations; it does not embed unexplained
+register literals.
+
+TRUNC has no corresponding native ALU algorithm. It is composed entirely on DPU EW as
+`floor(max(x, 0)) + ceil(min(x, 0))`, with `min(x,0)` expressed through SUB/MAX. This avoids the DPU's unsafe
+`infinity * 0` behavior and preserves finite values, both infinities, and NaN numerically. It does not preserve the
+negative-zero sign when a negative value with magnitude below one truncates to zero; canonical Tinygrad/Torch numeric
+comparison treats both zeros as equal, and no tolerance was relaxed.
+
+Historical `5619ceff8` was rejected because it routes floor/ceil through `_HOST_ELEMENTWISE_LAYOUT`. Historical
+`29559149c` composes integral rounding from a generated roundoff LUT, so only its test intent was relevant. The direct
+TRM algorithms and current DPU EW image are used here. `test_round` was also tested and remains excluded: Tinygrad's
+round-to-even graph still contains unsupported boolean/XOR selection, while the proven historical implementation uses
+a LUT, which is outside the current scope.
+
+- Focused canonical methods: **3 passed in 3.17 s**, sequentially.
+- Permanent rounding class: **4 passed in 3.10 s**; its exhaustive method checks all **65,536 FP16 encodings** and the
+  three operations use exactly **3 ioctls** total.
+- Complete Rockchip census: **343 passed, 11 skipped, 180 subtests passed in 391.86 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,892/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. The new renderer code only recognizes canonical UOps and
+selects DPU ALU configurations; all floor, ceil, min/max, subtraction, and addition stages execute on the NPU. There is
+no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input, or tolerance relaxation.

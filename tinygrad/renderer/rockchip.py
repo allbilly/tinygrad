@@ -163,6 +163,8 @@ _EW_ALU_ADD = 2 << 16
 _EW_ALU_FDIV = 3 << 16
 _EW_ALU_SUB = 4 << 16
 _EW_ALU_ABS = 5 << 16
+_EW_ALU_FLOOR = 7 << 16
+_EW_ALU_CEIL = 8 << 16
 _EW_RELUX_EN = 1 << 10
 _EW_RELU_BYPASS = 1 << 9
 _EW_OP_CVT_BYPASS = 1 << 8
@@ -175,6 +177,8 @@ _EW_CFG_RELU = _EW_CFG_COMMON
 _EW_CFG_RELU6 = _EW_CFG_COMMON | _EW_RELUX_EN
 _EW_CFG_MIN = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_MIN
 _EW_CFG_ABS = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ABS
+_EW_CFG_FLOOR = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_FLOOR
+_EW_CFG_CEIL = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_CEIL
 _EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_MUL_PRELU | _EW_OP_TYPE_MUL
 _EW_STAGE_FP32_OUT = 1 << 29  # software tag consumed before writing EW_CFG
 _DPU_DATA_FORMAT_FP16 = (2<<29)|(2<<26)|2
@@ -189,8 +193,9 @@ _BS_MUL_COMPARE = 0x40000000
 _BN_CFG_COMPARE = 0x40082
 _BN_MUL_COMPARE = 0x7c000000
 _BN_RELUX_COMPARE = 0x3f800000
-_NATIVE_ABS, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK, _NATIVE_RELU6, _NATIVE_SIGN = \
-  "rockchip_abs", "rockchip_leaky_relu", "rockchip_mask_mul", "rockchip_min", "rockchip_positive_mask", "rockchip_relu6", "rockchip_sign"
+(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK,
+ _NATIVE_RELU6, _NATIVE_SIGN) = ("rockchip_abs", "rockchip_ceil", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
+                                "rockchip_min", "rockchip_positive_mask", "rockchip_relu6", "rockchip_sign")
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
@@ -1764,6 +1769,8 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     else:
       cfg = _EW_CFG_RELU6 if expr.op is Ops.MAX and expr.arg == _NATIVE_RELU6 else \
         _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
+        _EW_CFG_FLOOR if expr.op is Ops.MAX and expr.arg == _NATIVE_FLOOR else \
+        _EW_CFG_CEIL if expr.op is Ops.MAX and expr.arg == _NATIVE_CEIL else \
         _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
         _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
       is_positive_mask = expr.op is Ops.MAX and expr.arg == _NATIVE_POSITIVE_MASK
@@ -1935,6 +1942,27 @@ def _fold_abs(x:UOp) -> UOp|None:
       return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
   return None
 
+def _fold_floor_ceil(x:UOp) -> UOp|None:
+  """Recognize Tinygrad's TRUNC-based floor/ceil expansions and select the native DPU ALU."""
+  condition, adjusted, truncated = x.src
+  if (truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or adjusted.op is not Ops.ADD or
+      truncated not in adjusted.src): return None
+  delta = next((float(u.arg) for u in adjusted.src if u.op is Ops.CONST), None)
+  source = truncated.src[0]
+  if delta == -1.0 and condition.src == (source, truncated): tag = _NATIVE_FLOOR
+  elif delta == 1.0 and condition.src == (truncated, source): tag = _NATIVE_CEIL
+  else: return None
+  return UOp(Ops.MAX, x.dtype, src=(source, source), arg=tag)
+
+def _fold_trunc(x:UOp) -> UOp:
+  """Compose truncation from native floor/ceil without mask multiplication on infinities."""
+  source, zero = x.src[0], UOp.const(0.0, dtypes.half)
+  positive = source.alu(Ops.MAX, zero)
+  negative = zero.alu(Ops.SUB, zero.alu(Ops.SUB, source).alu(Ops.MAX, zero))
+  floor = UOp(Ops.MAX, x.dtype, src=(positive, positive), arg=_NATIVE_FLOOR)
+  ceil = UOp(Ops.MAX, x.dtype, src=(negative, negative), arg=_NATIVE_CEIL)
+  return floor.alu(Ops.ADD, ceil)
+
 def _fold_sign(x:UOp) -> UOp|None:
   """Recognize WHERE(x!=0, WHERE(x<0, -1, 1), 0) before general WHERE lowering."""
   nonzero, signed, zero = x.src
@@ -2033,9 +2061,13 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
 _pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs)])
+_pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_floor_ceil)])
+_pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])
 _pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_floor_ceil, name="rockchip floor/ceil")
+  sink = graph_rewrite(sink, _pm_trunc, name="rockchip trunc")
   sink = graph_rewrite(sink, _pm_abs, name="rockchip abs")
   sink = graph_rewrite(sink, _pm_sign, name="rockchip sign")
   return list(graph_rewrite(sink, _pm_fp32_to_fp16, name="rockchip float→half").toposort())
