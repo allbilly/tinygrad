@@ -2003,3 +2003,35 @@ IEEE edge matrix. Exact boolean expectations were not relaxed.
 
 This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change and no
 new data conversion or host arithmetic. There is no LUT, CMAC, CNA, PPU fallback, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — FP16-input ANY/ALL reductions on DPU EW
+
+Global, tuple-axis, scalar, and empty-axis `any`/`all` now join the Rockchip census for FP16 inputs. Coverage includes
+positive and negative zero, finite nonzero values, both infinities, NaN, mixed result rows, and the exact empty
+identities (`any=False`, `all=True`). External boolean input tensors and upstream `test_all_large`, which constructs a
+boolean tensor, remain outside the NPU's FP16 external-input contract.
+
+Both Tinygrad reduction forms are recognized: small fully unrolled OR/AND trees and register-loop reductions. Static
+source offsets are packed into an aligned candidate-row matrix. DPU `SUB -> ABS -> positive mask` produces exact
+nonzero lanes, then a balanced DPU MAX tree implements ANY and a balanced DPU MUL tree implements ALL. The existing
+typed DPU conversion writes the public boolean result. Empty reductions contain no input values and use the existing
+constant-fill image for their mathematically fixed identity.
+
+Historical commit `03bad6205` was inspected but not ported: it uses CMAC to count masks, performs host bool/FP16
+conversion, and adds host tiling for multi-megabyte reductions. Searches under `~/npu` and `~/rk3588` found the
+canonical tests but no independent pure-DPU boolean-reduction register implementation. This milestone therefore
+reuses only the currently proven DPU EW mask, striped-gather, balanced-reduction, and typed-output machinery.
+
+- Before specialization, 5-element reductions used **46 submits**, 12-element reductions used **102 submits**, and
+  the 360-element loop form was rejected. All three forms now pass with **6 submits** each.
+- Focused boolean-reduction class: **6 passed in 5.26 s**, sequentially; slowest method **1.03 s**.
+- Complete Rockchip census: **339 passed, 11 skipped, 180 subtests passed in 389.29 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,864/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. Runtime gathers only raw FP16 lanes using compile-time
+offsets; it never reads, compares, reduces, or branches on tensor values. All nonzero classification and reduction
+arithmetic execute on DPU EW. Static empty identities are constant initialization, not host evaluation of input data.
+There is no LUT, CMAC, CNA, PPU fallback, FP32/boolean external-input conversion, or tolerance relaxation.

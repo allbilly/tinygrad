@@ -1388,6 +1388,73 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp], output:RKOutput) -> RKI
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
                                  extrema_plans, negated_candidates, list(range(count)))
 
+def _bool_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tuple[tuple[int, ...], ...], op:Ops) -> RKImage:
+  window = len(offsets)
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, window)
+  zero, one, candidates_slot, diff, magnitude, unequal, equal, int_tiles = range(8)
+  gathers = _stripe_gathers(source_slot, candidates_slot, count, offsets, vector_lanes)
+  scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(((count+3)//4)*64))
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops:list[RKEWOp] = []
+  _ew_eq_mask(ops, arg, candidates_slot, zero, (diff, magnitude, unequal, equal), one, matrix_lanes)
+  selected = _reduce_rows(ops, [arg(unequal, row*vector_bytes) for row in range(window)], count,
+                          _EW_CFG[Ops.MAX if op is Ops.OR else Ops.MUL])
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), selected, arg(int_tiles), count, _EW_CFG[Ops.MAX],
+                    stateful=True, int32_output=True, bool_output=True))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
+
+def _nonzero_load(term:UOp) -> UOp|None:
+  term = _unwrap_condition(term)
+  if term.op is not Ops.CMPNE: return None
+  candidates = [load for load,zero in (term.src, term.src[::-1]) if load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and
+                load.src[0].op is Ops.INDEX and zero.op is Ops.CONST and float(zero.arg) == 0.0]
+  return candidates[0] if len(candidates) == 1 else None
+
+def _lower_unrolled_bool_reduction(output:RKOutput) -> RKImage|None:
+  """Reduce a canonical unrolled FP16 nonzero tree with balanced DPU EW MAX/MUL stages."""
+  _, out_param, count, out_index, root = output
+  root = _unwrap_condition(root)
+  if root.op not in (Ops.OR, Ops.AND): return None
+  loads = [_nonzero_load(term) for term in _flatten_binary(root, root.op)]
+  if any(load is None for load in loads): return None
+  concrete = [load for load in loads if load is not None]
+  params = [_root_param(load.src[0]) for load in concrete]
+  if (not concrete or any(param is None or param.src[0].op is not Ops.CONST for param in params) or
+      len({param.arg.slot for param in params if param is not None}) != 1): return None
+  source = params[0]; assert source is not None
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  try: offsets = tuple(tuple(_gather_offsets(out_index, load.src[0].src[1], None, count)) for load in concrete)
+  except RuntimeError: return None
+  source_count = int(source.src[0].arg)
+  if source_count != count*len(concrete) or sorted(offset for row in offsets for offset in row) != list(range(source_count)): return None
+  return _bool_reduction_image(out_param.arg.slot, count, source.arg.slot, offsets, root.op)
+
+def _lower_loop_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
+  """Lower the register-loop form of FP16 any/all through the same balanced DPU EW image."""
+  store, out_param, _, _, root = output
+  nodes = list(root.toposort())
+  if (shape:=_loop_reduction_shape(store, out_param, nodes)) is None or _local_load(root) is None: return None
+  rows, envs, reduce_range, groups = shape
+  local_stores = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None]
+  updates = [u for u in local_stores if reduce_range in u.toposort()]
+  if len(local_stores) != 2 or len(updates) != 1: return None
+  update = _unwrap_condition(updates[0].src[1])
+  if update.op not in (Ops.OR, Ops.AND): return None
+  acc = next((x for x in update.src if _local_load(x) is not None), None)
+  predicate = update.src[1 if update.src[0] is acc else 0] if acc is not None else None
+  if predicate is None or (load:=_nonzero_load(predicate)) is None: return None
+  source = _root_param(load.src[0])
+  identity = update.op is Ops.AND
+  initials = [u for u in local_stores if u is not updates[0] and u.src[1].op is Ops.CONST and
+              u.src[1].dtype.scalar() is dtypes.bool and bool(u.src[1].arg) == identity]
+  if len(initials) != 1 or source is None or source.src[0].op is not Ops.CONST: return None
+  try:
+    offsets = tuple(tuple(_eval_int(load.src[0].src[1], {**env, reduce_range:group}) for env in envs) for group in range(groups))
+  except RuntimeError: return None
+  source_count = int(source.src[0].arg)
+  if source_count != rows*groups or sorted(offset for row in offsets for offset in row) != list(range(source_count)): return None
+  return _bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op)
+
 def _typed_bool_image(output:RKOutput, value:UOp) -> RKImage:
   """Lower an FP16 0/1 mask and pack its DPU-converted INT32 lanes into the public bool ABI."""
   store, out_param, count, _, _ = output
@@ -1507,8 +1574,14 @@ def _lower_ieee_predicate(output:RKOutput) -> RKImage|None:
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
+    if bool_output[4].op is Ops.CONST:
+      return RKImage(RKTarget.RK3588, constants=struct.pack("<?", bool(bool_output[4].arg)),
+                     fill=RKFill(RKArg(RKBufferKind.ARG, bool_output[1].arg.slot), bool_output[2], 1))
+    if (bool_reduction:=_lower_unrolled_bool_reduction(bool_output)) is not None: return bool_reduction
     if (predicate:=_lower_ieee_predicate(bool_output)) is not None: return predicate
     if (comparison:=_ieee_comparison_mask(bool_output[4])) is not None: return _typed_bool_image(bool_output, comparison)
+  if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
+     (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
   if (half_output:=_output_store(uops, dtypes.half)) is not None and \
      (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)

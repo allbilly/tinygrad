@@ -760,6 +760,44 @@ class TestRockchipLogicalPredicateOps(unittest.TestCase):
   test_isclose_scalar = _test_ops.TestOps.test_isclose_scalar
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipBooleanReductionOps(unittest.TestCase):
+  """ANY/ALL over FP16 inputs; external boolean tensors remain outside the DPU contract."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  @staticmethod
+  def _check(name:str, values:np.ndarray, axis=None):
+    _fp16_test_op(None, lambda x:getattr(x, name)(axis=axis), lambda x:getattr(x, name)(axis=axis),
+                  vals=[values], forward_only=True)
+
+  def test_any(self):
+    self._check("any", np.array([0., -0., 0.], dtype=np.float16))
+    self._check("any", np.array([0., math.nan, math.inf, -math.inf], dtype=np.float16))
+    _fp16_test_op([()], lambda x:x.any(), forward_only=True)
+
+  def test_any_axis(self):
+    values = np.zeros((3,4,5,6), dtype=np.float16)
+    values[0,0,0,0], values[1,1,2,3], values[2,3,4,5] = 1., math.inf, math.nan
+    self._check("any", values, axis=(1,2))
+
+  def test_all(self):
+    self._check("all", np.array([1., -2., math.nan, math.inf, -math.inf], dtype=np.float16))
+    self._check("all", np.array([1., 0., math.nan], dtype=np.float16))
+    _fp16_test_op([()], lambda x:x.all(), forward_only=True)
+
+  def test_all_axis(self):
+    values = np.ones((3,4,5,6), dtype=np.float16)
+    values[0,0,0,0], values[1,1,2,3] = 0., -0.
+    self._check("all", values, axis=(1,2))
+
+  test_any_zero_axis = _test_ops.TestOps.test_any_zero_axis
+  test_all_zero_axis = _test_ops.TestOps.test_all_zero_axis
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipWhereOps(unittest.TestCase):
   """FP16 WHERE and masked arithmetic lowered to DPU comparison masks and selection."""
 
