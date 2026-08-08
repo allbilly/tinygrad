@@ -1,6 +1,6 @@
 from __future__ import annotations
 # ruff: noqa: E702
-import base64, os, struct
+import base64, math, os, struct
 import numpy as np
 from dataclasses import dataclass
 from enum import IntEnum
@@ -589,8 +589,16 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
 def _fp32_alu_to_fp16(x:UOp) -> UOp|None:
   return None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))
 
+def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
+  """RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates."""
+  numerator, denominator = x.src
+  if numerator.op is not Ops.CONST or not math.isinf(value:=float(numerator.arg)): return None
+  unit = UOp.const(-1.0 if value < 0 else 1.0, dtypes.half)
+  return unit.alu(Ops.FDIV, denominator).alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
+
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
+  (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),

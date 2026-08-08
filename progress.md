@@ -846,3 +846,7 @@ The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU, IOMMU, CM
 The exact upstream `TestOps.test_scalar_div` method passes all seven tensor/scalar and scalar/tensor forms through native DPU FDIV, including two rank-zero cases. It passed individually in **3.07 s** without a renderer/runtime change.
 
 Non-finite numerator handling remains a separate in-progress milestone and is not counted here.
+
+### WIP — non-finite division sign
+
+The first `-inf/x` sign reconstruction (`MUL → MAX → FDIV → MUL → FDIV`) timed out at task 4/5 and left the current boot's NPU load stuck at 100%. That version was not committed. The replacement rewrites `±inf/x` as `(±1/x)/0`, producing two adjacent FDIV stages with no intervening pipeline transition. Offline image inspection, Ruff, and mypy pass, but the direct sign regression and exact upstream `test_div_naninf` remain unverified until reboot. This WIP is not counted as passing coverage.

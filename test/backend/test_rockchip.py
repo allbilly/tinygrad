@@ -134,6 +134,11 @@ class TestRockchip(unittest.TestCase):
     rhs = np.array([0.5, -2.0, 8.0], dtype=np.float16)
     self._check(1, Tensor(lhs) / Tensor(rhs), (lhs.astype(np.float32) / rhs).astype(np.float16))
 
+  def test_infinite_division_sign(self):
+    values = np.array([-3.0, -0.5, 0.5, 2.0], dtype=np.float16)
+    self._check(1, math.inf / Tensor(values), (np.float16(np.inf) / values).astype(np.float16))
+    self._check(1, -math.inf / Tensor(values), (np.float16(-np.inf) / values).astype(np.float16))
+
   # ---- MAX ----
   def test_maximum_fp16(self):
     a, b = self._half((45, 65), 17), self._half((45, 65), 18)
@@ -410,6 +415,7 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_scalar_mul = _test_ops.TestOps.test_scalar_mul
   test_div = _test_ops.TestOps.test_div
   test_scalar_div = _test_ops.TestOps.test_scalar_div
+  test_div_naninf = _test_ops.TestOps.test_div_naninf
 
 if __name__ == "__main__":
   unittest.main()
