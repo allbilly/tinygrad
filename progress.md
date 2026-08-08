@@ -1924,3 +1924,27 @@ features.
 The CPU-cheat audit found no runtime or test change in this milestone. All new helpers operate only on compile-time UOp
 structure, static index maps, and immutable command-image metadata; they do not inspect or calculate tensor values.
 There is no LUT, CMAC, CNA, PPU, Tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — shared equality masks and striped gather matrices
+
+Occurrence counting, sort-index selection, and cumulative-index selection now share `_ew_eq_mask` for their FP16
+`SUB -> ABS -> nonzero MAX -> 1-mask` sequence. Its two explicit barrier bits preserve the previously tested boundaries:
+ordinary value equality splits before ABS, while converted sort-count equality splits before SUB. Candidate, repeated-
+current, constant-mask, and weight rows now share `_stripe_layout` and `_stripe_gathers` rather than rebuilding aligned
+matrix gathers in each lowering path.
+
+The occurrence and sort parsers intentionally remain separate. Occurrence validates optional static prefix gates, while
+sort validates weighted conjunctions of FP16 value equality and INT32 occurrence-count equality. A shared matcher would
+hide these distinct IR contracts without reducing executable lines. `_lower_sort_compare` is also unchanged because its
+static WHERE-to-MAX/MIN algorithm does not use equality masks.
+
+- Focused arg/sort/cumulative regression: **26 passed, 30 subtests passed in 154.22 s**, sequentially.
+- Complete Rockchip census: **325 passed, 11 skipped, 180 subtests passed in 321.03 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,744/274 executable lines**.
+
+The cleanup removes nine more executable renderer lines and changes no test, runtime, command encoding, tolerance, or
+Tinygrad core file. Its gathers contain only compile-time offsets/constants, and all equality arithmetic remains DPU EW;
+there is no host tensor-value computation, LUT, CMAC, CNA, or PPU fallback.

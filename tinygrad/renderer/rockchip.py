@@ -802,6 +802,16 @@ def _split_load_pairs(pairs:tuple[tuple[UOp, UOp], ...]) -> tuple[UOp, tuple[UOp
   if any(x is None for x in candidates): return None
   return current, tuple(x for x in candidates if x is not None)
 
+def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
+  vector_bytes = (count*2+63)&-64
+  return vector_bytes, vector_bytes//2, rows*vector_bytes//2
+
+def _stripe_gathers(src_slot:int, dst_slot:int, count:int, rows:Iterable[Iterable[int]], vector_lanes:int, *,
+                    values:bool=False, itemsize:int=2) -> tuple[RKGather, ...]:
+  """Pack candidate or repeated-current rows into one aligned lane matrix."""
+  return tuple(RKGather(src_slot, dst_slot, count, offsets=() if values else tuple(row), values=tuple(row) if values else (),
+                        dst_addend=i*vector_lanes, itemsize=itemsize) for i,row in enumerate(rows))
+
 def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int) -> RKArg:
   """Append a balanced row reduction, making its first dependent stage self-contained."""
   first = True
@@ -813,6 +823,16 @@ def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int) -> RK
     if len(active) & 1: reduced.append(active[-1])
     active = reduced
   return active[0]
+
+def _ew_eq_mask(ops:list[RKEWOp], arg:Callable[[int], RKArg], lhs:int, rhs:int, temps:tuple[int, int, int, int], one:int,
+                lanes:int, barriers:tuple[bool, bool]=(False, True)) -> RKArg:
+  """Append SUB, ABS, nonzero comparison, and inversion for an FP16 equality mask."""
+  diff, magnitude, unequal, equal = temps
+  ops.extend((RKEWOp(arg(diff), arg(lhs), arg(rhs), lanes, _EW_CFG[Ops.SUB], submit_barrier=barriers[0], stateful=barriers[0]),
+              RKEWOp(arg(magnitude), arg(diff), arg(diff), lanes, _EW_CFG_ABS, submit_barrier=barriers[1], stateful=barriers[1]),
+              RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), lanes, _EW_CFG[Ops.MAX], compare=True),
+              RKEWOp(arg(equal), arg(one), arg(unequal), lanes, _EW_CFG[Ops.SUB], stateful=True)))
+  return arg(equal)
 
 def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:Callable[[int], RKArg],
                   out:RKArg|None=None, fp32_out:bool=False) -> RKArg:
@@ -910,22 +930,16 @@ def _lower_occurrence_count(output:RKOutput) -> RKImage|None:
     if not valid_offsets or len(valid_offsets) != len(set(valid_offsets)) or any(bits[dst] not in (0, 0x3c00) for bits in valid_bits): return None
 
   window = len(candidate_offsets)
-  vector_bytes = (count*2+63)&-64
-  vector_lanes, matrix_lanes = vector_bytes//2, window*vector_bytes//2
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, window)
   zero, one, candidates_slot, current_slot, valid_slot, diff, magnitude, unequal, equal, selected, int_tiles = range(11)
-  gathers:tuple[RKGather, ...] = tuple(RKGather(source.arg.slot, candidates_slot, count, offsets=offsets,
-                                                dst_addend=i*vector_lanes) for i,offsets in enumerate(candidate_offsets))
-  gathers += tuple(RKGather(source.arg.slot, current_slot, count, offsets=current_offsets,
-                            dst_addend=i*vector_lanes) for i in range(window))
-  gathers += tuple(RKGather(source.arg.slot, valid_slot, count, values=bits,
-                            dst_addend=i*vector_lanes) for i,bits in enumerate(valid_bits))
+  gathers = _stripe_gathers(source.arg.slot, candidates_slot, count, candidate_offsets, vector_lanes)
+  gathers += _stripe_gathers(source.arg.slot, current_slot, count, (current_offsets,)*window, vector_lanes)
+  gathers += _stripe_gathers(source.arg.slot, valid_slot, count, valid_bits, vector_lanes, values=True)
   scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(((count+3)//4)*64))
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  ops:list[RKEWOp] = [RKEWOp(arg(diff), arg(candidates_slot), arg(current_slot), matrix_lanes, _EW_CFG[Ops.SUB]),
-    RKEWOp(arg(magnitude), arg(diff), arg(diff), matrix_lanes, _EW_CFG_ABS, submit_barrier=True, stateful=True),
-    RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
-    RKEWOp(arg(equal), arg(one), arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
-    RKEWOp(arg(selected), arg(equal), arg(valid_slot), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)]
+  ops:list[RKEWOp] = []
+  equal_arg = _ew_eq_mask(ops, arg, candidates_slot, current_slot, (diff, magnitude, unequal, equal), one, matrix_lanes)
+  ops.append(RKEWOp(arg(selected), equal_arg, arg(valid_slot), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
   selected_arg = _reduce_rows(ops, [arg(selected, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.ADD])
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), selected_arg, arg(int_tiles), count,
                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
@@ -986,23 +1000,16 @@ def _lower_sort_index_selection(output:RKOutput) -> RKImage|None:
   if any(any(not 0 <= offset < int(param.src[0].arg) for offset in offsets) for offsets,param in maps_and_sizes): return None
 
   rows = len(parsed)
-  vector_bytes = (count*2+63)&-64
-  vector_lanes, matrix_lanes = vector_bytes//2, rows*vector_bytes//2
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, rows)
   (zero, one, raw_candidate_count, raw_current_count, candidate_count, current_count, convert_tiles,
    candidate_value, current_value, weights, value_diff, value_magnitude, value_unequal, value_equal,
    count_diff, count_magnitude, count_unequal, count_equal, selected, weighted, int_tiles) = range(21)
-  gathers:tuple[RKGather, ...] = ()
-  for row,(weight, half_offsets, int_offsets) in enumerate(zip((x[0] for x in parsed), half_candidate_offsets, int_candidate_offsets)):
-    addend = row*vector_lanes
-    gathers += (RKGather(half_candidate_params[0].arg.slot, candidate_value, count, offsets=half_offsets, dst_addend=addend),
-                RKGather(int_candidate_params[0].arg.slot, raw_candidate_count, count, offsets=int_offsets,
-                         dst_addend=addend, itemsize=4),
-                RKGather(half_candidate_params[0].arg.slot, weights, count,
-                         values=(struct.unpack("<H", struct.pack("<e", float(weight)))[0],)*count, dst_addend=addend))
-  gathers += tuple(RKGather(half_current_param.arg.slot, current_value, count, offsets=half_current_offsets,
-                            dst_addend=row*vector_lanes) for row in range(rows))
-  gathers += tuple(RKGather(int_current_param.arg.slot, raw_current_count, count, offsets=int_current_offsets,
-                            dst_addend=row*vector_lanes, itemsize=4) for row in range(rows))
+  weight_bits = tuple((struct.unpack("<H", struct.pack("<e", float(weight)))[0],)*count for weight,_,_ in parsed)
+  gathers = _stripe_gathers(half_candidate_params[0].arg.slot, candidate_value, count, half_candidate_offsets, vector_lanes)
+  gathers += _stripe_gathers(int_candidate_params[0].arg.slot, raw_candidate_count, count, int_candidate_offsets, vector_lanes, itemsize=4)
+  gathers += _stripe_gathers(half_candidate_params[0].arg.slot, weights, count, weight_bits, vector_lanes, values=True)
+  gathers += _stripe_gathers(half_current_param.arg.slot, current_value, count, (half_current_offsets,)*rows, vector_lanes)
+  gathers += _stripe_gathers(int_current_param.arg.slot, raw_current_count, count, (int_current_offsets,)*rows, vector_lanes, itemsize=4)
   scratch_sizes = [matrix_lanes*2]*21
   scratch_sizes[raw_candidate_count] = scratch_sizes[raw_current_count] = matrix_lanes*4
   scratch_sizes[convert_tiles] = ((matrix_lanes+3)//4)*64
@@ -1010,19 +1017,14 @@ def _lower_sort_index_selection(output:RKOutput) -> RKImage|None:
   scratch = tuple(RKScratch(_scratch_bytes(size//2) if i not in (raw_candidate_count, raw_current_count, convert_tiles, int_tiles)
                             else size) for i,size in enumerate(scratch_sizes))
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  ops:list[RKEWOp] = [
-    RKEWOp(arg(candidate_count), arg(raw_candidate_count), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True),
-    RKEWOp(arg(current_count), arg(raw_current_count), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True),
-    RKEWOp(arg(value_diff), arg(candidate_value), arg(current_value), matrix_lanes, _EW_CFG[Ops.SUB]),
-    RKEWOp(arg(value_magnitude), arg(value_diff), arg(value_diff), matrix_lanes, _EW_CFG_ABS, submit_barrier=True, stateful=True),
-    RKEWOp(arg(value_unequal), arg(value_magnitude), arg(value_magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
-    RKEWOp(arg(value_equal), arg(one), arg(value_unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
-    RKEWOp(arg(count_diff), arg(candidate_count), arg(current_count), matrix_lanes, _EW_CFG[Ops.SUB], submit_barrier=True, stateful=True),
-    RKEWOp(arg(count_magnitude), arg(count_diff), arg(count_diff), matrix_lanes, _EW_CFG_ABS),
-    RKEWOp(arg(count_unequal), arg(count_magnitude), arg(count_magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
-    RKEWOp(arg(count_equal), arg(one), arg(count_unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
-    RKEWOp(arg(selected), arg(value_equal), arg(count_equal), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
-    RKEWOp(arg(weighted), arg(selected), arg(weights), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)]
+  ops:list[RKEWOp] = [RKEWOp(arg(candidate_count), arg(raw_candidate_count), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True),
+                       RKEWOp(arg(current_count), arg(raw_current_count), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True)]
+  value_equal_arg = _ew_eq_mask(ops, arg, candidate_value, current_value, (value_diff, value_magnitude, value_unequal, value_equal),
+                                one, matrix_lanes)
+  count_equal_arg = _ew_eq_mask(ops, arg, candidate_count, current_count, (count_diff, count_magnitude, count_unequal, count_equal),
+                                one, matrix_lanes, (True, False))
+  ops.extend((RKEWOp(arg(selected), value_equal_arg, count_equal_arg, matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
+              RKEWOp(arg(weighted), arg(selected), arg(weights), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)))
   selected_arg = _reduce_rows(ops, [arg(weighted, row*vector_bytes) for row in range(rows)], count, _EW_CFG[Ops.ADD])
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), selected_arg, arg(int_tiles), count,
                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
@@ -1099,8 +1101,7 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
   extrema_slots = tuple(range(candidate_arena+1, candidate_arena+1+len(extrema_plans)))
   first_temp = candidate_arena+1+len(extrema_plans)
   coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(first_temp, first_temp+7)
-  vector_bytes = (count*2+63)&-64
-  vector_lanes, matrix_lanes = vector_bytes//2, window*vector_bytes//2
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, window)
   def materialize(plans:tuple[RKGather, ...], scratch_slot:int) -> tuple[RKGather, ...]:
     return tuple(RKGather(plan.src_index, scratch_slot, count, plan.base, plan.axes, plan.offsets, plan.fill_bits,
                           values=plan.values, partial=plan.partial, dst_stride=plan.dst_stride,
@@ -1122,18 +1123,13 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
     ew_ops.append(RKEWOp(extrema, extrema, args(slot), matrix_lanes, _EW_CFG[Ops.MAX],
                          submit_barrier=negate_extrema and i == 0, stateful=negate_extrema and i == 0))
   if negated_candidates:
-    ew_ops.extend((RKEWOp(args(diff), args(zero), args(candidate_arena), matrix_lanes, _EW_CFG[Ops.SUB],
-                           submit_barrier=bool(ew_ops), stateful=bool(ew_ops)),
-                   RKEWOp(args(magnitude), args(diff), extrema, matrix_lanes, _EW_CFG[Ops.SUB], submit_barrier=True, stateful=True)))
-  else: ew_ops.append(RKEWOp(args(magnitude), args(candidate_arena), extrema, matrix_lanes, _EW_CFG[Ops.SUB],
-                             submit_barrier=bool(ew_ops), stateful=bool(ew_ops)))
-  ew_ops.extend((RKEWOp(args(magnitude), args(magnitude), args(magnitude), matrix_lanes, _EW_CFG_ABS,
+    ew_ops.append(RKEWOp(args(diff), args(zero), args(candidate_arena), matrix_lanes, _EW_CFG[Ops.SUB],
+                          submit_barrier=bool(ew_ops), stateful=bool(ew_ops)))
+  equal_arg = _ew_eq_mask(ew_ops, args, diff if negated_candidates else candidate_arena, extrema_slots[0],
+                          (magnitude, magnitude, unequal, equal), one, matrix_lanes, (bool(ew_ops), True))
+  ew_ops.extend((RKEWOp(args(diff), equal_arg, args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
                         submit_barrier=True, stateful=True),
-                 RKEWOp(args(unequal), args(magnitude), args(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
-                 RKEWOp(args(equal), args(one), args(unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
-                 RKEWOp(args(diff), args(equal), args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
-                        submit_barrier=True, stateful=True),
-                 RKEWOp(args(selected_arena), args(equal), args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
+                 RKEWOp(args(selected_arena), equal_arg, args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
                         submit_barrier=True, stateful=True)))
   selected = _reduce_rows(ew_ops, [args(selected_arena, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.MAX])
   ew_ops.append(RKEWOp(args(diff), args(2), selected, count, _EW_CFG[Ops.SUB]) if first_tie else
