@@ -1035,6 +1035,34 @@ def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
                    src_kind=RKBufferKind.SCRATCH))
   return RKImage(RKTarget.RK3588, scratch, gathers=tuple(plans), ew_ops=ops, post_gathers=post)
 
+def _lower_sign(uops:list[UOp]) -> RKImage|None:
+  """Lower WHERE(x!=0, WHERE(x<0, -1, 1), 0) through positive and negative DPU masks."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.half: return None
+  store, value = stores[0], stores[0].src[1]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX or value.op is not Ops.WHERE: return None
+  nonzero, signed, zero = value.src
+  if (nonzero.op is not Ops.CMPNE or signed.op is not Ops.WHERE or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or
+      signed.src[0].op is not Ops.CMPLT or signed.src[1].op is not Ops.CONST or float(signed.src[1].arg) != -1.0 or
+      signed.src[2].op is not Ops.CONST or float(signed.src[2].arg) != 1.0): return None
+  source = next((x for x in nonzero.src if x.op is Ops.LOAD), None)
+  if (source is None or source.src[0].op is not Ops.INDEX or
+      not any(x.op is Ops.CONST and float(x.arg) == 0.0 for x in nonzero.src) or
+      signed.src[0].src[0].key != source.key or signed.src[0].src[1].op is not Ops.CONST or
+      float(signed.src[0].src[1].arg) != 0.0): return None
+  in_param = _root_param(source.src[0])
+  count = int(out_param.src[0].arg)
+  if (in_param is None or in_param.dtype.scalar() is not dtypes.half or in_param.src[0].op is not Ops.CONST or
+      int(in_param.src[0].arg) != count or source.src[0].src[1].key != store.src[0].src[1].key): return None
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  zero_arg, negative, negative_mask, positive_mask = (RKArg(RKBufferKind.SCRATCH, i) for i in range(4))
+  source_arg, out = RKArg(RKBufferKind.ARG, in_param.arg.slot), RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  ops = (RKEWOp(negative, zero_arg, source_arg, count, _EW_CFG[Ops.SUB]),
+         RKEWOp(negative_mask, negative, negative, count, _EW_CFG[Ops.MAX], compare=True),
+         RKEWOp(positive_mask, source_arg, source_arg, count, _EW_CFG[Ops.MAX], compare=True),
+         RKEWOp(out, positive_mask, negative_mask, count, _EW_CFG[Ops.SUB], stateful=True))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(_scratch_bytes(count)) for _ in range(4)), b"\0\0", ew_ops=ops)
+
 def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGather, ...],
                             extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int],
                             first_tie:bool=False, negate_extrema:bool=False) -> RKImage:
@@ -1376,6 +1404,7 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (sort_compare:=_lower_sort_compare(uops)) is not None: return sort_compare
+  if (sign:=_lower_sign(uops)) is not None: return sign
   if (occurrence_count:=_lower_occurrence_count(uops)) is not None: return occurrence_count
   if (sort_index:=_lower_sort_index_selection(uops)) is not None: return sort_index
   if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop

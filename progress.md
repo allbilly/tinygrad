@@ -1613,3 +1613,28 @@ The CPU-cheat audit found no runtime or host numeric implementation in this mile
 and DPU command construction changed. The host does not inspect, compare, negate, or select tensor values. There is no
 CMAC, CNA, PPU, tinygrad core change, external non-FP16 input support, or tolerance relaxation beyond the existing
 FP16 contract.
+
+---
+
+## 2026-08-08 — FP16 sign and softsign
+
+Upstream `test_sign`, `test_sign_exact`, `test_softsign`, and `test_softsign_exact` now join the Rockchip census. A
+permanent nonfinite sign regression also verifies `-inf`, `+inf`, both signed zeros, and NaN exactly.
+
+Historical milestone `e5fdcad64` supplies the DPU comparison-mask construction for sign. The current renderer accepts
+only Tinygrad's exact `WHERE(x!=0, WHERE(x<0, -1, 1), 0)` graph, computes positive and negative masks on DPU, and
+subtracts them on DPU. The four stages use four submits and return `-1`, `0`, or `1` without host classification.
+
+Softsign already composes the current native ABS, ADD, and FDIV stages as `x/(1+abs(x))`; historical milestone
+`506ffb537` and `~/npu/ops_ref/main.c` provide matching references. No extra special-case lowering was needed.
+Historical exact-copysign milestone `751a108e2` extracts sign bits with NumPy in the runtime, so it was deliberately not
+ported under the no-CPU-cheat rule; copysign remains a separate future problem.
+
+- Focused sign/softsign group: **5 passed in 4.83 s**, sequentially.
+- Complete Rockchip census: **313 passed, 11 skipped, 200 subtests passed in 308.65 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,644/269 executable lines**.
+
+The CPU-cheat audit found only static UOp validation and DPU command construction. Runtime code is unchanged and never
+reads or classifies tensor values for sign or softsign. Every negation, comparison, mask, subtraction, absolute value,
+addition, and division executes on DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or tolerance relaxation.

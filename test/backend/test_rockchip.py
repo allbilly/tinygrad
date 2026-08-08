@@ -709,6 +709,29 @@ class TestRockchipElementwiseExtremaOps(unittest.TestCase):
   def test_minimum(self): self._test(torch.minimum, Tensor.minimum)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipSignOps(unittest.TestCase):
+  """FP16 sign and softsign computed entirely by DPU EW stages."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_sign = _test_ops.TestOps.test_sign
+  test_sign_exact = _test_ops.TestOps.test_sign_exact
+  test_softsign = _test_ops.TestOps.test_softsign
+  test_softsign_exact = _test_ops.TestOps.test_softsign_exact
+
+  def test_sign_nonfinite(self):
+    values = np.array([-math.inf, -1., -0., 0., 1., math.inf, math.nan], dtype=np.float16)
+    before = Device["ROCKCHIP"].submit_count
+    got = Tensor(values).sign().realize().numpy()
+    expected = np.array([-1., -1., 0., 0., 1., 1., 0.], dtype=np.float16)
+    np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 
