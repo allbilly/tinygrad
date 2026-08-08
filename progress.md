@@ -2143,3 +2143,32 @@ This is a test-only coverage milestone. The CPU-cheat audit found no renderer, r
 division and integral-rounding arithmetic executes on DPU EW, with only static scalar-broadcast address preparation on
 the host. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion,
 or tolerance relaxation.
+
+---
+
+## 2026-08-09 — constant integer powers of FP16 inputs
+
+The integer-exponent portion of upstream `test_pow` now joins the Rockchip census: vector `x**0`, `x**1`, `x**2`,
+`x**3`, and `x**-2`; scalar `x**2` and `x**-2`; and the two negative-range cubic regressions. Fractional and runtime
+tensor exponents remain excluded because their historical Rockchip implementations depend on transcendental/LUT
+machinery, which is outside the current scope.
+
+Tinygrad simplifies the supported vector forms into static fill/copy, repeated MUL, or reciprocal plus MUL. `x**0` is
+the input-independent constant one and needs no ioctl; the four remaining ordinary vector forms and the negative-range
+vector cubic each execute in one DPU PC-chain. Rank-zero literal inputs constant-fold without a submit. The test asserts
+exactly **5 ioctls for the 9 forms**.
+
+The historical power series was inspected rather than ported. Commit `463d0dfd6` evaluates integer-tensor powers in a
+typed host task, while later general/fractional power commits use generated range-reduced LUT graphs. `~/npu` and
+`~/rk3588` contain the canonical tests but no simpler native constant-integer-power register operation. This milestone
+therefore relies only on Tinygrad's existing decomposition and proven DPU EW MUL/FDIV stages.
+
+- Focused integer-power class: **1 passed in 3.10 s**, sequentially; call time was **0.49 s**.
+- Complete Rockchip census: **350 passed, 11 skipped, 180 subtests passed in 397.32 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,895/274 executable lines**.
+
+This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change. Every
+input-dependent vector multiplication and reciprocal runs on DPU EW; static constant fills and compile-time rank-zero
+folds do not inspect a runtime tensor buffer. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback,
+external non-FP16 input conversion, or tolerance relaxation.

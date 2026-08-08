@@ -375,6 +375,20 @@ class TestRockchipPolynomialLossOps(unittest.TestCase):
     _fp16_fp32_golden_test_op([(3,4), (3,4)], lambda x,y: (x-y).abs().mean(), lambda x,y: (x-y).abs().mean())
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipIntegerPowerOps(unittest.TestCase):
+  """Constant integer powers composed from FP16 DPU EW multiplication and division."""
+
+  def test_pow(self):
+    before = Device["ROCKCHIP"].submit_count
+    for exponent in (0, 1, 2, 3, -2):
+      _fp16_test_op([(45,65)], lambda x,exponent=exponent:x**exponent, forward_only=True)
+    for exponent in (2, -2):
+      _fp16_test_op([()], lambda x,exponent=exponent:x**exponent, forward_only=True)
+    _fp16_test_op([(45,65)], lambda x:x**3, forward_only=True, low=-30, high=-27)
+    _fp16_test_op([()], lambda x:x**3, forward_only=True, low=-30, high=-27)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 5)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(unittest.TestCase):
   """FP16 scatter with compile-time-static indices; external integer NPU inputs are unsupported."""
 
