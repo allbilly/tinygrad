@@ -673,3 +673,17 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - `sz.py`: renderer 553 executable lines, runtime 165.
 
 The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next upstream interpolation case is `test_interpolate_bilinear_corners_aligned`.
+
+---
+
+## 2026-08-08 — `test_interpolate_bilinear_corners_aligned`
+
+The aligned-corners bilinear method passes all three upstream 2D resize pairs through the same two-pass FP16 DPU EW path.
+
+- Focused upstream method: **1 passed in 4.04 s**.
+- Complete admitted interpolation group: **6 passed in 6.92 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+The next upstream interpolation case is `test_interpolate_trilinear`.
