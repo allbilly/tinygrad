@@ -362,6 +362,29 @@ class TestRockchipInterpolateOps(unittest.TestCase):
   test_interpolate_trilinear_corners_aligned = _test_ops.TestOps.test_interpolate_trilinear_corners_aligned
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipMovementOps(unittest.TestCase):
+  """Static FP16 view and layout methods proven by the Rockchip gather path."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_transpose = _test_ops.TestOps.test_transpose
+  test_permute = _test_ops.TestOps.test_permute
+  test_reshape = _test_ops.TestOps.test_reshape
+  test_view = _test_ops.TestOps.test_view
+  test_flip = _test_ops.TestOps.test_flip
+  test_squeeze = _test_ops.TestOps.test_squeeze
+  test_unsqueeze = _test_ops.TestOps.test_unsqueeze
+  test_flatten = _test_ops.TestOps.test_flatten
+  test_unflatten = _test_ops.TestOps.test_unflatten
+  test_detach = _test_ops.TestOps.test_detach
+  test_expand = _test_ops.TestOps.test_expand
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):
   """Remaining test_ops methods, admitted and debugged in source order."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception

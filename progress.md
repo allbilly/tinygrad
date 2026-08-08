@@ -914,3 +914,28 @@ allowed FP16 tolerance.
 
 The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure,
 or kernel oops.
+
+---
+
+## 2026-08-08 — Static FP16 movement and view group
+
+Eleven exact upstream movement methods are now admitted: `test_transpose`, `test_permute`, `test_reshape`, `test_view`,
+`test_flip`, `test_squeeze`, `test_unsqueeze`, `test_flatten`, `test_unflatten`, `test_detach`, and `test_expand`. This is
+the view-only subset of the movement census proven on `rockchip/post-518-reference`. The `~/rk3588` examples and
+`~/npu/include/rknnops.h` likewise treat tensor packing as address/stride preparation around the accelerator rather than
+numeric execution.
+
+No renderer/runtime change was required. Non-contiguous views use the existing affine or fallback gather plan, which
+computes integer source indexes and copies raw `uint16` lanes into scratch. The value-preserving DPU EW stage remains the
+only input-dependent numeric operation. No CMAC path, FP32 conversion, tolerance change, or shared tinygrad core edit was
+added.
+
+- Each method passed separately in a fresh pytest process: 2.58–3.11 s.
+- Persistent-process movement group: **11 passed in 3.70 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**, through 131,072 elements.
+- Complete Rockchip census: **184 passed, 8 skipped, 96 subtests passed in 111.49 s**.
+- Ruff: pass. Renderer/runtime executable size remains 647/165 lines.
+
+The vendor script's legacy contiguous 4 MiB allocation logged its two known CMA fallback attempts; the subsequent
+tinygrad census produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left `CmaFree`
+at 6144 KiB.
