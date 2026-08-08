@@ -576,6 +576,20 @@ class TestRockchipCumulativeExtremaIndexOps(unittest.TestCase):
   def test_cummin_indices_zero_axis(self): self._test_indices("min", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipArgExtremaOps(unittest.TestCase):
+  """FP16 ArgMax/ArgMin selected entirely by DPU EW, including first-index ties."""
+
+  def _test(self, kind:str, values:tuple[tuple[float, ...], ...]):
+    torch_fxn, tinygrad_fxn = (torch.argmax, Tensor.argmax) if kind == "max" else (torch.argmin, Tensor.argmin)
+    for case in values:
+      with self.subTest(kind=kind, values=case):
+        _TEST_OPS_HELPER(None, lambda x: torch_fxn(x).int(), tinygrad_fxn, vals=[list(case)], forward_only=True)
+
+  def test_argmax_first_tie(self): self._test("max", ((2.0, 2.0), (1.0, 2.0, 2.0)))
+
+  def test_argmin_first_tie(self): self._test("min", ((2.0, 2.0), (3.0, 2.0, 2.0)))
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

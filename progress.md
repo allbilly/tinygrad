@@ -1404,3 +1404,33 @@ The CPU-cheat audit found only static address-map planning, scratch padding init
 lane movement on the host. Every comparison, mask, candidate negation, selection, reduction, subtraction, and numeric
 FP16-to-INT32 conversion executes on DPU EW. There is no CMAC, CNA, PPU, shared tinygrad core change, or tolerance
 relaxation.
+
+---
+
+## 2026-08-08 — FP16 ArgMax/ArgMin first-tie selection on DPU EW
+
+The first general selected-index milestone covers the exact first-occurrence rule for FP16 ArgMax and ArgMin, including
+equal pairs and repeated extrema after a distinct leading value. The unchanged upstream methods begin with `int32`
+literals and later add boolean/int32 conversion regressions, so those input-format cases remain a separate group rather
+than being presented as native FP16 coverage.
+
+Historical commit `7bea014d35` proves the RK3588 DPU compare/select design, but its large task runtime is not ported.
+`~/npu` documents RKNN ArgMax/ArgMin as CPU operators, and `~/rk3588` contains the upstream tests plus RKNN runtime
+operator strings rather than a lower-level register implementation. The current compact renderer recognizes only the
+fused graph containing one FP16 MAX tree, one equality/inversion/cast per candidate, the exact descending coordinate
+weights, one INT32 MAX tree, and the final `window-selected` transform. It also verifies that candidate gathers form an
+exact permutation of the source.
+
+Candidate and extreme-value matrices reuse the cumulative-index image. Descending coordinates make DPU MAX retain the
+earliest equal candidate; a final DPU subtraction restores its zero-based coordinate. ArgMin negates both the candidate
+matrix and the independent matrix used to construct `MAX(-x)`, then follows the same equality path.
+
+- Focused FP16 first-tie group: **2 passed, 4 subtests passed in 4.18 s**, sequentially.
+- Complete Rockchip census: **286 passed, 11 skipped, 172 subtests passed in 192.93 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,210/253 executable lines**.
+
+The runtime is unchanged. Host work is limited to static source-address and coordinate-bit image construction plus the
+existing raw lane movement. Candidate negation, extrema reduction, equality, mask weighting, first-tie selection,
+subtraction, and FP16-to-INT32 output conversion all execute on DPU EW. There is no CPU numeric fallback, CMAC, CNA,
+PPU, shared tinygrad core change, or tolerance relaxation.

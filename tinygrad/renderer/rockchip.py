@@ -743,12 +743,15 @@ def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 
 def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGather, ...],
-                            extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int]) -> RKImage:
+                            extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int],
+                            first_tie:bool=False, negate_extrema:bool=False) -> RKImage:
   """Emit a matrix equality/select reduction shared by unrolled and loop cumulative indices."""
   window = len(candidate_plans)
-  zero, one, candidate_arena = range(3)
-  extrema_slots = tuple(range(3, 3+len(extrema_plans)))
-  coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(3+len(extrema_plans), 10+len(extrema_plans))
+  constants = (0.0, 1.0, float(window)) if first_tie else (0.0, 1.0)
+  zero, one, candidate_arena = 0, 1, len(constants)
+  extrema_slots = tuple(range(candidate_arena+1, candidate_arena+1+len(extrema_plans)))
+  first_temp = candidate_arena+1+len(extrema_plans)
+  coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(first_temp, first_temp+7)
   vector_bytes = (count*2+63)&-64
   vector_lanes, matrix_lanes = vector_bytes//2, window*vector_bytes//2
   def materialize(plans:tuple[RKGather, ...], scratch_slot:int) -> tuple[RKGather, ...]:
@@ -757,15 +760,20 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
                           dst_addend=i*vector_lanes, itemsize=plan.itemsize) for i,plan in enumerate(plans))
   gathers = materialize(candidate_plans, candidate_arena)
   for plan,scratch_slot in zip(extrema_plans, extrema_slots): gathers += materialize((plan,)*window, scratch_slot)
-  coordinate_bits = tuple(tuple(struct.unpack("<H", struct.pack("<e", float(candidate+1 if candidate <= axis_coords[dst] else 0)))[0]
+  coordinate_bits = tuple(tuple(struct.unpack("<H", struct.pack("<e", float(window-candidate if first_tie else
+                                candidate+1 if candidate <= axis_coords[dst] else 0)))[0]
                                 for dst in range(count)) for candidate in range(window))
   gathers += tuple(RKGather(candidate_plans[0].src_index, coordinate_arena, count, values=bits, dst_addend=candidate*vector_lanes)
                    for candidate,bits in enumerate(coordinate_bits))
   scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(((count+3)//4)*64))
   def args(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   ew_ops:list[RKEWOp] = []
+  if negate_extrema:
+    for slot in extrema_slots: ew_ops.append(RKEWOp(args(slot), args(zero), args(slot), matrix_lanes, _EW_CFG[Ops.SUB]))
   extrema = args(extrema_slots[0])
-  for slot in extrema_slots[1:]: ew_ops.append(RKEWOp(extrema, extrema, args(slot), matrix_lanes, _EW_CFG[Ops.MAX]))
+  for i,slot in enumerate(extrema_slots[1:]):
+    ew_ops.append(RKEWOp(extrema, extrema, args(slot), matrix_lanes, _EW_CFG[Ops.MAX],
+                         submit_barrier=negate_extrema and i == 0, stateful=negate_extrema and i == 0))
   if negated_candidates:
     ew_ops.extend((RKEWOp(args(diff), args(zero), args(candidate_arena), matrix_lanes, _EW_CFG[Ops.SUB],
                            submit_barrier=bool(ew_ops), stateful=bool(ew_ops)),
@@ -791,10 +799,77 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
       reduced.append(active[i])
     if len(active) & 1: reduced.append(active[-1])
     active = reduced
-  ew_ops.append(RKEWOp(args(diff), active[0], args(one), count, _EW_CFG[Ops.SUB]))
+  ew_ops.append(RKEWOp(args(diff), args(2), active[0], count, _EW_CFG[Ops.SUB]) if first_tie else
+                RKEWOp(args(diff), active[0], args(one), count, _EW_CFG[Ops.SUB]))
   ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), args(diff), args(int_tiles), count,
                        _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
-  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ew_ops))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<"+"e"*len(constants), *constants), gathers=gathers, ew_ops=tuple(ew_ops))
+
+def _lower_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
+  """Lower fused FP16 ArgMax/ArgMin while preserving first-index tie semantics."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
+  store = stores[0]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  count, out_index, value = int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+
+  def flatten(root:UOp, op:Ops) -> list[UOp]:
+    return flatten(root.src[0], op)+flatten(root.src[1], op) if root.op is op else [root]
+  def candidate(root:UOp) -> tuple[UOp, bool]|None:
+    if root.op is Ops.LOAD: return (root, False)
+    if root.op is Ops.MUL and len(root.src) == 2:
+      loads = [x for x in root.src if x.op is Ops.LOAD]
+      constants = [x for x in root.src if x.op is Ops.CONST and float(x.arg) == -1.0]
+      if len(loads) == len(constants) == 1: return (loads[0], True)
+    return None
+
+  roots:list[tuple[UOp, list[UOp], list[tuple[UOp, bool]]]] = []
+  for root in value.toposort():
+    if root.op is not Ops.MAX or root.dtype.scalar() is not dtypes.half: continue
+    leaves = flatten(root, Ops.MAX)
+    maybe_parsed = [candidate(leaf) for leaf in leaves]
+    if all(x is not None for x in maybe_parsed): roots.append((root, leaves, [x for x in maybe_parsed if x is not None]))
+  if not roots: return None
+  extrema, candidate_exprs, parsed_candidates = max(roots, key=lambda x:len(x[1]))
+  signs = {negated for _,negated in parsed_candidates}
+  if len(parsed_candidates) < 2 or len(signs) != 1: return None
+  negated_candidates = signs.pop()
+  loads = [load for load,_ in parsed_candidates]
+  if len(set(loads)) != len(loads) or any(load.src[0].op is not Ops.INDEX or load.src[0].src[0].op is not Ops.PARAM for load in loads): return None
+  source = loads[0].src[0].src[0]
+  if any(load.src[0].src[0] is not source for load in loads) or source.src[0].op is not Ops.CONST: return None
+  window, source_count = len(loads), int(source.src[0].arg)
+  if source_count != count*window or window > 2048: return None
+  try: candidate_offsets = [tuple(_gather_offsets(out_index, load.src[0].src[1], None, count)) for load in loads]
+  except RuntimeError: return None
+  ordered = sorted(zip(candidate_offsets, candidate_exprs), key=lambda x:x[0])
+  if sorted(offset for offsets,_ in ordered for offset in offsets) != list(range(source_count)): return None
+
+  equal_casts:list[UOp] = []
+  for _,expr in ordered:
+    matches = [u for u in value.toposort() if u.op is Ops.CMPNE and (u.src == (expr, extrema) or u.src == (extrema, expr))]
+    if len(matches) != 1: return None
+    inversions = [u for u in value.toposort() if u.op is Ops.CMPNE and matches[0] in u.src and
+                  any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg) for x in u.src)]
+    casts = [u for u in value.toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
+             len(inversions) == 1 and u.src == (inversions[0],)]
+    if len(casts) != 1: return None
+    equal_casts.append(casts[0])
+  int_roots = [u for u in value.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int]
+  if not int_roots: return None
+  selected = max(int_roots, key=lambda x:len(flatten(x, Ops.MAX)))
+  terms = flatten(selected, Ops.MAX)
+  if len(terms) != window: return None
+  for candidate_index,cast in enumerate(equal_casts):
+    weight = window-candidate_index
+    if not any(term is cast if weight == 1 else term.op is Ops.MUL and cast in term.src and
+               any(x.op is Ops.CONST and int(x.arg) == weight for x in term.src) for term in terms): return None
+  if not (value.op is Ops.ADD and any(x.op is Ops.CONST and int(x.arg) == window for x in value.src) and
+          any(x.op is Ops.MUL and selected in x.src and any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src) for x in value.src)): return None
+  candidate_plans = tuple(RKGather(source.arg.slot, 0, count, offsets=offsets) for offsets,_ in ordered)
+  return _cumulative_index_image(out_param.arg.slot, count, candidate_plans, candidate_plans,
+                                 negated_candidates, [window-1]*count, first_tie=True, negate_extrema=negated_candidates)
 
 def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   """Select unrolled cumulative MAX/MIN axis coordinates with DPU equality masks."""
@@ -893,6 +968,7 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
+  if (arg_extrema:=_lower_arg_extrema_index(uops)) is not None: return arg_extrema
   if (raw_int32:=_lower_raw_int32_layout(uops)) is not None: return raw_int32
   if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
   if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
