@@ -620,3 +620,21 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - `sz.py`: renderer 552 executable lines, runtime 165.
 
 The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next upstream interpolation case is `test_interpolate_linear`.
+
+---
+
+## 2026-08-08 — `test_interpolate_linear`
+
+The upstream 1D linear interpolation method now passes both resize directions, `(2,3,52) -> (2,3,29)` and `(2,3,29) -> (2,3,52)`, at the unchanged FP16 tolerance. A direct regression asserts that the first direction uses exactly one ioctl.
+
+Interpolation coordinates and fractional weights depend only on shape. Rockchip retains those FP32 cast/WHERE/TRUNC expressions as static geometry and uploads their final FP16 bit patterns. It no longer rewrites geometry-only FP32 ADD/MUL into dynamic nodes. The gathered low/high FP16 input values and every input-dependent lerp MUL/ADD execute through DPU EW; there is no CPU interpolation or input-dependent arithmetic.
+
+Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- Focused direct and upstream methods: **2 passed in 3.06 s**; direct case exactly 1 ioctl.
+- Complete Rockchip census: **107 passed, 9 skipped, 96 subtests passed in 101.45 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 553 executable lines, runtime 165.
+
+The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next upstream interpolation case is `test_interpolate_linear_corners_aligned`.

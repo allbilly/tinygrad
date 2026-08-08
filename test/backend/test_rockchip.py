@@ -149,6 +149,11 @@ class TestRockchip(unittest.TestCase):
     ref = torch.nn.functional.interpolate(torch.from_numpy(x.numpy()), size=(9,), mode="nearest").numpy()
     self._check(1, x.interpolate((9,), mode="nearest"), ref, **_FP16)
 
+  def test_interpolate_linear_submit(self):
+    x = self._half((2, 3, 52), 503)
+    ref = torch.nn.functional.interpolate(torch.from_numpy(x.numpy()), size=(29,), mode="linear").numpy()
+    self._check(1, x.interpolate((29,), mode="linear"), ref, **_FP16)
+
   # ---- GEMM / MATMUL (from test_ops, fp16 tol) ----
   def test_matmul_simple(self):
     helper_test_op([(4), (4,4)], lambda x,y: x.matmul(y), Tensor.dot, **_FP16)
@@ -329,6 +334,7 @@ class TestRockchipInterpolateOps(unittest.TestCase):
 
   test_interpolate_nearest = _test_ops.TestOps.test_interpolate_nearest
   test_interpolate_nearest_exact = _test_ops.TestOps.test_interpolate_nearest_exact
+  test_interpolate_linear = _test_ops.TestOps.test_interpolate_linear
 
 if __name__ == "__main__":
   unittest.main()
