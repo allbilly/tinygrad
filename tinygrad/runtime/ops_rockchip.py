@@ -169,9 +169,4 @@ class RockchipDevice(Compiled):
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
-  def reset_npu(self):
-    try: rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=13, value=0)  # RKNPU_ACT_CLR_TOTAL_RW_AMOUNT
-    except OSError: pass
-    try: rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
-    except OSError: pass
   def synchronize(self): pass

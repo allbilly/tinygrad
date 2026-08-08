@@ -939,3 +939,14 @@ added.
 The vendor script's legacy contiguous 4 MiB allocation logged its two known CMA fallback attempts; the subsequent
 tinygrad census produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left `CmaFree`
 at 6144 KiB.
+
+### Runtime cleanup and host-computation audit
+
+The movement path was audited after admission. Runtime gathers view buffers only as raw `uint16` lanes; NumPy computes
+integer source indexes and never interprets or transforms input-dependent FP16 values. Renderer vector evaluation is
+restricted to parameter-free RANGE/CONST layout expressions. This is ABI/layout preparation, not a CPU numeric fallback.
+
+The unused `reset_npu` hook was removed. It had no caller, issued unsupported action 13, swallowed reset failures, and did
+not match the recovery ownership used by other tinygrad hardware runtimes. Blocking submission behavior is unchanged.
+The movement group still passes **11/11 in 3.55 s** after cleanup. Ruff and mypy pass; `sz.py` reports renderer/runtime
+sizes of **647/160 executable lines**, reducing the runtime by five lines while retaining comments and docstrings.
