@@ -121,7 +121,6 @@ class TestRockchip(unittest.TestCase):
     self._check(0, 2 * a, (a.numpy().astype(np.float32) * 2).astype(np.float16))
 
   def test_mul_naninf(self):
-    self.skipTest("RK3588 FP16 DPU EW MUL returns NaN for infinity operands")
     a = self._half((45, 65), 16)
     n = _ew_submits(45*65)
     self._check(n, a * math.inf, (a.numpy().astype(np.float32) * np.float32(np.inf)).astype(np.float16))
@@ -415,6 +414,7 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_scalar_mul = _test_ops.TestOps.test_scalar_mul
   test_div = _test_ops.TestOps.test_div
   test_scalar_div = _test_ops.TestOps.test_scalar_div
+  test_mul_naninf = _test_ops.TestOps.test_mul_naninf
   test_div_naninf = _test_ops.TestOps.test_div_naninf
 
 if __name__ == "__main__":

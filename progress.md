@@ -858,3 +858,18 @@ The first `-inf/x` sign reconstruction (`MUL → MAX → FDIV → MUL → FDIV`)
 - Complete Rockchip census: **159 passed, 9 skipped, 96 subtests passed in 111.57 s**.
 
 The complete tinygrad run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops. The reference example itself requested large contiguous buffers and logged two 4 MiB CMA allocation failures; Rockchip tinygrad continued to use its page-backed non-contiguous allocation policy and generated none.
+
+---
+
+## 2026-08-08 — Infinite FP16 multiplication on DPU
+
+RK3588 native EW MUL returns NaN for finite values multiplied by infinity. Rockchip now rewrites `x*+inf` to `x/+0`, and `x*-inf` to `(-x)/+0`. The former is one FDIV task; the latter is a two-task `MUL → FDIV` chain. Both execute entirely on DPU, inspect no input values on the host, use no reset or CMAC path, and preserve the expected infinity sign. Multiplication by NaN remains the correct native MUL operation.
+
+- Separate positive-zero FDIV probe: bit-exact pass.
+- Separate negative-infinity `MUL → FDIV` probe: bit-exact pass.
+- Direct `+inf`, `-inf`, and NaN regression: **1 passed in 2.71 s**, exactly one ioctl per expression.
+- Exact upstream `TestOps.test_mul_naninf`: **1 passed in 2.85 s**.
+- Complete incremental source-order group: **44 passed in 9.66 s**.
+- Complete Rockchip census: **161 passed, 8 skipped, 96 subtests passed in 110.71 s**.
+
+The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops.

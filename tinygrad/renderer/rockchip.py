@@ -589,6 +589,14 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
 def _fp32_alu_to_fp16(x:UOp) -> UOp|None:
   return None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))
 
+def _replace_infinite_multiply(x:UOp) -> UOp|None:
+  """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
+  for value, factor in (x.src, x.src[::-1]):
+    if factor.op is not Ops.CONST or not math.isinf(scale:=float(factor.arg)): continue
+    if scale < 0: value = value.alu(Ops.MUL, UOp.const(-1.0, dtypes.half))
+    return value.alu(Ops.FDIV, UOp.const(0.0, dtypes.half))
+  return None
+
 def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
   """RK3588 FDIV ignores the denominator sign for an infinite numerator; rebuild it with finite DPU intermediates."""
   numerator, denominator = x.src
@@ -598,6 +606,7 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
+  (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
   (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
