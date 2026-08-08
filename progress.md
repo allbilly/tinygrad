@@ -2584,3 +2584,38 @@ reconstruction, and FP16-to-INT32 conversion are all submitted to DPU EW. The ne
 this milestone: its 80-candidate, 2350-output-plane consumer still needs exact byte-wise INT32 comparison. A diagnostic
 run rejected that consumer after 36.55 seconds, showing that wide producer compilation/conversion also needs profiling
 before the full pipeline can meet the 30-second target.
+
+---
+
+## 2026-08-09 — exact wide MaxUnpool scatter
+
+Finite MaxUnpool now supports dynamic spatial indices beyond FP16's consecutive-integer range. A direct regression
+scatters distinct values to indices 2049 and 2499 in seven independent 50x50 planes and checks the complete FP16 output
+bit-exactly. The first wide upstream pipeline also passes: `(8,3,50,50)` FP16 input, 5x5 MaxPool with stride `(6,5)`,
+80 pooled candidates per plane, 1,920 dynamic INT32 indices, and 60,000 unpooled FP16 output lanes.
+
+The wide image compares the raw little-endian bytes of each dynamic INT32 index. Generic representation-preserving
+gathers expose each compact byte lane, DPU INT32-input conversion converts byte values to exact FP16 integers once, and
+the existing mid-image gather phase stripes those lanes over the candidate matrix. DPU SUB/ABS/MIN/inversion produces
+one exact equality mask per required base-256 byte; DPU multiplication combines the masks, selects the pooled values,
+and ADD-reduces the candidates. The loop matcher proves the canonical Tinygrad MaxUnpool accumulator, shared value/index
+addresses, plane and candidate dimensions, output-coordinate order, and affine source layout before emitting this image.
+It stores affine gather plans instead of expanding millions of repeated offsets in the compiled image.
+
+Profiling the complete pool/index/unpool pipeline attributed 3.61 seconds to rendering (0.01 pool values, 1.44 pool
+indices, 2.16 unpool), 15.46 seconds to DPU EW execution, and 15.16 seconds to INT32 conversion, including 15.06 seconds
+in the required conversion-boundary resets. Removing the page-derived conversion batch limit or its inter-batch reset
+caused reproducible driver timeouts and was reverted; the final runtime is unchanged. With affine plans and conservative
+conversion batches, the standalone wide method passes in **23.46 s** pytest time / **25.57 s** process wall time.
+
+- Direct exact indices 2049/2499 regression: pass.
+- Complete MaxUnpool class: **4 passed in 34.97 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **366 passed, 10 skipped, 180 subtests passed in
+  454.99 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,323/281 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change and no host interpretation of an index or pooled value.
+Python constructs only static/affine gather geometry and moves raw representations; all dynamic conversion, byte-wise
+comparison, selection, and reduction execute on DPU EW. There is no host scatter, host ArgMax, LUT, CMAC, CNA, PPU
+fallback, tolerance relaxation, or external non-FP16 input.
