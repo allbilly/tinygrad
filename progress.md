@@ -1638,3 +1638,34 @@ ported under the no-CPU-cheat rule; copysign remains a separate future problem.
 The CPU-cheat audit found only static UOp validation and DPU command construction. Runtime code is unchanged and never
 reads or classifies tensor values for sign or softsign. Every negation, comparison, mask, subtraction, absolute value,
 addition, and division executes on DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — FP16 WHERE and masked fill
+
+Nine FP16 selection cases now join the Rockchip census: tensor/scalar/broadcast arms, CMPNE, boolean AND/OR composition,
+nested WHERE, finite masked fill, unchanged upstream `test_masked_fill`, and unchanged upstream `test_inf_where`.
+The integer-output and external-boolean-input portions of upstream `test_where` remain outside the FP16-input contract.
+
+Reference milestone `fe0b2e114` supplies the proven RK3588 positive-mask construction. The current port keeps the compact
+renderer/image architecture: CMPLT and CMPNE become standalone DPU positive-mask stages, AND/OR compose exact FP16 0/1
+masks with DPU MUL/MAX, and finite arms are selected with tagged mask MUL and ADD. No old runtime graph execution or
+per-operation allocation machinery was imported.
+
+Nonfinite arms avoid `0*inf`. Threshold forms such as `(x<0).where(x, 1)` use native DPU MIN/MAX composition, while
+general infinity masked fills use a finite-numerator FDIV correction that is zero on the finite arm and signed infinity
+on the selected arm. Stateful FDIV now uses the same RDMA mode and output scale as the already-proven ordinary FDIV.
+
+Dedicated ABS and sign rewrite prepasses preserve their native algorithms before general WHERE rewriting. This prevents
+the selector from turning `abs(inf)` into `inf*sign(inf)` and preserves exact NaN sign output behavior.
+
+- Focused WHERE/masked-fill group: **9 passed in 6.28 s**, sequentially.
+- Sign, exact-ABS, and WHERE precedence regression: **15 passed in 8.51 s**, sequentially.
+- Complete Rockchip census: **322 passed, 11 skipped, 200 subtests passed in 313.77 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,698/269 executable lines**.
+
+The CPU-cheat audit found only compile-time UOp/constant inspection and DPU command construction. Runtime is unchanged;
+it never reads predicates or selects tensor values. Every comparison, mask composition, selection multiply/add,
+threshold MIN/MAX, and infinity correction executes on DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or
+tolerance relaxation beyond the existing FP16 contract.

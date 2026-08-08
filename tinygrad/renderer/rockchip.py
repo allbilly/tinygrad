@@ -185,8 +185,8 @@ _BS_MUL_COMPARE = 0x40000000
 _BN_CFG_COMPARE = 0x40082
 _BN_MUL_COMPARE = 0x7c000000
 _BN_RELUX_COMPARE = 0x3f800000
-_NATIVE_ABS, _NATIVE_LEAKY_RELU, _NATIVE_MIN, _NATIVE_RELU6 = \
-  "rockchip_abs", "rockchip_leaky_relu", "rockchip_min", "rockchip_relu6"
+_NATIVE_ABS, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK, _NATIVE_RELU6, _NATIVE_SIGN = \
+  "rockchip_abs", "rockchip_leaky_relu", "rockchip_mask_mul", "rockchip_min", "rockchip_positive_mask", "rockchip_relu6", "rockchip_sign"
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
@@ -229,6 +229,7 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
   if not (0 < count <= (4 if int32_output or int32_input else _MAX_EW_ELEMS_FP16)):
     raise ValueError(f"stateful EW count {count} out of range")
   lanes = 4 if int32_input else 8
+  is_div = ew_cfg == _EW_CFG[Ops.FDIV]
   width = (count + lanes-1) // lanes - 1
   pipeline:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_BS_CFG,_BS_BN_BYPASS),(_DPU,rk.REG_DPU_BN_CFG,_BS_BN_BYPASS),
     (_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),(_DPU,rk.REG_DPU_BS_OW_CFG,2),
@@ -246,7 +247,7 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
     (_DPU,rk.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else
                                (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else ew_cfg),
     (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
-    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if int32_output else (1<<16)|1),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
+    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if int32_output or is_div else (1<<16)|1),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
     (_DPU,rk.REG_DPU_SURFACE_ADD,4<<4),(_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
@@ -256,7 +257,7 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
   for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
                            (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
     relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
-  rdma_feature = (4<<15)|(15<<11)|(4<<5)|1 if int32_input else (2<<15)|(15<<11)|(2<<5)|(1<<3)|1
+  rdma_feature = (4<<15)|(15<<11)|(4<<5)|1 if int32_input else (2<<15)|(15<<11)|(2<<5)|(0 if is_div else 1<<3)|1
   commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature))
   return RKStage(tuple(commands), tuple(relocs))
 
@@ -574,7 +575,7 @@ def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, sup
 def _mul_reduction_terms(u:UOp) -> tuple[list[UOp], int]|None:
   """Flatten a half ADD tree containing products and optional bias terms."""
   if u.dtype.scalar() is not dtypes.half: return None
-  if u.op is Ops.MUL: return [u], 0 if u.arg == _NATIVE_LEAKY_RELU else 1
+  if u.op is Ops.MUL: return [u], 0 if u.arg in (_NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL) else 1
   if u.op is not Ops.ADD: return [u], 0
   lhs, rhs = _mul_reduction_terms(u.src[0]), _mul_reduction_terms(u.src[1])
   return None if lhs is None or rhs is None else (lhs[0] + rhs[0], lhs[1] + rhs[1])
@@ -1035,34 +1036,6 @@ def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
                    src_kind=RKBufferKind.SCRATCH))
   return RKImage(RKTarget.RK3588, scratch, gathers=tuple(plans), ew_ops=ops, post_gathers=post)
 
-def _lower_sign(uops:list[UOp]) -> RKImage|None:
-  """Lower WHERE(x!=0, WHERE(x<0, -1, 1), 0) through positive and negative DPU masks."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.half: return None
-  store, value = stores[0], stores[0].src[1]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX or value.op is not Ops.WHERE: return None
-  nonzero, signed, zero = value.src
-  if (nonzero.op is not Ops.CMPNE or signed.op is not Ops.WHERE or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or
-      signed.src[0].op is not Ops.CMPLT or signed.src[1].op is not Ops.CONST or float(signed.src[1].arg) != -1.0 or
-      signed.src[2].op is not Ops.CONST or float(signed.src[2].arg) != 1.0): return None
-  source = next((x for x in nonzero.src if x.op is Ops.LOAD), None)
-  if (source is None or source.src[0].op is not Ops.INDEX or
-      not any(x.op is Ops.CONST and float(x.arg) == 0.0 for x in nonzero.src) or
-      signed.src[0].src[0].key != source.key or signed.src[0].src[1].op is not Ops.CONST or
-      float(signed.src[0].src[1].arg) != 0.0): return None
-  in_param = _root_param(source.src[0])
-  count = int(out_param.src[0].arg)
-  if (in_param is None or in_param.dtype.scalar() is not dtypes.half or in_param.src[0].op is not Ops.CONST or
-      int(in_param.src[0].arg) != count or source.src[0].src[1].key != store.src[0].src[1].key): return None
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  zero_arg, negative, negative_mask, positive_mask = (RKArg(RKBufferKind.SCRATCH, i) for i in range(4))
-  source_arg, out = RKArg(RKBufferKind.ARG, in_param.arg.slot), RKArg(RKBufferKind.ARG, out_param.arg.slot)
-  ops = (RKEWOp(negative, zero_arg, source_arg, count, _EW_CFG[Ops.SUB]),
-         RKEWOp(negative_mask, negative, negative, count, _EW_CFG[Ops.MAX], compare=True),
-         RKEWOp(positive_mask, source_arg, source_arg, count, _EW_CFG[Ops.MAX], compare=True),
-         RKEWOp(out, positive_mask, negative_mask, count, _EW_CFG[Ops.SUB], stateful=True))
-  return RKImage(RKTarget.RK3588, tuple(RKScratch(_scratch_bytes(count)) for _ in range(4)), b"\0\0", ew_ops=ops)
-
 def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGather, ...],
                             extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int],
                             first_tie:bool=False, negate_extrema:bool=False) -> RKImage:
@@ -1404,7 +1377,6 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (sort_compare:=_lower_sort_compare(uops)) is not None: return sort_compare
-  if (sign:=_lower_sign(uops)) is not None: return sign
   if (occurrence_count:=_lower_occurrence_count(uops)) is not None: return occurrence_count
   if (sort_index:=_lower_sort_index_selection(uops)) is not None: return sort_index
   if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
@@ -1485,6 +1457,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     return visited[u]
   if not visit(val) or not order or order[-1] is not val:
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
+  mask_program = any(expr.op is Ops.MAX and expr.arg == _NATIVE_POSITIVE_MASK for expr in order)
   uses = {u: 0 for u in order}
   for node in order:
     for src in node.src:
@@ -1501,7 +1474,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       if isinstance((leaf:=ew_leaf(src)), float):
         bits = struct.pack("<e", leaf)
         if bits not in const_scratch: const_scratch[bits] = len(const_scratch)
-  if any(expr.op is Ops.MAX and expr.arg == _NATIVE_MIN for expr in order):
+  if any((expr.op is Ops.MAX and expr.arg == _NATIVE_MIN) or (expr.op is Ops.SUB and expr.arg == _NATIVE_SIGN) for expr in order):
     zero_bits = struct.pack("<e", 0.0)
     if zero_bits not in const_scratch: const_scratch[zero_bits] = len(const_scratch)
   scratch_count = len(const_scratch)
@@ -1563,16 +1536,27 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       zero = RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", 0.0)])
       neg_lhs, neg_rhs, neg_max = (RKArg(RKBufferKind.SCRATCH, scratch_count+i) for i in range(3))
       scratch_count += 3
-      ew_ops.extend((RKEWOp(neg_lhs, zero, lhs, count, _EW_CFG[Ops.SUB]),
-                     RKEWOp(neg_rhs, zero, rhs, count, _EW_CFG[Ops.SUB]),
-                     RKEWOp(neg_max, neg_lhs, neg_rhs, count, _EW_CFG[Ops.MAX]),
-                     RKEWOp(dst, zero, neg_max, count, _EW_CFG[Ops.SUB], submit_barrier=sequential_product and expr is val)))
+      ew_ops.extend((RKEWOp(neg_lhs, zero, lhs, count, _EW_CFG[Ops.SUB], stateful=mask_program),
+                     RKEWOp(neg_rhs, zero, rhs, count, _EW_CFG[Ops.SUB], stateful=mask_program),
+                     RKEWOp(neg_max, neg_lhs, neg_rhs, count, _EW_CFG[Ops.MAX], stateful=mask_program),
+                     RKEWOp(dst, zero, neg_max, count, _EW_CFG[Ops.SUB], submit_barrier=sequential_product and expr is val,
+                            stateful=mask_program)))
+    elif expr.op is Ops.SUB and expr.arg == _NATIVE_SIGN:
+      zero = RKArg(RKBufferKind.SCRATCH, const_scratch[struct.pack("<e", 0.0)])
+      negative, negative_mask, positive_mask = (RKArg(RKBufferKind.SCRATCH, scratch_count+i) for i in range(3))
+      scratch_count += 3
+      ew_ops.extend((RKEWOp(negative, zero, lhs, count, _EW_CFG[Ops.SUB]),
+                     RKEWOp(negative_mask, negative, negative, count, _EW_CFG[Ops.MAX], compare=True),
+                     RKEWOp(positive_mask, lhs, lhs, count, _EW_CFG[Ops.MAX], compare=True),
+                     RKEWOp(dst, positive_mask, negative_mask, count, _EW_CFG[Ops.SUB], stateful=True)))
     else:
       cfg = _EW_CFG_RELU6 if expr.op is Ops.MAX and expr.arg == _NATIVE_RELU6 else \
         _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
         _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
         _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
-      ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg, submit_barrier=sequential_product and expr is val))
+      is_positive_mask = expr.op is Ops.MAX and expr.arg == _NATIVE_POSITIVE_MASK
+      ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg, submit_barrier=sequential_product and expr is val,
+                           compare=is_positive_mask, stateful=mask_program and not is_positive_mask))
     values[expr] = dst
     for dep in expr.src:
       if dep in uses:
@@ -1651,6 +1635,66 @@ def _fold_ordered_where(x:UOp) -> UOp|None:
   if yes.key == lhs.key and no.key == rhs.key: return _native_min(lhs, rhs)
   return None
 
+def _unwrap_condition(u:UOp) -> UOp:
+  while u.op is Ops.CAST and u.dtype.scalar() in (dtypes.bool, dtypes.half, dtypes.float): u = u.src[0]
+  return u
+
+def _positive_mask(u:UOp) -> UOp:
+  return UOp(Ops.MAX, dtypes.half, src=(u, u), arg=_NATIVE_POSITIVE_MASK)
+
+def _mask_mul(lhs:UOp, rhs:UOp) -> UOp:
+  return UOp(Ops.MUL, dtypes.half, src=(lhs, rhs), arg=_NATIVE_MASK_MUL)
+
+def _mask_expr(u:UOp) -> UOp|None:
+  """Build an FP16 0/1 predicate using DPU positive-mask stages."""
+  u = _unwrap_condition(u)
+  if u.op in (Ops.CMPLT, Ops.CMPNE):
+    lhs, rhs = (_unwrap_condition(x) for x in u.src)
+    for value, other in ((lhs, rhs), (rhs, lhs)):
+      if value.op is Ops.CONST and value.dtype.scalar() is dtypes.bool:
+        mask = _mask_expr(other)
+        if mask is None: return None
+        return UOp.const(1.0, dtypes.half).alu(Ops.SUB, mask) if bool(value.arg) else mask
+    if lhs.dtype.scalar() not in (dtypes.half, dtypes.float) or rhs.dtype.scalar() not in (dtypes.half, dtypes.float): return None
+    lhs, rhs = lhs.cast(dtypes.half), rhs.cast(dtypes.half)
+    positive = _positive_mask(rhs.alu(Ops.SUB, lhs))
+    if u.op is Ops.CMPLT: return positive
+    return positive.alu(Ops.MAX, _positive_mask(lhs.alu(Ops.SUB, rhs)))
+  if u.op in (Ops.OR, Ops.AND):
+    mask_lhs, mask_rhs = (_mask_expr(x) for x in u.src)
+    if mask_lhs is None or mask_rhs is None: return None
+    return mask_lhs.alu(Ops.MAX, mask_rhs) if u.op is Ops.OR else _mask_mul(mask_lhs, mask_rhs)
+  return None
+
+def _fold_general_where(x:UOp) -> UOp|None:
+  """Select FP16 arms with DPU masks, avoiding multiplication by nonfinite constants."""
+  mask = _mask_expr(x.src[0])
+  if mask is None: return None
+  yes, no = (arm.cast(dtypes.half) for arm in x.src[1:])
+  one = UOp.const(1.0, dtypes.half)
+  inverse = one.alu(Ops.SUB, mask)
+  gate = _unwrap_condition(x.src[0])
+  if gate.op is Ops.CMPLT:
+    lhs, rhs, yes_u, no_u = (_unwrap_condition(u) for u in (*gate.src, *x.src[1:]))
+    if rhs.op is Ops.CONST and math.isfinite(float(rhs.arg)):
+      threshold = float(rhs.arg)
+      if yes_u.key == lhs.key and no_u.op is Ops.CONST and math.isfinite(float(no_u.arg)) and float(no_u.arg) != threshold:
+        return _native_min(lhs.cast(dtypes.half), UOp.const(threshold, dtypes.half)).alu(
+          Ops.ADD, _mask_mul(inverse, UOp.const(float(no_u.arg)-threshold, dtypes.half)))
+      if no_u.key == lhs.key and yes_u.op is Ops.CONST and math.isfinite(float(yes_u.arg)) and float(yes_u.arg) != threshold:
+        return lhs.cast(dtypes.half).alu(Ops.MAX, UOp.const(threshold, dtypes.half)).alu(
+          Ops.ADD, _mask_mul(mask, UOp.const(float(yes_u.arg)-threshold, dtypes.half)))
+  nonfinite = tuple(arm.op is Ops.CONST and not math.isfinite(float(arm.arg)) for arm in x.src[1:])
+  if any(nonfinite):
+    if any(arm.op is Ops.CONST and math.isnan(float(arm.arg)) for arm in x.src[1:]): return None
+    if all(nonfinite): return yes if float(x.src[1].arg) == float(x.src[2].arg) else None
+    inf_index = next(i for i,is_nonfinite in enumerate(nonfinite) if is_nonfinite)
+    finite, denominator = (no, inverse) if inf_index == 0 else (yes, mask)
+    sign = math.copysign(1.0, float(x.src[1+inf_index].arg))
+    correction = UOp.const(sign, dtypes.half).alu(Ops.FDIV, denominator).alu(Ops.SUB, UOp.const(sign, dtypes.half))
+    return finite.alu(Ops.ADD, correction)
+  return _mask_mul(yes, mask).alu(Ops.ADD, _mask_mul(no, inverse))
+
 def _fold_relu_cap(x:UOp) -> UOp|None:
   """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
   def shifted(u:UOp) -> tuple[UOp, float]:
@@ -1678,6 +1722,18 @@ def _fold_abs(x:UOp) -> UOp|None:
         plus_one.op is Ops.CONST and float(plus_one.arg) == 1.0):
       return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
   return None
+
+def _fold_sign(x:UOp) -> UOp|None:
+  """Recognize WHERE(x!=0, WHERE(x<0, -1, 1), 0) before general WHERE lowering."""
+  nonzero, signed, zero = x.src
+  if (nonzero.op is not Ops.CMPNE or signed.op is not Ops.WHERE or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or
+      signed.src[0].op is not Ops.CMPLT or signed.src[1].op is not Ops.CONST or float(signed.src[1].arg) != -1.0 or
+      signed.src[2].op is not Ops.CONST or float(signed.src[2].arg) != 1.0): return None
+  source = next((u for u in nonzero.src if u.dtype.scalar() is dtypes.half and u.op is not Ops.CONST), None)
+  if (source is None or not any(u.op is Ops.CONST and float(u.arg) == 0.0 for u in nonzero.src) or
+      signed.src[0].src[0].key != source.key or signed.src[0].src[1].op is not Ops.CONST or
+      float(signed.src[0].src[1].arg) != 0.0): return None
+  return UOp(Ops.SUB, dtypes.half, src=(source, source), arg=_NATIVE_SIGN)
 
 def _fold_minimum(x:UOp) -> UOp|None:
   """Recognize -max(-x,-y); native ALU-MIN mishandles infinities, so lowering expands it through SUB and MAX."""
@@ -1762,14 +1818,19 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, name="x"), lambda x: x.src[1].alu(Ops.MAX, x.src[2])
    if x.src[0].op is Ops.CMPLT and x.src[0].src[0] is x.src[2] and x.src[0].src[1] is x.src[1] and
       x.src[2].op is Ops.CONST and float(x.src[2].arg) == 0.0 else None),
+  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
+_pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs)])
+_pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_abs, name="rockchip abs")
+  sink = graph_rewrite(sink, _pm_sign, name="rockchip sign")
   return list(graph_rewrite(sink, _pm_fp32_to_fp16, name="rockchip float→half").toposort())
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
-  code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None, Ops.FDIV: lambda: None}
+  code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None, Ops.FDIV: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
