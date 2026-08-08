@@ -1515,3 +1515,42 @@ also avoid the 64-byte overwrite that made the exploratory short-run output path
 The CPU-cheat audit found only compile-time condition/address evaluation and raw `uint16` lane movement. MAX and MIN are
 native DPU EW operations, and the host never inspects FP16 values. There is no CMAC, CNA, PPU, shared tinygrad core
 change, FP32 input conversion, or tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — Stable FP16 sort and argsort indices on DPU EW
+
+Exact stable INT32 indices now accompany the FP16 value sort for all six `(8,8,6)` axis/direction combinations and the
+two repeated-value directions. The unchanged upstream `test_argsort` passes. Upstream `test_sort` passes every generated
+FP16 value and index realization, then reaches its Python-integer repeated-value fixture; that fixture creates an external
+INT32 input and remains outside the RK3588 FP16-input contract. The equivalent repeated FP16 fixture is permanent and
+passes in both directions.
+
+Historical commit `43f113d90` identifies occurrence counting and final value/count matching as the two stable-index graph
+families. The current Tinygrad scheduler unrolls both reductions, so the new matchers validate the present ADD trees,
+prefix gates, value/count equality pairs, source maps, and coordinate weights directly. `~/npu` still marks sort
+unsupported and `~/rk3588` has tests but no lower-level implementation.
+
+For each occurrence-count kernel, candidate/current FP16 matrices are subtracted, passed through native ABS and the
+verified positive-mask comparison, gated by compile-time prefix masks, and reduced with DPU ADD. Final selection compares
+both the original/sorted values and their stable occurrence counts, multiplies the two DPU equality masks by original
+coordinates, and reduces those coordinates on DPU.
+
+The count tensors are device-produced INT32, not external user inputs. RKIMAGE v24 adds a typed internal INT32-input
+conversion stage: runtime packs raw four-lane atoms, DPU converts them to FP16, and runtime unpacks the raw FP16 lanes.
+The inverse FP16-to-INT32 path already used by cumulative/arg-extrema indices shares the same conversion helper. Host code
+does not interpret either representation numerically.
+
+- Six `(8,8,6)` stable-index cases: **11.10–14.53 s each**, **121 submits** for axis `-1` and **147 submits** for axes
+  `0`/`1`; all outputs exact.
+- Repeated FP16 stable indices: **4.24 s ascending / 3.77 s descending**, **64 submits** each; outputs exact.
+- Focused index group after cleanup: **8 passed, 6 subtests passed in 90.30 s**, sequentially.
+- Unchanged upstream `test_argsort`: **1 passed in 17.10 s**, sequentially.
+- Complete Rockchip census after cleanup: **302 passed, 11 skipped, 198 subtests passed in 287.74 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,593/269 executable lines**.
+
+The CPU-cheat audit found only compile-time graph/address/weight validation and raw `uint16`/`uint32` atom movement.
+All value equality, occurrence-count equality, mask multiplication, count/coordinate reduction, and numeric conversion
+execute on DPU EW. There is no host sort or argsort, CMAC, CNA, PPU, shared tinygrad core change, external INT32-input
+support, or tolerance relaxation.

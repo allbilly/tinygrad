@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_image, patch_stage, emit_ew_stage,
-  RKArg, RKGather, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+  RKArg, RKGather, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -117,6 +117,42 @@ class RockchipProgram(Program['RockchipDevice']):
     ctypes.memmove(int(task.va_addr), ctypes.addressof(desc), _TASK_DESC_BYTES)
     self._submit(cmd, task, 1, standalone=True)
 
+  def _run_int32_conversion(self, op:RKEWOp, address, buffer) -> None:
+    """Convert aligned four-lane atoms on DPU; host movement preserves raw lane representations."""
+    to_int32 = op.int32_output
+    if op.rhs.kind is not RKBufferKind.SCRATCH or (to_int32 and op.lhs.kind is not RKBufferKind.SCRATCH):
+      raise RuntimeError("INT32 EW conversion requires scratch input and tile arena")
+    source, tiles, dest = buffer(op.lhs.kind, op.lhs.index), buffer(op.rhs.kind, op.rhs.index), buffer(op.dst.kind, op.dst.index)
+    src_itemsize, dst_itemsize = (2, 4) if to_int32 else (4, 2)
+    self.dev._sync_buffer(source, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    ctypes.memset(int(tiles.va_addr), 0, tiles.size)
+    for tile,start in enumerate(range(0, op.count, 4)):
+      ctypes.memmove(int(tiles.va_addr)+op.rhs.addend+tile*64, int(source.va_addr)+op.lhs.addend+start*src_itemsize,
+                     min(4, op.count-start)*src_itemsize)
+    self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    bodies:list[tuple[int, ...]] = []
+    command_bytes = 0
+    for start in range(0, op.count, 4):
+      count = min(4, op.count-start)
+      tile_arg = RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+start//4*64)
+      stage = emit_ew_stage(tile_arg, tile_arg, tile_arg, count, op.ew_cfg, stateful=True,
+                            int32_output=to_int32, int32_input=not to_int32)
+      body = patch_stage(stage, address)
+      if bodies and command_bytes+_task_command_bytes(len(body)) > mmap.PAGESIZE:
+        self._submit_pcchain(bodies)
+        self.dev.reset_npu()
+        bodies.clear()
+        command_bytes = 0
+      bodies.append(body)
+      command_bytes += _task_command_bytes(len(body))
+    if bodies: self._submit_pcchain(bodies)
+    self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    for tile,start in enumerate(range(0, op.count, 4)):
+      ctypes.memmove(int(dest.va_addr)+op.dst.addend+start*dst_itemsize, int(tiles.va_addr)+op.rhs.addend+tile*64,
+                     min(4, op.count-start)*dst_itemsize)
+    self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    self.dev.reset_npu()
+
   def _run_ew_ops(self, address, buffer) -> None:
     bodies:list[tuple[int, ...]] = []
     for i, op in enumerate(self.image.ew_ops):
@@ -131,41 +167,12 @@ class RockchipProgram(Program['RockchipDevice']):
         self.dev.reset_npu()
         bodies.clear()
         continue
-      if op.int32_output:
-        if i != len(self.image.ew_ops)-1: raise RuntimeError("INT32 EW output must be terminal")
+      if op.int32_input or op.int32_output:
+        if op.int32_output and i != len(self.image.ew_ops)-1: raise RuntimeError("INT32 EW output must be terminal")
         if bodies:
           self._submit_pcchain(bodies)
           bodies.clear()
-        if op.lhs.kind is not RKBufferKind.SCRATCH or op.rhs.kind is not RKBufferKind.SCRATCH:
-          raise RuntimeError("INT32 EW conversion requires scratch input and tile arena")
-        source, tiles, dest = buffer(op.lhs.kind, op.lhs.index), buffer(op.rhs.kind, op.rhs.index), buffer(op.dst.kind, op.dst.index)
-        self.dev._sync_buffer(source, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-        ctypes.memset(int(tiles.va_addr), 0, tiles.size)
-        for tile,start in enumerate(range(0, op.count, 4)):
-          ctypes.memmove(int(tiles.va_addr)+tile*64, int(source.va_addr)+op.lhs.addend+start*2, min(4, op.count-start)*2)
-        self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-        command_bytes = 0
-        for start in range(0, op.count, 4):
-          count = min(4, op.count-start)
-          tile_offset = start//4*64
-          tile_arg = RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+tile_offset)
-          stage = emit_ew_stage(tile_arg, tile_arg, tile_arg, count, op.ew_cfg,
-                                stateful=True, int32_output=True)
-          body = patch_stage(stage, address)
-          if bodies and command_bytes+_task_command_bytes(len(body)) > mmap.PAGESIZE:
-            self._submit_pcchain(bodies)
-            self.dev.reset_npu()
-            bodies.clear()
-            command_bytes = 0
-          bodies.append(body)
-          command_bytes += _task_command_bytes(len(body))
-        if bodies: self._submit_pcchain(bodies)
-        self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-        for tile,start in enumerate(range(0, op.count, 4)):
-          ctypes.memmove(int(dest.va_addr)+op.dst.addend+start*4, int(tiles.va_addr)+tile*64, min(4, op.count-start)*4)
-        self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
-        self.dev.reset_npu()
-        bodies.clear()
+        self._run_int32_conversion(op, address, buffer)
         continue
       if op.compare:
         if bodies:

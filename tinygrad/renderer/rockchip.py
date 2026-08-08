@@ -12,7 +12,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 23
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 24
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
@@ -58,7 +58,8 @@ class RKFill: dst: RKArg; count: int; itemsize: int = 2
 class RKEWOp:
   """One contiguous FP16 DPU elementwise operation."""
   dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int
-  submit_barrier: bool = False; compare: bool = False; stateful: bool = False; int32_output: bool = False
+  submit_barrier: bool = False; compare: bool = False; stateful: bool = False
+  int32_output: bool = False; int32_input: bool = False
 
 @dataclass(frozen=True)
 class RKImage:
@@ -88,7 +89,7 @@ def encode_image(image:RKImage) -> bytes:
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
   for op in image.ew_ops:
-    op_flags = int(op.submit_barrier) | int(op.compare)<<1 | int(op.stateful)<<2 | int(op.int32_output)<<3
+    op_flags = int(op.submit_barrier) | int(op.compare)<<1 | int(op.stateful)<<2 | int(op.int32_output)<<3 | int(op.int32_input)<<4
     out += _EWOP.pack(int(op.dst.kind), op_flags, op.dst.index,
                       int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
     out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
@@ -126,12 +127,12 @@ def decode_image(blob:bytes) -> RKImage:
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
-    if op_flags & ~0xf: raise ValueError("invalid RKEWOp flags")
+    if op_flags & ~0x1f or op_flags & 0x18 == 0x18: raise ValueError("invalid RKEWOp flags")
     count, ew_cfg = _EWOP2.unpack_from(blob, off); off += _EWOP2.size
     da, la, ra = struct.unpack_from("<iii", blob, off); off += 12
     ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
                          RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg,
-                         bool(op_flags & 1), bool(op_flags & 2), bool(op_flags & 4), bool(op_flags & 8)))
+                         bool(op_flags & 1), bool(op_flags & 2), bool(op_flags & 4), bool(op_flags & 8), bool(op_flags & 16)))
   fill = None
   if flags & 1:
     dst_kind, itemsize, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
@@ -175,6 +176,7 @@ _EW_STAGE_FP32_OUT = 1 << 29  # software tag consumed before writing EW_CFG
 _DPU_DATA_FORMAT_FP16 = (2<<29)|(2<<26)|2
 _DPU_DATA_FORMAT_FP32_OUT = (5<<29)|(2<<26)|2
 _DPU_DATA_FORMAT_INT32_OUT = (4<<29)|(2<<26)|2
+_DPU_DATA_FORMAT_INT32_IN = (2<<29)|(4<<26)|4
 _BS_BN_BYPASS = 1|(1<<1)|(1<<4)|(1<<6)
 _BS_OW_FP32_SCALAR = (1<<8)|(1<<5)|(1<<2)|(1<<1)
 _BS_CFG_COMPARE = 0x40040
@@ -222,41 +224,48 @@ def _emit_fp32_out_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int)
   return RKStage(tuple(commands), tuple(relocs))
 
 def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
-                         int32_output:bool=False) -> RKStage:
-  """Emit a self-contained FP16 DPU EW stage, optionally producing a positive mask or native INT32."""
-  if not (0 < count <= (4 if int32_output else _MAX_EW_ELEMS_FP16)): raise ValueError(f"stateful EW count {count} out of range")
-  width = (count + 7) // 8 - 1
+                         int32_output:bool=False, int32_input:bool=False) -> RKStage:
+  """Emit a self-contained DPU EW stage, optionally consuming or producing native INT32."""
+  if not (0 < count <= (4 if int32_output or int32_input else _MAX_EW_ELEMS_FP16)):
+    raise ValueError(f"stateful EW count {count} out of range")
+  lanes = 4 if int32_input else 8
+  width = (count + lanes-1) // lanes - 1
   pipeline:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_BS_CFG,_BS_BN_BYPASS),(_DPU,rk.REG_DPU_BN_CFG,_BS_BN_BYPASS),
     (_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),(_DPU,rk.REG_DPU_BS_OW_CFG,2),
-    (_DPU,rk.REG_DPU_WDMA_SIZE_0,7),(_DPU,rk.REG_DPU_WDMA_SIZE_1,width),(_DPU,rk.REG_DPU_BN_MUL_CFG,0),
+    (_DPU,rk.REG_DPU_WDMA_SIZE_0,lanes-1),(_DPU,rk.REG_DPU_WDMA_SIZE_1,width),(_DPU,rk.REG_DPU_BN_MUL_CFG,0),
     (_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0))
   if compare: pipeline += ((_DPU,rk.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(_DPU,rk.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),
     (_DPU,rk.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),(_DPU,rk.REG_DPU_BN_CFG,_BN_CFG_COMPARE),
     (_DPU,rk.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),(_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE))
   regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
     (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
-    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_INT32_OUT if int32_output else _DPU_DATA_FORMAT_FP16),
+    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_INT32_OUT if int32_output else
+                                  _DPU_DATA_FORMAT_INT32_IN if int32_input else _DPU_DATA_FORMAT_FP16),
     (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,width),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
-    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(7<<16)|7)) + pipeline + (
-    (_DPU,rk.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else ew_cfg),
+    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,((lanes-1)<<16)|(lanes-1))) + pipeline + (
+    (_DPU,rk.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else
+                               (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else ew_cfg),
     (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
     (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if int32_output else (1<<16)|1),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
     (_DPU,rk.REG_DPU_SURFACE_ADD,4<<4),(_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),
-    (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),(_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|(2<<2)))
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|((3 if int32_input else 2)<<2)))
   commands = [_cmd(*x) for x in regs]
   relocs:list[RKReloc] = []
   for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
                            (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
     relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
-  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(1<<3)|1))
+  rdma_feature = (4<<15)|(15<<11)|(4<<5)|1 if int32_input else (2<<15)|(15<<11)|(2<<5)|(1<<3)|1
+  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, rdma_feature))
   return RKStage(tuple(commands), tuple(relocs))
 
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
-                  stateful:bool=False, int32_output:bool=False) -> RKStage:
-  """Build one FP16-input DPU EW command body without its PC-chain tail."""
+                  stateful:bool=False, int32_output:bool=False, int32_input:bool=False) -> RKStage:
+  """Build one DPU EW command body without its PC-chain tail."""
   if ew_cfg & _EW_STAGE_FP32_OUT: return _emit_fp32_out_stage(dst, lhs, rhs, count, ew_cfg & ~_EW_STAGE_FP32_OUT)
-  if compare or stateful or int32_output: return _emit_stateful_stage(dst, lhs, rhs, count, ew_cfg, compare, int32_output)
+  if compare or stateful or int32_output or int32_input:
+    return _emit_stateful_stage(dst, lhs, rhs, count, ew_cfg, compare, int32_output, int32_input)
   if not (0 < count <= _MAX_EW_ELEMS_FP16): raise ValueError(f"EW fp16 count {count} out of range")
   is_div = ew_cfg == _EW_CFG[Ops.FDIV]
   width = (count + 7) // 8 - 1
@@ -750,6 +759,219 @@ def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 
+def _load_equality(predicate:UOp) -> tuple[UOp, UOp]|None:
+  """Recognize boolean inversion of CMPNE between two loaded lanes."""
+  if predicate.op is not Ops.CMPNE: return None
+  truths = [x for x in predicate.src if x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg)]
+  inequalities = [x for x in predicate.src if x.op is Ops.CMPNE]
+  if len(truths) != 1 or len(inequalities) != 1: return None
+  pair = inequalities[0].src
+  if len(pair) != 2 or any(x.op is not Ops.LOAD or x.src[0].op is not Ops.INDEX for x in pair): return None
+  return pair[0], pair[1]
+
+def _lower_occurrence_count(uops:list[UOp]) -> RKImage|None:
+  """Lower stable-sort's unrolled prefix equality counts to DPU masks and ADD."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if (len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or
+      out_param.dtype.scalar() is not dtypes.int or any(u.op is Ops.REDUCE for u in uops)): return None
+  store = stores[0]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  count, out_index = int(out_param.src[0].arg), store.src[0].src[1]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+
+  terms:list[UOp] = []
+  def flatten(value:UOp) -> None:
+    if value.op is Ops.ADD and value.dtype.scalar() is dtypes.int: flatten(value.src[0]); flatten(value.src[1])
+    else: terms.append(value)
+  flatten(store.src[1])
+  parsed:list[tuple[tuple[UOp, UOp], UOp|None]] = []
+  for term in terms:
+    if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int: return None
+    predicate, gate = term.src[0], None
+    if predicate.op is Ops.AND:
+      equalities = [x for x in predicate.src if not _is_static_expr(x)]
+      gates = [x for x in predicate.src if _is_static_expr(x)]
+      if len(equalities) != 1 or len(gates) != 1: return None
+      predicate, gate = equalities[0], gates[0]
+    if (pair:=_load_equality(predicate)) is None or any(x.dtype.scalar() is not dtypes.half for x in pair): return None
+    parsed.append((pair, gate))
+  if not 2 <= len(parsed) <= 255: return None
+  common = set(parsed[0][0]).intersection(*(set(pair) for pair,_ in parsed[1:]))
+  if len(common) != 1: return None
+  current = next(iter(common))
+  candidates = [next((x for x in pair if x is not current), None) for pair,_ in parsed]
+  if any(x is None for x in candidates): return None
+  candidate_loads = tuple(x for x in candidates if x is not None)
+  loads = (*candidate_loads, current)
+  params = tuple(_root_param(load.src[0]) for load in loads)
+  if (any(param is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST for param in params) or
+      len({param.arg.slot for param in params if param is not None}) != 1): return None
+  source = params[0]; assert source is not None
+  source_count = int(source.src[0].arg)
+
+  try:
+    candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in candidate_loads)
+    current_offsets = _gather_offsets(out_index, current.src[0].src[1], None, count)
+    valid_bits = tuple(_static_vector(out_index, gate, count) if gate is not None else (0x3c00,)*count for _,gate in parsed)
+  except RuntimeError: return None
+  if any(not 0 <= offset < source_count for offsets in (*candidate_offsets, current_offsets) for offset in offsets): return None
+  for dst in range(count):
+    valid_offsets = [offsets[dst] for offsets,bits in zip(candidate_offsets, valid_bits) if bits[dst] == 0x3c00]
+    if not valid_offsets or len(valid_offsets) != len(set(valid_offsets)) or any(bits[dst] not in (0, 0x3c00) for bits in valid_bits): return None
+
+  window = len(candidate_offsets)
+  vector_bytes = (count*2+63)&-64
+  vector_lanes, matrix_lanes = vector_bytes//2, window*vector_bytes//2
+  zero, one, candidates_slot, current_slot, valid_slot, diff, magnitude, unequal, equal, selected, int_tiles = range(11)
+  gathers:tuple[RKGather, ...] = tuple(RKGather(source.arg.slot, candidates_slot, count, offsets=offsets,
+                                                dst_addend=i*vector_lanes) for i,offsets in enumerate(candidate_offsets))
+  gathers += tuple(RKGather(source.arg.slot, current_slot, count, offsets=current_offsets,
+                            dst_addend=i*vector_lanes) for i in range(window))
+  gathers += tuple(RKGather(source.arg.slot, valid_slot, count, values=bits,
+                            dst_addend=i*vector_lanes) for i,bits in enumerate(valid_bits))
+  scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(((count+3)//4)*64))
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops:list[RKEWOp] = [RKEWOp(arg(diff), arg(candidates_slot), arg(current_slot), matrix_lanes, _EW_CFG[Ops.SUB]),
+    RKEWOp(arg(magnitude), arg(diff), arg(diff), matrix_lanes, _EW_CFG_ABS, submit_barrier=True, stateful=True),
+    RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
+    RKEWOp(arg(equal), arg(one), arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
+    RKEWOp(arg(selected), arg(equal), arg(valid_slot), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)]
+  active_args = [arg(selected, candidate*vector_bytes) for candidate in range(window)]
+  first = True
+  while len(active_args) > 1:
+    reduced:list[RKArg] = []
+    for i in range(0, len(active_args)-1, 2):
+      ops.append(RKEWOp(active_args[i], active_args[i], active_args[i+1], count, _EW_CFG[Ops.ADD], submit_barrier=first, stateful=first))
+      first = False
+      reduced.append(active_args[i])
+    if len(active_args) & 1: reduced.append(active_args[-1])
+    active_args = reduced
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), active_args[0], arg(int_tiles), count,
+                      _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
+
+def _lower_sort_index_selection(uops:list[UOp]) -> RKImage|None:
+  """Lower stable sort's value/count match and coordinate sum entirely to DPU EW."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if (len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or
+      out_param.dtype.scalar() is not dtypes.int or any(u.op is Ops.REDUCE for u in uops)): return None
+  store = stores[0]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  count, out_index = int(out_param.src[0].arg), store.src[0].src[1]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+
+  terms:list[UOp] = []
+  def flatten(value:UOp) -> None:
+    if value.op is Ops.ADD and value.dtype.scalar() is dtypes.int: flatten(value.src[0]); flatten(value.src[1])
+    else: terms.append(value)
+  flatten(store.src[1])
+  parsed:list[tuple[int, tuple[UOp, UOp], tuple[UOp, UOp]]] = []
+  for term in terms:
+    weight, cast = 1, term
+    if term.op is Ops.MUL:
+      constants = [x for x in term.src if x.op is Ops.CONST and x.dtype.scalar() is dtypes.int]
+      casts = [x for x in term.src if x.op is Ops.CAST]
+      if len(constants) != 1 or len(casts) != 1: return None
+      weight, cast = int(constants[0].arg), casts[0]
+    if weight <= 0 or cast.op is not Ops.CAST or cast.dtype.scalar() is not dtypes.int or cast.src[0].op is not Ops.AND: return None
+    pairs = [_load_equality(x) for x in cast.src[0].src]
+    if len(pairs) != 2 or any(pair is None for pair in pairs): return None
+    typed = [pair for pair in pairs if pair is not None]
+    half_pairs = [pair for pair in typed if all(x.dtype.scalar() is dtypes.half for x in pair)]
+    int_pairs = [pair for pair in typed if all(x.dtype.scalar() is dtypes.int for x in pair)]
+    if len(half_pairs) != 1 or len(int_pairs) != 1: return None
+    parsed.append((weight, half_pairs[0], int_pairs[0]))
+  if (not parsed or max(weight for weight,_,_ in parsed) > 255 or
+      {weight for weight,_,_ in parsed} != set(range(1, max(weight for weight,_,_ in parsed)+1))): return None
+  parsed.sort(key=lambda item: item[0])
+
+  def split_pairs(pairs:tuple[tuple[UOp, UOp], ...]) -> tuple[UOp, tuple[UOp, ...]]|None:
+    common = set(pairs[0]).intersection(*(set(pair) for pair in pairs[1:]))
+    if len(common) != 1: return None
+    current = next(iter(common))
+    candidates = tuple(next((x for x in pair if x is not current), None) for pair in pairs)
+    return None if any(x is None for x in candidates) else (current, tuple(x for x in candidates if x is not None))
+
+  if (half_split:=split_pairs(tuple(pair for _,pair,_ in parsed))) is None or \
+     (int_split:=split_pairs(tuple(pair for _,_,pair in parsed))) is None: return None
+  half_current, half_candidates = half_split
+  int_current, int_candidates = int_split
+  all_loads = (*half_candidates, half_current, *int_candidates, int_current)
+  params = tuple(_root_param(load.src[0]) for load in all_loads)
+  if any(param is None or param.src[0].op is not Ops.CONST for param in params): return None
+  concrete = tuple(param for param in params if param is not None)
+  half_candidate_params = concrete[:len(half_candidates)]
+  half_current_param = concrete[len(half_candidates)]
+  int_candidate_start = len(half_candidates)+1
+  int_candidate_params = concrete[int_candidate_start:int_candidate_start+len(int_candidates)]
+  int_current_param = concrete[-1]
+  if (len({x.arg.slot for x in half_candidate_params}) != 1 or len({x.arg.slot for x in int_candidate_params}) != 1 or
+      any(x.dtype.scalar() is not dtypes.half for x in (*half_candidate_params, half_current_param)) or
+      any(x.dtype.scalar() is not dtypes.int for x in (*int_candidate_params, int_current_param))): return None
+
+  try:
+    half_candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in half_candidates)
+    half_current_offsets = _gather_offsets(out_index, half_current.src[0].src[1], None, count)
+    int_candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in int_candidates)
+    int_current_offsets = _gather_offsets(out_index, int_current.src[0].src[1], None, count)
+  except RuntimeError: return None
+  if half_candidate_offsets != int_candidate_offsets: return None
+  maps_and_sizes = (*zip(half_candidate_offsets, half_candidate_params), (half_current_offsets, half_current_param),
+                    *zip(int_candidate_offsets, int_candidate_params), (int_current_offsets, int_current_param))
+  if any(any(not 0 <= offset < int(param.src[0].arg) for offset in offsets) for offsets,param in maps_and_sizes): return None
+
+  rows = len(parsed)
+  vector_bytes = (count*2+63)&-64
+  vector_lanes, matrix_lanes = vector_bytes//2, rows*vector_bytes//2
+  (zero, one, raw_candidate_count, raw_current_count, candidate_count, current_count, convert_tiles,
+   candidate_value, current_value, weights, value_diff, value_magnitude, value_unequal, value_equal,
+   count_diff, count_magnitude, count_unequal, count_equal, selected, weighted, int_tiles) = range(21)
+  gathers:tuple[RKGather, ...] = ()
+  for row,(weight, half_offsets, int_offsets) in enumerate(zip((x[0] for x in parsed), half_candidate_offsets, int_candidate_offsets)):
+    addend = row*vector_lanes
+    gathers += (RKGather(half_candidate_params[0].arg.slot, candidate_value, count, offsets=half_offsets, dst_addend=addend),
+                RKGather(int_candidate_params[0].arg.slot, raw_candidate_count, count, offsets=int_offsets,
+                         dst_addend=addend, itemsize=4),
+                RKGather(half_candidate_params[0].arg.slot, weights, count,
+                         values=(struct.unpack("<H", struct.pack("<e", float(weight)))[0],)*count, dst_addend=addend))
+  gathers += tuple(RKGather(half_current_param.arg.slot, current_value, count, offsets=half_current_offsets,
+                            dst_addend=row*vector_lanes) for row in range(rows))
+  gathers += tuple(RKGather(int_current_param.arg.slot, raw_current_count, count, offsets=int_current_offsets,
+                            dst_addend=row*vector_lanes, itemsize=4) for row in range(rows))
+  scratch_sizes = [matrix_lanes*2]*21
+  scratch_sizes[raw_candidate_count] = scratch_sizes[raw_current_count] = matrix_lanes*4
+  scratch_sizes[convert_tiles] = ((matrix_lanes+3)//4)*64
+  scratch_sizes[int_tiles] = ((count+3)//4)*64
+  scratch = tuple(RKScratch(_scratch_bytes(size//2) if i not in (raw_candidate_count, raw_current_count, convert_tiles, int_tiles)
+                            else size) for i,size in enumerate(scratch_sizes))
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops:list[RKEWOp] = [
+    RKEWOp(arg(candidate_count), arg(raw_candidate_count), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True),
+    RKEWOp(arg(current_count), arg(raw_current_count), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True),
+    RKEWOp(arg(value_diff), arg(candidate_value), arg(current_value), matrix_lanes, _EW_CFG[Ops.SUB]),
+    RKEWOp(arg(value_magnitude), arg(value_diff), arg(value_diff), matrix_lanes, _EW_CFG_ABS, submit_barrier=True, stateful=True),
+    RKEWOp(arg(value_unequal), arg(value_magnitude), arg(value_magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
+    RKEWOp(arg(value_equal), arg(one), arg(value_unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
+    RKEWOp(arg(count_diff), arg(candidate_count), arg(current_count), matrix_lanes, _EW_CFG[Ops.SUB], submit_barrier=True, stateful=True),
+    RKEWOp(arg(count_magnitude), arg(count_diff), arg(count_diff), matrix_lanes, _EW_CFG_ABS),
+    RKEWOp(arg(count_unequal), arg(count_magnitude), arg(count_magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
+    RKEWOp(arg(count_equal), arg(one), arg(count_unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
+    RKEWOp(arg(selected), arg(value_equal), arg(count_equal), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
+    RKEWOp(arg(weighted), arg(selected), arg(weights), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)]
+  active = [arg(weighted, row*vector_bytes) for row in range(rows)]
+  first = True
+  while len(active) > 1:
+    reduced:list[RKArg] = []
+    for i in range(0, len(active)-1, 2):
+      ops.append(RKEWOp(active[i], active[i], active[i+1], count, _EW_CFG[Ops.ADD], submit_barrier=first, stateful=first))
+      first = False
+      reduced.append(active[i])
+    if len(active) & 1: reduced.append(active[-1])
+    active = reduced
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), active[0], arg(int_tiles), count,
+                      _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
+
 def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
   """Lower one static bitonic compare/swap pass with DPU MAX and MIN."""
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -1149,6 +1371,8 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (sort_compare:=_lower_sort_compare(uops)) is not None: return sort_compare
+  if (occurrence_count:=_lower_occurrence_count(uops)) is not None: return occurrence_count
+  if (sort_index:=_lower_sort_index_selection(uops)) is not None: return sort_index
   if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
   if (arg_extrema:=_lower_arg_extrema_index(uops)) is not None: return arg_extrema

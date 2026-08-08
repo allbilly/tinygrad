@@ -644,6 +644,33 @@ class TestRockchipSortValueOps(unittest.TestCase):
                       lambda x, descending=descending: x.sort(descending=descending)[0], vals=[values], forward_only=True)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipSortIndexOps(unittest.TestCase):
+  """Exact stable INT32 sort indices selected by FP16 value/count equality on DPU EW."""
+
+  def _axis(self, axis:int, descending:bool):
+    _TEST_OPS_HELPER([(8,8,6)], lambda x: x.sort(axis, descending).indices.int(),
+                     lambda x: x.sort(axis, descending)[1], forward_only=True)
+
+  def test_sort_indices_trivial(self):
+    for shape in ((0,), (0,5), (1,), (1,5)):
+      with self.subTest(shape=shape):
+        _TEST_OPS_HELPER([shape], lambda x: x.sort(0).indices.int(), lambda x: x.sort(0)[1], forward_only=True)
+
+  def test_sort_indices_last_descending(self): self._axis(-1, True)
+  def test_sort_indices_last_ascending(self): self._axis(-1, False)
+  def test_sort_indices_axis0_descending(self): self._axis(0, True)
+  def test_sort_indices_axis0_ascending(self): self._axis(0, False)
+  def test_sort_indices_axis1_ascending(self): self._axis(1, False)
+  test_argsort = _test_ops.TestOps.test_argsort
+
+  def test_sort_indices_repeated(self):
+    values = np.array([0, 1] * 9, dtype=np.float16)
+    for descending in (False, True):
+      with self.subTest(descending=descending):
+        _TEST_OPS_HELPER(None, lambda x, descending=descending: x.sort(stable=True, descending=descending).indices.int(),
+                         lambda x, descending=descending: x.sort(descending=descending)[1], vals=[values], forward_only=True)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 
