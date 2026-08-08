@@ -1691,3 +1691,27 @@ operand is infinity, so this milestone makes only the finite tolerance-based cla
 The CPU-cheat audit found no backend code change for copysign and no host value inspection. Absolute value, sign-mask
 construction, and multiplication execute entirely on DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or
 tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — FP16 triangular layouts
+
+The complete numeric FP16 portions of upstream `test_tril` and `test_triu` now join the Rockchip census: square and
+rectangular matrices, positive and negative diagonal offsets beyond both matrix bounds, batched inputs, and an empty
+matrix dimension. The final external-boolean-input fixture in each upstream method remains outside the FP16-input
+contract.
+
+`~/npu/include/old/rknn_ops.md` marks the model-level Trilu operation unsupported, and neither the historical Rockchip
+branches nor `~/rk3588` contain a dedicated register implementation. None is needed here: Tinygrad lowers each static
+triangular mask to the backend's existing raw gather/fill representation. The runtime moves FP16 lane representations
+according to compile-time offsets and fills masked lanes with the FP16 zero bit pattern; it performs no tensor-value
+comparison or arithmetic.
+
+- Focused triangular group: **2 passed, 28 subtests passed in 3.40 s**, sequentially.
+- Complete Rockchip census: **325 passed, 11 skipped, 228 subtests passed in 314.50 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,698/269 executable lines** (unchanged).
+
+The CPU-cheat audit found no backend code change and no host numeric implementation. Static raw-lane movement and zero
+initialization are layout preparation, not Trilu arithmetic. There is no CMAC, CNA, PPU, tinygrad core change, or
+tolerance relaxation beyond the existing FP16 contract.

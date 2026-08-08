@@ -848,6 +848,21 @@ class TestRockchipMovementOps(unittest.TestCase):
   test_roll = _test_ops.TestOps.test_roll
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipTriangularOps(unittest.TestCase):
+  """Numeric FP16 portions of test_ops tril/triu; external boolean inputs are unsupported."""
+
+  def _test(self, name:str):
+    cases = (((3,3), 0), ((3,3), 1), ((3,3), 2), ((3,3), -1), ((3,3), -2),
+             ((4,5), 4), ((4,5), 5), ((4,5), 6), ((4,5), -4), ((4,5), -5), ((4,5), -6),
+             ((5,3,3), 0), ((5,0,3), 0), ((5,3,3), 1))
+    for shape, diagonal in cases:
+      with self.subTest(shape=shape, diagonal=diagonal):
+        _fp16_test_op([shape], lambda x: getattr(x, name)(diagonal), lambda x: getattr(x, name)(diagonal))
+
+  def test_tril(self): self._test("tril")
+  def test_triu(self): self._test("triu")
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipConcatOps(unittest.TestCase):
   """FP16 concatenation, stacking, and repetition through partial raw gathers."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
