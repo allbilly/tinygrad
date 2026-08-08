@@ -887,6 +887,36 @@ def _lower_raw_int32_layout(output:RKOutput) -> RKImage|None:
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 
+def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
+  """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
+  _, out_param, count, out_index, value = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  if value.op is not Ops.BITCAST or value.dtype.scalar() is not dtypes.int or len(value.src) != 1: return None
+  packed = value.src[0]
+  if packed.op is not Ops.ADD or packed.dtype.scalar() is not dtypes.uint: return None
+  lanes:dict[int, UOp] = {}
+  for term in packed.src:
+    if (term.op is not Ops.SHL or len(term.src) != 2 or term.src[1].op is not Ops.CONST or
+        (shift:=int(term.src[1].arg)) not in (0, 16)): return None
+    cast = term.src[0]
+    if (cast.op is not Ops.CAST or cast.dtype.scalar() is not dtypes.uint or len(cast.src) != 1 or
+        cast.src[0].op is not Ops.BITCAST or cast.src[0].dtype.scalar() is not dtypes.ushort or len(cast.src[0].src) != 1): return None
+    load = cast.src[0].src[0]
+    if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 1 or load.src[0].op is not Ops.INDEX: return None
+    lanes[shift] = load
+  if len(lanes) != 2: return None
+  params = tuple(_root_param(lanes[shift].src[0]) for shift in (0, 16))
+  if (any(param is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST for param in params) or
+      params[0].arg.slot != params[1].arg.slot): return None  # type: ignore[union-attr]
+  source = params[0]; assert source is not None
+  try: low, high = (_gather_offsets(out_index, lanes[shift].src[0].src[1], None, count) for shift in (0, 16))
+  except RuntimeError: return None
+  source_count = int(source.src[0].arg)
+  if any(offset < 0 or offset+1 >= source_count or offset & 1 or high[i] != offset+1 for i,offset in enumerate(low)): return None
+  gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=tuple(offset//2 for offset in low),
+                    dst_kind=RKBufferKind.ARG, itemsize=4)
+  return RKImage(RKTarget.RK3588, gathers=(gather,))
+
 def _load_equality(predicate:UOp) -> tuple[UOp, UOp]|None:
   """Recognize boolean inversion of CMPNE between two loaded lanes."""
   if predicate.op is not Ops.CMPNE: return None
@@ -1624,6 +1654,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (cumulative_index:=_lower_cumulative_extrema_index(uops, int_output)) is not None: return cumulative_index
     if (arg_extrema:=_lower_unrolled_arg_extrema(int_output)) is not None: return arg_extrema
     if (int_where:=_lower_int_where(int_output)) is not None: return int_where
+    if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
   if int_loop_output is not None and (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output)) is not None: return loop_arg_extrema
   if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32
   if (loop:=_loop_reduction_match(uops)) is not None:

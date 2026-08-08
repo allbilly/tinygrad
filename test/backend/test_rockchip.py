@@ -743,6 +743,20 @@ class TestRockchipCastOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 6)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipBitcastOps(unittest.TestCase):
+  """Exact FP16-pair to INT32 representation movement; the upstream odd-width FP16 shape is invalid."""
+
+  def test_bitcast(self):
+    values = np.array([0x0000, 0x8000, 0x3c00, 0xc000, 0x7c00, 0xfc00, 0x7e01, 0xfe01,
+                       0x3555, 0xb555, 0x7bff, 0xfbff, 0x0001, 0x8001, 0x03ff, 0x83ff,
+                       0x0400, 0x8400, 0x3c01, 0xbc01, 0x4000, 0xc000, 0x4200, 0xc200], dtype=np.uint16).view(np.float16).reshape(2,3,4)
+    before = Device["ROCKCHIP"].submit_count
+    np.testing.assert_array_equal(Tensor(values).bitcast(dtypes.int32).numpy(), values.view(np.int32))
+    np.testing.assert_array_equal(Tensor(values).permute(1,0,2).bitcast(dtypes.int32).numpy(),
+                                  values.transpose(1,0,2).view(np.int32))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 0)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipClassificationOps(unittest.TestCase):
   """FP16 IEEE predicates computed as DPU masks and packed through the typed bool-output ABI."""
 

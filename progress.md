@@ -2334,3 +2334,38 @@ This is a test-only coverage milestone. The CPU-cheat audit found no renderer, r
 runtime-dependent lane movement and arithmetic execute through the existing Rockchip NPU path; Torch is used only as
 the expected-value oracle. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16
 input conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — exact FP16-pair bitcast to INT32
+
+Rockchip now preserves the exact representation of adjacent FP16 lanes when Tinygrad bitcasts them to INT32. Permanent
+coverage includes contiguous and leading-axis-permuted layouts over positive and negative zero, infinities, signed NaNs,
+subnormals, maximum finite values, and ordinary normals.
+
+The unchanged upstream `test_bitcast` uses shape `(3,3)`. Under `DEFAULT_FLOAT=HALF`, PyTorch rejects it before the
+backend runs because its final dimension is not divisible by the two FP16 lanes required for one INT32 element. The
+Rockchip method therefore uses the equivalent valid shape `(2,3,4)` and checks both its direct and permuted views.
+
+Tinygrad expresses the reinterpretation as two `BITCAST(half -> ushort)`, zero-extension, shifts by 0/16, an unsigned
+ADD, and `BITCAST(uint -> int)`. The strict matcher accepts only that exact graph, proves that both loads use one bounded
+FP16 argument, and verifies that every high lane is the adjacent successor of an even low lane. It then copies each
+four-byte representation with the existing typed raw gather; no numeric cast, shift, or addition is performed on host
+or DPU. This follows other Tinygrad renderers' exact `Ops.BITCAST` treatment while mapping it to Rockchip's existing raw
+layout ABI instead of inventing a scalar instruction stream.
+
+No hardware-specific bitcast implementation exists in the other Rockchip Tinygrad branches, `~/npu`, or `~/rk3588`.
+The legacy `~/rk3588/experimental/ops_rockchip.py` interpreter uses host `struct.pack/unpack`; that CPU value interpreter
+was inspected and deliberately not ported.
+
+- Focused exact-bit method: **1 passed in 2.85 s**, sequentially; both layouts assert bit-for-bit equality and zero submits.
+- Typed cast/bitcast/TopK regression: **6 passed, 2 subtests passed in 21.52 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **358 passed, 11 skipped, 180 subtests passed in
+  401.05 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,947/274 executable lines**.
+
+The CPU-cheat audit found only compile-time UOp/index validation and raw `uint32` representation movement by the same
+gather mechanism already used for device-produced indices. Neither renderer nor runtime reads or interprets an FP16
+numeric value. There is no host tensor-value arithmetic, LUT, CMAC, CNA, PPU fallback, external non-FP16 input, Tinygrad
+core change, or tolerance relaxation.
