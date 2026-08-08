@@ -512,70 +512,41 @@ class TestRockchipCumulativeProductOps(unittest.TestCase):
   test_cumprod_zero_axis = _test_ops.TestOps.test_cumprod_zero_axis
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
-class TestRockchipCumulativeExtremaValueOps(unittest.TestCase):
-  """FP16 cumulative extrema values; integer axis indices remain a separate output-format group."""
+class TestRockchipCumulativeExtremaOps(unittest.TestCase):
+  """Unchanged FP16 cumulative-extrema methods with exact DPU-selected INT32 indices."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
 
-  def _test_values(self, kind:str, cases:tuple[tuple[tuple[int, ...], int], ...]):
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def _test_simple(self, kind:str):
     torch_fxn, tinygrad_fxn = (torch.cummax, Tensor.cummax) if kind == "max" else (torch.cummin, Tensor.cummin)
-    for shape, axis in cases:
-      with self.subTest(kind=kind, shape=shape, axis=axis):
-        _fp16_test_op([shape], lambda x, axis=axis: torch_fxn(x, dim=axis).values,
-                      lambda x, axis=axis: tinygrad_fxn(x, axis=axis)[0])
+    for count in (512, 1022):
+      np.random.seed(0)
+      data = np.random.uniform(-2, 2, size=(count,)).astype(np.float16)
+      expected = torch_fxn(torch.from_numpy(data), dim=0)
+      if count == 512:
+        values, indices = tinygrad_fxn(Tensor(data), axis=0)
+        Tensor.realize(values, indices)
+      else:
+        values = tinygrad_fxn(Tensor(data), axis=0)[0].realize()
+        indices = tinygrad_fxn(Tensor(data), axis=0)[1].realize()
+      np.testing.assert_allclose(values.numpy(), expected.values.numpy(), **_FP16)
+      np.testing.assert_equal(indices.numpy(), expected.indices.int().numpy())
 
-  def test_small_cummax_values(self): self._test_values("max", (((10,), 0),))
-
+  test_small_cummax = _test_ops.TestOps.test_small_cummax
   @slow_test
-  def test_simple_cummax_values(self): self._test_values("max", (((512,), 0), ((1022,), 0)))
-
+  def test_simple_cummax(self): self._test_simple("max")
+  test_cummax = _test_ops.TestOps.test_cummax
+  test_cummax_zero_axis = _test_ops.TestOps.test_cummax_zero_axis
+  test_small_cummin = _test_ops.TestOps.test_small_cummin
   @slow_test
-  def test_cummax_values(self):
-    self._test_values("max", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
-
-  def test_cummax_values_zero_axis(self): self._test_values("max", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
-
-  def test_small_cummin_values(self): self._test_values("min", (((10,), 0),))
-
-  @slow_test
-  def test_simple_cummin_values(self): self._test_values("min", (((512,), 0), ((1022,), 0)))
-
-  @slow_test
-  def test_cummin_values(self):
-    self._test_values("min", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
-
-  def test_cummin_values_zero_axis(self): self._test_values("min", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
-
-@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
-class TestRockchipCumulativeExtremaIndexOps(unittest.TestCase):
-  """Exact INT32 cumulative-extrema axis indices selected by DPU equality masks."""
-
-  def _test_indices(self, kind:str, cases:tuple[tuple[tuple[int, ...], int], ...]):
-    torch_fxn, tinygrad_fxn = (torch.cummax, Tensor.cummax) if kind == "max" else (torch.cummin, Tensor.cummin)
-    for shape,axis in cases:
-      with self.subTest(kind=kind, shape=shape, axis=axis):
-        _TEST_OPS_HELPER([shape], lambda x, axis=axis: torch_fxn(x, dim=axis).indices.int(),
-                         lambda x, axis=axis: tinygrad_fxn(x, axis=axis)[1], forward_only=True)
-
-  def test_small_cummax_indices(self): self._test_indices("max", (((10,), 0),))
-
-  def test_simple_cummax_indices_512(self): self._test_indices("max", (((512,), 0),))
-
-  def test_simple_cummax_indices_1022(self): self._test_indices("max", (((1022,), 0),))
-
-  def test_cummax_indices(self):
-    self._test_indices("max", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
-
-  def test_cummax_indices_zero_axis(self): self._test_indices("max", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
-
-  def test_small_cummin_indices(self): self._test_indices("min", (((10,), 0),))
-
-  def test_simple_cummin_indices_512(self): self._test_indices("min", (((512,), 0),))
-
-  def test_simple_cummin_indices_1022(self): self._test_indices("min", (((1022,), 0),))
-
-  def test_cummin_indices(self):
-    self._test_indices("min", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
-
-  def test_cummin_indices_zero_axis(self): self._test_indices("min", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
+  def test_simple_cummin(self): self._test_simple("min")
+  test_cummin = _test_ops.TestOps.test_cummin
+  test_cummin_zero_axis = _test_ops.TestOps.test_cummin_zero_axis
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipArgExtremaOps(unittest.TestCase):

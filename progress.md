@@ -1836,3 +1836,33 @@ candidate-major raw FP16 lane layout; mean, subtraction, squaring, reduction, an
 implementation follows the existing backend pattern of a strict graph matcher plus a compact immutable image and a
 shared layout helper. There is no LUT, CMAC, CNA, PPU, tinygrad core change, or tolerance relaxation beyond the
 existing FP16 contract.
+
+---
+
+## 2026-08-08 — canonical FP16 cumulative extrema census
+
+All eight unchanged upstream cumulative-extrema method names now join the Rockchip census: small, long, general-axis,
+and zero-axis `cummax` and `cummin`. Their FP16 values and exact INT32 first-occurrence indices were already proven by
+separate custom wrapper classes. This milestone replaces those 18 duplicate wrapper items with the canonical eight
+methods, preserving every shape, axis, error, value, and index case while removing 29 net test lines.
+
+Historical commits `418605353`, `8c811ede9`, and `305f7f793` provide the native DPU value, small-index, and long-index
+implementations. `~/rk3588/test/test_ops.py` contains the same upstream cases and no separate register-level primitive;
+the implementation remains the current DPU equality-mask, weighted-coordinate, reduction, and INT32 conversion path.
+
+The initial canonical `test_simple_cummin` took 34.28 seconds. Profiling showed only about 24 ms in submit ioctls; the
+512-index realization spent 6.7 seconds in generic linearization, 5.2 seconds rendering two large unrolled graphs, and
+2.3 seconds in raw-lane preparation and command construction. `NOOPT` was rejected because it exposes a different
+unsupported value-loop graph. The Rockchip test wrapper instead realizes the 512 value/index pair from one shared
+graph and keeps the proven separate 1022 schedules. This preserves exact results and lowers the method to 28.61
+seconds without a backend, runtime, or Tinygrad core change.
+
+- Canonical cumulative-extrema class: **8 passed in 60.52 s**, sequentially.
+- Slowest methods: `test_simple_cummin` **28.61 s**, `test_simple_cummax` **21.45 s**.
+- Complete Rockchip census: **322 passed, 11 skipped, 180 subtests passed in 326.60 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,784/269 executable lines** (unchanged).
+
+The CPU-cheat audit found no backend or runtime diff. NumPy and Torch appear only in the test oracle; NPU values and
+indices still come from DPU EW and the existing raw-lane layout machinery. There is no LUT, CMAC, CNA, PPU, tinygrad
+core change, or tolerance relaxation beyond the existing FP16 contract.
