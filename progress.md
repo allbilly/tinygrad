@@ -1764,3 +1764,41 @@ Large `(15,25,35)` keepdim variance remains structurally unsupported and is not 
 The CPU-cheat audit found no backend code change and no NumPy variance implementation. Mean, subtraction, squaring,
 reduction, and scaling execute on DPU EW whenever the result is not compile-time constant. There is no LUT, CMAC, CNA,
 PPU, tinygrad core change, or tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — full scalar FP16 variance on DPU EW
+
+The unchanged upstream `test_var` method now joins the Rockchip census. Its three `(15,25,35)` cases exercise
+correction values 1, 0, and 5. Tinygrad schedules each case as a scalar mean followed by
+`SUM((x-mean)^2) * scale`; the renderer now recognizes that exact centered-square accumulator graph.
+
+The native lowering gathers the input as aligned raw FP16 lanes, subtracts the independently computed scalar mean,
+squares every delta, reduces the squares with a balanced DPU ADD tree, and applies Tinygrad's correction scale. Each
+case uses two PC-chain ioctls and 52,500 DPU tasks: 13,125 for the mean and 39,375 for the centered-square pass. No LUT
+or CMAC is involved.
+
+Historical milestone `0d5561074` was inspected and rejected because it calls `np.var` in the runtime. Later
+`rockchip-upstream-research` variance work records rejected CMAC/selector experiments rather than a usable DPU EW
+implementation. `~/npu` documents MeanVarianceNormalization only as a CPU operator, and `~/rk3588` contains no native
+variance register example.
+
+The upstream strict-tolerance run completed all three NPU executions; correction 5 differed by `0.001953`, just beyond
+its generic `1e-3` relative tolerance. The unchanged method passes under the Rockchip census's established FP16
+`5e-3/5e-3` tolerance, which is the same limit used for `test_gemm_fp16`.
+
+- Unchanged upstream `test_var`: **1 passed in 10.31 s**, sequentially.
+- Per correction: **2 submits**, **52,500 DPU tasks**.
+- Wall decomposition per correction: **2.43–2.84 s realization**, of which only **0.022 s** is inside submit ioctls;
+  graph construction is **0.002–0.005 s** and copyout is **0.001–0.003 s**.
+- Reduction regression: **24 passed, 1 skipped in 19.29 s**; post-cleanup reduction/dot regression:
+  **30 passed, 1 skipped in 26.17 s**.
+- Complete Rockchip census after cleanup: **329 passed, 11 skipped, 228 subtests passed in 331.20 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,766/269 executable lines**.
+
+The CPU-cheat audit found only compile-time UOp matching/index evaluation and raw FP16 lane gathering. Runtime performs
+no variance, subtraction, multiplication, addition, scaling, or tensor-value inspection on the CPU. The arithmetic is
+entirely DPU EW. The cleanup shares cast/local-accumulator parsing across dot, scalar, and centered-square reducers,
+following the small-helper style used by the other Tinygrad backends. There is no LUT, CMAC, CNA, PPU, tinygrad core
+change, or tolerance relaxation beyond the existing FP16 contract.
