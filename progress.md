@@ -995,3 +995,25 @@ renderer/runtime change or host numeric operation was required.
 
 The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
 `CmaFree` at 6144 KiB.
+
+---
+
+## 2026-08-08 — FP16 concatenation, stacking, and repetition
+
+The multi-source partial-gather design from `rockchip/post-518-reference` is now ported to the current renderer image
+format. `test_cat`, `test_multicat`, `test_stack`, `test_stack_slice`, `test_stack_max`, and `test_repeat` are admitted.
+Several source buffers populate disjoint lanes of one scratch buffer, after which the ordinary DPU EW identity stage
+writes the result. Runtime preparation computes static integer offsets and copies raw `uint16` lanes only; it never
+decodes or evaluates input-dependent FP16 values. No CMAC path or shared tinygrad core change is involved.
+
+Selection-tree and static-expression results are cached during lowering. This keeps multi-source recognition bounded
+and avoids repeating the large-graph compile-time problem previously found while adding padded slices.
+
+- Every method passed separately in a fresh pytest process: **2.78–6.01 s**.
+- Complete concatenation group: **6 passed in 6.99 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Complete Rockchip census: **209 passed, 9 skipped, 96 subtests passed in 94.84 s**.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **729/160 executable lines**.
+
+The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
+`CmaFree` at 6144 KiB.

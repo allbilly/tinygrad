@@ -415,6 +415,31 @@ class TestRockchipMovementOps(unittest.TestCase):
   test_roll = _test_ops.TestOps.test_roll
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipConcatOps(unittest.TestCase):
+  """FP16 concatenation, stacking, and repetition through partial raw gathers."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def test_stack(self):
+    for dim in range(-1, 3):
+      _fp16_test_op([(5,6,3)]*3, lambda x,y,z: torch.stack((x,y,z), dim), lambda x,y,z: Tensor.stack(x,y,z,dim=dim))
+      _fp16_test_op([(5,6,3)]*3, lambda x,y,z: torch.stack((x,y,z), dim), lambda x,y,z: Tensor.stack((x,y,z),dim=dim))
+    with self.assertRaises(IndexError): Tensor.stack(Tensor.randn(45,65,3), dim=77)
+    with self.assertRaises(ValueError): Tensor.stack((Tensor([1,2]), Tensor([3,4])), Tensor([5,6]))
+    np.testing.assert_allclose(Tensor.stack(Tensor(3.14), Tensor(3.14)).numpy(), np.array([3.14,3.14]), **_FP16)
+
+  test_cat = _test_ops.TestOps.test_cat
+  test_multicat = _test_ops.TestOps.test_multicat
+  test_stack_slice = _test_ops.TestOps.test_stack_slice
+  test_stack_max = _test_ops.TestOps.test_stack_max
+  test_repeat = _test_ops.TestOps.test_repeat
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):
   """Remaining test_ops methods, admitted and debugged in source order."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception

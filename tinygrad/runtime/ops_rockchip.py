@@ -123,7 +123,7 @@ class RockchipProgram(Program['RockchipDevice']):
         src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
         index = np.asarray(gather.offsets, dtype=np.intp)
         valid = index >= 0
-        dst[:gather.count] = gather.fill_bits
+        if not gather.partial: dst[:gather.count] = gather.fill_bits
         dst[:gather.count][valid] = src[index[valid]]
       else:
         src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
