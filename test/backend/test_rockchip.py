@@ -384,6 +384,33 @@ class TestRockchipMovementOps(unittest.TestCase):
   test_detach = _test_ops.TestOps.test_detach
   test_expand = _test_ops.TestOps.test_expand
 
+  def test_slice_negative_strides(self):
+    rng = np.random.default_rng(600)
+    a = rng.standard_normal((10,10,10)).astype(np.float16)
+    t = Tensor(a)
+    for idx in (np.s_[::-1], np.s_[::-2], np.s_[:,2:0:-1], np.s_[:,2:0:-1,3:1:-2], np.s_[4:0:-3,2:0:-1,-1:-5:-2],
+                np.s_[2:5:-1,:,:], np.s_[:,2:5:-1,:], np.s_[:,:,2:5:-1]):
+      np.testing.assert_allclose(a[idx], t[idx].numpy(), **_FP16)
+
+  def test_slice_with_const_tensor(self):
+    self.skipTest("Rockchip DPU accepts FP16 inputs only; this case requires an integer index tensor")
+
+  test_slice_in_bounds_1dim = _test_ops.TestOps.test_slice_in_bounds_1dim
+  test_slice_on_0dim_tensor = _test_ops.TestOps.test_slice_on_0dim_tensor
+  test_slice_int_indexing = _test_ops.TestOps.test_slice_int_indexing
+  test_slice_in_bounds_multidim = _test_ops.TestOps.test_slice_in_bounds_multidim
+  test_slice_with_none = _test_ops.TestOps.test_slice_with_none
+  test_slice_one_endpoint_out_of_bounds = _test_ops.TestOps.test_slice_one_endpoint_out_of_bounds
+  test_slice_stride_gt_one = _test_ops.TestOps.test_slice_stride_gt_one
+  test_slice_both_endpoints_out_of_bounds = _test_ops.TestOps.test_slice_both_endpoints_out_of_bounds
+  test_slice_start_gt_end = _test_ops.TestOps.test_slice_start_gt_end
+  test_slice_zero_in_shape = _test_ops.TestOps.test_slice_zero_in_shape
+  test_slice_errors = _test_ops.TestOps.test_slice_errors
+  test_slice_ellipsis = _test_ops.TestOps.test_slice_ellipsis
+  test_double_slice = _test_ops.TestOps.test_double_slice
+  test_pad_reshape = _test_ops.TestOps.test_pad_reshape
+  test_pad_slice = _test_ops.TestOps.test_pad_slice
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):
   """Remaining test_ops methods, admitted and debugged in source order."""

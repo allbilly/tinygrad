@@ -950,3 +950,30 @@ The unused `reset_npu` hook was removed. It had no caller, issued unsupported ac
 not match the recovery ownership used by other tinygrad hardware runtimes. Blocking submission behavior is unchanged.
 The movement group still passes **11/11 in 3.55 s** after cleanup. Ruff and mypy pass; `sz.py` reports renderer/runtime
 sizes of **647/160 executable lines**, reducing the runtime by five lines while retaining comments and docstrings.
+
+---
+
+## 2026-08-08 — Static FP16 slicing and padded selection
+
+Sixteen more movement methods are admitted: bounded one- and multidimensional slicing, scalar integer dimension
+selection, inserted `None` axes, clipped endpoints, positive and negative strides, empty results, error cases, ellipsis,
+double slicing, and pad→reshape/slice compositions. The explicit `test_slice_with_const_tensor` case remains skipped
+because it requires an integer tensor input; it is not emulated on the CPU.
+
+Partly padded slices exposed tinygrad's static `WHERE` selection tree around raw loads. The proven post-518 selection
+gather was ported with support for one exact FP16 fill bit-pattern. It evaluates only parameter-free RANGE/CONST layout
+predicates at compile time, records integer source offsets, and moves raw `uint16` lanes at runtime. No input-dependent
+predicate or numeric value is evaluated on the host.
+
+An initial implementation attempted selection recognition on every ADD node and made large convolution compilation
+quadratic. Profiling showed the pytest process at 100% CPU with no active NPU ioctl or kernel error. Restricting the
+recognizer to its actual WHERE/gated-load roots restored focused depthwise/dilated convolution methods to 2.79–3.19 s.
+
+- Sixteen new methods passed separately in fresh pytest processes; the integer-tensor case skipped explicitly.
+- Complete movement group: **27 passed, 1 skipped in 5.50 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Complete Rockchip census: **200 passed, 9 skipped, 96 subtests passed in 115.26 s**.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **693/160 executable lines**.
+
+The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
+`CmaFree` at 6144 KiB.
