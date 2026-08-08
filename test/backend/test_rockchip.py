@@ -374,6 +374,14 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_ones = _test_ops.TestOps.test_ones
   test_ones_like = _test_ops.TestOps.test_ones_like
   test_eye = _test_ops.TestOps.test_eye
+  test_split = _test_ops.TestOps.test_split
+  test_chunk = _test_ops.TestOps.test_chunk
+  test_unfold = _test_ops.TestOps.test_unfold
+  test_meshgrid = _test_ops.TestOps.test_meshgrid
+  test_arange = _test_ops.TestOps.test_arange
+  test_arange_big = _test_ops.TestOps.test_arange_big
+  test_arange_4096 = _test_ops.TestOps.test_arange_4096
+  test_linspace = _test_ops.TestOps.test_linspace
 
 if __name__ == "__main__":
   unittest.main()

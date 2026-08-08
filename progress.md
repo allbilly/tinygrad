@@ -765,3 +765,19 @@ Six more source-order methods were admitted and run individually: `test_zeros`, 
 - No new kernel error signature.
 
 The next source-order method is `test_split`.
+
+---
+
+## 2026-08-08 — Movement and range construction through `test_linspace`
+
+Eight more source-order methods were admitted and run individually: `test_split`, `test_chunk`, `test_unfold`, `test_meshgrid`, `test_arange`, `test_arange_big`, `test_arange_4096`, and `test_linspace`.
+
+Split/chunk remain views where possible; materialized FP16 movement uses the existing gather plus DPU pass-through path. Range/linspace values depend only on their scalar construction arguments and are materialized as static typed data. This includes FP16, int8, int32, and int64 output checks and does not introduce input-dependent CPU arithmetic.
+
+- Individual method times: 2.92–5.72 s.
+- Complete incremental source-order group: **20 passed in 4.94 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+The next source-order method is `test_sum_fake`.
