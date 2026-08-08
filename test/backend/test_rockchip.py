@@ -488,6 +488,19 @@ class TestRockchipEinsumOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_einsum = _test_ops.TestOps.test_einsum
+
+  def test_einsum_ellipsis(self):
+    _fp16_test_op([(3,8,9), (3,8,9)], lambda a,b:torch.einsum("...id,...jd->...ij", a, b),
+                  lambda a,b:Tensor.einsum("...id,...jd->...ij", a, b))
+    _fp16_test_op([(3,8,9), (3,8,9)], lambda a,b:torch.einsum("...id,...jd", a, b),
+                  lambda a,b:Tensor.einsum("...id,...jd", a, b))
+    _fp16_test_op([(2,3,4,5), (5,2,4)], lambda a,b:torch.einsum("i...j,ji...->...", a, b),
+                  lambda a,b:Tensor.einsum("i...j,ji...->...", a, b))
+    self.helper_test_exception([(2,3,4), (2,3,4)], lambda a,b:torch.einsum("...ik...,...jk->", a, b),
+                               lambda a,b:Tensor.einsum("...ik...,...jk->", a, b), expected=(RuntimeError, IndexError))
+    self.helper_test_exception([(2,3,4), (2,3,4)], lambda a,b:torch.einsum("i...j,ji...->...", a, b),
+                               lambda a,b:Tensor.einsum("i...j,ji...->...", a, b), expected=RuntimeError)
+
   test_einsum_trace = _test_ops.TestOps.test_einsum_trace
   test_einsum_shape_check = _test_ops.TestOps.test_einsum_shape_check
   test_einsum_arity_check1 = _test_ops.TestOps.test_einsum_arity_check1

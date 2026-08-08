@@ -2303,3 +2303,34 @@ The CPU-cheat audit found no runtime or Tinygrad core change. The rewrite inspec
 mask construction plus gradient arithmetic executes on DPU EW; Torch is used only for the expected gradient. There is
 no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion, or tolerance
 relaxation.
+
+---
+
+## 2026-08-09 — FP16 einsum ellipsis layouts
+
+Three executable layouts and both static validation cases from upstream `test_einsum_ellipsis` now join the Rockchip
+census. The supported forms cover batched matrix products (`...id,...jd->...ij`), an implicit scalar reduction
+(`...id,...jd`), and permuted ellipsis axes (`i...j,ji...->...`). They reuse the existing FP16 gather, MUL, and ADD
+lowering without a special einsum operation.
+
+The remaining upstream execution case, two `(32,7,24,24,24)` inputs reduced by `ij...,ij...->ij`, was tested but is
+not admitted yet. Tinygrad lowers each of its 224 output rows to 432 loop iterations with a 32-product unrolled ADD
+tree, or 13,824 products per row and 3,096,576 input lanes overall. The current loop-reduction matcher recognizes the
+shape but its dot path accepts only one MUL contribution per iteration. Flattening this graph into ordinary EW stages
+would create an impractically large command sequence; it needs a bounded hierarchical reduction rather than a broad
+matcher relaxation.
+
+The canonical ellipsis cases are present under `~/rk3588/test/test_ops.py`. Searches across the other Rockchip
+Tinygrad branches and `~/npu` found no separate hardware-specific einsum implementation to port; their implementation
+is likewise the generic Tinygrad reshape/gather/multiply/reduce graph.
+
+- Focused Rockchip method: **1 passed in 3.03 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **357 passed, 11 skipped, 180 subtests passed in
+  400.70 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,918/274 executable lines**.
+
+This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change. All
+runtime-dependent lane movement and arithmetic execute through the existing Rockchip NPU path; Torch is used only as
+the expected-value oracle. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16
+input conversion, or tolerance relaxation.
