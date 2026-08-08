@@ -1366,6 +1366,67 @@ def _lower_loop_pool_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   return _pool_index_image(out_param.arg.slot, 1, spatial_size, spatial_size, plans, extrema_plan,
                            tuple((weight,) for weight in weights))
 
+def _lower_unrolled_max_unpool(output:RKOutput) -> RKImage|None:
+  """Scatter bounded MaxUnpool lanes through DPU INT32 equality and FP16 reduction."""
+  _, out_param, count, out_index, value = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  parsed:list[tuple[UOp, UOp, UOp]] = []
+  for term in _flatten_binary(value, Ops.ADD):
+    where = _strip_cast(term)
+    if (where.op is not Ops.WHERE or _strip_cast(where.src[0]).op is not Ops.CMPNE or
+        where.src[1].op is not Ops.CONST or float(where.src[1].arg) != 0.0): return None
+    condition, selected_load = _strip_cast(where.src[0]), _strip_cast(where.src[2])
+    index_loads = [x for x in condition.src if x.op is Ops.LOAD and x.dtype.scalar() is dtypes.int]
+    coordinate_exprs = [x for x in condition.src if _is_static_expr(x)]
+    if (len(index_loads) != 1 or len(coordinate_exprs) != 1 or selected_load.op is not Ops.LOAD or
+        selected_load.dtype.scalar() is not dtypes.half or selected_load.src[0].op is not Ops.INDEX or
+        index_loads[0].src[0].op is not Ops.INDEX or selected_load.src[0].src[1].key != index_loads[0].src[0].src[1].key): return None
+    parsed.append((index_loads[0], selected_load, coordinate_exprs[0]))
+  pooled = len(parsed)
+  if not 2 <= pooled <= 255: return None
+  index_params = [_root_param(index.src[0]) for index,_,_ in parsed]
+  value_params = [_root_param(value.src[0]) for _,value,_ in parsed]
+  if (any(param is None or param.src[0].op is not Ops.CONST for param in (*index_params,*value_params)) or
+      len({param.arg.slot for param in index_params if param is not None}) != 1 or
+      len({param.arg.slot for param in value_params if param is not None}) != 1): return None
+  index_param, value_param = index_params[0], value_params[0]
+  assert index_param is not None and value_param is not None
+  source_count = int(index_param.src[0].arg)
+  if (index_param.dtype.scalar() is not dtypes.int or value_param.dtype.scalar() is not dtypes.half or
+      int(value_param.src[0].arg) != source_count or source_count % pooled): return None
+  planes = source_count//pooled
+  if not planes or count % planes: return None
+  out_spatial = count//planes
+  try:
+    rows = [(_gather_offsets(out_index, index.src[0].src[1], None, count),
+             _gather_offsets(out_index, selected.src[0].src[1], None, count),
+             _static_int_vector(out_index, coordinate, count)) for index,selected,coordinate in parsed]
+  except RuntimeError: return None
+  if any(indexes != values or coords != tuple(lane%out_spatial for lane in range(count)) for indexes,values,coords in rows): return None
+  rows.sort(key=lambda row:row[0])
+  if any(sorted(indexes[lane] for indexes,_,_ in rows) != list(range(lane//out_spatial*pooled, (lane//out_spatial+1)*pooled))
+         for lane in range(count)): return None
+
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, pooled)
+  if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
+  zero, one, raw_index, half_index, convert_tiles, coordinate_slot, values, diff, magnitude, unequal, equal, selected_slot = range(12)
+  scratch_sizes = [matrix_lanes*2] * 12
+  scratch_sizes[raw_index], scratch_sizes[convert_tiles] = matrix_lanes*4, ((matrix_lanes+3)//4)*64
+  scratch = tuple(RKScratch(size) for size in scratch_sizes)
+  coordinate_bits = tuple(struct.unpack("<H", struct.pack("<e", float(lane%out_spatial)))[0] for lane in range(count))
+  gathers:tuple[RKGather, ...] = ()
+  for row,(offsets,_,_) in enumerate(rows):
+    gathers += (RKGather(index_param.arg.slot, raw_index, count, offsets=offsets, dst_addend=row*vector_lanes, itemsize=4),
+                RKGather(value_param.arg.slot, values, count, offsets=offsets, dst_addend=row*vector_lanes),
+                RKGather(index_param.arg.slot, coordinate_slot, count, values=coordinate_bits, dst_addend=row*vector_lanes))
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops:list[RKEWOp] = [RKEWOp(arg(half_index), arg(raw_index), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True)]
+  equal_arg = _ew_eq_mask(ops, arg, half_index, coordinate_slot, (diff, magnitude, unequal, equal), one, matrix_lanes)
+  ops.append(RKEWOp(arg(selected_slot), arg(values), equal_arg, matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+  reduced = _reduce_rows(ops, [arg(selected_slot, row*vector_bytes) for row in range(pooled)], count, _EW_CFG[Ops.ADD])
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), reduced, arg(zero), count, _EW_CFG[Ops.ADD]))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
+
 @dataclass(frozen=True)
 class RKArgMatch:
   source_slot:int; source_count:int; extrema:UOp; candidates:tuple[tuple[UOp, UOp, bool], ...]; extrema_plans:tuple[RKGather, ...]|None = None
@@ -1793,8 +1854,9 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (comparison:=_ieee_comparison_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, comparison, bool_output=True)
   if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
      (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
-  if (half_output:=_output_store(uops, dtypes.half)) is not None and \
-     (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
+  if (half_output:=_output_store(uops, dtypes.half)) is not None:
+    if (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
+    if (max_unpool:=_lower_unrolled_max_unpool(half_output)) is not None: return max_unpool
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
   if int_output is not None and not any(u.op is Ops.REDUCE for u in uops):
     if (occurrence_count:=_lower_occurrence_count(int_output)) is not None: return occurrence_count

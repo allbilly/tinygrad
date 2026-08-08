@@ -2476,3 +2476,43 @@ is used only for compile-time symbolic index evaluation, raw gather-map construc
 renderer, and FP16 test-fixture creation. All input-dependent equality, tie selection, MAX reduction, and INT32
 conversion execute on the NPU. There is no host ArgMax, host scatter, LUT, CMAC, CNA, PPU fallback, tolerance
 relaxation, or external non-FP16 input.
+
+---
+
+## 2026-08-09 — bounded native MaxUnpool scatter
+
+The small finite MaxUnpool case from upstream `test_max_unpool2d` now runs as a dedicated Rockchip regression: a
+`(1,3,7,6)` FP16 tensor is MaxPool2D'd with a 2x2 kernel, then unpooled to the explicitly requested `(7,6)` spatial
+shape. The kernel covers three planes, nine pooled candidates per plane, dynamic INT32 indices, and 126 FP16 output
+lanes. The complete pool/index/unpool pipeline passes in 5.98 seconds.
+
+The strict renderer matcher recognizes only the canonical Tinygrad one-hot scatter: each term compares a dynamic INT32
+index with the compile-time output-plane coordinate, selects the FP16 pooled lane on equality, and the terms are summed.
+It proves that the INT32 and FP16 loads share each candidate offset, that every output lane sees exactly one complete
+pooled plane, and that coordinates are the compact spatial order. Raw gathers stripe indices and values into a bounded
+matrix; DPU INT32-input conversion, equality masks, FP16 selection, and ADD reduction produce the output. The image has
+27 raw gathers and 15 logical EW stages. No runtime semantic path was added.
+
+The full upstream method is not marked complete yet. Its 25-candidate `(8,3,30,30)` case would repeat 600 indices into
+540,000 lanes before four-lane INT32 conversion, expanding to 135,000 conversion tasks. It needs an image phase that
+converts the compact index vector once and stripes the resulting FP16 lanes afterward. Its 80-candidate `(8,3,50,50)`
+case additionally produces spatial indices through 2499, beyond the exact-integer range of the current FP16 coordinate
+selector, and lowers the scatter as a loop. The infinity/NaN regression also needs representation-level selection,
+because ordinary `value * 0` turns an unselected infinity into NaN. These cases remain excluded rather than being run
+through the old branch's NumPy scatter or an inaccurate/unsafe expansion.
+
+Historical commit `76c31806e` supplied useful graph and plane-layout evidence, but its implementation included host
+packing/compaction helpers and an optional NumPy scatter. The RKNN operator guide lists MaxUnpool under CPU operators;
+`~/npu` and `~/rk3588` expose an RDMA `UNPOOLING_EN` bit but no verified dynamic-index data contract. None of those
+unproven or CPU paths were ported.
+
+- Focused bounded MaxUnpool pipeline: **1 passed in 5.98 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **362 passed, 10 skipped, 180 subtests passed in
+  418.57 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after focused and complete runs.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,142/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change and no host read of indices or pooled values. NumPy is used
+only by the pre-existing compile-time static-index machinery and test oracle/fixture code. All dynamic INT32 conversion,
+comparison, mask selection, and accumulation execute on DPU EW. There is no host scatter, host ArgMax, LUT, CMAC, CNA,
+PPU fallback, tolerance relaxation, or external non-FP16 input.

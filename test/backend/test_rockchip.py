@@ -320,6 +320,17 @@ for _name, _test in vars(_test_ops.TestOps).items():
     setattr(TestRockchipMaxPoolOps, _name, _test)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipMaxUnpoolOps(unittest.TestCase):
+  """Bounded FP16 MaxUnpool scatter from the upstream operator census."""
+
+  def test_max_unpool2d_bounded(self):
+    _fp16_test_op([(1,3,7,6)],
+      lambda x: torch.nn.functional.max_unpool2d(*torch.nn.functional.max_pool2d(x, kernel_size=(2,2), return_indices=True),
+                                                 kernel_size=(2,2), output_size=(99,99,7,6)),
+      lambda x: Tensor.max_unpool2d(*Tensor.max_pool2d(x, kernel_size=(2,2), return_indices=True),
+                                    kernel_size=(2,2), output_size=(99,99,7,6)), forward_only=True)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipAvgPoolOps(unittest.TestCase):
   """Every FP16 AvgPool case from test_ops at the test_gemm_fp16 tolerance."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
