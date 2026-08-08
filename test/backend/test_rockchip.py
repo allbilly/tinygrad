@@ -440,6 +440,22 @@ class TestRockchipConcatOps(unittest.TestCase):
   test_repeat = _test_ops.TestOps.test_repeat
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipPaddingOps(unittest.TestCase):
+  """Constant, reflect, replicate, and circular FP16 padding through raw gathers."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_pad = _test_ops.TestOps.test_pad
+  test_pad_reflect_mode = _test_ops.TestOps.test_pad_reflect_mode
+  test_pad_replicate_mode = _test_ops.TestOps.test_pad_replicate_mode
+  test_pad_circular_mode = _test_ops.TestOps.test_pad_circular_mode
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):
   """Remaining test_ops methods, admitted and debugged in source order."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception

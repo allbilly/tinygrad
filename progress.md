@@ -1017,3 +1017,25 @@ and avoids repeating the large-graph compile-time problem previously found while
 
 The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
 `CmaFree` at 6144 KiB.
+
+---
+
+## 2026-08-08 — Constant, reflect, replicate, and circular padding
+
+Four exact upstream padding methods are now admitted: `test_pad`, `test_pad_reflect_mode`,
+`test_pad_replicate_mode`, and `test_pad_circular_mode`. The implementation was checked against the proven
+`rockchip/post-518-reference` milestone `04186a805`. Its required selection-gather lowering is already subsumed by the
+current cached gather implementation, so this milestone adds coverage without adding renderer or runtime code.
+
+All modes lower static padding predicates and source offsets on the host, copy only raw `uint16` lanes into scratch,
+and use the DPU EW identity stage for output. No input-dependent FP16 arithmetic, CMAC path, tolerance change, or shared
+tinygrad core change is involved.
+
+- Individual methods: **1 passed** each in 2.87–6.31 s.
+- Complete padding group: **4 passed in 9.71 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Complete Rockchip census: **213 passed, 9 skipped, 96 subtests passed in 44.62 s** under `-n12`.
+- Ruff and mypy: pass. `sz.py` remains renderer/runtime **729/160 executable lines**.
+
+The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
+`CmaFree` at 6144 KiB.
