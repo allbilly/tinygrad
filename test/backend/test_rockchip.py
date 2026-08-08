@@ -720,6 +720,30 @@ class TestRockchipClassificationOps(unittest.TestCase):
   test_isfinite = _test_ops.TestOps.test_isfinite
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipComparisonOps(unittest.TestCase):
+  """FP16 portions of test_ops comparisons; integer and boolean inputs are outside the NPU contract."""
+
+  def _test_cmp(self, fxn, reverse:bool=True):
+    _fp16_test_op(None, fxn, fxn, forward_only=True, vals=[[0., 1., 2.], [2., 1., 0.]])
+    for shapes in [[(3,4,5), (3,4,5)], [(3,4,5), (5,)], [(5,), (3,4,5)]]:
+      _fp16_test_op(shapes, fxn, fxn, forward_only=True)
+    _fp16_test_op(None, lambda x,y:fxn(x, 2), lambda x,y:fxn(x, 2), forward_only=True,
+                  vals=[[0., 1., 2.], [2., 1., 0.]])
+    if reverse:
+      _fp16_test_op(None, lambda x,y:fxn(2, y), lambda x,y:fxn(2, y), forward_only=True,
+                    vals=[[0., 1., 2.], [2., 1., 0.]])
+    specials = [0.0, -0.0, 1.0, -1.0, math.inf, -math.inf, math.nan]
+    pairs = [(lhs, rhs) for lhs in specials for rhs in specials]
+    _fp16_test_op(None, fxn, fxn, forward_only=True, vals=[[x[0] for x in pairs], [x[1] for x in pairs]])
+
+  def test_cmp_eq(self): self._test_cmp(lambda x,y:x == y, reverse=False)
+  def test_cmp_ne(self): self._test_cmp(lambda x,y:x != y, reverse=False)
+  def test_cmp_gt(self): self._test_cmp(lambda x,y:x > y)
+  def test_cmp_ge(self): self._test_cmp(lambda x,y:x >= y)
+  def test_cmp_lt(self): self._test_cmp(lambda x,y:x < y)
+  def test_cmp_le(self): self._test_cmp(lambda x,y:x <= y)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipWhereOps(unittest.TestCase):
   """FP16 WHERE and masked arithmetic lowered to DPU comparison masks and selection."""
 

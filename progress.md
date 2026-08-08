@@ -1948,3 +1948,35 @@ static WHERE-to-MAX/MIN algorithm does not use equality masks.
 The cleanup removes nine more executable renderer lines and changes no test, runtime, command encoding, tolerance, or
 Tinygrad core file. Its gathers contain only compile-time offsets/constants, and all equality arithmetic remains DPU EW;
 there is no host tensor-value computation, LUT, CMAC, CNA, or PPU fallback.
+
+---
+
+## 2026-08-09 — IEEE-correct FP16 comparison outputs on DPU EW
+
+The FP16 portions of all six comparison predicates now join the Rockchip census: equal, not-equal, less, greater,
+less-or-equal, and greater-or-equal. Coverage includes equal shapes, both broadcast directions, scalar constants in both
+operand positions, signed zero, finite values, both infinities, and every pair involving NaN. Integer and boolean input
+comparisons remain outside the NPU's FP16 external-input contract.
+
+Each operand is classified on-device into NaN, positive infinity, negative infinity, and finite masks using the proven
+DPU positive-mask primitive. Ordered comparisons combine a finite subtraction mask with explicit infinity ordering and
+an unordered-NaN validity mask. Equality recognizes equal finite values and matching signed infinities; NaN is never
+equal and is always not-equal. Tinygrad lowers `>=` and `<=` as boolean inversion of `<`, so inversion is deliberately
+performed inside the validity mask rather than as a plain `1-result`, preserving IEEE false-on-NaN behavior.
+
+Research commit `bd1b8009a` supplied the proven device formula. `~/npu/include/old/rknn_ops.md` lists Greater,
+GreaterOrEqual, Less, and LessOrEqual as supported model operations, and `~/rk3588/test/test_rockchip.py` contains the
+same comparison matrix. The older `89c7cb67b` implementation was rejected because its runtime sanitized infinities and
+converted comparison tensors with NumPy. This port uses the current immutable DPU EW image and existing lossless typed
+bool-output ABI instead.
+
+- Focused six-predicate class: **6 passed in 56.45 s**, sequentially.
+- Classification plus comparisons: **9 passed in 59.17 s**, sequentially.
+- Complete Rockchip census: **331 passed, 11 skipped, 180 subtests passed in 375.24 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,797/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. Runtime never reads, sanitizes, compares, or converts input
+tensor values; all classification, comparison, boolean inversion, and FP16-to-INT32 mask conversion occur on DPU EW.
+Only the existing raw low-byte packing exposes NPU-produced 0/1 lanes as public bool bytes. There is no LUT, CMAC, CNA,
+PPU fallback, or tolerance relaxation.

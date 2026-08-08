@@ -1388,9 +1388,78 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp], output:RKOutput) -> RKI
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
                                  extrema_plans, negated_candidates, list(range(count)))
 
-def _lower_ieee_predicate(uops:list[UOp], output:RKOutput) -> RKImage|None:
+def _typed_bool_image(output:RKOutput, value:UOp) -> RKImage:
+  """Lower an FP16 0/1 mask and pack its DPU-converted INT32 lanes into the public bool ABI."""
+  store, out_param, count, _, _ = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  out_slot = out_param.arg.slot
+  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
+  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
+  image = lower_ew(list(store.replace(src=(half_index, value, *store.src[2:])).toposort()))
+  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
+  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.post_gathers:
+    raise RuntimeError("RKPLAN_REJECT:predicate_terminal")
+  result_slot, tiles_slot = len(image.scratch), len(image.scratch)+1
+  result, tiles = RKArg(RKBufferKind.SCRATCH, result_slot), RKArg(RKBufferKind.SCRATCH, tiles_slot)
+  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
+         RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, tiles, count, _EW_CFG[Ops.MAX],
+                stateful=True, int32_output=True, bool_output=True))
+  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(((count+3)//4)*64)), ew_ops=ops)
+
+def _ieee_comparison_mask(root:UOp) -> UOp|None:
+  """Build an IEEE-correct FP16 comparison mask without evaluating tensor values on the host."""
+  one = UOp.const(1.0, dtypes.half)
+  def inverse(value:UOp) -> UOp: return one.alu(Ops.SUB, value)
+  def numeric(value:UOp) -> UOp|None:
+    value = _unwrap_condition(value)
+    if value.dtype.scalar() not in (dtypes.half, dtypes.float): return None
+    loads = [u for u in value.toposort() if u.op is Ops.LOAD]
+    params = [_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads]
+    if any(param is None or param.dtype.scalar() is not dtypes.half for param in params): return None
+    return value if value.dtype.scalar() is dtypes.half else value.cast(dtypes.half)
+  def classes(value:UOp) -> tuple[UOp, UOp, UOp, UOp]:
+    high = _positive_mask(value.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
+    low = _positive_mask(UOp.const(-65504.0, dtypes.half).alu(Ops.SUB, value))
+    nan = _mask_mul(high, low)
+    return nan, high.alu(Ops.SUB, nan), low.alu(Ops.SUB, nan), inverse(high.alu(Ops.MAX, low))
+  def atom(op:Ops, lhs:UOp, rhs:UOp, invert:bool=False) -> UOp|None:
+    if (left:=numeric(lhs)) is None or (right:=numeric(rhs)) is None: return None
+    lhs_nan, lhs_pos, lhs_neg, lhs_finite = classes(left)
+    rhs_nan, rhs_pos, rhs_neg, rhs_finite = classes(right)
+    positive = _positive_mask(right.alu(Ops.SUB, left))
+    if op is Ops.CMPLT:
+      valid = inverse(lhs_nan.alu(Ops.MAX, rhs_nan))
+      forced = _mask_mul(lhs_neg, inverse(rhs_neg)).alu(Ops.MAX, _mask_mul(rhs_pos, inverse(lhs_pos)))
+      finite = _mask_mul(_mask_mul(lhs_finite, rhs_finite), positive)
+      comparison = forced.alu(Ops.MAX, finite)
+      return _mask_mul(valid, inverse(comparison) if invert else comparison)
+    unequal = positive.alu(Ops.MAX, _positive_mask(left.alu(Ops.SUB, right)))
+    finite_equal = _mask_mul(_mask_mul(lhs_finite, rhs_finite), inverse(unequal))
+    equal = finite_equal.alu(Ops.MAX, _mask_mul(lhs_pos, rhs_pos)).alu(Ops.MAX, _mask_mul(lhs_neg, rhs_neg))
+    return inverse(equal)
+  def mask(value:UOp) -> UOp|None:
+    value = _unwrap_condition(value)
+    if value.op is Ops.CONST and value.dtype.scalar() is dtypes.bool: return UOp.const(float(bool(value.arg)), dtypes.half)
+    if value.op is Ops.CMPNE:
+      for expression, marker in (value.src, value.src[::-1]):
+        marker = _unwrap_condition(marker)
+        if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool:
+          expression = _unwrap_condition(expression)
+          if bool(marker.arg) and expression.op is Ops.CMPLT:
+            return atom(Ops.CMPLT, expression.src[0], expression.src[1], invert=True)
+          if (inner:=mask(expression)) is None: return None
+          return inverse(inner) if bool(marker.arg) else inner
+    if value.op in (Ops.CMPLT, Ops.CMPNE): return atom(value.op, value.src[0], value.src[1])
+    if value.op in (Ops.OR, Ops.AND):
+      lhs, rhs = mask(value.src[0]), mask(value.src[1])
+      if lhs is None or rhs is None: return None
+      return lhs.alu(Ops.MAX, rhs) if value.op is Ops.OR else _mask_mul(lhs, rhs)
+    return None
+  return mask(root)
+
+def _lower_ieee_predicate(output:RKOutput) -> RKImage|None:
   """Classify FP16 NaN/infinity on DPU and expose the final 0/1 mask through the bool ABI."""
-  store, out_param, count, _, root = output
+  root = output[4]
 
   def logical_not(u:UOp) -> UOp|None:
     if u.op is not Ops.CMPNE: return None
@@ -1434,24 +1503,12 @@ def _lower_ieee_predicate(uops:list[UOp], output:RKOutput) -> RKImage|None:
   value = (both if kind == "nan" else UOp.const(1.0, dtypes.half).alu(Ops.SUB, either) if kind == "finite" else
            (positive_inf if kind == "positive_inf" else negative_inf if kind == "negative_inf" else either).alu(Ops.SUB, both))
 
-  out_slot = out_param.arg.slot
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
-  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
-  image = lower_ew(list(store.replace(src=(half_index, value, *store.src[2:])).toposort()))
-  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
-  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.post_gathers:
-    raise RuntimeError("RKPLAN_REJECT:predicate_terminal")
-  result_slot, tiles_slot = len(image.scratch), len(image.scratch)+1
-  result, tiles = RKArg(RKBufferKind.SCRATCH, result_slot), RKArg(RKBufferKind.SCRATCH, tiles_slot)
-  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
-         RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, tiles, count, _EW_CFG[Ops.MAX],
-                stateful=True, int32_output=True, bool_output=True))
-  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(((count+3)//4)*64)), ew_ops=ops)
+  return _typed_bool_image(output, value)
 
 def lower_ew(uops:list[UOp]) -> RKImage:
-  if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
-     (predicate:=_lower_ieee_predicate(uops, bool_output)) is not None: return predicate
+  if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
+    if (predicate:=_lower_ieee_predicate(bool_output)) is not None: return predicate
+    if (comparison:=_ieee_comparison_mask(bool_output[4])) is not None: return _typed_bool_image(bool_output, comparison)
   if (half_output:=_output_store(uops, dtypes.half)) is not None and \
      (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
