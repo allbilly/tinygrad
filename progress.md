@@ -738,3 +738,16 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - `sz.py`: renderer 556 executable lines, runtime 165.
 
 The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next source-order methods are the negative-dimension exception tests.
+
+---
+
+## 2026-08-08 — Negative-dimension validation methods
+
+Four source-order `TestOps` methods were admitted and run individually: `test_negative_dims`, `test_negative_dims_full`, `test_negative_dims_eye`, and `test_negative_dims_kaiming`. Every invalid shape raises before device allocation or submission.
+
+- Individual times: 2.59 s, 2.58 s, 2.57 s, and 2.51 s.
+- Incremental creation/validation group: **6 passed in 2.82 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+
+The next source-order method is `test_zeros`.
