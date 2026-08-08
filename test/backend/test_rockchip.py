@@ -839,6 +839,15 @@ class TestRockchipLogicalPredicateOps(unittest.TestCase):
 
   test_isclose_scalar = _test_ops.TestOps.test_isclose_scalar
 
+  def test_isclose_edge_cases(self):
+    values = (math.inf, -math.inf, math.nan, 0.0)
+    lhs, rhs = [a for a in values for _ in values], [b for _ in values for b in values]
+    before = Device["ROCKCHIP"].submit_count
+    for equal_nan in (False, True):
+      _fp16_test_op(None, lambda x,y,equal_nan=equal_nan:x.isclose(y, equal_nan=equal_nan),
+                    vals=[lhs, rhs], forward_only=True)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 104)
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIntegralRoundingOps(unittest.TestCase):
   """Native FP16 floor/ceil plus DPU-composed truncation; round-to-even still requires a LUT."""

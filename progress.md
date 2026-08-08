@@ -2402,3 +2402,37 @@ tasks before compensated accumulation. It was therefore removed instead of admit
 The CPU-cheat audit found no renderer, runtime, or Tinygrad-core change. All input-dependent extrema arithmetic executes
 on DPU EW; Python only asserts the returned scalar/array values. There is no host tensor-value arithmetic, LUT, CMAC,
 CNA, PPU fallback, external non-FP16 input, tolerance relaxation, or committed experimental einsum path.
+
+---
+
+## 2026-08-09 — vectorized IEEE isclose edge matrix
+
+All 16 pairs from `{+inf, -inf, NaN, 0}²` in upstream `test_isclose_edge_cases` now run in the Rockchip census for both
+`equal_nan=False` and `equal_nan=True`. The Rockchip method preserves every upstream pair but packs each mode into one
+16-lane graph instead of paying realization overhead for 32 scalar helper calls. The two graphs reuse the existing DPU
+EW ABS, arithmetic, IEEE classification, comparison-mask, and typed bool-output paths. They execute **364 DPU tasks in
+104 ioctls** and complete in **14.02 s**; the submit assertion prevents silent constant folding or fallback.
+
+Historical commit `b85d3c4b0` passes isclose through host-side predicate evaluation and was not ported. The current
+renderer already represents the complete IEEE predicate on DPU, so this milestone adds no backend special case and does
+not relax exact boolean expectations. General finite `test_isclose` remains excluded because FP16 subnormal tolerance
+arithmetic loses distinctions such as `x` versus `x+1e-6` before the comparison.
+
+Large boolean reduction was evaluated as the following candidate. `test_all_large` is not constant-folded: after an
+FP16 predicate reduction it needs a second 256-way AND over a byte-bool intermediate. Historical commits `25df366fb`
+and `03bad6205` widen those bytes to FP16 with NumPy, which is a CPU numeric conversion and is not ported. A clean route
+would use raw byte placement into zeroed INT32 lanes plus the existing DPU INT32-to-FP16 conversion, but the upstream
+one-million-lane first stage spends more than a minute in Tinygrad symbolic rewriting before reaching the renderer,
+including under `NOOPT=1`. Because Tinygrad core changes are out of scope and individual cases must remain below 30 s,
+the group is deferred rather than narrowed to only its 32K/64K cases.
+
+- Focused edge-matrix method: **1 passed in 14.02 s**, sequentially.
+- Complete logical-predicate class: **6 passed in 31.34 s**; no individual method exceeded 30 s.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **360 passed, 11 skipped, 180 subtests passed in
+  415.81 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,947/274 executable lines**.
+
+The CPU-cheat audit found no renderer, runtime, or Tinygrad-core change. Every runtime-dependent isclose operation and
+bool conversion executes on DPU EW; Python only constructs the static test matrix and checks exact bool output. There is
+no host tensor-value arithmetic, LUT, CMAC, CNA, PPU fallback, external non-FP16 input, or tolerance relaxation.
