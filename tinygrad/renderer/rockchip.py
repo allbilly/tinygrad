@@ -126,9 +126,11 @@ _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _EW_DATA_MODE_FP16 = 1 << 28
 _EW_EDATA_SIZE_FP16 = 2 << 22
+_EW_ALU_MIN = 1 << 16
 _EW_ALU_ADD = 2 << 16
 _EW_ALU_FDIV = 3 << 16
 _EW_ALU_ABS = 5 << 16
+_EW_RELUX_EN = 1 << 10
 _EW_RELU_BYPASS = 1 << 9
 _EW_OP_CVT_BYPASS = 1 << 8
 _EW_LUT_BYPASS = 1 << 7
@@ -137,9 +139,13 @@ _EW_MUL_PRELU = 1 << 5
 _EW_OP_TYPE_MUL = 1 << 2
 _EW_CFG_COMMON = _EW_DATA_MODE_FP16 | _EW_EDATA_SIZE_FP16 | _EW_LUT_BYPASS | _EW_OP_SRC_DMA
 _EW_CFG_RELU = _EW_CFG_COMMON
+_EW_CFG_RELU6 = _EW_CFG_COMMON | _EW_RELUX_EN
+_EW_CFG_MIN = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_MIN
 _EW_CFG_ABS = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ABS
 _EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_MUL_PRELU | _EW_OP_TYPE_MUL
-_NATIVE_ABS, _NATIVE_LEAKY_RELU = "rockchip_abs", "rockchip_leaky_relu"
+_NATIVE_ABS, _NATIVE_LEAKY_RELU, _NATIVE_MIN, _NATIVE_RELU6 = \
+  "rockchip_abs", "rockchip_leaky_relu", "rockchip_min", "rockchip_relu6"
+_EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
   Ops.MUL: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_OP_TYPE_MUL,
@@ -159,7 +165,8 @@ def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKS
     (_DPU,rk.REG_DPU_DATA_FORMAT,(2<<29)|(2<<26)|2),
     (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,width),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
     (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(7<<16)|7),
-    (_DPU,rk.REG_DPU_EW_CFG,ew_cfg)) + (((_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
+    (_DPU,rk.REG_DPU_EW_CFG,ew_cfg)) + (((_DPU,rk.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),)
+    if ew_cfg == _EW_CFG_RELU6 else ()) + (((_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
     (_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,1<<6)) if is_div else ()) + (
     (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if is_div else (1<<16)|1),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
@@ -538,7 +545,9 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    cfg = _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
+    cfg = _EW_CFG_MIN if expr.op is Ops.MAX and expr.arg == _NATIVE_MIN else \
+      _EW_CFG_RELU6 if expr.op is Ops.MAX and expr.arg == _NATIVE_RELU6 else \
+      _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
       _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
       _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
     ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg))
@@ -583,6 +592,43 @@ def _fold_scaled_negative(x:UOp) -> UOp|None:
     if value.key != base.key or factor.op is not Ops.CONST: continue
     scale = float(factor.arg)
     if 0.0 <= scale <= 1.0: return UOp(Ops.MUL, x.dtype, src=(base, factor), arg=_NATIVE_LEAKY_RELU)
+  return None
+
+def _const_operand(u:UOp, op:Ops, value:float|None=None) -> tuple[UOp, UOp]|None:
+  if u.op is not op: return None
+  for operand, const in (u.src, u.src[::-1]):
+    if const.op is Ops.CONST and (value is None or float(const.arg) == value): return operand, const
+  return None
+
+def _native_min(lhs:UOp, rhs:UOp) -> UOp:
+  return UOp(Ops.MAX, lhs.dtype, src=(lhs, rhs), arg=_NATIVE_MIN)
+
+def _fold_ordered_where(x:UOp) -> UOp|None:
+  """Turn ordered clamp WHEREs into native DPU EW MIN/MAX stages."""
+  gate, yes, no = x.src
+  if gate.op is Ops.OR and yes.op is Ops.CONST:
+    for upper, lower in ((gate.src[0], gate.src[1]), (gate.src[1], gate.src[0])):
+      if (upper.op is Ops.CMPLT and upper.src[0].key == yes.key and upper.src[1].op is Ops.MAX and
+          lower.op is Ops.CMPLT and lower.src[0].key == no.key and lower.src[1].key == yes.key and
+          {u.key for u in upper.src[1].src} == {no.key, yes.key}): return _native_min(upper.src[1], yes)
+  if gate.op is not Ops.CMPLT: return None
+  lhs, rhs = gate.src
+  if yes.key == rhs.key and no.key == lhs.key: return lhs.alu(Ops.MAX, rhs)
+  if yes.key == lhs.key and no.key == rhs.key: return _native_min(lhs, rhs)
+  return None
+
+def _fold_relu_cap(x:UOp) -> UOp|None:
+  """Recognize relu(source)-relu(source-cap), the canonical ReLU6/clamp expansion."""
+  def shifted(u:UOp) -> tuple[UOp, float]:
+    return (term[0], float(term[1].arg)) if (term:=_const_operand(u, Ops.ADD)) is not None else (u, 0.0)
+  for positive, negative in (x.src, x.src[::-1]):
+    source, scaled = _relu_operand(positive), _const_operand(negative, Ops.MUL, -1.0)
+    if source is None or scaled is None or (upper:=_relu_operand(scaled[0])) is None: continue
+    source_base, source_shift = shifted(source)
+    upper_base, upper_shift = shifted(upper)
+    if source_base.key != upper_base.key or (cap:=source_shift-upper_shift) < 0.0: continue
+    if cap == 6.0: return UOp(Ops.MAX, x.dtype, src=(source, UOp.const(0.0, dtypes.half)), arg=_NATIVE_RELU6)
+    return _native_min(positive, UOp.const(cap, dtypes.half))
   return None
 
 def _fold_abs(x:UOp) -> UOp|None:
@@ -639,12 +685,14 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
+  (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
   (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
   (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.
   (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat(Ops.LOAD, dtypes.half, name="load"), UPat.cvar("default"))),

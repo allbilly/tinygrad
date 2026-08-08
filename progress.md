@@ -889,3 +889,28 @@ The PReLU and ABS register recipes were checked against `rockchip/post-518-refer
 - Complete Rockchip census: **167 passed, 8 skipped, 96 subtests passed in 111.38 s**.
 
 The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops.
+
+---
+
+## 2026-08-08 — Native ReLU6, MIN, and hard-activation group
+
+Six more exact upstream methods are admitted: `test_relu6`, `test_clip`, `test_hardtanh`, `test_hardsigmoid`,
+`test_hardsigmoid_extreme`, and `test_hardswish`. The register recipes were verified against
+`rockchip/post-518-reference`, `~/npu/include/rknnops.h`, and the RK3588 examples/TRM. ReLU6 uses EW ReLUX with an
+FP32 compare value of 6, while ordered clamp graphs use native EW ALU MIN together with the existing native MAX path.
+Hardsigmoid and hardswish are algebraically folded onto those same primitives; no CMAC, CPU numeric evaluation, or
+shared tinygrad core change is involved.
+
+The extreme hardsigmoid graph is simplified by tinygrad to `relu(x/6+0.5)-relu(x/6-0.5)`. Evaluating that expression
+directly loses precision for large FP16 inputs, so Rockchip recognizes the common affine base and emits
+`min(relu(x/6+0.5), 1)` instead. The positive and negative 300–400 ranges then saturate exactly without changing the
+allowed FP16 tolerance.
+
+- All six methods pass separately in 2.70–3.14 s.
+- Six-method persistent-process group: **6 passed in 3.54 s**.
+- Complete incremental source-order group: **56 passed in 10.49 s**.
+- Complete Rockchip census: **173 passed, 8 skipped, 96 subtests passed in 112.09 s**.
+- Ruff and mypy: pass. Renderer/runtime executable size: 647/165 lines.
+
+The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure,
+or kernel oops.

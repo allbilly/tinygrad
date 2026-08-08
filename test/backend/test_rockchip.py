@@ -422,6 +422,12 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_leaky_relu = _test_ops.TestOps.test_leaky_relu
   test_abs = _test_ops.TestOps.test_abs
   test_abs_exact = _test_ops.TestOps.test_abs_exact
+  test_relu6 = _test_ops.TestOps.test_relu6
+  test_clip = _test_ops.TestOps.test_clip
+  test_hardtanh = _test_ops.TestOps.test_hardtanh
+  test_hardsigmoid = _test_ops.TestOps.test_hardsigmoid
+  test_hardsigmoid_extreme = _test_ops.TestOps.test_hardsigmoid_extreme
+  test_hardswish = _test_ops.TestOps.test_hardswish
 
 if __name__ == "__main__":
   unittest.main()
