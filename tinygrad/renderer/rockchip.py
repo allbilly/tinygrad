@@ -12,8 +12,8 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 25
-_HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 26
+_HEADER = struct.Struct("<4sHHHHIIIIII")  # magic/version/target, scratch/gather counts, ops/constants, phase split, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
@@ -66,6 +66,7 @@ class RKImage:
   target: RKTarget
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""; version: int = RKIMAGE_VERSION
   gathers: tuple[RKGather, ...] = (); fill: RKFill|None = None; ew_ops: tuple[RKEWOp, ...] = ()
+  mid_gathers: tuple[RKGather, ...] = (); gather_after: int = 0
   post_gathers: tuple[RKGather, ...] = ()
 
 @dataclass(frozen=True)
@@ -75,10 +76,11 @@ class RKReloc: word: int; arg: RKArg
 class RKStage: commands: tuple[int, ...]; relocs: tuple[RKReloc, ...]
 
 def encode_image(image:RKImage) -> bytes:
-  gathers = image.gathers + image.post_gathers
-  flags = int(image.fill is not None) | len(image.post_gathers)<<1
+  gathers = image.gathers + image.mid_gathers + image.post_gathers
+  if image.mid_gathers and not 0 < image.gather_after < len(image.ew_ops): raise ValueError("invalid mid-gather split")
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.scratch), len(gathers),
-                               len(image.ew_ops), len(image.constants), flags))
+                               len(image.ew_ops), len(image.constants), len(image.mid_gathers), len(image.post_gathers),
+                               image.gather_after, int(image.fill is not None)))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in gathers:
     kind = 3 if g.partial else 2 if g.values else 1 if g.offsets else 0
@@ -99,10 +101,9 @@ def encode_image(image:RKImage) -> bytes:
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
-  magic, version, target, nscratch, ngather, nop, nconst, flags = _HEADER.unpack_from(blob)
-  post_count = flags >> 1
-  if magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or post_count > ngather:
-    raise ValueError("invalid RKImage header")
+  magic, version, target, nscratch, ngather, nop, nconst, mid_count, post_count, gather_after, flags = _HEADER.unpack_from(blob)
+  if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags & ~1 or
+      bool(mid_count) != (0 < gather_after < nop)): raise ValueError("invalid RKImage header")
   off = _HEADER.size
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
@@ -143,8 +144,9 @@ def decode_image(blob:bytes) -> RKImage:
     if itemsize not in (1, 2, 4, 8): raise ValueError("invalid RKFill item size")
     fill = RKFill(RKArg(RKBufferKind(dst_kind), dst_index), count, itemsize)
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
-  split = len(gathers)-post_count
-  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:split]), fill, tuple(ew_ops), tuple(gathers[split:]))
+  pre_count = ngather-mid_count-post_count
+  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:pre_count]), fill, tuple(ew_ops),
+                 tuple(gathers[pre_count:pre_count+mid_count]), gather_after, tuple(gathers[-post_count:] if post_count else ()))
 
 def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tuple[int, ...]:
   commands = list(stage.commands)
@@ -1397,6 +1399,7 @@ def _lower_unrolled_max_unpool(output:RKOutput) -> RKImage|None:
   planes = source_count//pooled
   if not planes or count % planes: return None
   out_spatial = count//planes
+  if out_spatial > 2048: return None
   try:
     rows = [(_gather_offsets(out_index, index.src[0].src[1], None, count),
              _gather_offsets(out_index, selected.src[0].src[1], None, count),
@@ -1408,24 +1411,26 @@ def _lower_unrolled_max_unpool(output:RKOutput) -> RKImage|None:
          for lane in range(count)): return None
 
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, pooled)
-  if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
-  zero, one, raw_index, half_index, convert_tiles, coordinate_slot, values, diff, magnitude, unequal, equal, selected_slot = range(12)
+  zero, one, compact_index, convert_tiles, half_index, coordinate_slot, values, diff, magnitude, unequal, equal, selected_slot = range(12)
   scratch_sizes = [matrix_lanes*2] * 12
-  scratch_sizes[raw_index], scratch_sizes[convert_tiles] = matrix_lanes*4, ((matrix_lanes+3)//4)*64
+  scratch_sizes[compact_index], scratch_sizes[convert_tiles] = source_count*2, ((source_count+3)//4)*64
   scratch = tuple(RKScratch(size) for size in scratch_sizes)
   coordinate_bits = tuple(struct.unpack("<H", struct.pack("<e", float(lane%out_spatial)))[0] for lane in range(count))
-  gathers:tuple[RKGather, ...] = ()
+  gathers:tuple[RKGather, ...] = (); mid_gathers:tuple[RKGather, ...] = ()
   for row,(offsets,_,_) in enumerate(rows):
-    gathers += (RKGather(index_param.arg.slot, raw_index, count, offsets=offsets, dst_addend=row*vector_lanes, itemsize=4),
-                RKGather(value_param.arg.slot, values, count, offsets=offsets, dst_addend=row*vector_lanes),
+    gathers += (RKGather(value_param.arg.slot, values, count, offsets=offsets, dst_addend=row*vector_lanes),
                 RKGather(index_param.arg.slot, coordinate_slot, count, values=coordinate_bits, dst_addend=row*vector_lanes))
+    mid_gathers += (RKGather(compact_index, half_index, count, offsets=offsets, dst_addend=row*vector_lanes,
+                             src_kind=RKBufferKind.SCRATCH),)
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  ops:list[RKEWOp] = [RKEWOp(arg(half_index), arg(raw_index), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True)]
+  ops:list[RKEWOp] = [RKEWOp(arg(compact_index), RKArg(RKBufferKind.ARG, index_param.arg.slot), arg(convert_tiles), source_count,
+                              _EW_CFG[Ops.MAX], int32_input=True)]
   equal_arg = _ew_eq_mask(ops, arg, half_index, coordinate_slot, (diff, magnitude, unequal, equal), one, matrix_lanes)
   ops.append(RKEWOp(arg(selected_slot), arg(values), equal_arg, matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
   reduced = _reduce_rows(ops, [arg(selected_slot, row*vector_bytes) for row in range(pooled)], count, _EW_CFG[Ops.ADD])
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), reduced, arg(zero), count, _EW_CFG[Ops.ADD]))
-  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops),
+                 mid_gathers=mid_gathers, gather_after=1)
 
 @dataclass(frozen=True)
 class RKArgMatch:
@@ -1711,7 +1716,7 @@ def _typed_int_image(output:RKOutput, value:UOp, bool_output:bool=False) -> RKIm
   half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
   image = lower_ew(list(store.replace(src=(half_index, value, *store.src[2:])).toposort()))
   terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
-  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.post_gathers:
+  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.mid_gathers or image.post_gathers:
     raise RuntimeError("RKPLAN_REJECT:predicate_terminal")
   result_slot, tiles_slot = len(image.scratch), len(image.scratch)+1
   result, tiles = RKArg(RKBufferKind.SCRATCH, result_slot), RKArg(RKBufferKind.SCRATCH, tiles_slot)

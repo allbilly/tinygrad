@@ -158,14 +158,15 @@ class RockchipProgram(Program['RockchipDevice']):
     self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self.dev.reset_npu()
 
-  def _run_ew_ops(self, address, buffer) -> None:
+  def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None) -> None:
+    ops = self.image.ew_ops if ops is None else ops
     bodies:list[tuple[int, ...]] = []
-    for i, op in enumerate(self.image.ew_ops):
+    for i, op in enumerate(ops):
       if op.submit_barrier and bodies:
         self._submit_pcchain(bodies)
         bodies.clear()
       if op.ew_cfg & _EW_STAGE_FP32_OUT:
-        if i != len(self.image.ew_ops)-1: raise RuntimeError("FP32 EW output must be terminal")
+        if i != len(ops)-1: raise RuntimeError("FP32 EW output must be terminal")
         if bodies: self._submit_pcchain(bodies)
         stage = emit_ew_stage(op.dst, op.lhs, op.rhs, op.count, op.ew_cfg)
         self._submit_pcchain([patch_stage(stage, address)])
@@ -173,7 +174,7 @@ class RockchipProgram(Program['RockchipDevice']):
         bodies.clear()
         continue
       if op.int32_input or op.int32_output:
-        if op.int32_output and i != len(self.image.ew_ops)-1: raise RuntimeError("INT32 EW output must be terminal")
+        if op.int32_output and i != len(ops)-1: raise RuntimeError("INT32 EW output must be terminal")
         if bodies:
           self._submit_pcchain(bodies)
           bodies.clear()
@@ -251,14 +252,19 @@ class RockchipProgram(Program['RockchipDevice']):
       if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return self._dma(self.scratch[index])
     start = time.perf_counter()
-    self._run_ew_ops(address, buffer)
-    if self.image.post_gathers:
-      touched = {(g.src_kind, g.src_index) for g in self.image.post_gathers if not g.values}
-      touched.update((g.dst_kind, g.dst_index) for g in self.image.post_gathers)
+    def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+      touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
+      touched.update((g.dst_kind, g.dst_index) for g in gathers)
       for kind,index in touched: self.dev._sync_buffer(buffer(kind, index), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
-      apply_gathers(self.image.post_gathers, False)
-      for kind,index in {(g.dst_kind, g.dst_index) for g in self.image.post_gathers}:
+      apply_gathers(gathers, clear_scratch)
+      for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}:
         self.dev._sync_buffer(buffer(kind, index), rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    if self.image.mid_gathers:
+      self._run_ew_ops(address, buffer, self.image.ew_ops[:self.image.gather_after])
+      synchronized_gathers(self.image.mid_gathers, True)
+      self._run_ew_ops(address, buffer, self.image.ew_ops[self.image.gather_after:])
+    else: self._run_ew_ops(address, buffer)
+    if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if (fill:=self.image.fill) is not None:
       bits = self.image.constants[:fill.itemsize] * fill.count
       dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]

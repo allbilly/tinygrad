@@ -330,6 +330,14 @@ class TestRockchipMaxUnpoolOps(unittest.TestCase):
       lambda x: Tensor.max_unpool2d(*Tensor.max_pool2d(x, kernel_size=(2,2), return_indices=True),
                                     kernel_size=(2,2), output_size=(99,99,7,6)), forward_only=True)
 
+  def test_max_unpool2d_padded(self):
+    args = {"kernel_size":(3,3), "stride":(6,7), "padding":1}
+    _fp16_test_op([(8,3,30,30)],
+      lambda x: torch.nn.functional.max_unpool2d(*torch.nn.functional.max_pool2d(x, return_indices=True, **args),
+                                                 **args, output_size=(30,30)),
+      lambda x: Tensor.max_unpool2d(*Tensor.max_pool2d(x, return_indices=True, **args),
+                                    **args, output_size=(30,30)), forward_only=True)
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipAvgPoolOps(unittest.TestCase):
   """Every FP16 AvgPool case from test_ops at the test_gemm_fp16 tolerance."""

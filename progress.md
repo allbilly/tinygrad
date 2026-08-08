@@ -2516,3 +2516,37 @@ The CPU-cheat audit found no runtime or Tinygrad-core change and no host read of
 only by the pre-existing compile-time static-index machinery and test oracle/fixture code. All dynamic INT32 conversion,
 comparison, mask selection, and accumulation execute on DPU EW. There is no host scatter, host ArgMax, LUT, CMAC, CNA,
 PPU fallback, tolerance relaxation, or external non-FP16 input.
+
+---
+
+## 2026-08-09 — compact-index phase for padded MaxUnpool
+
+The second finite case from upstream `test_max_unpool2d` now runs natively: `(8,3,30,30)` FP16 input, 3x3 MaxPool
+with stride `(6,7)` and padding 1, followed by MaxUnpool to explicit `(30,30)` spatial output. It covers 24 planes,
+25 pooled candidates per plane, 600 dynamic INT32 indices, and 21,600 FP16 output lanes. The standalone case passes in
+14.23 seconds; both admitted MaxUnpool cases pass together in 14.31 seconds, so neither approaches the 30-second limit.
+
+RKImage version 26 adds one explicit mid-image raw-gather phase. The unpool program first converts the compact 600-lane
+INT32 index tensor to FP16 on DPU exactly once. After that blocking phase, the runtime synchronizes the produced scratch,
+stripes its FP16 representations into the compile-time candidate matrix, and resumes DPU equality/selection/reduction.
+This reduces the padded case from a projected 540,000 converted lanes / 135,000 four-lane conversion tasks to only 600
+converted lanes / 150 tasks. The same path improves the bounded case from 5.98 to 3.84 seconds.
+
+The phase is encoded explicitly with mid-gather count and EW split index, validated during image decode, and executed by
+the same synchronized raw-gather helper as terminal gathers. It does not interpret an index value or choose a
+destination on the host: all gather offsets are proven statically from the one-hot graph, while dynamic index conversion,
+equality, mask multiplication, and accumulation remain DPU operations. Existing images use zero mid-gathers and retain
+their prior execution order; the complete census verifies both cached-style ordinary programs and the new split program.
+
+- Focused bounded pipeline after compaction: **1 passed in 3.84 s**, sequentially.
+- Focused 25-candidate padded pipeline: **1 passed in 14.23 s**, sequentially.
+- Complete MaxUnpool class: **2 passed in 14.31 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **363 passed, 10 skipped, 180 subtests passed in
+  445.10 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after focused and complete runs.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,147/280 executable lines**.
+
+The CPU-cheat audit found only representation-preserving host movement between two blocking NPU phases, matching the
+backend's existing raw pre/post gather contract. Neither renderer nor runtime reads or branches on an index or pooled
+value. There is no host scatter, host ArgMax, numeric conversion, LUT, CMAC, CNA, PPU fallback, tolerance relaxation,
+or external non-FP16 input.
