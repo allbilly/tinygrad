@@ -589,6 +589,17 @@ class TestRockchipArgExtremaOps(unittest.TestCase):
 
   def test_argmin_first_tie(self): self._test("min", ((2.0, 2.0), (3.0, 2.0, 2.0)))
 
+  def _test_axes(self, kind:str):
+    torch_fxn, tinygrad_fxn = (torch.argmax, Tensor.argmax) if kind == "max" else (torch.argmin, Tensor.argmin)
+    for axis,keepdim in ((0, False), (1, False), (1, True)):
+      with self.subTest(kind=kind, axis=axis, keepdim=keepdim):
+        _TEST_OPS_HELPER([(10,20)], lambda x, axis=axis, keepdim=keepdim: torch_fxn(x, dim=axis, keepdim=keepdim).int(),
+                         lambda x, axis=axis, keepdim=keepdim: tinygrad_fxn(x, axis=axis, keepdim=keepdim), forward_only=True)
+
+  def test_argmax_axes(self): self._test_axes("max")
+
+  def test_argmin_axes(self): self._test_axes("min")
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""

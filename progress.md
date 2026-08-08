@@ -1434,3 +1434,27 @@ The runtime is unchanged. Host work is limited to static source-address and coor
 existing raw lane movement. Candidate negation, extrema reduction, equality, mask weighting, first-tie selection,
 subtraction, and FP16-to-INT32 output conversion all execute on DPU EW. There is no CPU numeric fallback, CMAC, CNA,
 PPU, shared tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — FP16 axis ArgMax/ArgMin with materialized extrema
+
+FP16 ArgMax and ArgMin now cover both axes of `(10,20)` plus axis-1 `keepdim=True`, matching the three axis forms in
+the upstream methods. Tinygrad schedules these as two kernels: ordinary DPU EW first materializes `MAX(x)` or
+`MAX(-x)`, then the new selected-index image compares every candidate against that saved extreme.
+
+The fused and split recognizers share one exact first-tie validator. The split form additionally requires exactly two
+FP16 source buffers, an extreme buffer whose static view is a permutation of the output, a candidate buffer whose views
+jointly permute the full input, one sign convention across all candidates, and the same descending-coordinate INT32 MAX
+graph. It therefore reuses the first-tie matrix emitter without accepting cumulative latest-tie or unrelated comparison
+graphs. The saved extreme remains device data and is never copied to or interpreted by the CPU.
+
+- Expanded FP16 ArgMax/ArgMin group: **4 passed, 10 subtests passed in 6.80 s**, sequentially.
+- Complete Rockchip census: **288 passed, 11 skipped, 178 subtests passed in 194.43 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,256/253 executable lines**.
+
+The runtime remains unchanged, and its no-CPU-cheat audit contains no host extrema, equality, or selected-index
+arithmetic. The renderer constructs only static address and coordinate metadata; all numeric work and conversion remain
+DPU EW. There is no CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation. The padded global 200-element
+bounded-loop graph and non-FP16 input conversions remain explicit next groups.

@@ -805,6 +805,42 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
                        _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<"+"e"*len(constants), *constants), gathers=gathers, ew_ops=tuple(ew_ops))
 
+def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
+  return _flatten_binary(root.src[0], op)+_flatten_binary(root.src[1], op) if root.op is op else [root]
+
+def _half_candidate(root:UOp) -> tuple[UOp, bool]|None:
+  if root.op is Ops.LOAD: return (root, False)
+  if root.op is Ops.MUL and len(root.src) == 2:
+    loads = [x for x in root.src if x.op is Ops.LOAD]
+    constants = [x for x in root.src if x.op is Ops.CONST and float(x.arg) == -1.0]
+    if len(loads) == len(constants) == 1: return (loads[0], True)
+  return None
+
+def _first_tie_selection(value:UOp, extrema:UOp, ordered_exprs:list[UOp]) -> bool:
+  """Verify Tinygrad's descending-coordinate INT32 MAX encoding for the first equal candidate."""
+  window = len(ordered_exprs)
+  equal_casts:list[UOp] = []
+  for expr in ordered_exprs:
+    matches = [u for u in value.toposort() if u.op is Ops.CMPNE and (u.src == (expr, extrema) or u.src == (extrema, expr))]
+    if len(matches) != 1: return False
+    inversions = [u for u in value.toposort() if u.op is Ops.CMPNE and matches[0] in u.src and
+                  any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg) for x in u.src)]
+    casts = [u for u in value.toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
+             len(inversions) == 1 and u.src == (inversions[0],)]
+    if len(casts) != 1: return False
+    equal_casts.append(casts[0])
+  int_roots = [u for u in value.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int]
+  if not int_roots: return False
+  selected = max(int_roots, key=lambda x:len(_flatten_binary(x, Ops.MAX)))
+  terms = _flatten_binary(selected, Ops.MAX)
+  if len(terms) != window: return False
+  for candidate_index,cast in enumerate(equal_casts):
+    weight = window-candidate_index
+    if not any(term is cast if weight == 1 else term.op is Ops.MUL and cast in term.src and
+               any(x.op is Ops.CONST and int(x.arg) == weight for x in term.src) for term in terms): return False
+  return value.op is Ops.ADD and any(x.op is Ops.CONST and int(x.arg) == window for x in value.src) and \
+    any(x.op is Ops.MUL and selected in x.src and any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src) for x in value.src)
+
 def _lower_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
   """Lower fused FP16 ArgMax/ArgMin while preserving first-index tie semantics."""
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -814,21 +850,11 @@ def _lower_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
   count, out_index, value = int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
   if count <= 0: return RKImage(RKTarget.RK3588)
 
-  def flatten(root:UOp, op:Ops) -> list[UOp]:
-    return flatten(root.src[0], op)+flatten(root.src[1], op) if root.op is op else [root]
-  def candidate(root:UOp) -> tuple[UOp, bool]|None:
-    if root.op is Ops.LOAD: return (root, False)
-    if root.op is Ops.MUL and len(root.src) == 2:
-      loads = [x for x in root.src if x.op is Ops.LOAD]
-      constants = [x for x in root.src if x.op is Ops.CONST and float(x.arg) == -1.0]
-      if len(loads) == len(constants) == 1: return (loads[0], True)
-    return None
-
   roots:list[tuple[UOp, list[UOp], list[tuple[UOp, bool]]]] = []
   for root in value.toposort():
     if root.op is not Ops.MAX or root.dtype.scalar() is not dtypes.half: continue
-    leaves = flatten(root, Ops.MAX)
-    maybe_parsed = [candidate(leaf) for leaf in leaves]
+    leaves = _flatten_binary(root, Ops.MAX)
+    maybe_parsed = [_half_candidate(leaf) for leaf in leaves]
     if all(x is not None for x in maybe_parsed): roots.append((root, leaves, [x for x in maybe_parsed if x is not None]))
   if not roots: return None
   extrema, candidate_exprs, parsed_candidates = max(roots, key=lambda x:len(x[1]))
@@ -845,31 +871,54 @@ def _lower_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
   except RuntimeError: return None
   ordered = sorted(zip(candidate_offsets, candidate_exprs), key=lambda x:x[0])
   if sorted(offset for offsets,_ in ordered for offset in offsets) != list(range(source_count)): return None
-
-  equal_casts:list[UOp] = []
-  for _,expr in ordered:
-    matches = [u for u in value.toposort() if u.op is Ops.CMPNE and (u.src == (expr, extrema) or u.src == (extrema, expr))]
-    if len(matches) != 1: return None
-    inversions = [u for u in value.toposort() if u.op is Ops.CMPNE and matches[0] in u.src and
-                  any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg) for x in u.src)]
-    casts = [u for u in value.toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
-             len(inversions) == 1 and u.src == (inversions[0],)]
-    if len(casts) != 1: return None
-    equal_casts.append(casts[0])
-  int_roots = [u for u in value.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int]
-  if not int_roots: return None
-  selected = max(int_roots, key=lambda x:len(flatten(x, Ops.MAX)))
-  terms = flatten(selected, Ops.MAX)
-  if len(terms) != window: return None
-  for candidate_index,cast in enumerate(equal_casts):
-    weight = window-candidate_index
-    if not any(term is cast if weight == 1 else term.op is Ops.MUL and cast in term.src and
-               any(x.op is Ops.CONST and int(x.arg) == weight for x in term.src) for term in terms): return None
-  if not (value.op is Ops.ADD and any(x.op is Ops.CONST and int(x.arg) == window for x in value.src) and
-          any(x.op is Ops.MUL and selected in x.src and any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src) for x in value.src)): return None
+  if not _first_tie_selection(value, extrema, [expr for _,expr in ordered]): return None
   candidate_plans = tuple(RKGather(source.arg.slot, 0, count, offsets=offsets) for offsets,_ in ordered)
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans, candidate_plans,
                                  negated_candidates, [window-1]*count, first_tie=True, negate_extrema=negated_candidates)
+
+def _lower_split_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
+  """Select an FP16 axis ArgMax/ArgMin coordinate against a separately materialized extreme."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
+  store = stores[0]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  count, out_index, value = int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  loads = [u for u in value.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
+           u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM]
+  by_slot:dict[int, list[UOp]] = {}
+  for load in loads:
+    slot = load.src[0].src[0].arg.slot
+    if load not in by_slot.setdefault(slot, []): by_slot[slot].append(load)
+  extrema_groups = [(slot, group[0]) for slot,group in by_slot.items() if len(group) == 1 and
+                    group[0].src[0].src[0].src[0].op is Ops.CONST and int(group[0].src[0].src[0].src[0].arg) == count]
+  if len(extrema_groups) != 1 or len(by_slot) != 2: return None
+  extrema_slot, extrema = extrema_groups[0]
+  data_slot, candidates = next((slot,group) for slot,group in by_slot.items() if slot != extrema_slot)
+  data_param = candidates[0].src[0].src[0]
+  if data_param.src[0].op is not Ops.CONST: return None
+  source_count = int(data_param.src[0].arg)
+  direct:list[tuple[UOp, UOp, bool]] = []
+  for cmp in [u for u in value.toposort() if u.op is Ops.CMPNE and extrema in u.src]:
+    expr = cmp.src[1] if cmp.src[0] is extrema else cmp.src[0]
+    if (parsed:=_half_candidate(expr)) is not None: direct.append((expr, parsed[0], parsed[1]))
+  signs = {negated for _,_,negated in direct}
+  candidate_loads = {load for _,load,_ in direct}
+  if not direct or len(signs) != 1 or len(candidate_loads) != len(direct) or candidate_loads != set(candidates): return None
+  negated_candidates = signs.pop()
+  window = len(direct)
+  if source_count != count*window or window > 2048: return None
+  try:
+    candidate_offsets = [tuple(_gather_offsets(out_index, load.src[0].src[1], None, count)) for _,load,_ in direct]
+    extrema_offsets = tuple(_gather_offsets(out_index, extrema.src[0].src[1], None, count))
+  except RuntimeError: return None
+  if sorted(extrema_offsets) != list(range(count)): return None
+  ordered = sorted(zip(candidate_offsets, (expr for expr,_,_ in direct)), key=lambda x:x[0])
+  if sorted(offset for offsets,_ in ordered for offset in offsets) != list(range(source_count)): return None
+  if not _first_tie_selection(value, extrema, [expr for _,expr in ordered]): return None
+  candidate_plans = tuple(RKGather(data_slot, 0, count, offsets=offsets) for offsets,_ in ordered)
+  return _cumulative_index_image(out_param.arg.slot, count, candidate_plans, (RKGather(extrema_slot, 0, count, offsets=extrema_offsets),),
+                                 negated_candidates, [window-1]*count, first_tie=True)
 
 def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   """Select unrolled cumulative MAX/MIN axis coordinates with DPU equality masks."""
@@ -969,6 +1018,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
   if (arg_extrema:=_lower_arg_extrema_index(uops)) is not None: return arg_extrema
+  if (split_arg_extrema:=_lower_split_arg_extrema_index(uops)) is not None: return split_arg_extrema
   if (raw_int32:=_lower_raw_int32_layout(uops)) is not None: return raw_int32
   if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
   if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
