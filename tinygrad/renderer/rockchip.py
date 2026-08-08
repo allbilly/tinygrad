@@ -744,7 +744,7 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
 
 def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
-  """Move an INT32 tensor through a static view without interpreting its values."""
+  """Move an INT32 tensor through a static view or shrink without interpreting its values."""
   stores = [u for u in uops if u.op is Ops.STORE]
   if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
   count, out_index, value = int(out_param.src[0].arg), stores[0].src[0].src[1], stores[0].src[1]
@@ -752,10 +752,10 @@ def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
   if (value.op is not Ops.LOAD or value.dtype.scalar() is not dtypes.int or len(value.src) != 1 or value.src[0].op is not Ops.INDEX or
       value.src[0].src[0].op is not Ops.PARAM): return None
   source, source_index = value.src[0].src[:2]
-  if source.src[0].op is not Ops.CONST or int(source.src[0].arg) != count: return None
+  if source.src[0].op is not Ops.CONST: return None
   try: offsets = _gather_offsets(out_index, source_index, None, count)
   except RuntimeError: return None
-  if sorted(offsets) != list(range(count)): return None
+  if len(set(offsets)) != count or any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 

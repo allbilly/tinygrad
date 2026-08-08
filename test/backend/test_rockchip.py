@@ -671,6 +671,29 @@ class TestRockchipSortIndexOps(unittest.TestCase):
                          lambda x, descending=descending: x.sort(descending=descending)[1], vals=[values], forward_only=True)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipTopKOps(unittest.TestCase):
+  """FP16 TopK values and stable INT32 indices composed from native sort and static slicing."""
+
+  def _test(self, shape:tuple[int, ...], k:int, axis:int, largest:bool):
+    _fp16_test_op([shape], lambda x: x.topk(k, axis, largest, True).values,
+                  lambda x: x.topk(k, axis, largest, True)[0], forward_only=True)
+    _TEST_OPS_HELPER([shape], lambda x: x.topk(k, axis, largest, True).indices.int(),
+                     lambda x: x.topk(k, axis, largest, True)[1], forward_only=True)
+
+  def test_topk_1d(self): self._test((8,), 3, -1, True)
+  def test_topk_axis0_largest(self): self._test((5,5,4), 4, 0, True)
+  def test_topk_axis1_smallest(self): self._test((5,5,4), 4, 1, False)
+
+  def test_topk_repeated(self):
+    values = np.array([1,1,0,1,0,1,0,0,1,0,0,0,1,0], dtype=np.float16)
+    for largest,expected in ((True, [0,1,3]), (False, [2,4,6])):
+      with self.subTest(largest=largest):
+        result_values, result_indices = Tensor(values).topk(3, largest=largest)
+        np.testing.assert_array_equal(result_values.numpy(), values[expected])
+        np.testing.assert_array_equal(result_indices.numpy(), expected)
+    with self.assertRaises((RuntimeError, ValueError)): Tensor(np.zeros(4, dtype=np.float16)).topk(5)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

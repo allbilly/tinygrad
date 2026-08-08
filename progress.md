@@ -1554,3 +1554,33 @@ The CPU-cheat audit found only compile-time graph/address/weight validation and 
 All value equality, occurrence-count equality, mask multiplication, count/coordinate reduction, and numeric conversion
 execute on DPU EW. There is no host sort or argsort, CMAC, CNA, PPU, shared tinygrad core change, external INT32-input
 support, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — FP16 TopK composition
+
+FP16 TopK values and stable INT32 indices now join the Rockchip census: one-dimensional largest-three, padded five-lane
+axis-0 largest-four, padded five-lane axis-1 smallest-four, and repeated-value largest/smallest cases. TopK itself needs
+no new numeric primitive; it composes the two native sort milestones with static shrinking.
+
+Historical milestone `5f48c8311` confirms that non-power-of-two TopK must preserve `-inf`/`+inf` padding without an
+arithmetic `0*inf` wire blend. The current native MIN/MAX plus raw post-gather sort already provides that behavior.
+`~/npu/include/old/rknn_ops.md` lists both TopK and `aten::topk` as unsupported, while `~/rk3588` contains only the
+upstream tests/runtime strings rather than a register implementation.
+
+One scheduler variant materializes stable indices at the full sorted shape, then emits a separate INT32 shrink. The raw
+INT32 layout recognizer now accepts an injective in-bounds subset as well as a same-size permutation. Runtime copies only
+the selected `uint32` representations; it does not inspect or compute indices.
+
+- Generated FP16 value realizations: **0.30–0.43 s**, **9 submits** each.
+- Generated FP16 index realizations: **2.24–3.26 s**, **41–50 submits** each; outputs exact.
+- Repeated FP16 TopK: **3.57 s largest / 3.27 s smallest**, **55 submits** each; exact indices `[0,1,3]` and `[2,4,6]`.
+- Focused TopK group: **4 passed, 2 subtests passed in 20.63 s**, sequentially.
+- Complete Rockchip census: **306 passed, 11 skipped, 200 subtests passed in 305.76 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,593/269 executable lines**.
+
+The unchanged upstream `test_topk` passes all generated FP16 cases and then reaches its repeated Python-integer fixture,
+which is external INT32 input and remains outside the NPU contract. Its equivalent FP16 repeated fixture is covered
+above. The CPU-cheat audit found only static address-map construction and raw lane movement; all sorting, stable counting,
+selection, and numeric conversion remain DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or tolerance relaxation.
