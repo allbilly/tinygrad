@@ -811,3 +811,15 @@ Seven FP16 arithmetic methods were admitted and run individually: `test_lerp`, `
 - No new kernel error signature.
 
 `test_where` and the boolean tail of `test_tril` remain unadmitted because their packed-boolean input/int32 output cannot be executed by the FP16-only DPU without a CPU value-selection fallback. They are not skipped or counted as passing.
+
+---
+
+## 2026-08-08 — Exact upstream ADD and MUL methods
+
+Six additional upstream `TestOps` methods were admitted: `test_tiny_add`, `test_tiny_mul`, `test_add`, `test_add3`, `test_mul`, and `test_scalar_mul`. Each method first passed in its own fresh pytest process, then the complete incremental class passed sequentially in one persistent process.
+
+- Individual method times: 2.62–3.07 s.
+- Complete incremental source-order group: **40 passed in 9.75 s**.
+- No new RKNPU, IOMMU, CMA, or kernel-oops message during the grouped run.
+
+The exact upstream `test_div` method is deliberately not counted yet. Its first dynamic graph is represented as `MUL(RECIPROCAL(x))`, and the Rockchip planner rejects `RECIPROCAL` before any ioctl. Native FP16 DPU division will be developed as a separate hardware milestone, beginning with a tiny one-submit regression before admitting the complete upstream method.
