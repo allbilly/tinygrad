@@ -845,8 +845,16 @@ The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU, IOMMU, CM
 
 The exact upstream `TestOps.test_scalar_div` method passes all seven tensor/scalar and scalar/tensor forms through native DPU FDIV, including two rank-zero cases. It passed individually in **3.07 s** without a renderer/runtime change.
 
-Non-finite numerator handling remains a separate in-progress milestone and is not counted here.
+Non-finite numerator handling is covered by the following separate milestone.
 
-### WIP — non-finite division sign
+### Non-finite division sign
 
-The first `-inf/x` sign reconstruction (`MUL → MAX → FDIV → MUL → FDIV`) timed out at task 4/5 and left the current boot's NPU load stuck at 100%. That version was not committed. The replacement rewrites `±inf/x` as `(±1/x)/0`, producing two adjacent FDIV stages with no intervening pipeline transition. Offline image inspection, Ruff, and mypy pass, but the direct sign regression and exact upstream `test_div_naninf` remain unverified until reboot. This WIP is not counted as passing coverage.
+The first `-inf/x` sign reconstruction (`MUL → MAX → FDIV → MUL → FDIV`) timed out at task 4/5. That version was never committed. The replacement rewrites `±inf/x` as `(±1/x)/0`, producing two adjacent FDIV stages with no intervening pipeline transition. The vendor reference elementwise health check subsequently passed all ADD/MUL/SUB/MAX/NEG/FDIV sizes through 131,072 elements, allowing the replacement to be verified on the same boot.
+
+- Separate `+inf/x` and `-inf/x` probes: bit-exact pass.
+- Direct sign regression: **1 passed in 2.64 s**, exactly one ioctl for each sign.
+- Exact upstream `TestOps.test_div_naninf`: **1 passed in 2.75 s**.
+- Complete incremental source-order group: **43 passed in 9.97 s**.
+- Complete Rockchip census: **159 passed, 9 skipped, 96 subtests passed in 111.57 s**.
+
+The complete tinygrad run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops. The reference example itself requested large contiguous buffers and logged two 4 MiB CMA allocation failures; Rockchip tinygrad continued to use its page-backed non-contiguous allocation policy and generated none.
