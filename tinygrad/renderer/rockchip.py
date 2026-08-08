@@ -12,9 +12,9 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 17
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 19
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
-_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBiH"), struct.Struct("<IIi")
+_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBiHI"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, pad, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
@@ -37,6 +37,7 @@ class RKGather:
   fill_bits: int = 0
   values: tuple[int, ...] = ()  # compile-time FP16 vector, no source argument
   partial: bool = False  # preserve lanes populated by another gather when the offset is negative
+  dst_stride: int = 1  # destination stride in FP16 lanes; scalar reductions use 32 for 64-byte spacing
 
 @dataclass(frozen=True)
 class RKMultiGather: gathers: tuple[RKGather, ...]
@@ -59,7 +60,6 @@ class RKImage:
   target: RKTarget
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""; version: int = RKIMAGE_VERSION
   gathers: tuple[RKGather, ...] = (); fill: RKFill|None = None; ew_ops: tuple[RKEWOp, ...] = ()
-  chain_limit: int = 512
 
 @dataclass(frozen=True)
 class RKReloc: word: int; arg: RKArg
@@ -68,13 +68,13 @@ class RKReloc: word: int; arg: RKArg
 class RKStage: commands: tuple[int, ...]; relocs: tuple[RKReloc, ...]
 
 def encode_image(image:RKImage) -> bytes:
-  flags = (1 if image.fill is not None else 0) | (image.chain_limit << 8)
+  flags = 1 if image.fill is not None else 0
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.scratch), len(image.gathers),
                                len(image.ew_ops), len(image.constants), flags))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in image.gathers:
     kind = 3 if g.partial else 2 if g.values else 1 if g.offsets else 0
-    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, kind, len(g.axes), g.base, g.fill_bits)
+    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, kind, len(g.axes), g.base, g.fill_bits, g.dst_stride)
     if kind == 2: out += struct.pack(f"<{g.count}H", *g.values)
     elif kind in (1, 3): out += struct.pack(f"<{g.count}i", *g.offsets)
     else:
@@ -87,24 +87,23 @@ def encode_image(image:RKImage) -> bytes:
 
 def decode_image(blob:bytes) -> RKImage:
   magic, version, target, nscratch, ngather, nop, nconst, flags = _HEADER.unpack_from(blob)
-  chain_limit = flags >> 8
-  if magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or flags & 0xfe or chain_limit not in (256, 512):
+  if magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or flags & ~1:
     raise ValueError("invalid RKImage header")
   off = _HEADER.size
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
   for _ in range(ngather):
-    dst_scratch, src_index, count, kind, naxes, base, fill_bits = _GATHER.unpack_from(blob, off); off += _GATHER.size
-    if kind not in (0, 1, 2, 3) or (kind and naxes): raise ValueError("invalid RKGather")
+    dst_scratch, src_index, count, kind, naxes, base, fill_bits, dst_stride = _GATHER.unpack_from(blob, off); off += _GATHER.size
+    if kind not in (0, 1, 2, 3) or (kind and naxes) or dst_stride < 1: raise ValueError("invalid RKGather")
     if kind == 2:
       values = struct.unpack_from(f"<{count}H", blob, off); off += 2*count
-      gathers.append(RKGather(src_index, dst_scratch, count, fill_bits=fill_bits, values=values))
+      gathers.append(RKGather(src_index, dst_scratch, count, fill_bits=fill_bits, values=values, dst_stride=dst_stride))
     elif kind in (1, 3):
       offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
-      gathers.append(RKGather(src_index, dst_scratch, count, offsets=offsets, fill_bits=fill_bits, partial=kind == 3))
+      gathers.append(RKGather(src_index, dst_scratch, count, offsets=offsets, fill_bits=fill_bits, partial=kind == 3, dst_stride=dst_stride))
     else:
       axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
-      gathers.append(RKGather(src_index, dst_scratch, count, base, axes, fill_bits=fill_bits))
+      gathers.append(RKGather(src_index, dst_scratch, count, base, axes, fill_bits=fill_bits, dst_stride=dst_stride))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, _, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
@@ -118,7 +117,7 @@ def decode_image(blob:bytes) -> RKImage:
     if itemsize not in (1, 2, 4, 8): raise ValueError("invalid RKFill item size")
     fill = RKFill(RKArg(RKBufferKind(dst_kind), dst_index), count, itemsize)
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
-  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers), fill, tuple(ew_ops), chain_limit)
+  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers), fill, tuple(ew_ops))
 
 def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tuple[int, ...]:
   commands = list(stage.commands)
@@ -496,7 +495,8 @@ def _two_sum(lhs:UOp, rhs:UOp, neg_one:UOp) -> tuple[UOp, UOp]:
 def _precise_mul_sum(terms:list[UOp]) -> UOp:
   """Recover FP16 product residuals and accumulate a three-half expansion using only DPU EW ops."""
   zero, neg_one, splitter = UOp.const(0.0, dtypes.half), UOp.const(-1.0, dtypes.half), UOp.const(65.0, dtypes.half)
-  products, errors = zip(*((_two_product(term, neg_one, splitter) if term.op is Ops.MUL else (term, zero)) for term in terms))
+  pairs = tuple(_two_product(term, neg_one, splitter) if term.op is Ops.MUL else (term, zero) for term in terms)
+  products, errors = tuple(x[0] for x in pairs), tuple(x[1] for x,term in zip(pairs, terms) if term.op is Ops.MUL)
   high, middle, low = products[0], zero, zero
   for part in products[1:] + errors:
     high, error = _two_sum(high, part, neg_one)
@@ -505,7 +505,79 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   middle = middle.alu(Ops.ADD, low)
   return high.alu(Ops.ADD, middle)
 
+def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
+  """Turn a compact scalar register reduction into balanced FP16 DPU EW stages."""
+  global_stores = [(store, _root_param(store.src[0])) for store in uops if store.op is Ops.STORE]
+  global_stores = [(store, param) for store,param in global_stores if param is not None]
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  if len(global_stores) != 1 or len(ranges) != 1: return None
+  store, out_param = global_stores[0]
+  assert out_param is not None
+  if (out_param.dtype.scalar() is not dtypes.half or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
+      store.src[0].op is not Ops.INDEX): return None
+  reduce_range = ranges[0]
+  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
+  loads:list[tuple[UOp, UOp]] = []
+  for u in uops:
+    if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.half or not u.src or u.src[0].op is not Ops.INDEX: continue
+    param = _root_param(u.src[0])
+    if param is not None and param.arg.slot != out_param.arg.slot: loads.append((u, param))
+  if not loads or len({param.key for _,param in loads}) != 1: return None
+  in_param = loads[0][1]
+  if in_param.src[0].op is not Ops.CONST: return None
+  updates = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
+  if len(updates) != 1: return None
+  final_value = store.src[1]
+  def local_load(x:UOp) -> UOp|None:
+    while x.op is Ops.CAST: x = x.src[0]
+    return x if x.op is Ops.LOAD and _root_param(x.src[0]) is None else None
+  if local_load(final_value) is not None: post_scale = 1.0
+  elif final_value.op is Ops.MUL and (final_load:=next((x for x in final_value.src if local_load(x) is not None), None)) is not None and \
+       (scale:=final_value.src[1 if final_value.src[0] is final_load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
+  else: return None
+  reduce_ops = {u.op for u in updates[0].src[1].toposort()
+                if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}
+  negate_inputs = reduce_ops == {Ops.MUL, Ops.MAX} and any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.half and
+                                                            float(u.arg) == -1.0 for u in updates[0].src[1].toposort())
+  if negate_inputs: reduce_op = Ops.MAX
+  elif len(reduce_ops) == 1: reduce_op = next(iter(reduce_ops))
+  else: return None
+  if reduce_op not in _EW_CFG: return None
+  gather_offsets = [tuple(_eval_int(load.src[0].src[1], {reduce_range:r}) for r in range(groups)) for load,_ in loads]
+  input_count = int(in_param.src[0].arg)
+  if input_count != groups*len(loads) or sorted(offset for offsets in gather_offsets for offset in offsets) != list(range(input_count)): return None
+  if input_count < 2: return None
+
+  const_values = tuple(dict.fromkeys(x for x in ((-1.0,) if negate_inputs else ()) + ((post_scale,) if post_scale != 1.0 else ())))
+  const_slots = {value:i for i,value in enumerate(const_values)}
+  data_slot = len(const_values)
+  gathers = (RKGather(in_param.arg.slot, data_slot, input_count, 0, ((1, input_count, 1),), dst_stride=32),)
+  cfg = _EW_CFG[reduce_op]
+  ew_ops:list[RKEWOp] = []
+  active = [i*64 for i in range(input_count)]
+  if negate_inputs:
+    neg_one = RKArg(RKBufferKind.SCRATCH, const_slots[-1.0])
+    for offset in active:
+      value = RKArg(RKBufferKind.SCRATCH, data_slot, offset)
+      ew_ops.append(RKEWOp(value, value, neg_one, 1, _EW_CFG[Ops.MUL]))
+  while len(active) > 1:
+    next_active:list[int] = []
+    for i in range(0, len(active)-1, 2):
+      lhs, rhs = active[i], active[i+1]
+      dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if len(active) == 2 and post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, data_slot, lhs)
+      ew_ops.append(RKEWOp(dst, RKArg(RKBufferKind.SCRATCH, data_slot, lhs), RKArg(RKBufferKind.SCRATCH, data_slot, rhs), 1, cfg))
+      next_active.append(lhs)
+    if len(active) & 1: next_active.append(active[-1])
+    active = next_active
+  if post_scale != 1.0:
+    ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), RKArg(RKBufferKind.SCRATCH, data_slot, active[0]),
+                         RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), 1, _EW_CFG[Ops.MUL]))
+  constants = b"".join(struct.pack("<e", value) for value in const_values)
+  scratch = tuple(RKScratch(2) for _ in const_values) + (RKScratch(input_count*64),)
+  return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
+
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
   if (not stores or any(p is None or p.dtype.scalar().fmt is None or p.src[0].op is not Ops.CONST for p in outs) or
@@ -542,14 +614,13 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
   if any(u not in static_nodes and u.op in GroupOp.ALU and u.op not in supported and u.dtype.scalar() is dtypes.half for u in uops):
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
-  chain_limit = 512
   relu_input = _relu_operand(val)
   reduction = relu_input if relu_input is not None else val
-  if (reduction_info:=_mul_reduction_terms(reduction)) is not None and reduction_info[1]:
+  if (reduction_info:=_mul_reduction_terms(reduction)) is not None and (reduction_info[1] or len(reduction_info[0]) > 8):
     terms = reduction_info[0]
     reduce_mode = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()
     if reduce_mode == "kahan": reduced = _compensated_mul_sum(terms)
-    elif reduce_mode == "twoproduct": reduced, chain_limit = _precise_mul_sum(terms), 256
+    elif reduce_mode == "twoproduct": reduced = _precise_mul_sum(terms)
     elif reduce_mode != "sequential": raise ValueError(f"invalid ROCKCHIP_EW_REDUCE={reduce_mode!r}")
     else: reduced = reduction
     val = reduced.alu(Ops.MAX, val.src[0] if val.src[1] is reduction else val.src[1]) if reduction is not val else reduced
@@ -648,7 +719,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     by_slot = {slot: bits for bits, slot in const_scratch.items()}
     constants = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot) + 1))
   return RKImage(RKTarget.RK3588, tuple(RKScratch(_scratch_bytes(count)) for _ in range(scratch_count)), constants,
-                 gathers=tuple(gathers), ew_ops=tuple(ew_ops), chain_limit=chain_limit)
+                 gathers=tuple(gathers), ew_ops=tuple(ew_ops))
 
 class RockchipCompiler(Compiler):
   def compile(self, src:str) -> bytes: return base64.b64decode(src)
@@ -754,6 +825,17 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
 def _fp32_alu_to_fp16(x:UOp) -> UOp|None:
   return None if _is_static_expr(x) else x.src[0].cast(dtypes.half).alu(x.op, x.src[1].cast(dtypes.half))
 
+def _fold_casted_relu(root:UOp) -> UOp|None:
+  """Recover native half MAX from the float WHERE emitted for half ReLU inside a reduction."""
+  if len(root.src) != 1 or (where:=root.src[0]).op is not Ops.WHERE or where.dtype.scalar() is not dtypes.float: return None
+  gate, yes, no = where.src
+  if (yes.op is not Ops.CAST or len(yes.src) != 1 or yes.src[0].dtype.scalar() is not dtypes.half or
+      no.op is not Ops.CONST or float(no.arg) != 0.0): return None
+  val = yes.src[0]
+  if (gate.op is not Ops.CMPLT or gate.src[0].op is not Ops.CONST or float(gate.src[0].arg) != 0.0 or
+      gate.src[1].key != val.key): return None
+  return val.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
+
 def _replace_infinite_multiply(x:UOp) -> UOp|None:
   """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
   for value, factor in (x.src, x.src[::-1]):
@@ -771,6 +853,7 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
+  (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
   (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),

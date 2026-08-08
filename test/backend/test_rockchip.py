@@ -7,21 +7,20 @@ perform host arithmetic or FP32→FP16 conversion. GEMM gather layout is prepare
 the host, then every MUL/ADD is submitted to DPU EW.
 
 Reduction via ROCKCHIP_EW_REDUCE=sequential|kahan|twoproduct (default sequential).
-TwoProduct uses a conservative 256-task mixed MUL/ADD chain cap.
+Each program uses one PC chain sized from its actual register-command and task-descriptor bytes.
 """
 from __future__ import annotations
-import math, os, unittest
+import math, unittest
 import numpy as np
 import torch
 from tinygrad import Tensor, Device
+from tinygrad.helpers import Context
 from test.backend import test_ops as _test_ops
 from test.backend.test_ops import helper_test_op, slow_test
 
 # fp16 tol matches test_ops.test_gemm_fp16
 _FP16 = dict(atol=5e-3, rtol=5e-3)
 _FP16_WITH_GRAD = dict(atol=5e-3, rtol=5e-3, grad_atol=5e-3, grad_rtol=5e-3)
-_EW_CHAIN_FP16, _EW_CHAIN_TWOPRODUCT = 512, 256
-_EW_REDUCE = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()
 _TEST_OPS_HELPER = _test_ops.helper_test_op
 
 def _fp16_test_op(*args, **kwargs):
@@ -38,11 +37,8 @@ def _fp16_fp32_golden_test_op(shps, torch_fxn, tinygrad_fxn, **kwargs):
   return _TEST_OPS_HELPER(shps, fp32_golden, tinygrad_fxn, **kwargs)
 
 def _ew_submits(n:int) -> int:
-  """EW ioctl count for one logical op over n half elements."""
-  from tinygrad.renderer.rockchip import _MAX_EW_ELEMS_FP16
-  tiles = (n + _MAX_EW_ELEMS_FP16 - 1) // _MAX_EW_ELEMS_FP16
-  chain = _EW_CHAIN_TWOPRODUCT if _EW_REDUCE == "twoproduct" else _EW_CHAIN_FP16
-  return (tiles + chain - 1) // chain
+  """All tiles for one realized Rockchip program share one dynamically sized PC-chain."""
+  return int(n > 0)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchip(unittest.TestCase):
@@ -54,24 +50,25 @@ class TestRockchip(unittest.TestCase):
     rng = np.random.default_rng(seed)
     return Tensor(rng.uniform(-2, 2, size=shape).astype(np.float16))
 
-  def _check(self, expected_submits:int, out:Tensor, ref:np.ndarray, atol=5e-3, rtol=5e-3):
+  def _check(self, expected_submits:int|None, out:Tensor, ref:np.ndarray, atol=5e-3, rtol=5e-3):
     """Realize `out`, compare to `ref`, assert ioctl submit delta.
 
     Default tol matches test_ops half gemm (DEFAULT_FLOAT=HALF / test_gemm_fp16).
     """
-    before = self.dev.submit_count
+    before, before_tasks = self.dev.submit_count, self.dev.task_count
     got = out.realize().numpy()
-    submits = self.dev.submit_count - before
-    print(f"  {self._testMethodName}: submits={submits} (expected {expected_submits})")
+    submits, tasks = self.dev.submit_count-before, self.dev.task_count-before_tasks
+    if expected_submits is None: expected_submits = int(tasks > 0)
+    print(f"  {self._testMethodName}: tasks={tasks} submits={submits} (expected {expected_submits})")
     np.testing.assert_allclose(got, ref, atol=atol, rtol=rtol, equal_nan=True)
     self.assertEqual(submits, expected_submits, f"{self._testMethodName}: submits={submits} expected={expected_submits}")
 
-  def _check_conv2d(self, expected_submits:int, x_shape:tuple[int, ...], w_shape:tuple[int, ...], seed:int, **kwargs):
+  def _check_conv2d(self, x_shape:tuple[int, ...], w_shape:tuple[int, ...], seed:int, **kwargs):
     rng = np.random.default_rng(seed)
     xn = rng.uniform(-2, 2, size=x_shape).astype(np.float16)
     wn = rng.uniform(-2, 2, size=w_shape).astype(np.float16)
     ref = torch.nn.functional.conv2d(torch.from_numpy(xn), torch.from_numpy(wn), **kwargs).numpy()
-    self._check(expected_submits, Tensor(xn).conv2d(Tensor(wn), **kwargs), ref, **_FP16)
+    self._check(None, Tensor(xn).conv2d(Tensor(wn), **kwargs), ref, **_FP16)
 
   # ---- ADD ----
   def test_tiny_add(self):
@@ -219,40 +216,40 @@ class TestRockchip(unittest.TestCase):
 
   # ---- CONV2D (from test_ops, fp16 tol) ----
   def test_simple_conv2d_1x1(self):
-    self._check_conv2d(1, (1,4,9,9), (4,4,1,1), 100)
+    self._check_conv2d((1,4,9,9), (4,4,1,1), 100)
 
   def test_simple_conv2d(self):
-    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 101)
+    self._check_conv2d((1,4,9,9), (4,4,3,3), 101)
 
   def test_simple_conv2d_batched(self):
-    self._check_conv2d(9, (2,4,9,9), (4,4,3,3), 102)
+    self._check_conv2d((2,4,9,9), (4,4,3,3), 102)
 
   def test_padded_conv2d(self):
-    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 103, padding=1)
+    self._check_conv2d((1,4,9,9), (4,4,3,3), 103, padding=1)
 
   def test_strided_conv2d(self):
-    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 104, stride=2)
+    self._check_conv2d((1,4,9,9), (4,4,3,3), 104, stride=2)
 
   def test_depthwise_conv2d(self):
-    self._check_conv2d(3, (1,4,9,9), (4,1,3,3), 105, groups=4)
+    self._check_conv2d((1,4,9,9), (4,1,3,3), 105, groups=4)
 
   def test_simple_conv2d_reduce63(self):
-    self._check_conv2d(16, (1,7,9,9), (4,7,3,3), 207)
+    self._check_conv2d((1,7,9,9), (4,7,3,3), 207)
 
   def test_simple_conv2d_reduce72(self):
-    self._check_conv2d(18, (1,8,9,9), (4,8,3,3), 208)
+    self._check_conv2d((1,8,9,9), (4,8,3,3), 208)
 
   def test_simple_conv2d_m4(self):
-    self._check_conv2d(35, (1,16,9,9), (16,16,3,3), 300)
+    self._check_conv2d((1,16,9,9), (16,16,3,3), 300)
 
   def test_simple_conv2d_1x1_m4(self):
-    self._check_conv2d(4, (1,16,32,32), (16,16,1,1), 301)
+    self._check_conv2d((1,16,32,32), (16,16,1,1), 301)
 
   def test_grouped_conv2d(self):
-    self._check_conv2d(9, (1,8,9,9), (8,4,3,3), 302, groups=2)
+    self._check_conv2d((1,8,9,9), (8,4,3,3), 302, groups=2)
 
   def test_dilated_conv2d(self):
-    self._check_conv2d(9, (1,4,9,9), (4,4,3,3), 303, dilation=2)
+    self._check_conv2d((1,4,9,9), (4,4,3,3), 303, dilation=2)
 
   def test_asymmetric_padding_conv2d(self):
     rng = np.random.default_rng(400)
@@ -268,7 +265,7 @@ class TestRockchip(unittest.TestCase):
     bn = rng.uniform(-2, 2, size=(4,)).astype(np.float16)
     args = dict(output_padding=(1,1), stride=(2,3))
     ref = torch.nn.functional.conv_transpose2d(torch.from_numpy(xn), torch.from_numpy(wn), torch.from_numpy(bn), **args).numpy()
-    self._check(9, Tensor(xn).conv_transpose2d(Tensor(wn), Tensor(bn), **args), ref, **_FP16)
+    self._check(None, Tensor(xn).conv_transpose2d(Tensor(wn), Tensor(bn), **args), ref, **_FP16)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipConvOps(unittest.TestCase):
@@ -458,6 +455,56 @@ class TestRockchipPaddingOps(unittest.TestCase):
   test_pad_circular_mode = _test_ops.TestOps.test_pad_circular_mode
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipReductionOps(unittest.TestCase):
+  """FP16 scalar sum, mean, minimum/maximum, and product reductions on DPU EW."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def test_min(self):
+    for shape in ((3,3), (45,3)): _fp16_test_op([shape], lambda x: x.min())
+    _fp16_test_op([(45,3)], lambda x: x.min().mul(0.5))
+    _fp16_test_op([()], lambda x: x.min())
+
+  def test_max(self):
+    _fp16_test_op([(45,3)], lambda x: x.max())
+    _fp16_test_op([(45,3)], lambda x: x.max().mul(0.5))
+    _fp16_test_op(None, lambda x: x.max().mul(0.5), vals=[[[1.0,1.0,0.0,1.0]]])
+    _fp16_test_op([(3,4,5,6)], lambda x: x.max(axis=1)[0], lambda x: x.max(axis=1))
+    _fp16_test_op([()], lambda x: x.max())
+
+  def test_sum_full(self):
+    before = Device["ROCKCHIP"].submit_count
+    with Context(NOOPT=1): _fp16_test_op([(16384)], lambda x: x.sum())
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+
+  def test_non_fp16_reductions(self):
+    self.skipTest("Rockchip DPU accepts FP16 tensors only; FP32 dtype, boolean, and integer reductions are excluded")
+
+  test_sum_fake = _test_ops.TestOps.test_sum_fake
+  test_sum_collapse = _test_ops.TestOps.test_sum_collapse
+  test_sum_collapse_neg = _test_ops.TestOps.test_sum_collapse_neg
+  test_sum_pad_collapse = _test_ops.TestOps.test_sum_pad_collapse
+  test_sum_twice = _test_ops.TestOps.test_sum_twice
+  test_sum_cat_collapse = _test_ops.TestOps.test_sum_cat_collapse
+  test_max_dont_collapse = _test_ops.TestOps.test_max_dont_collapse
+  test_sum_simple = _test_ops.TestOps.test_sum_simple
+  test_sum_relu = _test_ops.TestOps.test_sum_relu
+  test_sum_tiny = _test_ops.TestOps.test_sum_tiny
+  test_sum = _test_ops.TestOps.test_sum
+  test_sum_with_zeros_shape = _test_ops.TestOps.test_sum_with_zeros_shape
+  test_prod = _test_ops.TestOps.test_prod
+  test_prod_dtype_arg = _test_ops.TestOps.test_prod_dtype_arg
+  test_const_reduce = _test_ops.TestOps.test_const_reduce
+  test_mean = _test_ops.TestOps.test_mean
+  test_mean_axis = _test_ops.TestOps.test_mean_axis
+  test_mean_zero_axis = _test_ops.TestOps.test_mean_zero_axis
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):
   """Remaining test_ops methods, admitted and debugged in source order."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
@@ -488,13 +535,6 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_arange_big = _test_ops.TestOps.test_arange_big
   test_arange_4096 = _test_ops.TestOps.test_arange_4096
   test_linspace = _test_ops.TestOps.test_linspace
-  test_sum_fake = _test_ops.TestOps.test_sum_fake
-  test_sum_collapse = _test_ops.TestOps.test_sum_collapse
-  test_sum_collapse_neg = _test_ops.TestOps.test_sum_collapse_neg
-  test_sum_pad_collapse = _test_ops.TestOps.test_sum_pad_collapse
-  test_sum_twice = _test_ops.TestOps.test_sum_twice
-  test_sum_cat_collapse = _test_ops.TestOps.test_sum_cat_collapse
-  test_max_dont_collapse = _test_ops.TestOps.test_max_dont_collapse
   test_lerp = _test_ops.TestOps.test_lerp
   test_broadcasted_add = _test_ops.TestOps.test_broadcasted_add
   test_broadcasted_add_2 = _test_ops.TestOps.test_broadcasted_add_2

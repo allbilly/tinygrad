@@ -1057,3 +1057,33 @@ offsets and copies `uint16` lanes without interpreting FP16 values.
 
 The tinygrad census produced no RKNPU timeout, invalid IRQ, IOMMU fault, reset, or kernel oops. The vendor script again
 logged its two known failed contiguous 4 MiB CMA attempts, then passed every probe; `CmaFree` returned to 6144 KiB.
+
+---
+
+## 2026-08-08 — FP16 scalar reductions and dynamically sized one-submit PC chains
+
+The DPU EW scalar-reduction design from `rockchip/post-518-reference` milestone `326124baf` is ported for FP16 sum,
+mean, product, minimum, and maximum. Reduction inputs are gathered as raw FP16 lanes into 64-byte-spaced scratch and
+combined by a balanced tree of native DPU EW ADD, MUL, or MAX stages. Mean adds a final DPU MUL by its compile-time
+scale, and minimum uses the proven negate/MAX lowering. ReLU-wrapped sums and precise long multiply/add trees are also
+recognized.
+
+There is no CPU numeric fallback: the renderer evaluates only static integer layout expressions, while runtime copies
+raw `uint16` lanes using integer indices. It never decodes input FP16 values or computes a reduction on the host. No
+CMAC path, shared tinygrad core change, or tolerance relaxation was added; tests retain the `test_gemm_fp16` limit of
+`atol=rtol=grad_atol=grad_rtol=5e-3`.
+
+Fixed task-count caps are removed. Each realized program now computes its command and descriptor arena sizes from the
+actual emitted register-command qwords and 40-byte task descriptors, adds one mapped page of command-prefetch guard,
+and submits the complete PC chain with one blocking ioctl. The 16,384-element `test_sum_full` produces 16,383 tasks,
+a 2,887,504-byte command allocation (including guard), and a 655,320-byte descriptor allocation, and passes with
+exactly one submit. Arena growth allocates the replacement before releasing the old buffer.
+
+- Focused reduction group after cleanup: **21 passed, 1 skipped in 10.67 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.38 s.
+- Complete Rockchip census, sequential single-process hardware ownership: **229 passed, 10 skipped, 96 subtests
+  passed in 102.98 s**.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **807/164 executable lines**.
+
+FP32, boolean, and integer reductions remain explicitly skipped because the NPU input path is FP16-only. The complete
+run and focused post-cleanup run produced no RKNPU timeout, invalid IRQ, IOMMU fault, reset, or kernel oops.

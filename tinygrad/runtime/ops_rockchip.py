@@ -8,13 +8,19 @@ from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_i
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
-# Ordinary ADD/MUL chains pass through 512 tasks; mixed TwoProduct chains use the image's tested 256-task cap.
-_EW_CHAIN_MAX = 512
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
+_CMD_PREFETCH_GUARD = mmap.PAGESIZE
+_PC_DATA_AMOUNT_MAX = (1 << 16) - 1
+_TASK_DESC_BYTES = ctypes.sizeof(rk.struct_rknpu_task)
 _BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) & ~(alignment - 1)
+def _task_command_bytes(body_qwords:int) -> int: return _align_up(body_qwords + _PC_TAIL, 2) * 8
+def _pcchain_sizes(body_qwords:list[int]) -> tuple[int, int]:
+  """Exact command and descriptor BO sizes for one PC-chain, including prefetch guard."""
+  if not body_qwords or any(not 0 < amount <= _PC_DATA_AMOUNT_MAX for amount in body_qwords): raise ValueError("invalid EW PC-chain body")
+  return sum(_task_command_bytes(amount) for amount in body_qwords)+_CMD_PREFETCH_GUARD, len(body_qwords)*_TASK_DESC_BYTES
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
@@ -50,23 +56,24 @@ class RockchipProgram(Program['RockchipDevice']):
   def _submit_pcchain(self, bodies:list[tuple[int, ...]]) -> None:
     """Submit contiguous FP16 EW tasks as one blocking PC chain."""
     n = len(bodies)
-    if not (1 <= n <= _EW_CHAIN_MAX): raise ValueError(f"EW PC-chain length {n} out of range")
+    cmd_size, task_need = _pcchain_sizes([len(body) for body in bodies])
     offsets:list[int] = []
     words = 0
     for body in bodies:
       offsets.append(words)
       words += _align_up(len(body) + _PC_TAIL, 2)
     need = words * 8
-    if self._cmd_buf is None or self._cmd_cap < need:
-      if self._cmd_buf is not None: self.dev._gpu_free(self._cmd_buf)
-      self._cmd_buf = self.dev._gpu_alloc(max(need, _CMD_BUF_MIN))
-      self._cmd_cap = self._cmd_buf.size
-    task_need = n * ctypes.sizeof(rk.struct_rknpu_task)
+    assert cmd_size == need+_CMD_PREFETCH_GUARD
+    if self._cmd_buf is None or self._cmd_cap < cmd_size:
+      new_cmd, old_cmd = self.dev._gpu_alloc(max(cmd_size, _CMD_BUF_MIN)), self._cmd_buf
+      self._cmd_buf, self._cmd_cap = new_cmd, new_cmd.size
+      if old_cmd is not None: self.dev._gpu_free(old_cmd)
     if self._task_buf is None or self._task_buf.size < task_need:
-      if self._task_buf is not None: self.dev._gpu_free(self._task_buf)
-      self._task_buf = self.dev._gpu_alloc(max(task_need, _TASK_BUF_MIN), rk.RKNPU_MEM_KERNEL_MAPPING)
+      new_task, old_task = self.dev._gpu_alloc(max(task_need, _TASK_BUF_MIN), rk.RKNPU_MEM_KERNEL_MAPPING), self._task_buf
+      self._task_buf = new_task
+      if old_task is not None: self.dev._gpu_free(old_task)
     cmd, task = self._cmd_buf, self._task_buf
-    ctypes.memset(int(cmd.va_addr), 0, need)
+    ctypes.memset(int(cmd.va_addr), 0, cmd_size)
     base_dma = self._dma(cmd)
     for i, body in enumerate(bodies):
       base = offsets[i]
@@ -78,7 +85,7 @@ class RockchipProgram(Program['RockchipDevice']):
               _pc(rk.TARGET_VERSION, 0), _pc(rk.TARGET_PC, rk.REG_PC_OPERATION_ENABLE, 0x18))
       ctypes.memmove(int(cmd.va_addr) + (base+len(body))*8, (ctypes.c_uint64 * _PC_TAIL)(*tail), _PC_TAIL*8)
       desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(body)+_PC_TAIL, 0, base_dma+base*8)
-      ctypes.memmove(int(task.va_addr) + i*ctypes.sizeof(desc), ctypes.addressof(desc), ctypes.sizeof(desc))
+      ctypes.memmove(int(task.va_addr) + i*_TASK_DESC_BYTES, ctypes.addressof(desc), _TASK_DESC_BYTES)
     self.dev._sync_buffer(cmd, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
@@ -89,13 +96,10 @@ class RockchipProgram(Program['RockchipDevice']):
         rk.struct_rknpu_subcore_task(0, n), rk.struct_rknpu_subcore_task(n, 0), rk.struct_rknpu_subcore_task(n, 0)))
     self.submit_count += 1
     self.dev.submit_count += 1
+    self.dev.task_count += n
 
   def _run_ew_ops(self, address) -> None:
     bodies:list[tuple[int, ...]] = []
-    def flush() -> None:
-      if not bodies: return
-      self._submit_pcchain(bodies)
-      bodies.clear()
     for op in self.image.ew_ops:
       for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
         count = min(_MAX_EW_ELEMS_FP16, op.count-start)
@@ -104,8 +108,7 @@ class RockchipProgram(Program['RockchipDevice']):
                               RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
                               RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg)
         bodies.append(patch_stage(stage, address))
-        if len(bodies) >= self.image.chain_limit: flush()
-    flush()
+    if bodies: self._submit_pcchain(bodies)
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
@@ -118,19 +121,20 @@ class RockchipProgram(Program['RockchipDevice']):
     linear:dict[int, np.ndarray] = {}
     for gather in self.image.gathers:
       dst = np.frombuffer(to_mv(int(self.scratch[gather.dst_scratch].va_addr), self.scratch[gather.dst_scratch].size), dtype=np.uint16)
-      if gather.values: dst[:gather.count] = gather.values
+      if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
+      dst_index = linear[gather.count] * gather.dst_stride
+      if gather.values: dst[dst_index] = gather.values
       elif gather.offsets:
         src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
         index = np.asarray(gather.offsets, dtype=np.intp)
         valid = index >= 0
-        if not gather.partial: dst[:gather.count] = gather.fill_bits
-        dst[:gather.count][valid] = src[index[valid]]
+        if not gather.partial: dst[dst_index] = gather.fill_bits
+        dst[dst_index[valid]] = src[index[valid]]
       else:
         src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
-        if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
         index = np.full(gather.count, gather.base, dtype=np.intp)
         for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
-        dst[:gather.count] = src[index]
+        dst[dst_index] = src[index]
     for buf in (*bufs, *self.scratch): self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
@@ -150,7 +154,7 @@ class RockchipProgram(Program['RockchipDevice']):
 class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
-    self.submit_count = 0
+    self.submit_count = self.task_count = 0
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
