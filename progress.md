@@ -1458,3 +1458,30 @@ The runtime remains unchanged, and its no-CPU-cheat audit contains no host extre
 arithmetic. The renderer constructs only static address and coordinate metadata; all numeric work and conversion remain
 DPU EW. There is no CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation. The padded global 200-element
 bounded-loop graph and non-FP16 input conversions remain explicit next groups.
+
+---
+
+## 2026-08-08 — Global FP16 ArgMax/ArgMin bounded-loop selection
+
+Global FP16 ArgMax and ArgMin over the upstream `(10,20)` shape now join the Rockchip census. Additional deterministic
+cases place equal extrema at flat indices 37 and 99 and verify that the loop form also returns index 37.
+
+For 200 candidates Tinygrad replaces the unrolled graph with two ordered register loops. The first initializes a local
+FP16 accumulator to negative infinity and computes `MAX(x)` or `MAX(-x)`. The second initializes an INT32 accumulator
+to `INT_MIN`, compares each candidate with the completed extreme, weights equality by `window-coordinate`, and reduces
+with INT32 MAX. The final store computes `window-selected`.
+
+The new matcher accepts only that exact two-loop structure: one global FP16 input of the loop extent, matching direct
+candidate permutations in both loops, one sign convention, the expected local accumulator initializers and updates,
+descending coordinates, and the final inverse transform. It then emits the already verified matrix DPU image. No loop
+accumulator is read by the host.
+
+- Expanded FP16 ArgMax/ArgMin class: **6 passed, 10 subtests passed in 11.22 s**, sequentially.
+- Complete Rockchip census: **290 passed, 11 skipped, 178 subtests passed in 200.45 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,320/253 executable lines**.
+
+The CPU-cheat audit found only compile-time UOp structure, source-address, and coordinate evaluation. Runtime remains
+raw lane movement plus DPU submission and contains no host extrema or selected-index arithmetic. Every negation, MAX,
+comparison, mask, coordinate selection, subtraction, and FP16-to-INT32 conversion executes on DPU EW. There is no CMAC,
+CNA, PPU, shared tinygrad core change, or tolerance relaxation.

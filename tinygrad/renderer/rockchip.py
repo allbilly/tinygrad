@@ -920,6 +920,73 @@ def _lower_split_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans, (RKGather(extrema_slot, 0, count, offsets=extrema_offsets),),
                                  negated_candidates, [window-1]*count, first_tie=True)
 
+def _lower_loop_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
+  """Lower the two-register-loop graph used by a padded global FP16 ArgMax/ArgMin."""
+  final_stores = [(store, root) for store in uops if store.op is Ops.STORE and (root:=_root_param(store.src[0])) is not None]
+  if len(final_stores) != 1: return None
+  store, out_param = final_stores[0]
+  if (out_param.dtype.scalar() is not dtypes.int or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
+      store.src[0].op is not Ops.INDEX or _index_ranges(store.src[0].src[1])): return None
+  ranges = [u for u in uops if u.op is Ops.RANGE]
+  if len(ranges) != 2 or any(r.src[0].op is not Ops.CONST for r in ranges): return None
+  first_range, second_range = ranges
+  window = int(first_range.src[0].arg)
+  if not 2 <= window <= 2048 or int(second_range.src[0].arg) != window: return None
+  input_params = [u for u in uops if u.op is Ops.PARAM and u.dtype.scalar() is dtypes.half and
+                  u.src[0].op is Ops.CONST and int(u.src[0].arg) == window]
+  if len(input_params) != 1: return None
+  source = input_params[0]
+  local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
+  initial_half = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtypes.half and
+                  math.isinf(float(u.src[1].arg)) and float(u.src[1].arg) < 0]
+  initial_int = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtypes.int and
+                 int(u.src[1].arg) == -(1 << 31)]
+  half_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtypes.half and
+                  first_range in u.toposort()]
+  int_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtypes.int and
+                 second_range in u.toposort()]
+  if not all(len(x) == 1 for x in (initial_half, initial_int, half_updates, int_updates)) or len(local_stores) != 4: return None
+
+  def global_candidate(exprs:list[UOp], reduce_range:UOp) -> tuple[UOp, bool]|None:
+    parsed = [(expr, candidate) for expr in exprs if (candidate:=_half_candidate(expr)) is not None and
+              _root_param(candidate[0].src[0]) is source]
+    if len(parsed) != 1: return None
+    expr, (load, negated) = parsed[0]
+    if load.src[0].op is not Ops.INDEX or load.src[0].src[1] is not reduce_range: return None
+    try:
+      if [_eval_int(load.src[0].src[1], {reduce_range:i}) for i in range(window)] != list(range(window)): return None
+    except RuntimeError: return None
+    return expr, negated
+
+  half_candidate = global_candidate(list(half_updates[0].src[1].src), first_range)
+  comparisons = [u for u in int_updates[0].src[1].toposort() if u.op is Ops.CMPNE and u.dtype.scalar() is dtypes.bool]
+  inner_cmps = [u for u in comparisons if any(_half_candidate(x) is not None for x in u.src)]
+  if half_candidate is None or len(inner_cmps) != 1: return None
+  cmp = inner_cmps[0]
+  second_candidate = global_candidate(list(cmp.src), second_range)
+  if second_candidate is None or second_candidate[1] != half_candidate[1]: return None
+  extrema_operands = [x for x in cmp.src if x is not second_candidate[0]]
+  if len(extrema_operands) != 1 or extrema_operands[0].op is not Ops.LOAD or _root_param(extrema_operands[0].src[0]) is not None:
+    return None
+  inversions = [u for u in comparisons if cmp in u.src and any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg) for x in u.src)]
+  casts = [u for u in int_updates[0].src[1].toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
+           len(inversions) == 1 and u.src == (inversions[0],)]
+  if len(casts) != 1: return None
+  weighted = [u for u in int_updates[0].src[1].toposort() if u.op is Ops.MUL and u.dtype.scalar() is dtypes.int and casts[0] in u.src]
+  if len(weighted) != 1: return None
+  coordinate = weighted[0].src[1] if weighted[0].src[0] is casts[0] else weighted[0].src[0]
+  try:
+    if [_eval_int(coordinate, {second_range:i}) for i in range(window)] != list(range(window, 0, -1)): return None
+  except RuntimeError: return None
+  final_negative = [x for x in store.src[1].src if x.op is Ops.MUL and
+                    any(y.op is Ops.LOAD and y.dtype.scalar() is dtypes.int and _root_param(y.src[0]) is None for y in x.src) and
+                    any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src)]
+  if (store.src[1].op is not Ops.ADD or len(final_negative) != 1 or
+      not any(x.op is Ops.CONST and int(x.arg) == window for x in store.src[1].src)): return None
+  candidate_plans = tuple(RKGather(source.arg.slot, 0, 1, base=i) for i in range(window))
+  return _cumulative_index_image(out_param.arg.slot, 1, candidate_plans, candidate_plans,
+                                 half_candidate[1], [window-1], first_tie=True, negate_extrema=half_candidate[1])
+
 def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   """Select unrolled cumulative MAX/MIN axis coordinates with DPU equality masks."""
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -1019,6 +1086,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
   if (arg_extrema:=_lower_arg_extrema_index(uops)) is not None: return arg_extrema
   if (split_arg_extrema:=_lower_split_arg_extrema_index(uops)) is not None: return split_arg_extrema
+  if (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops)) is not None: return loop_arg_extrema
   if (raw_int32:=_lower_raw_int32_layout(uops)) is not None: return raw_int32
   if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
   if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
