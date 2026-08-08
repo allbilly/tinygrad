@@ -2436,3 +2436,43 @@ the group is deferred rather than narrowed to only its 32K/64K cases.
 The CPU-cheat audit found no renderer, runtime, or Tinygrad-core change. Every runtime-dependent isclose operation and
 bool conversion executes on DPU EW; Python only constructs the static test matrix and checks exact bool output. There is
 no host tensor-value arithmetic, LUT, CMAC, CNA, PPU fallback, external non-FP16 input, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — native MaxPool2D spatial-index output
+
+The complete upstream `test_max_pool2d_return_indices` method now runs in the Rockchip census. Its seven cases cover
+batch/channel planes, dilation, padding, ceil-mode tail padding, a 156-lane global window, first-index ties, and
+overlapping windows. The two explicit integer-literal fixtures are converted to FP16 while constructing the test input,
+which preserves their upstream values and tie semantics while respecting the NPU's FP16 input contract; expected and
+device-produced indices remain exact INT32.
+
+Tinygrad lowers each unrolled index graph to equality between every FP16 pool candidate and the already-produced pooled
+maximum, multiplies each equality by a descending spatial coordinate, MAX-reduces the candidates, and subtracts from
+the spatial size. The strict Rockchip matcher proves that exact graph, evaluates only its compile-time address/gate and
+coordinate expressions, and emits the existing raw gathers plus DPU equality/selection and native INT32-output stages.
+Invalid padded lanes carry FP16 `-inf` and zero selection weight, so they cannot win a valid window. The global case's
+single-register loop is recognized separately and lowered to the same immutable image. Spatial coordinates are capped
+at 2048 so every integer represented during DPU FP16 selection is exact.
+
+Historical commits `aa01f775e`, `d72bcc3f0`, `76c31806e`, and `cc3b7b6c6` established the candidate-address and
+first-tie algorithm, but also contained a NumPy ArgMax fallback, NumPy unpool scatter, LUT truncation, and thousands of
+tiny reset-heavy tasks; none of those paths were ported. Searches in `~/npu` and `~/rk3588` found the DPU RDMA
+`UNPOOLING_EN` and PPU pooling register definitions and operator declarations, but no proven returned-index register
+contract or compact EW implementation. The current implementation therefore stays on the already-proven DPU EW/image
+ABI and adds no runtime semantic interpreter.
+
+- Focused seven-case upstream method: **1 passed in 6.15 s**, sequentially.
+- Complete MaxPool class: **12 passed, 1 skipped, 33 subtests passed in 10.04 s**, sequentially.
+- Shared cumulative-extrema, arg-extrema, and sort-index regression: **22 passed, 16 subtests passed in 152.34 s**.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **361 passed, 10 skipped, 180 subtests passed in
+  416.48 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused method, shared regressions, and
+  complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,083/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change and no code that reads or interprets tensor values. NumPy
+is used only for compile-time symbolic index evaluation, raw gather-map construction already used throughout the
+renderer, and FP16 test-fixture creation. All input-dependent equality, tie selection, MAX reduction, and INT32
+conversion execute on the NPU. There is no host ArgMax, host scatter, LUT, CMAC, CNA, PPU fallback, tolerance
+relaxation, or external non-FP16 input.

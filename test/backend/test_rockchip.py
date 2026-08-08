@@ -28,6 +28,11 @@ def _fp16_test_op(*args, **kwargs):
   kwargs.update(_FP16_WITH_GRAD)
   return _TEST_OPS_HELPER(*args, **kwargs)
 
+def _fp16_pool_test_op(*args, **kwargs):
+  """Keep explicit MaxPool fixtures on the backend's FP16 input contract."""
+  if (vals:=kwargs.get("vals")) is not None: kwargs["vals"] = [np.asarray(value, dtype=np.float16) for value in vals]
+  return _fp16_test_op(*args, **kwargs)
+
 def _fp16_fp32_golden_test_op(shps, torch_fxn, tinygrad_fxn, **kwargs):
   """Use an FP32-accumulated golden when CPU FP16 reduction is less accurate than DPU EW."""
   def fp32_golden(*tensors):
@@ -297,11 +302,11 @@ for _name, _test in vars(_test_ops.TestOps).items():
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMaxPoolOps(unittest.TestCase):
-  """Every numeric FP16 MaxPool2D case from test_ops at the test_gemm_fp16 tolerance."""
+  """Every FP16 MaxPool2D case from test_ops at the test_gemm_fp16 tolerance."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
 
   @classmethod
-  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_pool_test_op
 
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
@@ -309,12 +314,9 @@ class TestRockchipMaxPoolOps(unittest.TestCase):
   @unittest.skip("Rockchip accepts FP16 inputs only")
   def test_max_pool2d_padding_int(self): pass
 
-  @unittest.skip("Rockchip DPU EW has no integer index output")
-  def test_max_pool2d_return_indices(self): pass
-
-# Keep the numeric MaxPool2D census synchronized as test_ops grows.
+# Keep the MaxPool2D census synchronized as test_ops grows.
 for _name, _test in vars(_test_ops.TestOps).items():
-  if _name.startswith("test_max_pool2d") and _name not in ("test_max_pool2d_padding_int", "test_max_pool2d_return_indices"):
+  if _name.startswith("test_max_pool2d") and _name != "test_max_pool2d_padding_int":
     setattr(TestRockchipMaxPoolOps, _name, _test)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
