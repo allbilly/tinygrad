@@ -536,13 +536,52 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   middle = middle.alu(Ops.ADD, low)
   return high.alu(Ops.ADD, middle)
 
+def _lower_dot_loop_reduction(uops:list[UOp]) -> RKImage|None:
+  """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
+  global_stores = [(store, _root_param(store.src[0])) for store in uops if store.op is Ops.STORE]
+  global_stores = [(store, param) for store,param in global_stores if param is not None]
+  if len(global_stores) != 1: return None
+  store, out_param = global_stores[0]
+  assert out_param is not None
+  if (out_param.dtype.scalar() is not dtypes.half or out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX or
+      not 0 < int(out_param.src[0].arg) <= _MAX_EW_ELEMS_FP16): return None
+  nodes = store.src[1].toposort()
+  output_ranges = _index_ranges(store.src[0].src[1])
+  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in output_ranges]
+  if len(reduce_ranges) != 1: return None
+  reduce_range = reduce_ranges[0]
+  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
+  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
+  if len(updates) != 1: return None
+  def strip_cast(x:UOp) -> UOp:
+    while x.op is Ops.CAST: x = x.src[0]
+    return x
+  def is_local_load(x:UOp) -> bool:
+    x = strip_cast(x)
+    return x.op is Ops.LOAD and _root_param(x.src[0]) is None
+  update = strip_cast(updates[0].src[1])
+  if update.op is not Ops.ADD or (acc:=next((x for x in update.src if is_local_load(x)), None)) is None: return None
+  product = strip_cast(update.src[1 if update.src[0] is acc else 0])
+  if product.op is not Ops.MUL or product.dtype.scalar() is not dtypes.half: return None
+  for operand in product.src:
+    operand = strip_cast(operand)
+    param = _root_param(operand.src[0]) if operand.op is Ops.LOAD and operand.src and operand.src[0].op is Ops.INDEX else None
+    if param is None or operand.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST: return None
+  if not is_local_load(store.src[1]): return None
+  terms = [product.substitute({reduce_range:reduce_range.const_like(r)}) for r in range(groups)]
+  while len(terms) > 1:
+    terms = [terms[i].alu(Ops.ADD, terms[i+1]) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
+  return lower_ew([store.replace(src=(store.src[0], terms[0], *store.src[2:]))])
+
 def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   """Turn a compact scalar register reduction into balanced FP16 DPU EW stages."""
   global_stores = [(store, _root_param(store.src[0])) for store in uops if store.op is Ops.STORE]
   global_stores = [(store, param) for store,param in global_stores if param is not None]
-  ranges = [u for u in uops if u.op is Ops.RANGE]
-  if len(global_stores) != 1 or len(ranges) != 1: return None
+  if len(global_stores) != 1: return None
   store, out_param = global_stores[0]
+  nodes = store.src[1].toposort()
+  ranges = [u for u in nodes if u.op is Ops.RANGE]
+  if len(ranges) != 1: return None
   assert out_param is not None
   fp32_out = out_param.dtype.scalar() is dtypes.float
   if (out_param.dtype.scalar() not in (dtypes.half, dtypes.float) or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
@@ -550,14 +589,14 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   reduce_range = ranges[0]
   if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
   loads:list[tuple[UOp, UOp]] = []
-  for u in uops:
+  for u in nodes:
     if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.half or not u.src or u.src[0].op is not Ops.INDEX: continue
     param = _root_param(u.src[0])
     if param is not None and param.arg.slot != out_param.arg.slot: loads.append((u, param))
   if not loads or len({param.key for _,param in loads}) != 1: return None
   in_param = loads[0][1]
   if in_param.src[0].op is not Ops.CONST: return None
-  updates = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
+  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
   if len(updates) != 1: return None
   final_value = store.src[1]
   def local_load(x:UOp) -> UOp|None:
@@ -612,6 +651,7 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
 
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
   if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]

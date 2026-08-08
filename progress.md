@@ -1177,3 +1177,27 @@ Broadcast layout is handled by the existing static raw-lane gather, and arithmet
 
 This milestone changes coverage only. It adds no host tensor arithmetic, CMAC, CNA, PPU, shared core change, or
 tolerance relaxation.
+
+---
+
+## 2026-08-08 — Exact dot, batched dot, and matvec census on DPU EW
+
+Six exact upstream methods are now admitted: `test_dot_1d`, `test_dot`, `test_broadcastdot`, `test_multidot`,
+`test_matvec`, and `test_matvecmat`. K-loop contractions arrive after FP16 rewriting as local FP32 accumulator loops.
+The renderer now recognizes the narrowly validated ADD-of-FP16-products form, statically substitutes only the reduction
+range, and feeds the resulting product tree back through the existing generic DPU EW lowering.
+
+This keeps execution scalable: each K term is a vector operation over all outputs, so task count depends on K rather
+than `M×N×K`. `ROCKCHIP_EW_REDUCE=twoproduct` reuses the established compensated FP16 product/sum graph; a plain
+balanced FP16 tree was rejected because one K65 lane missed the permitted tolerance by 0.007324. The older
+`rockchip-2608` reference used scalar CMAC for part of this scope, but CMAC is intentionally not ported here.
+
+- Individual methods: **1 passed each in 3.21–4.71 s**.
+- Combined dot/matvec group: **6 passed in 9.02 s**, sequentially in one process.
+- Complete Rockchip census: **253 passed, 11 skipped, 120 subtests passed in 113.20 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.46 s.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **878/173 executable lines**.
+
+No input value is evaluated on the host: compile time only substitutes static integer K indices, runtime performs the
+existing raw `uint16` gathers, and every MUL/ADD/compensation stage executes on DPU EW. There is no CMAC, CNA, PPU,
+shared core change, or tolerance relaxation. Kernel logs contain no new timeout, invalid IRQ, IOMMU fault, or oops.

@@ -443,6 +443,24 @@ class TestRockchipBroadcastOps(unittest.TestCase):
         with self.subTest(op=torch_op.__name__, shapes=pair): _fp16_test_op(pair, torch_op, tinygrad_op)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipDotOps(unittest.TestCase):
+  """FP16 dot, batched dot, and matvec compositions lowered through DPU EW."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_dot_1d = _test_ops.TestOps.test_dot_1d
+  test_dot = _test_ops.TestOps.test_dot
+  test_broadcastdot = _test_ops.TestOps.test_broadcastdot
+  test_multidot = _test_ops.TestOps.test_multidot
+  test_matvec = _test_ops.TestOps.test_matvec
+  test_matvecmat = _test_ops.TestOps.test_matvecmat
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 
