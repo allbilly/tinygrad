@@ -1715,3 +1715,28 @@ comparison or arithmetic.
 The CPU-cheat audit found no backend code change and no host numeric implementation. Static raw-lane movement and zero
 initialization are layout preparation, not Trilu arithmetic. There is no CMAC, CNA, PPU, tinygrad core change, or
 tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — FP16 padded and reordered arithmetic composition
+
+Unchanged upstream `test_padding_add` and `test_topo_sort` now join the Rockchip census. The first adds a `(60,60)`
+tensor into a statically zero-padded `(64,64)` layout; the second verifies the shared `(x+x)*x` graph remains correctly
+ordered. Each realization executes one ioctl submit on DPU EW.
+
+Historical milestone `54f88978a` solved normal-FP32 padding-add through a host elementwise boundary and was deliberately
+not ported. Under the current FP16 contract, the existing gather path prepares only the static raw-lane padding layout,
+then DPU ADD performs every numeric addition. Topological ordering needs no dedicated Rockchip primitive and composes
+the already-proven DPU ADD and MUL stages in one PC chain. Neither `~/npu` nor `~/rk3588` contains a more specific
+register implementation for this graph composition.
+
+- Unchanged upstream `test_padding_add`: **1 passed in 2.95 s**, one submit/one task.
+- Unchanged upstream `test_topo_sort`: **1 passed in 3.28 s**, one submit/45 tasks for the non-scalar realization.
+- Focused padding and polynomial groups: **10 passed in 5.89 s**, sequentially.
+- Complete Rockchip census: **327 passed, 11 skipped, 228 subtests passed in 315.28 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,698/269 executable lines** (unchanged).
+
+The CPU-cheat audit found no backend code change and no host tensor arithmetic. Host work is limited to compile-time
+index analysis and raw FP16 lane placement for padding; ADD and MUL execute on DPU EW. There is no LUT, CMAC, CNA, PPU,
+tinygrad core change, or tolerance relaxation beyond the existing FP16 contract.

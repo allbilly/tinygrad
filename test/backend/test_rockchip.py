@@ -359,6 +359,8 @@ class TestRockchipAdaptivePoolOps(unittest.TestCase):
 class TestRockchipPolynomialLossOps(unittest.TestCase):
   """Polynomial and simple loss expressions composed only from FP16 DPU EW primitives."""
 
+  test_topo_sort = _test_ops.TestOps.test_topo_sort
+
   def test_square_and_cubic(self):
     _fp16_test_op([(4,5)], lambda x: x.square(), lambda x: x.square())
     _fp16_test_op([(4,5)], lambda x: x*x*x, lambda x: x*x*x)
@@ -904,6 +906,7 @@ class TestRockchipPaddingOps(unittest.TestCase):
   test_pad_reflect_mode = _test_ops.TestOps.test_pad_reflect_mode
   test_pad_replicate_mode = _test_ops.TestOps.test_pad_replicate_mode
   test_pad_circular_mode = _test_ops.TestOps.test_pad_circular_mode
+  test_padding_add = _test_ops.TestOps.test_padding_add
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipReductionOps(unittest.TestCase):
