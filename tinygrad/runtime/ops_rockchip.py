@@ -174,7 +174,8 @@ class RockchipProgram(Program['RockchipDevice']):
         bodies.clear()
         continue
       if op.int32_input or op.int32_output:
-        if op.int32_output and i != len(ops)-1: raise RuntimeError("INT32 EW output must be terminal")
+        if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
+          raise RuntimeError("INT32 argument output must be terminal")
         if bodies:
           self._submit_pcchain(bodies)
           bodies.clear()
@@ -225,7 +226,7 @@ class RockchipProgram(Program['RockchipDevice']):
         if clear_scratch and gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
           ctypes.memset(int(dest.va_addr), 0, dest.size)
           cleared_scratch.add(gather.dst_index)
-        lane_dtype = np.uint16 if gather.itemsize == 2 else np.uint32
+        lane_dtype = {1:np.uint8, 2:np.uint16, 4:np.uint32}[gather.itemsize]
         dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)
         if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
         dst_index = gather.dst_addend + linear[gather.count] * gather.dst_stride

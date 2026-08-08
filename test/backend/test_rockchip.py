@@ -314,6 +314,14 @@ class TestRockchipMaxPoolOps(unittest.TestCase):
   @unittest.skip("Rockchip accepts FP16 inputs only")
   def test_max_pool2d_padding_int(self): pass
 
+  def test_max_pool2d_return_indices_wide(self):
+    data = np.zeros((1,1,50,50), dtype=np.float16)
+    data[0,0,46,49] = 1
+    expected = torch.nn.functional.max_pool2d(torch.from_numpy(data), kernel_size=(5,5), stride=(6,5), return_indices=True)[1].int().numpy()
+    got = Tensor(data, device="ROCKCHIP").max_pool2d((5,5), stride=(6,5), return_indices=True)[1].realize().numpy()
+    self.assertGreater(int(expected.max()), 2048)
+    np.testing.assert_array_equal(got, expected)
+
 # Keep the MaxPool2D census synchronized as test_ops grows.
 for _name, _test in vars(_test_ops.TestOps).items():
   if _name.startswith("test_max_pool2d") and _name != "test_max_pool2d_padding_int":

@@ -2550,3 +2550,37 @@ The CPU-cheat audit found only representation-preserving host movement between t
 backend's existing raw pre/post gather contract. Neither renderer nor runtime reads or branches on an index or pooled
 value. There is no host scatter, host ArgMax, numeric conversion, LUT, CMAC, CNA, PPU fallback, tolerance relaxation,
 or external non-FP16 input.
+
+---
+
+## 2026-08-09 — exact wide MaxPool spatial indices
+
+Returned MaxPool indices now remain exact beyond FP16's consecutive-integer range. A deterministic 50x50 regression
+uses a 5x5 window with stride `(6,5)` and selects spatial index 2349; it passes exactly in 3.79 seconds. The complete
+MaxPool class passes 13 tests plus 33 subtests, with only the explicit integer-input case skipped, in 10.98 seconds.
+
+Historical commit `76c31806e` established the representation-safe design: select base-256 pieces on DPU and assemble
+the final INT32 output by moving raw bytes. The current RKImage implementation preserves first-tie semantics without a
+sequential candidate chain. Compile-time priorities rank valid coordinates in each output lane. DPU equality masks
+select priority-tagged four-bit digits whose maximum remains within FP16's exact range; subtracting the selected
+priority recovers each digit, pairs of digits form exact bytes, and native DPU conversion produces INT32 byte values.
+The post-gather writes only those raw byte representations into the zeroed INT32 output. The digit radix and admitted
+window bound are derived from FP16's 11 explicit precision bits rather than an arbitrary task or command-buffer cap.
+
+`~/npu` and the RKNN guide contain no native returned-index contract, and MaxUnpool is documented as a CPU operator.
+`~/rk3588` contains the upstream tests and the older byte-assembly proof but no simpler verified DPU instruction for
+wide dynamic indices. No PPU, CMAC, LUT, or host ArgMax implementation was imported.
+
+- Focused exact-wide returned-index regression: **1 passed in 3.79 s**, sequentially.
+- Complete MaxPool class: **13 passed, 1 skipped, 33 subtests passed in 10.98 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **364 passed, 10 skipped, 180 subtests passed in
+  429.82 s** pytest time / **454.76 s** process wall time, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,215/281 executable lines**.
+
+The CPU-cheat audit found only compile-time coordinate/rank construction and raw representation movement in generic
+gathers. Runtime never reads, compares, converts, or branches on a tensor value: equality, priority selection, digit
+reconstruction, and FP16-to-INT32 conversion are all submitted to DPU EW. The next MaxUnpool case is not included in
+this milestone: its 80-candidate, 2350-output-plane consumer still needs exact byte-wise INT32 comparison. A diagnostic
+run rejected that consumer after 36.55 seconds, showing that wide producer compilation/conversion also needs profiling
+before the full pipeline can meet the 30-second target.

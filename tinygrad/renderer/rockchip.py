@@ -18,6 +18,7 @@ _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBB
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
+_ITEM_FORMAT = {1:"B", 2:"H", 4:"I"}
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
@@ -86,7 +87,7 @@ def encode_image(image:RKImage) -> bytes:
     kind = 3 if g.partial else 2 if g.values else 1 if g.offsets else 0
     out += _GATHER.pack(g.dst_index, g.src_index, g.count, kind, len(g.axes), g.itemsize, int(g.dst_kind), int(g.src_kind),
                         g.base, g.fill_bits, g.dst_stride, g.dst_addend)
-    if kind == 2: out += struct.pack(f"<{g.count}{'H' if g.itemsize == 2 else 'I'}", *g.values)
+    if kind == 2: out += struct.pack(f"<{g.count}{_ITEM_FORMAT[g.itemsize]}", *g.values)
     elif kind in (1, 3): out += struct.pack(f"<{g.count}i", *g.offsets)
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
@@ -110,10 +111,10 @@ def decode_image(blob:bytes) -> RKImage:
   for _ in range(ngather):
     dst_index, src_index, count, kind, naxes, itemsize, dst_kind, src_kind, base, fill_bits, dst_stride, dst_addend = \
       _GATHER.unpack_from(blob, off); off += _GATHER.size
-    if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in (2, 4) or dst_kind not in (0, 1) or src_kind not in (0, 1) or
+    if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in _ITEM_FORMAT or dst_kind not in (0, 1) or src_kind not in (0, 1) or
         dst_stride < 1 or dst_addend < 0): raise ValueError("invalid RKGather")
     if kind == 2:
-      values = struct.unpack_from(f"<{count}{'H' if itemsize == 2 else 'I'}", blob, off); off += itemsize*count
+      values = struct.unpack_from(f"<{count}{_ITEM_FORMAT[itemsize]}", blob, off); off += itemsize*count
       gathers.append(RKGather(src_index, dst_index, count, fill_bits=fill_bits, values=values,
                               dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
                               src_kind=RKBufferKind(src_kind)))
@@ -158,6 +159,9 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 
 _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
+_FP16_EXACT_INTEGER = 1 << 11
+_POOL_INDEX_DIGIT_BITS = 4
+_POOL_INDEX_DIGIT_RADIX = 1 << _POOL_INDEX_DIGIT_BITS
 _EW_DATA_MODE_FP16 = 1 << 28
 _EW_EDATA_SIZE_FP16 = 2 << 22
 _EW_ALU_MIN = 1 << 16
@@ -1268,10 +1272,79 @@ def _weighted_equality(term:UOp) -> tuple[tuple[UOp, UOp], UOp]|None:
   weight = term.src[1] if term.src[0] is casts[0] else term.src[0]
   return pair, weight
 
+def _wide_pool_index_image(out_slot:int, count:int, spatial_size:int, plans:tuple[RKGather, ...],
+                           extrema_plan:RKGather, coordinates:tuple[tuple[int, ...], ...]) -> RKImage|None:
+  """Select exact wide spatial indices as DPU-computed nibbles, then place their raw INT32 bytes."""
+  window = len(plans)
+  digit_mask = _POOL_INDEX_DIGIT_RADIX-1
+  if (spatial_size > 1 << 16 or window*_POOL_INDEX_DIGIT_RADIX+digit_mask > _FP16_EXACT_INTEGER or
+      len(coordinates) != window): return None
+
+  priorities = [[0]*count for _ in range(window)]
+  for lane in range(count):
+    ordered = sorted((row[lane], candidate) for candidate,row in enumerate(coordinates) if row[lane] < spatial_size)
+    if not ordered or len({coordinate for coordinate,_ in ordered}) != len(ordered): return None
+    for rank,(_,candidate) in enumerate(ordered): priorities[candidate][lane] = len(ordered)-rank
+  digits = max(1, ((spatial_size-1).bit_length()+_POOL_INDEX_DIGIT_BITS-1)//_POOL_INDEX_DIGIT_BITS)
+  encoded = tuple(tuple(tuple(priority*_POOL_INDEX_DIGIT_RADIX + ((coordinate >> (digit*_POOL_INDEX_DIGIT_BITS)) & digit_mask)
+                              if coordinate < spatial_size else 0 for coordinate,priority in zip(row,priority_row))
+                              for row,priority_row in zip(coordinates, priorities)) for digit in range(digits))
+  def half_bits(rows:Iterable[Iterable[int]]) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(struct.unpack("<H", struct.pack("<e", float(value)))[0] for value in row) for row in rows)
+
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, window)
+  zero, one, radix, candidates_slot, extrema_slot, priority_slot = range(6)
+  encoded_slots = tuple(range(6, 6+digits)); next_slot = 6+digits
+  diff, magnitude, unequal, equal, selected, priority_vector, scaled_priority = range(next_slot, next_slot+7); next_slot += 7
+  digit_slots = tuple(range(next_slot, next_slot+digits)); next_slot += digits
+  high_scaled = next_slot; next_slot += 1
+  byte_slots = tuple(range(next_slot, next_slot+(digits+1)//2)); next_slot += len(byte_slots)
+  int_tiles = next_slot; next_slot += 1
+  int_slots = tuple(range(next_slot, next_slot+len(byte_slots))); next_slot += len(int_slots)
+
+  gathers = tuple(replace(plan, dst_index=candidates_slot, dst_addend=candidate*vector_lanes)
+                  for candidate,plan in enumerate(plans))
+  gathers += tuple(replace(extrema_plan, dst_index=extrema_slot, dst_addend=candidate*vector_lanes)
+                   for candidate in range(window))
+  gathers += _stripe_gathers(plans[0].src_index, priority_slot, count, half_bits(priorities), vector_lanes, values=True)
+  for slot,rows in zip(encoded_slots, encoded):
+    gathers += _stripe_gathers(plans[0].src_index, slot, count, half_bits(rows), vector_lanes, values=True)
+
+  scratch_sizes = [_scratch_bytes(matrix_lanes)] * next_slot
+  scratch_sizes[int_tiles] = ((count+3)//4)*64
+  for slot in int_slots: scratch_sizes[slot] = max(count*4, 64)
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops:list[RKEWOp] = []
+  equal_arg = _ew_eq_mask(ops, arg, candidates_slot, extrema_slot, (diff, magnitude, unequal, equal), one, matrix_lanes)
+  ops.append(RKEWOp(arg(selected), equal_arg, arg(priority_slot), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+  priority = _reduce_rows(ops, [arg(selected, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.MAX])
+  ops.extend((RKEWOp(arg(priority_vector), priority, arg(zero), count, _EW_CFG[Ops.ADD]),
+              RKEWOp(arg(scaled_priority), arg(priority_vector), arg(radix), count, _EW_CFG[Ops.MUL])))
+  for encoded_slot,digit_slot in zip(encoded_slots, digit_slots):
+    ops.append(RKEWOp(arg(selected), equal_arg, arg(encoded_slot), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+    encoded_digit = _reduce_rows(ops, [arg(selected, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.MAX])
+    ops.append(RKEWOp(arg(digit_slot), encoded_digit, arg(scaled_priority), count, _EW_CFG[Ops.SUB]))
+  for byte,byte_slot in enumerate(byte_slots):
+    low, high = digit_slots[byte*2], digit_slots[byte*2+1] if byte*2+1 < digits else None
+    if high is not None:
+      ops.extend((RKEWOp(arg(high_scaled), arg(high), arg(radix), count, _EW_CFG[Ops.MUL]),
+                  RKEWOp(arg(byte_slot), arg(low), arg(high_scaled), count, _EW_CFG[Ops.ADD])))
+    else: ops.append(RKEWOp(arg(byte_slot), arg(low), arg(zero), count, _EW_CFG[Ops.ADD]))
+  ops.extend(RKEWOp(arg(dst), arg(src), arg(int_tiles), count, _EW_CFG[Ops.MAX], int32_output=True)
+             for src,dst in zip(byte_slots, int_slots))
+
+  post_gathers:list[RKGather] = [RKGather(0, out_slot, count*4, values=(0,)*(count*4), dst_kind=RKBufferKind.ARG, itemsize=1)]
+  byte_offsets = tuple(range(0, count*4, 4))
+  post_gathers.extend(RKGather(slot, out_slot, count, offsets=byte_offsets, partial=True, dst_stride=4, dst_addend=byte,
+                               dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
+                      for byte,slot in enumerate(int_slots))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<eee", 0.0, 1.0,
+                 float(_POOL_INDEX_DIGIT_RADIX)), gathers=gathers, ew_ops=tuple(ops), post_gathers=tuple(post_gathers))
+
 def _pool_index_image(out_slot:int, count:int, spatial_size:int, source_count:int, plans:tuple[RKGather, ...],
                       extrema_plan:RKGather, weights:tuple[tuple[int, ...], ...]) -> RKImage|None:
   """Validate static pool lanes and emit their descending-coordinate first-tie selection."""
-  if (not 2 <= len(plans) <= 2048 or spatial_size > 2048 or source_count < spatial_size or source_count % spatial_size or
+  if (not 2 <= len(plans) <= _FP16_EXACT_INTEGER or source_count < spatial_size or source_count % spatial_size or
       count % (source_count//spatial_size) or len(weights) != len(plans) or
       len({plan.src_index for plan in plans}) != 1 or extrema_plan.src_index == plans[0].src_index or
       sorted(_plan_offsets(extrema_plan)) != list(range(count))): return None
@@ -1291,6 +1364,8 @@ def _pool_index_image(out_slot:int, count:int, spatial_size:int, source_count:in
         row.append(offset%spatial_size); valid_lanes[lane] += 1
     coordinates.append(tuple(row))
   if any(valid < 1 for valid in valid_lanes): return None
+  if spatial_size > _FP16_EXACT_INTEGER:
+    return _wide_pool_index_image(out_slot, count, spatial_size, plans, extrema_plan, tuple(coordinates))
   return _cumulative_index_image(out_slot, count, plans, (extrema_plan,), False, [0]*count,
                                  first_tie=True, candidate_coords=tuple(coordinates), index_limit=spatial_size)
 
@@ -1334,7 +1409,7 @@ def _lower_loop_pool_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   _, out_param, count, out_index, value = output
   if count != 1 or _index_ranges(out_index) or (root:=_descending_index_root(value)) is None: return None
   spatial_size, selected = root
-  if spatial_size > 2048 or selected.op is not Ops.LOAD: return None
+  if selected.op is not Ops.LOAD: return None
   ranges = [u for u in uops if u.op is Ops.RANGE]
   local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
   if len(ranges) != 1 or ranges[0].src[0].op is not Ops.CONST or len(local_stores) != 2: return None
