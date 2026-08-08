@@ -581,3 +581,26 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - `sz.py`: renderer 501 executable lines, runtime 165; comments and docstrings retained.
 
 Across the complete monolithic run, `CmaFree` stayed at 6144 KiB and the kernel logged no CMA allocation failure, RKNPU timeout, invalid IRQ, IOMMU fault, or oops. The allocator safety prerequisite is therefore cleared. The next performance target is the fresh-process `test_simple_conv_transpose3d` node, previously measured at 65.21 s.
+
+---
+
+## 2026-08-08 — Vectorized static gather planning removes ConvTranspose3D compile stall
+
+`TestRockchipConvOps.test_simple_conv_transpose3d` previously passed but took **65.21 s** in a fresh pytest process. `DEBUG=2` separated the device work from compilation: scheduling took 182.05 ms, two uploads took 0.25 ms total, and the DPU program took 271.54 ms. Almost the entire remaining minute was Rockchip renderer CPU time.
+
+A CPU profile measured 112.88 s under profiling in `lower_ew`. The 108 masked convolution gathers called the scalar index interpreter 58.6 million times; `_eval_expr` consumed 108.43 s. Per-output expression memoization reduced the ordinary test from 65.21 s to 45.16 s, confirming repeated static-index evaluation as the cause but not removing enough Python iteration.
+
+Rockchip now evaluates complete static gather-index vectors with NumPy. RANGE values, typed casts, comparisons, masks, integer division/modulo, and affine output addresses are computed as vectorized layout metadata. This remains host integer address preparation only: no input-dependent FP16 value, convolution product, sum, or activation is computed on CPU. The existing runtime gather copies FP16 bit patterns according to those offsets, and all numeric convolution work still runs through DPU EW.
+
+Results after vectorization:
+
+- ConvTranspose3D pytest time: **6.32 s** (down from 65.21 s, 10.3x faster).
+- Shell wall time including imports: **8.604 s**.
+- Scheduling: 170.26 ms; NPU program: 274.85 ms.
+- Complete monolithic Rockchip census: **104 passed, 9 skipped, 96 subtests passed in 67.19 s** (down from 169.07 s after cache-sync enablement).
+- Focused nearest/AvgPool/ConvTranspose regressions: **4 passed in 7.38 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 552 executable lines, runtime 165; comments and docstrings retained.
+
+The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. Every individual Rockchip node is again below 30 seconds.

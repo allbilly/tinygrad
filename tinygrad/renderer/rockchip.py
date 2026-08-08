@@ -1,6 +1,7 @@
 from __future__ import annotations
 # ruff: noqa: E702
 import base64, os, struct
+import numpy as np
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable
@@ -174,30 +175,74 @@ def _eval_cast(value:int|float|bool, dtype:DType) -> int|float|bool:
   if dtype.scalar() is dtypes.float: return struct.unpack("<f", struct.pack("<f", float(value)))[0]
   return float(value)
 
-def _eval_expr(u:UOp, env:dict[UOp, int]) -> int|float|bool:
-  if u.op is Ops.CONST: return _eval_cast(u.arg, u.dtype)
-  if u.op is Ops.RANGE: return env[u]
-  if u.op is Ops.CAST: return _eval_cast(_eval_expr(u.src[0], env), u.dtype)
-  if u.op is Ops.WHERE: return _eval_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env) else u.src[2], env), u.dtype)
-  lhs = _eval_expr(u.src[0], env)
-  if u.op is Ops.RECIPROCAL: return _eval_cast(1.0 / float(lhs), u.dtype)
-  if u.op is Ops.TRUNC: return _eval_cast(int(lhs), u.dtype)
-  rhs = _eval_expr(u.src[1], env)
-  if u.op is Ops.ADD: return _eval_cast(lhs + rhs, u.dtype)
-  if u.op is Ops.MUL: return _eval_cast(lhs * rhs, u.dtype)
-  if u.op is Ops.SUB: return _eval_cast(lhs - rhs, u.dtype)
-  if u.op is Ops.CDIV: return _eval_cast(cdiv(int(lhs), int(rhs)), u.dtype)
-  if u.op is Ops.CMOD: return _eval_cast(cmod(int(lhs), int(rhs)), u.dtype)
-  if u.op is Ops.FLOORDIV: return _eval_cast(floordiv(int(lhs), int(rhs)), u.dtype)
-  if u.op is Ops.FLOORMOD: return _eval_cast(floormod(int(lhs), int(rhs)), u.dtype)
-  if u.op is Ops.MAX: return _eval_cast(max(lhs, rhs), u.dtype)
-  if u.op is Ops.CMPLT: return lhs < rhs
-  if u.op is Ops.CMPNE: return lhs != rhs
-  if u.op is Ops.AND: return _eval_cast(int(lhs) & int(rhs), u.dtype)
-  if u.op is Ops.OR: return _eval_cast(int(lhs) | int(rhs), u.dtype)
-  raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+def _eval_expr(u:UOp, env:dict[UOp, int], cache:dict[UOp, int|float|bool]) -> int|float|bool:
+  if u in cache: return cache[u]
+  if u.op is Ops.CONST: ret = _eval_cast(u.arg, u.dtype)
+  elif u.op is Ops.RANGE: ret = env[u]
+  elif u.op is Ops.CAST: ret = _eval_cast(_eval_expr(u.src[0], env, cache), u.dtype)
+  elif u.op is Ops.WHERE:
+    ret = _eval_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype)
+  else:
+    lhs = _eval_expr(u.src[0], env, cache)
+    if u.op is Ops.RECIPROCAL: ret = _eval_cast(1.0 / float(lhs), u.dtype)
+    elif u.op is Ops.TRUNC: ret = _eval_cast(int(lhs), u.dtype)
+    else:
+      rhs = _eval_expr(u.src[1], env, cache)
+      if u.op is Ops.ADD: ret = _eval_cast(lhs + rhs, u.dtype)
+      elif u.op is Ops.MUL: ret = _eval_cast(lhs * rhs, u.dtype)
+      elif u.op is Ops.SUB: ret = _eval_cast(lhs - rhs, u.dtype)
+      elif u.op is Ops.CDIV: ret = _eval_cast(cdiv(int(lhs), int(rhs)), u.dtype)
+      elif u.op is Ops.CMOD: ret = _eval_cast(cmod(int(lhs), int(rhs)), u.dtype)
+      elif u.op is Ops.FLOORDIV: ret = _eval_cast(floordiv(int(lhs), int(rhs)), u.dtype)
+      elif u.op is Ops.FLOORMOD: ret = _eval_cast(floormod(int(lhs), int(rhs)), u.dtype)
+      elif u.op is Ops.MAX: ret = _eval_cast(max(lhs, rhs), u.dtype)
+      elif u.op is Ops.CMPLT: ret = lhs < rhs
+      elif u.op is Ops.CMPNE: ret = lhs != rhs
+      elif u.op is Ops.AND: ret = _eval_cast(int(lhs) & int(rhs), u.dtype)
+      elif u.op is Ops.OR: ret = _eval_cast(int(lhs) | int(rhs), u.dtype)
+      else: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+  cache[u] = ret
+  return ret
 
-def _eval_int(u:UOp, env:dict[UOp, int]) -> int: return int(_eval_expr(u, env))
+def _eval_int(u:UOp, env:dict[UOp, int], cache:dict[UOp, int|float|bool]|None=None) -> int:
+  return int(_eval_expr(u, env, {} if cache is None else cache))
+
+def _vector_cast(value, dtype:DType) -> np.ndarray:
+  return np.asarray(value, dtype=np.dtype(dtype.scalar().fmt) if dtype.scalar().fmt is not None else None)
+
+def _eval_vector(u:UOp, env:dict[UOp, np.ndarray], cache:dict[UOp, np.ndarray]) -> np.ndarray:
+  if u in cache: return cache[u]
+  if u.op is Ops.CONST: ret = _vector_cast(u.arg, u.dtype)
+  elif u.op is Ops.RANGE: ret = env[u]
+  elif u.op is Ops.CAST: ret = _vector_cast(_eval_vector(u.src[0], env, cache), u.dtype)
+  elif u.op is Ops.WHERE:
+    ret = _vector_cast(np.where(_eval_vector(u.src[0], env, cache), _eval_vector(u.src[1], env, cache),
+                                _eval_vector(u.src[2], env, cache)), u.dtype)
+  else:
+    lhs = _eval_vector(u.src[0], env, cache)
+    if u.op is Ops.RECIPROCAL: ret = _vector_cast(1.0 / lhs, u.dtype)
+    elif u.op is Ops.TRUNC: ret = _vector_cast(np.trunc(lhs), u.dtype)
+    else:
+      rhs = _eval_vector(u.src[1], env, cache)
+      if u.op is Ops.ADD: ret = _vector_cast(lhs + rhs, u.dtype)
+      elif u.op is Ops.MUL: ret = _vector_cast(lhs * rhs, u.dtype)
+      elif u.op is Ops.SUB: ret = _vector_cast(lhs - rhs, u.dtype)
+      elif u.op in (Ops.CDIV, Ops.CMOD):
+        with np.errstate(divide="ignore", invalid="ignore"):
+          quotient = np.where(rhs != 0, np.trunc(lhs / rhs), 0)
+        ret = _vector_cast(quotient if u.op is Ops.CDIV else lhs-quotient*rhs, u.dtype)
+      elif u.op in (Ops.FLOORDIV, Ops.FLOORMOD):
+        quotient = np.zeros(np.broadcast_shapes(lhs.shape, rhs.shape), dtype=np.result_type(lhs, rhs))
+        np.floor_divide(lhs, rhs, out=quotient, where=rhs != 0)
+        ret = _vector_cast(quotient if u.op is Ops.FLOORDIV else lhs-quotient*rhs, u.dtype)
+      elif u.op is Ops.MAX: ret = _vector_cast(np.maximum(lhs, rhs), u.dtype)
+      elif u.op is Ops.CMPLT: ret = lhs < rhs
+      elif u.op is Ops.CMPNE: ret = lhs != rhs
+      elif u.op is Ops.AND: ret = _vector_cast(np.bitwise_and(lhs, rhs), u.dtype)
+      elif u.op is Ops.OR: ret = _vector_cast(np.bitwise_or(lhs, rhs), u.dtype)
+      else: raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+  cache[u] = ret
+  return ret
 
 _STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.TRUNC, Ops.WHERE,
                Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.MAX}
@@ -226,9 +271,10 @@ def _static_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
   values:list[int|None] = [None] * count
   for env in _iter_range_env(ranges):
-    dst = _eval_int(out_index, env)
+    cache:dict[UOp, int|float|bool] = {}
+    dst = _eval_int(out_index, env, cache)
     if not 0 <= dst < count: raise RuntimeError("RKPLAN_REJECT:static_index")
-    bits = struct.unpack("<H", struct.pack("<e", float(_eval_expr(expr, env))))[0]
+    bits = struct.unpack("<H", struct.pack("<e", float(_eval_expr(expr, env, cache))))[0]
     if values[dst] is not None and values[dst] != bits: raise RuntimeError("RKPLAN_REJECT:static_index")
     values[dst] = bits
   if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")
@@ -255,14 +301,21 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
   ranges = _index_ranges(out_index)
   if any(r not in ranges for r in _index_ranges(load_index) + ([] if gate is None else _index_ranges(gate))):
     raise RuntimeError("RKPLAN_REJECT:gather_index")
-  offsets = [-2] * count
-  for env in _iter_range_env(ranges):
-    dst, src = _eval_int(out_index, env), _eval_int(load_index, env)
-    if not (0 <= dst < count): raise RuntimeError("RKPLAN_REJECT:gather_index")
-    offsets[dst] = src if gate is None or _eval_int(gate, env) else -1
-    if offsets[dst] < -1: raise RuntimeError("RKPLAN_REJECT:gather_index")
-  if any(offset == -2 for offset in offsets): raise RuntimeError("RKPLAN_REJECT:gather_index")
-  return tuple(offsets)
+  envs = _iter_range_env(ranges)
+  vector_env = {r: np.fromiter((env[r] for env in envs), dtype=np.int64, count=len(envs)) for r in ranges}
+  cache:dict[UOp, np.ndarray] = {}
+  out_affine = _affine_index(out_index)
+  if out_affine is None: dst = np.broadcast_to(_eval_vector(out_index, vector_env, cache), len(envs)).astype(np.int64)
+  else:
+    dst = np.full(len(envs), out_affine[0], dtype=np.int64)
+    for r,stride in out_affine[1].items(): dst += vector_env[r]*stride
+  src = np.broadcast_to(_eval_vector(load_index, vector_env, cache), len(envs)).astype(np.int64)
+  values = src if gate is None else np.where(np.broadcast_to(_eval_vector(gate, vector_env, cache), len(envs)), src, -1)
+  if np.any((dst < 0) | (dst >= count)) or np.any(values < -1): raise RuntimeError("RKPLAN_REJECT:gather_index")
+  offsets = np.full(count, -2, dtype=np.int64)
+  offsets[dst] = values
+  if np.any(offsets == -2): raise RuntimeError("RKPLAN_REJECT:gather_index")
+  return tuple(int(x) for x in offsets)
 
 def _gather_plan(src_index:int, dst_scratch:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
   out_affine, load_affine = _affine_index(out_index), _affine_index(load_index)
