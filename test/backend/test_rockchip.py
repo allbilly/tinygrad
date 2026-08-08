@@ -706,6 +706,20 @@ class TestRockchipSignOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipClassificationOps(unittest.TestCase):
+  """FP16 IEEE predicates computed as DPU masks and packed through the typed bool-output ABI."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_isinf = _test_ops.TestOps.test_isinf
+  test_isnan = _test_ops.TestOps.test_isnan
+  test_isfinite = _test_ops.TestOps.test_isfinite
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipWhereOps(unittest.TestCase):
   """FP16 WHERE and masked arithmetic lowered to DPU comparison masks and selection."""
 

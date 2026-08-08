@@ -2,7 +2,7 @@ from __future__ import annotations
 # ruff: noqa: E702
 import base64, math, os, struct
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Callable
 from tinygrad.device import Compiler
@@ -12,7 +12,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 24
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 25
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
@@ -59,7 +59,7 @@ class RKEWOp:
   """One contiguous FP16 DPU elementwise operation."""
   dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int
   submit_barrier: bool = False; compare: bool = False; stateful: bool = False
-  int32_output: bool = False; int32_input: bool = False
+  int32_output: bool = False; int32_input: bool = False; bool_output: bool = False
 
 @dataclass(frozen=True)
 class RKImage:
@@ -89,7 +89,9 @@ def encode_image(image:RKImage) -> bytes:
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
   for op in image.ew_ops:
-    op_flags = int(op.submit_barrier) | int(op.compare)<<1 | int(op.stateful)<<2 | int(op.int32_output)<<3 | int(op.int32_input)<<4
+    if op.bool_output and not op.int32_output: raise ValueError("bool output requires INT32 conversion")
+    op_flags = (int(op.submit_barrier) | int(op.compare)<<1 | int(op.stateful)<<2 | int(op.int32_output)<<3 |
+                int(op.int32_input)<<4 | int(op.bool_output)<<5)
     out += _EWOP.pack(int(op.dst.kind), op_flags, op.dst.index,
                       int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
     out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
@@ -127,12 +129,14 @@ def decode_image(blob:bytes) -> RKImage:
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
-    if op_flags & ~0x1f or op_flags & 0x18 == 0x18: raise ValueError("invalid RKEWOp flags")
+    if op_flags & ~0x3f or op_flags & 0x18 == 0x18 or op_flags & 0x20 and not op_flags & 0x08:
+      raise ValueError("invalid RKEWOp flags")
     count, ew_cfg = _EWOP2.unpack_from(blob, off); off += _EWOP2.size
     da, la, ra = struct.unpack_from("<iii", blob, off); off += 12
     ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
                          RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg,
-                         bool(op_flags & 1), bool(op_flags & 2), bool(op_flags & 4), bool(op_flags & 8), bool(op_flags & 16)))
+                         bool(op_flags & 1), bool(op_flags & 2), bool(op_flags & 4), bool(op_flags & 8), bool(op_flags & 16),
+                         bool(op_flags & 32)))
   fill = None
   if flags & 1:
     dst_kind, itemsize, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
@@ -1469,7 +1473,73 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
                                  extrema_plans, negated_candidates, list(range(count)))
 
+def _lower_ieee_predicate(uops:list[UOp]) -> RKImage|None:
+  """Classify FP16 NaN/infinity on DPU and expose the final 0/1 mask through the bool ABI."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1 or stores[0].src[0].op is not Ops.INDEX or \
+     (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.bool or \
+     out_param.src[0].op is not Ops.CONST: return None
+  store, root = stores[0], stores[0].src[1]
+
+  def logical_not(u:UOp) -> UOp|None:
+    if u.op is not Ops.CMPNE: return None
+    for value, marker in (u.src, u.src[::-1]):
+      if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg): return value
+    return None
+
+  def atom(u:UOp) -> tuple[UOp, str]|None:
+    if u.op is Ops.CMPNE and u.src[0].key == u.src[1].key and u.src[0].op is Ops.LOAD and \
+       u.src[0].dtype.scalar() is dtypes.half: return u.src[0], "nan"
+    if (unequal:=logical_not(u)) is None or unequal.op is not Ops.CMPNE: return None
+    for load, constant in (unequal.src, unequal.src[::-1]):
+      if (load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and constant.op is Ops.CONST and
+          math.isinf(value:=float(constant.arg))): return load, "positive_inf" if value > 0 else "negative_inf"
+    return None
+
+  def union(u:UOp) -> list[tuple[UOp, str]]|None:
+    if (parsed:=atom(u)) is not None: return [parsed]
+    if u.op is not Ops.OR: return None
+    lhs, rhs = union(u.src[0]), union(u.src[1])
+    return None if lhs is None or rhs is None else lhs+rhs
+
+  matches, inverted = union(root), False
+  if matches is None and (inner:=logical_not(root)) is not None: matches, inverted = union(inner), True
+  if matches is None or len({load.key for load,_ in matches}) != 1: return None
+  tags = frozenset(tag for _,tag in matches)
+  if inverted:
+    if tags != {"nan", "positive_inf", "negative_inf"}: return None
+    kind = "finite"
+  else:
+    kinds = {frozenset(("nan",)):"nan", frozenset(("positive_inf",)):"positive_inf",
+             frozenset(("negative_inf",)):"negative_inf",
+             frozenset(("positive_inf", "negative_inf")):"inf"}
+    if tags not in kinds: return None
+    kind = kinds[tags]
+
+  source = matches[0][0]
+  positive_inf = _positive_mask(source.alu(Ops.SUB, UOp.const(65504.0, dtypes.half)))
+  negative_inf = _positive_mask(UOp.const(-65504.0, dtypes.half).alu(Ops.SUB, source))
+  either, both = positive_inf.alu(Ops.MAX, negative_inf), _mask_mul(positive_inf, negative_inf)
+  value = (both if kind == "nan" else UOp.const(1.0, dtypes.half).alu(Ops.SUB, either) if kind == "finite" else
+           (positive_inf if kind == "positive_inf" else negative_inf if kind == "negative_inf" else either).alu(Ops.SUB, both))
+
+  count, out_slot = int(out_param.src[0].arg), out_param.arg.slot
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
+  half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
+  image = lower_ew(list(store.replace(src=(half_index, value, *store.src[2:])).toposort()))
+  terminal = [i for i,op in enumerate(image.ew_ops) if op.dst.kind is RKBufferKind.ARG and op.dst.index == out_slot]
+  if terminal != [len(image.ew_ops)-1] or image.fill is not None or image.post_gathers:
+    raise RuntimeError("RKPLAN_REJECT:predicate_terminal")
+  result_slot, tiles_slot = len(image.scratch), len(image.scratch)+1
+  result, tiles = RKArg(RKBufferKind.SCRATCH, result_slot), RKArg(RKBufferKind.SCRATCH, tiles_slot)
+  ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
+         RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, tiles, count, _EW_CFG[Ops.MAX],
+                stateful=True, int32_output=True, bool_output=True))
+  return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(((count+3)//4)*64)), ew_ops=ops)
+
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (predicate:=_lower_ieee_predicate(uops)) is not None: return predicate
   if (sort_compare:=_lower_sort_compare(uops)) is not None: return sort_compare
   if (occurrence_count:=_lower_occurrence_count(uops)) is not None: return occurrence_count
   if (sort_index:=_lower_sort_index_selection(uops)) is not None: return sort_index

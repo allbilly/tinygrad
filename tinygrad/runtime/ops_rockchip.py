@@ -123,7 +123,7 @@ class RockchipProgram(Program['RockchipDevice']):
     if op.rhs.kind is not RKBufferKind.SCRATCH or (to_int32 and op.lhs.kind is not RKBufferKind.SCRATCH):
       raise RuntimeError("INT32 EW conversion requires scratch input and tile arena")
     source, tiles, dest = buffer(op.lhs.kind, op.lhs.index), buffer(op.rhs.kind, op.rhs.index), buffer(op.dst.kind, op.dst.index)
-    src_itemsize, dst_itemsize = (2, 4) if to_int32 else (4, 2)
+    src_itemsize, dst_itemsize = (2, 1 if op.bool_output else 4) if to_int32 else (4, 2)
     self.dev._sync_buffer(source, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     ctypes.memset(int(tiles.va_addr), 0, tiles.size)
     for tile,start in enumerate(range(0, op.count, 4)):
@@ -148,8 +148,13 @@ class RockchipProgram(Program['RockchipDevice']):
     if bodies: self._submit_pcchain(bodies)
     self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     for tile,start in enumerate(range(0, op.count, 4)):
-      ctypes.memmove(int(dest.va_addr)+op.dst.addend+start*dst_itemsize, int(tiles.va_addr)+op.rhs.addend+tile*64,
-                     min(4, op.count-start)*dst_itemsize)
+      lanes = min(4, op.count-start)
+      if op.bool_output:
+        for lane in range(lanes):
+          ctypes.memmove(int(dest.va_addr)+op.dst.addend+start+lane, int(tiles.va_addr)+op.rhs.addend+tile*64+lane*4, 1)
+      else:
+        ctypes.memmove(int(dest.va_addr)+op.dst.addend+start*dst_itemsize, int(tiles.va_addr)+op.rhs.addend+tile*64,
+                       lanes*dst_itemsize)
     self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     self.dev.reset_npu()
 

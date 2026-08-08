@@ -1866,3 +1866,32 @@ seconds without a backend, runtime, or Tinygrad core change.
 The CPU-cheat audit found no backend or runtime diff. NumPy and Torch appear only in the test oracle; NPU values and
 indices still come from DPU EW and the existing raw-lane layout machinery. There is no LUT, CMAC, CNA, PPU, tinygrad
 core change, or tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-09 — native FP16 IEEE classification and typed bool output
+
+The unchanged upstream `test_isnan`, `test_isinf`, and `test_isfinite` methods now join the Rockchip census. The
+`test_isinf` method also covers positive-only and negative-only detection. A strict graph recognizer accepts only
+Tinygrad's canonical `x != x`, equality-to-`±inf`, their OR, and the finite complement over one FP16 input.
+
+Classification uses the DPU positive-mask primitive around the largest finite half value. Positive and negative
+overflow masks identify `+inf` and `-inf`; their intersection identifies NaN because the proven RK3588 comparison
+pipeline marks NaN in both directions. DPU MAX, MUL, and SUB then form the requested 0/1 predicate. The final FP16 mask
+is converted to INT32 by the existing typed DPU conversion. Runtime packs the public one-byte bool ABI by copying only
+the low byte of each little-endian INT32 lane; it performs no comparison, cast, classification, or value-dependent
+branch on the CPU.
+
+Historical branch `rockchip-2608` milestone `091df1bd8` supplied the proven mask formula, but its runtime used NumPy
+`!= 0` to produce bool values and was therefore not ported. `~/npu/include/old/rknn_ops.md` lists model-level IsInf and
+IsNaN as unsupported, while `~/rk3588` provides no separate native classification example. The current implementation
+reuses only the already-proven DPU comparison and typed-conversion register paths.
+
+- Each seven-element predicate probe: **6 submits**, **7–9 DPU tasks**, and **0.55–0.65 s** warm-process wall time.
+- Focused canonical classification class: **3 passed in 5.67 s**, sequentially.
+- Complete Rockchip census: **325 passed, 11 skipped, 180 subtests passed in 337.66 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,846/274 executable lines**.
+
+The CPU-cheat audit found only raw memory movement for the public bool representation. All classification and FP16-to-
+integer conversion occur on DPU EW. There is no LUT, CMAC, CNA, PPU, Tinygrad core change, or tolerance relaxation.
