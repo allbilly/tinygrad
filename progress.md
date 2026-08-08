@@ -751,3 +751,17 @@ Four source-order `TestOps` methods were admitted and run individually: `test_ne
 - `mypy tinygrad/`: pass (216 source files).
 
 The next source-order method is `test_zeros`.
+
+---
+
+## 2026-08-08 — Creation methods through `test_eye`
+
+Six more source-order methods were admitted and run individually: `test_zeros`, `test_zeros_like`, `test_empty_0`, `test_ones`, `test_ones_like`, and `test_eye`. Uniform values use typed raw constant fill. `test_empty_0` folds to a constant NaN fill. Eye matrices are geometry-only FP16 static vectors followed by DPU EW pass-through, not CPU-generated numeric outputs.
+
+- Individual methods: all pass in 2.66–3.03 s.
+- Complete incremental creation/validation group: **12 passed in 3.15 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+The next source-order method is `test_split`.

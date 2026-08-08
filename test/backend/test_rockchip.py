@@ -368,6 +368,12 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_negative_dims_full = _test_ops.TestOps.test_negative_dims_full
   test_negative_dims_eye = _test_ops.TestOps.test_negative_dims_eye
   test_negative_dims_kaiming = _test_ops.TestOps.test_negative_dims_kaiming
+  test_zeros = _test_ops.TestOps.test_zeros
+  test_zeros_like = _test_ops.TestOps.test_zeros_like
+  test_empty_0 = _test_ops.TestOps.test_empty_0
+  test_ones = _test_ops.TestOps.test_ones
+  test_ones_like = _test_ops.TestOps.test_ones_like
+  test_eye = _test_ops.TestOps.test_eye
 
 if __name__ == "__main__":
   unittest.main()
