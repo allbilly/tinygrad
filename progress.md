@@ -1102,3 +1102,17 @@ supplies the golden while tinygrad expresses the same operation with fixed kerne
 
 Both cases reuse the existing raw FP16 gather plus DPU EW reduction path. No backend or shared core change, host numeric
 operation, CMAC, CNA, or PPU execution was added.
+
+---
+
+## 2026-08-08 — FP16 polynomial and simple loss expressions
+
+The Rockchip census now covers square, cubic, a Horner-form quadratic, mean-squared error, and mean absolute error from
+the proven `rockchip/post-518-reference` group. They compose the existing FP16 ADD, MUL, ABS, and reduction paths; BCE
+and NLL remain outside this group because they require transcendental or indexed semantics. FP32 is used only by the
+PyTorch golden for the loss reductions and is then cast to the FP16 device contract.
+
+- Polynomial/simple-loss census: **4 passed in 2.98 s**, sequentially on one NPU process.
+- Tolerance remains exactly `atol=5e-3, rtol=5e-3`.
+- Rockchip execution uses only DPU EW; no backend/core change, host tensor arithmetic, CMAC, CNA, or PPU execution was
+  added.
