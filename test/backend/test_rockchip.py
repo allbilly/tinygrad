@@ -1144,6 +1144,17 @@ class TestRockchipReductionOps(unittest.TestCase):
     _fp16_test_op([(3,4,5,6)], lambda x: x.max(axis=1)[0], lambda x: x.max(axis=1))
     _fp16_test_op([()], lambda x: x.max())
 
+  def test_max_nan(self):
+    before = Device["ROCKCHIP"].submit_count
+    for values in ([1.0, math.nan], [math.nan, 1.0]):
+      self.assertTrue(math.isnan(Tensor(np.array(values, dtype=np.float16)).max().item()))
+    values = np.array([[1.0, math.nan], [2.0, 3.0]], dtype=np.float16)
+    for reduction,finite in ((Tensor.max, 3.0), (Tensor.min, 2.0)):
+      result = reduction(Tensor(values), axis=1).numpy()
+      self.assertTrue(math.isnan(result[0]))
+      self.assertEqual(result[1], finite)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
+
   def test_sum_full(self):
     before = Device["ROCKCHIP"].submit_count
     with Context(NOOPT=1): _fp16_test_op([(16384)], lambda x: x.sum())

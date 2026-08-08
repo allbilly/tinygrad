@@ -2369,3 +2369,36 @@ The CPU-cheat audit found only compile-time UOp/index validation and raw `uint32
 gather mechanism already used for device-produced indices. Neither renderer nor runtime reads or interprets an FP16
 numeric value. There is no host tensor-value arithmetic, LUT, CMAC, CNA, PPU fallback, external non-FP16 input, Tinygrad
 core change, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — IEEE NaN propagation through FP16 extrema reductions
+
+The behavior named by upstream `test_max_nan` now runs actively in the Rockchip census even though the canonical test is
+globally skipped as broken by tinygrad issue #862. Runtime FP16 inputs cover NaN in both operand orders for scalar MAX,
+plus row-wise MAX and MIN with one NaN row and one finite control row. Every case propagates NaN exactly where required,
+preserves the finite result, and executes as one native DPU EW reduction task; the method asserts **4 ioctls total**.
+
+No Rockchip-specific NaN-extrema implementation exists in the other Tinygrad branches, `~/npu`, or `~/rk3588`. The
+existing RK3588 EW MAX configuration already has the required propagation behavior, so this is intentionally a test-only
+milestone with no renderer/runtime special case.
+
+The remaining large ellipsis-einsum case was investigated further but is still excluded. A temporary hierarchical
+layout reduced it from 27,648 gathers and 27,647 logical EW stages to two affine transposes, 15 logical stages, and 901
+hardware tiles. One 901-task ioctl hit the six-second driver timeout; splitting at the natural MUL/reduction boundary
+completed as two jobs in about six seconds, after which the vendor health check passed 60/60. Plain FP16 pairwise
+accumulation nevertheless missed 20/224 outputs at the permitted tolerance, with maximum absolute error 0.25. Modeling
+confirmed that even an exact sum of FP16-rounded products fails, so FP16 product residuals are required. The TRM exposes
+either EW ALU or MUL per stage rather than a two-input FMA; the non-LUT Dekker path would require more than 11,000 tiled
+tasks before compensated accumulation. It was therefore removed instead of admitting inaccurate or >30-second code.
+
+- Focused NaN-extrema regression: **1 passed in 3.16 s**, sequentially.
+- Complete reduction class: **28 passed, 1 skipped in 22.71 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **359 passed, 11 skipped, 180 subtests passed in
+  402.53 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused work and after the census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,947/274 executable lines**.
+
+The CPU-cheat audit found no renderer, runtime, or Tinygrad-core change. All input-dependent extrema arithmetic executes
+on DPU EW; Python only asserts the returned scalar/array values. There is no host tensor-value arithmetic, LUT, CMAC,
+CNA, PPU fallback, external non-FP16 input, tolerance relaxation, or committed experimental einsum path.
