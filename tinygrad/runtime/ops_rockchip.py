@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_image, patch_stage, emit_ew_stage,
-  RKArg, _MAX_EW_ELEMS_FP16)
+  RKArg, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -100,7 +100,15 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _run_ew_ops(self, address) -> None:
     bodies:list[tuple[int, ...]] = []
-    for op in self.image.ew_ops:
+    for i, op in enumerate(self.image.ew_ops):
+      if op.ew_cfg & _EW_STAGE_FP32_OUT:
+        if i != len(self.image.ew_ops)-1: raise RuntimeError("FP32 EW output must be terminal")
+        if bodies: self._submit_pcchain(bodies)
+        stage = emit_ew_stage(op.dst, op.lhs, op.rhs, op.count, op.ew_cfg)
+        self._submit_pcchain([patch_stage(stage, address)])
+        self.dev.reset_npu()
+        bodies.clear()
+        continue
       for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
         count = min(_MAX_EW_ELEMS_FP16, op.count-start)
         offset = start*2
@@ -173,4 +181,5 @@ class RockchipDevice(Compiled):
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
+  def reset_npu(self): rk.DRM_IOCTL_RKNPU_ACTION(self.fd_ctl, flags=rk.RKNPU_ACT_RESET, value=0)
   def synchronize(self): pass

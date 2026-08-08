@@ -1135,3 +1135,25 @@ inputs only.
 
 No backend/core change, host tensor arithmetic, CMAC, CNA, or PPU execution was added. The full run produced no RKNPU
 timeout, invalid IRQ, IOMMU fault, reset, or kernel oops.
+
+---
+
+## 2026-08-08 — Terminal FP32 output for FP16 scalar reduction
+
+The exact upstream `test_sum_dtype_arg` is now admitted using the proven `rockchip/post-518-reference` DPU recipe. The
+input and complete balanced reduction tree remain FP16. Only the terminal scalar ADD sets DPU `OUT_PRECISION=5`, while
+`IN_PRECISION=2` and `PROC_PRECISION=2` remain FP16. No FP32 value is fed into another NPU task.
+
+The terminal output stage is isolated from the dynamically sized FP16 PC chain, giving two blocking submits for the
+135-element case. A successful terminal task is followed by one supported action reset so its scalar FP32 BS/WDMA state
+cannot leak into the next FP16 program. An explicit same-process `test_sum_dtype_arg → test_tiny_add` sequence passed.
+
+- Focused FP32-output test: **1 passed in 2.93 s**; expected submit count is exactly 2.
+- Post-cleanup FP32-output then FP16 transition: **2 passed in 3.05 s**.
+- Complete Rockchip census: **244 passed, 11 skipped, 96 subtests passed in 103.21 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.45 s after the full census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **840/173 executable lines**.
+
+The renderer only tags the terminal UOp and emits register commands; runtime performs no host numeric conversion or
+tensor arithmetic. There is no CMAC, CNA, PPU, shared core change, or tolerance relaxation. Kernel logs contain no new
+RKNPU timeout, invalid IRQ, IOMMU fault, or oops.

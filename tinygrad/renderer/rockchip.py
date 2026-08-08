@@ -148,6 +148,11 @@ _EW_CFG_RELU6 = _EW_CFG_COMMON | _EW_RELUX_EN
 _EW_CFG_MIN = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_MIN
 _EW_CFG_ABS = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ABS
 _EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_MUL_PRELU | _EW_OP_TYPE_MUL
+_EW_STAGE_FP32_OUT = 1 << 29  # software tag consumed by emit_ew_stage, never written to EW_CFG
+_DPU_DATA_FORMAT_FP16 = (2<<29)|(2<<26)|2
+_DPU_DATA_FORMAT_FP32_OUT = (5<<29)|(2<<26)|2
+_BS_BN_BYPASS = 1|(1<<1)|(1<<4)|(1<<6)
+_BS_OW_FP32_SCALAR = (1<<8)|(1<<5)|(1<<2)|(1<<1)
 _NATIVE_ABS, _NATIVE_LEAKY_RELU, _NATIVE_MIN, _NATIVE_RELU6 = \
   "rockchip_abs", "rockchip_leaky_relu", "rockchip_min", "rockchip_relu6"
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
@@ -160,14 +165,40 @@ _EW_CFG = {
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 
+def _emit_fp32_out_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
+  """Emit one terminal scalar stage with FP16 inputs and an FP32 output."""
+  if count != 1: raise ValueError(f"terminal EW fp32 count {count} out of range")
+  regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
+    (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
+    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_FP32_OUT),(_DPU,rk.REG_DPU_DST_SURF_STRIDE,1<<4),
+    (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,0),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
+    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,0),
+    (_DPU,rk.REG_DPU_BS_CFG,_BS_BN_BYPASS),(_DPU,rk.REG_DPU_BN_CFG,_BS_BN_BYPASS),
+    (_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),(_DPU,rk.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR),
+    (_DPU,rk.REG_DPU_WDMA_SIZE_0,0),(_DPU,rk.REG_DPU_WDMA_SIZE_1,0),(_DPU,rk.REG_DPU_BN_MUL_CFG,0),
+    (_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(_DPU,rk.REG_DPU_EW_CFG,ew_cfg),
+    (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
+    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,0),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,4<<4),
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,0),
+    (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|(2<<2)))
+  commands = [_cmd(*x) for x in regs]
+  relocs:list[RKReloc] = []
+  for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
+                           (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
+    relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
+  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(1<<3)|1))
+  return RKStage(tuple(commands), tuple(relocs))
+
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
-  """Build one contiguous FP16 DPU EW command body without its PC-chain tail."""
+  """Build one FP16-input DPU EW command body without its PC-chain tail."""
+  if ew_cfg & _EW_STAGE_FP32_OUT: return _emit_fp32_out_stage(dst, lhs, rhs, count, ew_cfg & ~_EW_STAGE_FP32_OUT)
   if not (0 < count <= _MAX_EW_ELEMS_FP16): raise ValueError(f"EW fp16 count {count} out of range")
   is_div = ew_cfg == _EW_CFG[Ops.FDIV]
   width = (count + 7) // 8 - 1
   regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
     (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
-    (_DPU,rk.REG_DPU_DATA_FORMAT,(2<<29)|(2<<26)|2),
+    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_FP16),
     (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,width),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
     (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(7<<16)|7),
     (_DPU,rk.REG_DPU_EW_CFG,ew_cfg)) + (((_DPU,rk.REG_DPU_EW_RELUX_CMP_VALUE,_EW_RELUX_CMP_RELU6),)
@@ -513,7 +544,8 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if len(global_stores) != 1 or len(ranges) != 1: return None
   store, out_param = global_stores[0]
   assert out_param is not None
-  if (out_param.dtype.scalar() is not dtypes.half or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
+  fp32_out = out_param.dtype.scalar() is dtypes.float
+  if (out_param.dtype.scalar() not in (dtypes.half, dtypes.float) or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
       store.src[0].op is not Ops.INDEX): return None
   reduce_range = ranges[0]
   if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
@@ -564,14 +596,17 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
     next_active:list[int] = []
     for i in range(0, len(active)-1, 2):
       lhs, rhs = active[i], active[i+1]
-      dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if len(active) == 2 and post_scale == 1.0 else RKArg(RKBufferKind.SCRATCH, data_slot, lhs)
-      ew_ops.append(RKEWOp(dst, RKArg(RKBufferKind.SCRATCH, data_slot, lhs), RKArg(RKBufferKind.SCRATCH, data_slot, rhs), 1, cfg))
+      final = len(active) == 2 and post_scale == 1.0
+      dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if final else RKArg(RKBufferKind.SCRATCH, data_slot, lhs)
+      ew_ops.append(RKEWOp(dst, RKArg(RKBufferKind.SCRATCH, data_slot, lhs), RKArg(RKBufferKind.SCRATCH, data_slot, rhs), 1,
+                          cfg | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
       next_active.append(lhs)
     if len(active) & 1: next_active.append(active[-1])
     active = next_active
   if post_scale != 1.0:
     ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), RKArg(RKBufferKind.SCRATCH, data_slot, active[0]),
-                         RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), 1, _EW_CFG[Ops.MUL]))
+                         RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), 1,
+                         _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
   constants = b"".join(struct.pack("<e", value) for value in const_values)
   scratch = tuple(RKScratch(2) for _ in const_values) + (RKScratch(input_count*64),)
   return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
