@@ -941,7 +941,8 @@ def _fold_masked_max(gate:UOp, default:UOp, val:UOp, opposite:bool) -> UOp|None:
     rhs = _fold_masked_max(gate, default, val.src[1], opposite)
     return None if lhs is None or rhs is None else val.replace(src=(lhs, rhs))
   if val.op is not Ops.LOAD or len(val.src) <= 2 or val.src[1].op is not Ops.CONST: return None
-  condition_matches = _opposite_condition(gate, val.src[2]) if opposite else _same_condition(gate, val.src[2])
+  def matches(condition:UOp) -> bool: return _opposite_condition(gate, condition) if opposite else _same_condition(gate, condition)
+  condition_matches = matches(val.src[2]) or (val.src[2].op is Ops.AND and any(matches(x) for x in val.src[2].src))
   if condition_matches:
     return val.replace(src=(val.src[0], default, val.src[2]))
   return None

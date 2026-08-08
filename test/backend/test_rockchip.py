@@ -510,6 +510,39 @@ class TestRockchipCumulativeProductOps(unittest.TestCase):
   test_cumprod_zero_axis = _test_ops.TestOps.test_cumprod_zero_axis
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipCumulativeExtremaValueOps(unittest.TestCase):
+  """FP16 cumulative extrema values; integer axis indices remain a separate output-format group."""
+
+  def _test_values(self, kind:str, cases:tuple[tuple[tuple[int, ...], int], ...]):
+    torch_fxn, tinygrad_fxn = (torch.cummax, Tensor.cummax) if kind == "max" else (torch.cummin, Tensor.cummin)
+    for shape, axis in cases:
+      with self.subTest(kind=kind, shape=shape, axis=axis):
+        _fp16_test_op([shape], lambda x, axis=axis: torch_fxn(x, dim=axis).values,
+                      lambda x, axis=axis: tinygrad_fxn(x, axis=axis)[0])
+
+  def test_small_cummax_values(self): self._test_values("max", (((10,), 0),))
+
+  @slow_test
+  def test_simple_cummax_values(self): self._test_values("max", (((512,), 0), ((1022,), 0)))
+
+  @slow_test
+  def test_cummax_values(self):
+    self._test_values("max", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
+
+  def test_cummax_values_zero_axis(self): self._test_values("max", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
+
+  def test_small_cummin_values(self): self._test_values("min", (((10,), 0),))
+
+  @slow_test
+  def test_simple_cummin_values(self): self._test_values("min", (((512,), 0), ((1022,), 0)))
+
+  @slow_test
+  def test_cummin_values(self):
+    self._test_values("min", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
+
+  def test_cummin_values_zero_axis(self): self._test_values("min", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

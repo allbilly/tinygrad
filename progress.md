@@ -1280,3 +1280,28 @@ an initially considered software bit tag and cannot leak into a hardware registe
 The CPU-cheat audit found no input decoding or host numeric product. NumPy evaluates only static UOp coordinates,
 source slots, masks, and fill-bit placement; runtime copies raw `uint16` lanes, and every multiplication executes on DPU
 EW. There is no CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — FP16 cumulative extrema values
+
+The Rockchip census now covers the value outputs for cumulative MAX and MIN across every shape and axis used by the
+four upstream methods for each operation: scalar and empty tensors, 1D lengths 10/512/1,022, 2D axes 0/1, and 3D axes
+2/-1. The corresponding upstream methods also request `int32` axis indices, which remain an explicit separate output-
+format group rather than being hidden or computed on the host.
+
+`~/npu` has no native cumulative-extrema implementation and `~/rk3588` supplies the upstream definitions. Historical
+Rockchip milestones `d407bb338` and `eb7c58c98` prove DPU compare/select implementations for both values and indices,
+but their large specialized runtime is not ported. The current compact generic MAX path already handled all value cases
+except the padded 1,022 tail. That tail wraps a MAX tree in a static mask whose individual load gates contain the inverse
+condition. `_fold_masked_max` now recognizes that conjunction and safely moves the MAX identity fallback into each load,
+leaving ordinary native DPU EW MAX stages.
+
+- Cumulative-extrema value group: **8 passed, 24 subtests passed in 23.86 s**, sequentially.
+- Complete Rockchip census: **274 passed, 11 skipped, 144 subtests passed in 148.30 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.37 s.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **927/176 executable lines**.
+
+The CPU-cheat audit found no runtime input decoding, comparison, or extrema calculation. The new rule is a renderer-only
+identity rewrite guarded by structural condition checks; all MAX and negate/MAX work executes on DPU EW. There is no
+CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation.
