@@ -340,6 +340,22 @@ for _name, _test in vars(_test_ops.TestOps).items():
     setattr(TestRockchipAvgPoolOps, _name, _test)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipAdaptivePoolOps(unittest.TestCase):
+  """Adaptive-pooling-equivalent divisible windows; tinygrad has no adaptive pooling API."""
+
+  def test_adaptive_avg_pool2d_equivalent(self):
+    _fp16_test_op([(1,3,4,4)], lambda x: torch.nn.functional.adaptive_avg_pool2d(x, (2,2)),
+                  lambda x: x.avg_pool2d(kernel_size=2, stride=2))
+    _fp16_test_op([(1,3,4,4)], lambda x: torch.nn.functional.adaptive_avg_pool2d(x, (1,1)),
+                  lambda x: x.avg_pool2d(kernel_size=4, stride=4))
+
+  def test_adaptive_max_pool2d_equivalent(self):
+    _fp16_test_op([(1,3,4,4)], lambda x: torch.nn.functional.adaptive_max_pool2d(x, (2,2)),
+                  lambda x: x.max_pool2d(kernel_size=2, stride=2))
+    _fp16_test_op([(1,3,4,4)], lambda x: torch.nn.functional.adaptive_max_pool2d(x, (1,1)),
+                  lambda x: x.max_pool2d(kernel_size=4, stride=4))
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

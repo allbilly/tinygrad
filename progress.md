@@ -1087,3 +1087,18 @@ exactly one submit. Arena growth allocates the replacement before releasing the 
 
 FP32, boolean, and integer reductions remain explicitly skipped because the NPU input path is FP16-only. The complete
 run and focused post-cleanup run produced no RKNPU timeout, invalid IRQ, IOMMU fault, reset, or kernel oops.
+
+---
+
+## 2026-08-08 — Adaptive-pooling-equivalent FP16 windows
+
+Tinygrad currently exposes no adaptive average/max pooling API, so the Rockchip census now covers the exact equivalent
+divisible-window cases from `rockchip/post-518-reference`: 4×4 to 2×2 and 4×4 to global 1×1. PyTorch adaptive pooling
+supplies the golden while tinygrad expresses the same operation with fixed kernel and stride pooling.
+
+- Adaptive-equivalent census: **2 passed in 3.04 s**, sequentially on one NPU process.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.38 s.
+- Tolerance remains exactly `atol=5e-3, rtol=5e-3`.
+
+Both cases reuse the existing raw FP16 gather plus DPU EW reduction path. No backend or shared core change, host numeric
+operation, CMAC, CNA, or PPU execution was added.
