@@ -896,6 +896,15 @@ class TestRockchipWhereOps(unittest.TestCase):
   test_inf_where = _test_ops.TestOps.test_inf_where
   test_masked_fill = _test_ops.TestOps.test_masked_fill
 
+  def test_where_permute(self):
+    before = Device["ROCKCHIP"].submit_count
+    _fp16_test_op([(5,5)], lambda x: torch.where(x > .5, 4, 2).type(torch.int32).permute((1,0)),
+                  lambda x: (x > .5).where(4, 2).clone().permute((1,0)), forward_only=True)
+    values = [[math.nan, math.inf, -math.inf], [-0., 0., 1.]]
+    _fp16_test_op(None, lambda x: torch.where(x > .5, 4, 2).type(torch.int32).permute((1,0)),
+                  lambda x: (x > .5).where(4, 2).clone().permute((1,0)), vals=[values], forward_only=True)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 24)
+
   def test_where_tensor(self):
     _fp16_test_op([(100,), (100,), (100,)], lambda x,a,b: torch.where(x > .1, a, b), lambda x,a,b: (x > .1).where(a, b),
                   forward_only=True)

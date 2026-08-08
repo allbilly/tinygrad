@@ -2172,3 +2172,37 @@ This is a test-only coverage milestone. The CPU-cheat audit found no renderer, r
 input-dependent vector multiplication and reciprocal runs on DPU EW; static constant fills and compile-time rank-zero
 folds do not inspect a runtime tensor buffer. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback,
 external non-FP16 input conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — permuted INT32 WHERE output from FP16 predicates
+
+Upstream `test_where_permute` now joins the Rockchip census. Its FP16 comparison selects the INT32 constants 4 and 2,
+then writes a transposed result. Coverage also includes a non-square matrix containing NaN, both infinities, positive
+and negative zero, and a finite true case, proving IEEE predicate behavior and the static transpose mapping.
+
+The renderer now shares one typed DPU output helper between public bool masks and exact FP16-valued INT32 expressions.
+A strict matcher accepts only a DPU-lowerable FP16 comparison and two constant INT32 arms whose affine selection is
+exactly representable in FP16. DPU EW computes `false + mask*(true-false)`, and the existing hardware FP16-to-INT32
+output-conversion stage writes the public result. Static permutation is expressed only by compile-time gather offsets.
+
+Each IEEE-safe comparison currently uses **12 barrier-separated ioctls**, so the two permanent cases assert **24
+ioctls**. The barriers come from the existing NaN/infinity classification and positive-mask stages, not CPU execution
+or command-buffer tiling. The method call takes **2.58 s**, well below the 30-second profiling threshold.
+
+Historical commit `297b6fdc0` was inspected but not ported: it writes four FP16 byte planes and reassembles INT32 values
+with NumPy in the runtime. The current backend already has direct DPU INT32 output conversion, so this implementation
+needs no host reassembly, typed runtime ABI extension, or image-format change. Exact `copysign` was also tested as the
+next candidate and remains excluded: RK3588 FDIV maps both `1/+0` and `1/-0` to positive infinity, losing the sign bit
+before Tinygrad's canonical signed-zero predicate; host bit inspection would violate the no-CPU-cheat rule.
+
+- Focused WHERE-permute coverage: **1 passed in 5.22 s**, sequentially.
+- Shared WHERE/classification/comparison/logical/reduction regression: **30 passed in 85.02 s**, sequentially.
+- Complete Rockchip census: **351 passed, 11 skipped, 180 subtests passed in 401.19 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,909/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. The renderer inspects only constant arms, dtypes, UOp
+structure, and static indexes; it never reads tensor values. Comparison, selection arithmetic, and FP16-to-INT32
+conversion execute on DPU EW. There is no host tensor-value evaluation or reassembly, LUT, CMAC, CNA, PPU fallback,
+external non-FP16 input conversion, or tolerance relaxation.

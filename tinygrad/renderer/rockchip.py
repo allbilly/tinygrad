@@ -1460,8 +1460,8 @@ def _lower_loop_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
   if source_count != rows*groups or sorted(offset for row in offsets for offset in row) != list(range(source_count)): return None
   return _bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op)
 
-def _typed_bool_image(output:RKOutput, value:UOp) -> RKImage:
-  """Lower an FP16 0/1 mask and pack its DPU-converted INT32 lanes into the public bool ABI."""
+def _typed_int_image(output:RKOutput, value:UOp, bool_output:bool=False) -> RKImage:
+  """Lower an exact FP16 integer expression and expose its DPU-converted INT32 lanes."""
   store, out_param, count, _, _ = output
   if count <= 0: return RKImage(RKTarget.RK3588)
   out_slot = out_param.arg.slot
@@ -1475,7 +1475,7 @@ def _typed_bool_image(output:RKOutput, value:UOp) -> RKImage:
   result, tiles = RKArg(RKBufferKind.SCRATCH, result_slot), RKArg(RKBufferKind.SCRATCH, tiles_slot)
   ops = (*image.ew_ops[:-1], replace(image.ew_ops[-1], dst=result),
          RKEWOp(RKArg(RKBufferKind.ARG, out_slot), result, tiles, count, _EW_CFG[Ops.MAX],
-                stateful=True, int32_output=True, bool_output=True))
+                stateful=True, int32_output=True, bool_output=bool_output))
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(((count+3)//4)*64)), ew_ops=ops)
 
 def _ieee_comparison_mask(root:UOp) -> UOp|None:
@@ -1532,6 +1532,21 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
     return None
   return mask(root)
 
+def _lower_int_where(output:RKOutput) -> RKImage|None:
+  """Select two exactly representable INT32 constants from an FP16 comparison and convert on DPU."""
+  root = output[4]
+  if root.op is not Ops.WHERE or root.dtype.scalar() is not dtypes.int: return None
+  if (condition:=_ieee_comparison_mask(root.src[0])) is None: return None
+  arms = root.src[1:]
+  if any(arm.op is not Ops.CONST or arm.dtype.scalar() is not dtypes.int for arm in arms): return None
+  yes, no = (int(arm.arg) for arm in arms)
+  delta = yes-no
+  try: exact = all(_eval_cast(value, dtypes.half) == value for value in (no, delta))
+  except (OverflowError, struct.error): return None
+  if not exact: return None
+  return _typed_int_image(output, condition.alu(Ops.MUL, UOp.const(float(delta), dtypes.half)).alu(
+    Ops.ADD, UOp.const(float(no), dtypes.half)))
+
 def _lower_ieee_predicate(output:RKOutput) -> RKImage|None:
   """Classify FP16 NaN/infinity on DPU and expose the final 0/1 mask through the bool ABI."""
   root = output[4]
@@ -1578,7 +1593,7 @@ def _lower_ieee_predicate(output:RKOutput) -> RKImage|None:
   value = (both if kind == "nan" else UOp.const(1.0, dtypes.half).alu(Ops.SUB, either) if kind == "finite" else
            (positive_inf if kind == "positive_inf" else negative_inf if kind == "negative_inf" else either).alu(Ops.SUB, both))
 
-  return _typed_bool_image(output, value)
+  return _typed_int_image(output, value, bool_output=True)
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
@@ -1587,7 +1602,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
                      fill=RKFill(RKArg(RKBufferKind.ARG, bool_output[1].arg.slot), bool_output[2], 1))
     if (bool_reduction:=_lower_unrolled_bool_reduction(bool_output)) is not None: return bool_reduction
     if (predicate:=_lower_ieee_predicate(bool_output)) is not None: return predicate
-    if (comparison:=_ieee_comparison_mask(bool_output[4])) is not None: return _typed_bool_image(bool_output, comparison)
+    if (comparison:=_ieee_comparison_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, comparison, bool_output=True)
   if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
      (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
   if (half_output:=_output_store(uops, dtypes.half)) is not None and \
@@ -1601,6 +1616,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if int_output is not None:
     if (cumulative_index:=_lower_cumulative_extrema_index(uops, int_output)) is not None: return cumulative_index
     if (arg_extrema:=_lower_unrolled_arg_extrema(int_output)) is not None: return arg_extrema
+    if (int_where:=_lower_int_where(int_output)) is not None: return int_where
   if int_loop_output is not None and (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output)) is not None: return loop_arg_extrema
   if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32
   if (loop:=_loop_reduction_match(uops)) is not None:
