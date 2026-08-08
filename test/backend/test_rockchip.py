@@ -720,6 +720,7 @@ class TestRockchipSignOps(unittest.TestCase):
 
   test_sign = _test_ops.TestOps.test_sign
   test_sign_exact = _test_ops.TestOps.test_sign_exact
+  test_copysign = _test_ops.TestOps.test_copysign
   test_softsign = _test_ops.TestOps.test_softsign
   test_softsign_exact = _test_ops.TestOps.test_softsign_exact
 

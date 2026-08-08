@@ -1669,3 +1669,25 @@ The CPU-cheat audit found only compile-time UOp/constant inspection and DPU comm
 it never reads predicates or selects tensor values. Every comparison, mask composition, selection multiply/add,
 threshold MIN/MAX, and infinity correction executes on DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or
 tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — finite FP16 copysign composition
+
+The unchanged upstream `test_copysign` now joins the Rockchip census. Its finite FP16 cases need no new backend
+primitive: Tinygrad composes the existing native ABS, DPU sign-mask construction, and DPU MUL path.
+
+Historical milestone `751a108e2` was inspected but deliberately not ported: it reads tensor sign bits with NumPy in the
+runtime, which violates the no-CPU-cheat rule. Exact signed-zero and nonfinite copysign remain outside this milestone.
+The current pure-DPU composition loses the negative sign of a zero magnitude, and RK3588 EW MUL returns NaN when one
+operand is infinity, so this milestone makes only the finite tolerance-based claim exercised by upstream
+`test_copysign`.
+
+- Focused sign/softsign/copysign group: **6 passed in 6.46 s**, sequentially.
+- Complete Rockchip census: **323 passed, 11 skipped, 200 subtests passed in 314.47 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,698/269 executable lines**.
+
+The CPU-cheat audit found no backend code change for copysign and no host value inspection. Absolute value, sign-mask
+construction, and multiplication execute entirely on DPU EW. There is no CMAC, CNA, PPU, tinygrad core change, or
+tolerance relaxation beyond the existing FP16 contract.
