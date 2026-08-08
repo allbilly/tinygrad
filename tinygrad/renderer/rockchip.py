@@ -341,7 +341,7 @@ def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int) -> RKArg|RKStatic|float
     param, index, gate = u.src[0].src[0], u.src[0].src[1], u.src[2] if len(u.src) > 2 else None
     if len(u.src) > 1 and u.src[1].op is not Ops.CONST: return None
     fill_bits = struct.unpack("<H", struct.pack("<e", float(u.src[1].arg) if len(u.src) > 1 else 0.0))[0]
-    if param.dtype.scalar() is not dtypes.half or param.arg.slot == oslot or param.src[0].op is not Ops.CONST: return None
+    if param.dtype.scalar() not in (dtypes.half, dtypes.float) or param.arg.slot == oslot or param.src[0].op is not Ops.CONST: return None
     if gate is None and index.key == out_index.key and int(param.src[0].arg) == count: return RKArg(RKBufferKind.ARG, param.arg.slot)
     return param, index, gate, fill_bits
   return None
@@ -418,7 +418,7 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
 def lower_ew(uops:list[UOp]) -> RKImage:
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
-  if (not stores or any(p is None or p.dtype.scalar() is not dtypes.half or p.src[0].op is not Ops.CONST for p in outs) or
+  if (not stores or any(p is None or p.dtype.scalar() not in (dtypes.half, dtypes.float) or p.src[0].op is not Ops.CONST for p in outs) or
       len({p.arg.slot for p in outs}) != 1): raise RuntimeError("RKPLAN_REJECT:unsupported_graph")  # type: ignore[union-attr]
   out_param = outs[0]; assert out_param is not None
   count, oslot, store = int(out_param.src[0].arg), out_param.arg.slot, stores[0]

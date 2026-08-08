@@ -653,3 +653,23 @@ The second upstream 1D linear interpolation method passes both resize directions
 - No new kernel error signature.
 
 The next upstream interpolation case is `test_interpolate_bilinear`.
+
+---
+
+## 2026-08-08 — `test_interpolate_bilinear` without shared-core changes
+
+The upstream bilinear method now passes all three 2D resize pairs. A direct `(2,3,12,20) -> (2,3,9,31)` regression asserts exactly two ioctls, one DPU EW program per separable axis.
+
+Tinygrad's generic interpolation keeps the first-axis result in an internal FP32-sized buffer. Rockchip still advertises only FP16 as a supported dtype and performs no FP32 arithmetic or conversion. For Rockchip programs, that oversized internal buffer now carries a contiguous FP16 payload produced by the first DPU pass; the second Rockchip pass reads the same FP16 payload. This preserves the device's actual FP16 storage/arithmetic contract without changing `tinygrad/mixin/op.py` or any other shared core file.
+
+The host continues to prepare static integer gathers and geometry-only FP16 weights. Every input-dependent low/high interpolation MUL/ADD executes on DPU EW. No CPU interpolation, CMAC, CNA, or PPU path was added.
+
+Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- Focused direct and upstream methods: **2 passed in 4.29 s**; direct case exactly 2 ioctls.
+- Complete Rockchip census: **110 passed, 9 skipped, 96 subtests passed in 101.59 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 553 executable lines, runtime 165.
+
+The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next upstream interpolation case is `test_interpolate_bilinear_corners_aligned`.
