@@ -2206,3 +2206,40 @@ The CPU-cheat audit found no runtime or Tinygrad core change. The renderer inspe
 structure, and static indexes; it never reads tensor values. Comparison, selection arithmetic, and FP16-to-INT32
 conversion execute on DPU EW. There is no host tensor-value evaluation or reassembly, LUT, CMAC, CNA, PPU fallback,
 external non-FP16 input conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — direct FP16-to-bool cast on DPU EW
+
+The FP16-input portion of upstream `test_cast` now joins the Rockchip census. Coverage includes a normal tensor plus
+finite positive/negative values, positive and negative zero, both infinities, and NaN. FP32 output, external integer
+input, and external boolean input portions remain outside the NPU's FP16 external-input contract.
+
+Tinygrad lowers direct `.bool()` to `CMPNE(input, 0)`. The generic IEEE equality path was exact but used **14 ioctls**.
+A strict direct-load matcher now uses the identity `positive_mask(abs(input))`: native ABS maps both signed zeros to
+zero and both infinities to positive infinity, while the proven DPU positive-mask primitive treats NaN as nonzero.
+The public bool result uses the existing hardware FP16-to-INT32 conversion and raw low-byte packing. Each cast now uses
+**3 ioctls**, so the two permanent cases assert **6 total**.
+
+Historical `091df1bd8` established an older typed bool-output ABI whose runtime packed NPU-produced FP16 masks with a
+NumPy nonzero operation; `70740a365` documented rejection of direct channel-packed FP16 bool output. Neither path was
+ported. Searches under `~/npu` and `~/rk3588` found CPU reference checks and earlier comparison experiments but no
+smaller native nonzero register sequence than the current ABS/positive-mask composition.
+
+An exhaustive 65,536-pattern probe was attempted but deliberately not added. Public bool conversion operates on
+four-lane INT32 atoms; 65,536 values therefore create 16,384 conversion tasks, which the current page-sized conversion
+batching splits into roughly 1,171 submit/reset groups. The probe returned naturally after about two minutes with no
+driver timeout, but its output channel was lost and thus provides no correctness evidence. The immediate vendor health
+check still passed 60/60. This identifies conversion batching as a separate performance problem, not a cast-semantic
+failure.
+
+- Focused cast class: **1 passed in 3.42 s**, sequentially; call time was **0.79 s**.
+- Shared classification/logical/boolean-reduction regression: **14 passed in 25.53 s**, sequentially.
+- Complete Rockchip census: **352 passed, 11 skipped, 180 subtests passed in 400.13 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** both after the stress probe and after the census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,914/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. ABS, nonzero classification, and FP16-to-INT32 conversion
+all execute on DPU EW; runtime only packs the low byte of NPU-produced 0/1 INT32 lanes into the public bool buffer. The
+renderer inspects only the UOp shape and dtype. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback,
+external non-FP16 input conversion, or tolerance relaxation.

@@ -1532,6 +1532,12 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
     return None
   return mask(root)
 
+def _fp16_nonzero_mask(root:UOp) -> UOp|None:
+  """Recognize a direct FP16-to-bool cast; ABS then positivity is exact for zero, infinity, and NaN."""
+  if (load:=_nonzero_load(root)) is None: return None
+  magnitude = UOp(Ops.MAX, dtypes.half, src=(load, load), arg=_NATIVE_ABS)
+  return _positive_mask(magnitude)
+
 def _lower_int_where(output:RKOutput) -> RKImage|None:
   """Select two exactly representable INT32 constants from an FP16 comparison and convert on DPU."""
   root = output[4]
@@ -1602,6 +1608,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
                      fill=RKFill(RKArg(RKBufferKind.ARG, bool_output[1].arg.slot), bool_output[2], 1))
     if (bool_reduction:=_lower_unrolled_bool_reduction(bool_output)) is not None: return bool_reduction
     if (predicate:=_lower_ieee_predicate(bool_output)) is not None: return predicate
+    if (nonzero:=_fp16_nonzero_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, nonzero, bool_output=True)
     if (comparison:=_ieee_comparison_mask(bool_output[4])) is not None: return _typed_int_image(bool_output, comparison, bool_output=True)
   if (bool_loop_output:=_output_store(uops, dtypes.bool, allow_local=True)) is not None and \
      (bool_loop_reduction:=_lower_loop_bool_reduction(uops, bool_loop_output)) is not None: return bool_loop_reduction
