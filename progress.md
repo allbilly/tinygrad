@@ -539,3 +539,23 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - Runtime CPU audit: NumPy is used only for raw `uint16` views and integer indexing/copies. There is no host floating-point arithmetic or conversion.
 
 PyTorch CPU does not implement FP16 AvgPool3D, so that one test constructs its oracle in FP32 and casts the oracle to FP16. This affects test-reference generation only; Rockchip execution remains FP16 DPU EW.
+
+---
+
+## 2026-08-08 — First post-518 milestone: nearest interpolation through DPU EW
+
+Development restarted from the known-good `518487a5c24c7390e5b40cdb85f91d6e158c4383` baseline. The first newly admitted upstream method is `TestOps.test_interpolate_nearest`, covering six 1D, 2D, and 3D resize shapes. It passes at the unchanged `test_gemm_fp16` tolerance ceiling (`atol=rtol=grad_atol=grad_rtol=5e-3`). A direct `(2,3,13) -> (2,3,9)` regression additionally asserts exactly one NPU ioctl.
+
+Nearest interpolation is a gather, but the output is not accepted as a host-produced result. Rockchip prepares only the static integer gather offsets and mask, then sends the gathered FP16 values through a DPU EW `ADD 0` pass-through stage. Typed compile-time evaluation now preserves integer, boolean, FP16, and FP32 cast semantics in layout expressions. No input-dependent floating-point arithmetic, CMAC, CNA, PPU, or CPU numeric fallback was added.
+
+Focused verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- Direct submit-count regression: **1 passed in 2.83 s**, exactly 1 ioctl.
+- Full upstream `test_interpolate_nearest`: **1 passed in 3.96 s**, covering all six resize shapes.
+- Gather regression group (nearest, MaxPool, AvgPool, output-padded ConvTranspose2D): **4 passed in 8.13 s**.
+- Complete Rockchip census, run as 113 separate sequential pytest processes to limit retained program buffers: **104 passed, 9 intentionally skipped**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 501 executable lines, runtime 144; comments and docstrings retained.
+
+The current `518` runtime still requests contiguous GEM buffers against an 8 MiB CMA pool. Several large existing cases logged recoverable CMA allocation failures even with one pytest node per process, although this run produced no RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. Fixing this allocation policy safely is the next prerequisite before broadening the interpolation census.

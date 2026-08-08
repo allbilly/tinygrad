@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable
 from tinygrad.device import Compiler
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import Target, cdiv, cmod, floordiv, floormod
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
@@ -167,43 +167,41 @@ def _root_param(u:UOp) -> UOp|None:
     u = u.src[0]
   return u
 
-def _eval_int(u:UOp, env:dict[UOp, int]) -> int:
-  if u.op is Ops.CONST: return int(u.arg)
-  if u.op is Ops.RANGE: return env[u]
-  if u.op is Ops.ADD: return _eval_int(u.src[0], env) + _eval_int(u.src[1], env)
-  if u.op is Ops.MUL: return _eval_int(u.src[0], env) * _eval_int(u.src[1], env)
-  if u.op is Ops.SUB: return _eval_int(u.src[0], env) - _eval_int(u.src[1], env)
-  if u.op is Ops.CDIV: return cdiv(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
-  if u.op is Ops.CMOD: return cmod(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
-  if u.op is Ops.FLOORDIV: return floordiv(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
-  if u.op is Ops.FLOORMOD: return floormod(_eval_int(u.src[0], env), _eval_int(u.src[1], env))
-  if u.op is Ops.CMPLT: return int(_eval_int(u.src[0], env) < _eval_int(u.src[1], env))
-  if u.op is Ops.CMPNE: return int(_eval_int(u.src[0], env) != _eval_int(u.src[1], env))
-  if u.op is Ops.AND: return _eval_int(u.src[0], env) & _eval_int(u.src[1], env)
-  if u.op is Ops.OR: return _eval_int(u.src[0], env) | _eval_int(u.src[1], env)
-  raise RuntimeError(f"RKPLAN_REJECT:unsupported_index {u.op.name}")
+def _eval_cast(value:int|float|bool, dtype:DType) -> int|float|bool:
+  if dtype.scalar() is dtypes.bool: return bool(value)
+  if dtype.scalar() in dtypes.ints: return int(value)
+  if dtype.scalar() is dtypes.half: return struct.unpack("<e", struct.pack("<e", float(value)))[0]
+  if dtype.scalar() is dtypes.float: return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+  return float(value)
 
-_STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.WHERE,
-               Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.MAX}
-def _is_static_expr(u:UOp) -> bool: return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
-
-def _eval_static(u:UOp, env:dict[UOp, int]) -> float|bool:
-  if u.op is Ops.CONST: return u.arg
+def _eval_expr(u:UOp, env:dict[UOp, int]) -> int|float|bool:
+  if u.op is Ops.CONST: return _eval_cast(u.arg, u.dtype)
   if u.op is Ops.RANGE: return env[u]
-  if u.op is Ops.CAST: return _eval_static(u.src[0], env)
-  if u.op is Ops.WHERE: return _eval_static(u.src[1] if bool(_eval_static(u.src[0], env)) else u.src[2], env)
-  lhs = _eval_static(u.src[0], env)
-  if u.op is Ops.RECIPROCAL: return 1.0 / float(lhs)
-  rhs = _eval_static(u.src[1], env)
-  if u.op is Ops.ADD: return float(lhs) + float(rhs)
-  if u.op is Ops.MUL: return float(lhs) * float(rhs)
-  if u.op is Ops.SUB: return float(lhs) - float(rhs)
-  if u.op is Ops.MAX: return max(float(lhs), float(rhs))
+  if u.op is Ops.CAST: return _eval_cast(_eval_expr(u.src[0], env), u.dtype)
+  if u.op is Ops.WHERE: return _eval_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env) else u.src[2], env), u.dtype)
+  lhs = _eval_expr(u.src[0], env)
+  if u.op is Ops.RECIPROCAL: return _eval_cast(1.0 / float(lhs), u.dtype)
+  if u.op is Ops.TRUNC: return _eval_cast(int(lhs), u.dtype)
+  rhs = _eval_expr(u.src[1], env)
+  if u.op is Ops.ADD: return _eval_cast(lhs + rhs, u.dtype)
+  if u.op is Ops.MUL: return _eval_cast(lhs * rhs, u.dtype)
+  if u.op is Ops.SUB: return _eval_cast(lhs - rhs, u.dtype)
+  if u.op is Ops.CDIV: return _eval_cast(cdiv(int(lhs), int(rhs)), u.dtype)
+  if u.op is Ops.CMOD: return _eval_cast(cmod(int(lhs), int(rhs)), u.dtype)
+  if u.op is Ops.FLOORDIV: return _eval_cast(floordiv(int(lhs), int(rhs)), u.dtype)
+  if u.op is Ops.FLOORMOD: return _eval_cast(floormod(int(lhs), int(rhs)), u.dtype)
+  if u.op is Ops.MAX: return _eval_cast(max(lhs, rhs), u.dtype)
   if u.op is Ops.CMPLT: return lhs < rhs
   if u.op is Ops.CMPNE: return lhs != rhs
-  if u.op is Ops.AND: return bool(lhs) and bool(rhs)
-  if u.op is Ops.OR: return bool(lhs) or bool(rhs)
+  if u.op is Ops.AND: return _eval_cast(int(lhs) & int(rhs), u.dtype)
+  if u.op is Ops.OR: return _eval_cast(int(lhs) | int(rhs), u.dtype)
   raise RuntimeError(f"RKPLAN_REJECT:unsupported_static {u.op.name}")
+
+def _eval_int(u:UOp, env:dict[UOp, int]) -> int: return int(_eval_expr(u, env))
+
+_STATIC_OPS = {Ops.CONST, Ops.RANGE, Ops.CAST, Ops.ADD, Ops.MUL, Ops.SUB, Ops.RECIPROCAL, Ops.TRUNC, Ops.WHERE,
+               Ops.CMPLT, Ops.CMPNE, Ops.AND, Ops.OR, Ops.MAX}
+def _is_static_expr(u:UOp) -> bool: return u.op in _STATIC_OPS and all(_is_static_expr(x) for x in u.src)
 
 def _index_ranges(index:UOp) -> list[UOp]: return [u for u in index.toposort() if u.op is Ops.RANGE]
 
@@ -230,7 +228,7 @@ def _static_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   for env in _iter_range_env(ranges):
     dst = _eval_int(out_index, env)
     if not 0 <= dst < count: raise RuntimeError("RKPLAN_REJECT:static_index")
-    bits = struct.unpack("<H", struct.pack("<e", float(_eval_static(expr, env))))[0]
+    bits = struct.unpack("<H", struct.pack("<e", float(_eval_expr(expr, env))))[0]
     if values[dst] is not None and values[dst] != bits: raise RuntimeError("RKPLAN_REJECT:static_index")
     values[dst] = bits
   if any(x is None for x in values): raise RuntimeError("RKPLAN_REJECT:static_index")
@@ -376,10 +374,16 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   out_index, out, val = store.src[0].src[1], RKArg(RKBufferKind.ARG, oslot), store.src[1]
   if val.op is Ops.CONST and val.dtype.scalar() is dtypes.half:
     return RKImage(RKTarget.RK3588, constants=struct.pack("<e", float(val.arg)), fill=RKFill(out, count))
+  if _ew_leaf(val, out_index, count, oslot) is not None:
+    val = val.alu(Ops.ADD, UOp.const(0.0, dtypes.half))
   supported = RockchipRenderer.code_for_op
-  static_nodes:set[UOp] = set()
+  static_nodes:set[UOp] = set(out_index.toposort())
   for u in uops:
-    if isinstance((leaf:=_ew_leaf(u, out_index, count, oslot)), RKStatic): static_nodes.update(leaf.expr.toposort())
+    leaf = _ew_leaf(u, out_index, count, oslot)
+    if isinstance(leaf, RKStatic): static_nodes.update(leaf.expr.toposort())
+    elif isinstance(leaf, tuple):
+      static_nodes.update(leaf[1].toposort())
+      if leaf[2] is not None: static_nodes.update(leaf[2].toposort())
   if any(u not in static_nodes and (u.op is Ops.REDUCE or (u.op is Ops.CAST and u.dtype.scalar() is not dtypes.half) or
          (u.op is Ops.CAST and u.dtype.scalar() is dtypes.half and _ew_leaf(u, out_index, count, oslot) is None) or
          (u.op in GroupOp.ALU and u.dtype.scalar() in (dtypes.float, dtypes.float32, dtypes.float64))) for u in uops):
