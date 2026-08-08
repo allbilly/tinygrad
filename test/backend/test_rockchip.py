@@ -461,6 +461,23 @@ class TestRockchipDotOps(unittest.TestCase):
   test_matvecmat = _test_ops.TestOps.test_matvecmat
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipEinsumOps(unittest.TestCase):
+  """FP16 einsum contractions composed from static gathers and DPU EW reductions."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_einsum = _test_ops.TestOps.test_einsum
+  test_einsum_trace = _test_ops.TestOps.test_einsum_trace
+  test_einsum_shape_check = _test_ops.TestOps.test_einsum_shape_check
+  test_einsum_arity_check1 = _test_ops.TestOps.test_einsum_arity_check1
+  test_einsum_arity_check2 = _test_ops.TestOps.test_einsum_arity_check2
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

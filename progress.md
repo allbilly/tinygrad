@@ -1201,3 +1201,26 @@ balanced FP16 tree was rejected because one K65 lane missed the permitted tolera
 No input value is evaluated on the host: compile time only substitutes static integer K indices, runtime performs the
 existing raw `uint16` gathers, and every MUL/ADD/compensation stage executes on DPU EW. There is no CMAC, CNA, PPU,
 shared core change, or tolerance relaxation. Kernel logs contain no new timeout, invalid IRQ, IOMMU fault, or oops.
+
+---
+
+## 2026-08-08 — FP16 einsum contraction and validation census
+
+Five exact upstream methods now join the Rockchip census: `test_einsum`, `test_einsum_trace`,
+`test_einsum_shape_check`, and the two arity checks. The functional cases cover scalar identity, transposes, whole/axis
+sums, diagonal and batched trace, vector/matrix/batched products, permuted results and inputs, large tensor
+contractions, and a three-input bilinear expression.
+
+All functional forms compose the existing static raw-lane gathers, scalar reduction lowering, and compensated DPU EW
+dot loop from the prior milestone. No new backend implementation was required. The separate slow ellipsis stress method
+contains a 13,824-term reduction and remains a dedicated profiling target rather than being silently included here.
+
+- `test_einsum_trace`: **1 passed in 2.81 s**.
+- Main `test_einsum`: **1 passed in 6.40 s**.
+- Complete einsum group: **5 passed in 6.37 s**, sequentially.
+- Complete Rockchip census: **258 passed, 11 skipped, 120 subtests passed in 115.89 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.54 s.
+- Backend size remains renderer/runtime **878/173 executable lines**.
+
+This milestone changes coverage only and retains the exact FP16 tolerance ceiling. It adds no CPU tensor arithmetic,
+CMAC, CNA, PPU, or shared core change.
