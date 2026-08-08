@@ -964,7 +964,10 @@ class TestRockchipReductionOps(unittest.TestCase):
   test_mean_axis = _test_ops.TestOps.test_mean_axis
   test_mean_zero_axis = _test_ops.TestOps.test_mean_zero_axis
   test_var = _test_ops.TestOps.test_var
+  test_var_axis = _test_ops.TestOps.test_var_axis
+  test_var_zero_in_axis = _test_ops.TestOps.test_var_zero_in_axis
   test_var_one_in_axis = _test_ops.TestOps.test_var_one_in_axis
+  test_var_keepdim = _test_ops.TestOps.test_var_keepdim
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):

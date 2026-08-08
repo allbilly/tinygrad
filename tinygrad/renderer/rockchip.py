@@ -406,6 +406,28 @@ def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
     envs = [{**env, r: i} for env in envs for i in range(int(r.src[0].arg))]
   return envs
 
+def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[int, list[dict[UOp, int]], UOp, int]|None:
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  rows = int(out_param.src[0].arg)
+  out_ranges = _index_ranges(store.src[0].src[1])
+  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in out_ranges]
+  if rows <= 0 or len(reduce_ranges) != 1: return None
+  reduce_range = reduce_ranges[0]
+  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
+  try: envs = _iter_range_env(out_ranges)
+  except RuntimeError: return None
+  if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
+  return rows, envs, reduce_range, groups
+
+def _spaced_reduction_gathers(src_slot:int, dst_slot:int, rows:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...]) \
+    -> tuple[RKGather, ...]:
+  if rows != 1:
+    return tuple(RKGather(src_slot, dst_slot, rows, offsets=block, dst_addend=i*32) for i,block in enumerate(blocks))
+  offsets = tuple(block[0] for block in blocks)
+  direct = offsets == tuple(range(len(blocks)))
+  return (RKGather(src_slot, dst_slot, len(blocks), axes=((1, len(blocks), 1),) if direct else (),
+                   offsets=() if direct else offsets, dst_stride=32),)
+
 def _static_vector(out_index:UOp, expr:UOp, count:int) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
   if any(r not in ranges for r in _index_ranges(expr)): raise RuntimeError("RKPLAN_REJECT:static_index")
@@ -676,13 +698,12 @@ def _lower_centered_square_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if len(global_stores) != 1: return None
   store, out_param = global_stores[0]
   assert out_param is not None
-  nodes = store.src[1].toposort()
-  ranges = [u for u in nodes if u.op is Ops.RANGE]
+  nodes = list(store.src[1].toposort())
   fp32_out = out_param.dtype.scalar() is dtypes.float
-  if (len(ranges) != 1 or out_param.dtype.scalar() not in (dtypes.half, dtypes.float) or out_param.src[0].op is not Ops.CONST or
-      int(out_param.src[0].arg) != 1 or store.src[0].op is not Ops.INDEX): return None
-  reduce_range = ranges[0]
-  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) < 2: return None
+  if out_param.dtype.scalar() not in (dtypes.half, dtypes.float): return None
+  if (shape:=_loop_reduction_shape(store, out_param, nodes)) is None: return None
+  rows, envs, reduce_range, groups = shape
+  if groups < 2: return None
 
   updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
   if len(updates) != 1 or (update:=_strip_cast(updates[0].src[1])).op is not Ops.ADD: return None
@@ -705,11 +726,11 @@ def _lower_centered_square_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if (data_param is None or center_param is None or data_param.arg.slot == center_param.arg.slot or direct.dtype.scalar() is not dtypes.half or
       center.dtype.scalar() is not dtypes.half or data_param.src[0].op is not Ops.CONST or center_param.src[0].op is not Ops.CONST): return None
   try:
-    data_offsets = tuple(_eval_int(direct.src[0].src[1], {reduce_range:r}) for r in range(groups))
-    center_offsets = tuple(_eval_int(center.src[0].src[1], {reduce_range:r}) for r in range(groups))
+    data_blocks = tuple(tuple(_eval_int(direct.src[0].src[1], {**env, reduce_range:r}) for env in envs) for r in range(groups))
+    center_offsets = tuple(_eval_int(center.src[0].src[1], env) for env in envs)
   except RuntimeError: return None
-  if (int(data_param.src[0].arg) != groups or sorted(data_offsets) != list(range(groups)) or len(set(center_offsets)) != 1 or
-      not 0 <= center_offsets[0] < int(center_param.src[0].arg)): return None
+  if (int(data_param.src[0].arg) != rows*groups or sorted(offset for block in data_blocks for offset in block) != list(range(rows*groups)) or
+      center_offsets != tuple(range(rows)) or int(center_param.src[0].arg) != rows): return None
 
   final_value = store.src[1]
   if _local_load(final_value) is not None: post_scale = 1.0
@@ -718,31 +739,30 @@ def _lower_centered_square_loop_reduction(uops:list[UOp]) -> RKImage|None:
   else: return None
   constants = () if post_scale == 1.0 else (post_scale,)
   data_slot = len(constants)
-  gather = RKGather(data_param.arg.slot, data_slot, groups, axes=((1, groups, 1),) if data_offsets == tuple(range(groups)) else (),
-                    offsets=() if data_offsets == tuple(range(groups)) else data_offsets, dst_stride=32)
+  gathers = _spaced_reduction_gathers(data_param.arg.slot, data_slot, rows, data_blocks)
   def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, data_slot, offset)
-  center_arg = RKArg(RKBufferKind.ARG, center_param.arg.slot, center_offsets[0]*2)
+  center_arg = RKArg(RKBufferKind.ARG, center_param.arg.slot)
   ew_ops:list[RKEWOp] = []
   active = [r*64 for r in range(groups)]
   for offset in active:
     value = arena(offset)
-    ew_ops.append(RKEWOp(value, value, center_arg, 1, _EW_CFG[Ops.SUB], stateful=not ew_ops))
-    ew_ops.append(RKEWOp(value, value, value, 1, _EW_CFG[Ops.MUL]))
+    ew_ops.append(RKEWOp(value, value, center_arg, rows, _EW_CFG[Ops.SUB], stateful=not ew_ops))
+    ew_ops.append(RKEWOp(value, value, value, rows, _EW_CFG[Ops.MUL]))
   while len(active) > 1:
     next_active:list[int] = []
     for i in range(0, len(active)-1, 2):
       lhs, rhs = active[i], active[i+1]
       final = len(active) == 2 and post_scale == 1.0
       dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if final else arena(lhs)
-      ew_ops.append(RKEWOp(dst, arena(lhs), arena(rhs), 1, _EW_CFG[Ops.ADD] | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
+      ew_ops.append(RKEWOp(dst, arena(lhs), arena(rhs), rows, _EW_CFG[Ops.ADD] | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
       next_active.append(lhs)
     if len(active) & 1: next_active.append(active[-1])
     active = next_active
   if post_scale != 1.0:
-    ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), arena(active[0]), RKArg(RKBufferKind.SCRATCH, 0), 1,
+    ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), arena(active[0]), RKArg(RKBufferKind.SCRATCH, 0), rows,
                          _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
-  scratch = tuple(RKScratch(2) for _ in constants) + (RKScratch(groups*64),)
-  return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=(gather,), ew_ops=tuple(ew_ops))
+  scratch = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(groups*64),)
+  return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=gathers, ew_ops=tuple(ew_ops))
 
 def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   """Turn a compact scalar register reduction into balanced FP16 DPU EW stages."""
@@ -750,15 +770,12 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   global_stores = [(store, param) for store,param in global_stores if param is not None]
   if len(global_stores) != 1: return None
   store, out_param = global_stores[0]
-  nodes = store.src[1].toposort()
-  ranges = [u for u in nodes if u.op is Ops.RANGE]
-  if len(ranges) != 1: return None
+  nodes = list(store.src[1].toposort())
   assert out_param is not None
   fp32_out = out_param.dtype.scalar() is dtypes.float
-  if (out_param.dtype.scalar() not in (dtypes.half, dtypes.float) or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
-      store.src[0].op is not Ops.INDEX): return None
-  reduce_range = ranges[0]
-  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
+  if out_param.dtype.scalar() not in (dtypes.half, dtypes.float): return None
+  if (shape:=_loop_reduction_shape(store, out_param, nodes)) is None: return None
+  rows, envs, reduce_range, groups = shape
   loads:list[tuple[UOp, UOp]] = []
   for u in nodes:
     if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.half or not u.src or u.src[0].op is not Ops.INDEX: continue
@@ -782,40 +799,43 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   elif len(reduce_ops) == 1: reduce_op = next(iter(reduce_ops))
   else: return None
   if reduce_op not in _EW_CFG: return None
-  gather_offsets = [tuple(_eval_int(load.src[0].src[1], {reduce_range:r}) for r in range(groups)) for load,_ in loads]
+  try:
+    blocks = [tuple(_eval_int(load.src[0].src[1], {**env, reduce_range:r}) for env in envs)
+              for load,_ in loads for r in range(groups)]
+  except RuntimeError: return None
   input_count = int(in_param.src[0].arg)
-  if input_count != groups*len(loads) or sorted(offset for offsets in gather_offsets for offset in offsets) != list(range(input_count)): return None
+  if input_count != rows*len(blocks) or sorted(offset for block in blocks for offset in block) != list(range(input_count)): return None
   if input_count < 2: return None
 
   const_values = tuple(dict.fromkeys(x for x in ((-1.0,) if negate_inputs else ()) + ((post_scale,) if post_scale != 1.0 else ())))
   const_slots = {value:i for i,value in enumerate(const_values)}
   data_slot = len(const_values)
-  gathers = (RKGather(in_param.arg.slot, data_slot, input_count, 0, ((1, input_count, 1),), dst_stride=32),)
+  gathers = _spaced_reduction_gathers(in_param.arg.slot, data_slot, rows, blocks)
   cfg = _EW_CFG[reduce_op]
   ew_ops:list[RKEWOp] = []
-  active = [i*64 for i in range(input_count)]
+  active = [i*64 for i in range(len(blocks))]
   if negate_inputs:
     neg_one = RKArg(RKBufferKind.SCRATCH, const_slots[-1.0])
     for offset in active:
       value = RKArg(RKBufferKind.SCRATCH, data_slot, offset)
-      ew_ops.append(RKEWOp(value, value, neg_one, 1, _EW_CFG[Ops.MUL]))
+      ew_ops.append(RKEWOp(value, value, neg_one, rows, _EW_CFG[Ops.MUL]))
   while len(active) > 1:
     next_active:list[int] = []
     for i in range(0, len(active)-1, 2):
       lhs, rhs = active[i], active[i+1]
       final = len(active) == 2 and post_scale == 1.0
       dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if final else RKArg(RKBufferKind.SCRATCH, data_slot, lhs)
-      ew_ops.append(RKEWOp(dst, RKArg(RKBufferKind.SCRATCH, data_slot, lhs), RKArg(RKBufferKind.SCRATCH, data_slot, rhs), 1,
+      ew_ops.append(RKEWOp(dst, RKArg(RKBufferKind.SCRATCH, data_slot, lhs), RKArg(RKBufferKind.SCRATCH, data_slot, rhs), rows,
                           cfg | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
       next_active.append(lhs)
     if len(active) & 1: next_active.append(active[-1])
     active = next_active
   if post_scale != 1.0:
     ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), RKArg(RKBufferKind.SCRATCH, data_slot, active[0]),
-                         RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), 1,
+                         RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), rows,
                          _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
   constants = b"".join(struct.pack("<e", value) for value in const_values)
-  scratch = tuple(RKScratch(2) for _ in const_values) + (RKScratch(input_count*64),)
+  scratch = tuple(RKScratch(rows*2) for _ in const_values) + (RKScratch(len(blocks)*64),)
   return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
 
 def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:

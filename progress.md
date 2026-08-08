@@ -1802,3 +1802,37 @@ no variance, subtraction, multiplication, addition, scaling, or tensor-value ins
 entirely DPU EW. The cleanup shares cast/local-accumulator parsing across dot, scalar, and centered-square reducers,
 following the small-helper style used by the other Tinygrad backends. There is no LUT, CMAC, CNA, PPU, tinygrad core
 change, or tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — row-wise FP16 variance on DPU EW
+
+The unchanged upstream `test_var_axis`, `test_var_zero_in_axis`, and `test_var_keepdim` methods now join the Rockchip
+census. Together with the preceding scalar and one-axis milestones, all five forward-variance methods in `TestOps`
+are covered under the FP16 contract.
+
+The `(15,25,35)` axis cases reduce `K=15`, `K=35`, or `K=875`. Tinygrad already unrolls the two short reductions into
+ordinary DPU EW graphs. For the `15` independent rows at `K=875`, the scalar reducer is generalized to pack each
+reduction candidate as one aligned 15-lane vector. One DPU task therefore advances all rows together. The centered-
+square pass uses the same vector layout for SUB, MUL, balanced ADD, and correction scaling.
+
+The large row-wise case compiles to 875 mean tasks plus 2,625 centered-square tasks, rather than 52,500 scalar tasks.
+Its 3,500 tasks remain in two dynamically sized PC-chain submits. The shared `_spaced_reduction_gathers` helper keeps
+the scalar and row-vector layouts on the same compile-time raw-lane path.
+
+- Unchanged upstream `test_var_axis`: **1 passed in 3.92 s**, sequentially.
+- Axis, zero-axis, and keepdim variance: **3 passed in 6.74 s**, sequentially.
+- Complete reduction class after cleanup: **27 passed, 1 skipped in 22.96 s**.
+- Per nonconstant case: **2 submits**; task counts are **147** (`axis=0`), **227** (`axis=2`), and **3,500**
+  (`axis=(1,2)`).
+- Per-case realization wall time is **0.060–0.427 s** after graph construction; submit ioctl time is
+  **0.0004–0.0017 s**. Maximum absolute error across the profiled axis cases is **0.00390625**.
+- Complete Rockchip census: **332 passed, 11 skipped, 228 subtests passed in 333.74 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,784/269 executable lines**.
+
+The CPU-cheat audit found no runtime change and no host tensor arithmetic. Compile-time index evaluation constructs a
+candidate-major raw FP16 lane layout; mean, subtraction, squaring, reduction, and scaling all execute on DPU EW. The
+implementation follows the existing backend pattern of a strict graph matcher plus a compact immutable image and a
+shared layout helper. There is no LUT, CMAC, CNA, PPU, tinygrad core change, or tolerance relaxation beyond the
+existing FP16 contract.
