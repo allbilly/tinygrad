@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
 from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_image, patch_stage, emit_ew_stage,
-  RKArg, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
+  RKArg, RKGather, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 
@@ -192,6 +192,12 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
+    def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
+      if kind is RKBufferKind.ARG:
+        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
+        return bufs[index]
+      if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
+      return self.scratch[index]
     for buf in bufs: self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     for i in range(len(self.image.constants)//2):
       if i >= len(self.scratch): break
@@ -200,27 +206,31 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
     cleared_scratch:set[int] = set()
-    for gather in self.image.gathers:
-      dest = bufs[gather.dst_scratch] if gather.dst_kind is RKBufferKind.ARG else self.scratch[gather.dst_scratch]
-      if gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_scratch not in cleared_scratch:
-        ctypes.memset(int(dest.va_addr), 0, dest.size)
-        cleared_scratch.add(gather.dst_scratch)
-      lane_dtype = np.uint16 if gather.itemsize == 2 else np.uint32
-      dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)
-      if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
-      dst_index = gather.dst_addend + linear[gather.count] * gather.dst_stride
-      if gather.values: dst[dst_index] = gather.values
-      elif gather.offsets:
-        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=lane_dtype)
-        index = np.asarray(gather.offsets, dtype=np.intp)
-        valid = index >= 0
-        if not gather.partial: dst[dst_index] = gather.fill_bits
-        dst[dst_index[valid]] = src[index[valid]]
-      else:
-        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=lane_dtype)
-        index = np.full(gather.count, gather.base, dtype=np.intp)
-        for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
-        dst[dst_index] = src[index]
+    def apply_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
+      for gather in gathers:
+        dest = buffer(gather.dst_kind, gather.dst_index)
+        if clear_scratch and gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_index not in cleared_scratch:
+          ctypes.memset(int(dest.va_addr), 0, dest.size)
+          cleared_scratch.add(gather.dst_index)
+        lane_dtype = np.uint16 if gather.itemsize == 2 else np.uint32
+        dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)
+        if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
+        dst_index = gather.dst_addend + linear[gather.count] * gather.dst_stride
+        if gather.values: dst[dst_index] = gather.values
+        elif gather.offsets:
+          source = buffer(gather.src_kind, gather.src_index)
+          src = np.frombuffer(to_mv(int(source.va_addr), source.size), dtype=lane_dtype)
+          index = np.asarray(gather.offsets, dtype=np.intp)
+          valid = index >= 0
+          if not gather.partial: dst[dst_index] = gather.fill_bits
+          dst[dst_index[valid]] = src[index[valid]]
+        else:
+          source = buffer(gather.src_kind, gather.src_index)
+          src = np.frombuffer(to_mv(int(source.va_addr), source.size), dtype=lane_dtype)
+          index = np.full(gather.count, gather.base, dtype=np.intp)
+          for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
+          dst[dst_index] = src[index]
+    apply_gathers(self.image.gathers, True)
     for buf in (*bufs, *self.scratch): self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
@@ -229,13 +239,14 @@ class RockchipProgram(Program['RockchipDevice']):
       if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return self._dma(self.scratch[index])
     start = time.perf_counter()
-    def buffer(kind:RKBufferKind, index:int) -> HCQBuffer:
-      if kind is RKBufferKind.ARG:
-        if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
-        return bufs[index]
-      if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
-      return self.scratch[index]
     self._run_ew_ops(address, buffer)
+    if self.image.post_gathers:
+      touched = {(g.src_kind, g.src_index) for g in self.image.post_gathers if not g.values}
+      touched.update((g.dst_kind, g.dst_index) for g in self.image.post_gathers)
+      for kind,index in touched: self.dev._sync_buffer(buffer(kind, index), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      apply_gathers(self.image.post_gathers, False)
+      for kind,index in {(g.dst_kind, g.dst_index) for g in self.image.post_gathers}:
+        self.dev._sync_buffer(buffer(kind, index), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if (fill:=self.image.fill) is not None:
       bits = self.image.constants[:fill.itemsize] * fill.count
       dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]

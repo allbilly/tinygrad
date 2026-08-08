@@ -1485,3 +1485,33 @@ The CPU-cheat audit found only compile-time UOp structure, source-address, and c
 raw lane movement plus DPU submission and contains no host extrema or selected-index arithmetic. Every negation, MAX,
 comparison, mask, coordinate selection, subtraction, and FP16-to-INT32 conversion executes on DPU EW. There is no CMAC,
 CNA, PPU, shared tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — Stable FP16 sort values on DPU EW
+
+The FP16 value half of upstream `test_sort` now runs for every nontrivial `(8,8,6)` axis and direction, along with its
+empty/singleton and repeated-value cases. A dedicated infinity regression verifies both directions over `[-inf, 2]`.
+Stable INT32 indices remain the next milestone: the unchanged upstream method passes its value realizations, then rejects
+the first `(8,8,6)` index-count graph rather than falling back to the CPU.
+
+Historical milestone `43f113d90` supplies the native bitonic graph classification, but its MIN reconstruction uses
+negation and an arithmetic mask. That formulation produces `0*inf = NaN` for padded sort wires. The current lowering
+instead gathers each statically paired wire, computes complete contiguous native DPU MAX and MIN vectors, and merges them
+with the compile-time bitonic direction map. `~/npu/include/old/rknn_ops.md` explicitly lists `aten::sort` as unsupported;
+`~/rk3588` contains the upstream sort/argsort tests but no lower-level sort implementation.
+
+RKIMAGE v23 gives raw gathers explicit source and destination buffer kinds and separates pre-DPU from post-DPU gathers.
+The runtime invalidates cacheable DPU results, then copies only their `uint16` lane representations according to the
+compiled direction map. It never compares, ranks, sorts, or numerically transforms tensor data. Full-vector DPU writes
+also avoid the 64-byte overwrite that made the exploratory short-run output path corrupt adjacent lanes.
+
+- All six `(8,8,6)` axis/direction value sorts are bit-exact; each uses **9 ioctl submits**.
+- Focused value-sort group: **4 passed, 14 subtests passed in 5.03 s**, sequentially.
+- Complete Rockchip census: **294 passed, 11 skipped, 192 subtests passed in 213.92 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before and after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,383/264 executable lines**.
+
+The CPU-cheat audit found only compile-time condition/address evaluation and raw `uint16` lane movement. MAX and MIN are
+native DPU EW operations, and the host never inspects FP16 values. There is no CMAC, CNA, PPU, shared tinygrad core
+change, FP32 input conversion, or tolerance relaxation beyond the existing FP16 contract.

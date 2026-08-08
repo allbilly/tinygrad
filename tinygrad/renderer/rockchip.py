@@ -12,9 +12,9 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 22
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 23
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
-_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBiIIi"), struct.Struct("<IIi")
+_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBBiIIi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
@@ -31,7 +31,7 @@ class RKScratch: size: int; alignment: int = 4096
 @dataclass(frozen=True)
 class RKGather:
   """Materialize an affine or fallback raw-lane index map."""
-  src_index: int; dst_scratch: int; count: int; base: int = 0
+  src_index: int; dst_index: int; count: int; base: int = 0
   axes: tuple[tuple[int, int, int], ...] = ()  # dst divisor, range limit, source stride
   offsets: tuple[int, ...] = ()
   fill_bits: int = 0
@@ -41,6 +41,7 @@ class RKGather:
   dst_addend: int = 0  # destination offset in lanes
   dst_kind: RKBufferKind = RKBufferKind.SCRATCH
   itemsize: int = 2
+  src_kind: RKBufferKind = RKBufferKind.ARG
 
 @dataclass(frozen=True)
 class RKMultiGather: gathers: tuple[RKGather, ...]
@@ -64,6 +65,7 @@ class RKImage:
   target: RKTarget
   scratch: tuple[RKScratch, ...] = (); constants: bytes = b""; version: int = RKIMAGE_VERSION
   gathers: tuple[RKGather, ...] = (); fill: RKFill|None = None; ew_ops: tuple[RKEWOp, ...] = ()
+  post_gathers: tuple[RKGather, ...] = ()
 
 @dataclass(frozen=True)
 class RKReloc: word: int; arg: RKArg
@@ -72,13 +74,14 @@ class RKReloc: word: int; arg: RKArg
 class RKStage: commands: tuple[int, ...]; relocs: tuple[RKReloc, ...]
 
 def encode_image(image:RKImage) -> bytes:
-  flags = 1 if image.fill is not None else 0
-  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.scratch), len(image.gathers),
+  gathers = image.gathers + image.post_gathers
+  flags = int(image.fill is not None) | len(image.post_gathers)<<1
+  out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.scratch), len(gathers),
                                len(image.ew_ops), len(image.constants), flags))
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
-  for g in image.gathers:
+  for g in gathers:
     kind = 3 if g.partial else 2 if g.values else 1 if g.offsets else 0
-    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, kind, len(g.axes), g.itemsize, int(g.dst_kind),
+    out += _GATHER.pack(g.dst_index, g.src_index, g.count, kind, len(g.axes), g.itemsize, int(g.dst_kind), int(g.src_kind),
                         g.base, g.fill_bits, g.dst_stride, g.dst_addend)
     if kind == 2: out += struct.pack(f"<{g.count}{'H' if g.itemsize == 2 else 'I'}", *g.values)
     elif kind in (1, 3): out += struct.pack(f"<{g.count}i", *g.offsets)
@@ -94,28 +97,32 @@ def encode_image(image:RKImage) -> bytes:
 
 def decode_image(blob:bytes) -> RKImage:
   magic, version, target, nscratch, ngather, nop, nconst, flags = _HEADER.unpack_from(blob)
-  if magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or flags & ~1:
+  post_count = flags >> 1
+  if magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or post_count > ngather:
     raise ValueError("invalid RKImage header")
   off = _HEADER.size
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
   for _ in range(ngather):
-    dst_scratch, src_index, count, kind, naxes, itemsize, dst_kind, base, fill_bits, dst_stride, dst_addend = \
+    dst_index, src_index, count, kind, naxes, itemsize, dst_kind, src_kind, base, fill_bits, dst_stride, dst_addend = \
       _GATHER.unpack_from(blob, off); off += _GATHER.size
-    if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in (2, 4) or dst_kind not in (0, 1) or
+    if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in (2, 4) or dst_kind not in (0, 1) or src_kind not in (0, 1) or
         dst_stride < 1 or dst_addend < 0): raise ValueError("invalid RKGather")
     if kind == 2:
       values = struct.unpack_from(f"<{count}{'H' if itemsize == 2 else 'I'}", blob, off); off += itemsize*count
-      gathers.append(RKGather(src_index, dst_scratch, count, fill_bits=fill_bits, values=values,
-                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize))
+      gathers.append(RKGather(src_index, dst_index, count, fill_bits=fill_bits, values=values,
+                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
+                              src_kind=RKBufferKind(src_kind)))
     elif kind in (1, 3):
       offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
-      gathers.append(RKGather(src_index, dst_scratch, count, offsets=offsets, fill_bits=fill_bits, partial=kind == 3,
-                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize))
+      gathers.append(RKGather(src_index, dst_index, count, offsets=offsets, fill_bits=fill_bits, partial=kind == 3,
+                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
+                              src_kind=RKBufferKind(src_kind)))
     else:
       axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
-      gathers.append(RKGather(src_index, dst_scratch, count, base, axes, fill_bits=fill_bits,
-                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize))
+      gathers.append(RKGather(src_index, dst_index, count, base, axes, fill_bits=fill_bits,
+                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize,
+                              src_kind=RKBufferKind(src_kind)))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
@@ -131,7 +138,8 @@ def decode_image(blob:bytes) -> RKImage:
     if itemsize not in (1, 2, 4, 8): raise ValueError("invalid RKFill item size")
     fill = RKFill(RKArg(RKBufferKind(dst_kind), dst_index), count, itemsize)
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
-  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers), fill, tuple(ew_ops))
+  split = len(gathers)-post_count
+  return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers[:split]), fill, tuple(ew_ops), tuple(gathers[split:]))
 
 def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tuple[int, ...]:
   commands = list(stage.commands)
@@ -431,7 +439,7 @@ def _gather_offsets(out_index:UOp, load_index:UOp, gate:UOp|None, count:int) -> 
   if np.any(offsets == -2): raise RuntimeError("RKPLAN_REJECT:gather_index")
   return tuple(int(x) for x in offsets)
 
-def _gather_plan(src_index:int, dst_scratch:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
+def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, gate:UOp|None, count:int, fill_bits:int=0) -> RKGather:
   out_affine, load_affine = _affine_index(out_index), _affine_index(load_index)
   if gate is None and out_affine is not None and load_affine is not None and out_affine[0] == 0:
     expected = 1
@@ -444,8 +452,8 @@ def _gather_plan(src_index:int, dst_scratch:int, out_index:UOp, load_index:UOp, 
       expected *= limit
     else:
       if expected == count and all(r in out_affine[1] for r in load_affine[1]):
-        return RKGather(src_index, dst_scratch, count, load_affine[0], tuple(axes))
-  return RKGather(src_index, dst_scratch, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
+        return RKGather(src_index, dst_index, count, load_affine[0], tuple(axes))
+  return RKGather(src_index, dst_index, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
 
 def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cache:dict[UOp, tuple[bool, bool]]|None=None,
                       static_cache:dict[UOp, bool]|None=None) -> RKGather|RKMultiGather|None:
@@ -741,6 +749,64 @@ def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
   if sorted(offsets) != list(range(count)): return None
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
+
+def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
+  """Lower one static bitonic compare/swap pass with DPU MAX and MIN."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.half: return None
+  store = stores[0]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX or store.src[1].op is not Ops.WHERE: return None
+  count, out_index, condition = int(out_param.src[0].arg), store.src[0].src[1], store.src[1].src[0]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+
+  def maximum(root:UOp, negated:bool) -> tuple[UOp, UOp]|None:
+    if root.op is not Ops.MAX: return None
+    parsed = [_half_candidate(x) for x in root.src]
+    if len(parsed) != 2 or any(x is None or x[1] != negated for x in parsed): return None
+    candidates = [x for x in parsed if x is not None]
+    return candidates[0][0], candidates[1][0]
+  def extreme(root:UOp) -> tuple[bool, tuple[UOp, UOp]]|None:
+    if (pair:=maximum(root, False)) is not None: return True, pair
+    if root.op is Ops.MUL and len(root.src) == 2:
+      constants = [x for x in root.src if x.op is Ops.CONST and float(x.arg) == -1.0]
+      inner = [x for x in root.src if x.op is Ops.MAX]
+      if len(constants) == len(inner) == 1 and (pair:=maximum(inner[0], True)) is not None: return False, pair
+    return None
+
+  true_extreme, false_extreme = extreme(store.src[1].src[1]), extreme(store.src[1].src[2])
+  if (true_extreme is None or false_extreme is None or true_extreme[0] == false_extreme[0] or
+      set(true_extreme[1]) != set(false_extreme[1]) or not _is_static_expr(condition)): return None
+  pair = true_extreme[1]
+  plans:list[RKGather] = []
+  try:
+    for scratch_slot,load in enumerate(pair):
+      if load.src[0].op is not Ops.INDEX or (source:=_root_param(load.src[0])) is None or source.dtype.scalar() is not dtypes.half or \
+         source.src[0].op is not Ops.CONST: return None
+      offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count))
+      if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
+      plans.append(RKGather(source.arg.slot, scratch_slot, count, offsets=offsets))
+    choose_max:list[bool|None] = [None]*count
+    for env in _iter_range_env(_index_ranges(out_index)):
+      cache:dict[UOp, int|float|bool] = {}
+      dst = _eval_int(out_index, env, cache)
+      selected_kind = true_extreme if bool(_eval_expr(condition, env, cache)) else false_extreme
+      if not 0 <= dst < count or (choose_max[dst] is not None and choose_max[dst] != selected_kind[0]): return None
+      choose_max[dst] = selected_kind[0]
+  except RuntimeError: return None
+  if any(x is None for x in choose_max): return None
+  choices = [bool(x) for x in choose_max]
+  scratch = tuple(RKScratch(_scratch_bytes(count)) for _ in range(4))
+  ops = (RKEWOp(RKArg(RKBufferKind.SCRATCH, 2), RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1),
+                count, _EW_CFG[Ops.MAX]),
+         RKEWOp(RKArg(RKBufferKind.SCRATCH, 3), RKArg(RKBufferKind.SCRATCH, 0), RKArg(RKBufferKind.SCRATCH, 1),
+                count, _EW_CFG_MIN))
+  max_offsets = tuple(i if choose else -1 for i,choose in enumerate(choices))
+  min_offsets = tuple(i if not choose else -1 for i,choose in enumerate(choices))
+  post = (RKGather(2, out_param.arg.slot, count, offsets=max_offsets, dst_kind=RKBufferKind.ARG,
+                   src_kind=RKBufferKind.SCRATCH),
+          RKGather(3, out_param.arg.slot, count, offsets=min_offsets, partial=True, dst_kind=RKBufferKind.ARG,
+                   src_kind=RKBufferKind.SCRATCH))
+  return RKImage(RKTarget.RK3588, scratch, gathers=tuple(plans), ew_ops=ops, post_gathers=post)
 
 def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGather, ...],
                             extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int],
@@ -1082,6 +1148,7 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
                                  extrema_plans, negated_candidates, list(range(count)))
 
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (sort_compare:=_lower_sort_compare(uops)) is not None: return sort_compare
   if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
   if (arg_extrema:=_lower_arg_extrema_index(uops)) is not None: return arg_extrema

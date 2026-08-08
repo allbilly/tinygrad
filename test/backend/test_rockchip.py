@@ -614,6 +614,36 @@ class TestRockchipArgExtremaOps(unittest.TestCase):
   def test_argmin_global(self): self._test_global("min")
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipSortValueOps(unittest.TestCase):
+  """FP16 stable sort values using static bitonic lane maps and DPU EW MIN/MAX."""
+
+  def test_sort_values_trivial(self):
+    for shape in ((0,), (0,5), (1,), (1,5)):
+      with self.subTest(shape=shape):
+        _fp16_test_op([shape], lambda x: x.sort(0).values, lambda x: x.sort(0)[0], forward_only=True)
+
+  def test_sort_values_axes(self):
+    for axis in (-1, 0, 1):
+      for descending in (True, False):
+        with self.subTest(axis=axis, descending=descending):
+          _fp16_test_op([(8,8,6)], lambda x, axis=axis, descending=descending: x.sort(axis, descending).values,
+                        lambda x, axis=axis, descending=descending: x.sort(axis, descending)[0], forward_only=True)
+
+  def test_sort_values_repeated(self):
+    values = np.array([0, 1] * 9, dtype=np.float16)
+    for descending in (False, True):
+      with self.subTest(descending=descending):
+        _fp16_test_op(None, lambda x, descending=descending: x.sort(stable=True, descending=descending).values,
+                      lambda x, descending=descending: x.sort(descending=descending)[0], vals=[values], forward_only=True)
+
+  def test_sort_values_infinity(self):
+    values = np.array([-np.inf, 2.0], dtype=np.float16)
+    for descending in (False, True):
+      with self.subTest(descending=descending):
+        _fp16_test_op(None, lambda x, descending=descending: x.sort(descending=descending).values,
+                      lambda x, descending=descending: x.sort(descending=descending)[0], vals=[values], forward_only=True)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 
