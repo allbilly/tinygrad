@@ -1335,3 +1335,38 @@ submit bookkeeping are shared between both paths.
 The CPU-cheat audit found only raw `uint16` gather/layout operations and `memmove` around the aligned INT32 tiles. Every
 comparison, mask, selection, extrema reduction, subtraction, and numeric conversion executes on DPU EW. There is no
 CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — Multidimensional cumulative-extrema axis indices
+
+The remaining ordinary-shape cases from upstream `test_cummax` and `test_cummin` now join the Rockchip census: scalar,
+length 5, both axes of `(5,6)`, and axis `2`/`-1` of `(5,6,7)`. Both zero-axis methods are also covered. Together with
+the preceding length-10 milestone, the unchanged upstream `test_cummax`, `test_cummax_zero_axis`, `test_cummin`, and
+`test_cummin_zero_axis` methods now pass directly.
+
+Historical commits `d407bb338` and `eb7c58c98` establish that cumulative indices use packed reduction-axis coordinates,
+not flattened source addresses: the current coordinate is `dst % window`, later candidates are invalid, and the latest
+equal candidate wins. The new recognizer accepts that rule only when every candidate map is distinct and monotonic and
+the current-candidate addresses form an exact permutation of the input. `~/npu` still has no cumulative-extrema path;
+`~/rk3588` supplies the upstream definitions and the compare/framing examples used by the existing DPU stages.
+
+Multidimensional Tinygrad graphs finish with a pure INT32 view kernel. RKIMAGE v22 generalizes the existing raw-lane
+gather metadata to 2- or 4-byte lanes and scratch or argument destinations, allowing that final transpose without
+interpreting index values. Numeric selection and FP16-to-INT32 conversion remain on DPU.
+
+The first 210-element probe timed out at driver task counter 17 while one PC chain held 53 stateful four-lane INT32
+conversion stages. The backend now bounds only this terminal stage by its encoded command bytes: a batch may occupy at
+most one system page. With the current 288-byte body this computes 14 tasks per submit; there is no hardcoded task-count
+cap, and command/task BO allocation remains dynamically sized. The same case then passed exactly in **2.26 s** with
+**28 total submits**, including its seven reset-separated comparisons. The vendor health check passed 60/60 immediately
+after the exploratory timeout and again after the full census.
+
+- Expanded cumulative-index class: **6 passed, 20 subtests passed in 24.66 s**, sequentially.
+- Four unchanged upstream CumMax/CumMin methods: **4 passed in 20.33 s**, sequentially.
+- Complete Rockchip census: **280 passed, 11 skipped, 164 subtests passed in 178.53 s**, sequentially.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,075/249 executable lines**.
+
+The CPU-cheat audit found only address-map construction and raw `uint16`/`uint32` representation movement on the host.
+No runtime value is compared, selected, reduced, or numerically converted by the CPU. There is no CMAC, CNA, PPU,
+shared tinygrad core change, or tolerance relaxation.

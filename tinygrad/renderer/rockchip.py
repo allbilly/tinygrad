@@ -12,9 +12,9 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 21
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 22
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
-_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBiHIi"), struct.Struct("<IIi")
+_SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBBBiIIi"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
@@ -30,15 +30,17 @@ class RKScratch: size: int; alignment: int = 4096
 
 @dataclass(frozen=True)
 class RKGather:
-  """Materialize an affine or fallback index map into contiguous FP16 scratch."""
+  """Materialize an affine or fallback raw-lane index map."""
   src_index: int; dst_scratch: int; count: int; base: int = 0
   axes: tuple[tuple[int, int, int], ...] = ()  # dst divisor, range limit, source stride
   offsets: tuple[int, ...] = ()
   fill_bits: int = 0
   values: tuple[int, ...] = ()  # compile-time FP16 vector, no source argument
   partial: bool = False  # preserve lanes populated by another gather when the offset is negative
-  dst_stride: int = 1  # destination stride in FP16 lanes; scalar reductions use 32 for 64-byte spacing
-  dst_addend: int = 0  # destination offset in FP16 lanes
+  dst_stride: int = 1  # destination stride in lanes; scalar FP16 reductions use 32 for 64-byte spacing
+  dst_addend: int = 0  # destination offset in lanes
+  dst_kind: RKBufferKind = RKBufferKind.SCRATCH
+  itemsize: int = 2
 
 @dataclass(frozen=True)
 class RKMultiGather: gathers: tuple[RKGather, ...]
@@ -76,8 +78,9 @@ def encode_image(image:RKImage) -> bytes:
   for sc in image.scratch: out += _SCRATCH.pack(sc.size, sc.alignment)
   for g in image.gathers:
     kind = 3 if g.partial else 2 if g.values else 1 if g.offsets else 0
-    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, kind, len(g.axes), g.base, g.fill_bits, g.dst_stride, g.dst_addend)
-    if kind == 2: out += struct.pack(f"<{g.count}H", *g.values)
+    out += _GATHER.pack(g.dst_scratch, g.src_index, g.count, kind, len(g.axes), g.itemsize, int(g.dst_kind),
+                        g.base, g.fill_bits, g.dst_stride, g.dst_addend)
+    if kind == 2: out += struct.pack(f"<{g.count}{'H' if g.itemsize == 2 else 'I'}", *g.values)
     elif kind in (1, 3): out += struct.pack(f"<{g.count}i", *g.offsets)
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
@@ -97,20 +100,22 @@ def decode_image(blob:bytes) -> RKImage:
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
   for _ in range(ngather):
-    dst_scratch, src_index, count, kind, naxes, base, fill_bits, dst_stride, dst_addend = _GATHER.unpack_from(blob, off); off += _GATHER.size
-    if kind not in (0, 1, 2, 3) or (kind and naxes) or dst_stride < 1 or dst_addend < 0: raise ValueError("invalid RKGather")
+    dst_scratch, src_index, count, kind, naxes, itemsize, dst_kind, base, fill_bits, dst_stride, dst_addend = \
+      _GATHER.unpack_from(blob, off); off += _GATHER.size
+    if (kind not in (0, 1, 2, 3) or (kind and naxes) or itemsize not in (2, 4) or dst_kind not in (0, 1) or
+        dst_stride < 1 or dst_addend < 0): raise ValueError("invalid RKGather")
     if kind == 2:
-      values = struct.unpack_from(f"<{count}H", blob, off); off += 2*count
+      values = struct.unpack_from(f"<{count}{'H' if itemsize == 2 else 'I'}", blob, off); off += itemsize*count
       gathers.append(RKGather(src_index, dst_scratch, count, fill_bits=fill_bits, values=values,
-                              dst_stride=dst_stride, dst_addend=dst_addend))
+                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize))
     elif kind in (1, 3):
       offsets = struct.unpack_from(f"<{count}i", blob, off); off += 4*count
       gathers.append(RKGather(src_index, dst_scratch, count, offsets=offsets, fill_bits=fill_bits, partial=kind == 3,
-                              dst_stride=dst_stride, dst_addend=dst_addend))
+                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize))
     else:
       axes = tuple(_GATHER_AXIS.unpack_from(blob, off+i*_GATHER_AXIS.size) for i in range(naxes)); off += naxes*_GATHER_AXIS.size
       gathers.append(RKGather(src_index, dst_scratch, count, base, axes, fill_bits=fill_bits,
-                              dst_stride=dst_stride, dst_addend=dst_addend))
+                              dst_stride=dst_stride, dst_addend=dst_addend, dst_kind=RKBufferKind(dst_kind), itemsize=itemsize))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
     dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
@@ -721,6 +726,22 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   scratch = tuple(RKScratch(2) for _ in const_values) + (RKScratch(input_count*64),)
   return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
 
+def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
+  """Move an INT32 tensor through a static view without interpreting its values."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
+  count, out_index, value = int(out_param.src[0].arg), stores[0].src[0].src[1], stores[0].src[1]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  if (value.op is not Ops.LOAD or value.dtype.scalar() is not dtypes.int or len(value.src) != 1 or value.src[0].op is not Ops.INDEX or
+      value.src[0].src[0].op is not Ops.PARAM): return None
+  source, source_index = value.src[0].src[:2]
+  if source.src[0].op is not Ops.CONST or int(source.src[0].arg) != count: return None
+  try: offsets = _gather_offsets(out_index, source_index, None, count)
+  except RuntimeError: return None
+  if sorted(offsets) != list(range(count)): return None
+  gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
+  return RKImage(RKTarget.RK3588, gathers=(gather,))
+
 def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   """Select cumulative MAX/MIN axis coordinates with DPU equality masks and emit native INT32."""
   stores = [u for u in uops if u.op is Ops.STORE]
@@ -753,14 +774,11 @@ def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   if not candidate_offsets or any(any(offset < 0 for offset in offsets) for offsets in candidate_offsets): return None
   candidate_offsets.sort()
   window = len(candidate_offsets)
-  if window > 2048 or any(len({offsets[dst] for offsets in candidate_offsets}) != window for dst in range(count)): return None
-  axis_coords:list[int] = []
-  for dst in range(count):
-    matches = [candidate for candidate,offsets in enumerate(candidate_offsets) if offsets[dst] == dst]
-    if len(matches) != 1: return None
-    axis_coords.append(matches[0])
-  if any(any(candidate <= axis_coords[dst] and offsets[dst] > dst or candidate > axis_coords[dst] and offsets[dst] < dst
-             for dst in range(count)) for candidate,offsets in enumerate(candidate_offsets)): return None
+  if window > 2048 or count % window or any(len({offsets[dst] for offsets in candidate_offsets}) != window for dst in range(count)): return None
+  axis_coords = [dst % window for dst in range(count)]
+  current_offsets = [candidate_offsets[axis_coords[dst]][dst] for dst in range(count)]
+  if sorted(current_offsets) != list(range(count)) or any(candidate_offsets[candidate][dst] >= candidate_offsets[candidate+1][dst]
+                                                            for candidate in range(window-1) for dst in range(count)): return None
 
   zero, one, candidate_arena, coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(10)
   vector_bytes = (count*2+63)&-64
@@ -807,6 +825,7 @@ def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
+  if (raw_int32:=_lower_raw_int32_layout(uops)) is not None: return raw_int32
   if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
   if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
   stores = [u for u in uops if u.op is Ops.STORE]

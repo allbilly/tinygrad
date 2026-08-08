@@ -144,14 +144,22 @@ class RockchipProgram(Program['RockchipDevice']):
         for tile,start in enumerate(range(0, op.count, 4)):
           ctypes.memmove(int(tiles.va_addr)+tile*64, int(source.va_addr)+op.lhs.addend+start*2, min(4, op.count-start)*2)
         self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+        command_bytes = 0
         for start in range(0, op.count, 4):
           count = min(4, op.count-start)
           tile_offset = start//4*64
           tile_arg = RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+tile_offset)
           stage = emit_ew_stage(tile_arg, tile_arg, tile_arg, count, op.ew_cfg,
                                 stateful=True, int32_output=True)
-          bodies.append(patch_stage(stage, address))
-        self._submit_pcchain(bodies)
+          body = patch_stage(stage, address)
+          if bodies and command_bytes+_task_command_bytes(len(body)) > mmap.PAGESIZE:
+            self._submit_pcchain(bodies)
+            self.dev.reset_npu()
+            bodies.clear()
+            command_bytes = 0
+          bodies.append(body)
+          command_bytes += _task_command_bytes(len(body))
+        if bodies: self._submit_pcchain(bodies)
         self.dev._sync_buffer(tiles, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
         for tile,start in enumerate(range(0, op.count, 4)):
           ctypes.memmove(int(dest.va_addr)+op.dst.addend+start*4, int(tiles.va_addr)+tile*64, min(4, op.count-start)*4)
@@ -192,18 +200,20 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
     for gather in self.image.gathers:
-      dst = np.frombuffer(to_mv(int(self.scratch[gather.dst_scratch].va_addr), self.scratch[gather.dst_scratch].size), dtype=np.uint16)
+      dest = bufs[gather.dst_scratch] if gather.dst_kind is RKBufferKind.ARG else self.scratch[gather.dst_scratch]
+      lane_dtype = np.uint16 if gather.itemsize == 2 else np.uint32
+      dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)
       if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)
       dst_index = gather.dst_addend + linear[gather.count] * gather.dst_stride
       if gather.values: dst[dst_index] = gather.values
       elif gather.offsets:
-        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
+        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=lane_dtype)
         index = np.asarray(gather.offsets, dtype=np.intp)
         valid = index >= 0
         if not gather.partial: dst[dst_index] = gather.fill_bits
         dst[dst_index[valid]] = src[index[valid]]
       else:
-        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=np.uint16)
+        src = np.frombuffer(to_mv(int(bufs[gather.src_index].va_addr), bufs[gather.src_index].size), dtype=lane_dtype)
         index = np.full(gather.count, gather.base, dtype=np.intp)
         for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
         dst[dst_index] = src[index]

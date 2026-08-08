@@ -555,7 +555,17 @@ class TestRockchipCumulativeExtremaIndexOps(unittest.TestCase):
 
   def test_small_cummax_indices(self): self._test_indices("max", (((10,), 0),))
 
+  def test_cummax_indices(self):
+    self._test_indices("max", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
+
+  def test_cummax_indices_zero_axis(self): self._test_indices("max", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
+
   def test_small_cummin_indices(self): self._test_indices("min", (((10,), 0),))
+
+  def test_cummin_indices(self):
+    self._test_indices("min", (((), 0), ((5,), 0), ((5,6), 0), ((5,6), 1), ((5,6,7), 2), ((5,6,7), -1)))
+
+  def test_cummin_indices_zero_axis(self): self._test_indices("min", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
