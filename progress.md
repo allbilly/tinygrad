@@ -1895,3 +1895,32 @@ reuses only the already-proven DPU comparison and typed-conversion register path
 
 The CPU-cheat audit found only raw memory movement for the public bool representation. All classification and FP16-to-
 integer conversion occur on DPU EW. There is no LUT, CMAC, CNA, PPU, Tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — conservative Rockchip renderer matcher cleanup
+
+The DPU EW renderer now parses the single typed output store once, shares one `RKLoopReduction` descriptor across dot,
+scalar, and centered-square reductions, and shares balanced reduction/layout helpers. Fused and separately materialized
+ArgMax/ArgMin graphs now enter one `_lower_unrolled_arg_extrema` matcher and one common first-tie/gather/image tail.
+Sort parsing also reuses binary-tree flattening, equality-pair splitting, and parameter-load grouping.
+
+The slowest method remains `TestRockchipCumulativeExtremaOps.test_simple_cummin`. An exact test-body profile measured
+27.37 s: 0.010 s input creation, 0.0004 s Torch reference, 0.028 s graph construction, 27.32 s realization, 0.0046 s
+copyout, and 0.0050 s assertions. Within realization, seven renderer calls consumed 8.41 s and nine program calls
+consumed 8.43 s. The 73 submit ioctls themselves consumed only 0.037 s, while 73 required NPU resets consumed 7.77 s;
+the method issued 73 submits and 4,225 DPU tasks. This cleanup deliberately does not alter reset or submission semantics.
+
+An attempted shared equality-mask emitter was rejected: `sz.py` increased by one executable line and the abstraction
+hid operation-specific DPU barrier placement. Keeping the explicit occurrence/cumulative/sort emission is smaller and
+clearer. The accepted cleanup reduces the renderer from **1,846 to 1,753 executable lines** (93 lines) without removing
+features.
+
+- Focused merged ArgMax/ArgMin coverage: **6 passed, 10 subtests passed in 10.99 s**, sequentially.
+- Complete Rockchip census: **325 passed, 11 skipped, 180 subtests passed in 321.90 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,753/274 executable lines**.
+
+The CPU-cheat audit found no runtime or test change in this milestone. All new helpers operate only on compile-time UOp
+structure, static index maps, and immutable command-image metadata; they do not inspect or calculate tensor values.
+There is no LUT, CMAC, CNA, PPU, Tinygrad core change, or tolerance relaxation.

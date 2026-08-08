@@ -4,7 +4,7 @@ import base64, math, os, struct
 import numpy as np
 from dataclasses import dataclass, replace
 from enum import IntEnum
-from typing import Callable
+from typing import Callable, Iterable
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import Target, cdiv, cmod, floordiv, floormod
@@ -394,6 +394,19 @@ def _is_static_expr(u:UOp, cache:dict[UOp, bool]|None=None) -> bool:
 
 def _index_ranges(index:UOp) -> list[UOp]: return [u for u in index.toposort() if u.op is Ops.RANGE]
 
+RKOutput = tuple[UOp, UOp, int, UOp, UOp]
+def _output_store(uops:list[UOp], dtype:DType|tuple[DType, ...], *, allow_local:bool=False, reject_reduce:bool=False) \
+                  -> RKOutput|None:
+  """Return the single statically-sized output store shared by specialized graph matchers."""
+  stores = [u for u in uops if u.op is Ops.STORE]
+  outputs = [(store, root) for store in stores if (root:=_root_param(store.src[0])) is not None]
+  if (len(outputs) != 1 or not allow_local and len(stores) != 1 or reject_reduce and any(u.op is Ops.REDUCE for u in uops)):
+    return None
+  store, out_param = outputs[0]
+  accepted = dtype if isinstance(dtype, tuple) else (dtype,)
+  if out_param.dtype.scalar() not in accepted or out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  return store, out_param, int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
+
 def _iter_range_env(ranges:list[UOp]) -> list[dict[UOp, int]]:
   if not ranges: return [{}]
   order:list[UOp] = []
@@ -422,6 +435,25 @@ def _loop_reduction_shape(store:UOp, out_param:UOp, nodes:list[UOp]) -> tuple[in
   except RuntimeError: return None
   if len(envs) != rows or tuple(_eval_int(store.src[0].src[1], env) for env in envs) != tuple(range(rows)): return None
   return rows, envs, reduce_range, groups
+
+@dataclass(frozen=True)
+class RKLoopReduction:
+  store:UOp; out:UOp; nodes:list[UOp]; rows:int; envs:list[dict[UOp, int]]; reduce_range:UOp; groups:int; update:UOp; post_scale:float
+
+def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
+  """Parse the output, accumulator update, shape, and optional final scale of a loop reduction."""
+  if (output:=_output_store(uops, (dtypes.half, dtypes.float), allow_local=True)) is None: return None
+  store, out, _, _, root = output
+  nodes = list(root.toposort())
+  if (shape:=_loop_reduction_shape(store, out, nodes)) is None: return None
+  rows, envs, reduce_range, groups = shape
+  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
+  if len(updates) != 1: return None
+  if _local_load(root) is not None: post_scale = 1.0
+  elif root.op is Ops.MUL and (load:=next((x for x in root.src if _local_load(x) is not None), None)) is not None and \
+       (scale:=root.src[1 if root.src[0] is load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
+  else: return None
+  return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale)
 
 def _spaced_reduction_gathers(src_slot:int, dst_slot:int, rows:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...]) \
     -> tuple[RKGather, ...]:
@@ -664,24 +696,10 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
   middle = middle.alu(Ops.ADD, low)
   return high.alu(Ops.ADD, middle)
 
-def _lower_dot_loop_reduction(uops:list[UOp]) -> RKImage|None:
+def _lower_dot_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Lower an FP16 dot loop as vector MUL terms followed by a balanced vector ADD tree."""
-  global_stores = [(store, _root_param(store.src[0])) for store in uops if store.op is Ops.STORE]
-  global_stores = [(store, param) for store,param in global_stores if param is not None]
-  if len(global_stores) != 1: return None
-  store, out_param = global_stores[0]
-  assert out_param is not None
-  if (out_param.dtype.scalar() is not dtypes.half or out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX or
-      not 0 < int(out_param.src[0].arg) <= _MAX_EW_ELEMS_FP16): return None
-  nodes = store.src[1].toposort()
-  output_ranges = _index_ranges(store.src[0].src[1])
-  reduce_ranges = [u for u in nodes if u.op is Ops.RANGE and u not in output_ranges]
-  if len(reduce_ranges) != 1: return None
-  reduce_range = reduce_ranges[0]
-  if reduce_range.src[0].op is not Ops.CONST or (groups:=int(reduce_range.src[0].arg)) <= 0: return None
-  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
-  if len(updates) != 1: return None
-  update = _strip_cast(updates[0].src[1])
+  if loop.out.dtype.scalar() is not dtypes.half or loop.rows > _MAX_EW_ELEMS_FP16 or loop.post_scale != 1.0: return None
+  store, update, reduce_range, groups = loop.store, loop.update, loop.reduce_range, loop.groups
   if update.op is not Ops.ADD or (acc:=next((x for x in update.src if _local_load(x) is not None), None)) is None: return None
   product = _strip_cast(update.src[1 if update.src[0] is acc else 0])
   if product.op is not Ops.MUL or product.dtype.scalar() is not dtypes.half: return None
@@ -689,28 +707,19 @@ def _lower_dot_loop_reduction(uops:list[UOp]) -> RKImage|None:
     operand = _strip_cast(operand)
     param = _root_param(operand.src[0]) if operand.op is Ops.LOAD and operand.src and operand.src[0].op is Ops.INDEX else None
     if param is None or operand.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST: return None
-  if _local_load(store.src[1]) is None: return None
   terms = [product.substitute({reduce_range:reduce_range.const_like(r)}) for r in range(groups)]
   while len(terms) > 1:
     terms = [terms[i].alu(Ops.ADD, terms[i+1]) for i in range(0, len(terms)-1, 2)] + (terms[-1:] if len(terms) & 1 else [])
   return lower_ew([store.replace(src=(store.src[0], terms[0], *store.src[2:]))])
 
-def _lower_centered_square_loop_reduction(uops:list[UOp]) -> RKImage|None:
+def _lower_centered_square_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Lower scalar SUM((x-center)^2)*scale using only aligned one-lane DPU EW stages."""
-  global_stores = [(store, _root_param(store.src[0])) for store in uops if store.op is Ops.STORE]
-  global_stores = [(store, param) for store,param in global_stores if param is not None]
-  if len(global_stores) != 1: return None
-  store, out_param = global_stores[0]
-  assert out_param is not None
-  nodes = list(store.src[1].toposort())
+  if loop.groups < 2: return None
+  out_param = loop.out
+  rows, envs, reduce_range, groups, update, post_scale = \
+    loop.rows, loop.envs, loop.reduce_range, loop.groups, loop.update, loop.post_scale
   fp32_out = out_param.dtype.scalar() is dtypes.float
-  if out_param.dtype.scalar() not in (dtypes.half, dtypes.float): return None
-  if (shape:=_loop_reduction_shape(store, out_param, nodes)) is None: return None
-  rows, envs, reduce_range, groups = shape
-  if groups < 2: return None
-
-  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
-  if len(updates) != 1 or (update:=_strip_cast(updates[0].src[1])).op is not Ops.ADD: return None
+  if update.op is not Ops.ADD: return None
   acc = next((x for x in update.src if _local_load(x) is not None), None)
   if acc is None: return None
   square = _strip_cast(update.src[1 if update.src[0] is acc else 0])
@@ -736,50 +745,20 @@ def _lower_centered_square_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if (int(data_param.src[0].arg) != rows*groups or sorted(offset for block in data_blocks for offset in block) != list(range(rows*groups)) or
       center_offsets != tuple(range(rows)) or int(center_param.src[0].arg) != rows): return None
 
-  final_value = store.src[1]
-  if _local_load(final_value) is not None: post_scale = 1.0
-  elif final_value.op is Ops.MUL and (final_load:=next((x for x in final_value.src if _local_load(x) is not None), None)) is not None and \
-       (scale:=final_value.src[1 if final_value.src[0] is final_load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
-  else: return None
   constants = () if post_scale == 1.0 else (post_scale,)
-  data_slot = len(constants)
-  gathers = _spaced_reduction_gathers(data_param.arg.slot, data_slot, rows, data_blocks)
-  def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, data_slot, offset)
   center_arg = RKArg(RKBufferKind.ARG, center_param.arg.slot)
-  ew_ops:list[RKEWOp] = []
-  active = [r*64 for r in range(groups)]
-  for offset in active:
-    value = arena(offset)
-    ew_ops.append(RKEWOp(value, value, center_arg, rows, _EW_CFG[Ops.SUB], stateful=not ew_ops))
-    ew_ops.append(RKEWOp(value, value, value, rows, _EW_CFG[Ops.MUL]))
-  while len(active) > 1:
-    next_active:list[int] = []
-    for i in range(0, len(active)-1, 2):
-      lhs, rhs = active[i], active[i+1]
-      final = len(active) == 2 and post_scale == 1.0
-      dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if final else arena(lhs)
-      ew_ops.append(RKEWOp(dst, arena(lhs), arena(rhs), rows, _EW_CFG[Ops.ADD] | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
-      next_active.append(lhs)
-    if len(active) & 1: next_active.append(active[-1])
-    active = next_active
-  if post_scale != 1.0:
-    ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), arena(active[0]), RKArg(RKBufferKind.SCRATCH, 0), rows,
-                         _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
-  scratch = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(groups*64),)
-  return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=gathers, ew_ops=tuple(ew_ops))
+  def prepare(ops:list[RKEWOp], value:RKArg, _:dict[float, int]) -> None:
+    ops.append(RKEWOp(value, value, center_arg, rows, _EW_CFG[Ops.SUB], stateful=not ops))
+    ops.append(RKEWOp(value, value, value, rows, _EW_CFG[Ops.MUL]))
+  return _reduction_image(out_param.arg.slot, rows, data_param.arg.slot, data_blocks, constants,
+                          _EW_CFG[Ops.ADD], fp32_out, post_scale, prepare)
 
-def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
+def _lower_scalar_loop_reduction(loop:RKLoopReduction) -> RKImage|None:
   """Turn a compact scalar register reduction into balanced FP16 DPU EW stages."""
-  global_stores = [(store, _root_param(store.src[0])) for store in uops if store.op is Ops.STORE]
-  global_stores = [(store, param) for store,param in global_stores if param is not None]
-  if len(global_stores) != 1: return None
-  store, out_param = global_stores[0]
-  nodes = list(store.src[1].toposort())
-  assert out_param is not None
+  out_param, nodes = loop.out, loop.nodes
+  rows, envs, reduce_range, groups, update, post_scale = \
+    loop.rows, loop.envs, loop.reduce_range, loop.groups, loop.update, loop.post_scale
   fp32_out = out_param.dtype.scalar() is dtypes.float
-  if out_param.dtype.scalar() not in (dtypes.half, dtypes.float): return None
-  if (shape:=_loop_reduction_shape(store, out_param, nodes)) is None: return None
-  rows, envs, reduce_range, groups = shape
   loads:list[tuple[UOp, UOp]] = []
   for u in nodes:
     if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.half or not u.src or u.src[0].op is not Ops.INDEX: continue
@@ -788,17 +767,10 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if not loads or len({param.key for _,param in loads}) != 1: return None
   in_param = loads[0][1]
   if in_param.src[0].op is not Ops.CONST: return None
-  updates = [u for u in nodes if u.op is Ops.STORE and _root_param(u.src[0]) is None and reduce_range in u.toposort()]
-  if len(updates) != 1: return None
-  final_value = store.src[1]
-  if _local_load(final_value) is not None: post_scale = 1.0
-  elif final_value.op is Ops.MUL and (final_load:=next((x for x in final_value.src if _local_load(x) is not None), None)) is not None and \
-       (scale:=final_value.src[1 if final_value.src[0] is final_load else 0]).op is Ops.CONST: post_scale = float(scale.arg)
-  else: return None
-  reduce_ops = {u.op for u in updates[0].src[1].toposort()
-                if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}
+  update_nodes = update.toposort()
+  reduce_ops = {u.op for u in update_nodes if u.dtype.scalar() is dtypes.half and u.op in (Ops.ADD, Ops.MUL, Ops.MAX)}
   negate_inputs = reduce_ops == {Ops.MUL, Ops.MAX} and any(u.op is Ops.CONST and u.dtype.scalar() is dtypes.half and
-                                                            float(u.arg) == -1.0 for u in updates[0].src[1].toposort())
+                                                            float(u.arg) == -1.0 for u in update_nodes)
   if negate_inputs: reduce_op = Ops.MAX
   elif len(reduce_ops) == 1: reduce_op = next(iter(reduce_ops))
   else: return None
@@ -812,41 +784,73 @@ def _lower_scalar_loop_reduction(uops:list[UOp]) -> RKImage|None:
   if input_count < 2: return None
 
   const_values = tuple(dict.fromkeys(x for x in ((-1.0,) if negate_inputs else ()) + ((post_scale,) if post_scale != 1.0 else ())))
-  const_slots = {value:i for i,value in enumerate(const_values)}
-  data_slot = len(const_values)
-  gathers = _spaced_reduction_gathers(in_param.arg.slot, data_slot, rows, blocks)
-  cfg = _EW_CFG[reduce_op]
-  ew_ops:list[RKEWOp] = []
-  active = [i*64 for i in range(len(blocks))]
-  if negate_inputs:
-    neg_one = RKArg(RKBufferKind.SCRATCH, const_slots[-1.0])
-    for offset in active:
-      value = RKArg(RKBufferKind.SCRATCH, data_slot, offset)
-      ew_ops.append(RKEWOp(value, value, neg_one, rows, _EW_CFG[Ops.MUL]))
-  while len(active) > 1:
-    next_active:list[int] = []
-    for i in range(0, len(active)-1, 2):
-      lhs, rhs = active[i], active[i+1]
-      final = len(active) == 2 and post_scale == 1.0
-      dst = RKArg(RKBufferKind.ARG, out_param.arg.slot) if final else RKArg(RKBufferKind.SCRATCH, data_slot, lhs)
-      ew_ops.append(RKEWOp(dst, RKArg(RKBufferKind.SCRATCH, data_slot, lhs), RKArg(RKBufferKind.SCRATCH, data_slot, rhs), rows,
-                          cfg | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
-      next_active.append(lhs)
-    if len(active) & 1: next_active.append(active[-1])
-    active = next_active
-  if post_scale != 1.0:
-    ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), RKArg(RKBufferKind.SCRATCH, data_slot, active[0]),
-                         RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), rows,
-                         _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
-  constants = b"".join(struct.pack("<e", value) for value in const_values)
-  scratch = tuple(RKScratch(rows*2) for _ in const_values) + (RKScratch(len(blocks)*64),)
-  return RKImage(RKTarget.RK3588, scratch, constants, gathers=gathers, ew_ops=tuple(ew_ops))
+  def prepare(ops:list[RKEWOp], value:RKArg, slots:dict[float, int]) -> None:
+    ops.append(RKEWOp(value, value, RKArg(RKBufferKind.SCRATCH, slots[-1.0]), rows, _EW_CFG[Ops.MUL]))
+  return _reduction_image(out_param.arg.slot, rows, in_param.arg.slot, blocks, const_values,
+                          _EW_CFG[reduce_op], fp32_out, post_scale, prepare if negate_inputs else None)
 
-def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
+def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
+  return _flatten_binary(root.src[0], op)+_flatten_binary(root.src[1], op) if root.op is op else [root]
+
+def _split_load_pairs(pairs:tuple[tuple[UOp, UOp], ...]) -> tuple[UOp, tuple[UOp, ...]]|None:
+  """Split equality pairs into their one common lane and ordered candidate lanes."""
+  if not pairs: return None
+  common = set(pairs[0]).intersection(*(set(pair) for pair in pairs[1:]))
+  if len(common) != 1: return None
+  current = next(iter(common))
+  candidates = tuple(next((x for x in pair if x is not current), None) for pair in pairs)
+  if any(x is None for x in candidates): return None
+  return current, tuple(x for x in candidates if x is not None)
+
+def _reduce_rows(ops:list[RKEWOp], active:list[RKArg], count:int, cfg:int) -> RKArg:
+  """Append a balanced row reduction, making its first dependent stage self-contained."""
+  first = True
+  while len(active) > 1:
+    reduced = []
+    for i in range(0, len(active)-1, 2):
+      ops.append(RKEWOp(active[i], active[i], active[i+1], count, cfg, submit_barrier=first, stateful=first))
+      first = False; reduced.append(active[i])
+    if len(active) & 1: reduced.append(active[-1])
+    active = reduced
+  return active[0]
+
+def _reduce_arena(ops:list[RKEWOp], active:list[int], count:int, cfg:int, arena:Callable[[int], RKArg],
+                  out:RKArg|None=None, fp32_out:bool=False) -> RKArg:
+  """Append a balanced in-place arena reduction and optionally write its final stage directly to output."""
+  while len(active) > 1:
+    reduced = []
+    for i in range(0, len(active)-1, 2):
+      lhs, rhs, final = active[i], active[i+1], len(active) == 2 and out is not None
+      dst = out if final and out is not None else arena(lhs)
+      ops.append(RKEWOp(dst, arena(lhs), arena(rhs), count,
+                        cfg | (_EW_STAGE_FP32_OUT if fp32_out and final else 0)))
+      reduced.append(lhs)
+    if len(active) & 1: reduced.append(active[-1])
+    active = reduced
+  return out if out is not None else arena(active[0])
+
+def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...],
+                     constants:tuple[float, ...], cfg:int, fp32_out:bool, post_scale:float,
+                     prepare:Callable[[list[RKEWOp], RKArg, dict[float, int]], None]|None=None) -> RKImage:
+  """Materialize row blocks, apply an optional lane transform, reduce them, and write the typed result."""
+  const_slots, data_slot = {value:i for i,value in enumerate(constants)}, len(constants)
+  gathers = _spaced_reduction_gathers(source_slot, data_slot, rows, blocks)
+  def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, data_slot, offset)
+  ops:list[RKEWOp] = []
+  active = [i*64 for i in range(len(blocks))]
+  if prepare is not None:
+    for offset in active: prepare(ops, arena(offset), const_slots)
+  out = RKArg(RKBufferKind.ARG, out_slot)
+  reduced = _reduce_arena(ops, active, rows, cfg, arena, out if post_scale == 1.0 else None, fp32_out)
+  if post_scale != 1.0:
+    ops.append(RKEWOp(out, reduced, RKArg(RKBufferKind.SCRATCH, const_slots[post_scale]), rows,
+                      _EW_CFG[Ops.MUL] | (_EW_STAGE_FP32_OUT if fp32_out else 0)))
+  scratch = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(len(blocks)*64),)
+  return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=gathers, ew_ops=tuple(ops))
+
+def _lower_raw_int32_layout(output:RKOutput) -> RKImage|None:
   """Move an INT32 tensor through a static view or shrink without interpreting its values."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
-  count, out_index, value = int(out_param.src[0].arg), stores[0].src[0].src[1], stores[0].src[1]
+  _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
   if (value.op is not Ops.LOAD or value.dtype.scalar() is not dtypes.int or len(value.src) != 1 or value.src[0].op is not Ops.INDEX or
       value.src[0].src[0].op is not Ops.PARAM): return None
@@ -868,21 +872,12 @@ def _load_equality(predicate:UOp) -> tuple[UOp, UOp]|None:
   if len(pair) != 2 or any(x.op is not Ops.LOAD or x.src[0].op is not Ops.INDEX for x in pair): return None
   return pair[0], pair[1]
 
-def _lower_occurrence_count(uops:list[UOp]) -> RKImage|None:
+def _lower_occurrence_count(output:RKOutput) -> RKImage|None:
   """Lower stable-sort's unrolled prefix equality counts to DPU masks and ADD."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if (len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or
-      out_param.dtype.scalar() is not dtypes.int or any(u.op is Ops.REDUCE for u in uops)): return None
-  store = stores[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  count, out_index = int(out_param.src[0].arg), store.src[0].src[1]
+  store, out_param, count, out_index, _ = output
   if count <= 0: return RKImage(RKTarget.RK3588)
 
-  terms:list[UOp] = []
-  def flatten(value:UOp) -> None:
-    if value.op is Ops.ADD and value.dtype.scalar() is dtypes.int: flatten(value.src[0]); flatten(value.src[1])
-    else: terms.append(value)
-  flatten(store.src[1])
+  terms = _flatten_binary(store.src[1], Ops.ADD)
   parsed:list[tuple[tuple[UOp, UOp], UOp|None]] = []
   for term in terms:
     if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int: return None
@@ -895,12 +890,8 @@ def _lower_occurrence_count(uops:list[UOp]) -> RKImage|None:
     if (pair:=_load_equality(predicate)) is None or any(x.dtype.scalar() is not dtypes.half for x in pair): return None
     parsed.append((pair, gate))
   if not 2 <= len(parsed) <= 255: return None
-  common = set(parsed[0][0]).intersection(*(set(pair) for pair,_ in parsed[1:]))
-  if len(common) != 1: return None
-  current = next(iter(common))
-  candidates = [next((x for x in pair if x is not current), None) for pair,_ in parsed]
-  if any(x is None for x in candidates): return None
-  candidate_loads = tuple(x for x in candidates if x is not None)
+  if (split:=_split_load_pairs(tuple(pair for pair,_ in parsed))) is None: return None
+  current, candidate_loads = split
   loads = (*candidate_loads, current)
   params = tuple(_root_param(load.src[0]) for load in loads)
   if (any(param is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST for param in params) or
@@ -935,35 +926,17 @@ def _lower_occurrence_count(uops:list[UOp]) -> RKImage|None:
     RKEWOp(arg(unequal), arg(magnitude), arg(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
     RKEWOp(arg(equal), arg(one), arg(unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
     RKEWOp(arg(selected), arg(equal), arg(valid_slot), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)]
-  active_args = [arg(selected, candidate*vector_bytes) for candidate in range(window)]
-  first = True
-  while len(active_args) > 1:
-    reduced:list[RKArg] = []
-    for i in range(0, len(active_args)-1, 2):
-      ops.append(RKEWOp(active_args[i], active_args[i], active_args[i+1], count, _EW_CFG[Ops.ADD], submit_barrier=first, stateful=first))
-      first = False
-      reduced.append(active_args[i])
-    if len(active_args) & 1: reduced.append(active_args[-1])
-    active_args = reduced
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), active_args[0], arg(int_tiles), count,
+  selected_arg = _reduce_rows(ops, [arg(selected, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.ADD])
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), selected_arg, arg(int_tiles), count,
                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
 
-def _lower_sort_index_selection(uops:list[UOp]) -> RKImage|None:
+def _lower_sort_index_selection(output:RKOutput) -> RKImage|None:
   """Lower stable sort's value/count match and coordinate sum entirely to DPU EW."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if (len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or
-      out_param.dtype.scalar() is not dtypes.int or any(u.op is Ops.REDUCE for u in uops)): return None
-  store = stores[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  count, out_index = int(out_param.src[0].arg), store.src[0].src[1]
+  store, out_param, count, out_index, _ = output
   if count <= 0: return RKImage(RKTarget.RK3588)
 
-  terms:list[UOp] = []
-  def flatten(value:UOp) -> None:
-    if value.op is Ops.ADD and value.dtype.scalar() is dtypes.int: flatten(value.src[0]); flatten(value.src[1])
-    else: terms.append(value)
-  flatten(store.src[1])
+  terms = _flatten_binary(store.src[1], Ops.ADD)
   parsed:list[tuple[int, tuple[UOp, UOp], tuple[UOp, UOp]]] = []
   for term in terms:
     weight, cast = 1, term
@@ -984,15 +957,8 @@ def _lower_sort_index_selection(uops:list[UOp]) -> RKImage|None:
       {weight for weight,_,_ in parsed} != set(range(1, max(weight for weight,_,_ in parsed)+1))): return None
   parsed.sort(key=lambda item: item[0])
 
-  def split_pairs(pairs:tuple[tuple[UOp, UOp], ...]) -> tuple[UOp, tuple[UOp, ...]]|None:
-    common = set(pairs[0]).intersection(*(set(pair) for pair in pairs[1:]))
-    if len(common) != 1: return None
-    current = next(iter(common))
-    candidates = tuple(next((x for x in pair if x is not current), None) for pair in pairs)
-    return None if any(x is None for x in candidates) else (current, tuple(x for x in candidates if x is not None))
-
-  if (half_split:=split_pairs(tuple(pair for _,pair,_ in parsed))) is None or \
-     (int_split:=split_pairs(tuple(pair for _,_,pair in parsed))) is None: return None
+  if (half_split:=_split_load_pairs(tuple(pair for _,pair,_ in parsed))) is None or \
+     (int_split:=_split_load_pairs(tuple(pair for _,_,pair in parsed))) is None: return None
   half_current, half_candidates = half_split
   int_current, int_candidates = int_split
   all_loads = (*half_candidates, half_current, *int_candidates, int_current)
@@ -1057,27 +1023,16 @@ def _lower_sort_index_selection(uops:list[UOp]) -> RKImage|None:
     RKEWOp(arg(count_equal), arg(one), arg(count_unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
     RKEWOp(arg(selected), arg(value_equal), arg(count_equal), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
     RKEWOp(arg(weighted), arg(selected), arg(weights), matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)]
-  active = [arg(weighted, row*vector_bytes) for row in range(rows)]
-  first = True
-  while len(active) > 1:
-    reduced:list[RKArg] = []
-    for i in range(0, len(active)-1, 2):
-      ops.append(RKEWOp(active[i], active[i], active[i+1], count, _EW_CFG[Ops.ADD], submit_barrier=first, stateful=first))
-      first = False
-      reduced.append(active[i])
-    if len(active) & 1: reduced.append(active[-1])
-    active = reduced
-  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), active[0], arg(int_tiles), count,
+  selected_arg = _reduce_rows(ops, [arg(weighted, row*vector_bytes) for row in range(rows)], count, _EW_CFG[Ops.ADD])
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), selected_arg, arg(int_tiles), count,
                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops))
 
-def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
+def _lower_sort_compare(output:RKOutput) -> RKImage|None:
   """Lower one static bitonic compare/swap pass with DPU MAX and MIN."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.half: return None
-  store = stores[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX or store.src[1].op is not Ops.WHERE: return None
-  count, out_index, condition = int(out_param.src[0].arg), store.src[0].src[1], store.src[1].src[0]
+  _, out_param, count, out_index, value = output
+  if value.op is not Ops.WHERE: return None
+  condition = value.src[0]
   if count <= 0: return RKImage(RKTarget.RK3588)
 
   def maximum(root:UOp, negated:bool) -> tuple[UOp, UOp]|None:
@@ -1099,7 +1054,7 @@ def _lower_sort_compare(uops:list[UOp]) -> RKImage|None:
       if len(constants) == len(inner) == 1 and (pair:=maximum(inner[0], True)) is not None: return False, pair
     return None
 
-  true_extreme, false_extreme = extreme(store.src[1].src[1]), extreme(store.src[1].src[2])
+  true_extreme, false_extreme = extreme(value.src[1]), extreme(value.src[2])
   if (true_extreme is None or false_extreme is None or true_extreme[0] == false_extreme[0] or
       set(true_extreme[1]) != set(false_extreme[1]) or not _is_static_expr(condition)): return None
   pair = true_extreme[1]
@@ -1180,25 +1135,12 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
                         submit_barrier=True, stateful=True),
                  RKEWOp(args(selected_arena), args(equal), args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
                         submit_barrier=True, stateful=True)))
-  active = [args(selected_arena, candidate*vector_bytes) for candidate in range(window)]
-  first_reduction = True
-  while len(active) > 1:
-    reduced:list[RKArg] = []
-    for i in range(0, len(active)-1, 2):
-      ew_ops.append(RKEWOp(active[i], active[i], active[i+1], count, _EW_CFG[Ops.MAX],
-                           submit_barrier=first_reduction, stateful=first_reduction))
-      first_reduction = False
-      reduced.append(active[i])
-    if len(active) & 1: reduced.append(active[-1])
-    active = reduced
-  ew_ops.append(RKEWOp(args(diff), args(2), active[0], count, _EW_CFG[Ops.SUB]) if first_tie else
-                RKEWOp(args(diff), active[0], args(one), count, _EW_CFG[Ops.SUB]))
+  selected = _reduce_rows(ew_ops, [args(selected_arena, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.MAX])
+  ew_ops.append(RKEWOp(args(diff), args(2), selected, count, _EW_CFG[Ops.SUB]) if first_tie else
+                RKEWOp(args(diff), selected, args(one), count, _EW_CFG[Ops.SUB]))
   ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), args(diff), args(int_tiles), count,
                        _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<"+"e"*len(constants), *constants), gathers=gathers, ew_ops=tuple(ew_ops))
-
-def _flatten_binary(root:UOp, op:Ops) -> list[UOp]:
-  return _flatten_binary(root.src[0], op)+_flatten_binary(root.src[1], op) if root.op is op else [root]
 
 def _half_candidate(root:UOp) -> tuple[UOp, bool]|None:
   if root.op is Ops.LOAD: return (root, False)
@@ -1208,20 +1150,29 @@ def _half_candidate(root:UOp) -> tuple[UOp, bool]|None:
     if len(loads) == len(constants) == 1: return (loads[0], True)
   return None
 
+def _param_load_groups(nodes:Iterable[UOp]) -> dict[int, list[UOp]]:
+  """Group unique FP16 parameter loads by argument slot."""
+  grouped:dict[int, list[UOp]] = {}
+  for load in nodes:
+    if load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and load.src[0].op is Ops.INDEX and load.src[0].src[0].op is Ops.PARAM:
+      slot = load.src[0].src[0].arg.slot
+      if load not in grouped.setdefault(slot, []): grouped[slot].append(load)
+  return grouped
+
 def _first_tie_selection(value:UOp, extrema:UOp, ordered_exprs:list[UOp]) -> bool:
   """Verify Tinygrad's descending-coordinate INT32 MAX encoding for the first equal candidate."""
-  window = len(ordered_exprs)
+  window, nodes = len(ordered_exprs), value.toposort()
   equal_casts:list[UOp] = []
   for expr in ordered_exprs:
-    matches = [u for u in value.toposort() if u.op is Ops.CMPNE and (u.src == (expr, extrema) or u.src == (extrema, expr))]
+    matches = [u for u in nodes if u.op is Ops.CMPNE and (u.src == (expr, extrema) or u.src == (extrema, expr))]
     if len(matches) != 1: return False
-    inversions = [u for u in value.toposort() if u.op is Ops.CMPNE and matches[0] in u.src and
+    inversions = [u for u in nodes if u.op is Ops.CMPNE and matches[0] in u.src and
                   any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg) for x in u.src)]
-    casts = [u for u in value.toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
+    casts = [u for u in nodes if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
              len(inversions) == 1 and u.src == (inversions[0],)]
     if len(casts) != 1: return False
     equal_casts.append(casts[0])
-  int_roots = [u for u in value.toposort() if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int]
+  int_roots = [u for u in nodes if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int]
   if not int_roots: return False
   selected = max(int_roots, key=lambda x:len(_flatten_binary(x, Ops.MAX)))
   terms = _flatten_binary(selected, Ops.MAX)
@@ -1233,92 +1184,70 @@ def _first_tie_selection(value:UOp, extrema:UOp, ordered_exprs:list[UOp]) -> boo
   return value.op is Ops.ADD and any(x.op is Ops.CONST and int(x.arg) == window for x in value.src) and \
     any(x.op is Ops.MUL and selected in x.src and any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src) for x in value.src)
 
-def _lower_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
-  """Lower fused FP16 ArgMax/ArgMin while preserving first-index tie semantics."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
-  store = stores[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  count, out_index, value = int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
+@dataclass(frozen=True)
+class RKArgMatch:
+  source_slot:int; source_count:int; extrema:UOp; candidates:tuple[tuple[UOp, UOp, bool], ...]; extrema_plans:tuple[RKGather, ...]|None = None
+
+def _lower_unrolled_arg_extrema(output:RKOutput) -> RKImage|None:
+  """Share first-tie validation and gather packing across fused and split ArgMax/ArgMin graphs."""
+  _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
+  nodes = value.toposort()
 
-  roots:list[tuple[UOp, list[UOp], list[tuple[UOp, bool]]]] = []
-  for root in value.toposort():
-    if root.op is not Ops.MAX or root.dtype.scalar() is not dtypes.half: continue
-    leaves = _flatten_binary(root, Ops.MAX)
-    maybe_parsed = [_half_candidate(leaf) for leaf in leaves]
-    if all(x is not None for x in maybe_parsed): roots.append((root, leaves, [x for x in maybe_parsed if x is not None]))
-  if not roots: return None
-  extrema, candidate_exprs, parsed_candidates = max(roots, key=lambda x:len(x[1]))
-  signs = {negated for _,negated in parsed_candidates}
-  if len(parsed_candidates) < 2 or len(signs) != 1: return None
-  negated_candidates = signs.pop()
-  loads = [load for load,_ in parsed_candidates]
-  if len(set(loads)) != len(loads) or any(load.src[0].op is not Ops.INDEX or load.src[0].src[0].op is not Ops.PARAM for load in loads): return None
-  source = loads[0].src[0].src[0]
-  if any(load.src[0].src[0] is not source for load in loads) or source.src[0].op is not Ops.CONST: return None
-  window, source_count = len(loads), int(source.src[0].arg)
-  if source_count != count*window or window > 2048: return None
-  try: candidate_offsets = [tuple(_gather_offsets(out_index, load.src[0].src[1], None, count)) for load in loads]
+  def fused() -> RKArgMatch|None:
+    roots:list[tuple[UOp, list[UOp], list[tuple[UOp, bool]]]] = []
+    for root in nodes:
+      if root.op is not Ops.MAX or root.dtype.scalar() is not dtypes.half: continue
+      leaves = _flatten_binary(root, Ops.MAX); parsed_leaves = [_half_candidate(leaf) for leaf in leaves]
+      if all(x is not None for x in parsed_leaves): roots.append((root, leaves, [x for x in parsed_leaves if x is not None]))
+    if not roots: return None
+    extrema, exprs, parsed = max(roots, key=lambda x:len(x[1]))
+    loads = [load for load,_ in parsed]
+    if not loads or loads[0].src[0].op is not Ops.INDEX or (source:=_root_param(loads[0].src[0])) is None or source.src[0].op is not Ops.CONST:
+      return None
+    return RKArgMatch(source.arg.slot, int(source.src[0].arg), extrema,
+                      tuple((expr, load, negated) for expr,(load,negated) in zip(exprs, parsed)))
+
+  def split() -> RKArgMatch|None:
+    by_slot = _param_load_groups(nodes)
+    extrema_groups = [(slot, group[0]) for slot,group in by_slot.items() if len(group) == 1 and
+                      group[0].src[0].src[0].src[0].op is Ops.CONST and int(group[0].src[0].src[0].src[0].arg) == count]
+    if len(extrema_groups) != 1 or len(by_slot) != 2: return None
+    extrema_slot, extrema = extrema_groups[0]
+    data_slot, loads = next((slot,group) for slot,group in by_slot.items() if slot != extrema_slot)
+    data_param = loads[0].src[0].src[0]
+    if data_param.src[0].op is not Ops.CONST: return None
+    candidates:list[tuple[UOp, UOp, bool]] = []
+    for cmp in [u for u in nodes if u.op is Ops.CMPNE and extrema in u.src]:
+      expr = cmp.src[1] if cmp.src[0] is extrema else cmp.src[0]
+      if (parsed:=_half_candidate(expr)) is not None: candidates.append((expr, *parsed))
+    if {load for _,load,_ in candidates} != set(loads): return None
+    try: extrema_offsets = tuple(_gather_offsets(out_index, extrema.src[0].src[1], None, count))
+    except RuntimeError: return None
+    if sorted(extrema_offsets) != list(range(count)): return None
+    return RKArgMatch(data_slot, int(data_param.src[0].arg), extrema, tuple(candidates),
+                      (RKGather(extrema_slot, 0, count, offsets=extrema_offsets),))
+
+  if (match:=fused()) is None and (match:=split()) is None: return None
+  signs, loads = {negated for _,_,negated in match.candidates}, [load for _,load,_ in match.candidates]
+  if (len(match.candidates) < 2 or len(signs) != 1 or len(set(loads)) != len(loads) or
+      any(load.src[0].op is not Ops.INDEX or (source:=_root_param(load.src[0])) is None or
+          source.arg.slot != match.source_slot for load in loads)): return None
+  negated, window = signs.pop(), len(loads)
+  if match.source_count != count*window or window > 2048: return None
+  try: offsets = [tuple(_gather_offsets(out_index, load.src[0].src[1], None, count)) for load in loads]
   except RuntimeError: return None
-  ordered = sorted(zip(candidate_offsets, candidate_exprs), key=lambda x:x[0])
-  if sorted(offset for offsets,_ in ordered for offset in offsets) != list(range(source_count)): return None
-  if not _first_tie_selection(value, extrema, [expr for _,expr in ordered]): return None
-  candidate_plans = tuple(RKGather(source.arg.slot, 0, count, offsets=offsets) for offsets,_ in ordered)
-  return _cumulative_index_image(out_param.arg.slot, count, candidate_plans, candidate_plans,
-                                 negated_candidates, [window-1]*count, first_tie=True, negate_extrema=negated_candidates)
+  ordered = sorted(zip(offsets, (expr for expr,_,_ in match.candidates)), key=lambda x:x[0])
+  if (sorted(offset for row,_ in ordered for offset in row) != list(range(match.source_count)) or
+      not _first_tie_selection(value, match.extrema, [expr for _,expr in ordered])): return None
+  plans = tuple(RKGather(match.source_slot, 0, count, offsets=row) for row,_ in ordered)
+  return _cumulative_index_image(out_param.arg.slot, count, plans, plans if match.extrema_plans is None else match.extrema_plans,
+                                 negated, [window-1]*count, first_tie=True, negate_extrema=negated and match.extrema_plans is None)
 
-def _lower_split_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
-  """Select an FP16 axis ArgMax/ArgMin coordinate against a separately materialized extreme."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
-  store = stores[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  count, out_index, value = int(out_param.src[0].arg), store.src[0].src[1], store.src[1]
-  if count <= 0: return RKImage(RKTarget.RK3588)
-  loads = [u for u in value.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
-           u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM]
-  by_slot:dict[int, list[UOp]] = {}
-  for load in loads:
-    slot = load.src[0].src[0].arg.slot
-    if load not in by_slot.setdefault(slot, []): by_slot[slot].append(load)
-  extrema_groups = [(slot, group[0]) for slot,group in by_slot.items() if len(group) == 1 and
-                    group[0].src[0].src[0].src[0].op is Ops.CONST and int(group[0].src[0].src[0].src[0].arg) == count]
-  if len(extrema_groups) != 1 or len(by_slot) != 2: return None
-  extrema_slot, extrema = extrema_groups[0]
-  data_slot, candidates = next((slot,group) for slot,group in by_slot.items() if slot != extrema_slot)
-  data_param = candidates[0].src[0].src[0]
-  if data_param.src[0].op is not Ops.CONST: return None
-  source_count = int(data_param.src[0].arg)
-  direct:list[tuple[UOp, UOp, bool]] = []
-  for cmp in [u for u in value.toposort() if u.op is Ops.CMPNE and extrema in u.src]:
-    expr = cmp.src[1] if cmp.src[0] is extrema else cmp.src[0]
-    if (parsed:=_half_candidate(expr)) is not None: direct.append((expr, parsed[0], parsed[1]))
-  signs = {negated for _,_,negated in direct}
-  candidate_loads = {load for _,load,_ in direct}
-  if not direct or len(signs) != 1 or len(candidate_loads) != len(direct) or candidate_loads != set(candidates): return None
-  negated_candidates = signs.pop()
-  window = len(direct)
-  if source_count != count*window or window > 2048: return None
-  try:
-    candidate_offsets = [tuple(_gather_offsets(out_index, load.src[0].src[1], None, count)) for _,load,_ in direct]
-    extrema_offsets = tuple(_gather_offsets(out_index, extrema.src[0].src[1], None, count))
-  except RuntimeError: return None
-  if sorted(extrema_offsets) != list(range(count)): return None
-  ordered = sorted(zip(candidate_offsets, (expr for expr,_,_ in direct)), key=lambda x:x[0])
-  if sorted(offset for offsets,_ in ordered for offset in offsets) != list(range(source_count)): return None
-  if not _first_tie_selection(value, extrema, [expr for _,expr in ordered]): return None
-  candidate_plans = tuple(RKGather(data_slot, 0, count, offsets=offsets) for offsets,_ in ordered)
-  return _cumulative_index_image(out_param.arg.slot, count, candidate_plans, (RKGather(extrema_slot, 0, count, offsets=extrema_offsets),),
-                                 negated_candidates, [window-1]*count, first_tie=True)
-
-def _lower_loop_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
+def _lower_loop_arg_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Lower the two-register-loop graph used by a padded global FP16 ArgMax/ArgMin."""
-  final_stores = [(store, root) for store in uops if store.op is Ops.STORE and (root:=_root_param(store.src[0])) is not None]
-  if len(final_stores) != 1: return None
-  store, out_param = final_stores[0]
-  if (out_param.dtype.scalar() is not dtypes.int or out_param.src[0].op is not Ops.CONST or int(out_param.src[0].arg) != 1 or
-      store.src[0].op is not Ops.INDEX or _index_ranges(store.src[0].src[1])): return None
+  _, out_param, count, out_index, value = output
+  if count != 1 or _index_ranges(out_index): return None
   ranges = [u for u in uops if u.op is Ops.RANGE]
   if len(ranges) != 2 or any(r.src[0].op is not Ops.CONST for r in ranges): return None
   first_range, second_range = ranges
@@ -1351,7 +1280,8 @@ def _lower_loop_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
     return expr, negated
 
   half_candidate = global_candidate(list(half_updates[0].src[1].src), first_range)
-  comparisons = [u for u in int_updates[0].src[1].toposort() if u.op is Ops.CMPNE and u.dtype.scalar() is dtypes.bool]
+  int_nodes = int_updates[0].src[1].toposort()
+  comparisons = [u for u in int_nodes if u.op is Ops.CMPNE and u.dtype.scalar() is dtypes.bool]
   inner_cmps = [u for u in comparisons if any(_half_candidate(x) is not None for x in u.src)]
   if half_candidate is None or len(inner_cmps) != 1: return None
   cmp = inner_cmps[0]
@@ -1361,45 +1291,38 @@ def _lower_loop_arg_extrema_index(uops:list[UOp]) -> RKImage|None:
   if len(extrema_operands) != 1 or extrema_operands[0].op is not Ops.LOAD or _root_param(extrema_operands[0].src[0]) is not None:
     return None
   inversions = [u for u in comparisons if cmp in u.src and any(x.op is Ops.CONST and x.dtype.scalar() is dtypes.bool and bool(x.arg) for x in u.src)]
-  casts = [u for u in int_updates[0].src[1].toposort() if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
+  casts = [u for u in int_nodes if u.op is Ops.CAST and u.dtype.scalar() is dtypes.int and
            len(inversions) == 1 and u.src == (inversions[0],)]
   if len(casts) != 1: return None
-  weighted = [u for u in int_updates[0].src[1].toposort() if u.op is Ops.MUL and u.dtype.scalar() is dtypes.int and casts[0] in u.src]
+  weighted = [u for u in int_nodes if u.op is Ops.MUL and u.dtype.scalar() is dtypes.int and casts[0] in u.src]
   if len(weighted) != 1: return None
   coordinate = weighted[0].src[1] if weighted[0].src[0] is casts[0] else weighted[0].src[0]
   try:
     if [_eval_int(coordinate, {second_range:i}) for i in range(window)] != list(range(window, 0, -1)): return None
   except RuntimeError: return None
-  final_negative = [x for x in store.src[1].src if x.op is Ops.MUL and
+  final_negative = [x for x in value.src if x.op is Ops.MUL and
                     any(y.op is Ops.LOAD and y.dtype.scalar() is dtypes.int and _root_param(y.src[0]) is None for y in x.src) and
                     any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src)]
-  if (store.src[1].op is not Ops.ADD or len(final_negative) != 1 or
-      not any(x.op is Ops.CONST and int(x.arg) == window for x in store.src[1].src)): return None
+  if (value.op is not Ops.ADD or len(final_negative) != 1 or
+      not any(x.op is Ops.CONST and int(x.arg) == window for x in value.src)): return None
   candidate_plans = tuple(RKGather(source.arg.slot, 0, 1, base=i) for i in range(window))
   return _cumulative_index_image(out_param.arg.slot, 1, candidate_plans, candidate_plans,
                                  half_candidate[1], [window-1], first_tie=True, negate_extrema=half_candidate[1])
 
-def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
+def _lower_cumulative_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Select unrolled cumulative MAX/MIN axis coordinates with DPU equality masks."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
-  if out_param.src[0].op is not Ops.CONST or stores[0].src[0].op is not Ops.INDEX: return None
-  count, out_index, value = int(out_param.src[0].arg), stores[0].src[0].src[1], stores[0].src[1]
+  _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
-  if not any(u.op is Ops.CMPNE for u in value.toposort()): return None
-  loads = [u for u in value.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
-           u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM]
-  by_slot:dict[int, list[UOp]] = {}
-  for load in loads:
-    slot = load.src[0].src[0].arg.slot
-    if load not in by_slot.setdefault(slot, []): by_slot[slot].append(load)
+  nodes = value.toposort()
+  if not any(u.op is Ops.CMPNE for u in nodes): return None
+  by_slot = _param_load_groups(nodes)
   extrema_groups = [(slot, group[0]) for slot,group in by_slot.items() if len(group) == 1 and group[0].src[0].src[1].key == out_index.key]
   if len(extrema_groups) != 1 or len(by_slot) != 2: return None
   extrema_slot, _ = extrema_groups[0]
   data_slot, candidates = next((slot,group) for slot,group in by_slot.items() if slot != extrema_slot)
   def directly_negated(load:UOp) -> bool:
     return any(node.op is Ops.MUL and load in node.src and any(src.op is Ops.CONST and float(src.arg) == -1.0 for src in node.src)
-               for node in value.toposort())
+               for node in nodes)
   candidate_signs = {directly_negated(load) for load in candidates}
   if len(candidate_signs) != 1: return None
   negated_candidates = candidate_signs.pop()
@@ -1422,14 +1345,9 @@ def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
                                  (extrema_plan,), negated_candidates, axis_coords)
 
-def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
+def _lower_cumulative_extrema_index_loop(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Lower Tinygrad's bounded-loop form used by the padded length-1022 scan."""
-  final_stores = [(store, root) for store in uops if store.op is Ops.STORE and (root:=_root_param(store.src[0])) is not None and
-                  root.dtype.scalar() is dtypes.int]
-  if len(final_stores) != 1: return None
-  store, out_param = final_stores[0]
-  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
-  count, out_index = int(out_param.src[0].arg), store.src[0].src[1]
+  _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
   out_ranges = _index_ranges(out_index)
   if len(out_ranges) != 1 or out_ranges[0].src[0].op is not Ops.CONST or int(out_ranges[0].src[0].arg) != count: return None
@@ -1452,11 +1370,12 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
   reduce_range = candidate_index
   prefix_cmps = [u for u in uops if u.op is Ops.CMPLT and u.src == (out_range, reduce_range)]
   if len(prefix_cmps) != 1: return None
-  gates = [u for u in uops if u.op is Ops.AND and half_cmps[0] in u.toposort() and prefix_cmps[0] in u.toposort()]
+  def contains(root:UOp, *targets:UOp) -> bool:
+    nodes = set(root.toposort()); return all(target in nodes for target in targets)
+  gates = [u for u in uops if u.op is Ops.AND and contains(u, half_cmps[0], prefix_cmps[0])]
   if len(gates) != 1: return None
-  index_maxes = [u for u in uops if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int and gates[0] in u.toposort() and
-                 reduce_range in u.toposort()]
-  if len(index_maxes) != 1 or index_maxes[0] not in store.src[1].toposort(): return None
+  index_maxes = [u for u in uops if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int and contains(u, gates[0], reduce_range)]
+  if len(index_maxes) != 1 or index_maxes[0] not in value.toposort(): return None
   extrema_loads = [u for u in extrema_expr.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
                    u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM]
   if len(extrema_loads) != 2 or any(any(r is not out_range for r in _index_ranges(load.src[0].src[1])) for load in extrema_loads): return None
@@ -1473,13 +1392,9 @@ def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
   return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
                                  extrema_plans, negated_candidates, list(range(count)))
 
-def _lower_ieee_predicate(uops:list[UOp]) -> RKImage|None:
+def _lower_ieee_predicate(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Classify FP16 NaN/infinity on DPU and expose the final 0/1 mask through the bool ABI."""
-  stores = [u for u in uops if u.op is Ops.STORE]
-  if len(stores) != 1 or stores[0].src[0].op is not Ops.INDEX or \
-     (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.bool or \
-     out_param.src[0].op is not Ops.CONST: return None
-  store, root = stores[0], stores[0].src[1]
+  store, out_param, count, _, root = output
 
   def logical_not(u:UOp) -> UOp|None:
     if u.op is not Ops.CMPNE: return None
@@ -1523,7 +1438,7 @@ def _lower_ieee_predicate(uops:list[UOp]) -> RKImage|None:
   value = (both if kind == "nan" else UOp.const(1.0, dtypes.half).alu(Ops.SUB, either) if kind == "finite" else
            (positive_inf if kind == "positive_inf" else negative_inf if kind == "negative_inf" else either).alu(Ops.SUB, both))
 
-  count, out_slot = int(out_param.src[0].arg), out_param.arg.slot
+  out_slot = out_param.arg.slot
   if count <= 0: return RKImage(RKTarget.RK3588)
   half_param = out_param.replace(dtype=dtypes.half, arg=replace(out_param.arg, dtype=dtypes.half))
   half_index = store.src[0].replace(dtype=dtypes.half, src=(half_param, *store.src[0].src[1:]))
@@ -1539,19 +1454,25 @@ def _lower_ieee_predicate(uops:list[UOp]) -> RKImage|None:
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(((count+3)//4)*64)), ew_ops=ops)
 
 def lower_ew(uops:list[UOp]) -> RKImage:
-  if (predicate:=_lower_ieee_predicate(uops)) is not None: return predicate
-  if (sort_compare:=_lower_sort_compare(uops)) is not None: return sort_compare
-  if (occurrence_count:=_lower_occurrence_count(uops)) is not None: return occurrence_count
-  if (sort_index:=_lower_sort_index_selection(uops)) is not None: return sort_index
-  if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
-  if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
-  if (arg_extrema:=_lower_arg_extrema_index(uops)) is not None: return arg_extrema
-  if (split_arg_extrema:=_lower_split_arg_extrema_index(uops)) is not None: return split_arg_extrema
-  if (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops)) is not None: return loop_arg_extrema
-  if (raw_int32:=_lower_raw_int32_layout(uops)) is not None: return raw_int32
-  if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
-  if (variance:=_lower_centered_square_loop_reduction(uops)) is not None: return variance
-  if (loop_reduction:=_lower_scalar_loop_reduction(uops)) is not None: return loop_reduction
+  if (bool_output:=_output_store(uops, dtypes.bool)) is not None and \
+     (predicate:=_lower_ieee_predicate(uops, bool_output)) is not None: return predicate
+  if (half_output:=_output_store(uops, dtypes.half)) is not None and \
+     (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
+  int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
+  if int_output is not None and not any(u.op is Ops.REDUCE for u in uops):
+    if (occurrence_count:=_lower_occurrence_count(int_output)) is not None: return occurrence_count
+    if (sort_index:=_lower_sort_index_selection(int_output)) is not None: return sort_index
+  if int_loop_output is not None and (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops, int_loop_output)) is not None:
+    return cumulative_loop
+  if int_output is not None:
+    if (cumulative_index:=_lower_cumulative_extrema_index(uops, int_output)) is not None: return cumulative_index
+    if (arg_extrema:=_lower_unrolled_arg_extrema(int_output)) is not None: return arg_extrema
+  if int_loop_output is not None and (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output)) is not None: return loop_arg_extrema
+  if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32
+  if (loop:=_loop_reduction_match(uops)) is not None:
+    if (dot_reduction:=_lower_dot_loop_reduction(loop)) is not None: return dot_reduction
+    if (variance:=_lower_centered_square_loop_reduction(loop)) is not None: return variance
+    if (loop_reduction:=_lower_scalar_loop_reduction(loop)) is not None: return loop_reduction
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
   if (not stores or any(p is None or p.dtype.scalar().fmt is None or p.src[0].op is not Ops.CONST for p in outs) or
