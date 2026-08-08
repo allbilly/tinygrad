@@ -382,6 +382,13 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_arange_big = _test_ops.TestOps.test_arange_big
   test_arange_4096 = _test_ops.TestOps.test_arange_4096
   test_linspace = _test_ops.TestOps.test_linspace
+  test_sum_fake = _test_ops.TestOps.test_sum_fake
+  test_sum_collapse = _test_ops.TestOps.test_sum_collapse
+  test_sum_collapse_neg = _test_ops.TestOps.test_sum_collapse_neg
+  test_sum_pad_collapse = _test_ops.TestOps.test_sum_pad_collapse
+  test_sum_twice = _test_ops.TestOps.test_sum_twice
+  test_sum_cat_collapse = _test_ops.TestOps.test_sum_cat_collapse
+  test_max_dont_collapse = _test_ops.TestOps.test_max_dont_collapse
 
 if __name__ == "__main__":
   unittest.main()

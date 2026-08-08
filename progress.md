@@ -781,3 +781,19 @@ Split/chunk remain views where possible; materialized FP16 movement uses the exi
 - No new kernel error signature.
 
 The next source-order method is `test_sum_fake`.
+
+---
+
+## 2026-08-08 — Source-order sum/max reductions
+
+Seven more methods were admitted and run individually: `test_sum_fake`, `test_sum_collapse`, `test_sum_collapse_neg`, `test_sum_pad_collapse`, `test_sum_twice`, `test_sum_cat_collapse`, and `test_max_dont_collapse`.
+
+Geometry/constant reductions fold where legal. `test_sum_twice` reduces random FP16 input across two stages and therefore exercises the existing DPU EW ADD lowering rather than a host arithmetic path. No tolerance or backend code change was needed.
+
+- Individual method times: 2.64–4.05 s.
+- Complete incremental source-order group: **27 passed in 9.08 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+The next source-order method is `test_where`.
