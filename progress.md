@@ -1305,3 +1305,33 @@ leaving ordinary native DPU EW MAX stages.
 The CPU-cheat audit found no runtime input decoding, comparison, or extrema calculation. The new rule is a renderer-only
 identity rewrite guarded by structural condition checks; all MAX and negate/MAX work executes on DPU EW. There is no
 CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — Small cumulative-extrema INT32 axis indices on DPU EW
+
+The exact upstream `test_small_cummax` and `test_small_cummin` index outputs now join the Rockchip census. This first
+index milestone deliberately covers the official length-10 cases; multidimensional axes and larger tiled INT32 outputs
+remain the next group and are not claimed here.
+
+Historical Rockchip milestones `d407bb338` and `eb7c58c98`, plus `rockchip/post-518-reference`, provide the verified
+RK3588 compare/selection register sequence. `~/npu` has no cumulative-extrema implementation, while `~/rk3588`
+provides the upstream tests and experimental compare examples. The current lowering gathers FP16 candidates and static
+axis coordinates into 64-byte-aligned arenas, computes candidate-minus-extremum magnitude and equality masks on DPU EW,
+multiplies masks by coordinates, and reduces the selected coordinates with DPU MAX. CumMin recognizes the negated
+candidate form before applying the same selection graph.
+
+The terminal coordinate-minus-one remains FP16 DPU arithmetic. Native DPU output conversion then writes INT32 values
+through four-lane, 64-byte-aligned tiles. Runtime only packs and unpacks those raw lane bytes; it does not compare input
+values, choose an index, or numerically convert FP16 to INT32. Stateful compare submits retain the proven standalone PC
+framing, while ordinary PC chains keep their existing register template. Common command/task buffer growth and blocking
+submit bookkeeping are shared between both paths.
+
+- Focused index group: **2 passed, 2 subtests passed in 7.65 s**, sequentially.
+- Complete Rockchip census after cleanup: **276 passed, 11 skipped, 146 subtests passed in 153.63 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the full census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,058/239 executable lines**.
+
+The CPU-cheat audit found only raw `uint16` gather/layout operations and `memmove` around the aligned INT32 tiles. Every
+comparison, mask, selection, extrema reduction, subtraction, and numeric conversion executes on DPU EW. There is no
+CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation.

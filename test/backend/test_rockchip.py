@@ -543,6 +543,21 @@ class TestRockchipCumulativeExtremaValueOps(unittest.TestCase):
   def test_cummin_values_zero_axis(self): self._test_values("min", (((2,0,4), 1), ((0,3), 0), ((2,3,0), 2)))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipCumulativeExtremaIndexOps(unittest.TestCase):
+  """Exact INT32 cumulative-extrema axis indices selected by DPU equality masks."""
+
+  def _test_indices(self, kind:str, cases:tuple[tuple[tuple[int, ...], int], ...]):
+    torch_fxn, tinygrad_fxn = (torch.cummax, Tensor.cummax) if kind == "max" else (torch.cummin, Tensor.cummin)
+    for shape,axis in cases:
+      with self.subTest(kind=kind, shape=shape, axis=axis):
+        _TEST_OPS_HELPER([shape], lambda x, axis=axis: torch_fxn(x, dim=axis).indices.int(),
+                         lambda x, axis=axis: tinygrad_fxn(x, axis=axis)[1], forward_only=True)
+
+  def test_small_cummax_indices(self): self._test_indices("max", (((10,), 0),))
+
+  def test_small_cummin_indices(self): self._test_indices("min", (((10,), 0),))
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 
