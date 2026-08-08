@@ -1740,3 +1740,27 @@ register implementation for this graph composition.
 The CPU-cheat audit found no backend code change and no host tensor arithmetic. Host work is limited to compile-time
 index analysis and raw FP16 lane placement for padding; ADD and MUL execute on DPU EW. There is no LUT, CMAC, CNA, PPU,
 tinygrad core change, or tolerance relaxation beyond the existing FP16 contract.
+
+---
+
+## 2026-08-08 — small-axis FP16 variance composition
+
+The unchanged upstream `test_var_one_in_axis` now joins the Rockchip census. It covers size-one reduction axes,
+correction values 0, 1, and 5, invalid degrees of freedom, scalar output, and reductions across axes `(0,3)` and
+`(0,4)`. Nonconstant `(0,4)` cases execute the existing DPU EW mean, centered-square, reduction, and scale composition
+in two ioctls; invalid-degree and size-one cases legitimately simplify to constant NaN or zero.
+
+Historical milestone `0d5561074` passed the larger normal-FP32 variance groups by calling `np.var` in the runtime and
+was deliberately not ported. `~/npu` documents model-level MeanVarianceNormalization but provides no applicable DPU
+register implementation. The current branch contains no variance-specific runtime path or host tensor arithmetic.
+Large `(15,25,35)` keepdim variance remains structurally unsupported and is not claimed by this milestone.
+
+- Unchanged upstream `test_var_one_in_axis`: **1 passed in 2.95 s**, sequentially.
+- Nonconstant `(0,4)` probes: **2 submits**, **64–107 DPU EW tasks**; outputs finite and correct.
+- Complete Rockchip census: **328 passed, 11 skipped, 228 subtests passed in 314.70 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,698/269 executable lines** (unchanged).
+
+The CPU-cheat audit found no backend code change and no NumPy variance implementation. Mean, subtraction, squaring,
+reduction, and scaling execute on DPU EW whenever the result is not compile-time constant. There is no LUT, CMAC, CNA,
+PPU, tinygrad core change, or tolerance relaxation beyond the existing FP16 contract.
