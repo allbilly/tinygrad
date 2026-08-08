@@ -2067,3 +2067,26 @@ a LUT, which is outside the current scope.
 The CPU-cheat audit found no runtime or Tinygrad core change. The new renderer code only recognizes canonical UOps and
 selects DPU ALU configurations; all floor, ceil, min/max, subtraction, and addition stages execute on the NPU. There is
 no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — direct logical composition of FP16 predicates
+
+Direct boolean AND, OR, and XOR outputs derived from FP16 comparisons now join the Rockchip census. AND includes the
+FP16 portion of upstream `test_and`; OR and XOR cover finite values, signed zero, both infinities, and NaN. External
+INT32 and boolean input portions of the upstream bitwise methods remain outside the NPU's FP16 input contract.
+
+AND and OR were already expressible by the IEEE comparison-mask builder as DPU MUL and MAX respectively. XOR now uses
+the exact 0/1 identity `abs(lhs-rhs)`, emitted as DPU SUB followed by the proven native ABS algorithm, before the
+existing typed DPU boolean conversion. Historical `e7e2f2720`, `22c974ac2`, `23800edca`, and `59dcb9a15` were inspected
+but not ported because they operate on external public bool tensors through INT8 DPU surfaces; this milestone instead
+composes masks produced on-device from FP16 inputs.
+
+- Focused logical-predicate class: **5 passed in 20.41 s**, sequentially; AND/OR/XOR are each **1.89–1.92 s**.
+- Complete Rockchip census: **346 passed, 11 skipped, 180 subtests passed in 397.71 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,895/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. All operand classification, comparison, logical
+composition, subtraction, ABS, and typed bool conversion occur on DPU EW; the CPU never reads or branches on tensor
+values. There is no LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion, or tolerance relaxation.

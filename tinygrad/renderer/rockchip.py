@@ -1522,10 +1522,13 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
           if (inner:=mask(expression)) is None: return None
           return inverse(inner) if bool(marker.arg) else inner
     if value.op in (Ops.CMPLT, Ops.CMPNE): return atom(value.op, value.src[0], value.src[1])
-    if value.op in (Ops.OR, Ops.AND):
+    if value.op in (Ops.OR, Ops.AND, Ops.XOR):
       lhs, rhs = mask(value.src[0]), mask(value.src[1])
       if lhs is None or rhs is None: return None
-      return lhs.alu(Ops.MAX, rhs) if value.op is Ops.OR else _mask_mul(lhs, rhs)
+      if value.op is Ops.OR: return lhs.alu(Ops.MAX, rhs)
+      if value.op is Ops.AND: return _mask_mul(lhs, rhs)
+      delta = lhs.alu(Ops.SUB, rhs)
+      return UOp(Ops.MAX, dtypes.half, src=(delta, delta), arg=_NATIVE_ABS)
     return None
   return mask(root)
 
