@@ -328,6 +328,7 @@ class TestRockchipInterpolateOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_interpolate_nearest = _test_ops.TestOps.test_interpolate_nearest
+  test_interpolate_nearest_exact = _test_ops.TestOps.test_interpolate_nearest_exact
 
 if __name__ == "__main__":
   unittest.main()

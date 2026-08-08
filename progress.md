@@ -604,3 +604,19 @@ Results after vectorization:
 - `sz.py`: renderer 552 executable lines, runtime 165; comments and docstrings retained.
 
 The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. Every individual Rockchip node is again below 30 seconds.
+
+---
+
+## 2026-08-08 — `test_interpolate_nearest_exact`
+
+The next upstream method was added individually to the Rockchip census. `TestOps.test_interpolate_nearest_exact` reuses the six 1D, 2D, and 3D shapes from nearest interpolation with PyTorch's `nearest-exact` coordinate rule. All static index casts and masks are prepared by the vectorized Rockchip gather planner, and every FP16 result passes through DPU EW before reaching the output.
+
+Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- Focused upstream method: **1 passed in 3.41 s**; shell wall time 5.574 s.
+- Complete Rockchip census: **105 passed, 9 skipped, 96 subtests passed in 67.96 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 552 executable lines, runtime 165.
+
+The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next upstream interpolation case is `test_interpolate_linear`.
