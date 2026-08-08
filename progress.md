@@ -2270,3 +2270,36 @@ This is a test-only coverage milestone. The CPU-cheat audit found no renderer, r
 input-dependent ABS, addition, and division execute on DPU EW; compile-time scalar folding does not inspect a runtime
 tensor buffer. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input
 conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — embedded FP16 comparison masks for backward graphs
+
+The comparison-backward invariants from upstream `test_cmp_ne_backwards` and `test_cmp_lt_backwards` now join the
+Rockchip census. The upstream methods use `Tensor.randn`, whose normal-distribution graph requires transcendental/LUT
+support. The Rockchip variants instead use deterministic FP16 values spanning negative infinity, finite negative,
+signed zero, finite positive, positive infinity, and NaN while preserving the same derivative check against Torch.
+
+Backward exposes a previously unsupported graph boundary: Tinygrad casts the boolean comparison result back to FP16
+before multiplying it into the gradient. The renderer now narrowly matches `CAST(bool -> half)`, following the typed
+cast-matcher style used by the PTX renderer, and replaces it with an existing DPU FP16 0/1 mask. Direct `x != 0` uses
+the optimized ABS/nonzero path; other predicates use the IEEE-correct comparison mask already proven for public bool
+output. No new register primitive or runtime ABI is required.
+
+The `x != 0` backward graph executes **2 DPU tasks in 2 ioctls**. IEEE-correct `x < 0` executes **31 DPU tasks in 11
+ioctls**. Both gradients exactly match Torch across all seven finite/nonfinite inputs.
+
+No separate Rockchip comparison-backward implementation exists in the other Tinygrad branches, `~/npu`, or
+`~/rk3588`; their available material covers forward comparison primitives. The existing DPU masks are therefore the
+relevant reference. The historical CPU isclose paths were also reviewed and remain excluded.
+
+- Focused backward group: **2 passed in 4.00 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **356 passed, 11 skipped, 180 subtests passed in
+  402.05 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,918/274 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad core change. The rewrite inspects only predicate UOp structure and all
+mask construction plus gradient arithmetic executes on DPU EW; Torch is used only for the expected gradient. There is
+no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion, or tolerance
+relaxation.

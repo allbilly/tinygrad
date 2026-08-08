@@ -2045,6 +2045,11 @@ def _fold_casted_relu(root:UOp) -> UOp|None:
       gate.src[1].key != val.key): return None
   return val.alu(Ops.MAX, UOp.const(0.0, dtypes.half))
 
+def _fold_bool_to_half(predicate:UOp) -> UOp|None:
+  """Materialize an embedded boolean predicate as an FP16 DPU 0/1 mask."""
+  if (nonzero:=_fp16_nonzero_mask(predicate)) is not None: return nonzero
+  return _ieee_comparison_mask(predicate)
+
 def _replace_infinite_multiply(x:UOp) -> UOp|None:
   """DPU MUL maps finite infinity products to NaN; signed finite/zero FDIV has the required result."""
   for value, factor in (x.src, x.src[::-1]):
@@ -2063,6 +2068,7 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
   (UPat(Ops.CAST, dtypes.half, name="root"), _fold_casted_relu),
+  (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.bool, name="predicate"),)), _fold_bool_to_half),
   (UPat(Ops.ADD, dtypes.half, name="x"), _fold_relu_cap),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_minimum),
   (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
