@@ -416,6 +416,12 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_scalar_div = _test_ops.TestOps.test_scalar_div
   test_mul_naninf = _test_ops.TestOps.test_mul_naninf
   test_div_naninf = _test_ops.TestOps.test_div_naninf
+  test_relu = _test_ops.TestOps.test_relu
+  test_relu_exact = _test_ops.TestOps.test_relu_exact
+  test_relu_maximum_exact = _test_ops.TestOps.test_relu_maximum_exact
+  test_leaky_relu = _test_ops.TestOps.test_leaky_relu
+  test_abs = _test_ops.TestOps.test_abs
+  test_abs_exact = _test_ops.TestOps.test_abs_exact
 
 if __name__ == "__main__":
   unittest.main()

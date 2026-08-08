@@ -873,3 +873,19 @@ RK3588 native EW MUL returns NaN for finite values multiplied by infinity. Rockc
 - Complete Rockchip census: **161 passed, 8 skipped, 96 subtests passed in 110.71 s**.
 
 The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops.
+
+---
+
+## 2026-08-08 — Native ReLU, PReLU, and ABS activation group
+
+Six exact upstream activation methods are now admitted: `test_relu`, `test_relu_exact`, `test_relu_maximum_exact`, `test_leaky_relu`, `test_abs`, and `test_abs_exact`. ReLU already lowers through the proven EW MAX/ReLU path. Leaky-ReLU recognizes `WHERE(x<0, slope*x, x)` and uses RK3588's one-task EW PReLU configuration. ABS recognizes tinygrad's signed-zero-aware sign graph and uses native EW `ALU_ALGO=5` in one task.
+
+The PReLU and ABS register recipes were checked against `rockchip/post-518-reference`, the RK3588 TRM, and `~/npu/include/rknnops.h`. Only their named renderer configuration was ported; none of the archived reset, BS-PReLU, or stateful runtime machinery was imported.
+
+- Individual methods: all pass in 2.65–3.10 s.
+- Focused native ABS edge probe: `-1`, both signed zeros, `1`, both infinities, and both NaN signs pass; `-0` becomes `+0` exactly.
+- Six-method activation group: **6 passed in 3.26 s**.
+- Complete incremental source-order group: **50 passed in 10.12 s**.
+- Complete Rockchip census: **167 passed, 8 skipped, 96 subtests passed in 111.38 s**.
+
+The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops.

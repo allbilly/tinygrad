@@ -128,13 +128,18 @@ _EW_DATA_MODE_FP16 = 1 << 28
 _EW_EDATA_SIZE_FP16 = 2 << 22
 _EW_ALU_ADD = 2 << 16
 _EW_ALU_FDIV = 3 << 16
+_EW_ALU_ABS = 5 << 16
 _EW_RELU_BYPASS = 1 << 9
 _EW_OP_CVT_BYPASS = 1 << 8
 _EW_LUT_BYPASS = 1 << 7
 _EW_OP_SRC_DMA = 1 << 6
+_EW_MUL_PRELU = 1 << 5
 _EW_OP_TYPE_MUL = 1 << 2
 _EW_CFG_COMMON = _EW_DATA_MODE_FP16 | _EW_EDATA_SIZE_FP16 | _EW_LUT_BYPASS | _EW_OP_SRC_DMA
 _EW_CFG_RELU = _EW_CFG_COMMON
+_EW_CFG_ABS = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ABS
+_EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_MUL_PRELU | _EW_OP_TYPE_MUL
+_NATIVE_ABS, _NATIVE_LEAKY_RELU = "rockchip_abs", "rockchip_leaky_relu"
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
   Ops.MUL: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_OP_TYPE_MUL,
@@ -367,7 +372,7 @@ def _unsupported_ew_ops(uops:list[UOp], out_index:UOp, count:int, oslot:int, sup
 def _mul_reduction_terms(u:UOp) -> tuple[list[UOp], int]|None:
   """Flatten a half ADD tree containing products and optional bias terms."""
   if u.dtype.scalar() is not dtypes.half: return None
-  if u.op is Ops.MUL: return [u], 1
+  if u.op is Ops.MUL: return [u], 0 if u.arg == _NATIVE_LEAKY_RELU else 1
   if u.op is not Ops.ADD: return [u], 0
   lhs, rhs = _mul_reduction_terms(u.src[0]), _mul_reduction_terms(u.src[1])
   return None if lhs is None or rhs is None else (lhs[0] + rhs[0], lhs[1] + rhs[1])
@@ -533,7 +538,10 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       slot = free.pop() if free else scratch_count
       if slot == scratch_count: scratch_count += 1
       dst = RKArg(RKBufferKind.SCRATCH, slot)
-    ew_ops.append(RKEWOp(dst, lhs, rhs, count, _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]))
+    cfg = _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
+      _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
+      _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
+    ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg))
     values[expr] = dst
     for dep in expr.src:
       if dep in uses:
@@ -565,6 +573,31 @@ def _opposite_condition(lhs:UOp, rhs:UOp) -> bool:
   lhs_not, rhs_not = unwrap_not(lhs), unwrap_not(rhs)
   return ((lhs_not is not None and _same_condition(lhs_not, rhs)) or
           (rhs_not is not None and _same_condition(lhs, rhs_not)))
+
+def _fold_scaled_negative(x:UOp) -> UOp|None:
+  """Map WHERE(base<0, base*scale, base) to native DPU EW PReLU."""
+  gate, negative, base = x.src
+  if (gate.op is not Ops.CMPLT or gate.src[0].key != base.key or gate.src[1].op is not Ops.CONST or
+      float(gate.src[1].arg) != 0.0 or negative.op is not Ops.MUL): return None
+  for value, factor in (negative.src, negative.src[::-1]):
+    if value.key != base.key or factor.op is not Ops.CONST: continue
+    scale = float(factor.arg)
+    if 0.0 <= scale <= 1.0: return UOp(Ops.MUL, x.dtype, src=(base, factor), arg=_NATIVE_LEAKY_RELU)
+  return None
+
+def _fold_abs(x:UOp) -> UOp|None:
+  """Recognize tinygrad's signed-zero-aware ABS graph and select native DPU EW ABS."""
+  for value, sign in (x.src, x.src[::-1]):
+    if sign.op is not Ops.WHERE: continue
+    nonzero, signed, zero = sign.src
+    if (nonzero.op is not Ops.CMPNE or nonzero.src[0].key != value.key or nonzero.src[1].op is not Ops.CONST or
+        float(nonzero.src[1].arg) != 0.0 or zero.op is not Ops.CONST or float(zero.arg) != 0.0 or signed.op is not Ops.WHERE): continue
+    negative, minus_one, plus_one = signed.src
+    if (negative.op is Ops.CMPLT and negative.src[0].key == value.key and negative.src[1].op is Ops.CONST and
+        float(negative.src[1].arg) == 0.0 and minus_one.op is Ops.CONST and float(minus_one.arg) == -1.0 and
+        plus_one.op is Ops.CONST and float(plus_one.arg) == 1.0):
+      return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
+  return None
 
 def _fold_masked_load(gate:UOp, load:UOp, default:UOp) -> UOp|None:
   if len(load.src) <= 2 or load.src[1].op is not Ops.CONST: return None
@@ -606,11 +639,13 @@ def _preserve_infinite_division_sign(x:UOp) -> UOp|None:
 
 _pm_fp32_to_fp16 = PatternMatcher([
   (UPat((Ops.ADD, Ops.MUL), dtypes.float, name="x"), _fp32_alu_to_fp16),
+  (UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs),
   (UPat(Ops.MUL, dtypes.half, name="x"), _replace_infinite_multiply),
   (UPat(Ops.FDIV, dtypes.half, name="x"), _preserve_infinite_division_sign),
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.
   (UPat(Ops.WHERE, dtypes.half, src=(UPat.var("gate"), UPat(Ops.LOAD, dtypes.half, name="load"), UPat.cvar("default"))),
    lambda gate,load,default: _fold_masked_load(gate, load, default)),
