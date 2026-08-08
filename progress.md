@@ -638,3 +638,18 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - `sz.py`: renderer 553 executable lines, runtime 165.
 
 The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next upstream interpolation case is `test_interpolate_linear_corners_aligned`.
+
+---
+
+## 2026-08-08 — `test_interpolate_linear_corners_aligned`
+
+The second upstream 1D linear interpolation method passes both resize directions with `align_corners=True`. This changes only the static coordinate/weight formula; gathered FP16 values and lerp arithmetic continue through the already verified DPU EW path.
+
+- Focused upstream method: **1 passed in 3.03 s**.
+- Complete admitted interpolation group: **4 passed in 4.38 s**.
+- Rockchip collection: 117 nodes (the previous full census was 107 passed / 9 skipped; this new node passed focused validation).
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+The next upstream interpolation case is `test_interpolate_bilinear`.

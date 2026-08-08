@@ -335,6 +335,7 @@ class TestRockchipInterpolateOps(unittest.TestCase):
   test_interpolate_nearest = _test_ops.TestOps.test_interpolate_nearest
   test_interpolate_nearest_exact = _test_ops.TestOps.test_interpolate_nearest_exact
   test_interpolate_linear = _test_ops.TestOps.test_interpolate_linear
+  test_interpolate_linear_corners_aligned = _test_ops.TestOps.test_interpolate_linear_corners_aligned
 
 if __name__ == "__main__":
   unittest.main()
