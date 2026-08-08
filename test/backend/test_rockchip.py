@@ -410,6 +410,9 @@ class TestRockchipMovementOps(unittest.TestCase):
   test_double_slice = _test_ops.TestOps.test_double_slice
   test_pad_reshape = _test_ops.TestOps.test_pad_reshape
   test_pad_slice = _test_ops.TestOps.test_pad_slice
+  test_diag = _test_ops.TestOps.test_diag
+  test_diagonal = _test_ops.TestOps.test_diagonal
+  test_roll = _test_ops.TestOps.test_roll
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIncrementalOps(unittest.TestCase):

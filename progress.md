@@ -977,3 +977,21 @@ recognizer to its actual WHERE/gated-load roots restored focused depthwise/dilat
 
 The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
 `CmaFree` at 6144 KiB.
+
+---
+
+## 2026-08-08 — Diagonal and rolling static indexing
+
+The exact upstream `test_diag`, `test_diagonal`, and `test_roll` methods now join the movement census. They cover vector
+diagonal construction, rectangular/batched/offset diagonal extraction, and positive, negative, zero, multi-axis, and
+oversized cyclic shifts. All lower through the existing single-source static gather and raw FP16 identity path; no
+renderer/runtime change or host numeric operation was required.
+
+- Individual methods: **1 passed** each in 2.77–3.18 s.
+- Complete movement group: **30 passed, 1 skipped in 6.18 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Complete Rockchip census: **203 passed, 9 skipped, 96 subtests passed in 115.29 s**.
+- Ruff and mypy: pass. `sz.py` remains renderer/runtime **693/160 executable lines**.
+
+The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
+`CmaFree` at 6144 KiB.
