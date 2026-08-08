@@ -420,6 +420,29 @@ class TestRockchipScatterOps(unittest.TestCase):
   def test_scatter_dynamic_integer_index(self): pass
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipBroadcastOps(unittest.TestCase):
+  """FP16 broadcasting through static gather and DPU EW arithmetic."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_broadcast_simple = _test_ops.TestOps.test_broadcast_simple
+
+  def test_broadcast_full_arithmetic(self):
+    for torch_op, tinygrad_op in ((torch.add, Tensor.add), (torch.sub, Tensor.sub), (torch.mul, Tensor.mul), (torch.div, Tensor.div)):
+      for shapes in (((5,3,14,16), (5,1,14,1)), ((1,3,1,7,1), (2,1,5,1,8))):
+        with self.subTest(op=torch_op.__name__, shapes=shapes): _fp16_test_op(shapes, torch_op, tinygrad_op)
+
+  def test_broadcast_partial_arithmetic(self):
+    shapes = (((1,32,32,32), (1,32,1,1)), ((5,13,24,16,2), (1,13,24,1,1)), ((4,1), (4,5)), ((1,4), (5,4)))
+    for torch_op, tinygrad_op in ((torch.add, Tensor.add), (torch.sub, Tensor.sub), (torch.mul, Tensor.mul), (torch.div, Tensor.div)):
+      for pair in shapes:
+        with self.subTest(op=torch_op.__name__, shapes=pair): _fp16_test_op(pair, torch_op, tinygrad_op)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

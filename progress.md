@@ -1157,3 +1157,23 @@ cannot leak into the next FP16 program. An explicit same-process `test_sum_dtype
 The renderer only tags the terminal UOp and emits register commands; runtime performs no host numeric conversion or
 tensor arithmetic. There is no CMAC, CNA, PPU, shared core change, or tolerance relaxation. Kernel logs contain no new
 RKNPU timeout, invalid IRQ, IOMMU fault, or oops.
+
+---
+
+## 2026-08-08 — FP16 broadcast arithmetic census
+
+The exact upstream `test_broadcast_simple` now joins the Rockchip census. Full and partial broadcast shapes from
+`test_broadcast_full` and `test_broadcast_partial` are additionally covered for every currently native FP16 arithmetic
+operation: ADD, SUB, MUL, and FDIV. POW is intentionally kept separate rather than weakening those upstream methods or
+silently treating an unsupported primitive as broadcast support.
+
+Broadcast layout is handled by the existing static raw-lane gather, and arithmetic remains DPU EW. `~/npu` and
+`~/rk3588` contain broadcast register/layout examples but no additional backend lowering was required here.
+
+- Broadcast group: **3 passed, 24 subtests passed in 3.43 s**, sequentially.
+- Complete Rockchip census: **247 passed, 11 skipped, 120 subtests passed in 103.51 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.55 s.
+- Tolerance remains exactly `atol=5e-3, rtol=5e-3`; backend size remains renderer/runtime **840/173 executable lines**.
+
+This milestone changes coverage only. It adds no host tensor arithmetic, CMAC, CNA, PPU, shared core change, or
+tolerance relaxation.
