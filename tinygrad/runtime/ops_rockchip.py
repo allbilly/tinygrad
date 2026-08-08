@@ -11,15 +11,22 @@ from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
 # Ordinary ADD/MUL chains pass through 512 tasks; mixed TwoProduct chains use the image's tested 256-task cap.
 _EW_CHAIN_MAX = 512
 _PC_TAIL, _CMD_BUF_MIN, _TASK_BUF_MIN = 4, 65536, 16384
+_BO_FLAGS = rk.RKNPU_MEM_NON_CONTIGUOUS|rk.RKNPU_MEM_CACHEABLE|rk.RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT
 
 def _pc(target:int, reg:int, value:int=0) -> int: return (target << 48) | ((value & 0xffffffff) << 16) | reg
 def _align_up(value:int, alignment:int) -> int: return (value + alignment - 1) & ~(alignment - 1)
 
 class RockchipAllocator(LRUAllocator['RockchipDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer: return self.dev._gpu_alloc(size)
-  def _copyin(self, dest:HCQBuffer, src:memoryview): ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
-  def _copyout(self, dest:memoryview, src:HCQBuffer): ctypes.memmove(from_mv(dest), int(src.va_addr), dest.nbytes)
-  def _as_buffer(self, src:HCQBuffer): return to_mv(int(src.va_addr), src.size)
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    ctypes.memmove(int(dest.va_addr), from_mv(src), src.nbytes)
+    self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+  def _copyout(self, dest:memoryview, src:HCQBuffer):
+    self.dev._sync_buffer(src, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    ctypes.memmove(from_mv(dest), int(src.va_addr), dest.nbytes)
+  def _as_buffer(self, src:HCQBuffer):
+    self.dev._sync_buffer(src, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    return to_mv(int(src.va_addr), src.size)
   def _offset(self, buf:HCQBuffer, size:int, offset:int): return buf.offset(offset, size)
   def _free(self, buf:HCQBuffer, options:BufferSpec): self.dev._gpu_free(buf)
 
@@ -72,6 +79,8 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(cmd.va_addr) + (base+len(body))*8, (ctypes.c_uint64 * _PC_TAIL)(*tail), _PC_TAIL*8)
       desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(body)+_PC_TAIL, 0, base_dma+base*8)
       ctypes.memmove(int(task.va_addr) + i*ctypes.sizeof(desc), ctypes.addressof(desc), ctypes.sizeof(desc))
+    self.dev._sync_buffer(cmd, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    self.dev._sync_buffer(task, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     rk.DRM_IOCTL_RKNPU_SUBMIT(self.dev.fd_ctl,
       flags=rk.RKNPU_JOB_PC|rk.RKNPU_JOB_BLOCK|rk.RKNPU_JOB_PINGPONG, timeout=6000,
       task_start=0, task_number=n, task_counter=0, priority=0, task_obj_addr=task.meta.obj_addr,
@@ -100,6 +109,7 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def __call__(self, *bufs:HCQBuffer, global_size=(1,1,1), local_size=(1,1,1), vals=(), wait=False, **kwargs):
     del global_size, local_size, vals, kwargs
+    for buf in bufs: self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     for i in range(len(self.image.constants)//2):
       if i >= len(self.scratch): break
       count = max((op.count for op in self.image.ew_ops), default=0)
@@ -121,6 +131,7 @@ class RockchipProgram(Program['RockchipDevice']):
         index = np.full(gather.count, gather.base, dtype=np.intp)
         for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
         dst[:gather.count] = src[index]
+    for buf in (*bufs, *self.scratch): self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
@@ -133,6 +144,7 @@ class RockchipProgram(Program['RockchipDevice']):
       bits = self.image.constants[:2] * fill.count
       dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]
       ctypes.memmove(int(dest.va_addr), bits, len(bits))
+      self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)
     return time.perf_counter()-start if wait else None
 
 class RockchipDevice(Compiled):
@@ -142,9 +154,18 @@ class RockchipDevice(Compiled):
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
-    meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=alloc, flags=flags|rk.RKNPU_MEM_NON_CACHEABLE)
-    mapping = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=meta.handle, reserved=0, offset=0)
-    return HCQBuffer(self.fd_ctl.mmap(0, alloc, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mapping.offset), size, meta=meta)
+    try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=alloc, flags=flags|_BO_FLAGS)
+    except OSError as exc: raise MemoryError(f"RKNPU GEM allocation failed for {alloc} bytes") from exc
+    try:
+      mapping = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=meta.handle, reserved=0, offset=0)
+      mapped = self.fd_ctl.mmap(0, alloc, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, mapping.offset)
+    except Exception as exc:
+      try: rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=meta.handle, reserved=0, obj_addr=meta.obj_addr)
+      except (OSError, RuntimeError): pass
+      raise MemoryError(f"RKNPU GEM mapping failed for {alloc} bytes") from exc
+    return HCQBuffer(mapped, size, meta=meta)
+  def _sync_buffer(self, buf:HCQBuffer, flags:int):
+    rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)

@@ -559,3 +559,25 @@ Focused verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCH
 - `sz.py`: renderer 501 executable lines, runtime 144; comments and docstrings retained.
 
 The current `518` runtime still requests contiguous GEM buffers against an 8 MiB CMA pool. Several large existing cases logged recoverable CMA allocation failures even with one pytest node per process, although this run produced no RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. Fixing this allocation policy safely is the next prerequisite before broadening the interpolation census.
+
+---
+
+## 2026-08-08 — Page-backed RKNPU buffers remove the 8 MiB CMA limit
+
+All Rockchip GEM objects now use the allocation policy captured from the vendor RKNN runtime: ordinary data, scratch, and command buffers use `NON_CONTIGUOUS|CACHEABLE|IOMMU_LIMIT_IOVA_ALIGNMENT` (`0x403`), while task buffers additionally use `KERNEL_MAPPING` (`0x40b`). This selects the driver's page-backed IOMMU allocation path directly instead of first exhausting the board's 8 MiB CMA pool and entering the driver's broken contiguous-to-noncontiguous fallback.
+
+Cacheable mappings require explicit ownership transfer. Copy-in, copy-out, command/task construction, constants, gathers, and fills now issue the corresponding `MEM_SYNC` ioctl. Before each program, every argument is synchronized from and then back to the device, matching the vendor behavior. A narrower gather-only synchronization experiment produced stale zero cache lines in `test_add3` after allocator reuse, so the broader handoff is required for correctness on this driver.
+
+Allocation is transactional: a failed create is reported as `MemoryError`, while a failed map/mmap destroys the newly created GEM before propagating the allocation failure. Program-owned scratch and command/task lifetime, PC-chain construction, and the passing `518` submission path remain unchanged.
+
+Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- Tiny ADD health probe: **1 passed in 2.83 s**, exactly 1 ioctl.
+- Large GEMM + nearest gather + chained ADD: **3 passed in 6.89 s**.
+- Complete monolithic Rockchip census: **104 passed, 9 skipped, 96 subtests passed in 169.07 s**.
+- Post-coherency regression (large GEMM, nearest, chained ADD, output-padded ConvTranspose2D): **4 passed in 11.38 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 501 executable lines, runtime 165; comments and docstrings retained.
+
+Across the complete monolithic run, `CmaFree` stayed at 6144 KiB and the kernel logged no CMA allocation failure, RKNPU timeout, invalid IRQ, IOMMU fault, or oops. The allocator safety prerequisite is therefore cleared. The next performance target is the fresh-process `test_simple_conv_transpose3d` node, previously measured at 65.21 s.

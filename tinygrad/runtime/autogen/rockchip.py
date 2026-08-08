@@ -17,6 +17,10 @@ class struct_rknpu_mem_map(ctypes.Structure):
 class struct_rknpu_mem_destroy(ctypes.Structure):
   _pack_ = 1
   _fields_ = [('handle', ctypes.c_uint32), ('reserved', ctypes.c_uint32), ('obj_addr', ctypes.c_uint64)]
+class struct_rknpu_mem_sync(ctypes.Structure):
+  _pack_ = 1
+  _fields_ = [('flags', ctypes.c_uint32), ('reserved', ctypes.c_uint32), ('obj_addr', ctypes.c_uint64),
+              ('offset', ctypes.c_uint64), ('size', ctypes.c_uint64)]
 class struct_rknpu_task(ctypes.Structure):
   _pack_ = 1
   _fields_ = [('flags', ctypes.c_uint32), ('op_idx', ctypes.c_uint32), ('enable_mask', ctypes.c_uint32), ('int_mask', ctypes.c_uint32),
@@ -40,7 +44,10 @@ DRM_IOCTL_RKNPU_SUBMIT = functools.partial(_ioctl, 0x41, struct_rknpu_submit)
 DRM_IOCTL_RKNPU_MEM_CREATE = functools.partial(_ioctl, 0x42, struct_rknpu_mem_create)
 DRM_IOCTL_RKNPU_MEM_MAP = functools.partial(_ioctl, 0x43, struct_rknpu_mem_map)
 DRM_IOCTL_RKNPU_MEM_DESTROY = functools.partial(_ioctl, 0x44, struct_rknpu_mem_destroy)
-RKNPU_MEM_NON_CACHEABLE, RKNPU_MEM_KERNEL_MAPPING = 0, 8
+DRM_IOCTL_RKNPU_MEM_SYNC = functools.partial(_ioctl, 0x45, struct_rknpu_mem_sync)
+RKNPU_MEM_NON_CACHEABLE, RKNPU_MEM_NON_CONTIGUOUS, RKNPU_MEM_CACHEABLE = 0, 1, 2
+RKNPU_MEM_KERNEL_MAPPING, RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT = 8, 1024
+RKNPU_MEM_SYNC_TO_DEVICE, RKNPU_MEM_SYNC_FROM_DEVICE = 1, 2
 RKNPU_JOB_PC, RKNPU_JOB_BLOCK, RKNPU_JOB_PINGPONG, RKNPU_ACT_RESET = 1, 0, 4, 6
 
 REG_PC_OPERATION_ENABLE = 0x00000008
