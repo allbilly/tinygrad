@@ -2090,3 +2090,31 @@ composes masks produced on-device from FP16 inputs.
 The CPU-cheat audit found no runtime or Tinygrad core change. All operand classification, comparison, logical
 composition, subtraction, ABS, and typed bool conversion occur on DPU EW; the CPU never reads or branches on tensor
 values. There is no LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — FP16 fmod and modulo compositions on DPU EW
+
+The complete floating-input portions of upstream `test_fmod` and `test_mod` now join the Rockchip census. Coverage
+includes tensor/tensor remainder, integer-valued and fractional scalar divisors, and both integer-valued and fractional
+reverse scalar numerators. Integer tensor inputs remain outside the NPU's FP16 external-input contract.
+
+No dedicated modulo register path is required. Tinygrad's FP16 graphs decompose `fmod` through FDIV, TRUNC, MUL, and
+SUB, and Python-style modulo through FDIV, FLOOR, MUL, and SUB. The preceding native integral-rounding milestone lets
+each complete expression execute as one DPU PC-chain ioctl. The tests assert exactly **7 ioctls for 7 modulo forms**
+and **3 ioctls for 3 fmod forms**, preventing a host fallback from satisfying correctness alone.
+
+Historical commits `ead24405a` and `86b0f1c6f` were inspected but not ported because both explicitly route the
+operation through `_HOST_ELEMENTWISE_LAYOUT`. Searches under `~/npu` and `~/rk3588` found CPU reference `fmodf` and
+model-operator documentation, but no independent native modulo register implementation. The current composition uses
+only already proven DPU EW operations.
+
+- Focused modulo class: **2 passed in 3.03 s**, sequentially; method call times were **0.14–0.17 s**.
+- Complete Rockchip census: **348 passed, 11 skipped, 180 subtests passed in 396.01 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,895/274 executable lines**.
+
+This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change. Runtime
+gathers remain raw lane movement by compile-time offsets; all division, rounding, multiplication, and subtraction run
+on DPU EW. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion,
+or tolerance relaxation.

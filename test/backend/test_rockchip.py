@@ -793,6 +793,32 @@ class TestRockchipIntegralRoundingOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipModuloOps(unittest.TestCase):
+  """FP16 remainder compositions over DPU FDIV, FLOOR/TRUNC, MUL, and SUB."""
+
+  def test_mod(self):
+    a = [-4., 7., 5., 4., -7., 8., -9.]
+    b = [2., -3., 8., -2., 3., 5., -5.]
+    before = Device["ROCKCHIP"].submit_count
+    _fp16_test_op(None, lambda x,y:x%y, Tensor.mod, forward_only=True, vals=[a, b])
+    _fp16_test_op(None, lambda x,y:x%y, forward_only=True, vals=[a, b])
+    _fp16_test_op(None, lambda x:x%2, forward_only=True, vals=[a])
+    _fp16_test_op(None, lambda x:x%3, forward_only=True, vals=[a])
+    _fp16_test_op(None, lambda x:x%3.5, lambda x:(x%3.5).clone(), forward_only=True, vals=[a])
+    _fp16_test_op(None, lambda x:100%x, forward_only=True, vals=[a])
+    _fp16_test_op(None, lambda x:100.5%x, lambda x:(100.5%x).clone(), forward_only=True, vals=[a])
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 7)
+
+  def test_fmod(self):
+    a = [-4., 7., 5., 4., -7., 8., -9.]
+    b = [2., -3., 8., -2., 3., 5., -5.]
+    before = Device["ROCKCHIP"].submit_count
+    _fp16_test_op(None, lambda x,y:x.fmod(y), forward_only=True, vals=[a, b])
+    _fp16_test_op(None, lambda x:x.fmod(2), forward_only=True, vals=[a])
+    _fp16_test_op(None, lambda x:x.fmod(3.5), lambda x:x.fmod(3.5).clone(), forward_only=True, vals=[a])
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBooleanReductionOps(unittest.TestCase):
   """ANY/ALL over FP16 inputs; external boolean tensors remain outside the DPU contract."""
 
