@@ -2118,3 +2118,28 @@ This is a test-only coverage milestone. The CPU-cheat audit found no renderer, r
 gathers remain raw lane movement by compile-time offsets; all division, rounding, multiplication, and subtraction run
 on DPU EW. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion,
 or tolerance relaxation.
+
+---
+
+## 2026-08-09 — FP16 division rounding modes on DPU EW
+
+The complete FP16-input portion of upstream `test_div_rounding_mode` now joins the Rockchip census. One seven-element
+FP16 numerator is divided by each of ten signed, nonzero length-one FP16 denominators under true division, truncating
+division, and floor division. The 30 cases cover positive and negative operands, exact and inexact quotients, and zero.
+Integer tensor combinations remain outside the NPU's FP16 external-input contract.
+
+Tinygrad lowers these forms to scalar-broadcast DPU FDIV, followed by the native TRUNC or FLOOR composition introduced
+in the integral-rounding milestone. Every expression is one PC-chain ioctl; the test asserts exactly **30 ioctls for
+30 cases**. Historical commit `f29131cdf` and its documentation commit `c46039f9a` were inspected but not ported because
+they execute the division and rounding graph through a typed host elementwise task. Searches under `~/npu` and
+`~/rk3588` found the canonical test but no independent native implementation beyond the already used DPU primitives.
+
+- Focused division-rounding class: **1 passed in 2.86 s**, sequentially; call time was **0.27 s**.
+- Complete Rockchip census: **349 passed, 11 skipped, 180 subtests passed in 397.56 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,895/274 executable lines**.
+
+This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change. All
+division and integral-rounding arithmetic executes on DPU EW, with only static scalar-broadcast address preparation on
+the host. There is no host tensor-value evaluation, LUT, CMAC, CNA, PPU fallback, external non-FP16 input conversion,
+or tolerance relaxation.

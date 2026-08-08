@@ -819,6 +819,19 @@ class TestRockchipModuloOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipDivisionRoundingOps(unittest.TestCase):
+  """FP16 scalar-broadcast division with native DPU FLOOR/TRUNC epilogues."""
+
+  def test_div_rounding_mode(self):
+    numerator = [5., 6., 7., 0., -5., -6., -7.]
+    before = Device["ROCKCHIP"].submit_count
+    for denominator in (-10., -5., -3., -2., -1., 1., 2., 3., 5., 10.):
+      for mode in (None, "trunc", "floor"):
+        _fp16_test_op(None, lambda x,y,mode=mode:x.div(y, rounding_mode=mode), forward_only=True,
+                      vals=[numerator, [denominator]])
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 30)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBooleanReductionOps(unittest.TestCase):
   """ANY/ALL over FP16 inputs; external boolean tensors remain outside the DPU contract."""
 
