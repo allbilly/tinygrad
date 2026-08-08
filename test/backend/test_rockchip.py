@@ -128,6 +128,12 @@ class TestRockchip(unittest.TestCase):
     self._check(n, a * -math.inf, (a.numpy().astype(np.float32) * np.float32(-np.inf)).astype(np.float16))
     self._check(n, a * math.nan, (a.numpy().astype(np.float32) * np.float32(np.nan)).astype(np.float16))
 
+  # ---- DIV ----
+  def test_tiny_div(self):
+    lhs = np.array([-2.0, 3.0, 4.0], dtype=np.float16)
+    rhs = np.array([0.5, -2.0, 8.0], dtype=np.float16)
+    self._check(1, Tensor(lhs) / Tensor(rhs), (lhs.astype(np.float32) / rhs).astype(np.float16))
+
   # ---- MAX ----
   def test_maximum_fp16(self):
     a, b = self._half((45, 65), 17), self._half((45, 65), 18)
@@ -402,6 +408,7 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_add3 = _test_ops.TestOps.test_add3
   test_mul = _test_ops.TestOps.test_mul
   test_scalar_mul = _test_ops.TestOps.test_scalar_mul
+  test_div = _test_ops.TestOps.test_div
 
 if __name__ == "__main__":
   unittest.main()

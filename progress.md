@@ -823,3 +823,18 @@ Six additional upstream `TestOps` methods were admitted: `test_tiny_add`, `test_
 - No new RKNPU, IOMMU, CMA, or kernel-oops message during the grouped run.
 
 The exact upstream `test_div` method is deliberately not counted yet. Its first dynamic graph is represented as `MUL(RECIPROCAL(x))`, and the Rockchip planner rejects `RECIPROCAL` before any ioctl. Native FP16 DPU division will be developed as a separate hardware milestone, beginning with a tiny one-submit regression before admitting the complete upstream method.
+
+---
+
+## 2026-08-08 — Native FP16 DPU division
+
+Dynamic half division now uses RK3588's native DPU EW FDIV algorithm. Advertising typed `Ops.FDIV` lets tinygrad fuse `x * reciprocal(y)` before Rockchip lowering. The emitted stage uses named FDIV configuration bits, the FDIV output conversion scale, and FDIV's RDMA operand mode. No reciprocal or division is evaluated on the CPU, no CMAC path is used, and no shared tinygrad core file changed.
+
+The hardware rollout was deliberately sequential:
+
+- Three-element mixed-sign regression: **1 passed in 2.84 s**, exactly **1 ioctl**.
+- Exact upstream `TestOps.test_div`: **1 passed in 3.18 s**.
+- Complete incremental source-order group: **41 passed in 9.76 s**.
+- Complete Rockchip census: **156 passed, 9 skipped, 96 subtests passed in 111.21 s**.
+
+The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU, IOMMU, CMA, or kernel-oops message. Division-by-zero/non-finite semantics and rounding-mode division remain separate cases; this milestone covers the exact ordinary floating-point `test_div` method only.

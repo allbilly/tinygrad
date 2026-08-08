@@ -127,6 +127,7 @@ _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
 _EW_DATA_MODE_FP16 = 1 << 28
 _EW_EDATA_SIZE_FP16 = 2 << 22
 _EW_ALU_ADD = 2 << 16
+_EW_ALU_FDIV = 3 << 16
 _EW_RELU_BYPASS = 1 << 9
 _EW_OP_CVT_BYPASS = 1 << 8
 _EW_LUT_BYPASS = 1 << 7
@@ -138,6 +139,7 @@ _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
   Ops.MUL: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_OP_TYPE_MUL,
   Ops.MAX: _EW_CFG_COMMON | _EW_RELU_BYPASS,
+  Ops.FDIV: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_ALU_FDIV,
 }
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
@@ -145,13 +147,16 @@ def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
   """Build one contiguous FP16 DPU EW command body without its PC-chain tail."""
   if not (0 < count <= _MAX_EW_ELEMS_FP16): raise ValueError(f"EW fp16 count {count} out of range")
+  is_div = ew_cfg == _EW_CFG[Ops.FDIV]
   width = (count + 7) // 8 - 1
   regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
     (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
     (_DPU,rk.REG_DPU_DATA_FORMAT,(2<<29)|(2<<26)|2),
     (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,width),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
     (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,(7<<16)|7),
-    (_DPU,rk.REG_DPU_EW_CFG,ew_cfg),(_DPU,rk.REG_DPU_OUT_CVT_SCALE,(1<<16)|1),
+    (_DPU,rk.REG_DPU_EW_CFG,ew_cfg)) + (((_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
+    (_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,1<<6)) if is_div else ()) + (
+    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if is_div else (1<<16)|1),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,7),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|(2<<2)))
@@ -160,7 +165,7 @@ def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKS
   for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
                            (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
     relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
-  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(1<<3)|1))
+  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(0 if is_div else 1<<3)|1))
   return RKStage(tuple(commands), tuple(relocs))
 
 def _root_param(u:UOp) -> UOp|None:
@@ -606,7 +611,7 @@ def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
 
 class RockchipRenderer(Renderer):
   has_local, has_shared, supports_float4 = False, False, False
-  code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None}
+  code_for_op = {Ops.ADD: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None, Ops.FDIV: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
