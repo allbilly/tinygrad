@@ -409,6 +409,7 @@ class TestRockchipIncrementalOps(unittest.TestCase):
   test_mul = _test_ops.TestOps.test_mul
   test_scalar_mul = _test_ops.TestOps.test_scalar_mul
   test_div = _test_ops.TestOps.test_div
+  test_scalar_div = _test_ops.TestOps.test_scalar_div
 
 if __name__ == "__main__":
   unittest.main()

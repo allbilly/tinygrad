@@ -838,3 +838,11 @@ The hardware rollout was deliberately sequential:
 - Complete Rockchip census: **156 passed, 9 skipped, 96 subtests passed in 111.21 s**.
 
 The complete run left `CmaFree` at 6144 KiB and produced no new RKNPU, IOMMU, CMA, or kernel-oops message. Division-by-zero/non-finite semantics and rounding-mode division remain separate cases; this milestone covers the exact ordinary floating-point `test_div` method only.
+
+---
+
+## 2026-08-08 — Scalar FP16 division
+
+The exact upstream `TestOps.test_scalar_div` method passes all seven tensor/scalar and scalar/tensor forms through native DPU FDIV, including two rank-zero cases. It passed individually in **3.07 s** without a renderer/runtime change.
+
+Non-finite numerator handling remains a separate in-progress milestone and is not counted here.
