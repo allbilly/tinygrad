@@ -687,3 +687,17 @@ The aligned-corners bilinear method passes all three upstream 2D resize pairs th
 - No new kernel error signature.
 
 The next upstream interpolation case is `test_interpolate_trilinear`.
+
+---
+
+## 2026-08-08 — `test_interpolate_trilinear`
+
+The upstream trilinear method passes `(2,3,5,2,8) -> (2,3,3,6,4)`. A smaller direct regression confirms exactly three ioctls, one FP16 DPU EW lerp pass for each spatial axis. Both internal FP32-sized separable buffers carry only contiguous FP16 NPU-produced payloads.
+
+- Focused direct and upstream methods: **2 passed in 3.61 s**; direct case exactly 3 ioctls.
+- Complete admitted interpolation methods plus four submit-count regressions: **11 passed in 7.94 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- No new kernel error signature.
+
+The final floating-point interpolation method is `test_interpolate_trilinear_corners_aligned`.
