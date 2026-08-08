@@ -1980,3 +1980,26 @@ The CPU-cheat audit found no runtime or Tinygrad core change. Runtime never read
 tensor values; all classification, comparison, boolean inversion, and FP16-to-INT32 mask conversion occur on DPU EW.
 Only the existing raw low-byte packing exposes NPU-produced 0/1 lanes as public bool bytes. There is no LUT, CMAC, CNA,
 PPU fallback, or tolerance relaxation.
+
+---
+
+## 2026-08-09 — FP16 logical-not and scalar isclose coverage
+
+The FP16 half of `test_logical_not` and the unchanged upstream `test_isclose_scalar` now join the Rockchip census.
+Logical-not covers ordinary nonzero values, positive and negative zero, both infinities, and NaN. Scalar isclose covers
+the canonical `(3,4,5,6)` tensor-to-1 comparison plus exact/near/unequal finite values, infinities, and NaN. Both lower
+entirely through the preceding IEEE comparison milestone and typed bool-output ABI; no backend change was needed.
+
+General tensor/tensor `test_isclose` was tested and intentionally excluded. Its `x.isclose(x+1e-6)` case produced 14
+false results among 360 expected true results because the FP16 tolerance/difference enters the DPU's subnormal region.
+Historical commits `b85d3c4b0` and `31c07151d` passed this group only through `_HOST_ELEMENTWISE_LAYOUT`, explicitly
+computing isclose on the CPU; that path is not ported. Their native WIP also documented reset explosion on the 32-case
+IEEE edge matrix. Exact boolean expectations were not relaxed.
+
+- Focused logical-predicate class: **2 passed in 14.95 s**, sequentially.
+- Complete Rockchip census: **333 passed, 11 skipped, 180 subtests passed in 388.80 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **1,797/274 executable lines**.
+
+This is a test-only coverage milestone. The CPU-cheat audit found no renderer, runtime, or Tinygrad core change and no
+new data conversion or host arithmetic. There is no LUT, CMAC, CNA, PPU fallback, or tolerance relaxation.

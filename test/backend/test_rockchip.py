@@ -744,6 +744,22 @@ class TestRockchipComparisonOps(unittest.TestCase):
   def test_cmp_le(self): self._test_cmp(lambda x,y:x <= y)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipLogicalPredicateOps(unittest.TestCase):
+  """FP16 logical-not and scalar isclose compositions over native DPU comparison masks."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  def test_logical_not(self):
+    _fp16_test_op(None, torch.logical_not, Tensor.logical_not,
+                  vals=[[1., 2., 0., 0.5, -0.0, math.inf, -math.inf, math.nan]], forward_only=True)
+
+  test_isclose_scalar = _test_ops.TestOps.test_isclose_scalar
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipWhereOps(unittest.TestCase):
   """FP16 WHERE and masked arithmetic lowered to DPU comparison masks and selection."""
 
