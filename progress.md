@@ -701,3 +701,21 @@ The upstream trilinear method passes `(2,3,5,2,8) -> (2,3,3,6,4)`. A smaller dir
 - No new kernel error signature.
 
 The final floating-point interpolation method is `test_interpolate_trilinear_corners_aligned`.
+
+---
+
+## 2026-08-08 — Complete FP16 interpolation census
+
+`test_interpolate_trilinear_corners_aligned` passes its upstream 3D resize case, completing all eight floating-point `test_interpolate*` methods from `TestOps`: nearest, nearest-exact, 1D linear, aligned 1D linear, bilinear, aligned bilinear, trilinear, and aligned trilinear.
+
+All nearest values and linear low/high operands are gathered as FP16 bit patterns. Static geometry supplies only indices and FP16 weights. Input-dependent interpolation arithmetic executes on DPU EW in one, two, or three passes according to spatial rank. Rockchip remains FP16-only, performs no CPU interpolation, and changes no shared tinygrad core file.
+
+Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- Focused aligned-trilinear method: **1 passed in 3.24 s**.
+- Complete Rockchip census: **114 passed, 9 skipped, 96 subtests passed in 104.06 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 553 executable lines, runtime 165.
+
+The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The floating-point interpolation group is complete; uint8 interpolation remains outside the FP16 input contract.

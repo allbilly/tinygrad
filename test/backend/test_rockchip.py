@@ -349,6 +349,7 @@ class TestRockchipInterpolateOps(unittest.TestCase):
   test_interpolate_bilinear = _test_ops.TestOps.test_interpolate_bilinear
   test_interpolate_bilinear_corners_aligned = _test_ops.TestOps.test_interpolate_bilinear_corners_aligned
   test_interpolate_trilinear = _test_ops.TestOps.test_interpolate_trilinear
+  test_interpolate_trilinear_corners_aligned = _test_ops.TestOps.test_interpolate_trilinear_corners_aligned
 
 if __name__ == "__main__":
   unittest.main()
