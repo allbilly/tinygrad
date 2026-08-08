@@ -438,6 +438,8 @@ class TestRockchipConcatOps(unittest.TestCase):
   test_stack_slice = _test_ops.TestOps.test_stack_slice
   test_stack_max = _test_ops.TestOps.test_stack_max
   test_repeat = _test_ops.TestOps.test_repeat
+  test_repeat_interleave = _test_ops.TestOps.test_repeat_interleave
+  test_simple_repeat = _test_ops.TestOps.test_simple_repeat
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipPaddingOps(unittest.TestCase):

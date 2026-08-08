@@ -1039,3 +1039,21 @@ tinygrad core change is involved.
 
 The complete run produced no new RKNPU timeout, invalid IRQ, IOMMU fault, CMA failure, or kernel oops and left
 `CmaFree` at 6144 KiB.
+
+---
+
+## 2026-08-08 — Remaining FP16 repetition layouts
+
+The exact upstream `test_repeat_interleave` and `test_simple_repeat` methods now complete the repetition subset. No
+dedicated generic implementation exists in `rockchip/post-518-reference`, `~/npu`, or `~/rk3588`; both layouts lower
+directly through the current single-source raw gather and DPU EW identity path. The host computes static integer source
+offsets and copies `uint16` lanes without interpreting FP16 values.
+
+- Individual methods: **1 passed** each in 2.74–2.89 s.
+- Complete concatenation/repetition group: **8 passed in 7.20 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Complete Rockchip census: **215 passed, 9 skipped, 96 subtests passed in 43.32 s** under `-n12`.
+- Ruff and mypy: pass. `sz.py` remains renderer/runtime **729/160 executable lines**.
+
+The tinygrad census produced no RKNPU timeout, invalid IRQ, IOMMU fault, reset, or kernel oops. The vendor script again
+logged its two known failed contiguous 4 MiB CMA attempts, then passed every probe; `CmaFree` returned to 6144 KiB.
