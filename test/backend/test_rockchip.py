@@ -494,6 +494,22 @@ class TestRockchipCumulativeOps(unittest.TestCase):
   test_cumsum_zero_axis = _test_ops.TestOps.test_cumsum_zero_axis
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipCumulativeProductOps(unittest.TestCase):
+  """FP16 cumulative products on DPU EW."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_small_cumprod = _test_ops.TestOps.test_small_cumprod
+  test_simple_cumprod = _test_ops.TestOps.test_simple_cumprod
+  test_cumprod = _test_ops.TestOps.test_cumprod
+  test_cumprod_zero_axis = _test_ops.TestOps.test_cumprod_zero_axis
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInterpolateOps(unittest.TestCase):
   """FP16 interpolation cases advanced one test_ops method at a time."""
 

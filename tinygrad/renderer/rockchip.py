@@ -12,11 +12,11 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 19
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 20
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBiHI"), struct.Struct("<IIi")
 _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
-_EWOP = struct.Struct("<BBHIIII")  # dst_kind, pad, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
+_EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
 
 class RKTarget(IntEnum): RK3588 = 1
@@ -53,7 +53,7 @@ class RKFill: dst: RKArg; count: int; itemsize: int = 2
 @dataclass(frozen=True)
 class RKEWOp:
   """One contiguous FP16 DPU elementwise operation."""
-  dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int
+  dst: RKArg; lhs: RKArg; rhs: RKArg; count: int; ew_cfg: int; submit_barrier: bool = False
 
 @dataclass(frozen=True)
 class RKImage:
@@ -80,7 +80,8 @@ def encode_image(image:RKImage) -> bytes:
     else:
       for axis in g.axes: out += _GATHER_AXIS.pack(*axis)
   for op in image.ew_ops:
-    out += _EWOP.pack(int(op.dst.kind), 0, op.dst.index, int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
+    out += _EWOP.pack(int(op.dst.kind), int(op.submit_barrier), op.dst.index,
+                      int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
     out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
   if image.fill is not None: out += _FILL.pack(int(image.fill.dst.kind), image.fill.itemsize, image.fill.dst.index, image.fill.count)
   return bytes(out) + image.constants
@@ -106,11 +107,12 @@ def decode_image(blob:bytes) -> RKImage:
       gathers.append(RKGather(src_index, dst_scratch, count, base, axes, fill_bits=fill_bits, dst_stride=dst_stride))
   ew_ops:list[RKEWOp] = []
   for _ in range(nop):
-    dk, _, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
+    dk, op_flags, di, lk, li, rk_, ri = _EWOP.unpack_from(blob, off); off += _EWOP.size
+    if op_flags & ~1: raise ValueError("invalid RKEWOp flags")
     count, ew_cfg = _EWOP2.unpack_from(blob, off); off += _EWOP2.size
     da, la, ra = struct.unpack_from("<iii", blob, off); off += 12
     ew_ops.append(RKEWOp(RKArg(RKBufferKind(dk), di, da), RKArg(RKBufferKind(lk), li, la),
-                         RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg))
+                         RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg, bool(op_flags & 1)))
   fill = None
   if flags & 1:
     dst_kind, itemsize, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
@@ -148,7 +150,7 @@ _EW_CFG_RELU6 = _EW_CFG_COMMON | _EW_RELUX_EN
 _EW_CFG_MIN = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_MIN
 _EW_CFG_ABS = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ABS
 _EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_MUL_PRELU | _EW_OP_TYPE_MUL
-_EW_STAGE_FP32_OUT = 1 << 29  # software tag consumed by emit_ew_stage, never written to EW_CFG
+_EW_STAGE_FP32_OUT = 1 << 29  # software tag consumed before writing EW_CFG
 _DPU_DATA_FORMAT_FP16 = (2<<29)|(2<<26)|2
 _DPU_DATA_FORMAT_FP32_OUT = (5<<29)|(2<<26)|2
 _BS_BN_BYPASS = 1|(1<<1)|(1<<4)|(1<<6)
@@ -450,24 +452,26 @@ def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cach
       ret = np.where(enabled, param.arg.slot, fallback[0]), np.where(enabled, offset, fallback[1]), np.where(enabled, -1, fallback[2])
     choices[x] = ret
     return ret
-  slots, offsets = [-2] * count, [-2] * count
+  slots, offsets, fills = [-2] * count, [-2] * count, [-2] * count
   try:
     dsts = np.broadcast_to(_eval_vector(out_index, vector_env, eval_cache), len(envs)).astype(np.int64)
     selected_slots, selected_offsets, selected_fills = selected(u)
-    fill_values = np.unique(selected_fills[selected_fills >= 0])
-    if len(fill_values) > 1: raise ValueError
-    fill_bits = None if not len(fill_values) else int(fill_values[0])
-    for dst,slot,offset in zip(dsts, selected_slots, selected_offsets):
+    for dst,slot,offset,fill in zip(dsts, selected_slots, selected_offsets, selected_fills):
       if not 0 <= dst < count: raise ValueError
-      if slots[dst] not in (-2, slot) or offsets[dst] not in (-2, offset): raise ValueError
-      slots[dst], offsets[dst] = int(slot), int(offset)
+      if slots[dst] not in (-2, slot) or offsets[dst] not in (-2, offset) or fills[dst] not in (-2, fill): raise ValueError
+      slots[dst], offsets[dst], fills[dst] = int(slot), int(offset), int(fill)
   except (RuntimeError, ValueError): return None
   sources = sorted(set(slot for slot in slots if slot >= 0))
   if not sources or any(offset == -2 for offset in offsets): return None
-  if len(sources) == 1: return RKGather(sources[0], 0, count, offsets=tuple(offsets), fill_bits=fill_bits or 0)
-  if fill_bits is not None or any(slot < 0 for slot in slots): return None
-  return RKMultiGather(tuple(RKGather(src, 0, count, offsets=tuple(offset if slot == src else -1 for slot, offset in zip(slots, offsets)),
-                                      partial=True) for src in sources))
+  fill_values = set(fill for slot,fill in zip(slots, fills) if slot < 0 and fill >= 0)
+  if len(sources) == 1 and len(fill_values) <= 1:
+    return RKGather(sources[0], 0, count, offsets=tuple(offsets), fill_bits=next(iter(fill_values), 0))
+  plans:list[RKGather] = []
+  if any(slot < 0 for slot in slots):
+    plans.append(RKGather(sources[0], 0, count, values=tuple(fill if slot < 0 and fill >= 0 else 0 for slot,fill in zip(slots, fills))))
+  plans.extend(RKGather(src, 0, count, offsets=tuple(offset if slot == src else -1 for slot,offset in zip(slots, offsets)), partial=True)
+               for src in sources)
+  return RKMultiGather(tuple(plans))
 
 def _ew_leaf(u:UOp, out_index:UOp, count:int, oslot:int, static_cache:dict[UOp, bool]|None=None,
              selection_cache:dict[UOp, tuple[bool, bool]]|None=None) -> RKLeaf:
@@ -692,6 +696,18 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     return RKImage(RKTarget.RK3588, constants=struct.pack("<"+fmt, val.arg), fill=RKFill(out, count, dtype.itemsize))
   if ew_leaf(val) is not None:
     val = val.alu(Ops.ADD, UOp.const(0.0, dtypes.half))
+  mul_terms:list[UOp] = []
+  def flatten_selection_product(x:UOp) -> None:
+    if x.op is Ops.MUL and x.arg is None:
+      flatten_selection_product(x.src[0]); flatten_selection_product(x.src[1])
+    else: mul_terms.append(x)
+  flatten_selection_product(val)
+  mul_leaves = [ew_leaf(x) for x in mul_terms]
+  sequential_product = len(mul_terms) > 2 and all(x is not None for x in mul_leaves) and \
+    any(isinstance(x, (RKGather, RKMultiGather, tuple)) for x in mul_leaves)
+  if sequential_product:
+    val = mul_terms[0]
+    for term in mul_terms[1:]: val = val.alu(Ops.MUL, term)
   supported = RockchipRenderer.code_for_op
   static_nodes:set[UOp] = set(out_index.toposort())
   for u in uops:
@@ -709,7 +725,8 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     raise RuntimeError(f"RKPLAN_REJECT:unsupported_graph {_unsupported_ew_ops(uops, out_index, count, oslot, supported)}")
   relu_input = _relu_operand(val)
   reduction = relu_input if relu_input is not None else val
-  if (reduction_info:=_mul_reduction_terms(reduction)) is not None and (reduction_info[1] or len(reduction_info[0]) > 8):
+  if not sequential_product and (reduction_info:=_mul_reduction_terms(reduction)) is not None and \
+     (reduction_info[1] or len(reduction_info[0]) > 8):
     terms = reduction_info[0]
     reduce_mode = os.getenv("ROCKCHIP_EW_REDUCE", "sequential").strip().lower()
     if reduce_mode == "kahan": reduced = _compensated_mul_sum(terms)
@@ -768,6 +785,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
         param, index, gate, fill_bits = leaf
         gather_plans = (_gather_plan(param.arg.slot, 0, out_index, index, gate, count, fill_bits),)
       for plan in gather_plans:
+        if plan.values: continue
         source = next((x for x in u.toposort() if x.op is Ops.PARAM and x.arg.slot == plan.src_index), None)
         if source is None or source.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:gather_index")
         if plan.offsets: low, high = min(plan.offsets, default=0), max(plan.offsets, default=-1)
@@ -777,11 +795,12 @@ def lower_ew(uops:list[UOp]) -> RKImage:
             if stride < 0: low += (limit-1)*stride
             else: high += (limit-1)*stride
         if low < -1 or high >= int(source.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
-      key = tuple((plan.src_index, plan.count, plan.base, plan.axes, plan.offsets, plan.fill_bits, plan.partial) for plan in gather_plans)
+      key = tuple((plan.src_index, plan.count, plan.base, plan.axes, plan.offsets, plan.fill_bits, plan.values, plan.partial, plan.dst_stride)
+                  for plan in gather_plans)
       if key not in gather_scratch:
         gather_scratch[key] = scratch_count
         gathers.extend(RKGather(plan.src_index, scratch_count, plan.count, plan.base, plan.axes, plan.offsets, plan.fill_bits,
-                                partial=plan.partial) for plan in gather_plans)
+                                values=plan.values, partial=plan.partial, dst_stride=plan.dst_stride) for plan in gather_plans)
         scratch_count += 1
       ret = RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
     leaves[u] = ret
@@ -789,7 +808,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   for expr in order:
     lhs, rhs = operand(expr.src[0]), operand(expr.src[1])
     if expr is val: dst = out
-    elif (reuse:=next((values[src] for src in expr.src if src in values and uses[src] == 1 and
+    elif not sequential_product and (reuse:=next((values[src] for src in expr.src if src in values and uses[src] == 1 and
                        values[src].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
     else:
       slot = free.pop() if free else scratch_count
@@ -800,7 +819,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
       _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else \
       _EW_CFG_LEAKY_RELU if expr.op is Ops.MUL and expr.arg == _NATIVE_LEAKY_RELU else \
       _EW_CFG_RELU if _relu_operand(expr) is not None else _EW_CFG[expr.op]
-    ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg))
+    ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg, submit_barrier=sequential_product and expr is val))
     values[expr] = dst
     for dep in expr.src:
       if dep in uses:
@@ -842,6 +861,18 @@ def _fold_scaled_negative(x:UOp) -> UOp|None:
     if value.key != base.key or factor.op is not Ops.CONST: continue
     scale = float(factor.arg)
     if 0.0 <= scale <= 1.0: return UOp(Ops.MUL, x.dtype, src=(base, factor), arg=_NATIVE_LEAKY_RELU)
+  return None
+
+def _fold_masked_mul(x:UOp) -> UOp|None:
+  """Push a WHERE through MUL so inactive factors become identities before native DPU multiplication."""
+  gate, yes, no = x.src
+  if yes.op is Ops.WHERE and _same_condition(gate, yes.src[0]): return UOp(Ops.WHERE, x.dtype, src=(gate, yes.src[1], no))
+  if no.op is Ops.WHERE and _same_condition(gate, no.src[0]): return UOp(Ops.WHERE, x.dtype, src=(gate, yes, no.src[2]))
+  one = UOp.const(1.0, dtypes.half)
+  if yes.op is Ops.MUL and no.op is Ops.CONST:
+    return UOp(Ops.WHERE, x.dtype, src=(gate, yes.src[0], no)).alu(Ops.MUL, UOp(Ops.WHERE, x.dtype, src=(gate, yes.src[1], one)))
+  if no.op is Ops.MUL and yes.op is Ops.CONST:
+    return UOp(Ops.WHERE, x.dtype, src=(gate, yes, no.src[0])).alu(Ops.MUL, UOp(Ops.WHERE, x.dtype, src=(gate, one, no.src[1])))
   return None
 
 def _const_operand(u:UOp, op:Ops, value:float|None=None) -> tuple[UOp, UOp]|None:
@@ -954,6 +985,7 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.CAST, dtypes.half, name="root", src=(UPat.cvar("c"),)), lambda root,c: root.const_like(c.arg)),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(Ops.CAST, dtypes.float, src=(UPat(dtype=dtypes.half, name="x"),)),)), lambda x: x),
   (UPat(Ops.CAST, dtypes.half, src=(UPat(dtype=dtypes.half, name="x"),)), lambda x: x),
+  (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_masked_mul),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_ordered_where),
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_scaled_negative),
   # Fold padding into the gather mask. This changes only host layout initialization; selected values still feed DPU EW.

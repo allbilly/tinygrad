@@ -101,6 +101,9 @@ class RockchipProgram(Program['RockchipDevice']):
   def _run_ew_ops(self, address) -> None:
     bodies:list[tuple[int, ...]] = []
     for i, op in enumerate(self.image.ew_ops):
+      if op.submit_barrier and bodies:
+        self._submit_pcchain(bodies)
+        bodies.clear()
       if op.ew_cfg & _EW_STAGE_FP32_OUT:
         if i != len(self.image.ew_ops)-1: raise RuntimeError("FP32 EW output must be terminal")
         if bodies: self._submit_pcchain(bodies)

@@ -1250,3 +1250,33 @@ ADD executes as a DPU EW task.
 The CPU-cheat audit found no input decoding or host numeric result computation. NumPy is confined to static integer
 index, source-slot, gate, and FP16-fill-bit planning at compile time. There is no CMAC, CNA, PPU, shared tinygrad core
 change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — Ordered FP16 cumulative products on DPU EW
+
+Four exact upstream methods now join the Rockchip census: `test_small_cumprod`, `test_simple_cumprod`, `test_cumprod`,
+and `test_cumprod_zero_axis`. They cover scalar and empty inputs, 1D lengths through 1,022, and cumulative products
+across 2D/3D axes. `~/npu` has no native CumProd path and `~/rk3588` only supplies the upstream tests. Older Rockchip
+branches used specialized CMAC or partially validated product atoms; neither path was ported because this branch remains
+DPU-EW-only.
+
+Static selection planning now preserves independent FP16 padding values per output lane and can compose a compile-time
+prefill with partial raw gathers. The cumulative product is recognized only when its leaves form the verified prefix
+sequence, then rebuilt in source order as native FP16 MUL stages. Scratch destinations use ping-pong storage so a stage
+never aliases a still-live input, and generic dot-product compensation is not applied to this ordered scan.
+
+A 40-term prefix exposed eight NaNs when all dependent stages were submitted as one PC chain, while every finite result
+remained within tolerance. Isolated and bounded-chain probes showed the arithmetic was correct but the terminal dependent
+task lacked a proven inter-task visibility boundary. The image format now carries an explicit typed `submit_barrier`
+flag, and runtime closes the current blocking PC-chain immediately before the terminal output stage. The flag replaces
+an initially considered software bit tag and cannot leak into a hardware register.
+
+- Focused cumulative-product group after cleanup: **4 passed in 12.45 s**, sequentially in one process.
+- Complete Rockchip census: **266 passed, 11 skipped, 120 subtests passed in 137.45 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.53 s after the full census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **926/176 executable lines**.
+
+The CPU-cheat audit found no input decoding or host numeric product. NumPy evaluates only static UOp coordinates,
+source slots, masks, and fill-bit placement; runtime copies raw `uint16` lanes, and every multiplication executes on DPU
+EW. There is no CMAC, CNA, PPU, shared tinygrad core change, or tolerance relaxation.
