@@ -199,8 +199,12 @@ class RockchipProgram(Program['RockchipDevice']):
       bits = self.image.constants[i*2:i*2+2] * count
       ctypes.memmove(int(self.scratch[i].va_addr), bits, len(bits))
     linear:dict[int, np.ndarray] = {}
+    cleared_scratch:set[int] = set()
     for gather in self.image.gathers:
       dest = bufs[gather.dst_scratch] if gather.dst_kind is RKBufferKind.ARG else self.scratch[gather.dst_scratch]
+      if gather.dst_kind is RKBufferKind.SCRATCH and gather.dst_scratch not in cleared_scratch:
+        ctypes.memset(int(dest.va_addr), 0, dest.size)
+        cleared_scratch.add(gather.dst_scratch)
       lane_dtype = np.uint16 if gather.itemsize == 2 else np.uint32
       dst = np.frombuffer(to_mv(int(dest.va_addr), dest.size), dtype=lane_dtype)
       if gather.count not in linear: linear[gather.count] = np.arange(gather.count, dtype=np.intp)

@@ -1370,3 +1370,37 @@ after the exploratory timeout and again after the full census.
 The CPU-cheat audit found only address-map construction and raw `uint16`/`uint32` representation movement on the host.
 No runtime value is compared, selected, reduced, or numerically converted by the CPU. There is no CMAC, CNA, PPU,
 shared tinygrad core change, or tolerance relaxation.
+
+---
+
+## 2026-08-08 — Long cumulative-extrema indices with matrix DPU selection
+
+The remaining length-512 and padded length-1,022 INT32 index outputs from upstream `test_simple_cummax` and
+`test_simple_cummin` now run on Rockchip. The permanent Rockchip coverage splits the four realizations into separate
+methods so each hardware case stays below 30 seconds; the unchanged upstream methods pass as well.
+
+The earlier per-candidate selection graph repeated comparison setup hundreds of times. Candidate values and axis
+coordinates are now gathered into aligned matrices, then DPU EW performs bulk subtraction, absolute value, equality,
+mask multiplication, and a pairwise MAX tree. CumMin first negates its candidate matrix on DPU. Length 1,022 uses the
+exact bounded-loop form emitted by Tinygrad: the recognizer verifies its candidate permutation, output-before-reduction
+prefix gate, INT32 MAX dependence, and two partial-extremum loads before building the same matrix selection image.
+Candidate rows use compact affine gather metadata rather than storing a multi-megabyte repeated offset table.
+
+An exploratory length-512 run timed out at task counter 9 when a dependent equality-to-MUL transition shared one PC
+chain. The vendor elementwise health check immediately passed 60/60. Typed submit barriers now separate the dependent
+bulk phases; all subsequent focused and full-suite runs completed without a timeout. Scratch matrix padding is cleared
+as raw storage before gather placement so unused aligned lanes remain neutral.
+
+- CumMax 512: **1 passed in 16.61 s**; CumMax 1,022: **1 passed in 18.40 s**.
+- CumMin 512: **1 passed in 19.63 s**; CumMin 1,022: **1 passed in 17.03 s**.
+- Complete cumulative-index class: **10 passed, 24 subtests passed in 62.40 s**, sequentially.
+- Unchanged upstream `test_simple_cummax`: **1 passed in 24.30 s**; `test_simple_cummin`: **1 passed in 37.19 s**.
+  The latter combines four realizations; its slowest individual realization was 13.81 s.
+- Complete Rockchip census: **284 passed, 11 skipped, 168 subtests passed in 191.13 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the full census.
+- Ruff and mypy: pass. `sz.py`: renderer/runtime **1,139/253 executable lines**.
+
+The CPU-cheat audit found only static address-map planning, scratch padding initialization, and raw `uint16`/`uint32`
+lane movement on the host. Every comparison, mask, candidate negation, selection, reduction, subtraction, and numeric
+FP16-to-INT32 conversion executes on DPU EW. There is no CMAC, CNA, PPU, shared tinygrad core change, or tolerance
+relaxation.

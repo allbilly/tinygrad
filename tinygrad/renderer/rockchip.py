@@ -742,8 +742,62 @@ def _lower_raw_int32_layout(uops:list[UOp]) -> RKImage|None:
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 
+def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGather, ...],
+                            extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int]) -> RKImage:
+  """Emit a matrix equality/select reduction shared by unrolled and loop cumulative indices."""
+  window = len(candidate_plans)
+  zero, one, candidate_arena = range(3)
+  extrema_slots = tuple(range(3, 3+len(extrema_plans)))
+  coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(3+len(extrema_plans), 10+len(extrema_plans))
+  vector_bytes = (count*2+63)&-64
+  vector_lanes, matrix_lanes = vector_bytes//2, window*vector_bytes//2
+  def materialize(plans:tuple[RKGather, ...], scratch_slot:int) -> tuple[RKGather, ...]:
+    return tuple(RKGather(plan.src_index, scratch_slot, count, plan.base, plan.axes, plan.offsets, plan.fill_bits,
+                          values=plan.values, partial=plan.partial, dst_stride=plan.dst_stride,
+                          dst_addend=i*vector_lanes, itemsize=plan.itemsize) for i,plan in enumerate(plans))
+  gathers = materialize(candidate_plans, candidate_arena)
+  for plan,scratch_slot in zip(extrema_plans, extrema_slots): gathers += materialize((plan,)*window, scratch_slot)
+  coordinate_bits = tuple(tuple(struct.unpack("<H", struct.pack("<e", float(candidate+1 if candidate <= axis_coords[dst] else 0)))[0]
+                                for dst in range(count)) for candidate in range(window))
+  gathers += tuple(RKGather(candidate_plans[0].src_index, coordinate_arena, count, values=bits, dst_addend=candidate*vector_lanes)
+                   for candidate,bits in enumerate(coordinate_bits))
+  scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(((count+3)//4)*64))
+  def args(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ew_ops:list[RKEWOp] = []
+  extrema = args(extrema_slots[0])
+  for slot in extrema_slots[1:]: ew_ops.append(RKEWOp(extrema, extrema, args(slot), matrix_lanes, _EW_CFG[Ops.MAX]))
+  if negated_candidates:
+    ew_ops.extend((RKEWOp(args(diff), args(zero), args(candidate_arena), matrix_lanes, _EW_CFG[Ops.SUB],
+                           submit_barrier=bool(ew_ops), stateful=bool(ew_ops)),
+                   RKEWOp(args(magnitude), args(diff), extrema, matrix_lanes, _EW_CFG[Ops.SUB], submit_barrier=True, stateful=True)))
+  else: ew_ops.append(RKEWOp(args(magnitude), args(candidate_arena), extrema, matrix_lanes, _EW_CFG[Ops.SUB],
+                             submit_barrier=bool(ew_ops), stateful=bool(ew_ops)))
+  ew_ops.extend((RKEWOp(args(magnitude), args(magnitude), args(magnitude), matrix_lanes, _EW_CFG_ABS,
+                        submit_barrier=True, stateful=True),
+                 RKEWOp(args(unequal), args(magnitude), args(magnitude), matrix_lanes, _EW_CFG[Ops.MAX], compare=True),
+                 RKEWOp(args(equal), args(one), args(unequal), matrix_lanes, _EW_CFG[Ops.SUB], stateful=True),
+                 RKEWOp(args(diff), args(equal), args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
+                        submit_barrier=True, stateful=True),
+                 RKEWOp(args(selected_arena), args(equal), args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
+                        submit_barrier=True, stateful=True)))
+  active = [args(selected_arena, candidate*vector_bytes) for candidate in range(window)]
+  first_reduction = True
+  while len(active) > 1:
+    reduced:list[RKArg] = []
+    for i in range(0, len(active)-1, 2):
+      ew_ops.append(RKEWOp(active[i], active[i], active[i+1], count, _EW_CFG[Ops.MAX],
+                           submit_barrier=first_reduction, stateful=first_reduction))
+      first_reduction = False
+      reduced.append(active[i])
+    if len(active) & 1: reduced.append(active[-1])
+    active = reduced
+  ew_ops.append(RKEWOp(args(diff), active[0], args(one), count, _EW_CFG[Ops.SUB]))
+  ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), args(diff), args(int_tiles), count,
+                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
+  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ew_ops))
+
 def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
-  """Select cumulative MAX/MIN axis coordinates with DPU equality masks and emit native INT32."""
+  """Select unrolled cumulative MAX/MIN axis coordinates with DPU equality masks."""
   stores = [u for u in uops if u.op is Ops.STORE]
   if len(stores) != 1 or (out_param:=_root_param(stores[0].src[0])) is None or out_param.dtype.scalar() is not dtypes.int: return None
   if out_param.src[0].op is not Ops.CONST or stores[0].src[0].op is not Ops.INDEX: return None
@@ -780,50 +834,64 @@ def _lower_cumulative_extrema_index(uops:list[UOp]) -> RKImage|None:
   if sorted(current_offsets) != list(range(count)) or any(candidate_offsets[candidate][dst] >= candidate_offsets[candidate+1][dst]
                                                             for candidate in range(window-1) for dst in range(count)): return None
 
-  zero, one, candidate_arena, coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(10)
-  vector_bytes = (count*2+63)&-64
-  vector_lanes = vector_bytes//2
-  gathers = tuple(RKGather(data_slot, candidate_arena, count, offsets=offsets, dst_addend=candidate*vector_lanes)
-                  for candidate,offsets in enumerate(candidate_offsets))
-  coordinate_bits = tuple(tuple(struct.unpack("<H", struct.pack("<e", float(candidate+1 if candidate <= axis_coords[dst] else 0)))[0]
-                                for dst in range(count)) for candidate in range(window))
-  gathers += tuple(RKGather(data_slot, coordinate_arena, count, values=bits, dst_addend=candidate*vector_lanes)
-                   for candidate,bits in enumerate(coordinate_bits))
-  scratch = (RKScratch(_scratch_bytes(count)), RKScratch(_scratch_bytes(count)),
-             RKScratch(window*vector_bytes), RKScratch(window*vector_bytes), RKScratch(window*vector_bytes),
-             *(RKScratch(_scratch_bytes(count)) for _ in range(4)), RKScratch(((count+3)//4)*64))
-  def args(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
-  extrema = RKArg(RKBufferKind.ARG, extrema_slot)
-  ew_ops:list[RKEWOp] = []
-  for candidate in range(window):
-    candidate_value, coordinate = args(candidate_arena, candidate*vector_bytes), args(coordinate_arena, candidate*vector_bytes)
-    if negated_candidates:
-      ew_ops.extend((RKEWOp(args(diff), args(zero), candidate_value, count, _EW_CFG[Ops.SUB]),
-                     RKEWOp(args(magnitude), args(diff), extrema, count, _EW_CFG[Ops.SUB])))
-    else: ew_ops.append(RKEWOp(args(magnitude), candidate_value, extrema, count, _EW_CFG[Ops.SUB]))
-    ew_ops.append(RKEWOp(args(magnitude), args(magnitude), args(magnitude), count, _EW_CFG_ABS))
-    selected = args(selected_arena, candidate*vector_bytes)
-    ew_ops.extend((RKEWOp(args(unequal), args(magnitude), args(magnitude), count, _EW_CFG[Ops.MAX], compare=True),
-                   RKEWOp(args(equal), args(one), args(unequal), count, _EW_CFG[Ops.SUB], stateful=True),
-                   RKEWOp(args(diff), args(equal), coordinate, count, _EW_CFG[Ops.MUL]),
-                   RKEWOp(selected, args(equal), coordinate, count, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)))
-  active = [args(selected_arena, candidate*vector_bytes) for candidate in range(window)]
-  first_reduction = True
-  while len(active) > 1:
-    reduced:list[RKArg] = []
-    for i in range(0, len(active)-1, 2):
-      ew_ops.append(RKEWOp(active[i], active[i], active[i+1], count, _EW_CFG[Ops.MAX],
-                           submit_barrier=first_reduction, stateful=first_reduction))
-      first_reduction = False
-      reduced.append(active[i])
-    if len(active) & 1: reduced.append(active[-1])
-    active = reduced
-  ew_ops.append(RKEWOp(args(diff), active[0], args(one), count, _EW_CFG[Ops.SUB]))
-  ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), args(diff), args(int_tiles), count,
-                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
-  return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ew_ops))
+  extrema_plan = RKGather(extrema_slot, 0, count, 0, ((1, count, 1),))
+  candidate_plans = tuple(RKGather(data_slot, 0, count, offsets=offsets) for offsets in candidate_offsets)
+  return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
+                                 (extrema_plan,), negated_candidates, axis_coords)
+
+def _lower_cumulative_extrema_index_loop(uops:list[UOp]) -> RKImage|None:
+  """Lower Tinygrad's bounded-loop form used by the padded length-1022 scan."""
+  final_stores = [(store, root) for store in uops if store.op is Ops.STORE and (root:=_root_param(store.src[0])) is not None and
+                  root.dtype.scalar() is dtypes.int]
+  if len(final_stores) != 1: return None
+  store, out_param = final_stores[0]
+  if out_param.src[0].op is not Ops.CONST or store.src[0].op is not Ops.INDEX: return None
+  count, out_index = int(out_param.src[0].arg), store.src[0].src[1]
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  out_ranges = _index_ranges(out_index)
+  if len(out_ranges) != 1 or out_ranges[0].src[0].op is not Ops.CONST or int(out_ranges[0].src[0].arg) != count: return None
+  half_cmps = [u for u in uops if u.op is Ops.CMPNE and len(u.src) == 2 and all(x.dtype.scalar() is dtypes.half for x in u.src)]
+  if len(half_cmps) != 1: return None
+  lhs, rhs = half_cmps[0].src
+  extrema_expr, candidate_expr = (lhs, rhs) if lhs.op is Ops.MAX else (rhs, lhs)
+  if extrema_expr.op is not Ops.MAX: return None
+  negated_candidates = False
+  if candidate_expr.op is Ops.MUL:
+    constants = [x for x in candidate_expr.src if x.op is Ops.CONST and float(x.arg) == -1.0]
+    loads = [x for x in candidate_expr.src if x.op is Ops.LOAD]
+    if len(constants) != 1 or len(loads) != 1: return None
+    candidate_expr, negated_candidates = loads[0], True
+  if candidate_expr.op is not Ops.LOAD or candidate_expr.src[0].op is not Ops.INDEX or candidate_expr.src[0].src[0].op is not Ops.PARAM: return None
+  candidate_param, candidate_index = candidate_expr.src[0].src[:2]
+  out_range = out_ranges[0]
+  if (candidate_param.src[0].op is not Ops.CONST or int(candidate_param.src[0].arg) != count or candidate_index.op is not Ops.RANGE or
+      candidate_index.src[0].op is not Ops.CONST or int(candidate_index.src[0].arg) != count or out_range not in candidate_index.src[1:]): return None
+  reduce_range = candidate_index
+  prefix_cmps = [u for u in uops if u.op is Ops.CMPLT and u.src == (out_range, reduce_range)]
+  if len(prefix_cmps) != 1: return None
+  gates = [u for u in uops if u.op is Ops.AND and half_cmps[0] in u.toposort() and prefix_cmps[0] in u.toposort()]
+  if len(gates) != 1: return None
+  index_maxes = [u for u in uops if u.op is Ops.MAX and u.dtype.scalar() is dtypes.int and gates[0] in u.toposort() and
+                 reduce_range in u.toposort()]
+  if len(index_maxes) != 1 or index_maxes[0] not in store.src[1].toposort(): return None
+  extrema_loads = [u for u in extrema_expr.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.half and
+                   u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.PARAM]
+  if len(extrema_loads) != 2 or any(any(r is not out_range for r in _index_ranges(load.src[0].src[1])) for load in extrema_loads): return None
+  try:
+    candidate_values = [_eval_int(candidate_index, {reduce_range: candidate}) for candidate in range(count)]
+    if sorted(candidate_values) != list(range(count)): return None
+    candidate_plans = tuple(RKGather(candidate_param.arg.slot, 0, count, base=offset) for offset in candidate_values)
+    extrema_plans = tuple(_gather_plan(load.src[0].src[0].arg.slot, 0, out_index, load.src[0].src[1], None, count)
+                          for load in extrema_loads)
+  except RuntimeError: return None
+  for load,plan in zip(extrema_loads, extrema_plans):
+    source_size = int(load.src[0].src[0].src[0].arg)
+    if plan.offsets and any(not 0 <= offset < source_size for offset in plan.offsets): return None
+  return _cumulative_index_image(out_param.arg.slot, count, candidate_plans,
+                                 extrema_plans, negated_candidates, list(range(count)))
 
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops)) is not None: return cumulative_loop
   if (cumulative_index:=_lower_cumulative_extrema_index(uops)) is not None: return cumulative_index
   if (raw_int32:=_lower_raw_int32_layout(uops)) is not None: return raw_int32
   if (dot_reduction:=_lower_dot_loop_reduction(uops)) is not None: return dot_reduction
