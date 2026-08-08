@@ -1116,3 +1116,22 @@ PyTorch golden for the loss reductions and is then cast to the FP16 device contr
 - Tolerance remains exactly `atol=5e-3, rtol=5e-3`.
 - Rockchip execution uses only DPU EW; no backend/core change, host tensor arithmetic, CMAC, CNA, or PPU execution was
   added.
+
+---
+
+## 2026-08-08 — FP16 scatter with compile-time-static indices
+
+The Rockchip census now covers functional scatter replacement on dimensions 0 and 1, scalar-source scatter, and
+scatter-reduce sum, product, mean, maximum, and minimum from `rockchip/post-518-reference`. Indices are compile-time
+`arange` or broadcast constants: the renderer turns them into raw gather layout, while selected FP16 values and every
+reduction execute on DPU EW. External integer index buffers remain explicitly excluded because Rockchip accepts FP16
+inputs only.
+
+- Static-index scatter census: **8 passed, 1 skipped in 3.13 s**, sequentially on one NPU process.
+- Covered reductions: sum, product, mean, maximum, and minimum.
+- Complete Rockchip census: **243 passed, 11 skipped, 96 subtests passed in 101.99 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** in 0.38 s after the full census.
+- Tolerance remains exactly `atol=5e-3, rtol=5e-3`.
+
+No backend/core change, host tensor arithmetic, CMAC, CNA, or PPU execution was added. The full run produced no RKNPU
+timeout, invalid IRQ, IOMMU fault, reset, or kernel oops.
