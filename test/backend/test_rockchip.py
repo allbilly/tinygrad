@@ -351,5 +351,19 @@ class TestRockchipInterpolateOps(unittest.TestCase):
   test_interpolate_trilinear = _test_ops.TestOps.test_interpolate_trilinear
   test_interpolate_trilinear_corners_aligned = _test_ops.TestOps.test_interpolate_trilinear_corners_aligned
 
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipIncrementalOps(unittest.TestCase):
+  """Remaining test_ops methods, admitted and debugged in source order."""
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_full_like = _test_ops.TestOps.test_full_like
+  test_full = _test_ops.TestOps.test_full
+
 if __name__ == "__main__":
   unittest.main()

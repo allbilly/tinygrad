@@ -141,7 +141,7 @@ class RockchipProgram(Program['RockchipDevice']):
     start = time.perf_counter()
     self._run_ew_ops(address)
     if (fill:=self.image.fill) is not None:
-      bits = self.image.constants[:2] * fill.count
+      bits = self.image.constants[:fill.itemsize] * fill.count
       dest = bufs[fill.dst.index] if fill.dst.kind is RKBufferKind.ARG else self.scratch[fill.dst.index]
       ctypes.memmove(int(dest.va_addr), bits, len(bits))
       self.dev._sync_buffer(dest, rk.RKNPU_MEM_SYNC_TO_DEVICE)

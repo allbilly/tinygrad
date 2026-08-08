@@ -719,3 +719,22 @@ Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_RE
 - `sz.py`: renderer 553 executable lines, runtime 165.
 
 The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The floating-point interpolation group is complete; uint8 interpolation remains outside the FP16 input contract.
+
+---
+
+## 2026-08-08 — `test_full_like` and `test_full`: typed raw constant fill
+
+The remaining `TestOps` census is now advancing in source order. `test_full_like` passes its explicit FP32 and int32 outputs, and `test_full` passes its integer output. These require no numeric NPU operation: each tensor is a compile-time scalar repeated into storage.
+
+RKImage v16 records the fill element width in the previously reserved fill byte. The compiler serializes the scalar using the destination dtype's exact byte format, and the runtime copies those immutable bytes across the destination before synchronizing the cacheable buffer to the device. Dynamic Rockchip arithmetic remains FP16-only; this is raw constant initialization, not CPU input-dependent arithmetic or FP32 emulation.
+
+Verification with `FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP ROCKCHIP_EW_REDUCE=twoproduct`:
+
+- `test_full_like`: **1 passed in 2.66 s**.
+- `test_full`: **1 passed in 2.61 s**.
+- Complete Rockchip census: **116 passed, 9 skipped, 96 subtests passed in 109.58 s**.
+- Ruff: pass.
+- `mypy tinygrad/`: pass (216 source files).
+- `sz.py`: renderer 556 executable lines, runtime 165.
+
+The complete run left `CmaFree` at 6144 KiB and produced no CMA failure, RKNPU timeout, invalid IRQ, IOMMU fault, or kernel oops. The next source-order methods are the negative-dimension exception tests.

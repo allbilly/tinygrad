@@ -12,10 +12,10 @@ from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
 
-RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 15
+RKIMAGE_MAGIC, RKIMAGE_VERSION = b"RKIM", 16
 _HEADER = struct.Struct("<4sHHHHIII")  # magic, version, target, scratch, gathers, ops, constants, flags
 _SCRATCH, _GATHER, _GATHER_AXIS = struct.Struct("<II"), struct.Struct("<HHIBBiH"), struct.Struct("<IIi")
-_FILL = struct.Struct("<BBHI")  # dst_kind, pad, dst_index, count
+_FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, pad, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
 
@@ -41,7 +41,7 @@ class RKGather:
 class RKStatic: expr: UOp
 
 @dataclass(frozen=True)
-class RKFill: dst: RKArg; count: int
+class RKFill: dst: RKArg; count: int; itemsize: int = 2
 
 @dataclass(frozen=True)
 class RKEWOp:
@@ -76,7 +76,7 @@ def encode_image(image:RKImage) -> bytes:
   for op in image.ew_ops:
     out += _EWOP.pack(int(op.dst.kind), 0, op.dst.index, int(op.lhs.kind), op.lhs.index, int(op.rhs.kind), op.rhs.index)
     out += _EWOP2.pack(op.count, op.ew_cfg) + struct.pack("<iii", op.dst.addend, op.lhs.addend, op.rhs.addend)
-  if image.fill is not None: out += _FILL.pack(int(image.fill.dst.kind), 0, image.fill.dst.index, image.fill.count)
+  if image.fill is not None: out += _FILL.pack(int(image.fill.dst.kind), image.fill.itemsize, image.fill.dst.index, image.fill.count)
   return bytes(out) + image.constants
 
 def decode_image(blob:bytes) -> RKImage:
@@ -108,8 +108,9 @@ def decode_image(blob:bytes) -> RKImage:
                          RKArg(RKBufferKind(rk_), ri, ra), count, ew_cfg))
   fill = None
   if flags & 1:
-    dst_kind, _, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
-    fill = RKFill(RKArg(RKBufferKind(dst_kind), dst_index), count)
+    dst_kind, itemsize, dst_index, count = _FILL.unpack_from(blob, off); off += _FILL.size
+    if itemsize not in (1, 2, 4, 8): raise ValueError("invalid RKFill item size")
+    fill = RKFill(RKArg(RKBufferKind(dst_kind), dst_index), count, itemsize)
   if off + nconst != len(blob): raise ValueError("invalid RKImage size")
   return RKImage(RKTarget(target), scratch, blob[off:], version, tuple(gathers), fill, tuple(ew_ops), chain_limit)
 
@@ -418,15 +419,17 @@ def _precise_mul_sum(terms:list[UOp]) -> UOp:
 def lower_ew(uops:list[UOp]) -> RKImage:
   stores = [u for u in uops if u.op is Ops.STORE]
   outs = [_root_param(u.src[0]) for u in stores]
-  if (not stores or any(p is None or p.dtype.scalar() not in (dtypes.half, dtypes.float) or p.src[0].op is not Ops.CONST for p in outs) or
+  if (not stores or any(p is None or p.dtype.scalar().fmt is None or p.src[0].op is not Ops.CONST for p in outs) or
       len({p.arg.slot for p in outs}) != 1): raise RuntimeError("RKPLAN_REJECT:unsupported_graph")  # type: ignore[union-attr]
   out_param = outs[0]; assert out_param is not None
   count, oslot, store = int(out_param.src[0].arg), out_param.arg.slot, stores[0]
   if store.src[0].op is not Ops.INDEX: raise RuntimeError("RKPLAN_REJECT:unsupported_graph")
   if count <= 0: return RKImage(RKTarget.RK3588)
   out_index, out, val = store.src[0].src[1], RKArg(RKBufferKind.ARG, oslot), store.src[1]
-  if val.op is Ops.CONST and val.dtype.scalar() is dtypes.half:
-    return RKImage(RKTarget.RK3588, constants=struct.pack("<e", float(val.arg)), fill=RKFill(out, count))
+  if val.op is Ops.CONST and val.dtype.scalar() is out_param.dtype.scalar():
+    dtype, fmt = out_param.dtype.scalar(), out_param.dtype.scalar().fmt
+    assert fmt is not None
+    return RKImage(RKTarget.RK3588, constants=struct.pack("<"+fmt, val.arg), fill=RKFill(out, count, dtype.itemsize))
   if _ew_leaf(val, out_index, count, oslot) is not None:
     val = val.alu(Ops.ADD, UOp.const(0.0, dtypes.half))
   supported = RockchipRenderer.code_for_op
