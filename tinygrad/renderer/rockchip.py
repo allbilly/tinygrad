@@ -822,6 +822,24 @@ def _split_load_pairs(pairs:tuple[tuple[UOp, UOp], ...]) -> tuple[UOp, tuple[UOp
   if any(x is None for x in candidates): return None
   return current, tuple(x for x in candidates if x is not None)
 
+def _loaded_equality_rows(out_index:UOp, count:int, pairs:tuple[tuple[UOp, UOp], ...], dtype:DType,
+                          same_source:bool=False) -> tuple[int, int, tuple[tuple[int, ...], ...], tuple[int, ...]]|None:
+  """Resolve one common load and its candidate loads into bounded striped-row sources."""
+  if (split:=_split_load_pairs(pairs)) is None: return None
+  current, candidates = split
+  params = tuple(_root_param(load.src[0]) for load in (*candidates, current))
+  if any(param is None or param.dtype.scalar() is not dtype or param.src[0].op is not Ops.CONST for param in params): return None
+  concrete = tuple(param for param in params if param is not None)
+  candidate_params, current_param = concrete[:-1], concrete[-1]
+  if len({param.arg.slot for param in candidate_params}) != 1 or (same_source and candidate_params[0].arg.slot != current_param.arg.slot): return None
+  try:
+    candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in candidates)
+    current_offsets = _gather_offsets(out_index, current.src[0].src[1], None, count)
+  except RuntimeError: return None
+  if (any(not 0 <= offset < int(param.src[0].arg) for offsets,param in zip(candidate_offsets, candidate_params) for offset in offsets) or
+      any(not 0 <= offset < int(current_param.src[0].arg) for offset in current_offsets)): return None
+  return candidate_params[0].arg.slot, current_param.arg.slot, candidate_offsets, current_offsets
+
 def _stripe_layout(count:int, rows:int) -> tuple[int, int, int]:
   vector_bytes = (count*2+63)&-64
   return vector_bytes, vector_bytes//2, rows*vector_bytes//2
@@ -975,21 +993,11 @@ def _lower_occurrence_count(output:RKOutput) -> RKImage|None:
     if (pair:=_load_equality(predicate)) is None or any(x.dtype.scalar() is not dtypes.half for x in pair): return None
     parsed.append((pair, gate))
   if not 2 <= len(parsed) <= 255: return None
-  if (split:=_split_load_pairs(tuple(pair for pair,_ in parsed))) is None: return None
-  current, candidate_loads = split
-  loads = (*candidate_loads, current)
-  params = tuple(_root_param(load.src[0]) for load in loads)
-  if (any(param is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST for param in params) or
-      len({param.arg.slot for param in params if param is not None}) != 1): return None
-  source = params[0]; assert source is not None
-  source_count = int(source.src[0].arg)
-
+  if (rows:=_loaded_equality_rows(out_index, count, tuple(pair for pair,_ in parsed), dtypes.half, same_source=True)) is None: return None
+  candidate_src, current_src, candidate_offsets, current_offsets = rows
   try:
-    candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in candidate_loads)
-    current_offsets = _gather_offsets(out_index, current.src[0].src[1], None, count)
     valid_bits = tuple(_static_vector(out_index, gate, count) if gate is not None else (0x3c00,)*count for _,gate in parsed)
   except RuntimeError: return None
-  if any(not 0 <= offset < source_count for offsets in (*candidate_offsets, current_offsets) for offset in offsets): return None
   for dst in range(count):
     valid_offsets = [offsets[dst] for offsets,bits in zip(candidate_offsets, valid_bits) if bits[dst] == 0x3c00]
     if not valid_offsets or len(valid_offsets) != len(set(valid_offsets)) or any(bits[dst] not in (0, 0x3c00) for bits in valid_bits): return None
@@ -997,9 +1005,9 @@ def _lower_occurrence_count(output:RKOutput) -> RKImage|None:
   window = len(candidate_offsets)
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, window)
   zero, one, candidates_slot, current_slot, valid_slot, diff, magnitude, unequal, equal, selected, int_tiles = range(11)
-  gathers = _stripe_gathers(source.arg.slot, candidates_slot, count, candidate_offsets, vector_lanes)
-  gathers += _stripe_gathers(source.arg.slot, current_slot, count, (current_offsets,)*window, vector_lanes)
-  gathers += _stripe_gathers(source.arg.slot, valid_slot, count, valid_bits, vector_lanes, values=True)
+  gathers = _stripe_gathers(candidate_src, candidates_slot, count, candidate_offsets, vector_lanes)
+  gathers += _stripe_gathers(current_src, current_slot, count, (current_offsets,)*window, vector_lanes)
+  gathers += _stripe_gathers(candidate_src, valid_slot, count, valid_bits, vector_lanes, values=True)
   scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(((count+3)//4)*64))
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   ops:list[RKEWOp] = []
@@ -1036,33 +1044,12 @@ def _lower_sort_index_selection(output:RKOutput) -> RKImage|None:
       {weight for weight,_,_ in parsed} != set(range(1, max(weight for weight,_,_ in parsed)+1))): return None
   parsed.sort(key=lambda item: item[0])
 
-  if (half_split:=_split_load_pairs(tuple(pair for _,pair,_ in parsed))) is None or \
-     (int_split:=_split_load_pairs(tuple(pair for _,_,pair in parsed))) is None: return None
-  half_current, half_candidates = half_split
-  int_current, int_candidates = int_split
-  all_loads = (*half_candidates, half_current, *int_candidates, int_current)
-  params = tuple(_root_param(load.src[0]) for load in all_loads)
-  if any(param is None or param.src[0].op is not Ops.CONST for param in params): return None
-  concrete = tuple(param for param in params if param is not None)
-  half_candidate_params = concrete[:len(half_candidates)]
-  half_current_param = concrete[len(half_candidates)]
-  int_candidate_start = len(half_candidates)+1
-  int_candidate_params = concrete[int_candidate_start:int_candidate_start+len(int_candidates)]
-  int_current_param = concrete[-1]
-  if (len({x.arg.slot for x in half_candidate_params}) != 1 or len({x.arg.slot for x in int_candidate_params}) != 1 or
-      any(x.dtype.scalar() is not dtypes.half for x in (*half_candidate_params, half_current_param)) or
-      any(x.dtype.scalar() is not dtypes.int for x in (*int_candidate_params, int_current_param))): return None
-
-  try:
-    half_candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in half_candidates)
-    half_current_offsets = _gather_offsets(out_index, half_current.src[0].src[1], None, count)
-    int_candidate_offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in int_candidates)
-    int_current_offsets = _gather_offsets(out_index, int_current.src[0].src[1], None, count)
-  except RuntimeError: return None
+  half_rows = _loaded_equality_rows(out_index, count, tuple(pair for _,pair,_ in parsed), dtypes.half)
+  int_rows = _loaded_equality_rows(out_index, count, tuple(pair for _,_,pair in parsed), dtypes.int)
+  if half_rows is None or int_rows is None: return None
+  half_candidate_src, half_current_src, half_candidate_offsets, half_current_offsets = half_rows
+  int_candidate_src, int_current_src, int_candidate_offsets, int_current_offsets = int_rows
   if half_candidate_offsets != int_candidate_offsets: return None
-  maps_and_sizes = (*zip(half_candidate_offsets, half_candidate_params), (half_current_offsets, half_current_param),
-                    *zip(int_candidate_offsets, int_candidate_params), (int_current_offsets, int_current_param))
-  if any(any(not 0 <= offset < int(param.src[0].arg) for offset in offsets) for offsets,param in maps_and_sizes): return None
 
   rows = len(parsed)
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, rows)
@@ -1070,11 +1057,11 @@ def _lower_sort_index_selection(output:RKOutput) -> RKImage|None:
    candidate_value, current_value, weights, value_diff, value_magnitude, value_unequal, value_equal,
    count_diff, count_magnitude, count_unequal, count_equal, selected, weighted, int_tiles) = range(21)
   weight_bits = tuple((struct.unpack("<H", struct.pack("<e", float(weight)))[0],)*count for weight,_,_ in parsed)
-  gathers = _stripe_gathers(half_candidate_params[0].arg.slot, candidate_value, count, half_candidate_offsets, vector_lanes)
-  gathers += _stripe_gathers(int_candidate_params[0].arg.slot, raw_candidate_count, count, int_candidate_offsets, vector_lanes, itemsize=4)
-  gathers += _stripe_gathers(half_candidate_params[0].arg.slot, weights, count, weight_bits, vector_lanes, values=True)
-  gathers += _stripe_gathers(half_current_param.arg.slot, current_value, count, (half_current_offsets,)*rows, vector_lanes)
-  gathers += _stripe_gathers(int_current_param.arg.slot, raw_current_count, count, (int_current_offsets,)*rows, vector_lanes, itemsize=4)
+  gathers = _stripe_gathers(half_candidate_src, candidate_value, count, half_candidate_offsets, vector_lanes)
+  gathers += _stripe_gathers(int_candidate_src, raw_candidate_count, count, int_candidate_offsets, vector_lanes, itemsize=4)
+  gathers += _stripe_gathers(half_candidate_src, weights, count, weight_bits, vector_lanes, values=True)
+  gathers += _stripe_gathers(half_current_src, current_value, count, (half_current_offsets,)*rows, vector_lanes)
+  gathers += _stripe_gathers(int_current_src, raw_current_count, count, (int_current_offsets,)*rows, vector_lanes, itemsize=4)
   scratch_sizes = [matrix_lanes*2]*21
   scratch_sizes[raw_candidate_count] = scratch_sizes[raw_current_count] = matrix_lanes*4
   scratch_sizes[convert_tiles] = ((matrix_lanes+3)//4)*64

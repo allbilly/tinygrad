@@ -2619,3 +2619,22 @@ The CPU-cheat audit found no runtime or Tinygrad-core change and no host interpr
 Python constructs only static/affine gather geometry and moves raw representations; all dynamic conversion, byte-wise
 comparison, selection, and reduction execute on DPU EW. There is no host scatter, host ArgMax, LUT, CMAC, CNA, PPU
 fallback, tolerance relaxation, or external non-FP16 input.
+
+---
+
+## 2026-08-09 — equality-row matcher cleanup
+
+Occurrence-count and stable sort-index lowering now share one bounded equality-row parser. It identifies the common
+load and ordered candidate loads, validates their dtype and source buffers, evaluates their compile-time gather maps,
+and rejects every out-of-range lane. The two IR matchers remain separate because occurrence gates and weighted
+value/count conjunctions are different graphs; `_lower_sort_compare` is unchanged because its static MIN/MAX algorithm
+does not overlap equality-mask emission. Existing `_ew_eq_mask`, `_stripe_layout`, and `_stripe_gathers` continue to
+provide the shared DPU emission and aligned-matrix packing layers.
+
+- Sort-index and TopK regression: **12 passed, 8 subtests passed in 108.12 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Repository-wide Ruff and Tinygrad mypy: pass.
+- `sz.py`: renderer/runtime **2,310/281 executable lines**, down from **2,323/281**.
+
+This is a renderer-only structural refactor. It adds no tensor-value access, numeric host operation, runtime behavior,
+new tolerance, LUT, CMAC, or fallback path; the generated gather and DPU EW algorithms are unchanged.
