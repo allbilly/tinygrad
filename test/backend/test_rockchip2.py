@@ -815,6 +815,18 @@ class TestRockchipSortIndexOps(_base.TestRockchipSortIndexOps):
       with self.subTest(descending=descending):
         _TEST_OPS_HELPER(None, lambda x, descending=descending: x.sort(stable=True, descending=descending).indices.int(),
                          lambda x, descending=descending: x.sort(descending=descending)[1], vals=[values], forward_only=True)
+  def test_sort_indices_signed_zero_and_infinity(self):
+    values = np.array([0.0, -0.0, np.inf, np.inf, -np.inf, -np.inf], dtype=np.float16)
+    for descending in (False, True):
+      with self.subTest(descending=descending):
+        _TEST_OPS_HELPER(None, lambda x, descending=descending: x.sort(stable=True, descending=descending).indices.int(),
+                         lambda x, descending=descending: x.sort(descending=descending)[1], vals=[values], forward_only=True)
+  def test_sort_int32_limits(self):
+    values = np.array([0, -(1 << 31), (1 << 31)-1, -1, 0, -(1 << 31)], dtype=np.int32)
+    for descending in (False, True):
+      with self.subTest(descending=descending):
+        _TEST_OPS_HELPER(None, lambda x, descending=descending: x.sort(stable=True, descending=descending).indices.int(),
+                         lambda x, descending=descending: x.sort(descending=descending)[1], vals=[values], forward_only=True)
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

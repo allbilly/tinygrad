@@ -4510,3 +4510,32 @@ encoding, CPU arithmetic, CMAC, or LUTs. The existing AND/OR/XOR lowerer now sha
 The CPU-cheat audit found no runtime or Tinygrad-core change and no input-value inspection. Initial and mid gathers only
 move raw bytes and compiler-known constants/offsets; all data-dependent bit extraction, conditional selection, sign
 extension, weighting, and reconstruction execute as native DPU INT16 EW tasks. No tolerance was changed.
+
+---
+
+## 2026-08-10 — batched arg-extrema, stable sort, and TopK
+
+Four unchanged upstream methods were completed as one shared integer-selection milestone: `test_argmax`, `test_argmin`,
+`test_sort`, and `test_topk`. Signed INT32 extrema and compare/swap now operate on four widened byte lanes with an exact
+native-INT16 lexicographic comparator. Boolean extrema use the same running first-tie selection shape. Stable sort's
+occurrence and final-index graphs share one weighted equality emitter for FP16 numeric values and exact INT32 counts.
+FP16 equality canonicalizes signed zero, distinguishes signed infinities, and rejects NaNs without the reset-heavy FP16
+comparison mode.
+
+- Direct unchanged upstream batch: **4/4 passed in 18.31 s**, including axes, repeated values, booleans, bitwise-not,
+  signed INT32 limits, stable integer sort, and TopK values/indices.
+- The promoted test aliases plus backend-only arg/sort/topk regressions passed **23 tests / 36 subtests in 22.27 s**.
+  New local coverage includes signed zero, both infinities, repeated signed limits, and ascending/descending stable order.
+- The former slow representative 8x8x6 sort-index realization fell from **11.12 s to 0.53 s**. Its reset count fell
+  from **99 to 1**, submit count from **130 to 20**, and measured program wall from **10.78 s to 0.14 s**. The complete
+  upstream sort/topk pair fell from **97.04 s to below 30 s** as part of the four-method batch.
+- `test_rockchip.py` collects **346 upstream-only cases** (323 unique upstream method names); `test_rockchip2.py` collects
+  **189 backend-only cases**. The authoritative upstream-name remainder is now **98 of 421**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, `git diff --check`, and focused renderer mypy/Ruff: pass.
+- `sz.py`: renderer/runtime **5,605/331 executable lines**, total **30,991**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime or Tinygrad-core modification and no tensor-value inspection. Compilation handles
+only static graph topology, offsets, weights, and byte layout. Runtime gathers opaque bytes; all comparisons, equality
+masks, first-tie updates, weighted reductions, and INT32 writeback execute as native DPU INT16 EW tasks. There is no
+host result calculation, CPU fallback, LUT, CMAC, tolerance relaxation, or floating-point input wider than FP16.

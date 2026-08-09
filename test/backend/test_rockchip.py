@@ -647,6 +647,9 @@ class TestRockchipCumulativeExtremaOps(unittest.TestCase):
 class TestRockchipArgExtremaOps(unittest.TestCase):
   """FP16 ArgMax/ArgMin selected entirely by DPU EW, including first-index ties."""
 
+  test_argmax = _test_ops.TestOps.test_argmax
+  test_argmin = _test_ops.TestOps.test_argmin
+
   def _test(self, kind:str, values:tuple[tuple[float, ...], ...]):
     torch_fxn, tinygrad_fxn = (torch.argmax, Tensor.argmax) if kind == "max" else (torch.argmin, Tensor.argmin)
     for case in values:
@@ -674,6 +677,8 @@ class TestRockchipArgExtremaOps(unittest.TestCase):
 class TestRockchipSortValueOps(unittest.TestCase):
   """FP16 stable sort values using static bitonic lane maps and DPU EW MIN/MAX."""
 
+  test_sort = _test_ops.TestOps.test_sort
+
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipSortIndexOps(unittest.TestCase):
@@ -689,6 +694,9 @@ class TestRockchipSortIndexOps(unittest.TestCase):
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipTopKOps(unittest.TestCase):
   """FP16 TopK values and stable INT32 indices composed from native sort and static slicing."""
+
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+  test_topk = _test_ops.TestOps.test_topk
 
   def _test(self, shape:tuple[int, ...], k:int, axis:int, largest:bool):
     _fp16_test_op([shape], lambda x: x.topk(k, axis, largest, True).values,
