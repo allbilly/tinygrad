@@ -3519,3 +3519,33 @@ The CPU-cheat audit found no runtime value inspection or Tinygrad-core change. R
 static bounds, and gather addresses. Dynamic bool accumulation, INT32-index byte equality, selection, padding, and
 INT16-to-INT32 conversion all execute on DPU EW. Runtime only submits stages and copies opaque bytes. There is no host
 numeric evaluator, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact INT32 fixed-size Nonzero
+
+The exact upstream `test_nonzero_size` method now passes on Rockchip for ordinary INT32 tensors. Each arbitrary INT32
+source value is treated as four opaque bytes. Native INT16 MIN maps each byte to a 0/1 nonzero flag and native MAX
+combines the four flags. DPU INT16 ADD then produces the prefix/count, exact byte equality selects the compact
+coordinate, and the terminal INT16-to-INT32 stage writes the result. This covers negative values and values that cannot
+be represented numerically in INT16 without narrowing the source tensor.
+
+Historical `ae5a4a6f6`/`add791a62` nonzero implementations were inspected but deliberately not ported: they execute the
+reduction with NumPy in the Rockchip runtime. The hardware emission instead follows the INT16 and regrouping behavior
+proved by `~/rk3588/examples/elementwise_int.py`; `~/npu` has no standalone nonzero instruction. FP16 and INT32
+fixed-Nonzero lowerers now share one strict graph-plan parser, matching the matcher/emitter separation used by other
+Tinygrad hardware backends.
+
+- Exact upstream `test_nonzero_size`: **1 passed in 5.50 s**, covering truncate/pad, rank two, scalar shape, empty
+  input, and dtype preservation.
+- A stronger raw-bit regression over `0`, `-1`, `256`, `-65536`, `INT_MAX`, and `INT_MIN` passes exactly in **3.79 s**.
+- All six Rockchip Nonzero methods pass individually after cleanup in **2.97–7.06 s**; no case crosses 30 seconds.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **454 tests**.
+- `sz.py`: renderer/runtime **4,308/325 executable lines**, total **29,688**. The shared fixed-Nonzero plan removes the
+  duplicated FP16/INT32 count, compact-index, coordinate, fill, and bounds parsing.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Runtime gathers copy opaque bytes but never interpret a
+tensor value. All input-dependent INT32 nonzero detection, prefix/count reduction, exact index equality, coordinate
+selection, padding, and INT32 writeback execute on DPU EW. There is no host numeric evaluator, LUT, CMAC, tolerance
+change, or floating input wider than FP16.

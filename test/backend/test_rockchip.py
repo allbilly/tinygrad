@@ -520,7 +520,9 @@ class TestRockchipMaskedSelectOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipNonzeroOps(unittest.TestCase):
-  """Fixed FP16 nonzero coordinates selected by DPU prefix/equality stages."""
+  """Fixed FP16/INT32 nonzero coordinates selected by DPU prefix/equality stages."""
+
+  test_nonzero_size = _test_ops.TestOps.test_nonzero_size
 
   def test_fixed_nonzero_pad_and_truncate(self):
     values = np.array([1., 0., 2., 0., 3.], dtype=np.float16)
@@ -546,6 +548,11 @@ class TestRockchipNonzeroOps(unittest.TestCase):
     self.assertEqual(Tensor(5, dtype=dtypes.half, device="ROCKCHIP").nonzero(size=4).shape, (4, 0))
     self.assertEqual(Tensor(np.array([1., 0.], dtype=np.float16), device="ROCKCHIP").nonzero(size=3, fill_value=-1.5).dtype,
                      dtypes.int)
+
+  def test_int32_nonzero_exact_bytes(self):
+    values = np.array([0, -1, 256, -65536, 0, 2147483647, -2147483648], dtype=np.int32)
+    got = Tensor(values, device="ROCKCHIP").nonzero(size=6, fill_value=-1).numpy()
+    np.testing.assert_array_equal(got, np.array([[1], [2], [3], [5], [6], [-1]], dtype=np.int32))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipFancyIndexOps(unittest.TestCase):
