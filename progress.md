@@ -3890,8 +3890,8 @@ portable bitwise-complement form for signed MIN, materializes its static source 
 INT16 extrema tree. The terminal DPU task writes the INT16 result directly.
 
 The shared scalar-reduction arena no longer assumes that an output row fits in 64 bytes. Its block stride is derived as
-`max(64, rows*2)`, and gather spacing, task addresses, and scratch size all use that same value. The focused 40x257 case
-therefore uses `257 * 80 = 20,560` scratch bytes instead of overlapping rows above the old implicit 32-row limit.
+`align64(rows*2)`, and gather spacing, task addresses, and scratch size all use that same value. The focused 40x257 case
+therefore uses `257 * 128 = 32,896` scratch bytes instead of overlapping rows above the old implicit 32-row limit.
 
 `~/rk3588/examples/elementwise_int.py` supplies the hardware reference for signed INT16 MAX/MIN. No branch contains a
 more complete INT16 loop-reduction implementation. INT16 SUM is intentionally not claimed: Tinygrad promotes it to
@@ -3912,3 +3912,42 @@ The CPU-cheat audit found no runtime or core change. Compile time evaluates only
 gather plans; runtime gathers only rearrange tensor bytes. Every input-dependent comparison and reduction executes in
 native DPU INT16 EW tasks. There is no host extrema calculation, NumPy tensor evaluation, LUT, CMAC, tolerance change,
 or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact INT16 cumulative extrema on DPU
+
+One-dimensional signed-INT16 `cummax` and `cummin` values now lower through one shared native extrema image. Small scans
+are fully unrolled by Tinygrad; the matcher recovers each prefix candidate from direct MAX or the portable
+complemented-MAX/WHERE form. At 257 elements Tinygrad switches to a local accumulator loop, and the loop matcher now
+accepts the exact prefix-gated layout in addition to ordinary scalar reductions.
+
+Both forms prove their static gather plan before code emission: output lane `i` must contain exactly source offsets
+`0..i`, with disabled candidates replaced by the signed MAX/MIN identity. Input-dependent values are then reduced by
+native INT16 DPU tasks. Scalar and cumulative paths share `_int16_extrema_image`; arena strides are 64-byte aligned and
+derived from the row count rather than a task-count constant.
+
+The scheduled UOps were inspected at 8 and 257 elements. `~/rk3588/examples/elementwise_int.py` supplies the proven
+signed INT16 MIN/MAX register behavior; no branch contains a more complete INT16 cumulative implementation. Cumulative
+sum/product are not included because saturating INT16 ADD/MUL do not preserve Tinygrad's promoted or wrapped semantics.
+
+- Non-monotonic 17- and 257-element cumulative MAX/MIN pass exactly with asserted **16 and 256 tasks**, respectively,
+  and **one ioctl per realization**. The focused method takes **4.43 s** including startup.
+- Aligned scalar plus cumulative focused methods pass **2/2 in 5.01 s**; the INT16 class plus FP16 extrema regressions
+  pass **23/23 in 6.19 s**.
+- Current Rockchip collection is **475 tests**. A serial duration run passed 193 tests before one transient timeout in an
+  unchanged multidimensional scatter subtest. Vendor health remained **60/60**, that method then passed all three
+  subtests alone in **4.47 s**, and the remaining suffix passed **272 tests, 86 subtests, 2 skips**. Thus every collected
+  node was covered on current code without reboot; the immediately preceding complete run was 465/465 plus 9 skips.
+- No completed method exceeded 30 seconds. Existing FP16 `test_simple_cummin` was slowest at **27.13 s**; the next were
+  `test_dynamic_nonzero_rank_two` at **21.68 s** and FP16 `test_simple_cummax` at **19.37 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before testing, immediately after the transient
+  timeout, and after the suite suffix.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **4,777/327 executable lines**, total **30,159**. Sharing scalar/cumulative emission limits
+  this milestone to 39 renderer lines and no runtime or Tinygrad-core lines.
+
+The CPU-cheat audit found no runtime or core change. Compile time evaluates only static prefix membership and source
+offsets. Runtime gathers rearrange bytes and DPU INT16 MIN/MAX computes every cumulative value. There is no host extrema
+or prefix calculation over tensor values, NumPy backend evaluation, LUT, CMAC, tolerance change, or floating input wider
+than FP16.

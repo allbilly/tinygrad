@@ -7,7 +7,7 @@ from enum import IntEnum
 from typing import Callable, Iterable
 from tinygrad.device import Compiler
 from tinygrad.dtype import DType, dtypes
-from tinygrad.helpers import Target, cdiv, cmod, floordiv, floormod
+from tinygrad.helpers import Target, cdiv, cmod, floordiv, floormod, round_up
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.uop.ops import AxisType, GroupOp, Ops, UOp, UPat, PatternMatcher, graph_rewrite
@@ -227,6 +227,7 @@ _EW_CFG = {
 }
 def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((value&0xffffffff)<<16)|(reg&0xffff)
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
+def _reduction_stride(count:int) -> int: return round_up(count*2, 64)
 def _int32_tiles_bytes(count:int) -> int: return cdiv(count, 4) * 64
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
 def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
@@ -498,16 +499,17 @@ def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
   return RKLoopReduction(store, out, nodes, rows, envs, reduce_range, groups, _strip_cast(updates[0].src[1]), post_scale)
 
 def _spaced_reduction_gathers(src_slot:int, dst_slot:int, rows:int, blocks:list[tuple[int, ...]]|tuple[tuple[int, ...], ...],
-                               stride:int|None=None) -> tuple[RKGather, ...]:
-  stride = _scratch_bytes(rows) if stride is None else stride
+                               stride:int|None=None, fill_bits:int=0) -> tuple[RKGather, ...]:
+  stride = _reduction_stride(rows) if stride is None else stride
   if stride < rows*2 or stride % 2: raise ValueError("invalid reduction stride")
   stride_lanes = stride//2
   if rows != 1:
-    return tuple(RKGather(src_slot, dst_slot, rows, offsets=block, dst_addend=i*stride_lanes) for i,block in enumerate(blocks))
+    return tuple(RKGather(src_slot, dst_slot, rows, offsets=block, fill_bits=fill_bits,
+                          dst_addend=i*stride_lanes) for i,block in enumerate(blocks))
   offsets = tuple(block[0] for block in blocks)
   direct = offsets == tuple(range(len(blocks)))
   return (RKGather(src_slot, dst_slot, len(blocks), axes=((1, len(blocks), 1),) if direct else (),
-                   offsets=() if direct else offsets, dst_stride=stride_lanes),)
+                   offsets=() if direct else offsets, fill_bits=fill_bits, dst_stride=stride_lanes),)
 
 def _static_values(out_index:UOp, expr:UOp, count:int, encode:Callable[[int|float|bool], int]) -> tuple[int, ...]:
   ranges = _index_ranges(out_index)
@@ -1057,7 +1059,7 @@ def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[
                      prepare:Callable[[list[RKEWOp], RKArg, dict[float, int]], None]|None=None) -> RKImage:
   """Materialize row blocks, apply an optional lane transform, reduce them, and write the typed result."""
   const_slots, data_slot = {value:i for i,value in enumerate(constants)}, len(constants)
-  stride = _scratch_bytes(rows)
+  stride = _reduction_stride(rows)
   gathers = _spaced_reduction_gathers(source_slot, data_slot, rows, blocks, stride)
   def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, data_slot, offset)
   ops:list[RKEWOp] = []
@@ -1072,8 +1074,48 @@ def _reduction_image(out_slot:int, rows:int, source_slot:int, blocks:list[tuple[
   scratch = tuple(RKScratch(rows*2) for _ in constants) + (RKScratch(len(blocks)*stride),)
   return RKImage(RKTarget.RK3588, scratch, b"".join(struct.pack("<e", value) for value in constants), gathers=gathers, ew_ops=tuple(ops))
 
+def _int16_extrema_image(out_slot:int, rows:int, source_slot:int, blocks:tuple[tuple[int, ...], ...], minimum:bool) -> RKImage:
+  """Materialize signed INT16 candidates and reduce them with native MIN/MAX."""
+  stride = _reduction_stride(rows)
+  def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, 0, offset)
+  ops:list[RKEWOp] = []
+  _reduce_arena(ops, [i*stride for i in range(len(blocks))], rows, _EW_CFG_MIN if minimum else _EW_CFG[Ops.MAX], arena,
+                RKArg(RKBufferKind.ARG, out_slot), int16=True)
+  identity = _int16_bits(32767 if minimum else -32768)
+  return RKImage(RKTarget.RK3588, (RKScratch(len(blocks)*stride),),
+                 gathers=_spaced_reduction_gathers(source_slot, 0, rows, blocks, stride, identity), ew_ops=tuple(ops))
+
+def _int16_cumulative_candidate(expr:UOp, minimum:bool) -> UOp|None:
+  """Recover one prefix-scan load from Tinygrad's native MAX or complemented-MAX form."""
+  if not minimum: return expr if expr.op is Ops.LOAD else None
+  if (candidate:=_int16_nonconst(expr, -1)) is not None: return candidate if candidate.op is Ops.LOAD else None
+  if expr.op is not Ops.WHERE or not _int16_const(expr.src[1], -32768) or expr.src[2].op is not Ops.WHERE: return None
+  nested = expr.src[2]
+  if nested.src[0].key != expr.src[0].key or not _int16_const(nested.src[1], 0): return None
+  candidate = _int16_nonconst(nested.src[2], -1)
+  return candidate if candidate is not None and candidate.op is Ops.LOAD else None
+
+def _lower_unrolled_int16_cumulative_extrema(uops:list[UOp]) -> RKImage|None:
+  """Lower a fully unrolled one-dimensional signed INT16 prefix MIN/MAX."""
+  if (output:=_output_store(uops, dtypes.int16)) is None: return None
+  _, out_param, count, out_index, root = output
+  minimum = (maximum:=_int16_nonconst(root, -1)) is not None
+  maximum = maximum if minimum else root
+  if maximum is None or maximum.op is not Ops.MAX: return None
+  candidates = tuple(_int16_cumulative_candidate(expr, minimum) for expr in _flatten_binary(maximum, Ops.MAX))
+  if any(candidate is None for candidate in candidates): return None
+  loads = tuple(candidate for candidate in candidates if candidate is not None)
+  params = {_root_param(load.src[0]) for load in loads if load.src and load.src[0].op is Ops.INDEX}
+  if len(params) != 1 or (source:=next(iter(params))) is None or source.src[0].op is not Ops.CONST or int(source.src[0].arg) != count:
+    return None
+  try: blocks = tuple(_gather_offsets(out_index, load.src[0].src[1], load.src[2] if len(load.src) == 3 else None, count) for load in loads)
+  except RuntimeError: return None
+  if len(blocks) != count or any(sorted(offset for block in blocks if (offset:=block[dst]) >= 0) != list(range(dst+1))
+                                 for dst in range(count)): return None
+  return _int16_extrema_image(out_param.arg.slot, count, source.arg.slot, blocks, minimum)
+
 def _lower_int16_loop_extrema(uops:list[UOp]) -> RKImage|None:
-  """Lower a native signed INT16 MAX/MIN accumulator loop into a balanced DPU EW reduction."""
+  """Lower signed INT16 scalar or one-dimensional cumulative extrema loops."""
   if (output:=_output_store(uops, dtypes.int16, allow_local=True)) is None: return None
   store, out_param, _, _, root = output
   if (shape:=_loop_reduction_shape(store, out_param, uops)) is None: return None
@@ -1089,28 +1131,29 @@ def _lower_int16_loop_extrema(uops:list[UOp]) -> RKImage|None:
   minimum = _local_load(root) is None
   final_value = _int16_nonconst(root, -1) if minimum else root
   if final_value is None or _local_load(final_value) is None: return None
-  cfg = _EW_CFG_MIN if minimum else _EW_CFG[Ops.MAX]
   if update.op is not Ops.MAX: return None
   accumulator = next((x for x in update.src if _local_load(x) is not None), None)
   term = next((x for x in update.src if _local_load(x) is None), None)
   if accumulator is None or term is None: return None
-  if minimum and (term:=_int16_nonconst(term, -1)) is None: return None
-  if term.op is not Ops.LOAD or term.dtype.scalar() is not dtypes.int16 or not term.src or term.src[0].op is not Ops.INDEX: return None
-  source = _root_param(term.src[0])
+  loads = [u for u in term.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int16 and
+           u.src and u.src[0].op is Ops.INDEX and _root_param(u.src[0]) is not None]
+  if len(loads) != 1: return None
+  load = loads[0]
+  if minimum and not any(_int16_nonconst(u, -1) is load for u in term.toposort()): return None
+  source = _root_param(load.src[0])
   if source is None or source.arg.slot == out_param.arg.slot or source.src[0].op is not Ops.CONST: return None
+  def candidate_offset(env:dict[UOp, int], lane:int) -> int:
+    values = {**env, reduce_range:lane}
+    return _eval_int(load.src[0].src[1], values) if len(load.src) < 3 or bool(_eval_expr(load.src[2], values, {})) else -1
   try:
-    blocks = tuple(tuple(_eval_int(term.src[0].src[1], {**env, reduce_range:r}) for env in envs) for r in range(groups))
+    blocks = tuple(tuple(candidate_offset(env, lane) for env in envs) for lane in range(groups))
   except RuntimeError: return None
   input_count = int(source.src[0].arg)
-  if input_count != rows*groups or sorted(offset for block in blocks for offset in block) != list(range(input_count)): return None
-
-  stride = _scratch_bytes(rows)
-  def arena(offset:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, 0, offset)
-  ops:list[RKEWOp] = []
-  _reduce_arena(ops, [i*stride for i in range(groups)], rows, cfg, arena,
-                RKArg(RKBufferKind.ARG, out_param.arg.slot), int16=True)
-  return RKImage(RKTarget.RK3588, (RKScratch(groups*stride),),
-                 gathers=_spaced_reduction_gathers(source.arg.slot, 0, rows, blocks, stride), ew_ops=tuple(ops))
+  scalar = input_count == rows*groups and sorted(offset for block in blocks for offset in block if offset >= 0) == list(range(input_count))
+  cumulative = input_count == rows == groups and all(sorted(value for block in blocks if (value:=block[dst]) >= 0) == list(range(dst+1))
+                                                    for dst in range(rows))
+  if not scalar and not cumulative: return None
+  return _int16_extrema_image(out_param.arg.slot, rows, source.arg.slot, blocks, minimum)
 
 def _lower_raw_int32_layout(output:RKOutput) -> RKImage|None:
   """Move an INT32 tensor through a static view or shrink without interpreting its values."""
@@ -4556,6 +4599,7 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
                  gathers=tuple(gathers), ew_ops=tuple(ew_ops), post_gathers=post)
 
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (int16_cumulative:=_lower_unrolled_int16_cumulative_extrema(uops)) is not None: return int16_cumulative
   if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew
   if (int16_extrema:=_lower_int16_loop_extrema(uops)) is not None: return int16_extrema
   if (float_output:=_output_store(uops, dtypes.float)) is not None and \

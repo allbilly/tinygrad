@@ -1002,6 +1002,12 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self._check(values.max(1), lambda x:x.max(1), values, expected_tasks=256)
     self._check(values.min(1), lambda x:x.min(1), values, expected_tasks=256)
 
+  def test_cumulative_extrema(self):
+    for count in (17, 257):
+      values = (np.arange(count, dtype=np.uint32)*7919).astype(np.uint16).view(np.int16)
+      self._check(np.maximum.accumulate(values), lambda x:x.cummax(0)[0], values, expected_tasks=count-1)
+      self._check(np.minimum.accumulate(values), lambda x:x.cummin(0)[0], values, expected_tasks=count-1)
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDotOps(unittest.TestCase):
   """FP16 dot, batched dot, and matvec compositions lowered through DPU EW."""
