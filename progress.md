@@ -3292,3 +3292,28 @@ intended payoff from productizing INT16 as an RKImage/runtime precision rather t
 The CPU-cheat audit found no implementation change at all in this milestone. The tested path retains DPU-native INT16
 byte equality, validity masks, raw FP16 selection, and reduction with opaque runtime movement only. There is no CPU
 index evaluation, LUT, CMAC, tolerance change, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — mixed list/tensor fancy indexing
+
+The four forward expressions from upstream `test_slice_fancy_indexing_list_with_tensors` are now independent Rockchip
+methods. They cover one tensor wrapped in a Python index list, a tensor plus a collapsed scalar, a tensor plus a static
+tuple index, and five broadcast tensor indices.
+
+Three forms already passed. Tinygrad materializes the apparent static tuple `(1,1)` as a second external INT32 buffer,
+so the fourth form exposed a real matcher gap: multi-index lowering accepted only negative-normalized axes. The matcher
+now also accepts a direct positive-only INT32 load when the complete gate proves canonical nonnegative and strict upper
+bounds. It still requires every data-index and gate load to be uniquely accounted for. Positive-only axes omit the
+negative-coordinate alternative; normalized axes keep it.
+
+- Mixed list/tensor group: **4/4 passed individually**, from **11.73 s** to **12.25 s** pytest time.
+- The full five-negative-normalized-axis regression also passed after the matcher generalization.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. Rockchip collection: **428 tests**.
+- `sz.py`: renderer/runtime **3,693/307 executable lines**, total **29,055**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The second external INT32 buffer is never inspected on
+host: runtime gathers its opaque bytes and native INT16 DPU EW performs exact four-byte equality, axis conjunction,
+selection, and reduction. There is no host tuple/index evaluation, LUT, CMAC, tolerance change, or floating input
+wider than FP16.

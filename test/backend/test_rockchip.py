@@ -648,6 +648,22 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
     _,b,_,d,e,_,j,_,o,p = self._get_index_randoms()
     _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,None,b,None,d,e], lambda x:x[None,None,j,None,o,p])
 
+  def test_slice_fancy_indexing_list_with_tensor(self):
+    a,_,_,_,_,i,_,_,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(a,)], lambda x:x[(i,)])
+
+  def test_slice_fancy_indexing_list_with_tensor_and_scalar(self):
+    a,_,_,_,_,i,_,_,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(a,1)], lambda x:x[(i,1)])
+
+  def test_slice_fancy_indexing_list_with_tensor_and_tuple(self):
+    a,_,_,_,_,i,_,_,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(a,(1,1))], lambda x:x[(i,(1,1))])
+
+  def test_slice_fancy_indexing_list_with_tensors(self):
+    a,b,c,d,e,i,j,k,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(a,b,c,d,e)], lambda x:x[(i,j,k,o,p)])
+
   def test_fancy_indexing_negative_nonfinite_bits(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
     indices = np.array([-1, -2, -3], dtype=np.int32)

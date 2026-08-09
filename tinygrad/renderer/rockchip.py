@@ -2756,22 +2756,34 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
 def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
-  """Lower a bounded FP16 load addressed by one or more negative-normalized INT32 tensors."""
+  """Lower a bounded FP16 load addressed by positive-only or negative-normalized INT32 tensors."""
   _, out_param, count, out_index, load = output
   if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 3 or
       load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0): return None
   data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
   normalized = tuple((u, *parsed) for u in data_index.toposort() if (parsed:=_negative_normalized_index(u)) is not None)
-  loads = tuple(load for _,load,_ in normalized)
+  normalized_by_load = {load.key:(root, extent) for root,load,extent in normalized}
+  if len(normalized_by_load) != len(normalized): return None
+  loads = tuple({u.key:u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
+  axes:list[tuple[UOp, UOp, int, bool]] = []
+  for dynamic in loads:
+    if dynamic.key in normalized_by_load:
+      root, extent = normalized_by_load[dynamic.key]; wrapped = True
+    else:
+      limits = {int(u.src[1].arg) for u in gate.toposort() if u.op is Ops.CMPLT and u.src[0].key == dynamic.key and
+                u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0}
+      if len(limits) != 1: return None
+      root, extent, wrapped = dynamic, next(iter(limits)), False
+    if not _bounded_index_gate(gate, root, extent): return None
+    axes.append((root, dynamic, extent, wrapped))
   if (data_param is None or data_param.dtype.scalar() is not dtypes.half or data_param.src[0].op is not Ops.CONST or
-      not normalized or len({load.key for load in loads}) != len(loads) or
-      {u.key for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int} != {u.key for u in loads} or
+      not axes or len({load.key for load in loads}) != len(loads) or
       {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {u.key for u in loads} or
-      any(not _bounded_index_gate(gate, root, extent) for root,_,extent in normalized)): return None
+      any(root.key not in {u.key for u in data_index.toposort()} for root,_,_,_ in axes)): return None
   params = tuple(_root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None for load in loads)
   if any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params): return None
   concrete = tuple(param for param in params if param is not None)
-  options = tuple(tuple(range(extent)) for _,_,extent in normalized)
+  options = tuple(tuple(range(extent)) for _,_,extent,_ in axes)
   combinations:tuple[tuple[int, ...], ...] = ((),)
   for axis in options:
     combinations = tuple(prefix+(value,) for prefix in combinations for value in axis)
@@ -2788,7 +2800,8 @@ def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   indices = tuple((param.arg.slot, index_count, axis_offsets)
                   for param,index_count,axis_offsets in zip(concrete, index_counts, offsets))
   coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(loads)))
-  alternates = tuple((tuple(value-extent for value in axis),) for axis,(_,_,extent) in zip(coordinates, normalized))
+  alternates = tuple((tuple(value-extent for value in axis),) if wrapped else ()
+                     for axis,(_,_,extent,wrapped) in zip(coordinates, axes))
   return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
 def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
