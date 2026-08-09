@@ -492,7 +492,7 @@ class TestRockchipGatherOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipFancyIndexOps(unittest.TestCase):
-  """Single dynamic INT32 fancy index with exact negative normalization and FP16 bits."""
+  """Dynamic INT32 fancy indices with exact negative normalization and FP16 bits."""
 
   @classmethod
   def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
@@ -501,12 +501,20 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_fancy_indexing_inf = _test_ops.TestOps.test_fancy_indexing_inf
+  test_slice_fancy_indexing_with_tensors = _test_ops.TestOps.test_slice_fancy_indexing_with_tensors
 
   def test_fancy_indexing_negative_nonfinite_bits(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
     indices = np.array([-1, -2, -3], dtype=np.int32)
     got = Tensor(source, device="ROCKCHIP")[Tensor(indices, device="ROCKCHIP")].realize().numpy()
     np.testing.assert_array_equal(got.view(np.uint16), source[::-1].view(np.uint16))
+
+  def test_multi_fancy_indexing_negative_nonfinite_bits(self):
+    source = np.array([[math.inf, -math.inf, math.nan], [1.0, -0.0, 0.0]], dtype=np.float16)
+    rows = Tensor(np.array([[0, 0, 0], [-1, -1, -1]], dtype=np.int32), device="ROCKCHIP")
+    columns = Tensor(np.array([-3, -2, -1], dtype=np.int32), device="ROCKCHIP")
+    got = Tensor(source, device="ROCKCHIP")[rows, columns].realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), source.view(np.uint16))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(unittest.TestCase):

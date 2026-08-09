@@ -2805,3 +2805,42 @@ static source addresses; raw runtime indices are never read, normalized, compare
 All dynamic normalization equivalence, equality, byte selection, and reconstruction execute through DPU EW. There is
 no NumPy evaluator, host gather, LUT, CMAC, CNA, PPU fallback, tolerance beyond the established FP16 test tolerance, or
 floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact multi-index FP16 fancy indexing
+
+The unchanged upstream `TestOps.test_slice_fancy_indexing_with_tensors` now passes all four two-axis broadcast forms,
+including its signed case with independent negative indices on both axes. A direct representation regression selects
+`+inf`, `-inf`, NaN, `1.0`, `-0.0`, and `+0.0` through two dynamic INT32 index tensors and verifies every FP16 bit.
+
+Tinygrad expresses each dynamic axis as `WHERE(index < 0, index + extent, index)` and combines the normalized values in
+one bounds-masked source address. The matcher proves every normalized root, its canonical lower/upper gate, the static
+input sizes and broadcast maps, and the complete candidate-substituted source address. It enumerates only compile-time
+coordinate tuples; runtime index values remain opaque. The shared equality fragment now emits one exact four-byte DPU
+mask per dynamic axis and conjoins those masks on DPU before selecting the two raw FP16 source bytes.
+
+Generalizing the image exposed one stale constant: the mid-gather split was fixed at six operations, exactly the four
+byte conversions plus two source-byte conversions needed by one index. With two indices it ran before all eight index
+byte conversions completed. The split is now derived as `len(equality.pre_ops) + len(raw_value)`, so it follows the
+actual number of dynamic axes instead of encoding the single-index layout.
+
+Historical commit `f62827791` handled broad fancy indexing through a typed NumPy evaluator that read and normalized
+dynamic indices on the host. That implementation remains unported. The current runtime only moves raw bytes using
+compile-time-proved maps; all dynamic byte conversion, equality, multi-axis conjunction, selection, reduction, and
+numeric conversion execute through DPU EW. The local RKNN references still expose no verified native DPU Gather/fancy
+index instruction.
+
+- Complete fancy-index class: **4 passed in 24.60 s**, sequentially.
+- Shared OneHot, Gather, and fancy-index regression: **9 passed in 52.75 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **377 passed, 10 skipped, 180 subtests passed in
+  501.56 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before the complete census and after the final
+  candidate-budget guard.
+- Repository-wide Ruff and Tinygrad mypy: pass. `git diff --check`: pass. `sz.py`: renderer/runtime **2,621/281
+  executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Host evaluation rejects `PARAM` values and substitutes
+only compile-time candidates to derive and validate static addresses. Runtime gathers preserve opaque 1/2/4-byte
+representations and never interpret an index or floating value. There is no host fancy indexing, dynamic NumPy
+evaluation, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than FP16.
