@@ -1053,7 +1053,7 @@ class TestRockchipLogicalPredicateOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIntegralRoundingOps(unittest.TestCase):
-  """Native FP16 floor/ceil plus DPU-composed truncation; round-to-even still requires a LUT."""
+  """Native FP16 floor/ceil plus no-LUT DPU compositions for truncation and round-to-even."""
 
   @classmethod
   def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
@@ -1064,6 +1064,10 @@ class TestRockchipIntegralRoundingOps(unittest.TestCase):
   test_floor = _test_ops.TestOps.test_floor
   test_ceil = _test_ops.TestOps.test_ceil
   test_trunc = _test_ops.TestOps.test_trunc
+  test_round = _test_ops.TestOps.test_round
+
+  def test_round_quantization_gradient(self):
+    _fp16_test_op(None, lambda x: x + 0.125*(x.round()-x), vals=[[-1.2,-0.7,-0.2,0.2,0.7,1.2]], forward_only=True)
 
   def test_all_fp16_encodings(self):
     values = np.arange(1 << 16, dtype=np.uint16).view(np.float16)
@@ -1072,6 +1076,13 @@ class TestRockchipIntegralRoundingOps(unittest.TestCase):
       for name in ("floor", "ceil", "trunc"):
         np.testing.assert_equal(getattr(Tensor(values), name)().numpy(), getattr(np, name)(values))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
+
+  def test_round_all_fp16_encodings(self):
+    values = np.arange(1 << 16, dtype=np.uint16).view(np.float16)
+    before = Device["ROCKCHIP"].submit_count
+    with np.errstate(invalid="ignore"):
+      np.testing.assert_equal(Tensor(values).round().numpy(), np.round(values))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 10)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipModuloOps(unittest.TestCase):

@@ -3117,3 +3117,38 @@ buffer bounds, complete index coverage, and last-wins truth tables. It does not 
 Runtime gathers move opaque bytes; dynamic INT32 equality, collision masking, FP16 selection, and output construction
 execute on DPU EW. There is no typed host Scatter, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating
 input wider than FP16.
+
+---
+
+## 2026-08-09 — no-LUT FP16 round-to-even
+
+The complete forward `test_round` group is now in the Rockchip census. Tinygrad's exact round-to-even graph is
+recognized before its TRUNC/FLOOR/CEIL expansion and replaced with a DPU-only composition: native FLOOR obtains the
+integer and fractional parts, native ABS and positive-mask stages detect `fraction > 0.5` and exact ties, the existing
+native FLOOR/CEIL truncation composition determines parity, and DPU MUL/MAX/ADD applies the one-lane increment. This
+avoids the historical ROUNDOFF LUT and the older typed host conversion fallback.
+
+The first generic WHERE lowering passed ordinary ties but mapped infinities to NaN. A first specialized formula based
+on `floor(x+0.5)` fixed nonfinite values but failed 1,025 FP16 encodings because the `+0.5` itself rounded before FLOOR,
+including odd integers above 1,024. Computing `floor(x) + increment` from the fractional part instead is value-exact
+over all 65,536 FP16 encodings. It preserves infinity signs and NaN locations; like the upstream value-level contract,
+it does not promise raw NaN payloads or the sign bit of results numerically equal to zero.
+
+The independent `~/rk3588/examples/elementwise_int.py` reference was also translated from its Rocket wrapper to this
+machine's RKNPU ioctl ABI in a temporary probe. FP16 comparison to INT16 and INT16 ADD to INT32 both passed exactly.
+Those modes were not added to the backend because a conservative implementation must retain the existing exact
+byte/digit path for indices above signed INT16 range, so it would currently add machinery rather than remove it.
+
+- Upstream `test_round`: **1 passed in 5.77 s**; adapted forward-only quantization expression: **1 passed in 3.59 s**.
+- Exhaustive round regression: **all 65,536 FP16 encodings passed numerically**, **10 submit ioctls**, about **1.41 s**
+  operator wall time and **4.10 s** under isolated pytest.
+- Complete integral-rounding class: **7 passed in 7.20 s**, sequentially.
+- Representative 45x35 round: input realization 96 ms, graph construction 1 ms, scheduling 44 ms, rendering 114 ms,
+  DPU execution 642 ms, and copyout 3 ms; **7 submit ioctls**, 900 ms total.
+- Rockchip collection is **400 tests**. Repository-wide Tinygrad mypy, Ruff, and `git diff --check` pass. `sz.py`:
+  renderer/runtime **3,365/281 executable lines**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete focused run.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The renderer only matches static IR structure and emits
+DPU EW stages; it never reads or numerically evaluates a tensor buffer. There is no LUT, CMAC, CNA, PPU fallback,
+typed host rounding, tolerance relaxation, or floating input wider than FP16.

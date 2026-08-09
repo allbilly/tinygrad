@@ -3496,6 +3496,7 @@ def _fold_copysign(x:UOp) -> UOp|None:
 
 def _fold_floor_ceil(x:UOp) -> UOp|None:
   """Recognize Tinygrad's TRUNC-based floor/ceil expansions and select the native DPU ALU."""
+  if x.op is not Ops.WHERE or len(x.src) != 3: return None
   condition, adjusted, truncated = x.src
   if (truncated.op is not Ops.TRUNC or len(truncated.src) != 1 or condition.op is not Ops.CMPLT or adjusted.op is not Ops.ADD or
       truncated not in adjusted.src): return None
@@ -3514,6 +3515,40 @@ def _fold_trunc(x:UOp) -> UOp:
   floor = UOp(Ops.MAX, x.dtype, src=(positive, positive), arg=_NATIVE_FLOOR)
   ceil = UOp(Ops.MAX, x.dtype, src=(negative, negative), arg=_NATIVE_CEIL)
   return floor.alu(Ops.ADD, ceil)
+
+def _fold_round(x:UOp) -> UOp|None:
+  """Recognize Tinygrad's round-to-even graph and compose it from native FLOOR/TRUNC and DPU masks."""
+  if x.op is not Ops.WHERE or len(x.src) != 3: return None
+  gate, yes, no = x.src
+  floor, ceil = _fold_floor_ceil(yes), _fold_floor_ceil(no)
+  if floor is None or ceil is None or floor.arg != _NATIVE_FLOOR or ceil.arg != _NATIVE_CEIL or gate.op is not Ops.CMPNE: return None
+  floor_shift, ceil_shift = _const_operand(floor.src[0], Ops.ADD, 0.5), _const_operand(ceil.src[0], Ops.ADD, -0.5)
+  source, ceil_source = (None, None) if floor_shift is None or ceil_shift is None else (floor_shift[0], ceil_shift[0])
+  if source is None or ceil_source is None or source.key != ceil_source.key: return None
+  positive = next((u for u in gate.src if u.op is Ops.CMPLT and u.src[1].key == source.key and
+                   u.src[0].op is Ops.CONST and float(u.src[0].arg) == 0.0), None)
+  parity = next((u for u in gate.src if u is not positive), None)
+  if positive is None or parity is None or parity.op is not Ops.CMPNE: return None
+  unequal = next((u for u in parity.src if u.op is Ops.CMPNE), None)
+  truth = next((u for u in parity.src if u.op is Ops.CONST and u.dtype.scalar() is dtypes.bool), None)
+  if unequal is None or truth is None or not bool(truth.arg): return None
+  truncated_half = next((u for u in unequal.src if u.op is Ops.TRUNC), None)
+  half_value = next((u for u in unequal.src if u is not truncated_half), None)
+  truncated = next((u for u in half_value.src if u.op is Ops.TRUNC), None) if half_value is not None and half_value.op is Ops.MUL else None
+  scale = next((u for u in half_value.src if u.op is Ops.CONST), None) if half_value is not None and half_value.op is Ops.MUL else None
+  if (truncated_half is None or half_value is None or truncated_half.src != (half_value,) or truncated is None or
+      truncated.src != (source,) or scale is None or float(scale.arg) != 0.5): return None
+  one, half = (UOp.const(v, dtypes.half) for v in (1.0, 0.5))
+  def native(value:UOp, tag:str) -> UOp: return UOp(Ops.MAX, dtypes.half, src=(value, value), arg=tag)
+  source_floor = native(source, _NATIVE_FLOOR)
+  tie_delta = source.alu(Ops.SUB, source_floor).alu(Ops.SUB, half)
+  tie = one.alu(Ops.SUB, _positive_mask(native(tie_delta, _NATIVE_ABS)))
+  greater = _positive_mask(tie_delta)
+  floor_half = source_floor.alu(Ops.MUL, half)
+  parity_delta = floor_half.alu(Ops.SUB, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=(floor_half,))))
+  odd = _positive_mask(native(parity_delta, _NATIVE_ABS))
+  increment = greater.alu(Ops.MAX, _mask_mul(tie, odd))
+  return source_floor.alu(Ops.ADD, increment)
 
 def _fold_sign(x:UOp) -> UOp|None:
   """Recognize WHERE(x!=0, WHERE(x<0, -1, 1), 0) before general WHERE lowering."""
@@ -3619,11 +3654,13 @@ _pm_fp32_to_fp16 = PatternMatcher([
   (UPat(Ops.WHERE, dtypes.half, name="x"), _fold_general_where),
 ])
 _pm_abs = PatternMatcher([(UPat(Ops.MUL, dtypes.half, name="x"), _fold_abs)])
+_pm_round = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_round)])
 _pm_floor_ceil = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_floor_ceil)])
 _pm_trunc = PatternMatcher([(UPat(Ops.TRUNC, dtypes.half, name="x"), _fold_trunc)])
 _pm_sign = PatternMatcher([(UPat(Ops.WHERE, dtypes.half, name="x"), _fold_sign)])
 def _fp16_rewrite(uops:list[UOp]) -> list[UOp]:
   sink = next(u for u in uops if u.op is Ops.SINK)
+  sink = graph_rewrite(sink, _pm_round, name="rockchip round")
   sink = graph_rewrite(sink, _pm_floor_ceil, name="rockchip floor/ceil")
   sink = graph_rewrite(sink, _pm_trunc, name="rockchip trunc")
   sink = graph_rewrite(sink, _pm_abs, name="rockchip abs")
