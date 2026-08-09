@@ -491,6 +491,24 @@ class TestRockchipGatherOps(unittest.TestCase):
     np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipFancyIndexOps(unittest.TestCase):
+  """Single dynamic INT32 fancy index with exact negative normalization and FP16 bits."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_fancy_indexing_inf = _test_ops.TestOps.test_fancy_indexing_inf
+
+  def test_fancy_indexing_negative_nonfinite_bits(self):
+    source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
+    indices = np.array([-1, -2, -3], dtype=np.int32)
+    got = Tensor(source, device="ROCKCHIP")[Tensor(indices, device="ROCKCHIP")].realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), source[::-1].view(np.uint16))
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(unittest.TestCase):
   """FP16 scatter with compile-time-static indices; dynamic scatter indices remain unsupported."""
 

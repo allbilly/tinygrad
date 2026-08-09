@@ -330,6 +330,7 @@ def _eval_expr(u:UOp, env:dict[UOp, int], cache:dict[UOp, int|float|bool]) -> in
   if u in cache: return cache[u]
   if u.op is Ops.CONST: ret = _eval_cast(u.arg, u.dtype)
   elif u.op is Ops.RANGE: ret = env[u]
+  elif u.op is Ops.PARAM: raise RuntimeError("RKPLAN_REJECT:dynamic_static_expr")
   elif u.op is Ops.CAST: ret = _eval_cast(_eval_expr(u.src[0], env, cache), u.dtype)
   elif u.op is Ops.WHERE:
     ret = _eval_cast(_eval_expr(u.src[1] if _eval_expr(u.src[0], env, cache) else u.src[2], env, cache), u.dtype)
@@ -366,6 +367,7 @@ def _eval_vector(u:UOp, env:dict[UOp, np.ndarray], cache:dict[UOp, np.ndarray]) 
   if u in cache: return cache[u]
   if u.op is Ops.CONST: ret = _vector_cast(u.arg, u.dtype)
   elif u.op is Ops.RANGE: ret = env[u]
+  elif u.op is Ops.PARAM: raise RuntimeError("RKPLAN_REJECT:dynamic_static_expr")
   elif u.op is Ops.CAST: ret = _vector_cast(_eval_vector(u.src[0], env, cache), u.dtype)
   elif u.op is Ops.WHERE:
     ret = _vector_cast(np.where(_eval_vector(u.src[0], env, cache), _eval_vector(u.src[1], env, cache),
@@ -1652,9 +1654,10 @@ def _max_unpool_image(out_slot:int, count:int, out_spatial:int, source_count:int
                  mid_gathers=mid_gathers, gather_after=1)
 
 def _dynamic_fp16_gather_image(out_slot:int, count:int, index_slot:int, index_count:int, index_offsets:tuple[int, ...],
-                               plans:tuple[RKGather, ...]) -> RKImage|None:
+                               plans:tuple[RKGather, ...], coordinates:tuple[int, ...]) -> RKImage|None:
   """Select raw FP16 representations with exact byte-wise dynamic INT32 equality."""
-  coordinate_rows = tuple((candidate,)*count for candidate in range(len(plans)))
+  if len(coordinates) != len(plans): return None
+  coordinate_rows = tuple((candidate,)*count for candidate in coordinates)
   if (equality:=_int32_equality_matrix(index_slot, index_count, index_offsets, count, coordinate_rows)) is None: return None
   rows, matrix_lanes = len(plans), equality.matrix_lanes
   raw_value = (23, 24); half_value = (25, 26)
@@ -1706,25 +1709,35 @@ def _lower_dynamic_fp16_gather(output:RKOutput) -> RKImage|None:
   if (index_param is None or index_param.dtype.scalar() is not dtypes.int or index_param.src[0].op is not Ops.CONST or
       {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {index_load.key} or gate.op is not Ops.AND): return None
 
-  def nonnegative(u:UOp) -> bool:
+  def nonnegative(u:UOp, bounded:UOp) -> bool:
     if u.op is not Ops.CMPNE: return False
     for comparison,marker in (u.src, u.src[::-1]):
       if (marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and
-          comparison.op is Ops.CMPLT and comparison.src[0].key == index_load.key and
+          comparison.op is Ops.CMPLT and comparison.src[0].key == bounded.key and
           comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg) == 0): return True
     return False
-  uppers = [u for u in gate.src if u.op is Ops.CMPLT and u.src[0].key == index_load.key and u.src[1].op is Ops.CONST]
-  lowers = [u for u in gate.src if nonnegative(u)]
+  bounded = data_index if data_index.op is Ops.WHERE else index_load
+  uppers = [u for u in gate.src if u.op is Ops.CMPLT and u.src[0].key == bounded.key and u.src[1].op is Ops.CONST]
+  lowers = [u for u in gate.src if nonnegative(u, bounded)]
   if len(uppers) != 1 or len(lowers) != 1 or (limit:=int(uppers[0].src[1].arg)) <= 0: return None
+  coordinates = tuple(range(limit))
+  if bounded is not index_load:
+    if (bounded.op is not Ops.WHERE or bounded.src[0].op is not Ops.CMPLT or bounded.src[0].src[0].key != index_load.key or
+        bounded.src[0].src[1].op is not Ops.CONST or int(bounded.src[0].src[1].arg) != 0 or bounded.src[2].key != index_load.key or
+        bounded.src[1].op is not Ops.ADD): return None
+    additions = [x for x in bounded.src[1].src if x.key == index_load.key]
+    constants = [x for x in bounded.src[1].src if x.op is Ops.CONST and int(x.arg) == limit]
+    if len(additions) != 1 or len(constants) != 1: return None
+    coordinates += tuple(range(-limit, 0))
   try:
     index_offsets = _gather_offsets(out_index, index_load.src[0].src[1], None, count)
     plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index,
-      data_index.substitute({index_load:index_load.const_like(candidate)}), None, count) for candidate in range(limit))
+      data_index.substitute({index_load:index_load.const_like(candidate)}), None, count) for candidate in coordinates)
   except RuntimeError: return None
   data_count, index_count = int(data_param.src[0].arg), int(index_param.src[0].arg)
   if (any(not 0 <= offset < index_count for offset in index_offsets) or
       any(not 0 <= offset < data_count for plan in plans for offset in _plan_offsets(plan))): return None
-  return _dynamic_fp16_gather_image(out_param.arg.slot, count, index_param.arg.slot, index_count, index_offsets, plans)
+  return _dynamic_fp16_gather_image(out_param.arg.slot, count, index_param.arg.slot, index_count, index_offsets, plans, coordinates)
 
 def _affine_load_offset(root:UOp, load:UOp) -> int|None:
   """Return the constant in an integer `load + constant` expression."""

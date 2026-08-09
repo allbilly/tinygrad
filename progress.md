@@ -2772,3 +2772,36 @@ new typed fragment record; roughly sixty formerly duplicated construction lines 
 
 The refactor adds no tensor-value access, runtime operation, tolerance change, LUT, CMAC, or fallback. Exact dynamic
 comparison remains DPU EW work and host code remains limited to compile-time geometry plus raw representation movement.
+
+---
+
+## 2026-08-09 — exact negative single-index fancy indexing
+
+The upstream `TestOps.test_fancy_indexing_inf` and a direct negative-index regression now pass bit-exactly. The direct
+case selects `[-1, -2, -3]` from `[+inf, -inf, NaN]`, proving both Tinygrad's negative-index normalization and raw
+non-finite representation preservation.
+
+Tinygrad expresses a single fancy index as `WHERE(index < 0, index + extent, index)` inside the bounds-masked source
+address. The dynamic-gather matcher now recognizes only that exact normalization. It emits two compile-time coordinate
+spellings for every bounded source candidate: `0..extent-1` and `-extent..-1`. Each spelling maps to the same statically
+proved source address after candidate substitution, while the shared four-byte DPU equality fragment decides which
+runtime spelling matches. Invalid indices match no row and retain the masked-load zero default. No dynamic value is
+normalized or bounds-checked on the host.
+
+Historical commit `f62827791` covered broad fancy indexing by executing negative-index preprocessing and multi-index
+masked reductions in a typed NumPy evaluator. That CPU implementation remains intentionally unported. This milestone
+admits only one dynamic INT32 index and uses the DPU/raw-byte path proven by Gather; multi-index broadcasting and fused
+candidate reductions remain separate future work.
+
+- Upstream infinity and exact negative-index regression: **2 passed in 6.04 s**, sequentially.
+- Complete OneHot, Gather, and single-index fancy-index regression: **7 passed in 34.28 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **375 passed, 10 skipped, 180 subtests passed in
+  482.85 s** pytest time / **510.13 s** process wall time, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,563/281 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The host substitutes candidate constants only to prove
+static source addresses; raw runtime indices are never read, normalized, compared, or used to choose a source on CPU.
+All dynamic normalization equivalence, equality, byte selection, and reconstruction execute through DPU EW. There is
+no NumPy evaluator, host gather, LUT, CMAC, CNA, PPU fallback, tolerance beyond the established FP16 test tolerance, or
+floating input wider than FP16.
