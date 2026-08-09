@@ -3819,3 +3819,32 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time valid
 with native extrema UOps. Every input-dependent sign result is computed by two DPU INT16 EW tasks; runtime only submits
 the existing image. There is no host classification, comparison, or selection, no NumPy tensor evaluation, LUT, CMAC,
 tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — native INT16 ReLU6 and hardtanh on DPU
+
+INT16 ReLU6 and hardtanh now have explicit two-task contracts. Hardtanh naturally reuses the canonical clamp recovery.
+Tinygrad expands ReLU6 as `relu(x)-relu(x-6)`, so the shared hard-activation pre-pass recognizes that exact graph before
+the inner WHERE nodes expand and replaces it with `min(max(x,0),6)`.
+
+Historical commit `6d6751002` provides the analogous FP16 cap fold and was used as the structural reference. The INT16
+path deliberately does not reuse FP16 ReLUX configuration: `~/rk3588/examples/elementwise_int.py` proves integer MIN/MAX,
+which are sufficient and keep the typed pipeline within known hardware behavior. The sign and ReLU6 rules share one
+dedicated pre-pass, matching the staged rewrite organization used by the existing FP16 backend.
+
+Non-integral leaky-ReLU slopes promote an INT16 tensor to a weak floating output and are outside this backend's external
+FP16-only floating contract. Integral slopes retain INT16 and remain a separate bounded follow-on group.
+
+- Full-range ReLU6 and custom `hardtanh(-3,4)` pass exactly, each as **2 tasks / 1 ioctl**; their combined call is
+  **0.15 s** after startup.
+- With renderer caching disabled, the complete native INT16 class passes **18/18 in 3.42 s**. No case approaches 30 s.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused and class runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **472 tests**.
+- `sz.py`: renderer/runtime **4,684/327 executable lines**, total **30,066**. The bounded ReLU6 recognizer adds fifteen
+  renderer lines and no runtime lines.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only recognizes the exact hard-activation
+graph and emits native extrema UOps. All bounds and activations execute on DPU INT16 EW. There is no host clipping,
+comparison, or selection, no NumPy tensor evaluation, FP16 ReLUX assumption, LUT, CMAC, tolerance relaxation, or
+floating input wider than FP16.

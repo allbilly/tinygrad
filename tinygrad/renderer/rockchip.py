@@ -4312,6 +4312,21 @@ def _fold_native_int16_sign(x:UOp) -> UOp|None:
   lower = candidate.alu(Ops.MAX, UOp.const(-1, dtypes.int16))
   return UOp(Ops.MAX, x.dtype, src=(lower, UOp.const(1, dtypes.int16)), arg=_NATIVE_MIN)
 
+def _int16_relu_operand(x:UOp) -> UOp|None:
+  if x.op is not Ops.WHERE or x.src[0].op is not Ops.CMPLT or not _int16_const(x.src[2], 0): return None
+  lhs, rhs = x.src[0].src
+  return rhs if _int16_const(lhs, 0) and x.src[1].key == rhs.key else None
+
+def _fold_native_int16_relu6(x:UOp) -> UOp|None:
+  """Recover relu(x)-relu(x-6) as the exact clamp min(max(x,0),6)."""
+  for positive, negative in (x.src, x.src[::-1]):
+    source, scaled = _int16_relu_operand(positive), _int16_nonconst(negative, -1)
+    if source is None or scaled is None or (shifted:=_int16_relu_operand(scaled)) is None: continue
+    if shifted.op is Ops.ADD and (base:=_int16_nonconst(shifted, -6)) is not None and base.key == source.key:
+      lower = source.alu(Ops.MAX, UOp.const(0, dtypes.int16))
+      return UOp(Ops.MAX, x.dtype, src=(lower, UOp.const(6, dtypes.int16)), arg=_NATIVE_MIN)
+  return None
+
 def _fold_native_int16(x:UOp) -> UOp|None:
   """Recover native integer operations from Tinygrad's portable decompositions."""
   if x.op is Ops.XOR and (maximum:=_int16_nonconst(x, -1)) is not None and maximum.op is Ops.MAX:
@@ -4361,7 +4376,10 @@ def _native_int16_comparison(root:UOp) -> UOp|None:
         if (mask:=_native_int16_comparison(value)) is not None: return UOp.const(1, dtypes.int16).alu(Ops.SUB, mask)
   return None
 
-_pm_native_int16_sign = PatternMatcher([(UPat(Ops.WHERE, dtype=dtypes.int16, name="x"), _fold_native_int16_sign)])
+_pm_native_int16_hard_activation = PatternMatcher([
+  (UPat(Ops.WHERE, dtype=dtypes.int16, name="x"), _fold_native_int16_sign),
+  (UPat(Ops.ADD, dtype=dtypes.int16, name="x"), _fold_native_int16_relu6),
+])
 _pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
 
 def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
@@ -4377,7 +4395,7 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
       output, bool_output = (*output[:4], comparison), True
   _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
-  value = graph_rewrite(value, _pm_native_int16_sign, name="rockchip native int16 sign")
+  value = graph_rewrite(value, _pm_native_int16_hard_activation, name="rockchip native int16 hard activation")
   value = graph_rewrite(value, _pm_native_int16, name="rockchip native int16")
   supported = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.NEG}
   static_cache:dict[UOp, bool] = {}
