@@ -168,13 +168,15 @@ class RockchipProgram(Program['RockchipDevice']):
         bodies.clear()
         body_precision = 0
       if op.ew_cfg & _EW_STAGE_FP32_OUT:
-        if i != len(ops)-1: raise RuntimeError("FP32 EW output must be terminal")
+        if any(not later.ew_cfg & _EW_STAGE_FP32_OUT for later in ops[i+1:]):
+          raise RuntimeError("FP32 EW output must be terminal")
         if bodies: self._submit_pcchain(bodies)
-        stage = emit_ew_stage(op.dst, op.lhs, op.rhs, op.count, op.ew_cfg)
-        self._submit_pcchain([patch_stage(stage, address)])
+        stages = [patch_stage(emit_ew_stage(later.dst, later.lhs, later.rhs, later.count, later.ew_cfg), address)
+                  for later in ops[i:]]
+        self._submit_pcchain(stages)
         self.dev.reset_npu()
         bodies.clear()
-        continue
+        break
       if op.int16_input and op.int32_output:
         if op.int16_output or op.int32_input: raise RuntimeError("conflicting INT16→INT32 EW precision")
         if op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:

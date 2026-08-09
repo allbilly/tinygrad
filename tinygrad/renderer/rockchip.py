@@ -166,6 +166,7 @@ def patch_stage(stage:RKStage, address:Callable[[RKBufferKind, int], int]) -> tu
 
 _DPU, _RDMA = 0x1001, 0x2001
 _MAX_EW_ELEMS_FP16 = 64000  # elementwise.py tile cap
+_EW_ELEMS_32BIT = 8*dtypes.half.itemsize//dtypes.float.itemsize
 _FP16_EXACT_INTEGER = 1 << 11
 _POOL_INDEX_DIGIT_BITS = 4
 _POOL_INDEX_DIGIT_RADIX = 1 << _POOL_INDEX_DIGIT_BITS
@@ -230,38 +231,14 @@ def _int32_tiles_bytes(count:int) -> int: return cdiv(count, 4) * 64
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
 def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
 
-def _emit_fp32_out_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
-  """Emit one terminal scalar stage with FP16 inputs and an FP32 output."""
-  if count != 1: raise ValueError(f"terminal EW fp32 count {count} out of range")
-  regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
-    (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
-    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_FP32_OUT),(_DPU,rk.REG_DPU_DST_SURF_STRIDE,1<<4),
-    (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,0),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
-    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,0),
-    (_DPU,rk.REG_DPU_BS_CFG,_BS_BN_BYPASS),(_DPU,rk.REG_DPU_BN_CFG,_BS_BN_BYPASS),
-    (_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),(_DPU,rk.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR),
-    (_DPU,rk.REG_DPU_WDMA_SIZE_0,0),(_DPU,rk.REG_DPU_WDMA_SIZE_1,0),(_DPU,rk.REG_DPU_BN_MUL_CFG,0),
-    (_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0),(_DPU,rk.REG_DPU_EW_CFG,ew_cfg),
-    (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
-    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,0),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),(_DPU,rk.REG_DPU_SURFACE_ADD,4<<4),
-    (_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,0),
-    (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,0),
-    (_RDMA,rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,(1<<30)|(2<<2)))
-  commands = [_cmd(*x) for x in regs]
-  relocs:list[RKReloc] = []
-  for target, reg, arg in ((_DPU,rk.REG_DPU_DST_BASE_ADDR,dst),(_RDMA,rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,lhs),
-                           (_RDMA,rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,rhs)):
-    relocs.append(RKReloc(len(commands), arg)); commands.append(_cmd(target, reg, 0))
-  commands.append(_cmd(_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, (2<<15)|(15<<11)|(2<<5)|(1<<3)|1))
-  return RKStage(tuple(commands), tuple(relocs))
-
 def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                          int32_output:bool=False, int32_input:bool=False,
-                         int16_output:bool=False, int16_input:bool=False) -> RKStage:
+                         int16_output:bool=False, int16_input:bool=False, fp32_output:bool=False) -> RKStage:
   """Emit a self-contained DPU EW stage, optionally consuming or producing native integers."""
   native_int16, native_int32 = int16_input and int16_output, int32_input and int32_output
   int16_to_int32 = int16_input and int32_output and not int16_output and not int32_input
-  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if native_int32 else 4 if int32_output or int32_input else _MAX_EW_ELEMS_FP16
+  limit = 8 if int16_to_int32 else _MAX_EW_ELEMS_FP16//2 if native_int32 else \
+          _EW_ELEMS_32BIT if int32_output or int32_input or fp32_output else _MAX_EW_ELEMS_FP16
   if not 0 < count <= limit:
     raise ValueError(f"stateful EW count {count} out of range")
   lanes = 4 if int32_input else 8
@@ -269,26 +246,30 @@ def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int,
   width = (count + lanes-1) // lanes - 1
   pipeline:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_BS_CFG,_BS_BN_BYPASS),(_DPU,rk.REG_DPU_BN_CFG,_BS_BN_BYPASS),
     (_DPU,rk.REG_DPU_BS_ALU_CFG,0),(_DPU,rk.REG_DPU_BS_MUL_CFG,0),
-    (_DPU,rk.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 else 2),
-    (_DPU,rk.REG_DPU_WDMA_SIZE_0,lanes-1),(_DPU,rk.REG_DPU_WDMA_SIZE_1,width),(_DPU,rk.REG_DPU_BN_MUL_CFG,0),
+    (_DPU,rk.REG_DPU_BS_OW_CFG,_BS_OW_FP32_SCALAR if int16_to_int32 or fp32_output and count == 1 else 2),
+    (_DPU,rk.REG_DPU_WDMA_SIZE_0,0 if fp32_output and count == 1 else 3 if fp32_output else lanes-1),
+    (_DPU,rk.REG_DPU_WDMA_SIZE_1,width),(_DPU,rk.REG_DPU_BN_MUL_CFG,0),
     (_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,0))
   if compare: pipeline += ((_DPU,rk.REG_DPU_BS_CFG,_BS_CFG_COMPARE),(_DPU,rk.REG_DPU_BS_ALU_CFG,_BS_ALU_COMPARE),
     (_DPU,rk.REG_DPU_BS_MUL_CFG,_BS_MUL_COMPARE),(_DPU,rk.REG_DPU_BN_CFG,_BN_CFG_COMPARE),
     (_DPU,rk.REG_DPU_BN_MUL_CFG,_BN_MUL_COMPARE),(_DPU,rk.REG_DPU_BN_RELUX_CMP_VALUE,_BN_RELUX_COMPARE))
   regs:tuple[tuple[int, int, int], ...] = ((_DPU,rk.REG_DPU_S_POINTER,0xe),
     (_DPU,rk.REG_DPU_FEATURE_MODE_CFG,(15<<5)|(2<<1)|1),
-    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_INT16 if native_int16 else _DPU_DATA_FORMAT_INT32 if native_int32 else
+    (_DPU,rk.REG_DPU_DATA_FORMAT,_DPU_DATA_FORMAT_FP32_OUT if fp32_output else
+                                  _DPU_DATA_FORMAT_INT16 if native_int16 else _DPU_DATA_FORMAT_INT32 if native_int32 else
                                   _DPU_DATA_FORMAT_INT16_TO_INT32 if int16_to_int32 else
                                   _DPU_DATA_FORMAT_INT32_OUT if int32_output else _DPU_DATA_FORMAT_INT16_OUT if int16_output else
                                   _DPU_DATA_FORMAT_INT32_IN if int32_input else _DPU_DATA_FORMAT_FP16)) + \
-    (((_DPU,rk.REG_DPU_DST_SURF_STRIDE,1<<4),) if int16_to_int32 else ()) + (
+    (((_DPU,rk.REG_DPU_DST_SURF_STRIDE,1<<4),) if int16_to_int32 or fp32_output else ()) + (
     (_DPU,rk.REG_DPU_DATA_CUBE_WIDTH,width),(_DPU,rk.REG_DPU_DATA_CUBE_HEIGHT,0),
-    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),(_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,((lanes-1)<<16)|(lanes-1))) + pipeline + (
+    (_DPU,rk.REG_DPU_DATA_CUBE_NOTCH_ADDR,0),
+    (_DPU,rk.REG_DPU_DATA_CUBE_CHANNEL,0 if fp32_output and count == 1 else ((lanes-1)<<16)|(lanes-1))) + pipeline + (
     (_DPU,rk.REG_DPU_EW_CFG,_EW_CFG_COMMON|1 if compare else
                                (ew_cfg & ~(3<<22)) | (3<<22) | _EW_OP_CVT_BYPASS if int32_input else
                                ew_cfg & ~_EW_OP_CVT_BYPASS if native_int16 or int16_to_int32 else ew_cfg),
     (_DPU,rk.REG_DPU_EW_CVT_SCALE_VALUE,1),(_DPU,rk.REG_DPU_OUT_CVT_OFFSET,0),
-    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,1 if int32_output or int16_output or is_div else (1<<16)|1),(_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
+    (_DPU,rk.REG_DPU_OUT_CVT_SCALE,0 if fp32_output else 1 if int32_output or int16_output or is_div else (1<<16)|1),
+    (_DPU,rk.REG_DPU_OUT_CVT_SHIFT,0),
     (_DPU,rk.REG_DPU_SURFACE_ADD,(2 if native_int16 or int16_to_int32 else 4)<<4),(_RDMA,rk.REG_DPU_RDMA_RDMA_S_POINTER,0xe),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,width),(_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,0),
     (_RDMA,rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,lanes-1),
@@ -307,7 +288,8 @@ def emit_ew_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compar
                   stateful:bool=False, int32_output:bool=False, int32_input:bool=False,
                   int16_output:bool=False, int16_input:bool=False) -> RKStage:
   """Build one DPU EW command body without its PC-chain tail."""
-  if ew_cfg & _EW_STAGE_FP32_OUT: return _emit_fp32_out_stage(dst, lhs, rhs, count, ew_cfg & ~_EW_STAGE_FP32_OUT)
+  if ew_cfg & _EW_STAGE_FP32_OUT:
+    return _emit_stateful_stage(dst, lhs, rhs, count, ew_cfg & ~_EW_STAGE_FP32_OUT, fp32_output=True)
   if compare or stateful or int32_output or int32_input or int16_output or int16_input:
     return _emit_stateful_stage(dst, lhs, rhs, count, ew_cfg, compare, int32_output, int32_input, int16_output, int16_input)
   if not (0 < count <= _MAX_EW_ELEMS_FP16): raise ValueError(f"EW fp16 count {count} out of range")
@@ -1102,6 +1084,33 @@ def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
   if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.int or len(root.src) != 1 or
       root.src[0].op is not Ops.LOAD or root.src[0].dtype.scalar() is not dtypes.half): return None
   return _typed_int_image(output, _fold_trunc(UOp(Ops.TRUNC, dtypes.half, src=root.src)))
+
+def _lower_fp16_fp32_cast(output:RKOutput) -> RKImage|None:
+  """Widen a direct or statically gathered FP16 load with the DPU output converter."""
+  _, out_param, count, out_index, root = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  if (root.op is not Ops.CAST or root.dtype.scalar() is not dtypes.float or len(root.src) != 1 or
+      (load:=root.src[0]).op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or
+      len(load.src) != 1 or load.src[0].op is not Ops.INDEX or
+      (source:=_root_param(load.src[0])) is None or source.src[0].op is not Ops.CONST): return None
+  try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
+  except RuntimeError: return None
+  if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
+  direct = count <= _EW_ELEMS_32BIT and offsets == tuple(range(count))
+  values:tuple[RKArg, ...]; gathers:tuple[RKGather, ...]; scratch:tuple[RKScratch, ...]
+  if direct:
+    values, gathers, scratch = (RKArg(RKBufferKind.ARG, source.arg.slot),), (), ()
+  else:
+    groups = tuple(range(0, count, _EW_ELEMS_32BIT))
+    values = tuple(RKArg(RKBufferKind.SCRATCH, 0, group//_EW_ELEMS_32BIT*16) for group in groups)
+    gathers = tuple(RKGather(source.arg.slot, 0, min(_EW_ELEMS_32BIT, count-group),
+                             offsets=offsets[group:group+_EW_ELEMS_32BIT],
+                             dst_addend=group//_EW_ELEMS_32BIT*8) for group in groups)
+    scratch = (RKScratch((count+_EW_ELEMS_32BIT-1)//_EW_ELEMS_32BIT*16),)
+  ops = tuple(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot, group*16), value, value,
+                     min(_EW_ELEMS_32BIT, count-group*_EW_ELEMS_32BIT),
+                     _EW_CFG[Ops.MAX] | _EW_STAGE_FP32_OUT) for group,value in enumerate(values))
+  return RKImage(RKTarget.RK3588, scratch, gathers=gathers, ew_ops=ops)
 
 def _int16_byte_sum(ops:list[RKEWOp], gathers:list[RKGather], scratch:Callable[[int], int], source_slot:int,
                     operands:tuple[tuple[RKArg, ...], ...], count:int) -> tuple[RKArg, ...]:
@@ -4424,6 +4433,8 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew
+  if (float_output:=_output_store(uops, dtypes.float)) is not None and \
+     (fp16_cast:=_lower_fp16_fp32_cast(float_output)) is not None: return fp16_cast
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
     if bool_output[4].op is Ops.CONST:
       return RKImage(RKTarget.RK3588, constants=struct.pack("<?", bool(bool_output[4].arg)),

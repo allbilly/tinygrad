@@ -1222,7 +1222,15 @@ class TestRockchipSignOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipCastOps(unittest.TestCase):
-  """Direct FP16-to-bool and truncating FP16-to-INT32 conversion through DPU EW."""
+  """Native DPU conversion from FP16 inputs to boolean, INT32, and FP32 outputs."""
+
+  def test_cast_float(self):
+    before = Device["ROCKCHIP"].submit_count
+    _fp16_test_op([(3,3)], lambda x:x.float(), forward_only=True)
+    values = np.array([0x8000,0x0000,0xbc00,0x3c00,0x0001,0x8001,0x7c00,0x7e01,0x7bff], dtype=np.uint16).view(np.float16)
+    got = Tensor(values).float().realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint32), values.astype(np.float32).view(np.uint32))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 2)
 
   def test_cast_bool(self):
     before = Device["ROCKCHIP"].submit_count

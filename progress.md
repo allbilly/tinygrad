@@ -3647,3 +3647,33 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. The renderer only 
 the native FLOOR/CEIL UOp composition. Fractional truncation and terminal INT32 conversion execute on DPU EW; runtime
 only submits the existing typed stages and copies opaque output bytes. There is no NumPy numeric conversion, host tensor
 inspection, LUT, CMAC, tolerance change, or external floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact FP16-to-FP32 widening on DPU
+
+The FP16-input `.float()` portion of upstream `TestOps.test_cast` now runs on Rockchip. The DPU FP32 output converter
+writes four dense FP32 lanes from one eight-lane FP16 atom; larger inputs are therefore gathered into aligned four-lane
+groups and emitted as consecutive tasks in one PC-chain ioctl. This limit is derived from the FP16/FP32 element sizes,
+not a task-count or command-buffer constant. Direct one- through four-lane inputs need no gather.
+
+`~/rk3588`'s fused-pipeline probe established the FP16-to-FP32 register mode for four-lane, grouped, and wider inputs.
+Focused hardware probes found that ADD-zero loses the sign of negative zero, while native `MAX(x,x)` pass-through
+preserves every tested widened bit exactly: signed zeros, normal values, subnormals, infinities, and the FP16 NaN payload.
+The standalone scalar FP32 emitter was folded into the shared stateful typed emitter, so scalar FP32 reductions and the
+new vector cast use one register-construction path.
+
+- One-, two-, three-, four-, eight-, and nine-element focused conversions pass; the permanent random `(3,3)` and exact
+  encoding regression uses **one ioctl per realization**. The complete Cast class passes **3/3 in 3.89 s**.
+- The existing FP32 scalar reduction regression passes with its unchanged **2-ioctl** contract.
+- Full serial Rockchip census: **452 passed, 9 skipped, 187 subtests passed in 653.06 s**. The slowest case was
+  `test_simple_cummin` at **27.99 s**, so no individual test crossed the 30-second profiling threshold.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the census.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **461 tests**.
+- `sz.py`: renderer/runtime **4,626/327 executable lines**, total **30,008**. Removing the separate scalar emitter offsets
+  most of the new typed-cast matcher and grouped-layout code.
+
+The CPU-cheat audit found no Tinygrad-core change or runtime numeric conversion. Renderer work is limited to proving
+static FP16 addresses and preparing raw aligned lane movement; runtime gathers copy opaque `uint16` values. Widening and
+FP32 writeback execute on DPU EW. There is no NumPy cast, host tensor inspection, LUT, CMAC, tolerance change, or FP32
+input.
