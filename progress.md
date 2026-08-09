@@ -3395,3 +3395,28 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time evalu
 gather addresses. Runtime copies opaque `uint16` lanes; all input-dependent signed arithmetic, extrema, absolute value,
 negation, and saturation execute on DPU EW. There is no host numeric evaluator, LUT, CMAC, CNA, PPU fallback, tolerance
 relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — zero-stride FP16 mulacc census
+
+All three forward expressions from upstream `test_mulacc_with_zero_strides` now run on Rockchip: a scalar expanded over
+`(2,4,3)` and reduced on the last axis, two `(2,4,3)` zero-stride broadcasts reduced over axes `(0,2)`, and the `1x2 @
+2x3` matrix product. The upstream method's first and third expressions are entirely constant and therefore fold to a
+CPU realization before reaching a device backend. The Rockchip method preserves the same shapes and algebra but binds
+external FP16 buffers, then asserts exact results and the four resulting NPU submit ioctls.
+
+Historical commit `ad990be16` solved the old normal-FP32 form with compensated CMAC; it was intentionally not ported.
+The current FP16 backend already lowers these cases through raw broadcast gathers, DPU MUL/ADD reduction, and the
+existing DPU-only dot path. `~/rk3588/examples/elementwise.py` independently proves the underlying MUL and ADD stages.
+
+- Focused pytest: **1 passed in 2.95 s**, below the 30-second policy.
+- Direct wall decomposition, all three cases: **0.317 s total**, including 58.6 ms input setup. Case realizations were
+  **87.1 / 48.2 / 23.2 ms**, copyouts 2.4 / 0.7 / 0.6 ms, with **2 / 1 / 1 ioctls** and **2 / 4 / 3 tasks**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. Rockchip collection: **447 tests**.
+- `sz.py` remains renderer/runtime **3,855/307 executable lines**, total **29,217**; no backend implementation was added.
+
+The CPU-cheat audit found that all six operands are realized external FP16 Rockchip buffers before timing/submission.
+Runtime performs only raw layout gathers; every value-dependent multiplication and addition executes on DPU EW. There
+is no CPU constant-fold result, CMAC, LUT, host reduction, tolerance relaxation, or Tinygrad-core change.

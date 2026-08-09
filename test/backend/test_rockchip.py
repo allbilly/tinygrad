@@ -893,6 +893,22 @@ class TestRockchipDotOps(unittest.TestCase):
   test_broadcastdot = _test_ops.TestOps.test_broadcastdot
   test_multidot = _test_ops.TestOps.test_multidot
   test_matvec = _test_ops.TestOps.test_matvec
+
+  def test_mulacc_with_zero_strides(self):
+    """Upstream shapes with external FP16 buffers, preventing its all-constant cases from folding onto CPU."""
+    scalar_a = Tensor(np.ones((1,1,1), dtype=np.float16)).realize()
+    scalar_b = Tensor(np.ones((1,1,1), dtype=np.float16)).realize()
+    a = Tensor(np.ones((2,4,1), dtype=np.float16)).realize()
+    b = Tensor(np.ones((1,4,1), dtype=np.float16)).realize()
+    lhs = Tensor(np.ones((1,2), dtype=np.float16)).realize()
+    rhs = Tensor(np.ones((2,3), dtype=np.float16)).realize()
+    before = Device["ROCKCHIP"].submit_count
+    outputs = (scalar_a.expand(2,4,3).mul(scalar_b.expand(2,4,3)).sum(-1).realize(),
+               a.expand(2,4,3).mul(b.expand(2,4,3)).sum((0,2)).realize(), lhs.dot(rhs).realize())
+    for got,expected in zip(outputs, (np.full((2,4), 3, dtype=np.float16), np.full(4, 6, dtype=np.float16),
+                                      np.full((1,3), 2, dtype=np.float16))):
+      np.testing.assert_array_equal(got.numpy(), expected)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 4)
   test_matvecmat = _test_ops.TestOps.test_matvecmat
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
