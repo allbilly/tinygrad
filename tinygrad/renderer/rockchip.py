@@ -2297,25 +2297,32 @@ def _native_int16_byte_mask(ops:list[RKEWOp], gathers:list[RKGather], scratch:Ca
   return mask
 
 def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
-  """Lower a conjunction of canonical negative-normalized INT32 index bounds to one exact bool mask."""
+  """Lower canonical positive-only or negative-normalized INT32 index bounds to one exact bool mask."""
   _, out_param, count, out_index, root = output
   if count <= 0: return None
-  normalized_nodes = {node.key:(node, *parsed) for node in root.toposort()
-                      if (parsed:=_negative_normalized_index(node)) is not None}
-  terms:list[UOp] = []
-  for bounded,load,extent in normalized_nodes.values():
+  normalized = tuple((node, *parsed) for node in root.toposort() if (parsed:=_negative_normalized_index(node)) is not None)
+  normalized_by_load = {load.key:(bounded, extent) for bounded,load,extent in normalized}
+  loads = tuple({u.key:u for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int}.values())
+  if not loads or len(normalized_by_load) != len(normalized): return None
+  specs:list[tuple[UOp, UOp, int, bool, UOp]] = []
+  for load in loads:
+    if load.key in normalized_by_load:
+      bounded, extent = normalized_by_load[load.key]; wrapped = True
+    else:
+      limits = {int(u.src[1].arg) for u in root.toposort() if u.op is Ops.CMPLT and u.src[0].key == load.key and
+                u.src[1].op is Ops.CONST and int(u.src[1].arg) > 0}
+      if len(limits) != 1: return None
+      bounded, extent, wrapped = load, next(iter(limits)), False
     gates = [node for node in root.toposort() if _bounded_index_gate(node, bounded, extent) and
              {u.key for u in node.toposort() if u.op is Ops.LOAD} == {load.key}]
     if len(gates) != 1: return None
-    terms.append(gates[0])
+    specs.append((bounded, load, extent, wrapped, gates[0]))
+  terms = [term for *_,term in specs]
   actual_leaves, expected_leaves = _flatten_binary(root, Ops.AND), tuple(x for term in terms for x in _flatten_binary(term, Ops.AND))
-  if not terms or len(actual_leaves) != len(expected_leaves) or \
+  if len(actual_leaves) != len(expected_leaves) or \
      {x.key for x in actual_leaves} != {x.key for x in expected_leaves}: return None
-  axes:list[tuple[UOp, int, UOp, tuple[int, ...], int]] = []
-  for term in terms:
-    normalized = [(node, *parsed) for node in term.toposort() if (parsed:=_negative_normalized_index(node)) is not None]
-    if len(normalized) != 1: return None
-    bounded,load,extent = normalized[0]
+  axes:list[tuple[UOp, int, UOp, tuple[int, ...], int, bool]] = []
+  for bounded,load,extent,wrapped,term in specs:
     param = _root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None
     if (not _bounded_index_gate(term, bounded, extent) or param is None or param.dtype.scalar() is not dtypes.int or
         param.src[0].op is not Ops.CONST or {u.key for u in term.toposort() if u.op is Ops.LOAD} != {load.key}): return None
@@ -2323,11 +2330,10 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
     except RuntimeError: return None
     index_count = int(param.src[0].arg)
     if any(not 0 <= offset < index_count for offset in offsets): return None
-    axes.append((param, index_count, load, offsets, extent))
-  if len({load.key for _,_,load,_,_ in axes}) != len(axes) or \
-     {u.key for u in root.toposort() if u.op is Ops.LOAD} != {load.key for _,_,load,_,_ in axes}: return None
+    axes.append((param, index_count, load, offsets, extent, wrapped))
+  if {u.key for u in root.toposort() if u.op is Ops.LOAD} != {load.key for _,_,load,_,_,_ in axes}: return None
 
-  layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent in axes)
+  layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_ in axes)
   if any(matrix_lanes > _MAX_EW_ELEMS_FP16 for _,_,matrix_lanes,_ in layouts): return None
   scratch_sizes:list[int] = []
   def scratch(size:int) -> int: scratch_sizes.append(size); return len(scratch_sizes)-1
@@ -2335,11 +2341,11 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
   ops:list[RKEWOp] = []
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   valid_axes:list[RKArg] = []
-  for (param,_,_,offsets,extent),(_,vector_lanes,_,_) in zip(axes, layouts):
+  for (param,_,_,offsets,extent,wrapped),(_,vector_lanes,_,_) in zip(axes, layouts):
     positive = tuple((coordinate,)*count for coordinate in range(extent))
     negative = tuple((coordinate,)*count for coordinate in range(-extent, 0))
     if (mask:=_native_int16_byte_mask(ops, gathers, scratch, param.arg.slot, offsets,
-                                      (positive, negative), count, vector_lanes)) is None: return None
+                                      (positive, negative) if wrapped else (positive,), count, vector_lanes)) is None: return None
     valid_axes.append(_reduce_rows(ops, [RKArg(mask.kind, mask.index, mask.addend+row*vector_lanes*2)
                                         for row in range(extent)], count, _EW_CFG[Ops.MAX], int16=True))
   result = valid_axes[0]
@@ -2368,7 +2374,7 @@ def _lower_normalized_linear_index(output:RKOutput) -> RKImage|None:
   gate_param = _root_param(gate.src[0])
   if gate_param is None or gate_param.dtype.scalar() is not dtypes.bool or gate_param.src[0].op is not Ops.CONST: return None
 
-  axes:list[tuple[UOp, int, tuple[int, ...], int, int]] = []
+  axes:list[tuple[UOp, int, tuple[int, ...], int, int, bool]] = []
   for term in _flatten_binary(linear, Ops.ADD):
     value, coefficient = term, 1
     if term.op is Ops.MUL:
@@ -2376,25 +2382,36 @@ def _lower_normalized_linear_index(output:RKOutput) -> RKImage|None:
       dynamic = [x for x in term.src if x not in constants]
       if len(constants) != len(dynamic) != 0 or len(constants) != 1: return None
       value, coefficient = dynamic[0], int(constants[0].arg)
-    if coefficient <= 0 or (normalized:=_negative_normalized_index(value)) is None: return None
-    load, extent = normalized
+    if coefficient <= 0: return None
+    if (normalized:=_negative_normalized_index(value)) is not None: load, extent, wrapped = *normalized, True
+    elif value.op is Ops.LOAD and value.dtype.scalar() is dtypes.int and source_extent%coefficient == 0:
+      load, extent, wrapped = value, source_extent//coefficient, False
+    else: return None
     param = _root_param(load.src[0]) if load.src and load.src[0].op is Ops.INDEX else None
     if param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST: return None
     try: offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
     except RuntimeError: return None
     index_count = int(param.src[0].arg)
     if any(not 0 <= offset < index_count for offset in offsets): return None
-    axes.append((param, index_count, offsets, extent, coefficient))
+    axes.append((param, index_count, offsets, extent, coefficient, wrapped))
+  coefficients = {coefficient for *_,coefficient,_ in axes}
+  refined:list[tuple[UOp, int, tuple[int, ...], int, int, bool]] = []
+  for param,index_count,offsets,extent,coefficient,wrapped in axes:
+    upper_stride = min((other for other in coefficients if other > coefficient), default=source_extent)
+    if not wrapped:
+      if upper_stride%coefficient: return None
+      extent = upper_stride//coefficient
+    refined.append((param,index_count,offsets,extent,coefficient,wrapped))
+  axes = refined
   try: gate_offsets = _gather_offsets(out_index, gate.src[0].src[1], None, count)
   except RuntimeError: return None
   if (not axes or any(not 0 <= offset < int(gate_param.src[0].arg) for offset in gate_offsets) or
-      len({param.arg.slot for param,_,_,_,_ in axes}) != len(axes) or
+      len({param.arg.slot for param,_,_,_,_,_ in axes}) != len(axes) or
       {u.key for u in root.toposort() if u.op is Ops.LOAD} != {gate.key, *(u.key for u in linear.toposort() if u.op is Ops.LOAD)}):
     return None
-  maximum = sum((extent-1)*coefficient for _,_,_,extent,coefficient in axes)
-  if maximum >= source_extent or maximum >= 1<<15: return None
+  if source_extent >= 1<<15: return None
 
-  layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_ in axes)
+  layouts = tuple((*_stripe_layout(count, extent), extent) for *_,extent,_,_ in axes)
   if any(matrix_lanes > _MAX_EW_ELEMS_FP16 for _,_,matrix_lanes,_ in layouts): return None
   scratch_sizes:list[int] = []
   def scratch(size:int) -> int: scratch_sizes.append(size); return len(scratch_sizes)-1
@@ -2402,11 +2419,11 @@ def _lower_normalized_linear_index(output:RKOutput) -> RKImage|None:
   ops:list[RKEWOp] = []
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   contributions:list[RKArg] = []
-  for (param,_,offsets,extent,coefficient),(_,vector_lanes,matrix_lanes,_) in zip(axes, layouts):
+  for (param,_,offsets,extent,coefficient,wrapped),(_,vector_lanes,matrix_lanes,_) in zip(axes, layouts):
     positive = tuple((coordinate,)*count for coordinate in range(extent))
     negative = tuple((coordinate,)*count for coordinate in range(-extent, 0))
     if (mask:=_native_int16_byte_mask(ops, gathers, scratch, param.arg.slot, offsets,
-                                      (positive, negative), count, vector_lanes)) is None: return None
+                                      (positive, negative) if wrapped else (positive,), count, vector_lanes)) is None: return None
     weights, selected = scratch(matrix_lanes*2), scratch(matrix_lanes*2)
     values = tuple(value for row in range(extent) for value in (row*coefficient,)*count+(0,)*(vector_lanes-count))
     gathers.append(RKGather(param.arg.slot, weights, matrix_lanes, values=values, itemsize=2))

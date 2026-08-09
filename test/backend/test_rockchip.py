@@ -664,6 +664,33 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
     a,b,c,d,e,i,j,k,o,p = self._get_index_randoms()
     _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(a,b,c,d,e)], lambda x:x[(i,j,k,o,p)])
 
+  def test_slice_fancy_indexing_list_indices_static(self):
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[((0,),)], lambda x:x[((0,),)])
+
+  def test_slice_fancy_indexing_list_indices_leading(self):
+    _,b,c,d,_,_,j,k,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(0,),b,c,d,:], lambda x:x[(0,),j,k,o,:])
+
+  def test_slice_fancy_indexing_list_indices_broadcast(self):
+    _,b,c,d,_,_,j,k,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[[[[0]]],b,c,d,[[1]]], lambda x:x[[[[0]]],j,k,o,[[1]]])
+
+  def test_slice_fancy_indexing_list_indices_negative(self):
+    _,b,c,d,_,_,j,k,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[(1,0,-1),b,c,d,:], lambda x:x[(1,0,-1),j,k,o,:])
+
+  def test_slice_fancy_indexing_list_indices_trailing(self):
+    a,b,c,_,_,i,j,k,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,b,c,(1,2,3),...], lambda x:x[i,j,k,(1,2,3),...])
+
+  def test_slice_fancy_indexing_list_indices_column(self):
+    a,b,c,_,_,i,j,k,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,b,c,[[1],[2],[3]],...], lambda x:x[i,j,k,[[1],[2],[3]],...])
+
+  def test_slice_fancy_indexing_list_indices_mixed(self):
+    a,_,c,_,e,i,_,k,_,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,(2,1,0),c,(-2,1,0),e], lambda x:x[i,(2,1,0),k,(-2,1,0),p])
+
   def test_fancy_indexing_negative_nonfinite_bits(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
     indices = np.array([-1, -2, -3], dtype=np.int32)

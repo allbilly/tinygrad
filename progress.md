@@ -3317,3 +3317,28 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. The second externa
 host: runtime gathers its opaque bytes and native INT16 DPU EW performs exact four-byte equality, axis conjunction,
 selection, and reduction. There is no host tuple/index evaluation, LUT, CMAC, tolerance change, or floating input
 wider than FP16.
+
+---
+
+## 2026-08-09 — static-list and dynamic-tensor fancy indexing
+
+All seven forward expressions from upstream `test_slice_fancy_indexing_list_indices` are now independent Rockchip
+methods. They cover a static list alone, leading and trailing static lists mixed with dynamic tensors, broadcast list
+shapes, negative static indices, column-shaped lists, and multiple static/dynamic axes.
+
+Python lists and tuples become external INT32 buffers in Tinygrad's scheduled IR. Two strict matchers therefore needed
+the same positive-only extension already used by the final FP16 selector. The bool bounds image now accepts direct
+INT32 loads only when their canonical lower and upper gates cover every conjunction leaf. The flattened INT32 index
+image accepts a direct contribution only when row-major compile-time strides prove a finite candidate extent and the
+complete source index remains below signed INT16 range. Negative-normalized axes retain their signed alternatives.
+
+- Static-list group: **7/7 passed individually**, from **4.15 s** to **15.77 s** pytest time.
+- The preceding mixed tensor/tuple and five-negative-axis regressions pass after the shared matcher changes.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. Rockchip collection: **435 tests**.
+- `sz.py`: renderer/runtime **3,710/307 executable lines**, total **29,072**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Static stride analysis enumerates only candidate values;
+it never reads the list/tuple buffers. Runtime moves opaque bytes and native INT16 DPU EW computes exact byte equality,
+bounds conjunction, weighted index reconstruction, FP16 selection, and reduction. There is no host fancy indexing,
+LUT, CMAC, tolerance change, or floating input wider than FP16.
