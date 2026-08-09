@@ -2974,3 +2974,34 @@ move opaque representations according to those plans. Dynamic INT32 conversion, 
 hit/factor reduction, infinity/NaN construction, and final FP16 arithmetic all execute on DPU EW. There is no typed
 tensor evaluator, host Scatter arithmetic, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider
 than FP16.
+
+---
+
+## 2026-08-09 — flipped-eye static movement regression
+
+The unchanged forward-only `TestOps.test_flip_eye_crash` is now part of the Rockchip movement census and passes
+`eye(10) @ flip(eye(10), axis=0)` without reproducing its historical crash. Current Rockchip has no CMAC renderer or
+runtime path: static Eye/Flip layouts are proved as raw gathers and the small contraction uses the established DPU EW
+reduction.
+
+Historical milestone `d134eb1b8` had already recorded this exact method passing without a backend change. `~/npu`
+marks native `aten::flip` unsupported, while `~/rk3588` contains the same upstream method but no independent native
+Flip instruction example. This confirms that the existing static gather path is the appropriate implementation rather
+than adding a special opcode or host movement evaluator.
+
+The adjacent upstream `test_mulacc_with_zero_strides` was investigated but deliberately not admitted. Its historical
+fix in `ad990be16` is explicitly an FP32 CMAC plus compensated-DPU implementation, outside this branch's FP16-input,
+no-CMAC scope; today its first constant-only case also reaches an unrelated CPU vector-cast compiler error. No
+Tinygrad-core workaround or narrower replacement test was added.
+
+- Unchanged flipped-eye method: **1 passed in 3.09 s**, sequentially.
+- Complete movement class: **31 passed, 1 skipped in 6.03 s**, sequentially.
+- The immediately preceding complete Rockchip census passed **380 tests, 9 skipped, 184 subtests in 508.16 s**; this
+  test-only milestone adds the one focused passing node, for 390 collected nodes.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the movement-class run.
+- Repository-wide Tinygrad mypy and focused Ruff: pass. `git diff --check`: pass. `sz.py` remains renderer/runtime
+  **2,923/281 executable lines**.
+
+There is no backend/runtime/Tinygrad-core change and therefore no new CPU arithmetic or tensor-value access. The test
+uses the existing compile-time address plan and DPU EW path with no LUT, CMAC, CNA, PPU fallback, tolerance beyond the
+established FP16 cap, or floating input wider than FP16.

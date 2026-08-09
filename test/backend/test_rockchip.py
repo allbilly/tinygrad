@@ -1171,6 +1171,7 @@ class TestRockchipMovementOps(unittest.TestCase):
   test_reshape = _test_ops.TestOps.test_reshape
   test_view = _test_ops.TestOps.test_view
   test_flip = _test_ops.TestOps.test_flip
+  test_flip_eye_crash = _test_ops.TestOps.test_flip_eye_crash
   test_squeeze = _test_ops.TestOps.test_squeeze
   test_unsqueeze = _test_ops.TestOps.test_unsqueeze
   test_flatten = _test_ops.TestOps.test_flatten
