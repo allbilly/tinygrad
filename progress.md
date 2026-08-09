@@ -4371,3 +4371,37 @@ INT32 writeback all execute on DPU. NumPy appears only in test oracles. There is
 tolerance relaxation, or wider floating-point input. The unchanged upstream `test_ops.py` has 427 collected nodes and
 has not been run as one direct ROCKCHIP census; the 100 nodes outside the 327-case selected census are unclassified,
 not measured failures.
+
+---
+
+## 2026-08-09 — exact DPU bytewise complement
+
+The unchanged upstream `test_bitwise_not` now passes for both INT32 and boolean inputs. INT32 values are treated as
+four opaque bytes and complemented with native INT16 `255-byte`; boolean values use the same path as `1-byte`. A raw
+post-gather packs the low byte of each INT16 lane back into the typed destination. This preserves every INT32 bit,
+including both signed limits, without asking the DPU to represent the value numerically as FP16.
+
+No checked Rockchip branch, `~/npu`, or `~/rk3588` contains an integrated Tinygrad bitwise-not lowerer.
+`~/rk3588/examples/elementwise_int.py` proves native integer `EW_ALU_MINUS=4` for INT16, while
+`~/rk3588/test/test_ops.py` carries the same upstream behavior test. The new work is the bounded RKImage integration,
+static movement support, and exact byte packing.
+
+- Direct unchanged upstream `TestOps.test_bitwise_not`: **1 passed in 2.93 s**. The selected Rockchip copy passes in
+  **2.94 s**; the exact full-byte/movement regression passes in **2.74 s**.
+- The exact regression covers `INT32_MIN`, `INT32_MAX`, byte/carry boundaries, a transpose, boolean flip, and asserts
+  **two DPU tasks / two ioctls** for its two realizations.
+- Per the census-layout rule, `test_rockchip.py` contains **328 upstream-only cases** and `test_rockchip2.py` contains
+  **182 Rockchip-only cases**; combined collection is **510**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,066/331 executable lines**, total **30,452**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change and no tensor-value inspection. Compilation computes only
+static byte offsets and output layout. Runtime gathers opaque bytes, DPU INT16 SUB performs the complement, and raw
+post-gather repacks the result. NumPy is used only by test oracles. There is no host result calculation, LUT, CMAC,
+tolerance relaxation, or floating-point widening.
+
+The direct upstream failure census remains incomplete. On this working tree, `test_sort`, `test_cast`, and
+`test_pow_zero_exponent` are directly confirmed failures, `test_masked_select` is unresolved after a compile-time
+runaway, and the other **95** nodes outside the now-328-case selected census remain unclassified rather than measured
+failures.

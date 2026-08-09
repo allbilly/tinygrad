@@ -530,6 +530,18 @@ class TestRockchipBroadcastOps(_base.TestRockchipBroadcastOps):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipBitwiseOps(_base.TestRockchipBitwiseOps):
+  def test_bitwise_not_exact_bytes(self):
+    values = np.array([dtypes.int32.min, -16777217, -65536, -256, -1, 0,
+                       1, 255, 256, 65535, 16777216, dtypes.int32.max], dtype=np.int32).reshape(3,4)
+    booleans = np.array([[False, True, False], [True, True, False]], dtype=np.bool_)
+    before = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    np.testing.assert_array_equal((~Tensor(values).permute(1,0)).realize().numpy(), np.bitwise_not(values.T))
+    np.testing.assert_array_equal((~Tensor(booleans).flip(1)).realize().numpy(), np.logical_not(booleans[:,::-1]))
+    self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (2,2))
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInt16EWOps(_base.TestRockchipInt16EWOps):
   def test_add_sub(self):
     a = [-30000,-1200,-7,-1,0,1,1200,30000]

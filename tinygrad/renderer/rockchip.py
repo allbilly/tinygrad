@@ -1396,6 +1396,31 @@ def _lower_int32_byte_add(output:RKOutput) -> RKImage|None:
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers),
                  ew_ops=tuple(ops), post_gathers=post)
 
+def _lower_bytewise_not(output:RKOutput, dtype:DType) -> RKImage|None:
+  """Complement opaque INT32 or bool bytes with one native INT16 subtraction."""
+  _, out_param, count, out_index, root = output
+  if dtype not in (dtypes.int, dtypes.bool): return None
+  op, constant, itemsize, ceiling = (Ops.XOR, -1, 4, 255) if dtype is dtypes.int else (Ops.CMPNE, True, 1, 1)
+  if root.op is not op or root.dtype.scalar() is not dtype or not 1 <= count*itemsize <= _MAX_EW_ELEMS_FP16: return None
+  loads = [src for src in root.src if src.op is Ops.LOAD and src.dtype.scalar() is dtype and src.src and src.src[0].op is Ops.INDEX]
+  constants = [src for src in root.src if src.op is Ops.CONST and src.dtype.scalar() is dtype and src.arg == constant]
+  if len(loads) != 1 or len(constants) != 1: return None
+  load = loads[0]
+  source = _root_param(load.src[0])
+  if source is None or source.dtype.scalar() is not dtype or source.src[0].op is not Ops.CONST: return None
+  try: offsets = _gather_offsets(out_index, load.src[0].src[1], load.src[2] if len(load.src) == 3 else None, count)
+  except RuntimeError: return None
+  if any(not 0 <= offset < int(source.src[0].arg) for offset in offsets): return None
+  lanes = count*itemsize
+  byte_offsets = tuple(offset*itemsize+byte for offset in offsets for byte in range(itemsize))
+  data, limit = (RKArg(RKBufferKind.SCRATCH, slot) for slot in range(2))
+  gathers = (RKGather(source.arg.slot, data.index, lanes, offsets=byte_offsets, dst_stride=2, itemsize=1),
+             RKGather(source.arg.slot, limit.index, lanes, values=(ceiling,)*lanes, itemsize=2))
+  ops = (RKEWOp(data, limit, data, lanes, _EW_CFG[Ops.SUB], int16_input=True, int16_output=True),)
+  post = (RKGather(data.index, out_param.arg.slot, lanes, offsets=tuple(lane*2 for lane in range(lanes)),
+                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1),)
+  return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(lanes)),)*2, gathers=gathers, ew_ops=ops, post_gathers=post)
+
 def _lower_raw_fp16_bitcast(output:RKOutput) -> RKImage|None:
   """Pair adjacent FP16 lane representations into an INT32 output without numeric conversion."""
   _, out_param, count, out_index, value = output
@@ -4887,6 +4912,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if bool_output[4].op is Ops.CONST:
       return RKImage(RKTarget.RK3588, constants=struct.pack("<?", bool(bool_output[4].arg)),
                      fill=RKFill(RKArg(RKBufferKind.ARG, bool_output[1].arg.slot), bool_output[2], 1))
+    if (byte_not:=_lower_bytewise_not(bool_output, dtypes.bool)) is not None: return byte_not
     if (bounds_mask:=_lower_int32_bounds_mask(bool_output)) is not None: return bounds_mask
     if (stored_bool_reduction:=_lower_stored_bool_reduction(bool_output)) is not None: return stored_bool_reduction
     if (bool_reduction:=_lower_unrolled_bool_reduction(bool_output)) is not None: return bool_reduction
@@ -4914,6 +4940,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (int16_sum:=_lower_unrolled_int16_sum(int_output)) is not None: return int16_sum
     if (int16_total:=_lower_unrolled_integer_predicate_total(int_output)) is not None: return int16_total
     if (bounded_lookup:=_lower_bounded_int32_lookup(int_output)) is not None: return bounded_lookup
+    if (byte_not:=_lower_bytewise_not(int_output, dtypes.int)) is not None: return byte_not
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (int16_prefix:=_lower_unrolled_integer_prefix_count(int_output, dtypes.int16)) is not None: return int16_prefix
     if (int32_prefix:=_lower_unrolled_integer_prefix_count(int_output)) is not None: return int32_prefix

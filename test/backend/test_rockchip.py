@@ -414,6 +414,13 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipBitwiseOps(unittest.TestCase):
+  """Exact INT32 and boolean complement through the native DPU integer EW pipeline."""
+
+  test_bitwise_not = _test_ops.TestOps.test_bitwise_not
+
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInt16EWOps(unittest.TestCase):
   """Bounded signed INT16 arithmetic and exact comparisons on the native DPU integer EW pipeline."""
 
