@@ -2479,21 +2479,21 @@ def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
     for load,coordinate in (comparison.src, comparison.src[::-1]):
       if load in int_loads and _is_static_expr(coordinate): direct[comparison] = load, coordinate
   if len(direct) != len(int_loads) or {load for load,_ in direct.values()} != set(int_loads): return None
-  entries:list[tuple[int, UOp, UOp, tuple[int, ...]]] = []
+  entries:list[tuple[tuple[int, ...], UOp, UOp, tuple[int, ...]]] = []
   try:
     for comparison,(load,coordinate) in direct.items():
       offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
-      if len(set(offsets)) != 1: return None
-      entries.append((offsets[0], comparison, load, _static_int_vector(out_index, coordinate, count)))
+      entries.append((offsets, comparison, load, _static_int_vector(out_index, coordinate, count)))
   except RuntimeError: return None
   entries.sort(key=lambda entry:entry[0])
-  if tuple(position for position,_,_,_ in entries) != tuple(range(len(entries))): return None
   params = tuple(_root_param(load.src[0]) for _,_,load,_ in entries)
   if (any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params) or
       len({param.arg.slot for param in params if param is not None}) != 1): return None
   index_param = next(param for param in params if param is not None)
   index_count = int(index_param.src[0].arg)
-  if index_count < len(entries): return None
+  index_offset_rows = tuple(offsets for offsets,_,_,_ in entries)
+  if (sorted({offset for row in index_offset_rows for offset in row}) != list(range(index_count)) or
+      any(any(lhs[lane] >= rhs[lane] for lhs,rhs in zip(index_offset_rows, index_offset_rows[1:])) for lane in range(count))): return None
   comparison_candidates = {comparison:candidate for candidate,(_,comparison,_,_) in enumerate(entries)}
 
   def predicate(root:UOp, matches:int) -> bool:
@@ -2528,7 +2528,6 @@ def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
   base_count, source_count = int(base_param.src[0].arg), int(source_param.src[0].arg)
   if (any(not 0 <= offset < base_count for offset in base_offsets) or
       any(not 0 <= offset < source_count for offsets in source_offset_rows for offset in offsets)): return None
-  index_offset_rows = tuple((position,)*count for position,_,_,_ in entries)
   coordinate_rows = tuple(coordinates for _,_,_,coordinates in entries)
   return _dynamic_fp16_scatter_image(out_param.arg.slot, count, index_param.arg.slot, index_count,
                                      index_offset_rows, coordinate_rows, source_param.arg.slot, source_offset_rows,

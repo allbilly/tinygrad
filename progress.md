@@ -3077,3 +3077,43 @@ runtime source, prefix, or index buffer. Runtime gathers move opaque representat
 Dynamic nonzero classification, INT32 equality, coordinate selection, validity masking, and output conversion all
 execute on DPU EW. There is no typed host tensor evaluator, host Nonzero arithmetic, LUT, CMAC, CNA, PPU fallback,
 tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — multidimensional dynamic FP16 Scatter
+
+Bounded last-wins Scatter with an external INT32 index tensor and FP16 tensor source now covers every axis of a
+three-dimensional `(2,3,4)` tensor. The raw-bit regression includes infinities, NaNs, and signed zero, deliberately
+maps every candidate along the scatter axis to the same destination, and checks the final FP16 representations
+exactly. This proves multidimensional index addressing, source addressing, collisions, and last-wins ordering rather
+than only the earlier one-dimensional special-value cases.
+
+The existing strict Scatter matcher assumed each unrolled dynamic index load addressed one globally constant index
+position. Multidimensional codegen instead emits one candidate load whose offset varies across the non-scatter axes.
+The matcher now retains the complete per-output offset row, sorts candidate rows lexicographically, proves their union
+covers every external index element, and proves candidate offsets are strictly increasing for every output
+lane. The unchanged exact Scatter image then applies four-byte INT32 equality, raw FP16 byte selection, and DPU
+last-wins masks to those proven rows.
+
+Historical Scatter milestones `16ea0c339`, `262622ff0`, and `1ff6ebc9d` used typed NumPy tensor evaluators and were not
+ported. `~/npu/include/old/rknn_ops.md` marks native ScatterElements unsupported, while `~/rk3588` contains the upstream
+tests but no independent native Scatter instruction example. The implementation therefore extends only the existing
+immutable DPU plan instead of adding a host fallback.
+
+- Three-dimensional dynamic tensor-source Scatter: **1 passed, 3 subtests passed in 7.22 s**, sequentially, covering
+  axes 0, 1, and 2.
+- Complete Scatter class: **13 passed, 7 subtests passed in 15.33 s**, sequentially.
+- One representative axis-1 realization: input realization 100 ms, graph construction 3 ms, scheduling 106 ms,
+  rendering 120 ms, one NPU program 1.29 s, and copyout 3 ms; **49 submit ioctls / 135 DPU tasks**.
+- A discarded six-axis stress form completed axes 0/1/2/-1 but timed out on the redundant `-2` alias after five
+  reset-heavy programs in one process. The retained test removes normalized-axis duplicates; it and the full class
+  pass from fresh processes. Vendor `elementwise.py` passed **60/60** immediately after the timeout and after the
+  retained class, confirming the driver remained usable.
+- Focused Ruff and mypy, `git diff --check`, and host rendering for positive and normalized axes: pass. `sz.py`:
+  renderer/runtime **3,330/281 executable lines**, one renderer line smaller than the preceding milestone.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Static IR evaluation proves only coordinate expressions,
+buffer bounds, complete index coverage, and last-wins truth tables. It does not read an index, source, or base tensor.
+Runtime gathers move opaque bytes; dynamic INT32 equality, collision masking, FP16 selection, and output construction
+execute on DPU EW. There is no typed host Scatter, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating
+input wider than FP16.

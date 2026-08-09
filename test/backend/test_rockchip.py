@@ -622,6 +622,24 @@ class TestRockchipScatterOps(unittest.TestCase):
         got = Tensor(base).scatter(0, Tensor(indices), Tensor(values)).realize().numpy()
         np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
 
+  def test_scatter_dynamic_multidim_tensor_source(self):
+    shape = (2,3,4)
+    bits = np.resize(np.array([0x3c00,0x7c00,0x8000,0x7e01,0xfc00,0x0000,0xfe01,0x4000], dtype=np.uint16), np.prod(shape))
+    values = np.resize(np.array([0xbc00,0x7d01,0x3555,0x8000,0x7c00,0xfe01], dtype=np.uint16), np.prod(shape)).view(np.float16).reshape(shape)
+    coordinates = np.indices(shape)
+    for dim in range(len(shape)):
+      with self.subTest(dim=dim):
+        base = bits.view(np.float16).reshape(shape)
+        axis = dim % len(shape)
+        indices = (coordinates[(axis+1)%len(shape)] % shape[axis]).astype(np.int32)
+        expected = base.copy()
+        for position in np.ndindex(indices.shape):
+          target = list(position)
+          target[axis] = int(indices[position])
+          expected[tuple(target)] = values[position]
+        got = Tensor(base).scatter(dim, Tensor(indices), Tensor(values)).realize().numpy()
+        np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
   def test_scatter_dynamic_scalar_reductions(self):
     base = np.array([1.0, -2.0, 3.0, 4.0], dtype=np.float16)
     indices = Tensor(np.array([0, 0, 2, 1], dtype=np.int32)).realize()
