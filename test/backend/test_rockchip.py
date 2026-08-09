@@ -1024,6 +1024,33 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     a = [[-8,-4,0,4], [8,12,16,20]]
     self._check([[-9,-9,5,17], [17,17,37,49]], lambda x,y:(x+y).maximum(-3)*2-3, a, [2,-2,4,6])
 
+  def test_fused_concat_neg(self):
+    a = np.asarray([[-32768,-7,0], [1,1200,32767]], dtype=np.int16)
+    b = np.asarray([[3,-4,5], [6,-7,8]], dtype=np.int16)
+    expected = np.clip(-np.concatenate((a, b), axis=1).astype(np.int32), -32768, 32767).astype(np.int16)
+    self._check(expected, lambda x,y:Tensor.cat(x, y, dim=1).neg(), a, b, expected_tasks=1)
+
+  def test_fused_stack_abs(self):
+    a = np.asarray([[-32768,-7,0], [1,1200,32767]], dtype=np.int16)
+    b = np.asarray([[3,-4,5], [6,-7,8]], dtype=np.int16)
+    expected = np.clip(np.abs(np.stack((a, b)).astype(np.int32)), 0, 32767).astype(np.int16)
+    self._check(expected, lambda x,y:Tensor.stack(x, y).abs(), a, b, expected_tasks=3)
+
+  def test_fused_permute_add(self):
+    a = np.asarray([[-32768,-7,0], [1,1200,32760]], dtype=np.int16)
+    b = np.arange(6, dtype=np.int16).reshape(3,2)
+    self._check(a.T+b, lambda x,y:x.permute(1,0)+y, a, b, expected_tasks=1)
+
+  def test_fused_pad_clip(self):
+    a = np.asarray([[-32768,-7,0], [1,1200,32767]], dtype=np.int16)
+    expected = np.clip(np.pad(a, ((1,1),(2,1)), constant_values=-7), -5, 6)
+    self._check(expected, lambda x:x.pad(((1,1),(2,1)), value=-7).clip(-5, 6), a, expected_tasks=2)
+
+  def test_fused_repeat_add(self):
+    a = np.asarray([[-30000,-7,0], [1,1200,30000]], dtype=np.int16)
+    b = np.ones((4,9), dtype=np.int16)
+    self._check(np.tile(a, (2,3))+b, lambda x,y:x.repeat(2,3)+y, a, b, expected_tasks=1)
+
   def test_int32_writeback(self):
     a = [-30000,-1200,-7,-1,0,1,1200,30000]
     b = [1000,-30,2,-1,1,2,-30,1000]

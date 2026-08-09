@@ -4235,3 +4235,28 @@ The CPU-cheat audit found no runtime/core change and no tensor-value inspection 
 only static reduction shape, source coverage, masks, and buffer bounds. Runtime gathers opaque INT16 rows; widening,
 balanced INT32 accumulation, and final INT32 writeback all execute on DPU. There is no host sum/result calculation,
 NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — fused INT16 layouts and arithmetic
+
+Native signed-INT16 arithmetic is now covered after multi-source and transformed layouts: concat followed by NEG,
+stack followed by ABS, permute followed by ADD, constant pad followed by clip, and repeat followed by ADD. These were
+the explicit remaining forms from the prior raw-layout milestone. Current compile probes showed that the generic
+INT16 leaf/gather planner already composes all five, so no dtype- or operator-specific implementation was added.
+
+`~/rk3588/examples/elementwise_int.py` directly proves signed-INT16 NEG, ABS, ADD, MAX, and MIN; no other Tinygrad
+branch or `~/npu` provides a more integrated fused-layout path than the current generic Rockchip planner.
+
+- All five exact cases pass in **3.09 s**, with calls from **0.02 s** to **0.17 s**. Concat, permute, and repeat use one
+  DPU task; pad+clip uses two; stack+ABS composes two source-layout tasks and one ABS task in one ioctl.
+- The complete native INT16 EW class passes **29/29 in 6.57 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **495 tests**.
+- `sz.py` is unchanged at renderer/runtime **4,949/331 executable lines**, total **30,335**; this milestone is
+  test-only and does not change Tinygrad core.
+
+The CPU-cheat audit found no implementation change and no host-dependent arithmetic decision. The renderer derives
+only static gather plans; opaque INT16 layout movement and every NEG/ABS/ADD/MAX/MIN stage remain on the device path.
+There is no host result calculation, NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or floating input
+wider than FP16.
