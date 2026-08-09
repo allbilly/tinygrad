@@ -2881,3 +2881,52 @@ abstract Boolean selector truth table; it never reads a runtime index, base, or 
 moves opaque bytes at compile-time-proved addresses. Dynamic INT32 conversion and equality, last-wins choice, FP16-byte
 selection, and reductions all execute on DPU EW. There is no host Scatter, typed tensor evaluator, LUT, CMAC, CNA, PPU
 fallback, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — bounded exact FP16 Copysign and forward-only timing census
+
+The complete seven-by-seven upstream Copysign value matrix now passes bit-exactly for finite values, signed zeros,
+both infinities, and NaN. The Rockchip regression vectorizes the same 49 ordered pairs into one realization and checks
+the raw `uint16` result, making it stricter and much faster than 49 scalar helper invocations.
+
+Tinygrad's signed-zero-aware Copysign graph is recognized before the generic numeric sign rewrite. The strict matcher
+proves its `WHERE(sign<0 OR 1/sign<0, -abs(magnitude), abs(magnitude))` structure, direct FP16 loads, static source
+bounds, and output gather maps. Raw movement packs magnitude-low, magnitude-high, and sign-high bytes into one striped
+matrix. DPU INT32-input conversion maps bytes to exact integers in 0..255, one combined DPU threshold comparison builds
+both high-bit masks, and DPU arithmetic computes `magnitude_high - 128*magnitude_sign + 128*source_sign`. The unchanged
+low byte and replaced high byte are converted and gathered back as raw FP16 output.
+
+Historical exact-Copysign milestone `751a108e2` extracted tensor sign bits with NumPy in the runtime and was not ported.
+`~/npu` and `~/rk3588` expose the ordinary DPU ABS/PReLU register primitives and upstream tests, but no native Copysign
+or bitwise FP16 instruction. The current path therefore uses only raw representation movement and proven DPU EW. To
+bound the reset-heavy four-lane conversion cost without an arbitrary element count, the exact path is admitted only
+when its three-row conversion-tile arena fits one system page; larger finite tensors retain the established numeric
+fast path.
+
+Wall-time work removed two successive bottlenecks. The unchanged 49-scalar upstream method initially took **51.33 s**
+at ten submits per pair. Packing all required bytes into shared matrices reduced it to **35.37 s**. Vectorizing the
+same Cartesian coverage reduced the exact Rockchip test to **3.60 s** pytest time; exact plus the existing broad
+Copysign test passed in **5.54 s**, and the complete sign/softsign class passed **7 tests in 7.25 s**.
+
+The duration-enabled full census before removing two backward-only comparison methods passed **379 tests, 9 skipped,
+182 subtests in 505.96 s**. Because this backend is explicitly forward-only, `test_cmp_ne_backwards` and
+`test_cmp_lt_backwards` were then removed from the Rockchip class; collection now contains 386 nodes instead of 388.
+The slowest forward calls were simple CumMin 26.58 s, Gather 20.79 s, wide MaxUnpool 19.98 s, simple CumMax 19.06 s,
+and tensor fancy indexing 14.52 s.
+
+An instrumented isolated simple CumMin run took **27.49 s**: renderer compilation 8.56 s, nine NPU program calls
+8.43 s, and scheduling/PyTorch/reference overhead 10.31 s. Inside the device calls, 73 soft resets consumed **7.75 s**,
+73 submit ioctls consumed only **0.023 s**, and gather/sync/command preparation consumed 0.65 s. BO initialization was
+0.19 s and copyout 0.001 s. Future CumMin optimization should therefore reduce reset-separated comparison/conversion
+stages; larger command buffers or faster arithmetic cannot materially improve this profile.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before the correctness census and after both full
+  census/profile runs.
+- Repository-wide Ruff and Tinygrad mypy: pass. `git diff --check`: pass. `sz.py`: renderer/runtime **2,813/281
+  executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Host code recognizes static IR, proves addresses, and
+moves opaque bytes; it never reads a sign, classifies a value, or performs Copysign. Byte conversion, high-bit masks,
+sign removal/insertion, and output conversion execute on DPU EW. There is no NumPy tensor evaluator, host Copysign,
+LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than FP16.

@@ -199,9 +199,10 @@ _BS_MUL_COMPARE = 0x40000000
 _BN_CFG_COMPARE = 0x40082
 _BN_MUL_COMPARE = 0x7c000000
 _BN_RELUX_COMPARE = 0x3f800000
-(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN, _NATIVE_POSITIVE_MASK,
- _NATIVE_RELU6, _NATIVE_SIGN) = ("rockchip_abs", "rockchip_ceil", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
-                                "rockchip_min", "rockchip_positive_mask", "rockchip_relu6", "rockchip_sign")
+(_NATIVE_ABS, _NATIVE_CEIL, _NATIVE_COPYSIGN, _NATIVE_FLOOR, _NATIVE_LEAKY_RELU, _NATIVE_MASK_MUL, _NATIVE_MIN,
+ _NATIVE_POSITIVE_MASK, _NATIVE_RELU6, _NATIVE_SIGN) = (
+   "rockchip_abs", "rockchip_ceil", "rockchip_copysign", "rockchip_floor", "rockchip_leaky_relu", "rockchip_mask_mul",
+   "rockchip_min", "rockchip_positive_mask", "rockchip_relu6", "rockchip_sign")
 _EW_RELUX_CMP_RELU6 = struct.unpack("<I", struct.pack("<f", 6.0))[0]
 _EW_CFG = {
   Ops.ADD: _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ADD,
@@ -1675,7 +1676,7 @@ def _raw_fp16_gathers(src_slot:int, raw_slots:tuple[int, int], count:int, offset
                         dst_addend=row*vector_lanes*4, itemsize=1)
                for byte,slot in enumerate(raw_slots) for row,offsets in enumerate(offset_rows))
 
-def _append_byte_conversions(ops:list[RKEWOp], arg:Callable[[int], RKArg], raw:tuple[int, int], half:tuple[int, int],
+def _append_byte_conversions(ops:list[RKEWOp], arg:Callable[[int], RKArg], raw:tuple[int, ...], half:tuple[int, ...],
                              tiles:int, count:int) -> None:
   ops.extend(RKEWOp(arg(dst), arg(src), arg(tiles), count, _EW_CFG[Ops.MAX], int32_input=True) for src,dst in zip(raw, half))
 
@@ -1687,6 +1688,59 @@ def _raw_fp16_output(ops:list[RKEWOp], arg:Callable[[int], RKArg], values:tuple[
   return tuple(RKGather(slot, out_slot, count, offsets=offsets, dst_stride=2, dst_addend=byte,
                         dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
                for byte,slot in enumerate(int_slots))
+
+def _lower_exact_fp16_copysign(output:RKOutput) -> RKImage|None:
+  """Replace only the raw FP16 sign bit using exact byte conversion and DPU masks."""
+  _, out_param, count, out_index, value = output
+  if value.op is not Ops.ADD or value.arg != _NATIVE_COPYSIGN or len(value.src) != 2: return None
+  magnitude, sign = value.src
+  if any(x.op is not Ops.LOAD or x.dtype.scalar() is not dtypes.half or len(x.src) != 1 or x.src[0].op is not Ops.INDEX
+         for x in (magnitude, sign)): return None
+  params = tuple(_root_param(x.src[0]) for x in (magnitude, sign))
+  if any(param is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST for param in params): return None
+  concrete = tuple(param for param in params if param is not None)
+  try: magnitude_offsets, sign_offsets = (_gather_offsets(out_index, x.src[0].src[1], None, count) for x in (magnitude, sign))
+  except RuntimeError: return None
+  if any(not 0 <= offset < int(param.src[0].arg) for offsets,param in zip((magnitude_offsets, sign_offsets), concrete)
+         for offset in offsets): return None
+
+  threshold, sign_value, raw_bytes, half_bytes, convert_tiles, diff, sign_masks, weights, stripped, int_tiles, int_bytes = range(11)
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, 3)
+  high_lanes, output_lanes = 2*vector_lanes, 2*vector_lanes
+  scratch_sizes = [_scratch_bytes(matrix_lanes)] * 11
+  scratch_sizes[raw_bytes] = matrix_lanes*4
+  scratch_sizes[convert_tiles] = ((matrix_lanes+3)//4)*64
+  scratch_sizes[int_tiles] = ((output_lanes+3)//4)*64
+  scratch_sizes[int_bytes] = output_lanes*4
+  magnitude_slot, sign_slot = concrete[0].arg.slot, concrete[1].arg.slot
+  gathers = (RKGather(magnitude_slot, raw_bytes, count, offsets=tuple(offset*2 for offset in magnitude_offsets), dst_stride=4,
+                      itemsize=1),
+             RKGather(magnitude_slot, raw_bytes, count, offsets=tuple(offset*2+1 for offset in magnitude_offsets), dst_stride=4,
+                      dst_addend=vector_lanes*4, itemsize=1),
+             RKGather(sign_slot, raw_bytes, count, offsets=tuple(offset*2+1 for offset in sign_offsets), dst_stride=4,
+                      dst_addend=2*vector_lanes*4, itemsize=1))
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops = [RKEWOp(arg(half_bytes), arg(raw_bytes), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True),
+         RKEWOp(arg(diff), arg(half_bytes, vector_bytes), arg(threshold), high_lanes, _EW_CFG[Ops.SUB]),
+         RKEWOp(arg(sign_masks), arg(diff), arg(diff), high_lanes, _EW_CFG[Ops.MAX], compare=True),
+         RKEWOp(arg(weights), arg(sign_masks), arg(sign_value), high_lanes, _EW_CFG[Ops.MUL], stateful=True),
+         RKEWOp(arg(stripped), arg(half_bytes, vector_bytes), arg(weights), vector_lanes, _EW_CFG[Ops.SUB], stateful=True),
+         RKEWOp(arg(half_bytes, vector_bytes), arg(stripped), arg(weights, vector_bytes), vector_lanes, _EW_CFG[Ops.ADD], stateful=True),
+         RKEWOp(arg(int_bytes), arg(half_bytes), arg(int_tiles), output_lanes, _EW_CFG[Ops.MAX], int32_output=True)]
+  offsets = tuple(range(0, count*4, 4))
+  post = (RKGather(int_bytes, out_param.arg.slot, count, offsets=offsets, dst_stride=2, dst_kind=RKBufferKind.ARG,
+                   src_kind=RKBufferKind.SCRATCH, itemsize=1),
+          RKGather(int_bytes, out_param.arg.slot, count, offsets=tuple(vector_lanes*4+offset for offset in offsets), dst_stride=2,
+                   dst_addend=1, dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<ee", 127.0, 128.0),
+                 gathers=gathers, ew_ops=tuple(ops), post_gathers=post)
+
+def _lower_bounded_exact_fp16_copysign(uops:list[UOp]) -> RKImage|None:
+  """Keep the reset-heavy raw-bit path within one page of four-lane conversion tiles."""
+  if (output:=_output_store(uops, dtypes.half)) is None: return None
+  matrix_lanes = _stripe_layout(output[2], 3)[2]
+  if ((matrix_lanes+3)//4)*64 > os.sysconf("SC_PAGESIZE"): return None
+  return None if (tagged:=_fold_copysign(output[4])) is None else _lower_exact_fp16_copysign((*output[:4], tagged))
 
 def _dynamic_fp16_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIndex, ...], plans:tuple[RKGather, ...],
                                coordinates:tuple[tuple[int, ...], ...]) -> RKImage|None:
@@ -2877,6 +2931,23 @@ def _fold_abs(x:UOp) -> UOp|None:
       return UOp(Ops.MAX, x.dtype, src=(value, value), arg=_NATIVE_ABS)
   return None
 
+def _fold_copysign(x:UOp) -> UOp|None:
+  """Recognize Tinygrad's signed-zero-aware copysign graph before numeric sign folding."""
+  if x.op is not Ops.WHERE or len(x.src) != 3: return None
+  condition, negative, positive = x.src
+  if condition.op is not Ops.OR or negative.op is not Ops.MUL or positive.op is not Ops.MUL: return None
+  negated = _const_operand(negative, Ops.MUL, -1.0)
+  absolute = _fold_abs(positive)
+  if negated is None or negated[0].key != positive.key or absolute is None: return None
+  def lt_zero(root:UOp) -> UOp|None:
+    return root.src[0] if root.op is Ops.CMPLT and root.src[1].op is Ops.CONST and float(root.src[1].arg) == 0.0 else None
+  for direct, reciprocal in (condition.src, condition.src[::-1]):
+    sign, inverse = lt_zero(direct), lt_zero(reciprocal)
+    if (sign is not None and inverse is not None and inverse.op is Ops.FDIV and inverse.src[0].op is Ops.CONST and
+        float(inverse.src[0].arg) == 1.0 and inverse.src[1].key == sign.key):
+      return UOp(Ops.ADD, x.dtype, src=(absolute.src[0], sign), arg=_NATIVE_COPYSIGN)
+  return None
+
 def _fold_floor_ceil(x:UOp) -> UOp|None:
   """Recognize Tinygrad's TRUNC-based floor/ceil expansions and select the native DPU ALU."""
   condition, adjusted, truncated = x.src
@@ -3019,4 +3090,6 @@ class RockchipRenderer(Renderer):
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
   def supported_dtypes(self): return {dtypes.half}
-  def render(self, uops:list[UOp]) -> str: return base64.b64encode(encode_image(lower_ew(_fp16_rewrite(uops)))).decode()
+  def render(self, uops:list[UOp]) -> str:
+    image = _lower_bounded_exact_fp16_copysign(uops)
+    return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()

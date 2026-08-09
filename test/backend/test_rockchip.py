@@ -860,6 +860,13 @@ class TestRockchipSignOps(unittest.TestCase):
   test_softsign = _test_ops.TestOps.test_softsign
   test_softsign_exact = _test_ops.TestOps.test_softsign_exact
 
+  def test_copysign_exact(self):
+    values = np.array([-1., -0., 0., 1., math.inf, -math.inf, math.nan], dtype=np.float16)
+    magnitude, sign = np.repeat(values, len(values)), np.tile(values, len(values))
+    expected = np.copysign(magnitude, sign)
+    got = Tensor(magnitude).copysign(Tensor(sign)).realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
   def test_sign_nonfinite(self):
     values = np.array([-math.inf, -1., -0., 0., 1., math.inf, math.nan], dtype=np.float16)
     before = Device["ROCKCHIP"].submit_count
@@ -929,24 +936,6 @@ class TestRockchipComparisonOps(unittest.TestCase):
   def test_cmp_ge(self): self._test_cmp(lambda x,y:x >= y)
   def test_cmp_lt(self): self._test_cmp(lambda x,y:x < y)
   def test_cmp_le(self): self._test_cmp(lambda x,y:x <= y)
-
-  def _test_cmp_backward(self, predicate, expected_submits:int):
-    values = np.array([-math.inf, -2.0, -0.0, 0.0, 0.5, math.inf, math.nan], dtype=np.float16)
-    x = Tensor(values)
-    (x * predicate(x)).sum().backward()
-    tx = torch.tensor(values, requires_grad=True)
-    (tx * predicate(tx)).sum().backward()
-    assert x.grad is not None and tx.grad is not None
-    dev = Device["ROCKCHIP"]
-    before, before_tasks = dev.submit_count, dev.task_count
-    got = x.grad.numpy()
-    submits, tasks = dev.submit_count-before, dev.task_count-before_tasks
-    print(f"  {self._testMethodName}: tasks={tasks} submits={submits} (expected {expected_submits})")
-    np.testing.assert_equal(got, tx.grad.numpy())
-    self.assertEqual(submits, expected_submits)
-
-  def test_cmp_ne_backwards(self): self._test_cmp_backward(lambda x:x != 0, 2)
-  def test_cmp_lt_backwards(self): self._test_cmp_backward(lambda x:x < 0, 11)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(unittest.TestCase):
