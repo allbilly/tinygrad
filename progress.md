@@ -4825,3 +4825,17 @@ The CPU-cheat audit found only allocation ownership and cache-maintenance change
 opaque bytes and preserves the existing DPU addresses; it performs no tensor-value interpretation or numeric result
 calculation. The three promoted methods use the existing DPU EW/reduction path. There is no Tinygrad-core change, host
 loss computation, LUT, CMAC, FP32 input emulation, or tolerance relaxation beyond `test_gemm_fp16`.
+
+---
+
+## 2026-08-10 — hyperbolic batch admission
+
+A serial batch screened the eight remaining trigonometric and hyperbolic upstream methods under the established FP16
+contract. The unchanged `test_sinh` and `test_cosh` methods already execute correctly through the no-LUT EXP2 DPU
+composition and now belong to `test_rockchip.py`; together they pass **2/2 in 2.91 s**. ACOSH/ASINH still need robust
+large-magnitude and domain handling, ATAN needs large-magnitude selection, and SIN/COS/TAN still expose unsupported
+Tinygrad range-reduction graphs. Their provisional aliases were removed.
+
+- `test_rockchip.py`: **398 collected cases**, representing **375 unique upstream methods**.
+- Authoritative upstream-name remainder: **46 of 421**.
+- No Tinygrad-core change, host numerical computation, LUT, CMAC, tolerance change, or NPU timeout was involved.

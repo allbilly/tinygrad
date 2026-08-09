@@ -826,6 +826,8 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
   test_tanh = _test_ops.TestOps.test_tanh
   test_tanh_extreme = _test_ops.TestOps.test_tanh_extreme
   test_atanh = _test_ops.TestOps.test_atanh
+  test_sinh = _test_ops.TestOps.test_sinh
+  test_cosh = _test_ops.TestOps.test_cosh
   test_binary_crossentropy = _test_ops.TestOps.test_binary_crossentropy
   test_binary_crossentropy_reductions = _test_ops.TestOps.test_binary_crossentropy_reductions
   test_binary_crossentropy_logits_pos_weights = _test_ops.TestOps.test_binary_crossentropy_logits_pos_weights
