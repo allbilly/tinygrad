@@ -426,6 +426,18 @@ class TestRockchipFancyIndexOps(_base.TestRockchipFancyIndexOps):
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(_base.TestRockchipScatterOps):
+  def test_scatter_upstream_numeric_cases(self):
+    index = torch.randint(3, size=[3,4,5], dtype=torch.int64)
+    dynamic_index = Tensor(index.numpy().astype(np.int32))
+    for dim in (0,1,2,-1,-2,-3):
+      with self.subTest(dim=dim):
+        _fp16_test_op([(4,5,6), (4,5,6)], lambda x,src,dim=dim: x.scatter(dim, index, src),
+                      lambda x,src,dim=dim: x.scatter(dim, dynamic_index, src), forward_only=True)
+    _fp16_test_op([(3,4,5), (3,4,5)], lambda x,src: x.scatter(1, index, src),
+                  lambda x,src: x.scatter(1, dynamic_index, src), forward_only=True)
+    _fp16_test_op([(10,3,10), (10,10,10)], lambda x,src: x.scatter(1, index, src),
+                  lambda x,src: x.scatter(1, dynamic_index, src), forward_only=True)
+
   def test_scatter_static_tensor_source(self):
     index = torch.arange(4, dtype=torch.int64).reshape(2,2)
     _fp16_test_op([(2,4), (2,2)], lambda x,src: x.scatter(1, index, src),

@@ -403,9 +403,16 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
 class TestRockchipScatterOps(unittest.TestCase):
   """16-bit Scatter and FP16 ScatterReduce through static or exact dynamic INT32 selection."""
 
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
   test_scatter_add = _test_ops.TestOps.test_scatter_add
   test_scatter_mul = _test_ops.TestOps.test_scatter_mul
   test_scatter_no_reduce_tensor_src = _test_ops.TestOps.test_scatter_no_reduce_tensor_src
+  test_scatter_reduce = _test_ops.TestOps.test_scatter_reduce
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

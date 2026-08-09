@@ -4568,3 +4568,33 @@ SQRT support; all non-empty standard-deviation methods remain outside the curren
 The CPU-cheat audit found no runtime/core change and no tensor-value inspection. The renderer validates only CAST
 structure and static offsets. Runtime movement zero-extends opaque boolean bytes; both numeric conversions and FP32
 writeback execute on DPU. There is no CPU arithmetic, fallback, LUT, CMAC, tolerance change, or wider input contract.
+
+---
+
+## 2026-08-10 — batched dynamic Scatter and ScatterReduce
+
+Dynamic tensor Scatter and the five tensor ScatterReduce modes now share exact native-INT16 byte equality for external
+INT32 indices. Scatter performs last-wins raw 16-bit selection entirely in the integer EW pipeline. ScatterReduce packs
+the native 0/1 equality result into an FP16 mask at one mid-gather boundary, then performs sum, product, mean, minimum,
+or maximum on DPU EW. Both `include_self` modes are covered. This removes the former four INT32-to-FP16 byte conversions
+and their device resets from every reduction realization.
+
+- The unchanged upstream `test_scatter_reduce` passes all **30 reduction/dimension/include-self cases in 5.31 s** under
+  the established `test_gemm_fp16` tolerance.
+- Direct wall decomposition for those 30 cases: **2.253 s** method wall, **0.191 s / 30** renderer calls,
+  **0.099 s / 30** program calls, **0.013 s / 138** submit ioctls, and **0 resets**. The pre-optimization run had already
+  exceeded **38.58 s** before finishing the mean cases because every realization performed four conversion/reset paths.
+- The unchanged upstream `test_scatter` numeric prefix fell from **39.03 s to 4.20 s**. Its final dtype-error assertion
+  is not valid with `DEFAULT_FLOAT=HALF`, so the unchanged method is not claimed in `test_rockchip.py`; the same eight
+  numeric cases live in `test_rockchip2.py`.
+- The complete Scatter alias/regression batch passes **18 tests / 13 subtests in 11.81 s**.
+- `test_rockchip.py` collects **350 cases** representing **327 unique upstream methods**; `test_rockchip2.py` collects
+  **191 backend-only cases**. The authoritative upstream-name remainder is now **94 of 421**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,807/331 executable lines**, total **31,193**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime or Tinygrad-core modification and no tensor-value inspection. The renderer uses
+only static graph topology, offsets, and constants. Runtime gathers move opaque bytes; index comparison, last-wins
+selection, reduction masks, arithmetic, and output reconstruction all execute on DPU EW. No LUT, CMAC, host result
+calculation, tolerance relaxation beyond `test_gemm_fp16`, or input wider than FP16 was added.
