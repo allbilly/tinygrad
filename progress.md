@@ -4125,3 +4125,30 @@ The CPU-cheat audit found no runtime or core change and no tensor-value read in 
 static scatter layout, candidate coverage, and bounds. Every dynamic equality, duplicate-destination priority mask,
 source/base selection, and output write executes on DPU. There is no host scatter/result calculation, NumPy backend
 evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact fixed-size INT16 masked select on DPU
+
+Fixed-size `masked_select` now compacts signed-INT16 values under an external boolean mask, truncates or pads to the
+requested output size, and preserves every selected/fill bit exactly. The existing INT32 selector already computes the
+boolean count and compact-index equality on native INT16 DPU lanes before selecting each representation byte. It is now
+typed by integer dtype and byte width, so INT16 uses the same parser and emitter with two bytes instead of four.
+
+No other branch, `~/npu`, or `~/rk3588` contains an integrated INT16 masked-select implementation. The existing native
+INT32 masked-select milestone provides the complete fixed-output UOp proof and byte-selection image, while
+`~/rk3588/examples/elementwise_int.py` proves its INT16 count, equality, mask, and reduction operations.
+
+- Full-range selected INT16 values, duplicate sign patterns, `-12345` fill, and two-element truncation pass exactly in
+  **1.48 s** within the full-class run.
+- The complete MaskedSelect class passes **6/6 in 27.19 s**. Existing dynamic FP16, exact nonfinite-bit FP16, padding,
+  truncation, and INT32 coverage remain clean. The slowest individual method is **8.66 s**, below 30 seconds.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **483 tests**.
+- `sz.py`: renderer/runtime **4,889/331 executable lines**, total **30,275**. Generalizing byte count adds only two
+  renderer lines, no runtime lines, and no Tinygrad-core changes.
+
+The CPU-cheat audit found no runtime or core change and no host value inspection. Compile time validates only the
+fixed-output compact-index graph and buffer extents. Boolean counting, compact-index equality, validity masks, raw-byte
+selection, and fill composition all execute on DPU. There is no host compaction/result calculation, NumPy backend
+evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.

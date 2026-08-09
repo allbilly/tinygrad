@@ -3455,21 +3455,21 @@ def _lower_fixed_fp16_masked_select(output:RKOutput) -> RKImage|None:
                  gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid_gathers, gather_after=gather_after,
                  post_gathers=post_gathers)
 
-def _lower_fixed_int32_masked_select(output:RKOutput) -> RKImage|None:
-  """Select arbitrary INT32 values by exact byte equality under a complete external bool count."""
+def _lower_fixed_integer_masked_select(output:RKOutput, dtype:DType=dtypes.int) -> RKImage|None:
+  """Select arbitrary integer values by exact byte equality under a complete external bool count."""
   _, out_param, count, out_index, root = output
   if not 1 <= count <= _FP16_EXACT_INTEGER or root.op is not Ops.WHERE or len(root.src) != 3: return None
   condition, selected, fill = root.src
   if (condition.op is not Ops.CMPLT or condition.src[0].key != out_index.key or
-      fill.op is not Ops.CONST or fill.dtype.scalar() is not dtypes.int or
-      selected.op is not Ops.LOAD or selected.dtype.scalar() is not dtypes.int or len(selected.src) != 3 or
+      fill.op is not Ops.CONST or fill.dtype.scalar() is not dtype or
+      selected.op is not Ops.LOAD or selected.dtype.scalar() is not dtype or len(selected.src) != 3 or
       selected.src[0].op is not Ops.INDEX or selected.src[1].op is not Ops.CONST or int(selected.src[1].arg) != 0): return None
   if (mask_info:=_full_bool_count(condition.src[1], out_index, count)) is None or mask_info[1] != 1: return None
   mask_param = mask_info[0]
   source_count = int(mask_param.src[0].arg)
   data_param, data_index, gate = _root_param(selected.src[0]), selected.src[0].src[1], selected.src[2]
   index_loads = [u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int]
-  if (data_param is None or data_param.dtype.scalar() is not dtypes.int or data_param.src[0].op is not Ops.CONST or
+  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or
       int(data_param.src[0].arg) != source_count or len(index_loads) != 1 or data_index.key != index_loads[0].key): return None
   index_load = index_loads[0]
   index_param = _root_param(index_load.src[0]) if index_load.src and index_load.src[0].op is Ops.INDEX else None
@@ -3500,13 +3500,14 @@ def _lower_fixed_int32_masked_select(output:RKOutput) -> RKImage|None:
   gathers.extend((RKGather(mask_param.arg.slot, output_coordinate, count, values=tuple(range(count)), itemsize=2),
                   RKGather(mask_param.arg.slot, zero, count, values=(0,)*count, itemsize=2),
                   RKGather(mask_param.arg.slot, one, count, values=(1,)*count, itemsize=2)))
-  raw_values = tuple(scratch(matrix_lanes*2) for _ in range(4))
+  itemsize = dtype.itemsize
+  raw_values = tuple(scratch(matrix_lanes*2) for _ in range(itemsize))
   for byte,slot in enumerate(raw_values):
-    gathers.extend(RKGather(data_param.arg.slot, slot, count, offsets=(coordinate*4+byte,)*count,
+    gathers.extend(RKGather(data_param.arg.slot, slot, count, offsets=(coordinate*itemsize+byte,)*count,
                            dst_addend=coordinate*vector_bytes, dst_stride=2, itemsize=1)
                    for coordinate in range(source_count))
-  fill_bits = int(fill.arg) & 0xffffffff
-  fill_slots = tuple(scratch(count*2) for _ in range(4))
+  fill_bits = int(fill.arg) & ((1 << (itemsize*8))-1)
+  fill_slots = tuple(scratch(count*2) for _ in range(itemsize))
   for byte,slot in enumerate(fill_slots):
     gathers.append(RKGather(mask_param.arg.slot, slot, count, values=((fill_bits >> (byte*8)) & 0xff,)*count, itemsize=2))
 
@@ -3527,7 +3528,7 @@ def _lower_fixed_int32_masked_select(output:RKOutput) -> RKImage|None:
                 RKEWOp(arg(result), arg(guarded), arg(fill_part), count, _EW_CFG[Ops.ADD], **int16)))
     results.append(arg(result))
   post = tuple(RKGather(value.index, out_param.arg.slot, count,
-                        offsets=tuple(value.addend+lane*2 for lane in range(count)), dst_stride=4, dst_addend=byte,
+                        offsets=tuple(value.addend+lane*2 for lane in range(count)), dst_stride=itemsize, dst_addend=byte,
                         dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
                for byte,value in enumerate(results))
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
@@ -4707,6 +4708,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew
   if (int16_extrema:=_lower_int16_loop_extrema(uops)) is not None: return int16_extrema
   if (int16_output:=_output_store(uops, dtypes.int16)) is not None:
+    if (fixed_select:=_lower_fixed_integer_masked_select(int16_output, dtypes.int16)) is not None: return fixed_select
     if (unrolled_fancy:=_lower_unrolled_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return unrolled_fancy
     if (dynamic_gather:=_lower_dynamic_16bit_gather(int16_output, dtypes.int16)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return fancy_index
@@ -4745,7 +4747,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (int32_prefix:=_lower_unrolled_int32_prefix_count(int_output)) is not None: return int32_prefix
     if (bool_prefix:=_lower_unrolled_bool_prefix_count(int_output)) is not None: return bool_prefix
-    if (fixed_int_select:=_lower_fixed_int32_masked_select(int_output)) is not None: return fixed_int_select
+    if (fixed_int_select:=_lower_fixed_integer_masked_select(int_output)) is not None: return fixed_int_select
     if (predicate_total:=_lower_unrolled_fp16_predicate_total(int_output)) is not None: return predicate_total
     if (positive_prefix:=_lower_unrolled_fp16_prefix_count(int_output)) is not None: return positive_prefix
     if (fixed_int_nonzero:=_lower_fixed_int32_nonzero(int_output)) is not None: return fixed_int_nonzero

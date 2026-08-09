@@ -541,7 +541,7 @@ class TestRockchipGatherOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMaskedSelectOps(unittest.TestCase):
-  """Forward-only bounded FP16 and INT32 selection through DPU masks and raw-byte gathers."""
+  """Forward-only bounded FP16 and integer selection through DPU masks and raw-byte gathers."""
 
   test_masked_select_size = _test_ops.TestOps.test_masked_select_size
 
@@ -566,6 +566,15 @@ class TestRockchipMaskedSelectOps(unittest.TestCase):
     source = Tensor(values, device="ROCKCHIP")
     got = source.masked_select(source > 0, size=5, fill_value=-0.0).numpy()
     np.testing.assert_array_equal(got.view(np.uint16), expected)
+
+  def test_fixed_masked_select_int16(self):
+    values = np.array([-32768, -30000, -1, 0, 1, 30000, 32767], dtype=np.int16)
+    mask = np.array([True, False, True, False, False, True, True])
+    source, predicate = Tensor(values, device="ROCKCHIP"), Tensor(mask, device="ROCKCHIP")
+    got = source.masked_select(predicate, size=6, fill_value=-12345).numpy()
+    np.testing.assert_array_equal(got, np.array([-32768, -1, 30000, 32767, -12345, -12345], dtype=np.int16))
+    source, predicate = Tensor(values, device="ROCKCHIP"), Tensor(mask, device="ROCKCHIP")
+    np.testing.assert_array_equal(source.masked_select(predicate, size=2).numpy(), np.array([-32768, -1], dtype=np.int16))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipNonzeroOps(unittest.TestCase):
