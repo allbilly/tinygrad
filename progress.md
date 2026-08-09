@@ -3420,3 +3420,36 @@ existing DPU-only dot path. `~/rk3588/examples/elementwise.py` independently pro
 The CPU-cheat audit found that all six operands are realized external FP16 Rockchip buffers before timing/submission.
 Runtime performs only raw layout gathers; every value-dependent multiplication and addition executes on DPU EW. There
 is no CPU constant-fold result, CMAC, LUT, host reduction, tolerance relaxation, or Tinygrad-core change.
+
+---
+
+## 2026-08-09 — large boolean ALL reductions
+
+The exact upstream `test_all_large` method now covers `2**15`, `2**16`, and `2**20` on Rockchip. Tinygrad's ordinary
+non-local schedule expands the first `2**20` reduction into enough scalar UOps to consume more than five minutes and
+about 2.1 GiB before rendering. A cache-distinct `ROCKCHIP:BOOL` renderer mode instead accepts Tinygrad's compact
+16-lane grouped loop and proves its static launch coordinates form a complete source permutation before emitting DPU
+work. The default Rockchip renderer remains non-local, so unrelated elementwise, pooling, convolution, and GEMM
+schedules are unchanged.
+
+Contiguous FP16 blocks use a direct in-place DPU tree: FP16 nonzero comparison produces the mask, MAX/MUL performs
+ANY/ALL, and the existing DPU conversion exposes the exact bool byte. Tinygrad's second reduction reads an opaque bool
+buffer; bytes are widened into zeroed INT16 lanes, reduced by native INT16 MAX/MUL, then copied back as raw bool bytes.
+Non-contiguous grouped axes retain the proven striped-gather path. Historical `03bad6205` used CMAC plus host
+bool/FP16 conversion, and `~/rk3588`/`~/npu` contain no pure-bool reference, so neither older approach was ported.
+
+- Exact upstream focused pytest: **1 passed in 9.70 s** for all three sizes; the post-cleanup rerun passed in **11.84 s**.
+- Largest direct profile (`2**20`): **5.179 s total** = 1.2 ms graph construction + **5.174 s realization** + 3.4 ms
+  copyout; **26 ioctls / 3,195 DPU tasks**. Code generation alone is **0.372 s**, down from over five minutes.
+- Existing scalar and non-contiguous-axis ANY/ALL regressions pass individually after the grouped matcher addition.
+- Full serial Rockchip census: **439 passed, 9 skipped, 187 subtests passed** in **679.12 s**; collection is **448 tests**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the census. The first attempt exposed and led
+  to termination of a leaked host-only scheduler experiment; it was not an NPU timeout or wedge.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **3,983/307 executable lines**, total **29,345**. Shared contiguous block-tree emission
+  removes the duplicate FP16/INT16 reduction loop.
+
+The CPU-cheat audit found only compile-time evaluation of scheduler coordinates and a bijection proof over integer
+offsets. Runtime gathers never inspect values: they move opaque FP16 or bool bytes. Every input-dependent comparison,
+AND/OR reduction, and output conversion executes on DPU EW. There is no host numeric reduction, CMAC, LUT, tolerance
+change, floating input wider than FP16, or Tinygrad-core modification.

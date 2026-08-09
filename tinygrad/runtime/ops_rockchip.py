@@ -3,7 +3,7 @@ import ctypes, mmap, os, time
 import numpy as np
 from tinygrad.device import BufferSpec, Compiled, LRUAllocator, Program, TinyELF
 from tinygrad.helpers import from_mv, suppress_finalizing, to_mv
-from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, decode_image, patch_stage, emit_ew_stage,
+from tinygrad.renderer.rockchip import (RKBufferKind, RockchipRenderer, RockchipBoolRenderer, decode_image, patch_stage, emit_ew_stage,
   RKArg, RKGather, RKEWOp, _MAX_EW_ELEMS_FP16, _EW_STAGE_FP32_OUT)
 from tinygrad.runtime.autogen import rockchip as rk
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQBuffer
@@ -303,7 +303,7 @@ class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count = self.task_count = 0
-    super().__init__(device, RockchipAllocator(self), [RockchipRenderer], RockchipProgram)
+    super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)
     try: meta = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=alloc, flags=flags|_BO_FLAGS)
