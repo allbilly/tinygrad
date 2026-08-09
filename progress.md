@@ -4095,3 +4095,33 @@ The CPU-cheat audit found no runtime or core change. Compile time evaluates only
 coordinate domains; runtime performs the existing raw byte gathers. Every input-dependent index equality, candidate
 mask, and selection reduction executes on DPU. There is no host indexing/result calculation, NumPy backend evaluation,
 LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact dynamic INT16 scatter on DPU
+
+Dynamic INT32 scatter indices now assign signed-INT16 values exactly with Tinygrad's last-wins semantics. The existing
+FP16 scatter image already selects raw two-byte representations: it compares all four index bytes on DPU, constructs
+reverse-order effective masks for duplicate destinations, selects source or preserved base bytes, and writes those
+bytes unchanged. Its image, gather/output helpers, and parser are now named and typed for either FP16 or INT16 instead
+of duplicating the algorithm.
+
+No other branch, `~/npu`, or `~/rk3588` contains an integrated INT16 scatter implementation. Historical Rockchip
+commits `826e67550` and `eef7cecce` provide the bounded and multidimensional FP16 scatter parser structure;
+`~/rk3588/examples/elementwise_int.py` proves the native INT16 comparison, mask, and arithmetic operations used by the
+shared image.
+
+- A full-range signed-INT16 vector with repeated destinations passes exactly in **1.84 s**, proving that the later
+  `32767` and `1234` writes replace earlier `-32768` and `-30000` writes. A multidimensional axis scatter passes in
+  **1.59 s**.
+- The complete Scatter class passes **15 tests plus 7 subtests in 18.79 s**. Existing FP16 nonfinite/raw-bit and
+  multidimensional cases remain exact; the slowest individual method is **4.41 s**, well below 30 seconds.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **482 tests**.
+- `sz.py`: renderer/runtime **4,887/331 executable lines**, total **30,273**. Sharing the existing raw 16-bit path adds
+  one renderer dispatch line, no runtime lines, and no Tinygrad-core changes.
+
+The CPU-cheat audit found no runtime or core change and no tensor-value read in the renderer. Compile time checks only
+static scatter layout, candidate coverage, and bounds. Every dynamic equality, duplicate-destination priority mask,
+source/base selection, and output write executes on DPU. There is no host scatter/result calculation, NumPy backend
+evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.

@@ -819,7 +819,7 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(unittest.TestCase):
-  """FP16 Scatter and ScatterReduce through static or exact dynamic INT32 selection."""
+  """16-bit Scatter and FP16 ScatterReduce through static or exact dynamic INT32 selection."""
 
   test_scatter_add = _test_ops.TestOps.test_scatter_add
   test_scatter_mul = _test_ops.TestOps.test_scatter_mul
@@ -892,6 +892,29 @@ class TestRockchipScatterOps(unittest.TestCase):
           expected[tuple(target)] = values[position]
         got = Tensor(base).scatter(dim, Tensor(indices), Tensor(values)).realize().numpy()
         np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
+  def test_scatter_dynamic_int16(self):
+    base = np.array([-32768, -30000, -1, 0, 1, 30000, 32767, 123], dtype=np.int16)
+    indices = np.array([2, 2, 7, 0, 7, 4], dtype=np.int32)
+    values = np.array([-32768, 32767, -30000, 30000, 1234, -1234], dtype=np.int16)
+    expected = base.copy()
+    for lane,dst in enumerate(indices): expected[dst] = values[lane]
+    got = Tensor(base).scatter(0, Tensor(indices), Tensor(values)).realize().numpy()
+    self.assertEqual(got.dtype, np.int16)
+    np.testing.assert_array_equal(got, expected)
+
+  def test_scatter_dynamic_multidim_int16(self):
+    base = np.array([[-32768, -1, 32767], [30000, 0, -30000]], dtype=np.int16)
+    indices = np.array([[2, 0, 2], [1, 1, 0]], dtype=np.int32)
+    values = np.array([[1234, -1234, 30000], [32767, -32768, 1]], dtype=np.int16)
+    expected = base.copy()
+    for position in np.ndindex(indices.shape):
+      target = list(position)
+      target[1] = int(indices[position])
+      expected[tuple(target)] = values[position]
+    got = Tensor(base).scatter(1, Tensor(indices), Tensor(values)).realize().numpy()
+    self.assertEqual(got.dtype, np.int16)
+    np.testing.assert_array_equal(got, expected)
 
   def test_scatter_dynamic_scalar_reductions(self):
     base = np.array([1.0, -2.0, 3.0, 4.0], dtype=np.float16)

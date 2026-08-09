@@ -2555,8 +2555,8 @@ def _max_unpool_image(out_slot:int, count:int, out_spatial:int, source_count:int
                  mid_gathers=mid_gathers, gather_after=1)
 
 RKDynamicIndex = tuple[int, int, tuple[int, ...]]
-def _raw_fp16_gathers(src_slot:int, raw_slots:tuple[int, int], count:int, offset_rows:tuple[tuple[int, ...], ...],
-                      vector_lanes:int) -> tuple[RKGather, ...]:
+def _raw_16bit_gathers(src_slot:int, raw_slots:tuple[int, int], count:int, offset_rows:tuple[tuple[int, ...], ...],
+                       vector_lanes:int) -> tuple[RKGather, ...]:
   return tuple(RKGather(src_slot, slot, count, offsets=tuple(offset*2+byte for offset in offsets), dst_stride=4,
                         dst_addend=row*vector_lanes*4, itemsize=1)
                for byte,slot in enumerate(raw_slots) for row,offsets in enumerate(offset_rows))
@@ -2565,8 +2565,8 @@ def _append_byte_conversions(ops:list[RKEWOp], arg:Callable[[int], RKArg], raw:t
                              tiles:int, count:int) -> None:
   ops.extend(RKEWOp(arg(dst), arg(src), arg(tiles), count, _EW_CFG[Ops.MAX], int32_input=True) for src,dst in zip(raw, half))
 
-def _raw_fp16_output(ops:list[RKEWOp], arg:Callable[[int], RKArg], values:tuple[RKArg, RKArg], count:int, tiles:int,
-                     int_slots:tuple[int, int], out_slot:int, int16_output:bool=False) -> tuple[RKGather, ...]:
+def _raw_16bit_output(ops:list[RKEWOp], arg:Callable[[int], RKArg], values:tuple[RKArg, RKArg], count:int, tiles:int,
+                      int_slots:tuple[int, int], out_slot:int, int16_output:bool=False) -> tuple[RKGather, ...]:
   ops.extend(RKEWOp(arg(dst), value, value if int16_output else arg(tiles), count, _EW_CFG[Ops.MAX],
                     submit_barrier=int16_output, int32_output=not int16_output, int16_output=int16_output)
              for value,dst in zip(values, int_slots))
@@ -2710,11 +2710,11 @@ def _dynamic_16bit_gather_image(out_slot:int, count:int, indices:tuple[RKDynamic
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers),
                  ew_ops=tuple(ops), post_gathers=post_gathers)
 
-def _dynamic_fp16_scatter_image(out_slot:int, count:int, index_slot:int, index_count:int,
-                                index_offset_rows:tuple[tuple[int, ...], ...], coordinate_rows:tuple[tuple[int, ...], ...],
-                                source_slot:int, source_offset_rows:tuple[tuple[int, ...], ...],
-                                base_slot:int, base_offsets:tuple[int, ...]) -> RKImage|None:
-  """Apply a bounded last-wins Scatter through exact INT32 equality and raw FP16 byte selection."""
+def _dynamic_16bit_scatter_image(out_slot:int, count:int, index_slot:int, index_count:int,
+                                 index_offset_rows:tuple[tuple[int, ...], ...], coordinate_rows:tuple[tuple[int, ...], ...],
+                                 source_slot:int, source_offset_rows:tuple[tuple[int, ...], ...],
+                                 base_slot:int, base_offsets:tuple[int, ...]) -> RKImage|None:
+  """Apply bounded last-wins Scatter through exact INT32 equality and raw 16-bit selection."""
   rows = len(index_offset_rows)
   if (not rows or len(coordinate_rows) != rows or len(source_offset_rows) != rows or len(base_offsets) != count or
       any(len(row) != count for row in (*index_offset_rows, *coordinate_rows, *source_offset_rows))): return None
@@ -2734,8 +2734,8 @@ def _dynamic_fp16_scatter_image(out_slot:int, count:int, index_slot:int, index_c
   scratch_sizes[int_tiles] = _int32_tiles_bytes(count)
   scratch_sizes[int_low] = scratch_sizes[int_high] = count*4
 
-  gathers = list(equality.gathers + _raw_fp16_gathers(source_slot, raw_source, count, source_offset_rows, equality.vector_lanes) +
-                 _raw_fp16_gathers(base_slot, raw_base, count, (base_offsets,), count))
+  gathers = list(equality.gathers + _raw_16bit_gathers(source_slot, raw_source, count, source_offset_rows, equality.vector_lanes) +
+                 _raw_16bit_gathers(base_slot, raw_base, count, (base_offsets,), count))
 
   def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   ops = list(equality.pre_ops)
@@ -2759,8 +2759,8 @@ def _dynamic_fp16_scatter_image(out_slot:int, count:int, index_slot:int, index_c
              for src,dst in zip(half_base, result))
   ops.extend(RKEWOp(arg(dst), candidate, arg(dst), count, _EW_CFG[Ops.ADD], submit_barrier=True, stateful=True)
              for candidate,dst in zip(reduced, result))
-  post_gathers = _raw_fp16_output(ops, arg, (arg(result[0]), arg(result[1])), count, int_tiles,
-                                  (int_low, int_high), out_slot)
+  post_gathers = _raw_16bit_output(ops, arg, (arg(result[0]), arg(result[1])), count, int_tiles,
+                                   (int_low, int_high), out_slot)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
                  gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=equality.mid_gathers, gather_after=gather_after,
                  post_gathers=post_gathers)
@@ -3407,7 +3407,7 @@ def _lower_fixed_fp16_masked_select(output:RKOutput) -> RKImage|None:
   source_rows = tuple((coordinate,)*count for coordinate in coordinates)
   coordinate_rows = tuple((_fp16_bits(coordinate),)*count for coordinate in coordinates)
   gathers = list(_stripe_gathers(source.arg.slot, coordinate_matrix, count, coordinate_rows, vector_lanes, values=True) +
-                 _raw_fp16_gathers(source.arg.slot, raw_source, source_count, (tuple(range(source_count)),), source_count))
+                 _raw_16bit_gathers(source.arg.slot, raw_source, source_count, (tuple(range(source_count)),), source_count))
   gathers.extend(_stripe_gathers(source.arg.slot, source_values, 1, ((lane,) for lane in range(source_count)), vector_lanes))
   max_bits, negmax_bits = _fp16_bits(65504), _fp16_bits(-65504)
   gathers.extend((RKGather(source.arg.slot, maximum, matrix_lanes, values=(max_bits,)*matrix_lanes),
@@ -3449,8 +3449,8 @@ def _lower_fixed_fp16_masked_select(output:RKOutput) -> RKImage|None:
              for src,dst in zip(fill_bytes, fill_parts))
   ops.extend(RKEWOp(arg(dst), arg(selected_slot), arg(fill_slot), count, _EW_CFG[Ops.ADD], submit_barrier=True, stateful=True)
              for selected_slot,fill_slot,dst in zip(guarded_bytes, fill_parts, result))
-  post_gathers = _raw_fp16_output(ops, arg, (arg(result[0]), arg(result[1])), count, int_tiles, int_bytes,
-                                  out_param.arg.slot)
+  post_gathers = _raw_16bit_output(ops, arg, (arg(result[0]), arg(result[1])), count, int_tiles, int_bytes,
+                                   out_param.arg.slot)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
                  gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid_gathers, gather_after=gather_after,
                  post_gathers=post_gathers)
@@ -3703,8 +3703,8 @@ def _lower_multi_16bit_fancy_index(output:RKOutput, dtype:DType=dtypes.half) -> 
                      for axis,(_,_,extent,wrapped) in zip(coordinates, axes))
   return _dynamic_16bit_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
-def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
-  """Lower a bounded last-wins Scatter selector with one external INT32 index buffer."""
+def _lower_dynamic_16bit_scatter(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
+  """Lower bounded last-wins Scatter for 16-bit values and one external INT32 index buffer."""
   _, out_param, count, out_index, value = output
   if count <= 0 or value.op is not Ops.WHERE: return None
   int_loads = tuple({u.key:u for u in value.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int and
@@ -3740,7 +3740,7 @@ def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
     return lhs != rhs if root.op is Ops.CMPNE else lhs and rhs if root.op is Ops.AND else lhs or rhs
 
   def selected(root:UOp, matches:int) -> UOp:
-    if root.op is Ops.LOAD and root.dtype.scalar() is dtypes.half and len(root.src) == 1 and root.src[0].op is Ops.INDEX: return root
+    if root.op is Ops.LOAD and root.dtype.scalar() is dtype and len(root.src) == 1 and root.src[0].op is Ops.INDEX: return root
     if root.op is not Ops.WHERE or len(root.src) != 3: raise RuntimeError("RKPLAN_REJECT:scatter_selection")
     return selected(root.src[1] if predicate(root.src[0], matches) else root.src[2], matches)
 
@@ -3753,8 +3753,8 @@ def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
   except RuntimeError: return None
   base_param = _root_param(base.src[0])
   source_params = tuple(_root_param(source.src[0]) for source in sources)
-  if (base_param is None or base_param.dtype.scalar() is not dtypes.half or base_param.src[0].op is not Ops.CONST or
-      any(param is None or param.dtype.scalar() is not dtypes.half or param.src[0].op is not Ops.CONST for param in source_params) or
+  if (base_param is None or base_param.dtype.scalar() is not dtype or base_param.src[0].op is not Ops.CONST or
+      any(param is None or param.dtype.scalar() is not dtype or param.src[0].op is not Ops.CONST for param in source_params) or
       len({param.arg.slot for param in source_params if param is not None}) != 1): return None
   source_param = next(param for param in source_params if param is not None)
   try:
@@ -3765,9 +3765,9 @@ def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
   if (any(not 0 <= offset < base_count for offset in base_offsets) or
       any(not 0 <= offset < source_count for offsets in source_offset_rows for offset in offsets)): return None
   coordinate_rows = tuple(coordinates for _,_,_,coordinates in entries)
-  return _dynamic_fp16_scatter_image(out_param.arg.slot, count, index_param.arg.slot, index_count,
-                                     index_offset_rows, coordinate_rows, source_param.arg.slot, source_offset_rows,
-                                     base_param.arg.slot, base_offsets)
+  return _dynamic_16bit_scatter_image(out_param.arg.slot, count, index_param.arg.slot, index_count,
+                                      index_offset_rows, coordinate_rows, source_param.arg.slot, source_offset_rows,
+                                      base_param.arg.slot, base_offsets)
 
 def _affine_load_offset(root:UOp, load:UOp) -> int|None:
   """Return the constant in an integer `load + constant` expression."""
@@ -4710,6 +4710,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (unrolled_fancy:=_lower_unrolled_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return unrolled_fancy
     if (dynamic_gather:=_lower_dynamic_16bit_gather(int16_output, dtypes.int16)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return fancy_index
+    if (scatter:=_lower_dynamic_16bit_scatter(int16_output, dtypes.int16)) is not None: return scatter
   if (float_output:=_output_store(uops, dtypes.float)) is not None and \
      (fp16_cast:=_lower_fp16_fp32_cast(float_output)) is not None: return fp16_cast
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
@@ -4733,7 +4734,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (dynamic_gather:=_lower_dynamic_16bit_gather(half_output)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_16bit_fancy_index(half_output)) is not None: return fancy_index
     if (scatter_reduce:=_lower_dynamic_scalar_scatter_reduce(half_output)) is not None: return scatter_reduce
-    if (scatter:=_lower_dynamic_fp16_scatter(half_output)) is not None: return scatter
+    if (scatter:=_lower_dynamic_16bit_scatter(half_output)) is not None: return scatter
   if (half_loop_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
      (loop_max_unpool:=_lower_loop_max_unpool(uops, half_loop_output)) is not None: return loop_max_unpool
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
