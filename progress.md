@@ -4062,3 +4062,36 @@ The CPU-cheat audit found no runtime change and no tensor-value evaluation in th
 static layouts and coordinates; runtime retains the existing raw gathers. Every dynamic index comparison, value mask,
 typed conversion, duplicate accumulation, and output write executes on DPU. There is no host scatter/sum, NumPy backend
 evaluation, LUT, CMAC, tolerance relaxation, or Tinygrad-core change.
+
+---
+
+## 2026-08-09 — exact dynamic INT16 gather and fancy indexing on DPU
+
+Dynamic INT32 gather indices now select signed-INT16 tensors exactly, including out-of-range zero fill, Python-style
+negative fancy indices, and multiple simultaneous fancy-index axes. The prior FP16 gather emitter was already a raw
+two-byte selector: it compares all four dynamic index bytes with native INT16 DPU masks, selects each representation
+byte, and post-gathers those bytes unchanged. It is now named and typed as a shared 16-bit image instead of being
+duplicated for INT16.
+
+All three existing parsers—one bounded dynamic index, fully unrolled multi-index selection, and bounded multi-index
+loads—accept an explicit 16-bit value dtype. The generic native INT16 leaf parser now declines loads whose address or
+gate depends on an external tensor, allowing those graphs to reach the specialized dynamic-index validators rather
+than attempting to evaluate a dynamic address at compile time.
+
+No other branch, `~/npu`, or `~/rk3588` contains an integrated INT16 gather implementation. Historical Rockchip commits
+`75100be4a`, `85c85e7fe`, and `ea50b7c96` provide the dynamic/fancy FP16 parser and exact integer-mask structure;
+`~/rk3588/examples/elementwise_int.py` proves the native INT16 equality, MUL, and ADD operations used by the shared
+image.
+
+- Full-range INT16 gather with positive, negative, and multi-byte out-of-range INT32 indices passes exactly in
+  **2.95 s**, asserting **1 ioctl**. Negative row selection and two-axis fancy indexing pass in **3.05 s**.
+- Four representative FP16 gather/fancy regressions pass **4/4 in 7.93 s**. No focused case approaches 30 seconds.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **480 tests**.
+- `sz.py`: renderer/runtime **4,886/331 executable lines**, total **30,272**. Typing and renaming the shared parsers/image
+  adds only six renderer lines, no runtime lines, and no Tinygrad-core changes.
+
+The CPU-cheat audit found no runtime or core change. Compile time evaluates only static candidate offsets, bounds, and
+coordinate domains; runtime performs the existing raw byte gathers. Every input-dependent index equality, candidate
+mask, and selection reduction executes on DPU. There is no host indexing/result calculation, NumPy backend evaluation,
+LUT, CMAC, tolerance relaxation, or floating input wider than FP16.

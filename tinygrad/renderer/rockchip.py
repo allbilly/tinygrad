@@ -2138,7 +2138,9 @@ def _int16_leaf(u:UOp, out_index:UOp, count:int, out_slot:int, static_cache:dict
   if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.int16 or u.src[0].op is not Ops.INDEX or \
      (param:=_root_param(u.src[0])) is None or param.arg.slot == out_slot or param.src[0].op is not Ops.CONST: return None
   index, gate, fill = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None, u.src[1] if len(u.src) > 1 else None
-  if fill is not None and fill.op is not Ops.CONST: return None
+  if (fill is not None and fill.op is not Ops.CONST) or any(x.op is Ops.LOAD for x in index.toposort()) or \
+     gate is not None and any(x.op is Ops.LOAD for x in gate.toposort()):
+    return None
   return RKArg(RKBufferKind.ARG, param.arg.slot) if gate is None and index.key == out_index.key and int(param.src[0].arg) == count else \
     (param, index, gate, _int16_bits(0 if fill is None else fill.arg))
 
@@ -2627,11 +2629,11 @@ def _lower_bounded_exact_fp16_copysign(uops:list[UOp]) -> RKImage|None:
   if _int32_tiles_bytes(matrix_lanes) > os.sysconf("SC_PAGESIZE"): return None
   return None if (tagged:=_fold_copysign(output[4])) is None else _lower_exact_fp16_copysign((*output[:4], tagged))
 
-def _dynamic_fp16_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIndex, ...], plans:tuple[RKGather, ...],
-                               coordinates:tuple[tuple[int, ...], ...],
-                               alternate_coordinates:tuple[tuple[tuple[int, ...], ...], ...]|None=None,
-                               gate:RKDynamicIndex|None=None) -> RKImage|None:
-  """Select raw FP16 bytes with exact native INT16 byte masks, sharing repeated trailing lanes."""
+def _dynamic_16bit_gather_image(out_slot:int, count:int, indices:tuple[RKDynamicIndex, ...], plans:tuple[RKGather, ...],
+                                coordinates:tuple[tuple[int, ...], ...],
+                                alternate_coordinates:tuple[tuple[tuple[int, ...], ...], ...]|None=None,
+                                gate:RKDynamicIndex|None=None) -> RKImage|None:
+  """Select raw FP16 or INT16 bytes with exact native integer masks, sharing repeated trailing lanes."""
   if (not plans or len(coordinates) != len(indices) or any(len(axis) != len(plans) for axis in coordinates) or
       alternate_coordinates is not None and (len(alternate_coordinates) != len(indices) or
         any(any(len(axis) != len(plans) for axis in alternatives) for alternatives in alternate_coordinates)) or
@@ -3531,14 +3533,14 @@ def _lower_fixed_int32_masked_select(output:RKOutput) -> RKImage|None:
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
                  mid_gathers=mid, gather_after=gather_after, post_gathers=post)
 
-def _lower_dynamic_fp16_gather(output:RKOutput) -> RKImage|None:
-  """Recognize Tinygrad's bounds-masked FP16 load addressed by one dynamic INT32 index."""
+def _lower_dynamic_16bit_gather(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
+  """Recognize a bounds-masked 16-bit load addressed by one dynamic INT32 index."""
   _, out_param, count, out_index, load = output
-  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 3 or
-      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0): return None
+  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
+      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0): return None
   data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
   index_loads = [u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int]
-  if (data_param is None or data_param.dtype.scalar() is not dtypes.half or data_param.src[0].op is not Ops.CONST or
+  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or
       len(index_loads) != 1): return None
   index_load = index_loads[0]
   index_param = _root_param(index_load.src[0]) if index_load.src and index_load.src[0].op is Ops.INDEX else None
@@ -3574,10 +3576,10 @@ def _lower_dynamic_fp16_gather(output:RKOutput) -> RKImage|None:
     bool_count = int(bool_param.src[0].arg)
     if any(not 0 <= offset < bool_count for offset in bool_offsets): return None
     external_gate = (bool_param.arg.slot, bool_count, bool_offsets)
-  return _dynamic_fp16_gather_image(out_param.arg.slot, count, ((index_param.arg.slot, index_count, index_offsets),), plans,
-                                    (coordinates,), gate=external_gate)
+  return _dynamic_16bit_gather_image(out_param.arg.slot, count, ((index_param.arg.slot, index_count, index_offsets),), plans,
+                                     (coordinates,), gate=external_gate)
 
-def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
+def _lower_unrolled_multi_16bit_fancy_index(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
   """Collapse Tinygrad's unrolled multi-index selection into compact exact INT32 equality rows."""
   _, out_param, count, out_index, root = output
   terms = _flatten_binary(root, Ops.ADD)
@@ -3604,10 +3606,10 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
 
   candidates:dict[tuple[int, ...], UOp] = {}
   for term in terms:
-    if term.op is not Ops.WHERE or term.dtype.scalar() is not dtypes.half: return None
-    loads = [arm for arm in term.src[1:] if arm.op is Ops.LOAD and arm.dtype.scalar() is dtypes.half and
+    if term.op is not Ops.WHERE or term.dtype.scalar() is not dtype: return None
+    loads = [arm for arm in term.src[1:] if arm.op is Ops.LOAD and arm.dtype.scalar() is dtype and
              len(arm.src) == 1 and arm.src[0].op is Ops.INDEX]
-    zeros = [arm for arm in term.src[1:] if arm.op is Ops.CONST and arm.dtype.scalar() is dtypes.half and float(arm.arg) == 0.0]
+    zeros = [arm for arm in term.src[1:] if arm.op is Ops.CONST and arm.dtype.scalar() is dtype and int(arm.arg) == 0]
     if len(loads) != 1 or len(zeros) != 1 or term.src[1] is not loads[0]: return None
     candidate_coordinates:list[int|None] = [None]*len(axes)
     predicates = _flatten_binary(term.src[0], Ops.AND)
@@ -3631,7 +3633,7 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   candidate_loads = tuple(candidates[values] for values in combinations)
   params = tuple(_root_param(load.src[0]) for load in candidate_loads)
   index_params = tuple(_root_param(load.src[0]) for load in dynamic_loads)
-  if (any(param is None or param.dtype.scalar() is not dtypes.half or
+  if (any(param is None or param.dtype.scalar() is not dtype or
       param.src[0].op is not Ops.CONST for param in params) or len({param.arg.slot for param in params if param is not None}) != 1 or
       any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in index_params)):
     return None
@@ -3650,13 +3652,13 @@ def _lower_unrolled_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(axes)))
   alternates = tuple((tuple(value-extent for value in axis),) if wrapped else ()
                      for axis,(_,_,extent,wrapped) in zip(coordinates, axes))
-  return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
+  return _dynamic_16bit_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
-def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
-  """Lower a bounded FP16 load addressed by positive-only or negative-normalized INT32 tensors."""
+def _lower_multi_16bit_fancy_index(output:RKOutput, dtype:DType=dtypes.half) -> RKImage|None:
+  """Lower a bounded 16-bit load addressed by positive-only or negative-normalized INT32 tensors."""
   _, out_param, count, out_index, load = output
-  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 3 or
-      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0): return None
+  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtype or len(load.src) != 3 or
+      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0): return None
   data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
   normalized = tuple((u, *parsed) for u in data_index.toposort() if (parsed:=_negative_normalized_index(u)) is not None)
   normalized_by_load = {load.key:(root, extent) for root,load,extent in normalized}
@@ -3673,7 +3675,7 @@ def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
       root, extent, wrapped = dynamic, next(iter(limits)), False
     if not _bounded_index_gate(gate, root, extent): return None
     axes.append((root, dynamic, extent, wrapped))
-  if (data_param is None or data_param.dtype.scalar() is not dtypes.half or data_param.src[0].op is not Ops.CONST or
+  if (data_param is None or data_param.dtype.scalar() is not dtype or data_param.src[0].op is not Ops.CONST or
       not axes or len({load.key for load in loads}) != len(loads) or
       {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {u.key for u in loads} or
       any(root.key not in {u.key for u in data_index.toposort()} for root,_,_,_ in axes)): return None
@@ -3699,7 +3701,7 @@ def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   coordinates = tuple(tuple(values[axis] for values in combinations) for axis in range(len(loads)))
   alternates = tuple((tuple(value-extent for value in axis),) if wrapped else ()
                      for axis,(_,_,extent,wrapped) in zip(coordinates, axes))
-  return _dynamic_fp16_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
+  return _dynamic_16bit_gather_image(out_param.arg.slot, count, indices, plans, coordinates, alternates)
 
 def _lower_dynamic_fp16_scatter(output:RKOutput) -> RKImage|None:
   """Lower a bounded last-wins Scatter selector with one external INT32 index buffer."""
@@ -4704,6 +4706,10 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (int16_cumulative:=_lower_unrolled_int16_cumulative_extrema(uops)) is not None: return int16_cumulative
   if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew
   if (int16_extrema:=_lower_int16_loop_extrema(uops)) is not None: return int16_extrema
+  if (int16_output:=_output_store(uops, dtypes.int16)) is not None:
+    if (unrolled_fancy:=_lower_unrolled_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return unrolled_fancy
+    if (dynamic_gather:=_lower_dynamic_16bit_gather(int16_output, dtypes.int16)) is not None: return dynamic_gather
+    if (fancy_index:=_lower_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return fancy_index
   if (float_output:=_output_store(uops, dtypes.float)) is not None and \
      (fp16_cast:=_lower_fp16_fp32_cast(float_output)) is not None: return fp16_cast
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
@@ -4723,9 +4729,9 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
     if (max_unpool:=_lower_unrolled_max_unpool(half_output)) is not None: return max_unpool
     if (fixed_masked_select:=_lower_fixed_fp16_masked_select(half_output)) is not None: return fixed_masked_select
-    if (unrolled_fancy:=_lower_unrolled_multi_fp16_fancy_index(half_output)) is not None: return unrolled_fancy
-    if (dynamic_gather:=_lower_dynamic_fp16_gather(half_output)) is not None: return dynamic_gather
-    if (fancy_index:=_lower_multi_fp16_fancy_index(half_output)) is not None: return fancy_index
+    if (unrolled_fancy:=_lower_unrolled_multi_16bit_fancy_index(half_output)) is not None: return unrolled_fancy
+    if (dynamic_gather:=_lower_dynamic_16bit_gather(half_output)) is not None: return dynamic_gather
+    if (fancy_index:=_lower_multi_16bit_fancy_index(half_output)) is not None: return fancy_index
     if (scatter_reduce:=_lower_dynamic_scalar_scatter_reduce(half_output)) is not None: return scatter_reduce
     if (scatter:=_lower_dynamic_fp16_scatter(half_output)) is not None: return scatter
   if (half_loop_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \

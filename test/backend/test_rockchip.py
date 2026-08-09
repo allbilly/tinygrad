@@ -510,7 +510,7 @@ class TestRockchipOneHotOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipGatherOps(unittest.TestCase):
-  """Dynamic INT32 gather with exact index and raw FP16 representation selection on DPU."""
+  """Dynamic INT32 gather with exact index and raw 16-bit representation selection on DPU."""
 
   helper_test_exception = _test_ops.TestOps.helper_test_exception
 
@@ -521,6 +521,15 @@ class TestRockchipGatherOps(unittest.TestCase):
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
   test_gather = _test_ops.TestOps.test_gather
+
+  def test_gather_int16_full_index_bytes(self):
+    source = np.array([-32768, -1, 0, 1, 7, 8, 9, 32767], dtype=np.int16)
+    indices = np.array([7, 0, 3, 99, -1], dtype=np.int32)
+    expected = np.array([32767, -32768, 1, 0, 0], dtype=np.int16)
+    before = Device["ROCKCHIP"].submit_count
+    got = Tensor(source, device="ROCKCHIP").gather(0, Tensor(indices, device="ROCKCHIP")).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
   def test_gather_nonfinite_full_index_bytes(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
@@ -609,7 +618,7 @@ class TestRockchipNonzeroOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipFancyIndexOps(unittest.TestCase):
-  """Dynamic INT32 fancy indices with exact negative normalization and FP16 bits."""
+  """Dynamic INT32 fancy indices with exact negative normalization and raw 16-bit values."""
 
   _get_index_randoms = _test_ops.TestOps._get_index_randoms
 
@@ -621,6 +630,16 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
 
   test_fancy_indexing_inf = _test_ops.TestOps.test_fancy_indexing_inf
   test_slice_fancy_indexing_with_tensors = _test_ops.TestOps.test_slice_fancy_indexing_with_tensors
+
+  def test_fancy_indexing_int16(self):
+    source = np.array([[-32768,-1,0,1], [7,8,9,32767]], dtype=np.int16)
+    rows = np.array([1,0,-1], dtype=np.int32)
+    got = Tensor(source, device="ROCKCHIP")[Tensor(rows, device="ROCKCHIP")].realize().numpy()
+    np.testing.assert_array_equal(got, source[rows])
+
+    cols = np.array([3,0,1], dtype=np.int32)
+    got = Tensor(source, device="ROCKCHIP")[Tensor(rows, device="ROCKCHIP"), Tensor(cols, device="ROCKCHIP")].realize().numpy()
+    np.testing.assert_array_equal(got, source[rows,cols])
 
   def test_slice_fancy_indexing_dim_inject_and_collapse(self):
     _,b,_,d,_,_,j,_,o,_ = self._get_index_randoms()
