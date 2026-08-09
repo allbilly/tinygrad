@@ -491,6 +491,25 @@ class TestRockchipGatherOps(unittest.TestCase):
     np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipMaskedSelectOps(unittest.TestCase):
+  """Forward-only fixed FP16 selection with a source-derived positive mask."""
+
+  def test_fixed_masked_select_pad_and_truncate(self):
+    values = np.array([-3., 2., -1., 4., 5., -2.], dtype=np.float16)
+    source = Tensor(values, device="ROCKCHIP")
+    padded = source.masked_select(source > 0, size=8, fill_value=-7).numpy()
+    np.testing.assert_array_equal(padded, np.array([2., 4., 5., -7., -7., -7., -7., -7.], dtype=np.float16))
+    source = Tensor(values, device="ROCKCHIP")
+    np.testing.assert_array_equal(source.masked_select(source > 0, size=2).numpy(), np.array([2., 4.], dtype=np.float16))
+
+  def test_fixed_masked_select_exact_bits(self):
+    values = np.array([0x7e01, 0xfc00, 0x8000, 0x0000, 0x0001, 0x3c00, 0x7c00], dtype=np.uint16).view(np.float16)
+    expected = np.array([0x0001, 0x3c00, 0x7c00, 0x8000, 0x8000], dtype=np.uint16)
+    source = Tensor(values, device="ROCKCHIP")
+    got = source.masked_select(source > 0, size=5, fill_value=-0.0).numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), expected)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipFancyIndexOps(unittest.TestCase):
   """Dynamic INT32 fancy indices with exact negative normalization and FP16 bits."""
 

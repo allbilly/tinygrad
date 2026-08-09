@@ -3005,3 +3005,35 @@ Tinygrad-core workaround or narrower replacement test was added.
 There is no backend/runtime/Tinygrad-core change and therefore no new CPU arithmetic or tensor-value access. The test
 uses the existing compile-time address plan and DPU EW path with no LUT, CMAC, CNA, PPU fallback, tolerance beyond the
 established FP16 cap, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — WIP bounded fixed FP16 masked select
+
+Fixed-size `x.masked_select(x > 0, size=..., fill_value=...)` is lowered as four strict DPU-EW programs: an
+IEEE-correct positive prefix count, an INT32 occurrence histogram, an INT32 histogram prefix, and an exact raw-FP16
+guarded gather/fill. The matcher admits only a source-derived positive mask, proves every static prefix and address,
+and bounds counts to the exact FP16 integer range. The exact regression includes NaN, both infinities, signed zero,
+the smallest positive subnormal, and raw-bit checking of selected and fill values.
+
+The initial correct path used 94 submits and 220 tasks for a representative six-input/four-output case. Reusing
+whole-vector INT32 conversions and compact raw-source bytes reduced it to 50 submits and 87 tasks. Before the compact
+raw-source change, the longest pad-and-truncate test took 7.39 s: 6.75 s was 64 reset ioctls, 0.024 s was 112 actual
+submit ioctls, and about 0.61 s was host scheduling, rendering, marshalling, and reference work. Reset separation is
+therefore the remaining wall-time bottleneck.
+
+A reset-free ReLU/MIN validity experiment was rejected after it caused an IOMMU read fault and a six-second NPU job
+timeout; the renderer was restored to the previously passing comparison path and no further NPU command was issued on
+that boot. The latest compact raw-source form still requires focused hardware revalidation after reboot before this
+milestone can be committed.
+
+The cleanup pass follows the other hardware backends' compact immutable-plan style: runtime code remains unchanged,
+FP16 representation encoding and INT32 conversion-tile sizing are centralized, an unused scratch constant was
+removed, and matchers return only data consumed by their emitters. Host-only rendering produces four valid immutable
+RKImages for both finite and special-value cases. Repository-wide Tinygrad mypy and Ruff pass, as does
+`git diff --check`; `sz.py` reports renderer/runtime **3,224/281 executable lines**.
+
+The CPU-cheat audit finds changes only in the renderer, tests, and this progress record. Compile-time code inspects
+static IR and encodes constants but never reads tensor buffers or evaluates a dynamic FP16/INT32 value. Runtime numeric
+semantics, Tinygrad core, tolerances, and the external FP16 contract are unchanged. There is no typed host evaluator,
+LUT, CMAC, CNA, or PPU fallback.
