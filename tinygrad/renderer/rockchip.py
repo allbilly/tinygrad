@@ -2094,6 +2094,61 @@ def _lower_int_where(output:RKOutput) -> RKImage|None:
   return _typed_int_image(output, condition.alu(Ops.MUL, UOp.const(float(delta), dtypes.half)).alu(
     Ops.ADD, UOp.const(float(no), dtypes.half)))
 
+def _lower_one_hot(output:RKOutput) -> RKImage|None:
+  """Compare dynamic INT32 indices with static class coordinates byte-wise on DPU EW."""
+  _, out_param, count, out_index, root = output
+  if (root.op is not Ops.WHERE or root.dtype.scalar() is not dtypes.int or root.src[0].op is not Ops.CMPNE or
+      any(arm.op is not Ops.CONST or arm.dtype.scalar() is not dtypes.int for arm in root.src[1:]) or
+      tuple(int(arm.arg) for arm in root.src[1:]) != (0, 1)): return None
+  loads = [x for x in root.src[0].src if x.op is Ops.LOAD and x.dtype.scalar() is dtypes.int and
+           len(x.src) == 1 and x.src[0].op is Ops.INDEX]
+  coordinates = [x for x in root.src[0].src if _is_static_expr(x)]
+  if len(loads) != 1 or len(coordinates) != 1: return None
+  load, coordinate = loads[0], coordinates[0]
+  source = _root_param(load.src[0])
+  if source is None or source.dtype.scalar() is not dtypes.int or source.src[0].op is not Ops.CONST: return None
+  source_count = int(source.src[0].arg)
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  if source_count <= 0: return None
+  try:
+    offsets = _gather_offsets(out_index, load.src[0].src[1], None, count)
+    coordinate_values = _static_int_vector(out_index, coordinate, count)
+  except RuntimeError: return None
+  if (any(not 0 <= offset < source_count for offset in offsets) or
+      any(not -(1<<31) <= value < 1<<31 for value in coordinate_values)): return None
+
+  one = 0
+  raw_bytes = tuple(range(1, 5)); convert_tiles = 5
+  half_bytes = tuple(range(6, 10)); expanded_bytes = tuple(range(10, 14)); coordinate_bytes = tuple(range(14, 18))
+  diff, magnitude, unequal, equal, combined, int_tiles = range(18, 24)
+  scratch_sizes = [_scratch_bytes(count)] * 24
+  for slot in raw_bytes: scratch_sizes[slot] = source_count*4
+  scratch_sizes[convert_tiles] = ((source_count+3)//4)*64
+  for slot in half_bytes: scratch_sizes[slot] = _scratch_bytes(source_count)
+  scratch_sizes[int_tiles] = ((count+3)//4)*64
+
+  gathers:tuple[RKGather, ...] = tuple(RKGather(source.arg.slot, slot, source_count,
+    offsets=tuple(lane*4+byte for lane in range(source_count)), dst_stride=4, itemsize=1)
+    for byte,slot in enumerate(raw_bytes))
+  for byte,slot in enumerate(coordinate_bytes):
+    bits = tuple(struct.unpack("<H", struct.pack("<e", float((value >> (byte*8)) & 0xff)))[0] for value in coordinate_values)
+    gathers += (RKGather(source.arg.slot, slot, count, values=bits),)
+  mid_gathers = tuple(RKGather(src, dst, count, offsets=offsets, src_kind=RKBufferKind.SCRATCH)
+                      for src,dst in zip(half_bytes, expanded_bytes))
+
+  def arg(slot:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot)
+  ops:list[RKEWOp] = [RKEWOp(arg(dst), arg(src), arg(convert_tiles), source_count, _EW_CFG[Ops.MAX], int32_input=True)
+                       for src,dst in zip(raw_bytes, half_bytes)]
+  result:RKArg = arg(one)
+  for lhs,rhs in zip(expanded_bytes, coordinate_bytes):
+    byte_equal = _ew_integer_eq_mask(ops, arg, lhs, rhs, (diff, magnitude, unequal, equal), one, count)
+    ops.append(RKEWOp(arg(combined), result, byte_equal, count, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+    result = arg(combined)
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), result, arg(int_tiles), count,
+                    _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
+                 gathers=gathers, ew_ops=tuple(ops), mid_gathers=mid_gathers, gather_after=4)
+
 def _lower_ieee_predicate(output:RKOutput) -> RKImage|None:
   """Classify FP16 NaN/infinity on DPU and expose the final 0/1 mask through the bool ABI."""
   root = output[4]
@@ -2168,6 +2223,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (cumulative_index:=_lower_cumulative_extrema_index(uops, int_output)) is not None: return cumulative_index
     if (arg_extrema:=_lower_unrolled_arg_extrema(int_output)) is not None: return arg_extrema
     if (pool_index:=_lower_unrolled_pool_index(int_output)) is not None: return pool_index
+    if (one_hot:=_lower_one_hot(int_output)) is not None: return one_hot
     if (int_where:=_lower_int_where(int_output)) is not None: return int_where
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
   if int_loop_output is not None:

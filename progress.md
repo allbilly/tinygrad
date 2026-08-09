@@ -2679,3 +2679,38 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Host code only con
 bytes without comparing, converting, branching on, or selecting a tensor value. All runtime-dependent equality,
 first-tie choice, byte masking, and numeric conversion execute on DPU EW. There is no host scatter, host ArgMax, LUT,
 CMAC, CNA, PPU fallback, tolerance relaxation, or external floating-point input wider than FP16.
+
+---
+
+## 2026-08-09 — exact full-range INT32 one-hot equality
+
+The complete upstream `TestOps.test_one_hot` now runs on Rockchip. Its scheduled integer graph is the strict form
+`WHERE(dynamic_index != static_class_coordinate, 0, 1)`. The matcher proves that form, the INT32 input buffer and its
+static bounds, every input gather offset, every compile-time coordinate, and the signed INT32 coordinate range before
+emitting an image.
+
+Historical commit `32cb1cd67` on `rockchip-2607` supplied the original DPU one-hot proof. That version expanded the
+dynamic INT32 indices, converted whole values to FP16, and deliberately capped the class extent at 2,048. Its notes
+also recorded that native INT32 comparison mode produced invalid masks and identified byte-limb comparison as the
+required full-range solution. The current implementation completes that solution: representation-preserving gathers
+place each of the four little-endian input bytes in a zeroed INT32 lane, DPU conversion turns each byte into an exact
+FP16 integer in 0..255, and a mid-image gather expands those compact byte vectors over the output layout. Four DPU
+SUB/ABS/MIN/inversion equality masks are multiplied and converted by DPU to the final INT32 output. Class 2,049 in a
+2,050-class output therefore passes exactly instead of depending on FP16 whole-integer precision.
+
+The RKNN v2.3.2 operator guide lists OneHot in its CPU-operator chapter, while `~/npu/include/old/rknn_ops.md` marks it
+unsupported. `~/rk3588` contains the upstream test and runtime strings but no verified native DPU OneHot instruction.
+No CPU operator or undocumented instruction was imported.
+
+- Complete upstream one-hot case, full-byte out-of-range regression, and class-2,049 regression: **3 passed in 9.31 s**,
+  sequentially. The largest focused test passed in **7.35 s**.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **371 passed, 10 skipped, 180 subtests passed in
+  460.02 s** pytest time / **485.79 s** process wall time, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,467/281 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The host evaluates only static class coordinates and
+moves dynamic bytes by statically proven addresses; it never numerically reads, compares, branches on, or selects from
+an input index. All dynamic byte conversion, equality, mask conjunction, and INT32 output conversion execute on DPU
+EW. There is no host OneHot, scatter, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than
+FP16.

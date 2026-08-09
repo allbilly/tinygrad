@@ -450,8 +450,27 @@ class TestRockchipIntegerPowerOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 5)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipOneHotOps(unittest.TestCase):
+  """Exact INT32 one-hot equality through four raw bytes and DPU EW masks."""
+
+  test_one_hot = _test_ops.TestOps.test_one_hot
+
+  def test_one_hot_full_int32_bytes(self):
+    values = np.array([0, 5, 256, 65536, 1 << 24, -1], dtype=np.int32)
+    expected = np.zeros((len(values), 6), dtype=np.int32)
+    expected[0,0] = expected[1,5] = 1
+    got = Tensor(values, device="ROCKCHIP").one_hot(6).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+
+  def test_one_hot_beyond_fp16_integer_range(self):
+    expected = np.zeros((1, 2050), dtype=np.int32)
+    expected[0,2049] = 1
+    got = Tensor(np.array([2049], dtype=np.int32), device="ROCKCHIP").one_hot(2050).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(unittest.TestCase):
-  """FP16 scatter with compile-time-static indices; external integer NPU inputs are unsupported."""
+  """FP16 scatter with compile-time-static indices; dynamic scatter indices remain unsupported."""
 
   def test_scatter_static_tensor_source(self):
     index = torch.arange(4, dtype=torch.int64).reshape(2,2)
