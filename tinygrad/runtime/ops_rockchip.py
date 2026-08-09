@@ -299,6 +299,8 @@ class RockchipProgram(Program['RockchipDevice']):
       if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return self._dma(self.scratch[index])
     start = time.perf_counter()
+    native_int16 = any(op.int16_input or op.int16_output for op in self.image.ew_ops)
+    if self.image.ew_ops and self.dev._native_int16 and not native_int16: self.dev.reset_npu()
     def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
       touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
       touched.update((g.dst_kind, g.dst_index) for g in gathers)
@@ -311,6 +313,7 @@ class RockchipProgram(Program['RockchipDevice']):
       synchronized_gathers(self.image.mid_gathers, True)
       self._run_ew_ops(address, buffer, self.image.ew_ops[self.image.gather_after:])
     else: self._run_ew_ops(address, buffer)
+    if self.image.ew_ops: self.dev._native_int16 = native_int16
     if self.image.post_gathers: synchronized_gathers(self.image.post_gathers, False)
     if (fill:=self.image.fill) is not None:
       bits = self.image.constants[:fill.itemsize] * fill.count
@@ -323,6 +326,7 @@ class RockchipDevice(Compiled):
   def __init__(self, device:str):
     self.fd_ctl = FileIOInterface(os.getenv("ROCKCHIP_DRM", "/dev/dri/card1"), os.O_RDWR)
     self.submit_count = self.task_count = 0
+    self._native_int16 = False
     super().__init__(device, RockchipAllocator(self), [RockchipRenderer, RockchipBoolRenderer], RockchipProgram)
   def _gpu_alloc(self, size:int, flags:int=0) -> HCQBuffer:
     alloc = max(4096, (size+4095)&-4096)

@@ -52,7 +52,7 @@ class RKMultiGather: gathers: tuple[RKGather, ...]
 class RKStatic: expr: UOp
 
 RKLeaf = RKArg|RKStatic|RKGather|RKMultiGather|float|tuple[UOp, UOp, UOp|None, int]|None
-RKInt16Leaf = RKArg|RKStatic|int|tuple[UOp, UOp, UOp|None, int]|None
+RKInt16Leaf = RKArg|RKStatic|RKGather|RKMultiGather|int|tuple[UOp, UOp, UOp|None, int]|None
 
 @dataclass(frozen=True)
 class RKFill: dst: RKArg; count: int; itemsize: int = 2
@@ -613,13 +613,14 @@ def _gather_cache_key(plans:Iterable[RKGather]) -> tuple:
                 p.dst_stride, p.dst_addend, p.itemsize, p.src_kind) for p in plans)
 
 def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cache:dict[UOp, tuple[bool, bool]]|None=None,
-                      static_cache:dict[UOp, bool]|None=None) -> RKGather|RKMultiGather|None:
-  """Collapse a static selection tree into raw offsets from one or more FP16 source buffers."""
+                      static_cache:dict[UOp, bool]|None=None, dtype:DType=dtypes.half) -> RKGather|RKMultiGather|None:
+  """Collapse a static selection tree into raw offsets from one or more same-typed source buffers."""
+  encode = _int16_bits if dtype is dtypes.int16 else _fp16_bits
   seen = selection_cache if selection_cache is not None else {}
   def selection_tree(x:UOp) -> tuple[bool, bool]:
     if x in seen: return seen[x]
-    if x.op is Ops.CONST: ret = (x.dtype.scalar() is dtypes.half, False)
-    elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half: ret = selection_tree(x.src[0])
+    if x.op is Ops.CONST: ret = (x.dtype.scalar() is dtype, False)
+    elif x.op is Ops.CAST and x.dtype.scalar() is dtype: ret = selection_tree(x.src[0])
     elif x.op is Ops.WHERE:
       lhs, rhs = selection_tree(x.src[1]), selection_tree(x.src[2]); ret = (lhs[0] and rhs[0], True)
     elif x.op is Ops.ADD:
@@ -643,10 +644,10 @@ def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cach
   empty = np.full(len(envs), -1, dtype=np.int64)
   def selected(x:UOp) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if x in choices: return choices[x]
-    if x.op is Ops.CONST and x.dtype.scalar() is dtypes.half:
-      bits = _fp16_bits(x.arg)
+    if x.op is Ops.CONST and x.dtype.scalar() is dtype:
+      bits = encode(x.arg)
       ret = empty, empty, np.full(len(envs), bits, dtype=np.int64)
-    elif x.op is Ops.CAST and x.dtype.scalar() is dtypes.half: ret = selected(x.src[0])
+    elif x.op is Ops.CAST and x.dtype.scalar() is dtype: ret = selected(x.src[0])
     elif x.op is Ops.WHERE:
       if not _is_static_expr(x.src[0], static_cache): raise ValueError
       cond = np.broadcast_to(_eval_vector(x.src[0], vector_env, eval_cache), len(envs)).astype(bool)
@@ -660,7 +661,7 @@ def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cach
     else:
       if x.op is not Ops.LOAD or x.src[0].op is not Ops.INDEX or x.src[0].src[0].op is not Ops.PARAM: raise ValueError
       param, index, gate = x.src[0].src[0], x.src[0].src[1], x.src[2] if len(x.src) > 2 else None
-      if (param.dtype.scalar() is not dtypes.half or param.arg.slot == oslot or param.src[0].op is not Ops.CONST or
+      if (param.dtype.scalar() is not dtype or param.arg.slot == oslot or param.src[0].op is not Ops.CONST or
           any(r not in out_range_set for r in index_ranges(index) + ([] if gate is None else index_ranges(gate)))): raise ValueError
       if gate is not None:
         if not _is_static_expr(gate, static_cache): raise ValueError
@@ -2129,13 +2130,30 @@ def _first_tie_selection(value:UOp, extrema:UOp, ordered_exprs:list[UOp]) -> boo
   return value.op is Ops.ADD and any(x.op is Ops.CONST and int(x.arg) == window for x in value.src) and \
     any(x.op is Ops.MUL and selected in x.src and any(y.op is Ops.CONST and int(y.arg) == -1 for y in x.src) for x in value.src)
 
-def _fp16_gather_plan(value:UOp, out_index:UOp, count:int, out_slot:int) -> RKGather|None:
-  """Turn one FP16 lane expression into the raw gather used by specialized reductions."""
-  leaf = _ew_leaf(value, out_index, count, out_slot)
+def _int16_leaf(u:UOp, out_index:UOp, count:int, out_slot:int, static_cache:dict[UOp, bool]|None=None) -> RKInt16Leaf:
+  if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int16: return int(u.arg)
+  if u.dtype.scalar() is dtypes.int16 and _is_static_expr(u, static_cache): return RKStatic(u)
+  if u.dtype.scalar() is dtypes.int16 and \
+     (selection:=_selection_gather(u, out_index, count, out_slot, static_cache=static_cache, dtype=dtypes.int16)) is not None: return selection
+  if u.op is not Ops.LOAD or u.dtype.scalar() is not dtypes.int16 or u.src[0].op is not Ops.INDEX or \
+     (param:=_root_param(u.src[0])) is None or param.arg.slot == out_slot or param.src[0].op is not Ops.CONST: return None
+  index, gate, fill = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None, u.src[1] if len(u.src) > 1 else None
+  if fill is not None and fill.op is not Ops.CONST: return None
+  return RKArg(RKBufferKind.ARG, param.arg.slot) if gate is None and index.key == out_index.key and int(param.src[0].arg) == count else \
+    (param, index, gate, _int16_bits(0 if fill is None else fill.arg))
+
+def _typed_gather_plan(value:UOp, out_index:UOp, count:int, out_slot:int, dtype:DType=dtypes.half) -> RKGather|None:
+  """Turn one FP16 or INT16 lane expression into the raw gather used by specialized reductions."""
+  if dtype is dtypes.half: leaf:RKLeaf|RKInt16Leaf = _ew_leaf(value, out_index, count, out_slot)
+  elif dtype is dtypes.int16: leaf = _int16_leaf(value, out_index, count, out_slot)
+  else: return None
   if isinstance(leaf, RKArg):
     if leaf.kind is not RKBufferKind.ARG or leaf.addend: return None
     return RKGather(leaf.index, 0, count, axes=((1, count, 1),) if count > 1 else ())
   if isinstance(leaf, RKGather): plan = leaf
+  elif isinstance(leaf, RKMultiGather):
+    if len(leaf.gathers) != 1: return None
+    plan = leaf.gathers[0]
   elif isinstance(leaf, tuple) and len(leaf) == 4 and isinstance(leaf[0], UOp):
     param, index, gate, fill_bits = leaf
     plan = _gather_plan(param.arg.slot, 0, out_index, index, gate, count, fill_bits)
@@ -2156,10 +2174,10 @@ def _descending_index_root(value:UOp) -> tuple[int, UOp]|None:
   selected = next((x for x in negatives[0].src if x.op is not Ops.CONST), None)
   return (int(limits[0].arg), selected) if selected is not None else None
 
-def _weighted_equality(term:UOp) -> tuple[tuple[UOp, UOp], UOp]|None:
+def _weighted_equality(term:UOp, dtype:DType=dtypes.half) -> tuple[tuple[UOp, UOp], UOp]|None:
   if term.op is not Ops.MUL or len(term.src) != 2: return None
   casts = [x for x in term.src if x.op is Ops.CAST and x.dtype.scalar() is dtypes.int and len(x.src) == 1]
-  if len(casts) != 1 or (pair:=_equality_pair(casts[0].src[0])) is None or any(x.dtype.scalar() is not dtypes.half for x in pair): return None
+  if len(casts) != 1 or (pair:=_equality_pair(casts[0].src[0])) is None or any(x.dtype.scalar() is not dtype for x in pair): return None
   weight = term.src[1] if term.src[0] is casts[0] else term.src[0]
   return pair, weight
 
@@ -2288,7 +2306,8 @@ def _raw_weight_pool_index_image(out_slot:int, count:int, plans:tuple[RKGather, 
                  gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=tuple(mid_gathers), gather_after=4)
 
 def _pool_index_image(out_slot:int, count:int, spatial_size:int, source_count:int, plans:tuple[RKGather, ...],
-                      extrema_plan:RKGather, weights:tuple[tuple[int, ...], ...], raw_weight:bool=False) -> RKImage|None:
+                      extrema_plan:RKGather, weights:tuple[tuple[int, ...], ...], raw_weight:bool=False,
+                      native_int16:bool=False) -> RKImage|None:
   """Validate static pool lanes and emit their descending-coordinate first-tie selection."""
   if (not 2 <= len(plans) <= _FP16_EXACT_INTEGER or source_count < spatial_size or source_count % spatial_size or
       count % (source_count//spatial_size) or len(weights) != len(plans) or
@@ -2296,7 +2315,7 @@ def _pool_index_image(out_slot:int, count:int, spatial_size:int, source_count:in
       sorted(_plan_offsets(extrema_plan)) != list(range(count))): return None
   coordinates:list[tuple[int, ...]] = []
   valid_lanes = [0] * count
-  min_bits = _fp16_bits(dtypes.half.min)
+  min_bits = _int16_bits(dtypes.int16.min) if native_int16 else _fp16_bits(dtypes.half.min)
   for plan,row_weights in zip(plans, weights):
     offsets = _plan_offsets(plan)
     if len(offsets) != count or len(row_weights) != count: return None
@@ -2310,16 +2329,19 @@ def _pool_index_image(out_slot:int, count:int, spatial_size:int, source_count:in
         row.append(offset%spatial_size); valid_lanes[lane] += 1
     coordinates.append(tuple(row))
   if any(valid < 1 for valid in valid_lanes): return None
+  if native_int16 and (raw_weight or spatial_size > 32767): return None
   if raw_weight: return _raw_weight_pool_index_image(out_slot, count, plans, extrema_plan, weights)
   if spatial_size > _FP16_EXACT_INTEGER:
     return _wide_pool_index_image(out_slot, count, spatial_size, plans, extrema_plan, tuple(coordinates))
   return _cumulative_index_image(out_slot, count, plans, (extrema_plan,), False, [0]*count,
-                                 first_tie=True, candidate_coords=tuple(coordinates), index_limit=spatial_size, raw_weight=raw_weight)
+                                 first_tie=True, candidate_coords=tuple(coordinates), index_limit=spatial_size,
+                                 raw_weight=raw_weight, native_int16=native_int16)
 
-def _lower_unrolled_pool_index(output:RKOutput) -> RKImage|None:
+def _lower_unrolled_pool_index(output:RKOutput, native_int16:bool=False) -> RKImage|None:
   """Select MaxPool's first spatial index with raw gathers and DPU equality masks."""
   _, out_param, count, out_index, value = output
   if count <= 0: return None
+  dtype = dtypes.int16 if native_int16 else dtypes.half
   raw_weight = False
   if (root:=_descending_index_root(value)) is not None: spatial_size, selected = root
   else:
@@ -2328,7 +2350,7 @@ def _lower_unrolled_pool_index(output:RKOutput) -> RKImage|None:
     if len(negatives) != 1 or len(selected_values) != 1: return None
     spatial_size, selected, raw_weight = 0, selected_values[0], True
   terms = _flatten_binary(selected, Ops.MAX)
-  parsed = [_weighted_equality(term) for term in terms]
+  parsed = [_weighted_equality(term, dtype) for term in terms]
   if not 2 <= len(parsed) <= 2048 or any(item is None for item in parsed): return None
   concrete = [item for item in parsed if item is not None]
   pairs = tuple(pair for pair,_ in concrete)
@@ -2339,8 +2361,8 @@ def _lower_unrolled_pool_index(output:RKOutput) -> RKImage|None:
   if any(x is None for x in candidates) or len(set(candidates)) != len(candidates): return None
 
   try:
-    extrema_plan = _fp16_gather_plan(extrema, out_index, count, out_param.arg.slot)
-    candidate_plans = tuple(_fp16_gather_plan(candidate, out_index, count, out_param.arg.slot)
+    extrema_plan = _typed_gather_plan(extrema, out_index, count, out_param.arg.slot, dtype)
+    candidate_plans = tuple(_typed_gather_plan(candidate, out_index, count, out_param.arg.slot, dtype)
                             for candidate in candidates if candidate is not None)
   except RuntimeError: return None
   if extrema_plan is None or len(candidate_plans) != len(candidates) or any(plan is None for plan in candidate_plans): return None
@@ -2348,7 +2370,7 @@ def _lower_unrolled_pool_index(output:RKOutput) -> RKImage|None:
   params = [u for u in value.toposort() if u.op is Ops.PARAM and u.arg.slot in (plans[0].src_index, extrema_plan.src_index)]
   source_params = [u for u in params if u.arg.slot == plans[0].src_index]
   extrema_params = [u for u in params if u.arg.slot == extrema_plan.src_index]
-  if (len(set(source_params)) != 1 or len(set(extrema_params)) != 1 or any(p.dtype.scalar() is not dtypes.half for p in params) or
+  if (len(set(source_params)) != 1 or len(set(extrema_params)) != 1 or any(p.dtype.scalar() is not dtype for p in params) or
       any(p.src[0].op is not Ops.CONST for p in params)): return None
   source_count = int(source_params[0].src[0].arg)
   if raw_weight: spatial_size = source_count
@@ -2356,11 +2378,13 @@ def _lower_unrolled_pool_index(output:RKOutput) -> RKImage|None:
   try:
     weights = tuple(_static_int_vector(out_index, weight, count) for _,weight in concrete)
   except (OverflowError, RuntimeError): return None
-  return _pool_index_image(out_param.arg.slot, count, spatial_size, source_count, plans, extrema_plan, weights, raw_weight=raw_weight)
+  return _pool_index_image(out_param.arg.slot, count, spatial_size, source_count, plans, extrema_plan, weights,
+                           raw_weight=raw_weight, native_int16=native_int16)
 
-def _lower_loop_pool_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
+def _lower_loop_pool_index(uops:list[UOp], output:RKOutput, native_int16:bool=False) -> RKImage|None:
   """Lower the one-register loop used by a global MaxPool returned index."""
   _, out_param, count, out_index, value = output
+  dtype = dtypes.int16 if native_int16 else dtypes.half
   if count != 1 or _index_ranges(out_index) or (root:=_descending_index_root(value)) is None: return None
   spatial_size, selected = root
   if selected.op is not Ops.LOAD: return None
@@ -2376,17 +2400,17 @@ def _lower_loop_pool_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   local_buffers = [{x for x in node.toposort() if x.op is Ops.BUFFER} for node in (initial.src[0], update.src[0], selected)]
   if (weighted is None or len(accumulator) != 1 or set(update.src[1].src) != {accumulator[0], weighted} or
       any(len(buffers) != 1 for buffers in local_buffers) or len(set.union(*local_buffers)) != 1 or
-      (parsed:=_weighted_equality(weighted)) is None): return None
+      (parsed:=_weighted_equality(weighted, dtype)) is None): return None
   pair, weight = parsed
   candidates = [x for x in pair if reduce_range in x.toposort()]
   extrema = [x for x in pair if reduce_range not in x.toposort()]
   if len(candidates) != 1 or len(extrema) != 1 or candidates[0].op is not Ops.LOAD or extrema[0].op is not Ops.LOAD: return None
   candidate_param, candidate_index = _root_param(candidates[0].src[0]), candidates[0].src[0].src[1]
-  extrema_plan = _fp16_gather_plan(extrema[0], out_index, 1, out_param.arg.slot)
+  extrema_plan = _typed_gather_plan(extrema[0], out_index, 1, out_param.arg.slot, dtype)
   extrema_params = [u for u in uops if u.op is Ops.PARAM and extrema_plan is not None and u.arg.slot == extrema_plan.src_index]
-  if (candidate_param is None or candidate_param.src[0].op is not Ops.CONST or candidate_param.dtype.scalar() is not dtypes.half or
+  if (candidate_param is None or candidate_param.src[0].op is not Ops.CONST or candidate_param.dtype.scalar() is not dtype or
       extrema_plan is None or int(candidate_param.src[0].arg) != spatial_size or len(set(extrema_params)) != 1 or
-      extrema_params[0].dtype.scalar() is not dtypes.half or extrema_params[0].src[0].op is not Ops.CONST or
+      extrema_params[0].dtype.scalar() is not dtype or extrema_params[0].src[0].op is not Ops.CONST or
       int(extrema_params[0].src[0].arg) != 1): return None
   try:
     offsets = tuple(_eval_int(candidate_index, {reduce_range:i}) for i in range(window))
@@ -2395,7 +2419,7 @@ def _lower_loop_pool_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   if len(set(offsets)) != window: return None
   plans = tuple(RKGather(candidate_param.arg.slot, 0, 1, base=offset) for offset in offsets)
   return _pool_index_image(out_param.arg.slot, 1, spatial_size, spatial_size, plans, extrema_plan,
-                           tuple((weight,) for weight in weights))
+                           tuple((weight,) for weight in weights), native_int16=native_int16)
 
 def _single_max_unpool_image(out_slot:int, count:int, out_spatial:int, source_count:int, index_slot:int,
                              plan:RKGather, index_offset:int) -> RKImage|None:
@@ -4555,19 +4579,8 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
   static_cache:dict[UOp, bool] = {}
   leaf_cache:dict[UOp, RKInt16Leaf] = {}
   def leaf(u:UOp) -> RKInt16Leaf:
-    if u in leaf_cache: return leaf_cache[u]
-    ret:RKInt16Leaf = None
-    if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int16: ret = int(u.arg)
-    elif u.dtype.scalar() is dtypes.int16 and _is_static_expr(u, static_cache): ret = RKStatic(u)
-    elif u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int16 and u.src[0].op is Ops.INDEX and \
-         (param:=_root_param(u.src[0])) is not None and param.arg.slot != out_param.arg.slot and param.src[0].op is Ops.CONST:
-      index, gate = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None
-      fill = u.src[1] if len(u.src) > 1 else None
-      if fill is None or fill.op is Ops.CONST:
-        ret = (RKArg(RKBufferKind.ARG, param.arg.slot) if gate is None and index.key == out_index.key and
-               int(param.src[0].arg) == count else (param, index, gate, _int16_bits(0 if fill is None else fill.arg)))
-    leaf_cache[u] = ret
-    return ret
+    if u not in leaf_cache: leaf_cache[u] = _int16_leaf(u, out_index, count, out_param.arg.slot, static_cache)
+    return leaf_cache[u]
   if leaf(value) is not None: value = value.alu(Ops.ADD, UOp.const(0, dtypes.int16))
   order:list[UOp] = []
   visited:dict[UOp, bool] = {}
@@ -4611,10 +4624,17 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
       ret = RKArg(RKBufferKind.SCRATCH, static_slots[vector])
     elif isinstance(parsed, RKArg): ret = parsed
     else:
-      assert isinstance(parsed, tuple)
-      param, index, gate, fill_bits = parsed
-      plans = (_gather_plan(param.arg.slot, 0, out_index, index, gate, count, fill_bits),)
-      for plan in plans: _validate_gather_bounds(plan, int(param.src[0].arg))
+      if isinstance(parsed, RKMultiGather): plans = parsed.gathers
+      elif isinstance(parsed, RKGather): plans = (parsed,)
+      else:
+        assert isinstance(parsed, tuple)
+        param, index, gate, fill_bits = parsed
+        plans = (_gather_plan(param.arg.slot, 0, out_index, index, gate, count, fill_bits),)
+      for plan in plans:
+        if plan.values: continue
+        source = next((x for x in u.toposort() if x.op is Ops.PARAM and x.arg.slot == plan.src_index), None)
+        if source is None or source.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:gather_index")
+        _validate_gather_bounds(plan, int(source.src[0].arg))
       key = _gather_cache_key(plans)
       if key not in gather_slots:
         gather_slots[key] = scratch_count
@@ -4708,6 +4728,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (cumulative_index:=_lower_cumulative_extrema_index(uops, int_output)) is not None: return cumulative_index
     if (int16_arg_extrema:=_lower_unrolled_arg_extrema(int_output, native_int16=True)) is not None: return int16_arg_extrema
     if (arg_extrema:=_lower_unrolled_arg_extrema(int_output)) is not None: return arg_extrema
+    if (int16_pool_index:=_lower_unrolled_pool_index(int_output, native_int16=True)) is not None: return int16_pool_index
     if (pool_index:=_lower_unrolled_pool_index(int_output)) is not None: return pool_index
     if (one_hot:=_lower_one_hot(int_output)) is not None: return one_hot
     if (int_where:=_lower_int_where(int_output)) is not None: return int_where
@@ -4716,6 +4737,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (int16_loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output, native_int16=True)) is not None:
       return int16_loop_arg_extrema
     if (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output)) is not None: return loop_arg_extrema
+    if (int16_loop_pool_index:=_lower_loop_pool_index(uops, int_loop_output, native_int16=True)) is not None: return int16_loop_pool_index
     if (loop_pool_index:=_lower_loop_pool_index(uops, int_loop_output)) is not None: return loop_pool_index
   if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32
   if (loop:=_loop_reduction_match(uops)) is not None:
@@ -5245,7 +5267,7 @@ class RockchipRenderer(Renderer):
   code_for_op = {Ops.ADD: lambda: None, Ops.SUB: lambda: None, Ops.MUL: lambda: None, Ops.MAX: lambda: None, Ops.FDIV: lambda: None}
   compiler = RockchipCompiler("rockchip")
   def __init__(self, target:Target): super().__init__(target)
-  def supported_dtypes(self): return {dtypes.half}
+  def supported_dtypes(self): return {dtypes.half, dtypes.int16}
   def render(self, uops:list[UOp]) -> str:
     image = _lower_bounded_exact_fp16_copysign(uops)
     return base64.b64encode(encode_image(image if image is not None else lower_ew(_fp16_rewrite(uops)))).decode()

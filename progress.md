@@ -3992,3 +3992,38 @@ The CPU-cheat audit found no tensor-value read or host-side result calculation. 
 candidate coverage, and Tinygrad's first-tie IR. Runtime only chains command bodies and performs the existing raw
 mid-gather. Every extrema, complement, equality, coordinate selection, and typed writeback operation executes on DPU.
 There is no host ArgMax/ArgMin, NumPy backend evaluation, LUT, CMAC, tolerance change, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact signed-INT16 MaxPool values and indices on DPU
+
+Rockchip now advertises signed INT16 as a native renderer dtype and lowers padded MaxPool values plus exact returned
+INT32 indices. The existing static selection gather is typed instead of duplicated, so padding maps invalid lanes to
+the signed `-32768` identity before native INT16 DPU MAX. The existing pool-index parser is likewise parameterized by
+candidate dtype and reuses the native INT16 equality/descending-coordinate image added for ArgExtrema. First ties,
+padding, batch/channel planes, and the global loop form remain validated from static UOps before emission.
+
+`~/rk3588/examples/elementwise_int.py` supplies the proven signed INT16 MAX/MIN, equality-mask, and conversion register
+behavior. The existing FP16 pool-index milestones supplied the spatial-coordinate and global-loop parsers. No new pool
+parser, runtime tensor arithmetic, or CPU result path was added.
+
+The first full MaxPool-class run exposed a precision-boundary hazard: native INT16 returned indices followed by the
+existing wide FP16 index case timed out at task counter 1/raw status `0xc0000000`, although the wide test passed alone.
+The vendor health probe remained 60/60. Runtime now records only whether the preceding EW image used native INT16 and
+issues one device reset when leaving that mode. The exact INT16-then-wide sequence and the original full-class order
+then pass; ordinary FP16 programs and tasks receive no extra resets.
+
+- Full-range padded `(4,2,11,28)` INT16 MaxPool values, padded duplicate-max first ties, and global `(12,13)` returned
+  indices pass bit-exactly. Returned-index cases use one value program plus one index program (**2 ioctls**).
+- The complete MaxPool class passes **15 tests plus 33 subtests in 11.74 s**. The native INT16 class plus the new and
+  wide pool regressions pass **25/25 in 8.30 s**. No case approaches the 30-second profiling threshold.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** immediately after the diagnostic timeout and after
+  final physical testing; no reboot was required.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **477 tests**.
+- `sz.py`: renderer/runtime **4,850/331 executable lines**, total **30,236**. Sharing typed gather/equality/index emission
+  limits the milestone to 21 renderer lines and four runtime state-transition lines; Tinygrad core is untouched.
+
+The CPU-cheat audit found only compile-time evaluation of static gates, offsets, weights, and coordinate bounds.
+Runtime gathers preserve raw INT16 bytes; every input-dependent maximum, equality mask, first-tie selection, and
+INT16-to-INT32 writeback executes on DPU. There is no host MaxPool/index calculation, NumPy backend evaluation, LUT,
+CMAC, tolerance relaxation, or Tinygrad-core change.

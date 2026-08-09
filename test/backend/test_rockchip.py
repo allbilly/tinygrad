@@ -302,7 +302,7 @@ for _name, _test in vars(_test_ops.TestOps).items():
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMaxPoolOps(unittest.TestCase):
-  """Every FP16 MaxPool2D case from test_ops at the test_gemm_fp16 tolerance."""
+  """FP16 MaxPool2D census plus exact signed-INT16 DPU coverage."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
 
   @classmethod
@@ -311,8 +311,24 @@ class TestRockchipMaxPoolOps(unittest.TestCase):
   @classmethod
   def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
 
-  @unittest.skip("Rockchip accepts FP16 inputs only")
-  def test_max_pool2d_padding_int(self): pass
+  def _check_int16(self, data:np.ndarray, *, return_indices:bool=False, expected_submits:int=1, **kwargs):
+    expected = torch.nn.functional.max_pool2d(torch.from_numpy(data), return_indices=return_indices, **kwargs)
+    before = Device["ROCKCHIP"].submit_count
+    got = Tensor(data, device="ROCKCHIP").max_pool2d(return_indices=return_indices, **kwargs)
+    if return_indices: expected, got = expected[1].int().numpy(), got[1].realize().numpy()
+    else: expected, got = expected.numpy(), got.realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
+
+  def test_max_pool2d_padding_int(self):
+    data = np.random.default_rng(2608).integers(-32768, 32768, (4,2,11,28), dtype=np.int16)
+    self._check_int16(data, kernel_size=(2,2), padding=1)
+
+  def test_max_pool2d_return_indices_int16(self):
+    data = np.array([[[[-32768, 7, 7, -9], [3, 7, -4, -4], [5, 5, 2, 1], [5, -8, 2, 2]]]], dtype=np.int16)
+    self._check_int16(data, kernel_size=(3,3), padding=1, return_indices=True, expected_submits=2)
+    global_data = np.random.default_rng(2609).integers(-32768, 32768, (1,1,12,13), dtype=np.int16)
+    self._check_int16(global_data, kernel_size=(12,13), return_indices=True, expected_submits=2)
 
   def test_max_pool2d_return_indices_wide(self):
     data = np.zeros((1,1,50,50), dtype=np.float16)
