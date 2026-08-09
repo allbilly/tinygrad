@@ -3453,3 +3453,39 @@ The CPU-cheat audit found only compile-time evaluation of scheduler coordinates 
 offsets. Runtime gathers never inspect values: they move opaque FP16 or bool bytes. Every input-dependent comparison,
 AND/OR reduction, and output conversion executes on DPU EW. There is no host numeric reduction, CMAC, LUT, tolerance
 change, floating input wider than FP16, or Tinygrad-core modification.
+
+---
+
+## 2026-08-09 — dynamic FP16 threshold MaskedSelect
+
+The data-dependent half of upstream `test_masked_select` now passes at its exact `(32,10)` shape and `x > 0.5`
+predicate. Scalar predicate totals and prefix scans accept one proven uniform FP16 threshold. DPU SUB shifts the
+threshold to zero before the existing IEEE positive-mask stages; DPU ADD produces the dynamic count and prefix. Prefix
+matrices are divided into blocks derived from `_MAX_EW_ELEMS_FP16`, compacted through immutable scratch gathers, and
+converted to INT32 only at the terminal stage. Tinygrad's local-register histogram prefix is normalized back into the
+existing verified unrolled prefix image, and the final raw-FP16 selector applies the same threshold before exact byte
+selection.
+
+The exact seeded case selects 118 of 320 values and passes in **12.83 s** under pytest. Direct wall decomposition is
+**10.004 s total** = 3.4 ms input construction + **1.676 s dynamic shape/count/prefix** + **8.324 s final realization**
++ 1.1 ms copyout/compare; it uses **54 submit ioctls / 2,347 DPU tasks**. A scalar-`True` dynamic broadcast over 32
+values also passes in **5.60 s**. The two existing fixed MaskedSelect methods and all four adjacent fixed Nonzero
+methods pass individually, with the longest at **9.01 s**. Rockchip collection is now **450 tests**.
+
+The remaining scalar-`True` half of the upstream method at 320 values is not claimed: constant folding fuses three
+redundant 320-lane reductions, and generic `devectorize2` grows from 2,061 compact nodes beyond the 30-second/roughly
+2-GiB host budget before the Rockchip renderer is called. Historical commit `797611d18` solved this with an early
+native-program hook that replaced the topology with a typed flat copy. That hook changes Tinygrad core and is therefore
+not ported under this branch's no-core-change rule. `~/rk3588` and `~/npu` provide the underlying EW primitives but no
+standalone MaskedSelect instruction or backend-side pre-codegen hook.
+
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after all focused NPU tests.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **4,081/307 executable lines**, total **29,443**. The cleanup shares threshold parsing,
+  walks each prefix term once, and avoids reparsing the final 320-term predicate.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile-time logic reads only UOp structure, shapes,
+constants, and statically proven gather addresses. Dynamic FP16 comparison, predicate count, prefix addition, INT32
+histogram/index normalization, equality, and raw FP16 selection execute on DPU EW. Python reads only the DPU-computed
+scalar required by Tinygrad's dynamic-output API; it does not compute a tensor value. There is no host numeric
+evaluator, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than FP16.

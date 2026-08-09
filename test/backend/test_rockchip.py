@@ -492,7 +492,14 @@ class TestRockchipGatherOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMaskedSelectOps(unittest.TestCase):
-  """Forward-only fixed FP16 selection with a source-derived positive mask."""
+  """Forward-only FP16 selection with source-derived and broadcast predicates."""
+
+  def test_dynamic_threshold(self):
+    _fp16_test_op([(32,10)], lambda x:x.masked_select(x>0.5), lambda x:x.masked_select(x>0.5), forward_only=True)
+
+  def test_dynamic_scalar_true_small(self):
+    _fp16_test_op([(32,)], lambda x:x.masked_select(torch.tensor(True)),
+                  lambda x:x.masked_select(Tensor(True)), forward_only=True)
 
   def test_fixed_masked_select_pad_and_truncate(self):
     values = np.array([-3., 2., -1., 4., 5., -2.], dtype=np.float16)
