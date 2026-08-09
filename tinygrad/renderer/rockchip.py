@@ -4325,13 +4325,20 @@ def _fold_native_int16(x:UOp) -> UOp|None:
 _pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
 
 def _native_int16_comparison(root:UOp) -> UOp|None:
-  """Express signed INT16 comparisons as saturating integer ALU masks."""
+  """Express signed INT16 comparisons and their boolean compositions as saturating integer ALU masks."""
   if root.op in (Ops.CMPLT, Ops.CMPNE) and all(src.dtype.scalar() is dtypes.int16 for src in root.src):
     lhs, rhs = root.src
     delta = rhs.alu(Ops.SUB, lhs) if root.op is Ops.CMPLT else lhs.alu(Ops.SUB, rhs)
     magnitude = delta.alu(Ops.MAX, UOp.const(0, dtypes.int16)) if root.op is Ops.CMPLT else \
                 UOp(Ops.MAX, dtypes.int16, src=(delta, delta), arg=_NATIVE_ABS)
     return UOp(Ops.MAX, dtypes.int16, src=(magnitude, UOp.const(1, dtypes.int16)), arg=_NATIVE_MIN)
+  if root.op in (Ops.AND, Ops.OR, Ops.XOR):
+    left_mask, right_mask = (_native_int16_comparison(src) for src in root.src)
+    if left_mask is None or right_mask is None: return None
+    if root.op is Ops.AND: return left_mask.alu(Ops.MUL, right_mask)
+    if root.op is Ops.OR: return left_mask.alu(Ops.MAX, right_mask)
+    delta = left_mask.alu(Ops.SUB, right_mask)
+    return UOp(Ops.MAX, dtypes.int16, src=(delta, delta), arg=_NATIVE_ABS)
   if root.op is Ops.CMPNE:
     for value, marker in (root.src, root.src[::-1]):
       if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg):

@@ -877,12 +877,12 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
-  def _check_bool(self, op, *values):
+  def _check_bool(self, op, *values, expected=None):
     arrays = tuple(np.asarray(value, dtype=np.int16) for value in values)
     before = Device["ROCKCHIP"].submit_count
     got = op(*(Tensor(value) for value in arrays)).realize().numpy()
     self.assertEqual(got.dtype, np.bool_)
-    np.testing.assert_array_equal(got, op(*arrays))
+    np.testing.assert_array_equal(got, op(*arrays) if expected is None else expected)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
   def test_add_sub(self):
@@ -930,6 +930,12 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     a = [-32768,-32768,-30000,-1,0,1,30000,32767]
     b = [32767,-32768,30000,0,0,-1,-30000,-32768]
     for op in (lambda x,y:x==y, lambda x,y:x!=y): self._check_bool(op, a, b)
+
+  def test_compare_logical(self):
+    a = np.asarray([-32768,-32768,-30000,-1,0,1,30000,32767], dtype=np.int16)
+    b = np.asarray([32767,-32768,30000,0,0,-1,-30000,-32768], dtype=np.int16)
+    for op in (lambda x,y:(x<y)&(x!=0), lambda x,y:(x<y)|(x!=0), lambda x,y:(x<y)^(x!=0)): self._check_bool(op, a, b)
+    self._check_bool(lambda x,y:(x<y).logical_not(), a, b, expected=np.logical_not(a<b))
 
   def test_compare_broadcast_scalar(self):
     a = [[-32768,-1,0,32767], [32767,2,-3,-32768]]

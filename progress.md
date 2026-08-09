@@ -3713,3 +3713,27 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only 
 broadcast addresses, and constants. Every input-dependent SUB, ABS, MAX, MIN, inversion, and boolean mask is computed by
 DPU INT16 EW; runtime merely copies each NPU-produced low byte into the public bool buffer. There is no NumPy predicate,
 host tensor inspection, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — native INT16 comparison compositions on DPU
+
+Boolean trees over signed-INT16 comparisons now remain in the native integer EW pipeline. The comparison matcher
+recursively turns each predicate into its exact zero/one INT16 mask, then applies the same hardware-tested algebra used
+by the FP16 logical path: MUL for AND, MAX for OR, ABS of SUB for XOR, and one-minus-mask for logical NOT. The DPU
+operations are all independently covered by `~/rk3588/examples/elementwise_int.py`; no new register mode or runtime
+special case was needed.
+
+- Full-range `(x<y)&(x!=0)`, OR, XOR, and explicit `logical_not` all pass exactly, with **one ioctl per realization**;
+  the focused method passes in **3.11 s**.
+- The complete native INT16 and existing FP16 logical-predicate groups pass **18/18 in 32.13 s**. No individual test
+  exceeds 30 seconds; the two slowest are the existing `isclose` methods at **11.07 s** and **10.69 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **466 tests**.
+- `sz.py`: renderer/runtime **4,651/327 executable lines**, total **30,033**; the milestone adds seven renderer lines
+  and no runtime lines.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only recognizes the boolean tree and emits
+native INT16 stages. Every input-dependent comparison and logical composition executes on DPU EW; runtime only performs
+the existing opaque low-byte transport into the public bool buffer. There is no host predicate evaluation, LUT, CMAC,
+tolerance relaxation, or floating input wider than FP16.
