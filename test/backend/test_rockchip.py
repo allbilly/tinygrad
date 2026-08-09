@@ -979,13 +979,14 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
     if expected_tasks is not None: self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
-  def _check_bool(self, op, *values, expected=None):
+  def _check_bool(self, op, *values, expected=None, expected_tasks=None, expected_submits=1):
     arrays = tuple(np.asarray(value, dtype=np.int16) for value in values)
-    before = Device["ROCKCHIP"].submit_count
+    before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
     got = op(*(Tensor(value) for value in arrays)).realize().numpy()
     self.assertEqual(got.dtype, np.bool_)
     np.testing.assert_array_equal(got, op(*arrays) if expected is None else expected)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
+    if expected_tasks is not None: self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_index(self, expected, op, values, submits, tasks):
     before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
@@ -1111,6 +1112,22 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     values = np.ones((257,2), dtype=np.int16)
     values[:3, :] = ((300,-300), (300,-300), (-1,-1))
     self._check(self._saturating_cumprod(values, 0), lambda x:x.cumprod(0), values, expected_tasks=258, expected_submits=2)
+
+  def test_any_reduction_loop(self):
+    values = np.zeros(257, dtype=np.int16)
+    values[128] = -32768
+    self._check_bool(lambda x:x.any(), values, expected_tasks=259)
+    matrix = np.zeros((2,257), dtype=np.int16)
+    matrix[0,128] = -32768
+    self._check_bool(lambda x:x.any(1), matrix, expected_tasks=259)
+
+  def test_all_reduction_loop(self):
+    values = np.ones(257, dtype=np.int16)
+    values[128] = 0
+    self._check_bool(lambda x:x.all(), values, expected_tasks=259)
+    matrix = np.ones((257,2), dtype=np.int16)
+    matrix[128,0] = 0
+    self._check_bool(lambda x:x.all(0), matrix, expected_tasks=259)
 
   def test_compare_ordering(self):
     a = [-32768,-32768,-30000,-1,0,1,30000,32767]

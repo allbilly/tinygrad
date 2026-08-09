@@ -4270,6 +4270,22 @@ def _stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, offse
   return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(matrix_lanes)),), gathers=gathers,
                  ew_ops=tuple(ops), post_gathers=post)
 
+def _integer_bool_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tuple[tuple[int, ...], ...],
+                                  op:Ops, itemsize:int) -> RKImage|None:
+  """Reduce exact integer nonzero masks with native INT16 MAX/MUL."""
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, len(offsets))
+  if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
+  scratch_sizes:list[int] = []
+  def scratch(size:int) -> int: scratch_sizes.append(max(64, size)); return len(scratch_sizes)-1
+  gathers:list[RKGather] = []
+  ops:list[RKEWOp] = []
+  if (mask:=_native_integer_nonzero_mask(ops, gathers, scratch, source_slot, offsets,
+                                         count, vector_lanes, itemsize)) is None: return None
+  reduced = _reduce_rows(ops, [replace(mask, addend=mask.addend+row*vector_bytes) for row in range(len(offsets))],
+                         count, _EW_CFG[Ops.MAX if op is Ops.OR else Ops.MUL], int16=True)
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
+                 post_gathers=(_int16_low_bytes(reduced, out_slot, count),))
+
 def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, groups:int, op:Ops) -> RKImage:
   """Reduce contiguous opaque bool blocks after widening their bytes into native INT16 lanes."""
   source_count = count*groups
@@ -4343,7 +4359,8 @@ def _lower_loop_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
   if update.op not in (Ops.OR, Ops.AND): return None
   acc = next((x for x in update.src if _local_load(x) is not None), None)
   predicate = update.src[1 if update.src[0] is acc else 0] if acc is not None else None
-  if predicate is None or (load:=_nonzero_load(predicate)) is None: return None
+  if predicate is None or (load:=_nonzero_load(predicate)) is None and \
+     (load:=_integer_nonzero_load(predicate, dtypes.int16)) is None: return None
   source = _root_param(load.src[0])
   identity = update.op is Ops.AND
   initials = [u for u in local_stores if u is not updates[0] and u.src[1].op is Ops.CONST and
@@ -4354,7 +4371,8 @@ def _lower_loop_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
   except RuntimeError: return None
   source_count = int(source.src[0].arg)
   if source_count != rows*groups or sorted(offset for row in offsets for offset in row) != list(range(source_count)): return None
-  return _bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op)
+  return (_integer_bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op, 2)
+          if load.dtype.scalar() is dtypes.int16 else _bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op))
 
 def _lower_grouped_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Lower grouped FP16 or stored-bool any/all after proving launch coordinates and full source coverage."""

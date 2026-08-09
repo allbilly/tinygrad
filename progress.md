@@ -4314,3 +4314,29 @@ The CPU-cheat audit found no runtime/core change and no tensor-value inspection.
 addresses, masks, and reduction topology. Runtime gathers opaque INT16 lanes; every ordered saturating MUL and final
 write executes on DPU. The NumPy routine exists only in the test oracle. There is no host product/result calculation,
 LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact INT16 any/all reductions on DPU
+
+Large signed-INT16 `any` and `all` register loops now reduce exact nonzero predicates entirely on the DPU. Each opaque
+INT16 lane is converted to a native 0/1 mask from both source bytes, preserving `-32768` as nonzero; `any` then uses
+INT16 MAX and `all` uses INT16 MUL. The final low result byte is copied directly into Tinygrad's boolean output layout.
+
+No checked Tinygrad branch, `~/npu`, or `~/rk3588` contains an integrated INT16 any/all reduction. The local
+`elementwise_int.py` reference proves the native integer MAX/MUL primitives; this milestone composes them with the
+backend's existing exact integer-nonzero mask and shared row reducer.
+
+- A 257-element global `any`, **2x257 last-axis** `any`, 257-element global `all`, and **257x2 first-axis** `all` pass
+  exactly. The input includes `-32768` to prove that the high source byte participates in the nonzero predicate.
+- Each operation uses **259 DPU tasks / one submit ioctl**. Independent test methods pass in **3.20 s** and **3.00 s**;
+  warm calls in the full class take at most **0.12 s**, well below the 30-second policy.
+- The complete native INT16 EW class passes **39/39 in 17.41 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **505 tests**.
+- `sz.py`: renderer/runtime **5,007/331 executable lines**, total **30,393**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime/core change or tensor-value inspection. The renderer validates only static loop
+offsets and topology. Runtime gathers opaque integer bytes; nonzero-mask construction, MAX/MUL reduction, and result
+writeback execute on DPU. The post-gather is a raw low-byte layout copy, not host boolean computation. NumPy is used
+only as the test oracle. There is no host reduction, LUT, CMAC, tolerance relaxation, or wider floating-point input.
