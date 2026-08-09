@@ -510,6 +510,35 @@ class TestRockchipMaskedSelectOps(unittest.TestCase):
     np.testing.assert_array_equal(got.view(np.uint16), expected)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipNonzeroOps(unittest.TestCase):
+  """Fixed FP16 nonzero coordinates selected by DPU prefix/equality stages."""
+
+  def test_fixed_nonzero_pad_and_truncate(self):
+    values = np.array([1., 0., 2., 0., 3.], dtype=np.float16)
+    source = Tensor(values, device="ROCKCHIP")
+    np.testing.assert_array_equal(source.nonzero(size=3).numpy(), np.array([[0], [2], [4]], dtype=np.int32))
+    source = Tensor(values, device="ROCKCHIP")
+    np.testing.assert_array_equal(source.nonzero(size=5, fill_value=-1).numpy(),
+                                  np.array([[0], [2], [4], [-1], [-1]], dtype=np.int32))
+
+  def test_fixed_nonzero_rank_two(self):
+    source = Tensor(np.array([[1., 0.], [0., 2.]], dtype=np.float16), device="ROCKCHIP")
+    np.testing.assert_array_equal(source.nonzero(size=2).numpy(), np.array([[0, 0], [1, 1]], dtype=np.int32))
+
+  def test_fixed_nonzero_fp16_specials(self):
+    values = np.array([0x0000, 0x8000, 0xbc00, 0x7e01, 0x7c00], dtype=np.uint16).view(np.float16)
+    source = Tensor(values, device="ROCKCHIP")
+    np.testing.assert_array_equal(source.nonzero(size=5, fill_value=-1).numpy(),
+                                  np.array([[2], [3], [4], [-1], [-1]], dtype=np.int32))
+
+  def test_fixed_nonzero_empty_scalar_and_dtype(self):
+    empty = Tensor(np.empty((0,), dtype=np.float16), device="ROCKCHIP")
+    np.testing.assert_array_equal(empty.nonzero(size=3, fill_value=-1).numpy(), np.full((3, 1), -1, dtype=np.int32))
+    self.assertEqual(Tensor(5, dtype=dtypes.half, device="ROCKCHIP").nonzero(size=4).shape, (4, 0))
+    self.assertEqual(Tensor(np.array([1., 0.], dtype=np.float16), device="ROCKCHIP").nonzero(size=3, fill_value=-1.5).dtype,
+                     dtypes.int)
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipFancyIndexOps(unittest.TestCase):
   """Dynamic INT32 fancy indices with exact negative normalization and FP16 bits."""
 

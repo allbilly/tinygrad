@@ -3024,8 +3024,8 @@ therefore the remaining wall-time bottleneck.
 
 A reset-free ReLU/MIN validity experiment was rejected after it caused an IOMMU read fault and a six-second NPU job
 timeout; the renderer was restored to the previously passing comparison path and no further NPU command was issued on
-that boot. The latest compact raw-source form still requires focused hardware revalidation after reboot before this
-milestone can be committed.
+that boot. At this point the compact raw-source form still required focused hardware revalidation; the following
+Nonzero milestone records that successful validation.
 
 The cleanup pass follows the other hardware backends' compact immutable-plan style: runtime code remains unchanged,
 FP16 representation encoding and INT32 conversion-tile sizing are centralized, an unused scratch constant was
@@ -3037,3 +3037,43 @@ The CPU-cheat audit finds changes only in the renderer, tests, and this progress
 static IR and encodes constants but never reads tensor buffers or evaluates a dynamic FP16/INT32 value. Runtime numeric
 semantics, Tinygrad core, tolerances, and the external FP16 contract are unchanged. There is no typed host evaluator,
 LUT, CMAC, CNA, or PPU fallback.
+
+---
+
+## 2026-08-09 — bounded fixed FP16 Nonzero
+
+Fixed-size FP16 `nonzero(size=..., fill_value=...)` now passes for rank-one truncation and padding, rank-two coordinate
+selection, signed zeros, finite negative values, NaN, infinity, empty inputs, and scalar output shape. Tinygrad lowers
+this operation through four programs: a repeated FP16 nonzero prefix count, the existing exact INT32 occurrence
+histogram, its INT32 prefix, and a guarded coordinate selector. The new final matcher proves the complete source
+nonzero count, dynamic prefix-index buffer, every static coordinate row, every validity threshold, and an exactly
+FP16-representable integer fill before emitting an image.
+
+The count and final selection remain DPU computations. Native ABS plus comparison creates the nonzero mask, DPU ADD
+reduces it, the shared four-byte INT32 equality plan selects the runtime prefix indices exactly, and DPU arithmetic
+combines static coordinate rows with the dynamic validity mask before exact INT32 output conversion. An initial
+hardware run returned all-zero coordinates because the new image omitted the shared equality plan's FP16 `1`
+constant; adding that immutable image constant fixed the result without a runtime or tolerance change.
+
+Historical nonzero milestones `ae5a4a6f6` and `add791a62` evaluated complete tensor expressions with NumPy in the
+runtime and were not ported. `~/npu/include/old/rknn_ops.md` marks native NonZero unsupported, and `~/rk3588` has no
+verified native NonZero instruction. The current implementation instead composes the already proven prefix,
+byte-equality, gather-plan, and DPU EW primitives.
+
+- Fixed Nonzero class: **4 passed in 11.44 s**, sequentially; every individual method passed under 30 seconds.
+- Adjacent fixed MaskedSelect regressions: **2 passed**, individually in **8.94 s** and **5.65 s**. This closes the
+  post-reboot validation left pending by the preceding WIP milestone.
+- One rank-one truncate realization: input realization 83 ms, graph construction 9 ms, scheduling 131 ms, rendering
+  224 ms, four NPU programs 1.93 s, and copyout 3 ms. It used **51 submit ioctls / 69 DPU tasks**; the exact final
+  selector was the largest program at 962 ms.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before focused work, after the initial numerical
+  failure, and after the complete focused run. No new RKNPU timeout or IOMMU fault appeared in the kernel journal.
+- Repository-wide Tinygrad mypy and Ruff, host compilation of every Nonzero program, and `git diff --check`: pass.
+  `sz.py`: renderer/runtime **3,331/281 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Static IR evaluation only proves addresses, coordinate
+tables, and selector truth tables after replacing abstract dynamic nodes with validation constants; it never reads a
+runtime source, prefix, or index buffer. Runtime gathers move opaque representations according to those plans.
+Dynamic nonzero classification, INT32 equality, coordinate selection, validity masking, and output conversion all
+execute on DPU EW. There is no typed host tensor evaluator, host Nonzero arithmetic, LUT, CMAC, CNA, PPU fallback,
+tolerance relaxation, or floating input wider than FP16.
