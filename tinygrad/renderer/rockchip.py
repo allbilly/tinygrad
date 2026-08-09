@@ -1216,26 +1216,32 @@ def _lower_unrolled_int16_sum(output:RKOutput) -> RKImage|None:
     except RuntimeError: return None
   return _int16_sum_image(out_param.arg.slot, count, concrete)
 
-def _lower_int16_sum_loop(uops:list[UOp], output:RKOutput) -> RKImage|None:
-  """Lower a promoted INT16 register-loop sum with native INT32 accumulation."""
+def _int16_loop_reduction(uops:list[UOp], output:RKOutput, op:Ops, initial:int, promoted:bool) \
+                          -> tuple[int, int, int, tuple[tuple[int, ...], ...]]|None:
+  """Parse one exact scalar or cumulative INT16 register-loop reduction."""
   store, out_param, _, _, root = output
   if _local_load(root) is None or (shape:=_loop_reduction_shape(store, out_param, uops)) is None: return None
   rows, envs, reduce_range, groups = shape
   local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
   updates = [u for u in local_stores if reduce_range in u.toposort()]
   initializers = [u for u in local_stores if reduce_range not in u.toposort()]
+  dtype = dtypes.int if promoted else dtypes.int16
   if (len(updates) != 1 or len(initializers) != 1 or len(local_stores) != 2 or
-      initializers[0].src[1].op is not Ops.CONST or initializers[0].src[1].dtype.scalar() is not dtypes.int or
-      int(initializers[0].src[1].arg) != 0): return None
+      initializers[0].src[1].op is not Ops.CONST or initializers[0].src[1].dtype.scalar() is not dtype or
+      int(initializers[0].src[1].arg) != initial): return None
   update = updates[0].src[1]
-  if update.op is not Ops.ADD or update.dtype.scalar() is not dtypes.int: return None
+  if update.op is not op or update.dtype.scalar() is not dtype: return None
   acc = next((x for x in update.src if _local_load(x) is not None), None)
   term = next((x for x in update.src if x is not acc), None)
-  if (acc is None or term is None or term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or
-      (load:=term.src[0]).op is not Ops.LOAD or load.dtype.scalar() is not dtypes.int16 or load.src[0].op is not Ops.INDEX): return None
+  if acc is None or term is None: return None
+  if promoted:
+    if term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1: return None
+    load = term.src[0]
+  else: load = term
+  if load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.int16 or load.src[0].op is not Ops.INDEX: return None
   source = _root_param(load.src[0])
-  if source is None or source.src[0].op is not Ops.CONST: return None
-  if len(load.src) > 1 and (load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0): return None
+  if source is None or source.arg.slot == out_param.arg.slot or source.src[0].op is not Ops.CONST: return None
+  if len(load.src) > 1 and (load.src[1].op is not Ops.CONST or int(load.src[1].arg) != initial): return None
   try:
     blocks = tuple(tuple(_eval_int(load.src[0].src[1], {**env, reduce_range:r})
                          if len(load.src) < 3 or bool(_eval_expr(load.src[2], {**env, reduce_range:r}, {})) else -1
@@ -1245,8 +1251,35 @@ def _lower_int16_sum_loop(uops:list[UOp], output:RKOutput) -> RKImage|None:
   scalar = source_count == rows*groups and sorted(offset for block in blocks for offset in block if offset >= 0) == list(range(source_count))
   cumulative = source_count == rows and _cumulative_prefix_blocks(blocks, source_count)
   if not scalar and not cumulative: return None
-  return _int16_sum_image(out_param.arg.slot, rows,
-                          tuple(RKGather(source.arg.slot, 0, rows, offsets=block) for block in blocks))
+  return out_param.arg.slot, rows, source.arg.slot, blocks
+
+def _lower_int16_sum_loop(uops:list[UOp], output:RKOutput) -> RKImage|None:
+  """Lower a promoted INT16 register-loop sum with native INT32 accumulation."""
+  if (parsed:=_int16_loop_reduction(uops, output, Ops.ADD, 0, True)) is None: return None
+  out_slot, rows, source_slot, blocks = parsed
+  return _int16_sum_image(out_slot, rows, tuple(RKGather(source_slot, 0, rows, offsets=block) for block in blocks))
+
+def _int16_product_image(out_slot:int, count:int, plans:tuple[RKGather, ...]) -> RKImage|None:
+  """Multiply gathered INT16 rows in reduction order on the saturating native ALU."""
+  if not 1 <= count <= _MAX_EW_ELEMS_FP16 or not 2 <= len(plans) <= _RKIMAGE_U16_MAX: return None
+  stride = _reduction_stride(count)
+  gathers = tuple(replace(plan, dst_index=0, dst_addend=row*stride//2) for row,plan in enumerate(plans))
+  def arg(row:int) -> RKArg: return RKArg(RKBufferKind.SCRATCH, 0, row*stride)
+  total = arg(0)
+  ops:list[RKEWOp] = []
+  for row in range(1, len(plans)):
+    ops.append(RKEWOp(total, total, arg(row), count, _EW_CFG[Ops.MUL], int16_input=True, int16_output=True))
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), total, total, count,
+                    _EW_CFG[Ops.MAX], int16_input=True, int16_output=True))
+  return RKImage(RKTarget.RK3588, (RKScratch(len(plans)*stride),), gathers=gathers, ew_ops=tuple(ops))
+
+def _lower_int16_product_loop(uops:list[UOp]) -> RKImage|None:
+  """Lower scalar and cumulative INT16 register-loop products."""
+  if (output:=_output_store(uops, dtypes.int16, allow_local=True)) is None or \
+     (parsed:=_int16_loop_reduction(uops, output, Ops.MUL, 1, False)) is None: return None
+  out_slot, rows, source_slot, blocks = parsed
+  plans = tuple(RKGather(source_slot, 0, rows, offsets=block, fill_bits=1) for block in blocks)
+  return _int16_product_image(out_slot, rows, plans)
 
 def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
   """Truncate a direct FP16 load on DPU before the terminal INT32 conversion."""
@@ -4785,6 +4818,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (int16_cumulative:=_lower_unrolled_int16_cumulative_extrema(uops)) is not None: return int16_cumulative
   if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew
   if (int16_extrema:=_lower_int16_loop_extrema(uops)) is not None: return int16_extrema
+  if (int16_product:=_lower_int16_product_loop(uops)) is not None: return int16_product
   if (int16_output:=_output_store(uops, dtypes.int16)) is not None:
     if (fixed_select:=_lower_fixed_integer_masked_select(int16_output, dtypes.int16)) is not None: return fixed_select
     if (unrolled_fancy:=_lower_unrolled_multi_16bit_fancy_index(int16_output, dtypes.int16)) is not None: return unrolled_fancy

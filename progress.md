@@ -4287,3 +4287,30 @@ The CPU-cheat audit found no runtime/core change or tensor-value inspection. The
 source-offset sets and proves uniqueness, partitioning, and strict prefix nesting. Runtime gathers opaque INT16 lanes;
 all widening, balanced ADD, and INT32 writeback execute on DPU. There is no host cumsum/result calculation, NumPy
 backend evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — ordered INT16 product reductions on DPU
+
+Large signed-INT16 `prod` and `cumprod` register loops now lower to an ordered native-MUL chain. Masked cumulative lanes
+use the exact multiplicative identity one. The chain is intentionally sequential rather than balanced because RK3588
+INT16 MUL saturates; reassociation can change an overflowed result. Sum and product now share one typed local-loop
+parser for accumulator initialization, source/load validation, static block construction, and scalar/prefix coverage.
+
+No checked Tinygrad branch, `~/npu`, or `~/rk3588` contains an integrated loop-product implementation.
+`~/rk3588/examples/elementwise_int.py` directly proves signed-INT16 MUL and its saturating limits on this DPU EW path.
+
+- A **40x257** axis product, a 257-element cumulative product, and **2x257 last-axis** plus **257x2 first-axis**
+  cumulative products pass exactly. The sequence `300 * 300 * -1` proves ordered saturation: `32767`, then `-32767`.
+- Independent calls take **0.22 s**, **0.91 s**, **1.88 s**, and **2.04 s**. First-axis cumprod includes one Tinygrad
+  layout kernel and the 257-task product chain; the other cases use one submit.
+- The complete native INT16 EW class passes **37/37 in 16.97 s**; no case approaches the 30-second policy.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **503 tests**.
+- `sz.py`: renderer/runtime **4,991/331 executable lines**, total **30,377**. Sharing the existing sum parser keeps the
+  implementation to a net 28 renderer lines; runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime/core change and no tensor-value inspection. Compile time evaluates only static
+addresses, masks, and reduction topology. Runtime gathers opaque INT16 lanes; every ordered saturating MUL and final
+write executes on DPU. The NumPy routine exists only in the test oracle. There is no host product/result calculation,
+LUT, CMAC, tolerance relaxation, or floating input wider than FP16.

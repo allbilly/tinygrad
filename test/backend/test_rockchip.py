@@ -1082,6 +1082,36 @@ class TestRockchipInt16EWOps(unittest.TestCase):
   def test_cumsum_last_axis(self): self._check_cumsum((2,257), 1, 16962)
   def test_cumsum_first_axis(self): self._check_cumsum((257,2), 0, 16962)
 
+  @staticmethod
+  def _saturating_cumprod(values, axis):
+    moved = np.moveaxis(values, axis, -1).astype(np.int32)
+    out, acc = np.empty_like(moved, dtype=np.int16), np.ones(moved.shape[:-1], dtype=np.int32)
+    for i in range(moved.shape[-1]):
+      acc = np.clip(acc*moved[..., i], -32768, 32767)
+      out[..., i] = acc
+    return np.moveaxis(out, -1, axis)
+
+  def test_product_loop(self):
+    values = np.ones((40,257), dtype=np.int16)
+    values[:, :3] = (300,300,-1)
+    values[::2, 3] = 0
+    self._check(self._saturating_cumprod(values, 1)[:, -1], lambda x:x.prod(1), values, expected_tasks=257)
+
+  def test_cumprod_1d(self):
+    values = np.ones(257, dtype=np.int16)
+    values[:3] = (300,300,-1)
+    self._check(self._saturating_cumprod(values, 0), lambda x:x.cumprod(0), values, expected_tasks=257)
+
+  def test_cumprod_last_axis(self):
+    values = np.ones((2,257), dtype=np.int16)
+    values[:, :3] = ((300,300,-1), (-300,-300,-1))
+    self._check(self._saturating_cumprod(values, 1), lambda x:x.cumprod(1), values, expected_tasks=257)
+
+  def test_cumprod_first_axis(self):
+    values = np.ones((257,2), dtype=np.int16)
+    values[:3, :] = ((300,-300), (300,-300), (-1,-1))
+    self._check(self._saturating_cumprod(values, 0), lambda x:x.cumprod(0), values, expected_tasks=258, expected_submits=2)
+
   def test_compare_ordering(self):
     a = [-32768,-32768,-30000,-1,0,1,30000,32767]
     b = [32767,-32768,30000,0,0,-1,-30000,-32768]
