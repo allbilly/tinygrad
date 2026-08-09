@@ -3951,3 +3951,44 @@ The CPU-cheat audit found no runtime or core change. Compile time evaluates only
 offsets. Runtime gathers rearrange bytes and DPU INT16 MIN/MAX computes every cumulative value. There is no host extrema
 or prefix calculation over tensor values, NumPy backend evaluation, LUT, CMAC, tolerance change, or floating input wider
 than FP16.
+
+---
+
+## 2026-08-09 — exact signed-INT16 ArgMax/ArgMin on DPU
+
+Signed-INT16 ArgMax and ArgMin now return exact first-tie INT32 indices for global, axis, and 257-element loop forms.
+The existing FP16 parser and first-tie validator are typed rather than duplicated: INT16 candidates use direct loads for
+ArgMax and Tinygrad's `x XOR -1` complement for ArgMin. The shared image performs native extrema, exact equality masks,
+descending-coordinate selection, and terminal INT16-to-INT32 conversion on DPU.
+
+Axis ArgMin materializes a complemented-minimum temporary. Its value kernel now recovers `MAX(~x...)` as
+`~MIN(x...)`, implemented exactly as native MIN followed by `-1 - value`; this handles `-32768` without the saturation
+error that a NEG-based complement would introduce. The index kernel then compares the same complemented domain.
+
+The small fused layout keeps one ioctl and uses replicated extrema gathers. At 257 candidates, replication would require
+`window**2 + 2*window` gathers and overflow RKImage's unsigned-16-bit gather count. That limit is derived from the image
+field width, not a hardcoded candidate cap. The wide path reduces a second candidate arena once and mid-gathers the
+compact extrema row, reducing gather growth from quadratic to linear. The terminal INT16-to-INT32 body is now appended
+to an existing compatible PC chain, matching the prepare/emit/submit layering used by Tinygrad's other hardware
+backends and avoiding an otherwise unnecessary ioctl.
+
+Historical FP16 commits `2ec7c17ea`, `309896f58`, and `83bd88931` supplied the tie, axis, and global parser references.
+`~/rk3588/examples/elementwise_int.py` proves the signed INT16 MIN/MAX, SUB, and conversion building blocks; neither it,
+`~/npu`, nor another branch contains a native INT16 ArgMax implementation to copy.
+
+- Full-range global first ties, axis 0/1 selections, and non-monotonic 257-element global ArgMax/ArgMin pass exactly.
+  The final focused method takes **0.66 s call / 3.63 s including startup**.
+- Asserted task counts are global-8 **22/31**, axis-1 **14/16**, axis-0 **12/14**, and global-257 **520/522** for
+  Max/Min. Small global cases use **1 ioctl**; axis cases use one value plus one index program; the wide global case uses
+  two phases because its compact extrema row must be mid-gathered.
+- The INT16 and existing FP16 ArgExtrema regression groups passed **28/28 plus 10 subtests in 14.42 s**; final added
+  axis-0 assertions also pass in the focused method. No case approaches the 30-second profiling threshold.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after hardware testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **476 tests**.
+- `sz.py`: renderer/runtime **4,829/327 executable lines**, total **30,211**. Sharing the existing parser/emitter limits
+  the milestone to 52 renderer lines; runtime executable size is unchanged and Tinygrad core is untouched.
+
+The CPU-cheat audit found no tensor-value read or host-side result calculation. Compile time checks only static offsets,
+candidate coverage, and Tinygrad's first-tie IR. Runtime only chains command bodies and performs the existing raw
+mid-gather. Every extrema, complement, equality, coordinate selection, and typed writeback operation executes on DPU.
+There is no host ArgMax/ArgMin, NumPy backend evaluation, LUT, CMAC, tolerance change, or floating input wider than FP16.

@@ -181,7 +181,7 @@ class RockchipProgram(Program['RockchipDevice']):
         if op.int16_output or op.int32_input: raise RuntimeError("conflicting INT16→INT32 EW precision")
         if op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
           raise RuntimeError("INT32 argument output must be terminal")
-        if bodies:
+        if bodies and body_precision not in (0, 16):
           self._submit_pcchain(bodies)
           bodies.clear()
         stages = []
@@ -192,7 +192,7 @@ class RockchipProgram(Program['RockchipDevice']):
             RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+start*2),
             RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+start*2), count, op.ew_cfg,
             stateful=True, int32_output=True, int16_input=True), address))
-        self._submit_pcchain(stages)
+        bodies.extend(stages)
         body_precision = 0
         continue
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:

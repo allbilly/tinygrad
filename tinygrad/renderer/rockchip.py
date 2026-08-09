@@ -19,6 +19,7 @@ _FILL = struct.Struct("<BBHI")  # dst_kind, itemsize, dst_index, count
 _EWOP = struct.Struct("<BBHIIII")  # dst_kind, flags, dst_index, lhs_kind, lhs_index, rhs_kind, rhs_index
 _EWOP2 = struct.Struct("<II")  # count, ew_cfg
 _ITEM_FORMAT = {1:"B", 2:"H", 4:"I"}
+_RKIMAGE_U16_MAX = (1 << 16) - 1
 
 class RKTarget(IntEnum): RK3588 = 1
 class RKBufferKind(IntEnum): ARG = 0; SCRATCH = 1
@@ -2002,14 +2003,19 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
                             extrema_plans:tuple[RKGather, ...], negated_candidates:bool, axis_coords:list[int],
                             first_tie:bool=False, negate_extrema:bool=False,
                             candidate_coords:tuple[tuple[int, ...], ...]|None=None, index_limit:int|None=None,
-                            raw_weight:bool=False) -> RKImage:
+                            raw_weight:bool=False, native_int16:bool=False) -> RKImage:
   """Emit a matrix equality/select reduction shared by unrolled and loop cumulative indices."""
   window = len(candidate_plans)
   limit = window if index_limit is None else index_limit
-  constants = (0.0, 1.0, float(limit)) if first_tie else (0.0, 1.0)
+  if native_int16: constants:tuple[int|float, ...] = (0, 1, limit) if first_tie else (0, 1)
+  else: constants = (0.0, 1.0, float(limit)) if first_tie else (0.0, 1.0)
+  complement = len(constants)
+  if native_int16 and (negated_candidates or negate_extrema): constants += (-1,)
   zero, one, candidate_arena = 0, 1, len(constants)
-  extrema_slots = tuple(range(candidate_arena+1, candidate_arena+1+len(extrema_plans)))
-  first_temp = candidate_arena+1+len(extrema_plans)
+  fused_extrema = native_int16 and extrema_plans is candidate_plans and window*window+2*window > _RKIMAGE_U16_MAX
+  extrema_arena = candidate_arena+1
+  extrema_slots = (candidate_arena+2,) if fused_extrema else tuple(range(candidate_arena+1, candidate_arena+1+len(extrema_plans)))
+  first_temp = candidate_arena+3 if fused_extrema else candidate_arena+1+len(extrema_plans)
   coordinate_arena, selected_arena, diff, magnitude, unequal, equal, int_tiles = range(first_temp, first_temp+7)
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, window)
   def materialize(plans:tuple[RKGather, ...], scratch_slot:int) -> tuple[RKGather, ...]:
@@ -2017,8 +2023,11 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
                           values=plan.values, partial=plan.partial, dst_stride=plan.dst_stride,
                           dst_addend=i*vector_lanes, itemsize=plan.itemsize) for i,plan in enumerate(plans))
   gathers = materialize(candidate_plans, candidate_arena)
-  for plan,scratch_slot in zip(extrema_plans, extrema_slots): gathers += materialize((plan,)*window, scratch_slot)
-  coordinate_bits = tuple(tuple(_fp16_bits(limit-(candidate_coords[candidate][dst]
+  if fused_extrema: gathers += materialize(candidate_plans, extrema_arena)
+  else:
+    for plan,scratch_slot in zip(extrema_plans, extrema_slots): gathers += materialize((plan,)*window, scratch_slot)
+  encode = _int16_bits if native_int16 else _fp16_bits
+  coordinate_bits = tuple(tuple(encode(limit-(candidate_coords[candidate][dst]
                                 if candidate_coords is not None else candidate) if first_tie else
                                 candidate+1 if candidate <= axis_coords[dst] else 0)
                                 for dst in range(count)) for candidate in range(window))
@@ -2027,27 +2036,51 @@ def _cumulative_index_image(out_slot:int, count:int, candidate_plans:tuple[RKGat
   scratch = (*(RKScratch(_scratch_bytes(matrix_lanes)) for _ in range(int_tiles)), RKScratch(_int32_tiles_bytes(count)))
   def args(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
   ew_ops:list[RKEWOp] = []
+  integer = dict(int16_input=True, int16_output=True) if native_int16 else {}
+  mid_gathers:tuple[RKGather, ...] = ()
+  gather_after = 0
+  if fused_extrema:
+    _reduce_rows(ew_ops, [args(extrema_arena, candidate*vector_bytes) for candidate in range(window)], count,
+                 _EW_CFG_MIN if negated_candidates else _EW_CFG[Ops.MAX], int16=True)
+    gather_after = len(ew_ops)
+    offsets = tuple(range(count))
+    mid_gathers = tuple(RKGather(extrema_arena, extrema_slots[0], count, offsets=offsets,
+                                 dst_addend=candidate*vector_lanes, src_kind=RKBufferKind.SCRATCH) for candidate in range(window))
   if negate_extrema:
-    for slot in extrema_slots: ew_ops.append(RKEWOp(args(slot), args(zero), args(slot), matrix_lanes, _EW_CFG[Ops.SUB]))
+    for slot in extrema_slots:
+      ew_ops.append(RKEWOp(args(slot), args(complement if native_int16 else zero), args(slot), matrix_lanes, _EW_CFG[Ops.SUB], **integer))
   extrema = args(extrema_slots[0])
   for i,slot in enumerate(extrema_slots[1:]):
     ew_ops.append(RKEWOp(extrema, extrema, args(slot), matrix_lanes, _EW_CFG[Ops.MAX],
-                         submit_barrier=negate_extrema and i == 0, stateful=negate_extrema and i == 0))
+                         submit_barrier=not native_int16 and negate_extrema and i == 0,
+                         stateful=not native_int16 and negate_extrema and i == 0, **integer))
   if negated_candidates:
-    ew_ops.append(RKEWOp(args(diff), args(zero), args(candidate_arena), matrix_lanes, _EW_CFG[Ops.SUB],
-                          submit_barrier=bool(ew_ops), stateful=bool(ew_ops)))
-  equal_arg = _ew_eq_mask(ew_ops, args, diff if negated_candidates else candidate_arena, extrema_slots[0],
-                          (magnitude, magnitude, unequal, equal), one, matrix_lanes, (bool(ew_ops), True))
+    ew_ops.append(RKEWOp(args(diff), args(complement if native_int16 else zero), args(candidate_arena), matrix_lanes, _EW_CFG[Ops.SUB],
+                          submit_barrier=not native_int16 and bool(ew_ops), stateful=not native_int16 and bool(ew_ops), **integer))
+  if native_int16:
+    ew_ops.extend((RKEWOp(args(diff), args(diff if negated_candidates else candidate_arena), args(extrema_slots[0]), matrix_lanes,
+                          _EW_CFG[Ops.SUB], **integer),
+                   RKEWOp(args(magnitude), args(diff), args(diff), matrix_lanes, _EW_CFG_ABS, **integer),
+                   RKEWOp(args(unequal), args(magnitude), args(one), matrix_lanes, _EW_CFG_MIN, **integer),
+                   RKEWOp(args(equal), args(one), args(unequal), matrix_lanes, _EW_CFG[Ops.SUB], **integer)))
+    equal_arg = args(equal)
+  else:
+    equal_arg = _ew_eq_mask(ew_ops, args, diff if negated_candidates else candidate_arena, extrema_slots[0],
+                            (magnitude, magnitude, unequal, equal), one, matrix_lanes, (bool(ew_ops), True))
   ew_ops.extend((RKEWOp(args(diff), equal_arg, args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
-                        submit_barrier=True, stateful=True),
+                        submit_barrier=not native_int16, stateful=not native_int16, **integer),
                  RKEWOp(args(selected_arena), equal_arg, args(coordinate_arena), matrix_lanes, _EW_CFG[Ops.MUL],
-                        submit_barrier=True, stateful=True)))
-  selected = _reduce_rows(ew_ops, [args(selected_arena, candidate*vector_bytes) for candidate in range(window)], count, _EW_CFG[Ops.MAX])
-  ew_ops.append(RKEWOp(args(diff), args(zero if raw_weight else 2), selected, count, _EW_CFG[Ops.SUB]) if first_tie else
-                RKEWOp(args(diff), selected, args(one), count, _EW_CFG[Ops.SUB]))
+                        submit_barrier=not native_int16, stateful=not native_int16, **integer)))
+  selected = _reduce_rows(ew_ops, [args(selected_arena, candidate*vector_bytes) for candidate in range(window)], count,
+                          _EW_CFG[Ops.MAX], int16=native_int16)
+  if first_tie:
+    ew_ops.append(RKEWOp(args(diff), args(zero if raw_weight else 2), selected, count, _EW_CFG[Ops.SUB], **integer))
+  else: ew_ops.append(RKEWOp(args(diff), selected, args(one), count, _EW_CFG[Ops.SUB], **integer))
   ew_ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), args(diff), args(int_tiles), count,
-                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True))
-  return RKImage(RKTarget.RK3588, scratch, struct.pack("<"+"e"*len(constants), *constants), gathers=gathers, ew_ops=tuple(ew_ops))
+                       _EW_CFG[Ops.MAX], stateful=True, int32_output=True, int16_input=native_int16))
+  constant_data = struct.pack("<"+("h" if native_int16 else "e")*len(constants), *constants)
+  return RKImage(RKTarget.RK3588, scratch, constant_data, gathers=gathers, ew_ops=tuple(ew_ops),
+                 mid_gathers=mid_gathers, gather_after=gather_after)
 
 def _half_candidate(root:UOp) -> tuple[UOp, bool]|None:
   if root.op is Ops.LOAD: return (root, False)
@@ -2057,11 +2090,16 @@ def _half_candidate(root:UOp) -> tuple[UOp, bool]|None:
     if len(loads) == len(constants) == 1: return (loads[0], True)
   return None
 
-def _param_load_groups(nodes:Iterable[UOp]) -> dict[int, list[UOp]]:
-  """Group unique FP16 parameter loads by argument slot."""
+def _int16_candidate(root:UOp) -> tuple[UOp, bool]|None:
+  if root.op is Ops.LOAD: return (root, False)
+  candidate = _int16_nonconst(root, -1) if root.op is Ops.XOR else None
+  return (candidate, True) if candidate is not None and candidate.op is Ops.LOAD else None
+
+def _param_load_groups(nodes:Iterable[UOp], dtype:DType=dtypes.half) -> dict[int, list[UOp]]:
+  """Group unique typed parameter loads by argument slot."""
   grouped:dict[int, list[UOp]] = {}
   for load in nodes:
-    if load.op is Ops.LOAD and load.dtype.scalar() is dtypes.half and load.src[0].op is Ops.INDEX and load.src[0].src[0].op is Ops.PARAM:
+    if load.op is Ops.LOAD and load.dtype.scalar() is dtype and load.src[0].op is Ops.INDEX and load.src[0].src[0].op is Ops.PARAM:
       slot = load.src[0].src[0].arg.slot
       if load not in grouped.setdefault(slot, []): grouped[slot].append(load)
   return grouped
@@ -3797,17 +3835,18 @@ def _lower_loop_max_unpool(uops:list[UOp], output:RKOutput) -> RKImage|None:
 class RKArgMatch:
   source_slot:int; source_count:int; extrema:UOp; candidates:tuple[tuple[UOp, UOp, bool], ...]; extrema_plans:tuple[RKGather, ...]|None = None
 
-def _lower_unrolled_arg_extrema(output:RKOutput) -> RKImage|None:
+def _lower_unrolled_arg_extrema(output:RKOutput, native_int16:bool=False) -> RKImage|None:
   """Share first-tie validation and gather packing across fused and split ArgMax/ArgMin graphs."""
   _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
   nodes = value.toposort()
+  dtype, candidate = (dtypes.int16, _int16_candidate) if native_int16 else (dtypes.half, _half_candidate)
 
   def fused() -> RKArgMatch|None:
     roots:list[tuple[UOp, list[UOp], list[tuple[UOp, bool]]]] = []
     for root in nodes:
-      if root.op is not Ops.MAX or root.dtype.scalar() is not dtypes.half: continue
-      leaves = _flatten_binary(root, Ops.MAX); parsed_leaves = [_half_candidate(leaf) for leaf in leaves]
+      if root.op is not Ops.MAX or root.dtype.scalar() is not dtype: continue
+      leaves = _flatten_binary(root, Ops.MAX); parsed_leaves = [candidate(leaf) for leaf in leaves]
       if all(x is not None for x in parsed_leaves): roots.append((root, leaves, [x for x in parsed_leaves if x is not None]))
     if not roots: return None
     extrema, exprs, parsed = max(roots, key=lambda x:len(x[1]))
@@ -3818,7 +3857,7 @@ def _lower_unrolled_arg_extrema(output:RKOutput) -> RKImage|None:
                       tuple((expr, load, negated) for expr,(load,negated) in zip(exprs, parsed)))
 
   def split() -> RKArgMatch|None:
-    by_slot = _param_load_groups(nodes)
+    by_slot = _param_load_groups(nodes, dtype)
     extrema_groups = [(slot, group[0]) for slot,group in by_slot.items() if len(group) == 1 and
                       group[0].src[0].src[0].src[0].op is Ops.CONST and int(group[0].src[0].src[0].src[0].arg) == count]
     if len(extrema_groups) != 1 or len(by_slot) != 2: return None
@@ -3829,7 +3868,7 @@ def _lower_unrolled_arg_extrema(output:RKOutput) -> RKImage|None:
     candidates:list[tuple[UOp, UOp, bool]] = []
     for cmp in [u for u in nodes if u.op is Ops.CMPNE and extrema in u.src]:
       expr = cmp.src[1] if cmp.src[0] is extrema else cmp.src[0]
-      if (parsed:=_half_candidate(expr)) is not None: candidates.append((expr, *parsed))
+      if (parsed:=candidate(expr)) is not None: candidates.append((expr, *parsed))
     if {load for _,load,_ in candidates} != set(loads): return None
     try: extrema_offsets = tuple(_gather_offsets(out_index, extrema.src[0].src[1], None, count))
     except RuntimeError: return None
@@ -3851,10 +3890,11 @@ def _lower_unrolled_arg_extrema(output:RKOutput) -> RKImage|None:
       not _first_tie_selection(value, match.extrema, [expr for _,expr in ordered])): return None
   plans = tuple(RKGather(match.source_slot, 0, count, offsets=row) for row,_ in ordered)
   return _cumulative_index_image(out_param.arg.slot, count, plans, plans if match.extrema_plans is None else match.extrema_plans,
-                                 negated, [window-1]*count, first_tie=True, negate_extrema=negated and match.extrema_plans is None)
+                                 negated, [window-1]*count, first_tie=True, negate_extrema=negated and match.extrema_plans is None,
+                                 native_int16=native_int16)
 
-def _lower_loop_arg_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
-  """Lower the two-register-loop graph used by a padded global FP16 ArgMax/ArgMin."""
+def _lower_loop_arg_extrema_index(uops:list[UOp], output:RKOutput, native_int16:bool=False) -> RKImage|None:
+  """Lower the two-register-loop graph used by a padded global ArgMax/ArgMin."""
   _, out_param, count, out_index, value = output
   if count != 1 or _index_ranges(out_index): return None
   ranges = [u for u in uops if u.op is Ops.RANGE]
@@ -3862,24 +3902,24 @@ def _lower_loop_arg_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|No
   first_range, second_range = ranges
   window = int(first_range.src[0].arg)
   if not 2 <= window <= 2048 or int(second_range.src[0].arg) != window: return None
-  input_params = [u for u in uops if u.op is Ops.PARAM and u.dtype.scalar() is dtypes.half and
+  dtype, candidate = (dtypes.int16, _int16_candidate) if native_int16 else (dtypes.half, _half_candidate)
+  input_params = [u for u in uops if u.op is Ops.PARAM and u.dtype.scalar() is dtype and
                   u.src[0].op is Ops.CONST and int(u.src[0].arg) == window]
   if len(input_params) != 1: return None
   source = input_params[0]
   local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
-  initial_half = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtypes.half and
-                  math.isinf(float(u.src[1].arg)) and float(u.src[1].arg) < 0]
+  initial_value = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtype and
+                   (int(u.src[1].arg) == -32768 if native_int16 else math.isinf(float(u.src[1].arg)) and float(u.src[1].arg) < 0)]
   initial_int = [u for u in local_stores if u.src[1].op is Ops.CONST and u.src[1].dtype.scalar() is dtypes.int and
                  int(u.src[1].arg) == -(1 << 31)]
-  half_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtypes.half and
-                  first_range in u.toposort()]
+  value_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtype and
+                   first_range in u.toposort()]
   int_updates = [u for u in local_stores if u.src[1].op is Ops.MAX and u.src[1].dtype.scalar() is dtypes.int and
                  second_range in u.toposort()]
-  if not all(len(x) == 1 for x in (initial_half, initial_int, half_updates, int_updates)) or len(local_stores) != 4: return None
+  if not all(len(x) == 1 for x in (initial_value, initial_int, value_updates, int_updates)) or len(local_stores) != 4: return None
 
   def global_candidate(exprs:list[UOp], reduce_range:UOp) -> tuple[UOp, bool]|None:
-    parsed = [(expr, candidate) for expr in exprs if (candidate:=_half_candidate(expr)) is not None and
-              _root_param(candidate[0].src[0]) is source]
+    parsed = [(expr, match) for expr in exprs if (match:=candidate(expr)) is not None and _root_param(match[0].src[0]) is source]
     if len(parsed) != 1: return None
     expr, (load, negated) = parsed[0]
     if load.src[0].op is not Ops.INDEX or load.src[0].src[1] is not reduce_range: return None
@@ -3888,14 +3928,14 @@ def _lower_loop_arg_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|No
     except RuntimeError: return None
     return expr, negated
 
-  half_candidate = global_candidate(list(half_updates[0].src[1].src), first_range)
+  value_candidate = global_candidate(list(value_updates[0].src[1].src), first_range)
   int_nodes = int_updates[0].src[1].toposort()
   comparisons = [u for u in int_nodes if u.op is Ops.CMPNE and u.dtype.scalar() is dtypes.bool]
-  inner_cmps = [u for u in comparisons if any(_half_candidate(x) is not None for x in u.src)]
-  if half_candidate is None or len(inner_cmps) != 1: return None
+  inner_cmps = [u for u in comparisons if any(candidate(x) is not None for x in u.src)]
+  if value_candidate is None or len(inner_cmps) != 1: return None
   cmp = inner_cmps[0]
   second_candidate = global_candidate(list(cmp.src), second_range)
-  if second_candidate is None or second_candidate[1] != half_candidate[1]: return None
+  if second_candidate is None or second_candidate[1] != value_candidate[1]: return None
   extrema_operands = [x for x in cmp.src if x is not second_candidate[0]]
   if len(extrema_operands) != 1 or extrema_operands[0].op is not Ops.LOAD or _root_param(extrema_operands[0].src[0]) is not None:
     return None
@@ -3916,7 +3956,8 @@ def _lower_loop_arg_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|No
       not any(x.op is Ops.CONST and int(x.arg) == window for x in value.src)): return None
   candidate_plans = tuple(RKGather(source.arg.slot, 0, 1, base=i) for i in range(window))
   return _cumulative_index_image(out_param.arg.slot, 1, candidate_plans, candidate_plans,
-                                 half_candidate[1], [window-1], first_tie=True, negate_extrema=half_candidate[1])
+                                 value_candidate[1], [window-1], first_tie=True, negate_extrema=value_candidate[1],
+                                 native_int16=native_int16)
 
 def _lower_cumulative_extrema_index(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Select unrolled cumulative MAX/MIN axis coordinates with DPU equality masks."""
@@ -4484,6 +4525,16 @@ _pm_native_int16_hard_activation = PatternMatcher([
 ])
 _pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
 
+def _fold_native_int16_complemented_min(root:UOp) -> UOp:
+  """Recover MAX(~x...) temporary extrema as `~MIN(x...)` for ArgMin index selection."""
+  leaves = _flatten_binary(root, Ops.MAX) if root.op is Ops.MAX else []
+  candidates = tuple(_int16_nonconst(leaf, -1) for leaf in leaves)
+  if len(candidates) < 2 or any(candidate is None for candidate in candidates): return root
+  values = tuple(candidate for candidate in candidates if candidate is not None)
+  minimum = values[0]
+  for value in values[1:]: minimum = UOp(Ops.MAX, dtypes.int16, src=(minimum, value), arg=_NATIVE_MIN)
+  return UOp.const(-1, dtypes.int16).alu(Ops.SUB, minimum)
+
 def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
   """Lower signed INT16 arithmetic and exact comparison masks to the DPU integer EW pipeline."""
   int32_output = bool_output = False
@@ -4497,6 +4548,7 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
       output, bool_output = (*output[:4], comparison), True
   _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
+  value = _fold_native_int16_complemented_min(value)
   value = graph_rewrite(value, _pm_native_int16_hard_activation, name="rockchip native int16 hard activation")
   value = graph_rewrite(value, _pm_native_int16, name="rockchip native int16")
   supported = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.NEG}
@@ -4654,12 +4706,15 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (cumulative_loop:=_lower_cumulative_extrema_index_loop(uops, int_loop_output)) is not None: return cumulative_loop
   if int_output is not None:
     if (cumulative_index:=_lower_cumulative_extrema_index(uops, int_output)) is not None: return cumulative_index
+    if (int16_arg_extrema:=_lower_unrolled_arg_extrema(int_output, native_int16=True)) is not None: return int16_arg_extrema
     if (arg_extrema:=_lower_unrolled_arg_extrema(int_output)) is not None: return arg_extrema
     if (pool_index:=_lower_unrolled_pool_index(int_output)) is not None: return pool_index
     if (one_hot:=_lower_one_hot(int_output)) is not None: return one_hot
     if (int_where:=_lower_int_where(int_output)) is not None: return int_where
     if (raw_bitcast:=_lower_raw_fp16_bitcast(int_output)) is not None: return raw_bitcast
   if int_loop_output is not None:
+    if (int16_loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output, native_int16=True)) is not None:
+      return int16_loop_arg_extrema
     if (loop_arg_extrema:=_lower_loop_arg_extrema_index(uops, int_loop_output)) is not None: return loop_arg_extrema
     if (loop_pool_index:=_lower_loop_pool_index(uops, int_loop_output)) is not None: return loop_pool_index
   if int_output is not None and (raw_int32:=_lower_raw_int32_layout(int_output)) is not None: return raw_int32

@@ -886,6 +886,14 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     np.testing.assert_array_equal(got, op(*arrays) if expected is None else expected)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
+  def _check_index(self, expected, op, values, submits, tasks):
+    before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    got = op(Tensor(np.asarray(values, dtype=np.int16))).realize().numpy()
+    self.assertEqual(got.dtype, np.int32)
+    np.testing.assert_array_equal(got, np.asarray(expected, dtype=np.int32))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, submits)
+    self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, tasks)
+
   def test_add_sub(self):
     a = [-30000,-1200,-7,-1,0,1,1200,30000]
     b = [1000,-30,2,-1,1,2,-30,1000]
@@ -1007,6 +1015,19 @@ class TestRockchipInt16EWOps(unittest.TestCase):
       values = (np.arange(count, dtype=np.uint32)*7919).astype(np.uint16).view(np.int16)
       self._check(np.maximum.accumulate(values), lambda x:x.cummax(0)[0], values, expected_tasks=count-1)
       self._check(np.minimum.accumulate(values), lambda x:x.cummin(0)[0], values, expected_tasks=count-1)
+
+  def test_arg_extrema(self):
+    values = np.asarray([32767, -32768, 7, 7, -1, 32767, 0, -32768], dtype=np.int16)
+    self._check_index(np.argmax(values), lambda x:x.argmax(), values, 1, 22)
+    self._check_index(np.argmin(values), lambda x:x.argmin(), values, 1, 31)
+    matrix = values[:4].reshape(1, 4).repeat(3, 0)
+    self._check_index(np.argmax(matrix, axis=1), lambda x:x.argmax(1), matrix, 2, 14)
+    self._check_index(np.argmin(matrix, axis=1), lambda x:x.argmin(1), matrix, 2, 16)
+    self._check_index(np.argmax(matrix, axis=0), lambda x:x.argmax(0), matrix, 2, 12)
+    self._check_index(np.argmin(matrix, axis=0), lambda x:x.argmin(0), matrix, 2, 14)
+    wide = (np.arange(257, dtype=np.uint32)*7919).astype(np.uint16).view(np.int16)
+    self._check_index(np.argmax(wide), lambda x:x.argmax(), wide, 2, 520)
+    self._check_index(np.argmin(wide), lambda x:x.argmin(), wide, 2, 522)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDotOps(unittest.TestCase):
