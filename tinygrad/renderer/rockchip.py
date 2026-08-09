@@ -4327,6 +4327,19 @@ def _fold_native_int16_relu6(x:UOp) -> UOp|None:
       return UOp(Ops.MAX, x.dtype, src=(lower, UOp.const(6, dtypes.int16)), arg=_NATIVE_MIN)
   return None
 
+def _fold_native_int16_leaky_relu(x:UOp) -> UOp|None:
+  """Recover integral leaky ReLU as x + min(x,0)*(slope-1), preserving saturating INT16 semantics."""
+  gate, negative, positive = x.src
+  if gate.op is not Ops.CMPLT or not _int16_const(gate.src[1], 0) or positive.key != gate.src[0].key or negative.op is not Ops.MUL:
+    return None
+  for factor, value in (negative.src, negative.src[::-1]):
+    if (value.key != positive.key or factor.op is not Ops.CONST or factor.dtype.scalar() not in (dtypes.int16, dtypes.weakint) or
+        not 2 <= (slope:=int(factor.arg)) <= 32767): continue
+    below = UOp(Ops.MAX, x.dtype, src=(positive, UOp.const(0, dtypes.int16)), arg=_NATIVE_MIN)
+    correction = below if slope == 2 else below.alu(Ops.MUL, UOp.const(slope-1, dtypes.int16))
+    return positive.alu(Ops.ADD, correction)
+  return None
+
 def _fold_native_int16(x:UOp) -> UOp|None:
   """Recover native integer operations from Tinygrad's portable decompositions."""
   if x.op is Ops.XOR and (maximum:=_int16_nonconst(x, -1)) is not None and maximum.op is Ops.MAX:
@@ -4378,6 +4391,7 @@ def _native_int16_comparison(root:UOp) -> UOp|None:
 
 _pm_native_int16_hard_activation = PatternMatcher([
   (UPat(Ops.WHERE, dtype=dtypes.int16, name="x"), _fold_native_int16_sign),
+  (UPat(Ops.WHERE, dtype=dtypes.int16, name="x"), _fold_native_int16_leaky_relu),
   (UPat(Ops.ADD, dtype=dtypes.int16, name="x"), _fold_native_int16_relu6),
 ])
 _pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])

@@ -970,6 +970,13 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self._check(np.clip(values, 0, 6), lambda x:x.relu6(), values, expected_tasks=2)
     self._check(np.clip(values, -3, 4), lambda x:x.hardtanh(-3, 4), values, expected_tasks=2)
 
+  def test_leaky_relu_integral(self):
+    values = np.asarray([-32768,-20000,-1200,-1,0,1,1200,20000,32767], dtype=np.int16)
+    for slope, tasks in ((2, 2), (3, 3)):
+      wide = values.astype(np.int32)
+      expected = np.where(values < 0, np.clip(wide*slope, -32768, 32767), wide).astype(np.int16)
+      self._check(expected, lambda x,slope=slope:x.leaky_relu(slope), values, expected_tasks=tasks)
+
   def test_compare_broadcast_scalar(self):
     a = [[-32768,-1,0,32767], [32767,2,-3,-32768]]
     self._check_bool(lambda x,y:x>=y, a, [-32768,0,0,32767])

@@ -3848,3 +3848,34 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only 
 graph and emits native extrema UOps. All bounds and activations execute on DPU INT16 EW. There is no host clipping,
 comparison, or selection, no NumPy tensor evaluation, FP16 ReLUX assumption, LUT, CMAC, tolerance relaxation, or
 floating input wider than FP16.
+
+---
+
+## 2026-08-09 — bounded integral INT16 leaky ReLU on DPU
+
+Leaky ReLU with integral slopes from 2 through 32767 now stays in the native INT16 EW pipeline. The renderer recognizes
+Tinygrad's exact `where(x<0, slope*x, x)` graph and uses `x + min(x,0)*(slope-1)`. Slope two needs only MIN plus ADD;
+larger slopes add one MUL stage.
+
+This identity remains exact under RK3588's saturating INT16 arithmetic. For nonnegative inputs the correction is zero.
+For negative inputs, if `(slope-1)*x` saturates low, the final addition remains saturated low; otherwise the final sum is
+exactly `slope*x` and saturates at the same boundary. The focused tests include `-32768`, values that overflow only after
+scaling, zero, and `32767`.
+
+Historical FP16 commit `ea8294006` and the TRM/RKNN references under `~/npu` document the PReLU mode, but that mode was
+not assumed for integer data. The implementation uses only the signed INT16 MIN, MUL, and ADD behavior directly proven
+by `~/rk3588/examples/elementwise_int.py`. Fractional slopes promote the output to floating point and remain outside this
+bounded INT16 path.
+
+- Slopes two and three pass every saturation endpoint exactly with asserted **2 and 3 tasks**, respectively, and one
+  ioctl per realization; their combined call is **0.12 s** after startup.
+- With renderer caching disabled, the complete native INT16 class passes **19/19 in 3.41 s**. No case approaches 30 s.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused and class runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **473 tests**.
+- `sz.py`: renderer/runtime **4,696/327 executable lines**, total **30,078**. The bounded leaky-ReLU fold adds twelve
+  renderer lines and no runtime lines.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only recognizes a bounded typed graph and
+emits native MIN/MUL/ADD UOps. All input-dependent activation work executes on DPU INT16 EW. NumPy is used only for the
+test oracle, never by the backend. There is no host classification or selection, unproven integer PReLU mode, LUT, CMAC,
+tolerance relaxation, or floating input wider than FP16.
