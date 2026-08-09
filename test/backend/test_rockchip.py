@@ -605,6 +605,49 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
     _,_,c,_,e,_,_,k,_,p = self._get_index_randoms()
     _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[...,c,:,e], lambda x:x[...,k,:,p])
 
+  def test_slice_fancy_indexing_dim_inject_none_leading(self):
+    _,b,c,d,e,_,j,k,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,b,c,d,e], lambda x:x[None,j,k,o,p])
+
+  def test_slice_fancy_indexing_dim_inject_none_trailing(self):
+    a,b,c,d,_,i,j,k,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,b,c,d,None], lambda x:x[i,j,k,o,None])
+
+  def test_slice_fancy_indexing_dim_inject_none_middle(self):
+    a,b,_,d,e,i,j,_,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,b,None,d,e], lambda x:x[i,j,None,o,p])
+
+  def test_slice_fancy_indexing_dim_inject_none_ends(self):
+    _,b,c,d,_,_,j,k,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,b,c,d,None], lambda x:x[None,j,k,o,None])
+
+  def test_slice_fancy_indexing_dim_inject_none_static_axis(self):
+    a,_,_,d,e,i,_,_,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,:,None,d,e], lambda x:x[i,:,None,o,p])
+
+  def test_slice_fancy_indexing_dim_inject_none_only(self):
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,None,None,None,None], lambda x:x[None,None,None,None,None])
+
+  def test_slice_fancy_indexing_dim_inject_none_double_leading(self):
+    _,b,c,d,e,_,j,k,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,None,b,c,d,e], lambda x:x[None,None,j,k,o,p])
+
+  def test_slice_fancy_indexing_dim_inject_none_pairs(self):
+    _,b,c,_,_,_,j,k,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,None,b,c,None,None], lambda x:x[None,None,j,k,None,None])
+
+  def test_slice_fancy_indexing_dim_inject_none_internal_pair(self):
+    a,_,c,d,e,i,_,k,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,None,None,c,d,e], lambda x:x[i,None,None,k,o,p])
+
+  def test_slice_fancy_indexing_dim_inject_none_internal_and_trailing(self):
+    a,_,c,_,_,i,_,k,_,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,None,None,c,None,None], lambda x:x[i,None,None,k,None,None])
+
+  def test_slice_fancy_indexing_dim_inject_none_sparse(self):
+    _,b,_,d,e,_,j,_,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[None,None,b,None,d,e], lambda x:x[None,None,j,None,o,p])
+
   def test_fancy_indexing_negative_nonfinite_bits(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
     indices = np.array([-1, -2, -3], dtype=np.int32)

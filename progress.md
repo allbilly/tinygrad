@@ -3270,3 +3270,25 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. The removed guard 
 dynamic INT32 byte equality, negative normalization, raw FP16 selection, and reduction continue to execute through
 native INT16 DPU EW. Runtime gathers only move opaque bytes according to compile-time address plans. There is no host
 fancy indexing, LUT, CMAC, tolerance change, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — dimension-injected dynamic FP16 fancy indexing census
+
+All eleven forward expressions from upstream `test_slice_fancy_indexing_dim_inject_none` are now independently
+bounded Rockchip methods. They cover leading, trailing, internal, paired, and sparse `None` dimensions around as many
+as four broadcast dynamic INT32 index tensors, plus the static all-`None` movement form.
+
+Every case lowered through the existing native-INT16 fancy-index plan; no backend special case was needed. This is the
+intended payoff from productizing INT16 as an RKImage/runtime precision rather than adding a matcher-specific probe.
+
+- Dimension-injection group: **11/11 passed individually**, from **2.82 s** to **19.95 s** pytest time; no case
+  exceeded the 30-second policy.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. Rockchip collection: **424 tests**.
+- `sz.py` is unchanged at renderer/runtime **3,680/307 executable lines**, total **29,042**; tests and comments are not
+  counted.
+
+The CPU-cheat audit found no implementation change at all in this milestone. The tested path retains DPU-native INT16
+byte equality, validity masks, raw FP16 selection, and reduction with opaque runtime movement only. There is no CPU
+index evaluation, LUT, CMAC, tolerance change, or floating input wider than FP16.
