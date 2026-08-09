@@ -4260,3 +4260,30 @@ The CPU-cheat audit found no implementation change and no host-dependent arithme
 only static gather plans; opaque INT16 layout movement and every NEG/ABS/ADD/MAX/MIN stage remain on the device path.
 There is no host result calculation, NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or floating input
 wider than FP16.
+
+---
+
+## 2026-08-09 — exact promoted INT16 cumulative sums
+
+Signed-INT16 `cumsum` now stays exact in INT32 when Tinygrad lowers a large scan to a masked register-loop reduction.
+The existing promoted-sum matcher already handled small unrolled scans; its loop coverage proof now recognizes
+disjoint nested prefix chains rather than requiring each input lane exactly once. The same validator replaces the
+older one-dimensional cumulative-extrema check, so scan safety has one shared static proof.
+
+No checked Tinygrad branch, `~/npu`, or `~/rk3588` contains an integrated INT16 cumulative-sum path.
+`~/rk3588/examples/elementwise_int.py` proves the required signed INT16-to-INT32 writeback and ADD stages; this
+milestone composes them through the existing balanced INT32 reduction image.
+
+- Exact unrolled 17-element and loop-shaped 257-element scans pass independently. Batched **2x257 last-axis** and
+  **257x2 first-axis** scans also pass, proving both contiguous and interleaved prefix layouts.
+- Independent calls take **0.24 s**, **1.19 s**, **2.59 s**, and **2.73 s**; no case approaches the 30-second policy.
+- The complete native INT16 EW class passes **33/33 in 12.55 s**. Focused cumulative-extrema, cumsum, and scalar-sum
+  regressions pass **3/3 in 5.87 s** after sharing the validator.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **499 tests**.
+- `sz.py`: renderer/runtime **4,963/331 executable lines**, total **30,349**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime/core change or tensor-value inspection. The new helper examines only compile-time
+source-offset sets and proves uniqueness, partitioning, and strict prefix nesting. Runtime gathers opaque INT16 lanes;
+all widening, balanced ADD, and INT32 writeback execute on DPU. There is no host cumsum/result calculation, NumPy
+backend evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.

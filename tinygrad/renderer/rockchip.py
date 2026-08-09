@@ -1117,7 +1117,7 @@ def _lower_unrolled_int16_cumulative_extrema(uops:list[UOp]) -> RKImage|None:
   return _int16_extrema_image(out_param.arg.slot, count, source.arg.slot, blocks, minimum)
 
 def _lower_int16_loop_extrema(uops:list[UOp]) -> RKImage|None:
-  """Lower signed INT16 scalar or one-dimensional cumulative extrema loops."""
+  """Lower signed INT16 scalar or cumulative extrema loops."""
   if (output:=_output_store(uops, dtypes.int16, allow_local=True)) is None: return None
   store, out_param, _, _, root = output
   if (shape:=_loop_reduction_shape(store, out_param, uops)) is None: return None
@@ -1152,8 +1152,7 @@ def _lower_int16_loop_extrema(uops:list[UOp]) -> RKImage|None:
   except RuntimeError: return None
   input_count = int(source.src[0].arg)
   scalar = input_count == rows*groups and sorted(offset for block in blocks for offset in block if offset >= 0) == list(range(input_count))
-  cumulative = input_count == rows == groups and all(sorted(value for block in blocks if (value:=block[dst]) >= 0) == list(range(dst+1))
-                                                    for dst in range(rows))
+  cumulative = input_count == rows and _cumulative_prefix_blocks(blocks, input_count)
   if not scalar and not cumulative: return None
   return _int16_extrema_image(out_param.arg.slot, rows, source.arg.slot, blocks, minimum)
 
@@ -1184,6 +1183,21 @@ def _int16_sum_image(out_slot:int, count:int, plans:tuple[RKGather, ...]) -> RKI
                     int32_input=True, int32_output=True))
   return RKImage(RKTarget.RK3588, (RKScratch(len(plans)*in_stride), RKScratch(len(plans)*out_stride)),
                  gathers=gathers, ew_ops=tuple(ops))
+
+def _cumulative_prefix_blocks(blocks:tuple[tuple[int, ...], ...], source_count:int) -> bool:
+  """Prove that static masked rows form disjoint nested cumulative-prefix chains."""
+  groups = len(blocks)
+  if not groups or any(len(block) != source_count for block in blocks): return False
+  ordered = tuple(tuple(block[lane] for block in blocks if block[lane] >= 0) for lane in range(source_count))
+  if any(not 1 <= len(prefix) <= groups or len(prefix) != len(set(prefix)) for prefix in ordered): return False
+  prefixes = tuple(frozenset(prefix) for prefix in ordered)
+  full = set(prefix for prefix in prefixes if len(prefix) == groups)
+  if len(full)*groups != source_count or set().union(*full) != set(range(source_count)): return False
+  for group in full:
+    chain = sorted((prefix for prefix in prefixes if prefix <= group), key=len)
+    if len(chain) != groups or [len(prefix) for prefix in chain] != list(range(1, groups+1)) or \
+       any(not lhs < rhs for lhs,rhs in zip(chain, chain[1:])): return False
+  return True
 
 def _lower_unrolled_int16_sum(output:RKOutput) -> RKImage|None:
   """Recognize a statically indexed promoted INT16 sum."""
@@ -1228,7 +1242,9 @@ def _lower_int16_sum_loop(uops:list[UOp], output:RKOutput) -> RKImage|None:
                          for env in envs) for r in range(groups))
   except RuntimeError: return None
   source_count = int(source.src[0].arg)
-  if sorted(offset for block in blocks for offset in block if offset >= 0) != list(range(source_count)): return None
+  scalar = source_count == rows*groups and sorted(offset for block in blocks for offset in block if offset >= 0) == list(range(source_count))
+  cumulative = source_count == rows and _cumulative_prefix_blocks(blocks, source_count)
+  if not scalar and not cumulative: return None
   return _int16_sum_image(out_param.arg.slot, rows,
                           tuple(RKGather(source.arg.slot, 0, rows, offsets=block) for block in blocks))
 

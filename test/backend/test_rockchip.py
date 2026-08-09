@@ -1072,6 +1072,16 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self._check(values.sum(1, dtype=np.int32), lambda x:x.sum(1), values, output_dtype=np.int32,
                 expected_tasks=1542, expected_submits=2)
 
+  def _check_cumsum(self, shape, axis, tasks):
+    values = (np.arange(np.prod(shape), dtype=np.uint32)*7919).astype(np.uint16).view(np.int16).reshape(shape)
+    self._check(np.cumsum(values, axis=axis, dtype=np.int32), lambda x:x.cumsum(axis), values, output_dtype=np.int32,
+                expected_tasks=tasks, expected_submits=2)
+
+  def test_cumsum_unrolled(self): self._check_cumsum((17,), 0, 68)
+  def test_cumsum_1d(self): self._check_cumsum((257,), 0, 8738)
+  def test_cumsum_last_axis(self): self._check_cumsum((2,257), 1, 16962)
+  def test_cumsum_first_axis(self): self._check_cumsum((257,2), 0, 16962)
+
   def test_compare_ordering(self):
     a = [-32768,-32768,-30000,-1,0,1,30000,32767]
     b = [32767,-32768,30000,0,0,-1,-30000,-32768]
