@@ -3579,3 +3579,45 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Renderer evaluatio
 bounds, and gather addresses. All input-dependent byte addition, carry generation, and regrouping run through DPU EW;
 runtime gathers only copy opaque bytes. There is no host numeric evaluator, LUT, CMAC, tolerance change, or floating
 input wider than FP16.
+
+---
+
+## 2026-08-09 — dynamic FP16 Nonzero with exact INT32 coordinates
+
+All forward cases from upstream `TestOps.test_nonzero` now pass on Rockchip when run as independent hardware tests:
+`(32,10)`, `(20,)`, `(10,5,3)`, and the six scalar values. They are split into four Rockchip tests so each physical-NPU
+case has an independent wall-time result and a failure cannot obscure the next shape. The rank-two, rank-one, rank-three,
+and scalar methods pass in **25.14 s**, **5.32 s**, **10.60 s**, and **3.02 s** respectively. Rockchip collection is now
+**459 tests**.
+
+The dynamic FP16 predicate count and prefix remain on the existing DPU FP16 path. Arbitrary dynamic INT32 coordinate
+sums are gathered as opaque bytes and added exactly modulo `2**32` with the native INT16 carry emitter introduced in
+`bdc9623bc`. Four byte-equality masks form the exact histogram, native INT16 reductions accumulate it, and a syntactically
+proven `0 <= index < limit` gate selects static coordinate functions through exact INT32-byte equality. Register-lane
+blocks derive from `_MAX_EW_ELEMS_FP16`; block transitions insert submit barriers without a hardcoded task-count or
+command-buffer limit.
+
+The original `(32,10)` profile was **32.34 s** = **12.01 s** dynamic count/prefix construction + **19.07 s** final
+realization + about 1 ms copyout, using **109 submit ioctls / 4,507 DPU tasks**. The ioctls themselves totaled only about
+44 ms. Renderer profiling found scalar static-layout proof was the avoidable cost: the 256-row prefix took **7.00 s** to
+render, while the bounded coordinate selector separately scalar-evaluated hundreds of candidate expressions. A shared
+vector static evaluator reduces the prefix render to **1.32 s** and brings the complete pytest case below 30 seconds;
+NPU tasks and numeric behavior are unchanged.
+
+The Rocket reference's FP16-compare-to-INT16 body was also tested as a possible reset reduction. A focused dynamic
+threshold run timed out when that body was placed in the current RKNPU PC-chain transition, so the experiment was fully
+reverted. The established reset-isolated FP16 compare path remains. The vendor `~/rk3588/examples/elementwise.py` health
+probe passed **60/60** immediately after the revert and again after all final focused runs; no reboot was required.
+
+- Exact INT32 wrap regression: pass; all seven native INT16 EW regressions: **7 passed in 3.02 s**.
+- Fixed Nonzero regressions: **4 passed in 10.69 s**; exact arbitrary-INT32 bytes: **1 passed in 3.52 s**; upstream
+  fixed-size Nonzero: **1 passed in 4.68 s**.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **4,609/325 executable lines**, total **29,989**. Cleanup shares one local-add-loop parser,
+  reuses the exact byte-sum emitter, and removes the unused loop-specific coordinate selector.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Renderer vector evaluation is limited to compile-time UOp
+index expressions, constants, bounds, and candidate coordinate tables. Runtime gathers still move opaque bytes only.
+All input-dependent FP16 predicates, dynamic counts/prefixes, INT32 byte carries/equality, histogram reductions,
+coordinate selection, and INT32 writeback execute on DPU EW. There is no host numeric fallback, LUT, CMAC, tolerance
+change, or floating input wider than FP16.

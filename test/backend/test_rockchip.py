@@ -524,6 +524,19 @@ class TestRockchipNonzeroOps(unittest.TestCase):
 
   test_nonzero_size = _test_ops.TestOps.test_nonzero_size
 
+  def test_dynamic_nonzero_rank_two(self):
+    _fp16_test_op([(32,10)], lambda x:(x>0.5).nonzero().int(), lambda x:(x>0.5).nonzero(), forward_only=True)
+
+  def test_dynamic_nonzero_rank_one(self):
+    _fp16_test_op([(20,)], lambda x:(x>0.5).nonzero().int(), lambda x:(x>0.5).nonzero(), forward_only=True)
+
+  def test_dynamic_nonzero_rank_three(self):
+    _fp16_test_op([(10,5,3)], lambda x:(x>0.5).nonzero().int(), lambda x:(x>0.5).nonzero(), forward_only=True)
+
+  def test_dynamic_nonzero_scalars(self):
+    for value in (0, 1, 0.0, 2.5, True, False):
+      _fp16_test_op(None, lambda x:x.nonzero().int(), lambda x:x.nonzero(), vals=[value], forward_only=True)
+
   def test_fixed_nonzero_pad_and_truncate(self):
     values = np.array([1., 0., 2., 0., 3.], dtype=np.float16)
     source = Tensor(values, device="ROCKCHIP")
