@@ -1834,6 +1834,120 @@ def _dynamic_fp16_scatter_image(out_slot:int, count:int, index_slot:int, index_c
                  gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=equality.mid_gathers, gather_after=gather_after,
                  post_gathers=post_gathers)
 
+def _lower_dynamic_scalar_scatter_reduce(output:RKOutput) -> RKImage|None:
+  """Lower bounded scalar Scatter add/multiply through exact INT32 equality and DPU EW reduction."""
+  _, out_param, count, out_index, value = output
+  if count <= 0 or value.op not in (Ops.ADD, Ops.MUL): return None
+  reduce_op, neutral = value.op, 0.0 if value.op is Ops.ADD else 1.0
+  terms = _flatten_binary(value, reduce_op)
+  bases = [term for term in terms if (root:=_strip_cast(term)).op is Ops.LOAD and root.dtype.scalar() is dtypes.half]
+  updates = [term for term in terms if term not in bases]
+  if len(bases) != 1 or not updates: return None
+  base = _strip_cast(bases[0])
+  base_param = _root_param(base.src[0]) if base.src and base.src[0].op is Ops.INDEX else None
+  if base_param is None or base_param.dtype.scalar() is not dtypes.half or base_param.src[0].op is not Ops.CONST: return None
+
+  neutral_bits = struct.unpack("<H", struct.pack("<e", neutral))[0]
+  index_rows:list[tuple[int, ...]] = []
+  coordinate_rows:list[tuple[int, ...]] = []
+  valid_rows:list[tuple[int, ...]] = []
+  scalar_bits:int|None = None
+  index_param:UOp|None = None
+  try:
+    for term in updates:
+      root = _strip_cast(term)
+      int_loads = tuple({u.key:u for u in root.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int and
+                         u.src and u.src[0].op is Ops.INDEX}.values())
+      if len(int_loads) != 1: return None
+      load = int_loads[0]
+      direct = [(comparison, coordinate) for comparison in root.toposort() if comparison.op is Ops.CMPNE
+                for dynamic,coordinate in (comparison.src, comparison.src[::-1])
+                if dynamic is load and _is_static_expr(coordinate)]
+      if len(direct) != 1: return None
+      comparison, coordinate = direct[0]
+      equal = root.substitute({comparison:comparison.const_like(False)})
+      unequal = root.substitute({comparison:comparison.const_like(True)})
+      if not _is_static_expr(equal) or not _is_static_expr(unequal): return None
+      equal_bits, unequal_bits = _static_vector(out_index, equal, count), _static_vector(out_index, unequal, count)
+      if any(bits != neutral_bits for bits in unequal_bits): return None
+      nonneutral = {bits for bits in equal_bits if bits != neutral_bits}
+      if len(nonneutral) != 1 or scalar_bits not in (None, next(iter(nonneutral))): return None
+      scalar_bits = next(iter(nonneutral))
+      valid_rows.append(tuple(struct.unpack("<H", struct.pack("<e", float(bits != neutral_bits)))[0] for bits in equal_bits))
+      coordinate_rows.append(_static_int_vector(out_index, coordinate, count))
+      index_rows.append(_gather_offsets(out_index, load.src[0].src[1], load.src[2] if len(load.src) == 3 else None, count))
+      param = _root_param(load.src[0])
+      if param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST or \
+         index_param is not None and param.arg.slot != index_param.arg.slot: return None
+      index_param = param
+  except (OverflowError, RuntimeError, struct.error): return None
+  if scalar_bits is None or index_param is None: return None
+  index_count = int(index_param.src[0].arg)
+  if any(offset >= index_count for row in index_rows for offset in row): return None
+  if (equality:=_int32_equality_matrix(((index_param.arg.slot, index_count, tuple(index_rows), tuple(coordinate_rows)),), count)) is None:
+    return None
+  try: base_plan = _gather_plan(base_param.arg.slot, 0, out_index, base.src[0].src[1], base.src[2] if len(base.src) == 3 else None, count)
+  except RuntimeError: return None
+  if any(offset >= int(base_param.src[0].arg) for offset in base_plan.offsets): return None
+
+  scratch_sizes = list(equality.scratch_sizes)
+  def scratch(lanes:int) -> int:
+    scratch_sizes.append(_scratch_bytes(lanes)); return len(scratch_sizes)-1
+  valid, effective = scratch(equality.matrix_lanes), scratch(equality.matrix_lanes)
+  base_slot = scratch(count)
+  gathers = list(equality.gathers)
+  gathers.append(replace(base_plan, dst_index=base_slot))
+  gathers.extend(_stripe_gathers(index_param.arg.slot, valid, count, valid_rows, equality.vector_lanes, values=True))
+  def constant(bits:int, lanes:int) -> int:
+    slot = scratch(lanes)
+    gathers.append(RKGather(index_param.arg.slot, slot, lanes, values=(bits,)*lanes))
+    return slot
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops = list(equality.pre_ops) + list(equality.mask_ops)
+  ops.append(RKEWOp(arg(effective), equality.mask, arg(valid), equality.matrix_lanes,
+                    _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+  scalar = struct.unpack("<e", struct.pack("<H", scalar_bits))[0]
+  if scalar == 0.0: return None  # signed-zero selection needs raw representation handling
+  out = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+
+  if reduce_op is Ops.MUL and math.isfinite(scalar):
+    scalar_matrix = constant(scalar_bits, equality.matrix_lanes)
+    selected, remaining, factors = scratch(equality.matrix_lanes), scratch(equality.matrix_lanes), scratch(equality.matrix_lanes)
+    ops.extend((RKEWOp(arg(selected), arg(effective), arg(scalar_matrix), equality.matrix_lanes, _EW_CFG[Ops.MUL]),
+                RKEWOp(arg(remaining), arg(0), arg(effective), equality.matrix_lanes, _EW_CFG[Ops.SUB]),
+                RKEWOp(arg(factors), arg(remaining), arg(selected), equality.matrix_lanes, _EW_CFG[Ops.ADD])))
+    factor = _reduce_rows(ops, [arg(factors, row*equality.vector_bytes) for row in range(len(updates))], count, _EW_CFG[Ops.MUL])
+    ops.append(RKEWOp(out, arg(base_slot), factor, count, _EW_CFG[Ops.MUL]))
+  else:
+    hits = _reduce_rows(ops, [arg(effective, row*equality.vector_bytes) for row in range(len(updates))], count, _EW_CFG[Ops.ADD])
+    remaining_slot:int|None = None
+    if math.isfinite(scalar):
+      scalar_slot, contribution = constant(scalar_bits, count), scratch(count)
+      ops.append(RKEWOp(arg(contribution), hits, arg(scalar_slot), count, _EW_CFG[Ops.MUL]))
+      result = arg(contribution)
+    else:
+      hit, maximum, doubled, special = scratch(count), constant(0x7bff, count), constant(0x4000, count), scratch(count)
+      ops.extend((RKEWOp(arg(hit), hits, arg(0), count, _EW_CFG_MIN),
+                  RKEWOp(arg(special), arg(hit), arg(maximum), count, _EW_CFG[Ops.MUL]),
+                  RKEWOp(arg(special), arg(special), arg(doubled), count, _EW_CFG[Ops.MUL])))
+      if math.isnan(scalar):
+        remaining_slot = scratch(count)
+        ops.extend((RKEWOp(arg(remaining_slot), arg(0), arg(hit), count, _EW_CFG[Ops.SUB]),
+                    RKEWOp(arg(special), arg(special), arg(remaining_slot), count, _EW_CFG[Ops.MUL])))
+      elif scalar < 0:
+        zero = constant(0, count)
+        ops.append(RKEWOp(arg(special), arg(zero), arg(special), count, _EW_CFG[Ops.SUB]))
+      result = arg(special)
+    if reduce_op is Ops.MUL:
+      remaining, factor_slot = remaining_slot if remaining_slot is not None else scratch(count), scratch(count)
+      if remaining_slot is None: ops.append(RKEWOp(arg(remaining), arg(0), arg(hit), count, _EW_CFG[Ops.SUB]))
+      ops.extend((RKEWOp(arg(factor_slot), arg(remaining), result, count, _EW_CFG[Ops.ADD]),
+                  RKEWOp(out, arg(base_slot), arg(factor_slot), count, _EW_CFG[Ops.MUL])))
+    else: ops.append(RKEWOp(out, arg(base_slot), result, count, _EW_CFG[Ops.ADD]))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
+                 gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=equality.mid_gathers,
+                 gather_after=len(equality.pre_ops))
+
 def _negative_normalized_index(root:UOp) -> tuple[UOp, int]|None:
   """Recognize `WHERE(index < 0, index + extent, index)` exactly."""
   if root.op is not Ops.WHERE or root.src[0].op is not Ops.CMPLT or root.src[0].src[1].op is not Ops.CONST or \
@@ -2569,6 +2683,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (max_unpool:=_lower_unrolled_max_unpool(half_output)) is not None: return max_unpool
     if (dynamic_gather:=_lower_dynamic_fp16_gather(half_output)) is not None: return dynamic_gather
     if (fancy_index:=_lower_multi_fp16_fancy_index(half_output)) is not None: return fancy_index
+    if (scatter_reduce:=_lower_dynamic_scalar_scatter_reduce(half_output)) is not None: return scatter_reduce
     if (scatter:=_lower_dynamic_fp16_scatter(half_output)) is not None: return scatter
   if (half_loop_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
      (loop_max_unpool:=_lower_loop_max_unpool(uops, half_loop_output)) is not None: return loop_max_unpool

@@ -2930,3 +2930,47 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Host code recogniz
 moves opaque bytes; it never reads a sign, classifies a value, or performs Copysign. Byte conversion, high-bit masks,
 sign removal/insertion, and output conversion execute on DPU EW. There is no NumPy tensor evaluator, host Copysign,
 LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — bounded dynamic scalar Scatter add/multiply
+
+The unchanged forward-only upstream `test_scatter_add` and `test_scatter_mul` now pass on Rockchip for external INT32
+indices, including their infinity and NaN cases. A deterministic regression also covers repeated destinations with a
+finite scalar, proving that add counts every hit and multiply applies every factor instead of collapsing the mask to a
+single Boolean.
+
+Tinygrad unrolls this Scatter family into one guarded equality term per candidate plus the FP16 base load. The strict
+matcher proves one dynamic INT32 load per term, its static coordinate expression, its bounds-gated address, the exact
+neutral result when unequal, one common scalar FP16 representation when equal, and the statically bounded base map.
+The shared four-byte equality fragment builds every runtime mask on DPU. A compile-time validity matrix suppresses
+lanes outside the index tensor's shape; DPU ADD or MUL then reduces the candidate rows and combines the result with the
+base.
+
+Non-finite scalars require avoiding `0*inf` on no-hit lanes. Conditional infinity is generated entirely on DPU from
+finite inputs as `hit * 65504 * 2`. Conditional NaN uses the RK3588's verified `inf * 0` behavior as
+`conditional_inf * (1-hit)`, producing NaN only when selected and exact zero otherwise. Add uses a reduced hit count;
+multiply constructs one factor per finite candidate, while its infinity/NaN cases use the equivalent any-hit factor.
+No host branch depends on a runtime index or FP16 value.
+
+Historical milestone `1ff6ebc9d` admitted FP16 ScatterReduce by routing the complete graph through a typed host
+elementwise evaluator, so that implementation was not ported. `~/npu/include/old/rknn_ops.md` marks ScatterElements
+unsupported, and `~/rk3588` contains the upstream Scatter tests but no verified native DPU Scatter instruction. The
+current implementation instead composes only the existing exact INT32 equality, static gather planning, and DPU EW
+arithmetic primitives; it uses neither LUT nor CMAC.
+
+- Repeated-index finite regression: **1 passed, 2 subtests passed in 3.93 s**, sequentially.
+- Unchanged upstream Scatter add: **1 passed in 4.72 s**; Scatter multiply: **1 passed in 4.77 s**, sequentially.
+- Complete Scatter class: **12 passed, 4 subtests passed in 10.91 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **380 passed, 9 skipped, 184 subtests passed in
+  508.16 s**, sequentially. Collection contains 389 forward-only nodes.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused hardware tests.
+- Repository-wide Ruff and Tinygrad mypy: pass. `git diff --check`: pass. `sz.py`: renderer/runtime **2,923/281
+  executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The renderer encodes only compile-time FP16 constants;
+static IR evaluation proves output coordinates, gates, and addresses and rejects dynamic parameters. Runtime gathers
+move opaque representations according to those plans. Dynamic INT32 conversion, byte equality, validity masking,
+hit/factor reduction, infinity/NaN construction, and final FP16 arithmetic all execute on DPU EW. There is no typed
+tensor evaluator, host Scatter arithmetic, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider
+than FP16.

@@ -520,6 +520,9 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
 class TestRockchipScatterOps(unittest.TestCase):
   """FP16 Scatter and ScatterReduce through static or exact dynamic INT32 selection."""
 
+  test_scatter_add = _test_ops.TestOps.test_scatter_add
+  test_scatter_mul = _test_ops.TestOps.test_scatter_mul
+
   def test_scatter_static_tensor_source(self):
     index = torch.arange(4, dtype=torch.int64).reshape(2,2)
     _fp16_test_op([(2,4), (2,2)], lambda x,src: x.scatter(1, index, src),
@@ -570,6 +573,15 @@ class TestRockchipScatterOps(unittest.TestCase):
         for lane,dst in enumerate(indices): expected[dst] = values[lane]
         got = Tensor(base).scatter(0, Tensor(indices), Tensor(values)).realize().numpy()
         np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
+  def test_scatter_dynamic_scalar_reductions(self):
+    base = np.array([1.0, -2.0, 3.0, 4.0], dtype=np.float16)
+    indices = Tensor(np.array([0, 0, 2, 1], dtype=np.int32)).realize()
+    for mode,value,expected in (("add", 2.0, [5.0, 0.0, 5.0, 4.0]),
+                                ("multiply", -1.0, [1.0, 2.0, -3.0, 4.0])):
+      with self.subTest(mode=mode):
+        got = Tensor(base).scatter(0, indices, value, reduce=mode).realize().numpy()
+        np.testing.assert_array_equal(got, np.array(expected, dtype=np.float16))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBroadcastOps(unittest.TestCase):
