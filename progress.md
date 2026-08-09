@@ -2714,3 +2714,39 @@ moves dynamic bytes by statically proven addresses; it never numerically reads, 
 an input index. All dynamic byte conversion, equality, mask conjunction, and INT32 output conversion execute on DPU
 EW. There is no host OneHot, scatter, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than
 FP16.
+
+---
+
+## 2026-08-09 — exact dynamic INT32 gather on DPU EW
+
+The unchanged upstream `TestOps.test_gather` now passes all positive and negative axis aliases, seven three-dimensional
+gathers, both shape-error cases, a one-dimensional gather, and its `-inf` representation case. A direct regression also
+uses dynamic indices `0`, `1`, `2`, `256`, `65,536`, `2**24`, and `-1` against `+inf`, `-inf`, and NaN source lanes;
+valid results match bit-for-bit and every out-of-range high-byte alias remains zero.
+
+Tinygrad lowers Gather to one bounds-masked FP16 load whose source address contains a dynamic INT32 load. The strict
+matcher proves the zero default, the exact nonnegative/upper-bound predicate, both statically sized source buffers,
+the dynamic-index gather map, and every candidate-substituted source address. It then exposes the four raw index bytes
+and both raw FP16 source bytes with representation-preserving gathers. DPU INT32-input conversion turns each byte into
+an exact FP16 integer, four DPU equality masks select the bounded candidate, and DPU ADD reductions select each FP16
+byte independently. DPU INT32-output conversion plus raw post-gathers reconstruct the FP16 result. This preserves NaN
+and infinity representations without unsafe `inf*0` masking.
+
+Historical commit `f62827791` implemented gather and fancy indexing with a typed NumPy evaluator, including dynamic
+negative-index preprocessing and masked reductions on the host. That implementation violates the current no-CPU-cheat
+contract and was not ported. The RKNN v2.3.2 guide lists Gather in its CPU-operator chapter, the older operator table
+marks `aten::gather` unsupported, and `~/rk3588` contains no verified native DPU Gather instruction. The current path
+therefore composes only proven DPU EW and raw movement primitives.
+
+- Complete unchanged upstream gather: **1 passed in 23.47 s**, sequentially.
+- Upstream and exact raw-byte regression together: **2 passed in 24.73 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **373 passed, 10 skipped, 180 subtests passed in
+  479.44 s** pytest time / **505.58 s** process wall time, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,555/281 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Host evaluation substitutes only compile-time candidate
+coordinates into address expressions and validates their static bounds. Runtime moves bytes at those fixed addresses;
+it never interprets an index or source value, chooses a candidate, or performs a numeric gather. Dynamic comparison,
+selection, reduction, and numeric conversion execute on DPU EW. There is no host Gather, NumPy evaluator, LUT, CMAC,
+CNA, PPU fallback, tolerance beyond the established FP16 test tolerance, or floating input wider than FP16.

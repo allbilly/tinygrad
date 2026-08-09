@@ -469,6 +469,28 @@ class TestRockchipOneHotOps(unittest.TestCase):
     np.testing.assert_array_equal(got, expected)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipGatherOps(unittest.TestCase):
+  """Dynamic INT32 gather with exact index and raw FP16 representation selection on DPU."""
+
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_gather = _test_ops.TestOps.test_gather
+
+  def test_gather_nonfinite_full_index_bytes(self):
+    source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
+    indices = np.array([0, 1, 2, 256, 65536, 1 << 24, -1], dtype=np.int32)
+    expected = np.zeros(len(indices), dtype=np.float16)
+    expected[:3] = source
+    got = Tensor(source, device="ROCKCHIP").gather(0, Tensor(indices, device="ROCKCHIP")).realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipScatterOps(unittest.TestCase):
   """FP16 scatter with compile-time-static indices; dynamic scatter indices remain unsupported."""
 

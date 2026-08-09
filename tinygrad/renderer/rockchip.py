@@ -1612,6 +1612,100 @@ def _max_unpool_image(out_slot:int, count:int, out_spatial:int, source_count:int
   return RKImage(RKTarget.RK3588, scratch, struct.pack("<ee", 0.0, 1.0), gathers=gathers, ew_ops=tuple(ops),
                  mid_gathers=mid_gathers, gather_after=1)
 
+def _dynamic_fp16_gather_image(out_slot:int, count:int, index_slot:int, index_count:int, index_offsets:tuple[int, ...],
+                               plans:tuple[RKGather, ...]) -> RKImage|None:
+  """Select raw FP16 representations with exact byte-wise dynamic INT32 equality."""
+  rows = len(plans)
+  vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, rows)
+  if not rows or matrix_lanes > _MAX_EW_ELEMS_FP16: return None
+  one = 0
+  raw_index = tuple(range(1, 5)); convert_tiles = 5
+  half_index = tuple(range(6, 10)); index_matrix = tuple(range(10, 14)); coordinate = tuple(range(14, 18))
+  raw_value = (18, 19); half_value = (20, 21)
+  diff, magnitude, unequal, equal, combined, selected_low, selected_high, int_tiles, int_low, int_high = range(22, 32)
+  scratch_sizes = [_scratch_bytes(matrix_lanes)] * 32
+  for slot in raw_index: scratch_sizes[slot] = index_count*4
+  for slot in half_index: scratch_sizes[slot] = _scratch_bytes(index_count)
+  scratch_sizes[convert_tiles] = ((max(index_count, matrix_lanes)+3)//4)*64
+  for slot in raw_value: scratch_sizes[slot] = matrix_lanes*4
+  scratch_sizes[int_tiles] = ((count+3)//4)*64
+  scratch_sizes[int_low] = scratch_sizes[int_high] = count*4
+
+  gathers:list[RKGather] = [RKGather(index_slot, slot, index_count,
+    offsets=tuple(lane*4+byte for lane in range(index_count)), dst_stride=4, itemsize=1)
+    for byte,slot in enumerate(raw_index)]
+  for byte,slot in enumerate(raw_value):
+    for row,plan in enumerate(plans):
+      gathers.append(RKGather(plan.src_index, slot, count, offsets=tuple(offset*2+byte for offset in _plan_offsets(plan)),
+                              dst_stride=4, dst_addend=row*vector_lanes*4, itemsize=1))
+  for byte,slot in enumerate(coordinate):
+    bits = tuple(tuple(struct.unpack("<H", struct.pack("<e", float((row >> (byte*8)) & 0xff)))[0] for _ in range(count))
+                 for row in range(rows))
+    gathers.extend(_stripe_gathers(index_slot, slot, count, bits, vector_lanes, values=True))
+  mid_gathers = tuple(RKGather(src, dst, count, offsets=index_offsets, dst_addend=row*vector_lanes,
+                               src_kind=RKBufferKind.SCRATCH)
+                      for src,dst in zip(half_index, index_matrix) for row in range(rows))
+
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops:list[RKEWOp] = [RKEWOp(arg(dst), arg(src), arg(convert_tiles), index_count, _EW_CFG[Ops.MAX], int32_input=True)
+                       for src,dst in zip(raw_index, half_index)]
+  ops.extend(RKEWOp(arg(dst), arg(src), arg(convert_tiles), matrix_lanes, _EW_CFG[Ops.MAX], int32_input=True)
+             for src,dst in zip(raw_value, half_value))
+  result = arg(one)
+  for lhs,rhs in zip(index_matrix, coordinate):
+    byte_equal = _ew_integer_eq_mask(ops, arg, lhs, rhs, (diff, magnitude, unequal, equal), one, matrix_lanes)
+    ops.append(RKEWOp(arg(combined), result, byte_equal, matrix_lanes, _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True))
+    result = arg(combined)
+  ops.extend((RKEWOp(arg(selected_low), arg(half_value[0]), result, matrix_lanes,
+                     _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True),
+              RKEWOp(arg(selected_high), arg(half_value[1]), result, matrix_lanes,
+                     _EW_CFG[Ops.MUL], submit_barrier=True, stateful=True)))
+  low = _reduce_rows(ops, [arg(selected_low, row*vector_bytes) for row in range(rows)], count, _EW_CFG[Ops.ADD])
+  high = _reduce_rows(ops, [arg(selected_high, row*vector_bytes) for row in range(rows)], count, _EW_CFG[Ops.ADD])
+  ops.extend((RKEWOp(arg(int_low), low, arg(int_tiles), count, _EW_CFG[Ops.MAX], int32_output=True),
+              RKEWOp(arg(int_high), high, arg(int_tiles), count, _EW_CFG[Ops.MAX], int32_output=True)))
+  byte_offsets = tuple(range(0, count*4, 4))
+  post_gathers = tuple(RKGather(slot, out_slot, count, offsets=byte_offsets, dst_stride=2, dst_addend=byte,
+                                dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
+                       for byte,slot in enumerate((int_low, int_high)))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), struct.pack("<e", 1.0),
+                 gathers=tuple(gathers), ew_ops=tuple(ops), mid_gathers=mid_gathers, gather_after=6,
+                 post_gathers=post_gathers)
+
+def _lower_dynamic_fp16_gather(output:RKOutput) -> RKImage|None:
+  """Recognize Tinygrad's bounds-masked FP16 load addressed by one dynamic INT32 index."""
+  _, out_param, count, out_index, load = output
+  if (count <= 0 or load.op is not Ops.LOAD or load.dtype.scalar() is not dtypes.half or len(load.src) != 3 or
+      load.src[0].op is not Ops.INDEX or load.src[1].op is not Ops.CONST or float(load.src[1].arg) != 0.0): return None
+  data_param, data_index, gate = _root_param(load.src[0]), load.src[0].src[1], load.src[2]
+  index_loads = [u for u in data_index.toposort() if u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int]
+  if (data_param is None or data_param.dtype.scalar() is not dtypes.half or data_param.src[0].op is not Ops.CONST or
+      len(index_loads) != 1): return None
+  index_load = index_loads[0]
+  index_param = _root_param(index_load.src[0]) if index_load.src and index_load.src[0].op is Ops.INDEX else None
+  if (index_param is None or index_param.dtype.scalar() is not dtypes.int or index_param.src[0].op is not Ops.CONST or
+      {u.key for u in gate.toposort() if u.op is Ops.LOAD} != {index_load.key} or gate.op is not Ops.AND): return None
+
+  def nonnegative(u:UOp) -> bool:
+    if u.op is not Ops.CMPNE: return False
+    for comparison,marker in (u.src, u.src[::-1]):
+      if (marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg) and
+          comparison.op is Ops.CMPLT and comparison.src[0].key == index_load.key and
+          comparison.src[1].op is Ops.CONST and int(comparison.src[1].arg) == 0): return True
+    return False
+  uppers = [u for u in gate.src if u.op is Ops.CMPLT and u.src[0].key == index_load.key and u.src[1].op is Ops.CONST]
+  lowers = [u for u in gate.src if nonnegative(u)]
+  if len(uppers) != 1 or len(lowers) != 1 or (limit:=int(uppers[0].src[1].arg)) <= 0: return None
+  try:
+    index_offsets = _gather_offsets(out_index, index_load.src[0].src[1], None, count)
+    plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index,
+      data_index.substitute({index_load:index_load.const_like(candidate)}), None, count) for candidate in range(limit))
+  except RuntimeError: return None
+  data_count, index_count = int(data_param.src[0].arg), int(index_param.src[0].arg)
+  if (any(not 0 <= offset < index_count for offset in index_offsets) or
+      any(not 0 <= offset < data_count for plan in plans for offset in _plan_offsets(plan))): return None
+  return _dynamic_fp16_gather_image(out_param.arg.slot, count, index_param.arg.slot, index_count, index_offsets, plans)
+
 def _affine_load_offset(root:UOp, load:UOp) -> int|None:
   """Return the constant in an integer `load + constant` expression."""
   root = _strip_cast(root)
@@ -2211,6 +2305,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if (half_output:=_output_store(uops, dtypes.half)) is not None:
     if (sort_compare:=_lower_sort_compare(half_output)) is not None: return sort_compare
     if (max_unpool:=_lower_unrolled_max_unpool(half_output)) is not None: return max_unpool
+    if (dynamic_gather:=_lower_dynamic_fp16_gather(half_output)) is not None: return dynamic_gather
   if (half_loop_output:=_output_store(uops, dtypes.half, allow_local=True)) is not None and \
      (loop_max_unpool:=_lower_loop_max_unpool(uops, half_loop_output)) is not None: return loop_max_unpool
   int_output, int_loop_output = _output_store(uops, dtypes.int), _output_store(uops, dtypes.int, allow_local=True)
