@@ -2750,3 +2750,25 @@ coordinates into address expressions and validates their static bounds. Runtime 
 it never interprets an index or source value, chooses a candidate, or performs a numeric gather. Dynamic comparison,
 selection, reduction, and numeric conversion execute on DPU EW. There is no host Gather, NumPy evaluator, LUT, CMAC,
 CNA, PPU fallback, tolerance beyond the established FP16 test tolerance, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — shared exact INT32 equality-matrix emission
+
+OneHot and dynamic Gather now share one immutable `RKByteEquality` image fragment. It owns raw four-byte extraction,
+DPU byte conversion, compact-to-striped mid-gathers, compile-time coordinate-byte packing, and the four DPU equality
+masks plus conjunction. The operation-specific matchers remain separate: OneHot still proves its integer WHERE graph,
+while Gather still proves its bounds-masked dynamic address. Their terminal emitters continue to differ because OneHot
+writes one INT32 mask and Gather uses that mask to select and reconstruct two raw FP16 bytes.
+
+This is the same parser-versus-emitter separation used by the existing `RKLoopReduction` and gather-plan helpers. It
+removes duplicated construction without creating a combined IR mega-matcher or changing runtime behavior. `sz.py`
+reports renderer/runtime **2,550/281 executable lines**, down from **2,555/281**. The small net reduction includes the
+new typed fragment record; roughly sixty formerly duplicated construction lines now have one implementation.
+
+- Complete OneHot plus Gather regression: **5 passed in 31.59 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**.
+- Renderer mypy, Ruff, and `git diff --check`: pass.
+
+The refactor adds no tensor-value access, runtime operation, tolerance change, LUT, CMAC, or fallback. Exact dynamic
+comparison remains DPU EW work and host code remains limited to compile-time geometry plus raw representation movement.
