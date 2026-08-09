@@ -3549,3 +3549,33 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Runtime gathers co
 tensor value. All input-dependent INT32 nonzero detection, prefix/count reduction, exact index equality, coordinate
 selection, padding, and INT32 writeback execute on DPU EW. There is no host numeric evaluator, LUT, CMAC, tolerance
 change, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact INT32 wraparound ADD through native INT16 EW
+
+Bounded arbitrary INT32 ADD now executes exactly modulo `2**32` without an INT32 arithmetic assumption. Each external
+INT32 operand is gathered as four opaque unsigned bytes into native INT16 lanes. DPU INT16 ADD accumulates each byte,
+SUB/MAX/MIN constructs the carry, and the four result bytes are regrouped into the external INT32 output. This avoids
+the RK3588 native INT32 saturating-ADD mismatch while reusing the public INT16 EW path introduced by `c359841b5`.
+
+The FP16 predicate-prefix emitter was also separated from its original fixed-MaskedSelect parser. It now accepts a
+statically proven arbitrary predicate/address matrix and blocks rows from `_MAX_EW_ELEMS_FP16`; the existing dynamic
+threshold MaskedSelect regression still passes. This is emitter/matcher separation consistent with the other hardware
+backends rather than another operation-specific arithmetic copy.
+
+- Exact wrap regression includes `INT_MAX+1`, `INT_MIN-1`, multioperand carries, and a result crossing the sign bit;
+  it passes in **2.82 s** and uses **one submit ioctl**.
+- All seven native INT16 arithmetic/writeback methods pass in **3.16 s**. Dynamic-threshold MaskedSelect passes in
+  **12.77 s**. All six fixed Nonzero methods pass individually in **2.85–7.10 s**.
+- The slow upstream dynamic `test_nonzero` now completes its 320-value FP16 predicate prefix and exact three-endpoint
+  INT32 ADD, then rejects the next distinct 640-by-236 dynamic INT32 coordinate histogram. That larger histogram is
+  not claimed by this milestone; the focused run reaches the reject in **20.72 s**, without an NPU timeout.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **455 tests**.
+- `sz.py`: renderer/runtime **4,371/325 executable lines**, total **29,751**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Renderer evaluation is limited to UOp structure, static
+bounds, and gather addresses. All input-dependent byte addition, carry generation, and regrouping run through DPU EW;
+runtime gathers only copy opaque bytes. There is no host numeric evaluator, LUT, CMAC, tolerance change, or floating
+input wider than FP16.

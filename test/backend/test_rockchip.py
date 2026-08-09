@@ -900,6 +900,16 @@ class TestRockchipInt16EWOps(unittest.TestCase):
                 output_dtype=np.int32)
     self._check(a, lambda x:x.cast(dtypes.int32), a, output_dtype=np.int32)
 
+  def test_int32_byte_add_wrap(self):
+    a = np.array([0x7fffffff, -1, -0x80000000, 0x12345678], dtype=np.int32)
+    b = np.array([1, 1, -1, 0x6dcba988], dtype=np.int32)
+    c = np.array([0, -1, 1, 0], dtype=np.int32)
+    with np.errstate(over="ignore"): expected = np.add(np.add(a, b, dtype=np.int32), c, dtype=np.int32)
+    before = Device["ROCKCHIP"].submit_count
+    got = (Tensor(a, device="ROCKCHIP") + Tensor(b, device="ROCKCHIP") + Tensor(c, device="ROCKCHIP")).numpy()
+    np.testing.assert_array_equal(got, expected)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDotOps(unittest.TestCase):
   """FP16 dot, batched dot, and matvec compositions lowered through DPU EW."""
