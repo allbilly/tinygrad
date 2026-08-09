@@ -1724,7 +1724,7 @@ class TestRockchipInterpolateOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMovementOps(unittest.TestCase):
-  """Static FP16 view and layout methods proven by the Rockchip gather path."""
+  """Static 16-bit view and layout methods proven by the Rockchip gather path."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
 
   @classmethod
@@ -1776,6 +1776,11 @@ class TestRockchipMovementOps(unittest.TestCase):
   test_diagonal = _test_ops.TestOps.test_diagonal
   test_roll = _test_ops.TestOps.test_roll
 
+  def test_int16_raw_movement(self):
+    values = np.array([[-32768, -256, -1, 0], [1, 256, 32767, 123]], dtype=np.int16)
+    got = Tensor(values, device="ROCKCHIP").permute(1, 0).flip(0)[1:4].numpy()
+    np.testing.assert_array_equal(got, np.flip(values.T, axis=0)[1:4])
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipTriangularOps(unittest.TestCase):
   """Numeric FP16 portions of test_ops tril/triu; external boolean inputs are unsupported."""
@@ -1793,7 +1798,7 @@ class TestRockchipTriangularOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipConcatOps(unittest.TestCase):
-  """FP16 concatenation, stacking, and repetition through partial raw gathers."""
+  """16-bit concatenation, stacking, and repetition through partial raw gathers."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
 
   @classmethod
@@ -1818,9 +1823,18 @@ class TestRockchipConcatOps(unittest.TestCase):
   test_repeat_interleave = _test_ops.TestOps.test_repeat_interleave
   test_simple_repeat = _test_ops.TestOps.test_simple_repeat
 
+  def test_int16_concat_stack_repeat(self):
+    a = np.array([[-32768, -1, 0], [1, 256, 32767]], dtype=np.int16)
+    b = np.array([[-30000, 30000], [-256, 123]], dtype=np.int16)
+    got = Tensor.cat(Tensor(a, device="ROCKCHIP"), Tensor(b, device="ROCKCHIP"), dim=1).numpy()
+    np.testing.assert_array_equal(got, np.concatenate((a, b), axis=1))
+    got = Tensor.stack(Tensor(a, device="ROCKCHIP"), Tensor(-a, device="ROCKCHIP"), dim=1).numpy()
+    np.testing.assert_array_equal(got, np.stack((a, -a), axis=1))
+    np.testing.assert_array_equal(Tensor(b, device="ROCKCHIP").repeat(2, 1).numpy(), np.tile(b, (2, 1)))
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipPaddingOps(unittest.TestCase):
-  """Constant, reflect, replicate, and circular FP16 padding through raw gathers."""
+  """Constant, reflect, replicate, and circular 16-bit padding through raw gathers."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception
 
   @classmethod
@@ -1834,6 +1848,11 @@ class TestRockchipPaddingOps(unittest.TestCase):
   test_pad_replicate_mode = _test_ops.TestOps.test_pad_replicate_mode
   test_pad_circular_mode = _test_ops.TestOps.test_pad_circular_mode
   test_padding_add = _test_ops.TestOps.test_padding_add
+
+  def test_int16_constant_padding(self):
+    values = np.array([[-32768, -1, 0], [1, 256, 32767]], dtype=np.int16)
+    got = Tensor(values, device="ROCKCHIP").pad(((1, 2), (2, 1)), value=-12345).numpy()
+    np.testing.assert_array_equal(got, np.pad(values, ((1, 2), (2, 1)), constant_values=-12345))
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipReductionOps(unittest.TestCase):

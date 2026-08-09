@@ -4183,3 +4183,28 @@ coverage, coordinate layouts, and bounds. Runtime gathers opaque source bytes; b
 compact-index equality, coordinate selection, validity/fill composition, and INT32 writeback execute on DPU. There is
 no host Nonzero/result calculation, NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or floating input wider
 than FP16.
+
+---
+
+## 2026-08-09 — exact INT16 raw layouts on the generic gather path
+
+Signed-INT16 movement, concatenation, stacking, repetition, and constant padding are now covered bit-exactly. Compile
+probes showed that pure raw layouts already lower through the renderer's common static gather planner; only a fused
+layout-plus-negation probe was unsupported and is intentionally left for the arithmetic fusion group. The correct
+milestone therefore adds coverage without a dtype-specific renderer path.
+
+No branch, `~/npu`, or `~/rk3588` contains or needs a distinct INT16 layout implementation: these operations move raw
+bytes and do not invoke arithmetic registers. The existing Tinygrad Rockchip static/partial gather path is the direct
+reference, matching the separation used by other hardware backends between layout planning and numeric kernels.
+
+- Chained permute/flip/slice, constant `-12345` two-dimensional padding, axis concat, internal-axis stack, and repeat
+  all pass bit-exactly: **3/3 in 3.08 s**, with every test call at or below **0.14 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **488 tests**.
+- `sz.py` is unchanged at renderer/runtime **4,892/331 executable lines**, total **30,278**; this is test-only coverage
+  with no runtime, renderer, or Tinygrad-core modification.
+
+The CPU-cheat audit found no implementation change and no host-dependent layout decision. Tinygrad computes only the
+static address plan at compile time; runtime raw gathers perform every tensor movement on the device-visible buffers.
+There is no host tensor read/result calculation, NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or numeric
+conversion.
