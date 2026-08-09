@@ -347,6 +347,30 @@ for _name, _test in vars(_test_ops.TestOps).items():
 class TestRockchipMaxUnpoolOps(unittest.TestCase):
   """FP16 MaxUnpool scatter from the upstream operator census."""
 
+  def test_max_unpool2d_int16(self):
+    values = np.array([[[[-32768, 32767], [7, -9]]]], dtype=np.int16)
+    indices = np.array([[[[0, 3], [12, 15]]]], dtype=np.int32)
+    expected = torch.nn.functional.max_unpool2d(torch.from_numpy(values).float(), torch.from_numpy(indices).long(), 2).int().numpy()
+    before = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    got = Tensor(values, device="ROCKCHIP").max_unpool2d(Tensor(indices, device="ROCKCHIP"), 2).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+    self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (2,40))
+
+    duplicate_values = np.array([[[[30000, 30000]]]], dtype=np.int16)
+    duplicate_indices = np.zeros((1,1,1,2), dtype=np.int32)
+    expected = np.zeros((1,1,1,4), dtype=np.int32)
+    expected[0,0,0,0] = 60000
+    got = Tensor(duplicate_values, device="ROCKCHIP").max_unpool2d(
+      Tensor(duplicate_indices, device="ROCKCHIP"), (1,2)).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+
+    data = np.array([[[[-32768, 7, 7, -9], [3, 7, -4, -4], [5, 5, 2, 1], [5, -8, 2, 2]]]], dtype=np.int16)
+    pooled, pooled_indices = torch.nn.functional.max_pool2d(torch.from_numpy(data), (2,2), return_indices=True)
+    expected = torch.nn.functional.max_unpool2d(pooled.float(), pooled_indices, (2,2)).int().numpy()
+    got = Tensor.max_unpool2d(
+      *Tensor.max_pool2d(Tensor(data, device="ROCKCHIP"), (2,2), return_indices=True), (2,2)).realize().numpy()
+    np.testing.assert_array_equal(got, expected)
+
   def test_max_unpool2d_nonfinite_bits(self):
     values = np.array([math.inf, -math.inf, math.nan, 3.5], dtype=np.float16).reshape(4,1,1,1)
     indices = np.arange(4, dtype=np.int32).reshape(4,1,1,1)

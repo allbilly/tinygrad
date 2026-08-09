@@ -4027,3 +4027,38 @@ The CPU-cheat audit found only compile-time evaluation of static gates, offsets,
 Runtime gathers preserve raw INT16 bytes; every input-dependent maximum, equality mask, first-tie selection, and
 INT16-to-INT32 writeback executes on DPU. There is no host MaxPool/index calculation, NumPy backend evaluation, LUT,
 CMAC, tolerance relaxation, or Tinygrad-core change.
+
+---
+
+## 2026-08-09 — exact signed-INT16 MaxUnpool on DPU
+
+Signed-INT16 MaxUnpool now scatters through exact dynamic INT32 indices and returns Tinygrad's promoted INT32 output.
+The FP16 MaxUnpool parser is typed rather than copied. Its static plane/candidate validation produces the same gather
+plans, while a compact native image compares all four index bytes on DPU, masks the INT16 candidate matrix, converts
+selected lanes to INT32, and performs the balanced candidate sum in native INT32.
+
+The INT32 reduction is required for exact Tinygrad semantics: duplicate destination indices are summed, and two valid
+INT16 values can exceed the signed-INT16 range. A regression deliberately maps `30000` and `30000` to one destination
+and verifies the exact result `60000`. The shared byte-mask helper now accepts either one repeated index-offset vector
+or a statically validated row per candidate; all existing gather, fancy-index, masked-select, and scatter callers keep
+the former path unchanged.
+
+`~/rk3588/examples/elementwise_int.py` provides the native INT16 equality, MUL, INT16-to-INT32, and INT32 arithmetic
+register evidence. Existing FP16 MaxUnpool supplied the UOp parser and static scatter-layout validation; no local
+reference contains a more complete native integer MaxUnpool implementation.
+
+- Direct full-range INT16 scatter passes exactly with **40 DPU tasks / 2 ioctls**; pool→index→unpool round-trip and the
+  duplicate-index INT32 accumulation also pass. The focused method takes **3.17 s** including startup.
+- The complete MaxUnpool class passes **7/7 in 37.35 s**. Duration decomposition is wide FP16 **20.12 s**, padded FP16
+  **10.40 s**, and every other method at or below **1.41 s**; no individual case crosses the 30-second threshold.
+- Four representative existing dynamic gather/fancy-index/scatter/masked-select regressions plus two subtests pass in
+  **8.72 s**, covering the unchanged single-offset form of the shared byte-mask helper.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **478 tests**.
+- `sz.py`: renderer/runtime **4,880/331 executable lines**, total **30,266**. The milestone adds 30 renderer lines,
+  no runtime lines, and no Tinygrad-core changes.
+
+The CPU-cheat audit found no runtime change and no tensor-value evaluation in the renderer. Compile time validates only
+static layouts and coordinates; runtime retains the existing raw gathers. Every dynamic index comparison, value mask,
+typed conversion, duplicate accumulation, and output write executes on DPU. There is no host scatter/sum, NumPy backend
+evaluation, LUT, CMAC, tolerance relaxation, or Tinygrad-core change.
