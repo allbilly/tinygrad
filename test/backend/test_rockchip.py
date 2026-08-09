@@ -937,6 +937,18 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     for op in (lambda x,y:(x<y)&(x!=0), lambda x,y:(x<y)|(x!=0), lambda x,y:(x<y)^(x!=0)): self._check_bool(op, a, b)
     self._check_bool(lambda x,y:(x<y).logical_not(), a, b, expected=np.logical_not(a<b))
 
+  def test_where(self):
+    a = np.asarray([-32768,-32768,-30000,-1,0,1,30000,32767], dtype=np.int16)
+    b = np.asarray([32767,-32768,30000,0,0,-1,-30000,-32768], dtype=np.int16)
+    self._check(np.where(a < b, a, b), lambda x,y:(x<y).where(x, y), a, b)
+    self._check(np.where(a != 0, a, -7), lambda x:(x!=0).where(x, -7), a)
+
+  def test_where_logical_broadcast(self):
+    a = np.asarray([[-8,-4,0,4], [8,12,16,20]], dtype=np.int16)
+    b = np.asarray([2,-2,4,6], dtype=np.int16)
+    condition = (a < b) & (a != 0)
+    self._check(np.where(condition, a+b, a-b), lambda x,y:((x<y)&(x!=0)).where(x+y, x-y), a, b)
+
   def test_compare_broadcast_scalar(self):
     a = [[-32768,-1,0,32767], [32767,2,-3,-32768]]
     self._check_bool(lambda x,y:x>=y, a, [-32768,0,0,32767])

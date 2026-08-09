@@ -4320,9 +4320,11 @@ def _fold_native_int16(x:UOp) -> UOp|None:
   if x.op is Ops.ADD:
     for lhs,rhs in (x.src, x.src[::-1]):
       if rhs.op is Ops.NEG: return UOp(Ops.SUB, x.dtype, src=(lhs, rhs.src[0]))
+  if x.op is Ops.WHERE and (mask:=_native_int16_comparison(x.src[0])) is not None:
+    selected = mask.alu(Ops.MUL, x.src[1])
+    rejected = UOp.const(1, dtypes.int16).alu(Ops.SUB, mask).alu(Ops.MUL, x.src[2])
+    return selected.alu(Ops.ADD, rejected)
   return None
-
-_pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
 
 def _native_int16_comparison(root:UOp) -> UOp|None:
   """Express signed INT16 comparisons and their boolean compositions as saturating integer ALU masks."""
@@ -4344,6 +4346,8 @@ def _native_int16_comparison(root:UOp) -> UOp|None:
       if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg):
         if (mask:=_native_int16_comparison(value)) is not None: return UOp.const(1, dtypes.int16).alu(Ops.SUB, mask)
   return None
+
+_pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
 
 def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
   """Lower signed INT16 arithmetic and exact comparison masks to the DPU integer EW pipeline."""

@@ -3737,3 +3737,30 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only 
 native INT16 stages. Every input-dependent comparison and logical composition executes on DPU EW; runtime only performs
 the existing opaque low-byte transport into the public bool buffer. There is no host predicate evaluation, LUT, CMAC,
 tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — native INT16 selection on DPU
+
+Comparison-driven INT16 `where` now lowers through the same native integer EW graph as arithmetic and predicates. The
+scheduled IR is a single typed WHERE over the already-supported comparison tree. The renderer rewrites that bounded form
+to `mask*a + (1-mask)*b`; because the mask is exactly zero or one, one product is always zero and the saturating INT16 ADD
+returns the selected branch exactly, including the signed endpoints. This avoids the unsafe `b + mask*(a-b)` form, whose
+intermediate subtraction could saturate before selection.
+
+The implementation uses only the INT16 SUB, MUL, and ADD behavior proven by `~/rk3588/examples/elementwise_int.py` and
+adds no register mode or runtime special case. The native matcher declaration was moved below the comparison helper so
+the renderer reads in dependency order.
+
+- Full-range tensor/tensor selection and scalar fallback selection pass exactly; the method is **0.14 s** after startup.
+- A composed AND predicate with broadcast inputs and arithmetic branches passes exactly in **one ioctl** and **0.14 s**.
+- The complete native INT16 class passes **14/14 in 3.45 s**; no case approaches the 30-second profiling threshold.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **468 tests**.
+- `sz.py`: renderer/runtime **4,655/327 executable lines**, total **30,037**; selection adds four renderer lines and no
+  runtime lines.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only rewrites the typed selection graph.
+Predicates, mask inversion, masked products, addition, and branch arithmetic all execute on DPU INT16 EW; runtime only
+submits the existing stages. There is no host selection, NumPy tensor evaluation, LUT, CMAC, tolerance relaxation, or
+floating input wider than FP16.
