@@ -838,6 +838,46 @@ class TestRockchipBroadcastOps(unittest.TestCase):
         with self.subTest(op=torch_op.__name__, shapes=pair): _fp16_test_op(pair, torch_op, tinygrad_op)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipInt16EWOps(unittest.TestCase):
+  """Bounded signed INT16 arithmetic on the native DPU integer EW pipeline."""
+
+  def _check(self, expected, op, *values):
+    before = Device["ROCKCHIP"].submit_count
+    got = op(*(Tensor(np.asarray(value, dtype=np.int16)) for value in values)).realize().numpy()
+    self.assertEqual(got.dtype, np.int16)
+    np.testing.assert_array_equal(got, np.asarray(expected, dtype=np.int16))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+
+  def test_add_sub(self):
+    a = [-30000,-1200,-7,-1,0,1,1200,30000]
+    b = [1000,-30,2,-1,1,2,-30,1000]
+    self._check([-29000,-1230,-5,-2,1,3,1170,31000], lambda x,y:x+y, a, b)
+    self._check([-31000,-1170,-9,0,-1,-1,1230,29000], lambda x,y:x-y, a, b)
+
+  def test_mul_max(self):
+    a, b = [-100,-24,-7,-1,0,1,24,100], [20,-6,2,-1,1,2,-3,5]
+    self._check([-2000,144,-14,1,0,2,-72,500], lambda x,y:x*y, a, b)
+    self._check([20,-6,2,-1,1,2,24,100], lambda x,y:x.maximum(y), a, b)
+
+  def test_min_abs_neg(self):
+    a = [-30000,-1200,-7,-1,0,1,1200,30000]
+    b = [1000,-30,2,-1,1,2,-30,1000]
+    self._check([-30000,-1200,-7,-1,0,1,-30,1000], lambda x,y:x.minimum(y), a, b)
+    self._check([30000,1200,7,1,0,1,1200,30000], lambda x:x.abs(), a)
+    self._check([30000,1200,7,1,0,-1,-1200,-30000], lambda x:-x, a)
+
+  def test_saturating_limit(self):
+    self._check([32767,-32768], lambda x,y:x+y, [32000,-32000], [1000,-1000])
+    self._check([32767,-32768], lambda x,y:x-y, [32000,-32000], [-1000,1000])
+    self._check([32767,-32768], lambda x,y:x*y, [300,-300], [300,300])
+    self._check([32767], lambda x:x.abs(), [-32768])
+    self._check([32767], lambda x:-x, [-32768])
+
+  def test_broadcast_chain(self):
+    a = [[-8,-4,0,4], [8,12,16,20]]
+    self._check([[-9,-9,5,17], [17,17,37,49]], lambda x,y:(x+y).maximum(-3)*2-3, a, [2,-2,4,6])
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDotOps(unittest.TestCase):
   """FP16 dot, batched dot, and matvec compositions lowered through DPU EW."""
   helper_test_exception = _test_ops.TestOps.helper_test_exception

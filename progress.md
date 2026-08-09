@@ -3366,3 +3366,32 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Direct tuple buffe
 IR predicates prove only their allowed coordinate domains. Native INT16 DPU EW performs exact byte equality,
 conjunction, FP16 selection, and reduction. There is no host tuple evaluation, LUT, CMAC, tolerance change, or floating
 input wider than FP16.
+
+---
+
+## 2026-08-09 — public bounded INT16 DPU EW
+
+The native INT16 precision introduced for index masks is now reachable from ordinary Tinygrad signed-INT16 elementwise
+graphs. The implementation follows `~/rk3588/examples/elementwise_int.py`: DPU input, process, and output precision are
+INT16, while ADD, SUB, MUL, MAX, MIN, ABS, and NEG use the decoded integer ALU encodings. Tinygrad's portable
+`ADD(x, MUL(y, -1))`, XOR-based minimum, and WHERE-based absolute-value forms are folded back to native operations.
+Static broadcasts reuse the same immutable raw-gather plans as FP16.
+
+The path deliberately does not add INT16 to `supported_dtypes`: RK3588 saturates signed integer ADD/SUB/MUL/ABS/NEG,
+whereas Tinygrad's general fixed-width integer contract wraps on overflow. Dedicated limit tests record the hardware
+behavior exactly instead of falsely advertising a fully general INT16 backend.
+
+- Five methods / **13 DPU programs passed individually**, including arithmetic, broadcasting, chaining, and saturation;
+  every program asserts exactly **one submit ioctl**.
+- Largest direct profile, 131,072-element ADD: **0.345 s total** = 242.2 ms device open + 8.7 ms input creation +
+  0.1 ms graph construction + **91.4 ms realization** + 2.6 ms copyout; **1 ioctl / 3 DPU tasks**.
+- FP16 broadcast and native-INT16 tuple-fancy regressions pass after sharing gather validation/cache helpers.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. Rockchip collection: **446 tests**.
+- `sz.py`: renderer/runtime **3,855/307 executable lines**, total **29,217**. Shared gather validation and immutable-plan
+  retargeting remove duplicated FP16/INT16 bounds and cache plumbing.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time evaluates only static shapes, constants, and
+gather addresses. Runtime copies opaque `uint16` lanes; all input-dependent signed arithmetic, extrema, absolute value,
+negation, and saturation execute on DPU EW. There is no host numeric evaluator, LUT, CMAC, CNA, PPU fallback, tolerance
+relaxation, or floating input wider than FP16.

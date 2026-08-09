@@ -51,6 +51,7 @@ class RKMultiGather: gathers: tuple[RKGather, ...]
 class RKStatic: expr: UOp
 
 RKLeaf = RKArg|RKStatic|RKGather|RKMultiGather|float|tuple[UOp, UOp, UOp|None, int]|None
+RKInt16Leaf = RKArg|RKStatic|int|tuple[UOp, UOp, UOp|None, int]|None
 
 @dataclass(frozen=True)
 class RKFill: dst: RKArg; count: int; itemsize: int = 2
@@ -172,6 +173,7 @@ _EW_ALU_ADD = 2 << 16
 _EW_ALU_FDIV = 3 << 16
 _EW_ALU_SUB = 4 << 16
 _EW_ALU_ABS = 5 << 16
+_EW_ALU_NEG = 6 << 16
 _EW_ALU_FLOOR = 7 << 16
 _EW_ALU_CEIL = 8 << 16
 _EW_RELUX_EN = 1 << 10
@@ -186,6 +188,7 @@ _EW_CFG_RELU = _EW_CFG_COMMON
 _EW_CFG_RELU6 = _EW_CFG_COMMON | _EW_RELUX_EN
 _EW_CFG_MIN = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_MIN
 _EW_CFG_ABS = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_ABS
+_EW_CFG_NEG = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_NEG
 _EW_CFG_FLOOR = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_FLOOR
 _EW_CFG_CEIL = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_ALU_CEIL
 _EW_CFG_LEAKY_RELU = _EW_CFG_COMMON | _EW_RELU_BYPASS | _EW_OP_CVT_BYPASS | _EW_MUL_PRELU | _EW_OP_TYPE_MUL
@@ -221,6 +224,7 @@ def _cmd(target:int, reg:int, value:int) -> int: return ((target&0xffff)<<48)|((
 def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _int32_tiles_bytes(count:int) -> int: return cdiv(count, 4) * 64
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
+def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
 
 def _emit_fp32_out_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int) -> RKStage:
   """Emit one terminal scalar stage with FP16 inputs and an FP32 output."""
@@ -568,6 +572,19 @@ def _gather_plan(src_index:int, dst_index:int, out_index:UOp, load_index:UOp, ga
       if expected == count and all(r in out_affine[1] for r in load_affine[1]):
         return RKGather(src_index, dst_index, count, load_affine[0], tuple(axes))
   return RKGather(src_index, dst_index, count, offsets=_gather_offsets(out_index, load_index, gate, count), fill_bits=fill_bits)
+
+def _validate_gather_bounds(plan:RKGather, source_count:int) -> None:
+  if plan.offsets: low, high = min(plan.offsets, default=0), max(plan.offsets, default=-1)
+  else:
+    low = high = plan.base
+    for _,limit,stride in plan.axes:
+      if stride < 0: low += (limit-1)*stride
+      else: high += (limit-1)*stride
+  if low < -1 or high >= source_count: raise RuntimeError("RKPLAN_REJECT:gather_index")
+
+def _gather_cache_key(plans:Iterable[RKGather]) -> tuple:
+  return tuple((p.src_index, p.count, p.base, p.axes, p.offsets, p.fill_bits, p.values, p.partial,
+                p.dst_stride, p.dst_addend, p.itemsize, p.src_kind) for p in plans)
 
 def _selection_gather(u:UOp, out_index:UOp, count:int, oslot:int, selection_cache:dict[UOp, tuple[bool, bool]]|None=None,
                       static_cache:dict[UOp, bool]|None=None) -> RKGather|RKMultiGather|None:
@@ -3461,7 +3478,141 @@ def _lower_ieee_predicate(output:RKOutput) -> RKImage|None:
 
   return _typed_int_image(output, value, bool_output=True)
 
+def _int16_const(u:UOp, value:int) -> bool:
+  return u.op is Ops.CONST and u.dtype.scalar() is dtypes.int16 and int(u.arg) == value
+
+def _int16_nonconst(u:UOp, value:int) -> UOp|None:
+  if len(u.src) != 2: return None
+  if _int16_const(u.src[0], value): return u.src[1]
+  if _int16_const(u.src[1], value): return u.src[0]
+  return None
+
+def _fold_native_int16(x:UOp) -> UOp|None:
+  """Recover native integer operations from Tinygrad's portable decompositions."""
+  if x.op is Ops.XOR and (maximum:=_int16_nonconst(x, -1)) is not None and maximum.op is Ops.MAX:
+    lhs, rhs = (_int16_nonconst(src, -1) for src in maximum.src)
+    if lhs is not None and rhs is not None: return UOp(Ops.MAX, x.dtype, src=(lhs, rhs), arg=_NATIVE_MIN)
+  if x.op is Ops.MUL:
+    for source, sign in (x.src, x.src[::-1]):
+      if _int16_const(sign, -1): return UOp(Ops.NEG, x.dtype, src=(source,))
+      if (sign.op is not Ops.WHERE or len(sign.src) != 3 or not _int16_const(sign.src[2], 0) or
+          sign.src[0].op is not Ops.CMPNE or source not in sign.src[0].src or
+          not any(_int16_const(u, 0) for u in sign.src[0].src)): continue
+      inner = sign.src[1]
+      if (inner.op is Ops.WHERE and inner.src[0].op is Ops.CMPLT and inner.src[0].src[0].key == source.key and
+          _int16_const(inner.src[0].src[1], 0) and _int16_const(inner.src[1], -1) and _int16_const(inner.src[2], 1)):
+        return UOp(Ops.MAX, x.dtype, src=(source, source), arg=_NATIVE_ABS)
+  if x.op is Ops.ADD:
+    for lhs,rhs in (x.src, x.src[::-1]):
+      if rhs.op is Ops.NEG: return UOp(Ops.SUB, x.dtype, src=(lhs, rhs.src[0]))
+  return None
+
+_pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
+
+def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
+  """Lower bounded signed INT16 arithmetic directly to the DPU integer EW pipeline."""
+  if (output:=_output_store(uops, dtypes.int16)) is None: return None
+  _, out_param, count, out_index, value = output
+  if count <= 0: return RKImage(RKTarget.RK3588)
+  value = graph_rewrite(value, _pm_native_int16, name="rockchip native int16")
+  out = RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  supported = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.NEG}
+  static_cache:dict[UOp, bool] = {}
+  leaf_cache:dict[UOp, RKInt16Leaf] = {}
+  def leaf(u:UOp) -> RKInt16Leaf:
+    if u in leaf_cache: return leaf_cache[u]
+    ret:RKInt16Leaf = None
+    if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int16: ret = int(u.arg)
+    elif u.dtype.scalar() is dtypes.int16 and _is_static_expr(u, static_cache): ret = RKStatic(u)
+    elif u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int16 and u.src[0].op is Ops.INDEX and \
+         (param:=_root_param(u.src[0])) is not None and param.arg.slot != out.index and param.src[0].op is Ops.CONST:
+      index, gate = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None
+      fill = u.src[1] if len(u.src) > 1 else None
+      if fill is None or fill.op is Ops.CONST:
+        ret = (RKArg(RKBufferKind.ARG, param.arg.slot) if gate is None and index.key == out_index.key and
+               int(param.src[0].arg) == count else (param, index, gate, _int16_bits(0 if fill is None else fill.arg)))
+    leaf_cache[u] = ret
+    return ret
+  if leaf(value) is not None: value = value.alu(Ops.ADD, UOp.const(0, dtypes.int16))
+  order:list[UOp] = []
+  visited:dict[UOp, bool] = {}
+  def visit(u:UOp) -> bool:
+    if u in visited: return visited[u]
+    if u.op in supported and u.dtype.scalar() is dtypes.int16:
+      visited[u] = len(u.src) == (1 if u.op is Ops.NEG else 2) and all(visit(src) for src in u.src)
+      if visited[u]: order.append(u)
+    else: visited[u] = leaf(u) is not None
+    return visited[u]
+  if not visit(value) or not order or order[-1] is not value: return None
+
+  uses = {u:sum(u in expr.src for expr in order) for u in order}
+  values:dict[UOp, RKArg] = {}
+  leaves:dict[UOp, RKArg] = {}
+  free:list[int] = []
+  constants:dict[bytes, int] = {}
+  static_slots:dict[tuple[int, ...], int] = {}
+  gather_slots:dict[tuple, int] = {}
+  gathers:list[RKGather] = []
+  for expr in order:
+    for src in expr.src:
+      if isinstance((parsed:=leaf(src)), int):
+        bits = struct.pack("<H", _int16_bits(parsed))
+        if bits not in constants: constants[bits] = len(constants)
+  scratch_count = len(constants)
+  def operand(u:UOp) -> RKArg:
+    nonlocal scratch_count
+    if u in values: return values[u]
+    if u in leaves: return leaves[u]
+    parsed = leaf(u); assert parsed is not None
+    if isinstance(parsed, int): ret = RKArg(RKBufferKind.SCRATCH, constants[struct.pack("<H", _int16_bits(parsed))])
+    elif isinstance(parsed, RKStatic):
+      vector = _static_values(out_index, parsed.expr, count, _int16_bits)
+      if vector not in static_slots:
+        static_slots[vector] = scratch_count
+        gathers.append(RKGather(0, scratch_count, count, values=vector))
+        scratch_count += 1
+      ret = RKArg(RKBufferKind.SCRATCH, static_slots[vector])
+    elif isinstance(parsed, RKArg): ret = parsed
+    else:
+      assert isinstance(parsed, tuple)
+      param, index, gate, fill_bits = parsed
+      plans = (_gather_plan(param.arg.slot, 0, out_index, index, gate, count, fill_bits),)
+      for plan in plans: _validate_gather_bounds(plan, int(param.src[0].arg))
+      key = _gather_cache_key(plans)
+      if key not in gather_slots:
+        gather_slots[key] = scratch_count
+        gathers.extend(replace(p, dst_index=scratch_count, itemsize=2) for p in plans)
+        scratch_count += 1
+      ret = RKArg(RKBufferKind.SCRATCH, gather_slots[key])
+    leaves[u] = ret
+    return ret
+  ew_ops:list[RKEWOp] = []
+  for expr in order:
+    lhs = operand(expr.src[0]); rhs = lhs if expr.op is Ops.NEG else operand(expr.src[1])
+    if expr is value: dst = out
+    elif (reuse:=next((values[src] for src in expr.src if src in values and uses[src] == 1 and
+                       values[src].kind is RKBufferKind.SCRATCH), None)) is not None: dst = reuse
+    else:
+      slot = free.pop() if free else scratch_count
+      if slot == scratch_count: scratch_count += 1
+      dst = RKArg(RKBufferKind.SCRATCH, slot)
+    cfg = _EW_CFG_MIN if expr.op is Ops.MAX and expr.arg == _NATIVE_MIN else \
+      _EW_CFG_ABS if expr.op is Ops.MAX and expr.arg == _NATIVE_ABS else _EW_CFG_NEG if expr.op is Ops.NEG else _EW_CFG[expr.op]
+    ew_ops.append(RKEWOp(dst, lhs, rhs, count, cfg, int16_input=True, int16_output=True))
+    values[expr] = dst
+    for dep in expr.src:
+      if dep in uses:
+        uses[dep] -= 1
+        if uses[dep] == 0 and values[dep].kind is RKBufferKind.SCRATCH and values[dep] != dst: free.append(values[dep].index)
+  constant_data = b""
+  if constants:
+    by_slot = {slot:bits for bits,slot in constants.items()}
+    constant_data = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot)+1))
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(_scratch_bytes(count)) for _ in range(scratch_count)), constant_data,
+                 gathers=tuple(gathers), ew_ops=tuple(ew_ops))
+
 def lower_ew(uops:list[UOp]) -> RKImage:
+  if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew
   if (bool_output:=_output_store(uops, dtypes.bool)) is not None:
     if bool_output[4].op is Ops.CONST:
       return RKImage(RKTarget.RK3588, constants=struct.pack("<?", bool(bool_output[4].arg)),
@@ -3627,21 +3778,11 @@ def lower_ew(uops:list[UOp]) -> RKImage:
         if plan.values: continue
         source = next((x for x in u.toposort() if x.op is Ops.PARAM and x.arg.slot == plan.src_index), None)
         if source is None or source.src[0].op is not Ops.CONST: raise RuntimeError("RKPLAN_REJECT:gather_index")
-        if plan.offsets: low, high = min(plan.offsets, default=0), max(plan.offsets, default=-1)
-        else:
-          low = high = plan.base
-          for _, limit, stride in plan.axes:
-            if stride < 0: low += (limit-1)*stride
-            else: high += (limit-1)*stride
-        if low < -1 or high >= int(source.src[0].arg): raise RuntimeError("RKPLAN_REJECT:gather_index")
-      key = tuple((plan.src_index, plan.count, plan.base, plan.axes, plan.offsets, plan.fill_bits, plan.values, plan.partial,
-                   plan.dst_stride, plan.dst_addend)
-                  for plan in gather_plans)
+        _validate_gather_bounds(plan, int(source.src[0].arg))
+      key = _gather_cache_key(gather_plans)
       if key not in gather_scratch:
         gather_scratch[key] = scratch_count
-        gathers.extend(RKGather(plan.src_index, scratch_count, plan.count, plan.base, plan.axes, plan.offsets, plan.fill_bits,
-                                values=plan.values, partial=plan.partial, dst_stride=plan.dst_stride, dst_addend=plan.dst_addend)
-                       for plan in gather_plans)
+        gathers.extend(replace(plan, dst_index=scratch_count) for plan in gather_plans)
         scratch_count += 1
       ret = RKArg(RKBufferKind.SCRATCH, gather_scratch[key])
     leaves[u] = ret
