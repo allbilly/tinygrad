@@ -4598,3 +4598,37 @@ The CPU-cheat audit found no runtime or Tinygrad-core modification and no tensor
 only static graph topology, offsets, and constants. Runtime gathers move opaque bytes; index comparison, last-wins
 selection, reduction masks, arithmetic, and output reconstruction all execute on DPU EW. No LUT, CMAC, host result
 calculation, tolerance relaxation beyond `test_gemm_fp16`, or input wider than FP16 was added.
+
+---
+
+## 2026-08-10 — batched exact signed INT32 division and remainder
+
+One byte-restoring native-INT16 DPU lowerer now covers signed INT32 truncating division, floor division, C-style
+remainder, and floor modulo. Four opaque input bytes are conditionally converted to magnitude, divided over 32 exact
+bit steps, then sign- and rounding-corrected before raw INT32 writeback. A companion mixed INT32/FP16 path performs
+device conversion followed by native FDIV, FLOOR/CEIL, MUL, and SUB stages. Direct use of the reference integer
+`DIV` register was rejected: `~/rk3588/examples/elementwise_int.py` documents that it retains floating-point semantics
+in integer precision and is therefore not exact signed integer division.
+
+- Full unchanged upstream `test_mod`, `test_fmod`, `test_div_int`, and `test_div_rounding_mode`, plus a backend-only
+  signed-limit regression, pass together: **5/5 in 33.43 s**. The local regression covers INT32 minimum/maximum,
+  mixed signs, zero numerators, and all four rounding/remainder modes in **4 ioctls / 13,980 DPU tasks**.
+- The only newly represented upstream method name is `test_div_int`; the other three replace earlier shortened local
+  copies with their complete unchanged upstream bodies. `test_rockchip.py` now collects **351 upstream-only cases**
+  representing **328 unique upstream method names**; `test_rockchip2.py` collects **192 backend-only cases**. The
+  authoritative unselected remainder falls from 94 to **93 of 421**. These 93 are not all confirmed failures: most
+  belong to shared transcendental-dependent families outside the current no-LUT scope.
+- The former slowest case, unchanged `test_div_rounding_mode`, fell from **30.76 s to 26.34 s**. Before command reuse,
+  a direct profile measured **28.093 s wall**, **0.106 s / 15 renderer calls**, **26.420 s / 144 program calls**, and
+  **1.790 s / 320 submit ioctls**. Retaining the last immutable PC-chain bodies and prepatched scratch-only INT16
+  bodies reduced the direct profile to **23.296 s wall**, **0.105 s renderer**, **21.599 s program**, and
+  **0.334 s ioctl wall** without caching tensor values.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing. Repository-wide Tinygrad
+  mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,117/352 executable lines**, total **31,524**.
+
+The CPU-cheat audit found no Tinygrad-core change, runtime tensor-value inspection, or host numeric result calculation.
+Compilation handles only graph topology, static offsets, constants, and register words. Runtime gathers opaque bytes;
+all data-dependent sign detection, two's-complement conversion, comparison, subtraction, quotient/remainder formation,
+rounding, and reconstruction execute on native DPU EW. The command cache retains immutable command qwords only. No
+LUT, CMAC, tolerance relaxation, FP32 input emulation, or wider floating-point input was added.

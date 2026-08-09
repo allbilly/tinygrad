@@ -855,42 +855,18 @@ class TestRockchipIntegralRoundingOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipModuloOps(unittest.TestCase):
-  """FP16 remainder compositions over DPU FDIV, FLOOR/TRUNC, MUL, and SUB."""
+  """Unchanged FP16/INT32 remainder coverage over native DPU division stages."""
 
-  def test_mod(self):
-    a = [-4., 7., 5., 4., -7., 8., -9.]
-    b = [2., -3., 8., -2., 3., 5., -5.]
-    before = Device["ROCKCHIP"].submit_count
-    _fp16_test_op(None, lambda x,y:x%y, Tensor.mod, forward_only=True, vals=[a, b])
-    _fp16_test_op(None, lambda x,y:x%y, forward_only=True, vals=[a, b])
-    _fp16_test_op(None, lambda x:x%2, forward_only=True, vals=[a])
-    _fp16_test_op(None, lambda x:x%3, forward_only=True, vals=[a])
-    _fp16_test_op(None, lambda x:x%3.5, lambda x:(x%3.5).clone(), forward_only=True, vals=[a])
-    _fp16_test_op(None, lambda x:100%x, forward_only=True, vals=[a])
-    _fp16_test_op(None, lambda x:100.5%x, lambda x:(100.5%x).clone(), forward_only=True, vals=[a])
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 7)
-
-  def test_fmod(self):
-    a = [-4., 7., 5., 4., -7., 8., -9.]
-    b = [2., -3., 8., -2., 3., 5., -5.]
-    before = Device["ROCKCHIP"].submit_count
-    _fp16_test_op(None, lambda x,y:x.fmod(y), forward_only=True, vals=[a, b])
-    _fp16_test_op(None, lambda x:x.fmod(2), forward_only=True, vals=[a])
-    _fp16_test_op(None, lambda x:x.fmod(3.5), lambda x:x.fmod(3.5).clone(), forward_only=True, vals=[a])
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 3)
+  test_mod = _test_ops.TestOps.test_mod
+  test_fmod = _test_ops.TestOps.test_fmod
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDivisionRoundingOps(unittest.TestCase):
-  """FP16 scalar-broadcast division with native DPU FLOOR/TRUNC epilogues."""
+  """FP16 rounding plus exact INT32 division through native DPU EW."""
 
-  def test_div_rounding_mode(self):
-    numerator = [5., 6., 7., 0., -5., -6., -7.]
-    before = Device["ROCKCHIP"].submit_count
-    for denominator in (-10., -5., -3., -2., -1., 1., 2., 3., 5., 10.):
-      for mode in (None, "trunc", "floor"):
-        _fp16_test_op(None, lambda x,y,mode=mode:x.div(y, rounding_mode=mode), forward_only=True,
-                      vals=[numerator, [denominator]])
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 30)
+  helper_test_exception = _test_ops.TestOps.helper_test_exception
+  test_div_int = _test_ops.TestOps.test_div_int
+  test_div_rounding_mode = _test_ops.TestOps.test_div_rounding_mode
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBooleanReductionOps(unittest.TestCase):

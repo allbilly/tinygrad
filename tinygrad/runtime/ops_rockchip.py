@@ -45,6 +45,8 @@ class RockchipProgram(Program['RockchipDevice']):
     self._task_buf:HCQBuffer|None = None
     self._standalone_cmd_buf:HCQBuffer|None = None
     self._standalone_task_buf:HCQBuffer|None = None
+    self._pcchain_bodies:tuple[tuple[int, ...], ...]|None = None
+    self._scratch_ew_bodies:dict[tuple[RKEWOp, ...], tuple[tuple[int, ...], ...]] = {}
 
   @suppress_finalizing
   def __del__(self):
@@ -79,7 +81,10 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _submit_pcchain(self, bodies:list[tuple[int, ...]]) -> None:
     """Submit contiguous FP16 EW tasks as one blocking PC chain."""
-    n = len(bodies)
+    packed_bodies, n = tuple(bodies), len(bodies)
+    if self._pcchain_bodies == packed_bodies and self._cmd_buf is not None and self._task_buf is not None:
+      self._submit(self._cmd_buf, self._task_buf, n)
+      return
     cmd_size, task_need = _pcchain_sizes([len(body) for body in bodies])
     offsets:list[int] = []
     words = 0
@@ -103,6 +108,7 @@ class RockchipProgram(Program['RockchipDevice']):
       ctypes.memmove(int(cmd.va_addr) + (base+len(body))*8, (ctypes.c_uint64 * _PC_TAIL)(*tail), _PC_TAIL*8)
       desc = rk.struct_rknpu_task(0, 4, 0x18, 0x300, 0x1ffff, 0, len(body)+_PC_TAIL, 0, base_dma+base*8)
       ctypes.memmove(int(task.va_addr) + i*_TASK_DESC_BYTES, ctypes.addressof(desc), _TASK_DESC_BYTES)
+    self._pcchain_bodies = packed_bodies
     self._submit(cmd, task, n)
 
   def _submit_standalone(self, body:tuple[int, ...]) -> None:
@@ -160,6 +166,21 @@ class RockchipProgram(Program['RockchipDevice']):
 
   def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None) -> None:
     ops = self.image.ew_ops if ops is None else ops
+    scratch_int16 = bool(ops) and all(op.int16_input and op.int16_output and not op.submit_barrier and not op.compare and
+      op.dst.kind is RKBufferKind.SCRATCH and op.lhs.kind is RKBufferKind.SCRATCH and op.rhs.kind is RKBufferKind.SCRATCH for op in ops)
+    if scratch_int16:
+      if (cached:=self._scratch_ew_bodies.get(ops)) is None:
+        stages = []
+        for op in ops:
+          for start in range(0, op.count, _MAX_EW_ELEMS_FP16):
+            count, offset = min(_MAX_EW_ELEMS_FP16, op.count-start), start*2
+            stages.append(patch_stage(emit_ew_stage(
+              RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset), RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
+              RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
+              stateful=True, int16_output=True, int16_input=True), address))
+        self._scratch_ew_bodies[ops] = cached = tuple(stages)
+      self._submit_pcchain(list(cached))
+      return
     bodies:list[tuple[int, ...]] = []
     body_precision = 0
     for i, op in enumerate(ops):

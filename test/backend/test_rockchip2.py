@@ -577,6 +577,23 @@ class TestRockchipBitwiseOps(_base.TestRockchipBitwiseOps):
 
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipIntegerDivisionOps(unittest.TestCase):
+  def test_signed_limits_and_rounding(self):
+    lhs = np.array([dtypes.int32.min, dtypes.int32.max, -7, 7, -1, 1, 0], dtype=np.int32)
+    rhs = np.array([-1, 1, 3, -3, 2, -2, 5], dtype=np.int32)
+    before = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    trunc = Tensor(lhs).div(Tensor(rhs), rounding_mode="trunc").realize().numpy()
+    floor = (Tensor(lhs)//Tensor(rhs)).realize().numpy()
+    modulo = (Tensor(lhs)%Tensor(rhs)).realize().numpy()
+    fmod = Tensor(lhs).fmod(Tensor(rhs)).realize().numpy()
+    np.testing.assert_array_equal(trunc, np.array([dtypes.int32.min, dtypes.int32.max, -2, -2, 0, 0, 0], dtype=np.int32))
+    np.testing.assert_array_equal(floor, np.array([dtypes.int32.min, dtypes.int32.max, -3, -3, -1, -1, 0], dtype=np.int32))
+    np.testing.assert_array_equal(modulo, np.array([0, 0, 2, -2, 1, -1, 0], dtype=np.int32))
+    np.testing.assert_array_equal(fmod, np.array([0, 0, -1, 1, -1, 1, 0], dtype=np.int32))
+    self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (4, 13980))
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(_base.TestRockchipLogicalPredicateOps):
   def test_logical_and(self):
     _fp16_test_op(None, lambda x:(1 < x) & (x < 2), forward_only=True, vals=[[1.2, 1.2, 1.2, 3.2]])
