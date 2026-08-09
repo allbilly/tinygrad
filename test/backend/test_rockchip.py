@@ -827,6 +827,21 @@ class TestRockchipTranscendentalOps(unittest.TestCase):
   test_tanh_extreme = _test_ops.TestOps.test_tanh_extreme
   test_atanh = _test_ops.TestOps.test_atanh
   test_binary_crossentropy = _test_ops.TestOps.test_binary_crossentropy
+  test_binary_crossentropy_reductions = _test_ops.TestOps.test_binary_crossentropy_reductions
+  test_binary_crossentropy_logits_pos_weights = _test_ops.TestOps.test_binary_crossentropy_logits_pos_weights
+
+
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipLossOps(unittest.TestCase):
+  """Cross-entropy composites evaluated by DPU EW and reduction stages."""
+
+  @classmethod
+  def setUpClass(cls): _test_ops.helper_test_op = _fp16_test_op
+
+  @classmethod
+  def tearDownClass(cls): _test_ops.helper_test_op = _TEST_OPS_HELPER
+
+  test_cross_entropy_class_probabilities = _test_ops.TestOps.test_cross_entropy_class_probabilities
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")

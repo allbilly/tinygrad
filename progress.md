@@ -4787,3 +4787,41 @@ The CPU-cheat audit found no Tinygrad-core change, runtime tensor-value inspecti
 Compilation evaluates only graph structure and static layout; all data-dependent approximation, masking, normalization,
 reduction, and special-function arithmetic executes on DPU EW. Tolerance remains capped at the established FP16
 `test_gemm_fp16` limit.
+
+---
+
+## 2026-08-10 — packed scratch arena and loss batch
+
+Rockchip programs now pack their declared scratch slots into one GEM object while preserving every slot's encoded
+alignment and exposing ordinary `HCQBuffer.offset` views. Runtime cache retention therefore costs one scratch mapping
+per compiled program instead of one mapping per temporary. MEM_SYNC is deduplicated by GEM object address, including
+mid/post-gather boundaries, so all logical views of the arena produce one cache-maintenance ioctl rather than hundreds
+of identical full-object syncs.
+
+This fixes the reproducible `RKNPU GEM mapping failed for 4096 bytes` failure in complex binary-cross-entropy graphs.
+The first arena prototype exposed the redundant sync loop: the process spent roughly a minute issuing MEM_SYNC calls
+and reached 779 MiB RSS. A live Python stack sample identified `_sync_buffer` at the hot boundary; object-address
+deduplication removed it. A speculative combined graph-rewrite optimization broke vector `round` through matcher-order
+interference and was reverted before the milestone.
+
+- Three newly admitted unchanged upstream methods pass: `test_binary_crossentropy_reductions`,
+  `test_binary_crossentropy_logits_pos_weights`, and `test_cross_entropy_class_probabilities`. The final regression of
+  vector round, baseline BCE, both new BCE methods, and class-probability CE passes **5/5 in 125.51 s**. Direct strict
+  probing measured the unreduced BCE output at max absolute error **0.004883**; the unchanged method passes under the
+  established combined FP16 tolerance.
+- A provisional batch of all 14 remaining cross-entropy/sparse-CE/NLL methods completed in **76.31 s**: class-
+  probability CE passed and the other 13 consistently rejected unsupported dynamic integer-index/boolean-gate graphs.
+  Their historical branch implementations use NumPy host loss computation and remain rejected. A second three-method
+  batch (`softmax_argmax`, `normalize`, numerical `logcumsumexp`) rejected unsupported graphs in **10.14 s**. Failed
+  provisional aliases were removed, preserving the upstream-success-only contract of `test_rockchip.py`.
+- `test_rockchip.py`: **396 collected cases**, representing **373 unique upstream methods**. The authoritative
+  upstream-name remainder falls from 51 to **48 of 421**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing. No submit timeout, kernel
+  error, or reboot was needed during this milestone.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,671/367 executable lines**, total **32,093**.
+
+The CPU-cheat audit found only allocation ownership and cache-maintenance changes in the runtime. Scratch packing moves
+opaque bytes and preserves the existing DPU addresses; it performs no tensor-value interpretation or numeric result
+calculation. The three promoted methods use the existing DPU EW/reduction path. There is no Tinygrad-core change, host
+loss computation, LUT, CMAC, FP32 input emulation, or tolerance relaxation beyond `test_gemm_fp16`.

@@ -40,7 +40,15 @@ class RockchipAllocator(LRUAllocator['RockchipDevice']):
 class RockchipProgram(Program['RockchipDevice']):
   def __init__(self, dev:'RockchipDevice', obj:TinyELF):
     self.dev, self.name, self.image = dev, obj.name, decode_image(obj.lib)
-    self.scratch = tuple(dev._gpu_alloc(x.size) for x in self.image.scratch)
+    scratch_offsets:list[int] = []
+    scratch_size = 0
+    for spec in self.image.scratch:
+      scratch_size = _align_up(scratch_size, spec.alignment)
+      scratch_offsets.append(scratch_size)
+      scratch_size += spec.size
+    self._scratch_arena = dev._gpu_alloc(scratch_size) if scratch_size else None
+    self.scratch = (() if self._scratch_arena is None else
+                    tuple(self._scratch_arena.offset(offset, spec.size) for offset, spec in zip(scratch_offsets, self.image.scratch)))
     self.submit_count = 0
     self._cmd_buf:HCQBuffer|None = None
     self._task_buf:HCQBuffer|None = None
@@ -51,7 +59,7 @@ class RockchipProgram(Program['RockchipDevice']):
 
   @suppress_finalizing
   def __del__(self):
-    for buf in getattr(self, "scratch", ()): self.dev._gpu_free(buf)
+    if (scratch:=getattr(self, "_scratch_arena", None)) is not None: self.dev._gpu_free(scratch)
     if (cmd:=getattr(self, "_cmd_buf", None)) is not None: self.dev._gpu_free(cmd)
     if (task:=getattr(self, "_task_buf", None)) is not None: self.dev._gpu_free(task)
     if (cmd:=getattr(self, "_standalone_cmd_buf", None)) is not None: self.dev._gpu_free(cmd)
@@ -280,7 +288,7 @@ class RockchipProgram(Program['RockchipDevice']):
         return bufs[index]
       if index >= len(self.scratch): raise RuntimeError(f"RKImage scratch slot {index} is not declared")
       return self.scratch[index]
-    for buf in bufs: self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+    self.dev._sync_buffers(bufs, rk.RKNPU_MEM_SYNC_FROM_DEVICE)
     for i in range(len(self.image.constants)//2):
       if i >= len(self.scratch): break
       count = max((op.count for op in self.image.ew_ops), default=0)
@@ -313,7 +321,7 @@ class RockchipProgram(Program['RockchipDevice']):
           for divisor, limit, stride in gather.axes: index += (linear[gather.count]//divisor%limit)*stride
           dst[dst_index] = src[index]
     apply_gathers(self.image.gathers, True)
-    for buf in (*bufs, *self.scratch): self.dev._sync_buffer(buf, rk.RKNPU_MEM_SYNC_TO_DEVICE)
+    self.dev._sync_buffers((*bufs, *((self._scratch_arena,) if self._scratch_arena is not None else ())), rk.RKNPU_MEM_SYNC_TO_DEVICE)
     def address(kind:RKBufferKind, index:int) -> int:
       if kind is RKBufferKind.ARG:
         if index >= len(bufs): raise RuntimeError(f"RKImage argument slot {index} is not bound")
@@ -326,10 +334,10 @@ class RockchipProgram(Program['RockchipDevice']):
     def synchronized_gathers(gathers:tuple[RKGather, ...], clear_scratch:bool) -> None:
       touched = {(g.src_kind, g.src_index) for g in gathers if not g.values}
       touched.update((g.dst_kind, g.dst_index) for g in gathers)
-      for kind,index in touched: self.dev._sync_buffer(buffer(kind, index), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
+      self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in touched), rk.RKNPU_MEM_SYNC_FROM_DEVICE)
       apply_gathers(gathers, clear_scratch)
-      for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}:
-        self.dev._sync_buffer(buffer(kind, index), rk.RKNPU_MEM_SYNC_TO_DEVICE)
+      self.dev._sync_buffers(tuple(buffer(kind, index) for kind,index in {(g.dst_kind, g.dst_index) for g in gathers}),
+                             rk.RKNPU_MEM_SYNC_TO_DEVICE)
     if self.image.mid_gathers:
       self._run_ew_ops(address, buffer, self.image.ew_ops[:self.image.gather_after])
       synchronized_gathers(self.image.mid_gathers, True)
@@ -364,6 +372,12 @@ class RockchipDevice(Compiled):
     return HCQBuffer(mapped, size, meta=meta)
   def _sync_buffer(self, buf:HCQBuffer, flags:int):
     rk.DRM_IOCTL_RKNPU_MEM_SYNC(self.fd_ctl, flags=flags, reserved=0, obj_addr=buf.meta.obj_addr, offset=0, size=buf.meta.size)
+  def _sync_buffers(self, bufs:tuple[HCQBuffer, ...], flags:int):
+    seen:set[int] = set()
+    for buf in bufs:
+      if buf.meta.obj_addr in seen: continue
+      seen.add(buf.meta.obj_addr)
+      self._sync_buffer(buf, flags)
   def _gpu_free(self, buf:HCQBuffer):
     FileIOInterface.munmap(int(buf.base.va_addr), max(4096, (buf.base.size+4095)&-4096))
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=buf.meta.handle, reserved=0, obj_addr=buf.meta.obj_addr)
