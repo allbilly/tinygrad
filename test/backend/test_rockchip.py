@@ -329,7 +329,23 @@ for _name, _test in vars(_test_ops.TestOps).items():
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMaxUnpoolOps(unittest.TestCase):
-  """Finite FP16 MaxUnpool scatter from the upstream operator census."""
+  """FP16 MaxUnpool scatter from the upstream operator census."""
+
+  def test_max_unpool2d_nonfinite_bits(self):
+    values = np.array([math.inf, -math.inf, math.nan, 3.5], dtype=np.float16).reshape(4,1,1,1)
+    indices = np.arange(4, dtype=np.int32).reshape(4,1,1,1)
+    expected = np.zeros((4,1,2,2), dtype=np.float16)
+    expected.reshape(4,4)[np.arange(4),np.arange(4)] = values.reshape(4)
+    got = Tensor(values, device="ROCKCHIP").max_unpool2d(Tensor(indices, device="ROCKCHIP"), 2).realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
+
+  def test_max_unpool2d_inf(self):
+    data = np.array([[[[math.inf, -math.inf, math.nan], [1.0, 2.0, 3.0]]]], dtype=np.float16)
+    expected = torch.nn.functional.max_unpool2d(
+      *torch.nn.functional.max_pool2d(torch.from_numpy(data), kernel_size=(2,2), return_indices=True), kernel_size=(2,2)).numpy()
+    got = Tensor.max_unpool2d(
+      *Tensor.max_pool2d(Tensor(data, device="ROCKCHIP"), kernel_size=(2,2), return_indices=True), kernel_size=(2,2)).realize().numpy()
+    np.testing.assert_array_equal(got.view(np.uint16), expected.view(np.uint16))
 
   def test_max_unpool2d_wide_indices(self):
     values = np.arange(1, 15, dtype=np.float16).reshape(7,1,1,2)

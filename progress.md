@@ -2638,3 +2638,44 @@ provide the shared DPU emission and aligned-matrix packing layers.
 
 This is a renderer-only structural refactor. It adds no tensor-value access, numeric host operation, runtime behavior,
 new tolerance, LUT, CMAC, or fallback path; the generated gather and DPU EW algorithms are unchanged.
+
+---
+
+## 2026-08-09 — representation-safe non-finite MaxUnpool
+
+The remaining FP16 `test_max_unpool2d_inf` pipeline now preserves its exact non-finite output representation. Its fused
+schedule stores an internal negative pool-selection weight and applies the spatial-size correction in the MaxUnpool
+consumer. The unrolled pool-index matcher now recognizes and proves that form. Because FP16 subtraction and
+multiplication are not representation-safe for infinities (`inf-inf` and `inf*0` produce NaN), this narrow path compares
+the two raw FP16 bytes of every candidate with the pooled extremum instead.
+
+Generic raw gathers place each byte in the low byte of a zeroed INT32 lane without interpreting it. Native DPU
+INT32-input conversion turns the 0..255 byte values into exactly representable FP16 numbers; DPU byte equality selects
+the negative first-tie weight. The single-candidate MaxUnpool consumer uses the same mechanism for its pooled FP16
+value, multiplies each finite byte value by the DPU-computed equality mask, converts the selected bytes to INT32 on DPU,
+and writes their low bytes into the FP16 output representation. Thus selected `+inf`, `-inf`, and NaN bits survive while
+every unselected lane becomes exact positive zero. A direct four-plane regression covers `+inf`, `-inf`, NaN, and 3.5;
+the upstream pool-to-unpool case verifies the fused internal-index correction.
+
+Historical commit `76c31806e` supplied the original raw-representation selection proof, but its optional NumPy scatter
+and operation-specific host packing runtime were not ported. The current implementation uses only the existing generic
+RKImage gather phases and DPU EW conversions. `~/npu` documents MaxUnpool as a CPU operator and `~/rk3588` contains no
+simpler verified native dynamic-index contract.
+
+Wall-time profiling of a fresh standalone pipeline measured 1.55 seconds of graph construction, 0.012 seconds of
+renderer work, and 1.52 seconds for realization plus copyout. The three NPU programs consumed 1.28 seconds, issuing
+29 ioctls / 34 tasks; ten INT32 conversions consumed 1.06 seconds and twelve required resets consumed 1.27 seconds
+(these timings overlap the program total). A first cold pytest cache miss reached 28.30 seconds, while the cached rerun
+reported a 2.12-second test body and 4.64 seconds total. The hardware work itself is therefore well below 30 seconds.
+
+- Direct exact-bit non-finite MaxUnpool and upstream infinity pipeline: pass.
+- Complete MaxPool + MaxUnpool regression: **19 passed, 1 skipped, 33 subtests passed in 45.88 s**, sequentially.
+- Complete Rockchip census with `ROCKCHIP_EW_REDUCE=twoproduct`: **368 passed, 10 skipped, 180 subtests passed in
+  482.49 s**, sequentially.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the complete census.
+- Repository-wide Ruff and Tinygrad mypy: pass. `sz.py`: renderer/runtime **2,416/281 executable lines**.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Host code only constructs static gather maps and moves raw
+bytes without comparing, converting, branching on, or selecting a tensor value. All runtime-dependent equality,
+first-tie choice, byte masking, and numeric conversion execute on DPU EW. There is no host scatter, host ArgMax, LUT,
+CMAC, CNA, PPU fallback, tolerance relaxation, or external floating-point input wider than FP16.
