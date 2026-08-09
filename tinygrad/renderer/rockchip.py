@@ -2772,11 +2772,9 @@ def _lower_multi_fp16_fancy_index(output:RKOutput) -> RKImage|None:
   if any(param is None or param.dtype.scalar() is not dtypes.int or param.src[0].op is not Ops.CONST for param in params): return None
   concrete = tuple(param for param in params if param is not None)
   options = tuple(tuple(range(extent)) for _,_,extent in normalized)
-  vector_lanes = ((count*2+63)&-64)//2
   combinations:tuple[tuple[int, ...], ...] = ((),)
   for axis in options:
     combinations = tuple(prefix+(value,) for prefix in combinations for value in axis)
-    if len(combinations)*vector_lanes > _MAX_EW_ELEMS_FP16: return None
   try:
     offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], None, count) for load in loads)
     plans = tuple(_gather_plan(data_param.arg.slot, 0, out_index, data_index.substitute(mapping), gate.substitute(mapping), count)

@@ -3244,3 +3244,29 @@ structure, static coordinates, and bounds. Runtime gathers move opaque bytes acc
 byte equality, validity masks, weighted coordinates, selection, and reductions execute on DPU EW. There is no typed
 host index/fancy-gather evaluator, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than
 FP16.
+
+---
+
+## 2026-08-09 — no-collapse dynamic FP16 fancy indexing
+
+All five forward cases from upstream `test_slice_fancy_indexing_no_dim_collapse` are now separate bounded Rockchip
+methods. They cover five broadcast dynamic axes, static outer dimensions around three dynamic axes, trailing and
+spanning ellipses, and a dynamic middle axis surrounded by static slices.
+
+Four forms already lowered through the native-INT16 fancy-index image. The static-outer form exposed one obsolete
+guard in `_lower_multi_fp16_fancy_index`: it rejected a complete candidate matrix over 64K lanes even though the
+shared image builder now partitions candidates into independently bounded blocks. Removing that pre-blocking guard
+lets the existing dynamic blocker calculate each safe matrix; runtime command and descriptor sizes remain derived
+from the emitted bodies rather than a hardcoded candidate count.
+
+- Five no-collapse cases: **5/5 passed individually**, from **6.15 s** to **17.87 s** pytest time.
+- Largest direct profile: **9.206 s** total, including **9.198 s** realization and 2.6 ms copyout;
+  **3 submit ioctls / 7,933 DPU tasks / 0 soft resets**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused run.
+- Repository-wide Tinygrad mypy and Ruff plus `git diff --check`: pass. `sz.py`: renderer/runtime
+  **3,680/307 executable lines**, total **29,042**; this milestone removes two renderer lines while adding coverage.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. The removed guard changes only static plan acceptance;
+dynamic INT32 byte equality, negative normalization, raw FP16 selection, and reduction continue to execute through
+native INT16 DPU EW. Runtime gathers only move opaque bytes according to compile-time address plans. There is no host
+fancy indexing, LUT, CMAC, tolerance change, or floating input wider than FP16.
