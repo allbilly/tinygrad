@@ -484,6 +484,18 @@ def _local_add_loop(uops:list[UOp], out_index:UOp) -> tuple[UOp, int, UOp, list[
   term = next((x for x in updates[0].src if x is not acc), None)
   return None if acc is None or term is None else (reduce_range, groups, term, local_stores)
 
+def _unrolled_local_add(uops:list[UOp], out_index:UOp, initial:tuple[DType, int]|None=None) -> UOp|None:
+  """Expand one statically bounded local ADD loop after optionally validating its identity."""
+  if (loop:=_local_add_loop(uops, out_index)) is None: return None
+  reduce_range, groups, term, local_stores = loop
+  initializers = [local for local in local_stores if reduce_range not in local.toposort()]
+  if initial is not None and (len(initializers) != 1 or initializers[0].src[1].op is not Ops.CONST or
+     initializers[0].src[1].dtype.scalar() is not initial[0] or int(initializers[0].src[1].arg) != initial[1]): return None
+  terms = [term.substitute({reduce_range:reduce_range.const_like(lane)}) for lane in range(groups)]
+  value = terms[0]
+  for term in terms[1:]: value = value.alu(Ops.ADD, term)
+  return value
+
 def _loop_reduction_match(uops:list[UOp]) -> RKLoopReduction|None:
   """Parse the output, accumulator update, shape, and optional final scale of a loop reduction."""
   if (output:=_output_store(uops, (dtypes.half, dtypes.float), allow_local=True)) is None: return None
@@ -1603,6 +1615,35 @@ def _lower_unrolled_integer_prefix_count(output:RKOutput, dtype:DType=dtypes.int
   ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_param.arg.slot), reduced, reduced, count, _EW_CFG[Ops.MAX],
                     int16_input=True, int32_output=True))
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops))
+
+def _lower_unrolled_integer_predicate_total(output:RKOutput, dtype:DType=dtypes.int16) -> RKImage|None:
+  """Count a complete external integer tensor through exact native nonzero masks."""
+  _, out_param, count, out_index, root = output
+  terms = _flatten_binary(root, Ops.ADD)
+  loads:list[UOp] = []
+  for term in terms:
+    if (term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or
+        (load:=_integer_nonzero_load(term.src[0], dtype)) is None or
+        [u for u in term.toposort() if u.op is Ops.LOAD] != [load] or
+        len(load.src) > 1 and (load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0)): return None
+    loads.append(load)
+  params = tuple(_root_param(load.src[0]) for load in loads)
+  if (not loads or any(param is None or param.dtype.scalar() is not dtype or param.src[0].op is not Ops.CONST for param in params) or
+      len({param.arg.slot for param in params if param is not None}) != 1): return None
+  source = params[0]; assert source is not None
+  source_count = int(source.src[0].arg)
+  if not 1 <= source_count <= 32767: return None
+  try: offsets = tuple(_gather_offsets(out_index, load.src[0].src[1], load.src[2] if len(load.src) == 3 else None, count)
+                       for load in loads)
+  except RuntimeError: return None
+  if sorted(offset for row in offsets for offset in row if offset >= 0) != list(range(source_count)): return None
+  return _integer_predicate_reduction_image(out_param.arg.slot, count, source.arg.slot, offsets, Ops.ADD, dtype.itemsize)
+
+def _lower_loop_integer_predicate_total(uops:list[UOp], output:RKOutput, dtype:DType=dtypes.int16) -> RKImage|None:
+  """Normalize a local-register integer predicate sum into the verified unrolled emitter."""
+  store, out_param, count, out_index, _ = output
+  if (value:=_unrolled_local_add(uops, out_index, (dtypes.int, 0))) is None: return None
+  return _lower_unrolled_integer_predicate_total((store, out_param, count, out_index, value), dtype)
 
 def _lower_unrolled_int_occurrence_count(output:RKOutput) -> RKImage|None:
   """Count each requested coordinate in a bounded generated INT32 prefix vector."""
@@ -3292,21 +3333,13 @@ def _lower_unrolled_fp16_predicate_total(output:RKOutput) -> RKImage|None:
 def _lower_loop_fp16_predicate_total(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Normalize a scalar local-register predicate reduction into the verified unrolled total emitter."""
   store, out_param, count, out_index, _ = output
-  if count != 1 or (loop:=_local_add_loop(uops, out_index)) is None: return None
-  reduce_range, groups, term, _ = loop
-  terms = [term.substitute({reduce_range:reduce_range.const_like(lane)}) for lane in range(groups)]
-  value = terms[0]
-  for term in terms[1:]: value = value.alu(Ops.ADD, term)
+  if count != 1 or (value:=_unrolled_local_add(uops, out_index)) is None: return None
   return _lower_unrolled_fp16_predicate_total((store, out_param, count, out_index, value))
 
 def _lower_loop_fp16_prefix_count(uops:list[UOp], output:RKOutput) -> RKImage|None:
   """Normalize a local-register FP16 predicate scan into the blocked prefix emitter."""
   store, out_param, count, out_index, _ = output
-  if not 1 <= count <= _FP16_EXACT_INTEGER or (loop:=_local_add_loop(uops, out_index)) is None: return None
-  reduce_range, groups, term, _ = loop
-  terms = [term.substitute({reduce_range:reduce_range.const_like(lane)}) for lane in range(groups)]
-  value = terms[0]
-  for term in terms[1:]: value = value.alu(Ops.ADD, term)
+  if not 1 <= count <= _FP16_EXACT_INTEGER or (value:=_unrolled_local_add(uops, out_index)) is None: return None
   return _lower_unrolled_fp16_prefix_count((store, out_param, count, out_index, value))
 
 RKFixedNonzero = tuple[UOp, int, UOp, tuple[int, ...], tuple[tuple[int, ...], ...], int]
@@ -4270,9 +4303,9 @@ def _stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, offse
   return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(matrix_lanes)),), gathers=gathers,
                  ew_ops=tuple(ops), post_gathers=post)
 
-def _integer_bool_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tuple[tuple[int, ...], ...],
-                                  op:Ops, itemsize:int) -> RKImage|None:
-  """Reduce exact integer nonzero masks with native INT16 MAX/MUL."""
+def _integer_predicate_reduction_image(out_slot:int, count:int, source_slot:int, offsets:tuple[tuple[int, ...], ...],
+                                       op:Ops, itemsize:int) -> RKImage|None:
+  """Reduce exact integer nonzero masks with native INT16 ADD/MAX/MUL."""
   vector_bytes, vector_lanes, matrix_lanes = _stripe_layout(count, len(offsets))
   if matrix_lanes > _MAX_EW_ELEMS_FP16: return None
   scratch_sizes:list[int] = []
@@ -4282,9 +4315,14 @@ def _integer_bool_reduction_image(out_slot:int, count:int, source_slot:int, offs
   if (mask:=_native_integer_nonzero_mask(ops, gathers, scratch, source_slot, offsets,
                                          count, vector_lanes, itemsize)) is None: return None
   reduced = _reduce_rows(ops, [replace(mask, addend=mask.addend+row*vector_bytes) for row in range(len(offsets))],
-                         count, _EW_CFG[Ops.MAX if op is Ops.OR else Ops.MUL], int16=True)
+                         count, _EW_CFG[{Ops.OR:Ops.MAX, Ops.AND:Ops.MUL}.get(op, op)], int16=True)
+  if op is Ops.ADD:
+    ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), reduced, reduced, count, _EW_CFG[Ops.MAX],
+                      int16_input=True, int32_output=True))
+    post:tuple[RKGather, ...] = ()
+  else: post = (_int16_low_bytes(reduced, out_slot, count),)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers), ew_ops=tuple(ops),
-                 post_gathers=(_int16_low_bytes(reduced, out_slot, count),))
+                 post_gathers=post)
 
 def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, groups:int, op:Ops) -> RKImage:
   """Reduce contiguous opaque bool blocks after widening their bytes into native INT16 lanes."""
@@ -4371,7 +4409,7 @@ def _lower_loop_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
   except RuntimeError: return None
   source_count = int(source.src[0].arg)
   if source_count != rows*groups or sorted(offset for row in offsets for offset in row) != list(range(source_count)): return None
-  return (_integer_bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op, 2)
+  return (_integer_predicate_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op, 2)
           if load.dtype.scalar() is dtypes.int16 else _bool_reduction_image(out_param.arg.slot, rows, source.arg.slot, offsets, update.op))
 
 def _lower_grouped_bool_reduction(uops:list[UOp], output:RKOutput) -> RKImage|None:
@@ -4874,6 +4912,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (linear_index:=_lower_normalized_linear_index(int_output)) is not None: return linear_index
     if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
     if (int16_sum:=_lower_unrolled_int16_sum(int_output)) is not None: return int16_sum
+    if (int16_total:=_lower_unrolled_integer_predicate_total(int_output)) is not None: return int16_total
     if (bounded_lookup:=_lower_bounded_int32_lookup(int_output)) is not None: return bounded_lookup
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (int16_prefix:=_lower_unrolled_integer_prefix_count(int_output, dtypes.int16)) is not None: return int16_prefix
@@ -4892,6 +4931,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (sort_index:=_lower_sort_index_selection(int_output)) is not None: return sort_index
   if int_loop_output is not None:
     if (loop_int16_sum:=_lower_int16_sum_loop(uops, int_loop_output)) is not None: return loop_int16_sum
+    if (loop_int16_total:=_lower_loop_integer_predicate_total(uops, int_loop_output)) is not None: return loop_int16_total
     if (loop_predicate_total:=_lower_loop_fp16_predicate_total(uops, int_loop_output)) is not None: return loop_predicate_total
     if (loop_fp16_prefix:=_lower_loop_fp16_prefix_count(uops, int_loop_output)) is not None: return loop_fp16_prefix
     if (loop_occurrence:=_lower_loop_int32_occurrence_count(uops, int_loop_output)) is not None: return loop_occurrence

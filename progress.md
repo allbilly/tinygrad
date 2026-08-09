@@ -4340,3 +4340,34 @@ The CPU-cheat audit found no runtime/core change or tensor-value inspection. The
 offsets and topology. Runtime gathers opaque integer bytes; nonzero-mask construction, MAX/MUL reduction, and result
 writeback execute on DPU. The post-gather is a raw low-byte layout copy, not host boolean computation. NumPy is used
 only as the test oracle. There is no host reduction, LUT, CMAC, tolerance relaxation, or wider floating-point input.
+
+---
+
+## 2026-08-09 — exact INT16 nonzero counts and test-census split
+
+Signed-INT16 `(x != 0).sum(...)` now produces exact INT32 counts for unrolled, register-loop, and matrix-axis graphs.
+The existing byte-exact integer predicate mask feeds native INT16 ADD, followed by the DPU INT16-to-INT32 output
+converter. The predicate emitter is shared with INT16 `any`/`all`; only the final reduction operation and output layout
+differ. A shared local-ADD unroller also removes duplicate loop normalization from the existing FP16 count paths.
+
+No checked Tinygrad branch, `~/npu`, or `~/rk3588` contains an integrated integer nonzero-count reduction.
+`~/rk3588/examples/elementwise_int.py` proves the required native INT16 ADD-to-INT32 primitive on this hardware.
+
+- Exact 7-element unrolled, 257-element loop, **2x257 last-axis**, and **257x2 first-axis** counts pass independently.
+  Inputs include `-32768`, proving that both opaque source bytes participate in the nonzero test.
+- The unrolled case uses **10 DPU tasks / one ioctl**; each 257-lane reduction uses **260 tasks / one ioctl**. Final
+  focused pytest methods pass in **2.89 s**, **2.77 s**, and **2.92 s**.
+- Per the census-layout rule, `test_rockchip.py` now contains only upstream `TestOps` method names: **327 collected**.
+  The **181 Rockchip-only** hardware regressions live in `test_rockchip2.py`; combined collection remains **508**.
+- After the split, the backend-only INT16 class passes **38/38 in 17.34 s** and its four upstream-derived siblings pass
+  **4/4 in 2.94 s**. No individual case approaches the 30-second policy.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after final physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,041/331 executable lines**, total **30,427**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime/core change and no tensor-value inspection. Compilation proves only static source
+coverage, masks, and output topology. Runtime gathers opaque INT16 bytes; predicate construction, ADD reduction, and
+INT32 writeback all execute on DPU. NumPy appears only in test oracles. There is no host result calculation, LUT, CMAC,
+tolerance relaxation, or wider floating-point input. The unchanged upstream `test_ops.py` has 427 collected nodes and
+has not been run as one direct ROCKCHIP census; the 100 nodes outside the 327-case selected census are unclassified,
+not measured failures.
