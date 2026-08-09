@@ -230,6 +230,9 @@ def _scratch_bytes(count:int) -> int: return max(count * 2, 64)
 def _int32_tiles_bytes(count:int) -> int: return cdiv(count, 4) * 64
 def _fp16_bits(value:float|int) -> int: return struct.unpack("<H", struct.pack("<e", float(value)))[0]
 def _int16_bits(value:int|float|bool) -> int: return int(value) & 0xffff
+def _int16_low_bytes(source:RKArg, out_slot:int, count:int, stride:int=2) -> RKGather:
+  return RKGather(source.index, out_slot, count, base=source.addend, axes=((1, count, stride),),
+                  dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1)
 
 def _emit_stateful_stage(dst:RKArg, lhs:RKArg, rhs:RKArg, count:int, ew_cfg:int, compare:bool=False,
                          int32_output:bool=False, int32_input:bool=False,
@@ -2834,8 +2837,7 @@ def _lower_int32_bounds_mask(output:RKOutput) -> RKImage|None:
   for valid in valid_axes[1:]:
     dst = scratch(count*2); ops.append(RKEWOp(arg(dst), result, valid, count, _EW_CFG[Ops.MUL],
       int16_input=True, int16_output=True)); result = arg(dst)
-  post = (RKGather(result.index, out_param.arg.slot, count, offsets=tuple(result.addend+i*2 for i in range(count)),
-                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1),)
+  post = (_int16_low_bytes(result, out_param.arg.slot, count),)
   return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes),
                  gathers=tuple(gathers), ew_ops=tuple(ops), post_gathers=post)
 
@@ -3967,8 +3969,7 @@ def _stored_bool_reduction_image(out_slot:int, count:int, source_slot:int, offse
   ops:list[RKEWOp] = []
   selected = _reduce_rows(ops, [RKArg(RKBufferKind.SCRATCH, 0, i*vector_bytes) for i in range(len(offsets))], count,
                           _EW_CFG[Ops.MAX if op is Ops.OR else Ops.MUL], int16=True)
-  post = (RKGather(selected.index, out_slot, count, offsets=tuple(selected.addend+i*2 for i in range(count)),
-                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1),)
+  post = (_int16_low_bytes(selected, out_slot, count),)
   return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(matrix_lanes)),), gathers=gathers,
                  ew_ops=tuple(ops), post_gathers=post)
 
@@ -3977,8 +3978,7 @@ def _contiguous_stored_bool_reduction_image(out_slot:int, count:int, source_slot
   source_count = count*groups
   ops = _block_bool_reduction_ops(RKArg(RKBufferKind.SCRATCH, 0), count, groups, op, int16=True)
   gathers = (RKGather(source_slot, 0, source_count, dst_stride=2, itemsize=1),)
-  post = (RKGather(0, out_slot, count, offsets=tuple(lane*groups*2 for lane in range(count)),
-                   dst_kind=RKBufferKind.ARG, src_kind=RKBufferKind.SCRATCH, itemsize=1),)
+  post = (_int16_low_bytes(RKArg(RKBufferKind.SCRATCH, 0), out_slot, count, groups*2),)
   return RKImage(RKTarget.RK3588, (RKScratch(_scratch_bytes(source_count)),), gathers=gathers,
                  ew_ops=tuple(ops), post_gathers=post)
 
@@ -4324,17 +4324,34 @@ def _fold_native_int16(x:UOp) -> UOp|None:
 
 _pm_native_int16 = PatternMatcher([(UPat(GroupOp.ALU, dtype=dtypes.int16, name="x"), _fold_native_int16)])
 
+def _native_int16_comparison(root:UOp) -> UOp|None:
+  """Express signed INT16 comparisons as saturating integer ALU masks."""
+  if root.op in (Ops.CMPLT, Ops.CMPNE) and all(src.dtype.scalar() is dtypes.int16 for src in root.src):
+    lhs, rhs = root.src
+    delta = rhs.alu(Ops.SUB, lhs) if root.op is Ops.CMPLT else lhs.alu(Ops.SUB, rhs)
+    magnitude = delta.alu(Ops.MAX, UOp.const(0, dtypes.int16)) if root.op is Ops.CMPLT else \
+                UOp(Ops.MAX, dtypes.int16, src=(delta, delta), arg=_NATIVE_ABS)
+    return UOp(Ops.MAX, dtypes.int16, src=(magnitude, UOp.const(1, dtypes.int16)), arg=_NATIVE_MIN)
+  if root.op is Ops.CMPNE:
+    for value, marker in (root.src, root.src[::-1]):
+      if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg):
+        if (mask:=_native_int16_comparison(value)) is not None: return UOp.const(1, dtypes.int16).alu(Ops.SUB, mask)
+  return None
+
 def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
-  """Lower bounded signed INT16 arithmetic directly to the DPU integer EW pipeline."""
-  int32_output = False
+  """Lower signed INT16 arithmetic and exact comparison masks to the DPU integer EW pipeline."""
+  int32_output = bool_output = False
   if (output:=_output_store(uops, dtypes.int16)) is None:
     output = _output_store(uops, dtypes.int)
-    if output is None or output[4].op is not Ops.CAST or output[4].src[0].dtype.scalar() is not dtypes.int16: return None
-    output, int32_output = (*output[:4], output[4].src[0]), True
+    if output is not None and output[4].op is Ops.CAST and output[4].src[0].dtype.scalar() is dtypes.int16:
+      output, int32_output = (*output[:4], output[4].src[0]), True
+    else:
+      output = _output_store(uops, dtypes.bool)
+      if output is None or (comparison:=_native_int16_comparison(output[4])) is None: return None
+      output, bool_output = (*output[:4], comparison), True
   _, out_param, count, out_index, value = output
   if count <= 0: return RKImage(RKTarget.RK3588)
   value = graph_rewrite(value, _pm_native_int16, name="rockchip native int16")
-  out = RKArg(RKBufferKind.ARG, out_param.arg.slot)
   supported = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.MAX, Ops.NEG}
   static_cache:dict[UOp, bool] = {}
   leaf_cache:dict[UOp, RKInt16Leaf] = {}
@@ -4344,7 +4361,7 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
     if u.op is Ops.CONST and u.dtype.scalar() is dtypes.int16: ret = int(u.arg)
     elif u.dtype.scalar() is dtypes.int16 and _is_static_expr(u, static_cache): ret = RKStatic(u)
     elif u.op is Ops.LOAD and u.dtype.scalar() is dtypes.int16 and u.src[0].op is Ops.INDEX and \
-         (param:=_root_param(u.src[0])) is not None and param.arg.slot != out.index and param.src[0].op is Ops.CONST:
+         (param:=_root_param(u.src[0])) is not None and param.arg.slot != out_param.arg.slot and param.src[0].op is Ops.CONST:
       index, gate = u.src[0].src[1], u.src[2] if len(u.src) > 2 else None
       fill = u.src[1] if len(u.src) > 1 else None
       if fill is None or fill.op is Ops.CONST:
@@ -4378,6 +4395,8 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
         bits = struct.pack("<H", _int16_bits(parsed))
         if bits not in constants: constants[bits] = len(constants)
   scratch_count = len(constants)
+  out = RKArg(RKBufferKind.SCRATCH, scratch_count) if bool_output else RKArg(RKBufferKind.ARG, out_param.arg.slot)
+  if bool_output: scratch_count += 1
   def operand(u:UOp) -> RKArg:
     nonlocal scratch_count
     if u in values: return values[u]
@@ -4428,8 +4447,9 @@ def _lower_native_int16_ew(uops:list[UOp]) -> RKImage|None:
   if constants:
     by_slot = {slot:bits for bits,slot in constants.items()}
     constant_data = b"".join(by_slot.get(i, b"\0\0") for i in range(max(by_slot)+1))
+  post = (_int16_low_bytes(out, out_param.arg.slot, count),) if bool_output else ()
   return RKImage(RKTarget.RK3588, tuple(RKScratch(_scratch_bytes(count)) for _ in range(scratch_count)), constant_data,
-                 gathers=tuple(gathers), ew_ops=tuple(ew_ops))
+                 gathers=tuple(gathers), ew_ops=tuple(ew_ops), post_gathers=post)
 
 def lower_ew(uops:list[UOp]) -> RKImage:
   if (int16_ew:=_lower_native_int16_ew(uops)) is not None: return int16_ew

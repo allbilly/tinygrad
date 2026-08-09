@@ -3677,3 +3677,39 @@ The CPU-cheat audit found no Tinygrad-core change or runtime numeric conversion.
 static FP16 addresses and preparing raw aligned lane movement; runtime gathers copy opaque `uint16` values. Widening and
 FP32 writeback execute on DPU EW. There is no NumPy cast, host tensor inspection, LUT, CMAC, tolerance change, or FP32
 input.
+
+---
+
+## 2026-08-09 — exact signed-INT16 comparisons on DPU
+
+All six signed-INT16 comparisons now lower through the public native integer EW path: `<`, `>`, `<=`, `>=`, `==`, and
+`!=`. RK3588 has no separately proven INT16 comparison opcode, so the implementation composes the operations established
+by `~/rk3588/examples/elementwise_int.py`. Saturating `rhs-lhs` preserves the sign needed for ordered comparison across
+the complete INT16 range; MAX with zero followed by MIN with one produces the strict-less mask. Equality uses saturated
+SUB, ABS, and MIN-one, so every nonzero difference—including opposite endpoints—maps to one. Tinygrad's boolean
+inversions are recovered as native `1-mask` SUB.
+
+Historical exact-INT32 comparison commit `4e2931c2c` was inspected for its sign-safe mask composition, but its four
+FP16 byte-plane ABI was not ported: direct INT16 inputs already have the correct signed representation. Boolean output
+uses one shared affine low-byte gather also reused by the stored-boolean reduction paths. This is representation movement
+after DPU computation, not host predicate evaluation.
+
+- Full-range tensor/tensor ordering and equality, scalar operands in both directions, and a `(2,4)`/`(4,)` broadcast all
+  pass. Each realization uses **one ioctl**. The three focused methods pass in **2.95 s**.
+- A **131,072-element** comparison passes in one ioctl: **1.5 ms** tensor creation + **163.8 ms** realization +
+  **2.6 ms** copyout = **167.8 ms** total. The complete native INT16 class passes **11/11 in 3.22 s**.
+- Native INT16 plus the existing stored-boolean reduction group passes **17 tests in 12.76 s** before the large case was
+  added; the affine low-byte cleanup therefore preserves both consumers.
+- A serial full-census attempt reached **193 passed, 7 skipped, and 100 subtests** before one existing multidimensional
+  scatter subcase hit a transient six-second driver timeout. Vendor health immediately passed **60/60**, and the exact
+  scatter method then passed all three subtests in **7.26 s**. The parent milestone's complete census remains
+  **452 passed, 9 skipped, 187 subtests**; no new matcher can accept that FP16-output scatter graph.
+- Final vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed**. Repository-wide Tinygrad mypy (**216 files**),
+  Ruff, and `git diff --check`: pass. Rockchip collection: **465 tests**.
+- `sz.py`: renderer/runtime **4,644/327 executable lines**, total **30,026**. Sharing the affine INT16-low-byte transport
+  reduced the initial comparison implementation by one executable line while removing several materialized offset tuples.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only recognizes comparison structure, static
+broadcast addresses, and constants. Every input-dependent SUB, ABS, MAX, MIN, inversion, and boolean mask is computed by
+DPU INT16 EW; runtime merely copies each NPU-produced low byte into the public bool buffer. There is no NumPy predicate,
+host tensor inspection, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.

@@ -868,13 +868,21 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInt16EWOps(unittest.TestCase):
-  """Bounded signed INT16 arithmetic on the native DPU integer EW pipeline."""
+  """Bounded signed INT16 arithmetic and exact comparisons on the native DPU integer EW pipeline."""
 
   def _check(self, expected, op, *values, output_dtype=np.int16):
     before = Device["ROCKCHIP"].submit_count
     got = op(*(Tensor(np.asarray(value, dtype=np.int16)) for value in values)).realize().numpy()
     self.assertEqual(got.dtype, output_dtype)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+
+  def _check_bool(self, op, *values):
+    arrays = tuple(np.asarray(value, dtype=np.int16) for value in values)
+    before = Device["ROCKCHIP"].submit_count
+    got = op(*(Tensor(value) for value in arrays)).realize().numpy()
+    self.assertEqual(got.dtype, np.bool_)
+    np.testing.assert_array_equal(got, op(*arrays))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
   def test_add_sub(self):
@@ -912,6 +920,26 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self._check([-29000,-1230,-5,-2,1,3,1170,31000], lambda x,y:(x+y).cast(dtypes.int32), a, b,
                 output_dtype=np.int32)
     self._check(a, lambda x:x.cast(dtypes.int32), a, output_dtype=np.int32)
+
+  def test_compare_ordering(self):
+    a = [-32768,-32768,-30000,-1,0,1,30000,32767]
+    b = [32767,-32768,30000,0,0,-1,-30000,-32768]
+    for op in (lambda x,y:x<y, lambda x,y:x>y, lambda x,y:x<=y, lambda x,y:x>=y): self._check_bool(op, a, b)
+
+  def test_compare_equality(self):
+    a = [-32768,-32768,-30000,-1,0,1,30000,32767]
+    b = [32767,-32768,30000,0,0,-1,-30000,-32768]
+    for op in (lambda x,y:x==y, lambda x,y:x!=y): self._check_bool(op, a, b)
+
+  def test_compare_broadcast_scalar(self):
+    a = [[-32768,-1,0,32767], [32767,2,-3,-32768]]
+    self._check_bool(lambda x,y:x>=y, a, [-32768,0,0,32767])
+    self._check_bool(lambda x,y:x<y, a, 1)
+    self._check_bool(lambda x,y:x<y, 1, a)
+
+  def test_compare_large(self):
+    a = np.arange(131072, dtype=np.uint16).view(np.int16)
+    self._check_bool(lambda x,y:x<y, a, np.roll(a, 1))
 
   def test_int32_byte_add_wrap(self):
     a = np.array([0x7fffffff, -1, -0x80000000, 0x12345678], dtype=np.int32)
