@@ -4405,3 +4405,41 @@ The direct upstream failure census remains incomplete. On this working tree, `te
 `test_pow_zero_exponent` are directly confirmed failures, `test_masked_select` is unresolved after a compile-time
 runaway, and the other **95** nodes outside the now-328-case selected census remain unclassified rather than measured
 failures.
+
+---
+
+## 2026-08-10 — exact DPU binary bitwise operations
+
+The unchanged upstream `test_and`, `test_or`, `test_xor`, and `test_int_or` now pass alongside bytewise complement.
+INT32 inputs are gathered as four opaque byte lanes. Each byte is decomposed into eight exact 0/1 INT16 lanes by
+descending threshold, clamp, scale, and subtract stages. Native MIN/MAX implement AND/OR; SUB followed by native ABS
+implements XOR. Weighted INT16 ADD reconstructs each byte, and a raw post-gather writes the exact little-endian INT32
+representation. Boolean buffer AND/OR use a one-task native mask path instead of the full decomposition.
+
+The reference audit found no hardware bitwise primitive. `~/npu/include/old/rknn_ops.md` marks BitwiseAnd/Or/Xor as
+unsupported, and `/home/orangepi/rk3588/experimental/ops_rockchip.py` explicitly fell back to CPU for these ops.
+`~/rk3588/examples/elementwise_int.py` proves the native INT16 MIN/MAX/SUB/ABS/MUL/ADD building blocks used here;
+other checked Rockchip branches only contain boolean-mask AND/OR composition. This milestone replaces the old CPU
+fallback idea with an exact bounded DPU construction.
+
+- Direct unchanged upstream methods pass independently: AND **4.74 s**, OR **3.04 s**, XOR **2.91 s**, and integer
+  all-ones OR **2.96 s**. The selected five-method bitwise class passes serially in **4.90 s**.
+- A transposed full-bit-pattern regression covering signed limits, alternating bits, and arbitrary hex patterns passes
+  in **3.13 s**. AND/OR use **92 tasks** each and XOR uses **100 tasks**, one ioctl per realization; the regression
+  asserts **284 tasks / three ioctls**.
+- The former predicate-only custom `test_and/or/xor` methods moved to `test_rockchip2.py` as explicitly local tests and
+  pass **3/3 in 8.24 s**. `test_rockchip.py` now collects **329 upstream-only cases**, `test_rockchip2.py` collects
+  **186 backend-only cases**, and combined collection is **515**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after final physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **5,147/331 executable lines**, total **30,533**. A shared typed-load matcher removes
+  duplicate INDEX/source/bounds parsing from byte addition, complement, boolean logic, and binary logic.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change and no tensor-value inspection. Compilation materializes
+only static offsets, public scalar constants, and threshold rows. All data-dependent bit extraction, bit combination,
+and reconstruction execute as native DPU INT16 tasks. NumPy appears only in test oracles. There is no host result
+calculation, CPU fallback, LUT, CMAC, tolerance relaxation, or floating-point widening.
+
+The direct upstream failure census remains incomplete. The selected census now covers 329 of 427 nodes; among the
+remaining 98, `test_sort`, `test_cast`, and `test_pow_zero_exponent` are confirmed failures, `test_masked_select` is
+unresolved after a compile-time runaway, and **94** remain unclassified.

@@ -415,9 +415,13 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipBitwiseOps(unittest.TestCase):
-  """Exact INT32 and boolean complement through the native DPU integer EW pipeline."""
+  """Exact INT32 and boolean bitwise operations through the native DPU integer EW pipeline."""
 
+  test_xor = _test_ops.TestOps.test_xor
+  test_and = _test_ops.TestOps.test_and
+  test_or = _test_ops.TestOps.test_or
   test_bitwise_not = _test_ops.TestOps.test_bitwise_not
+  test_int_or = _test_ops.TestOps.test_int_or
 
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
@@ -780,17 +784,6 @@ class TestRockchipLogicalPredicateOps(unittest.TestCase):
   def test_logical_not(self):
     _fp16_test_op(None, torch.logical_not, Tensor.logical_not,
                   vals=[[1., 2., 0., 0.5, -0.0, math.inf, -math.inf, math.nan]], forward_only=True)
-
-  def test_and(self):
-    _fp16_test_op(None, lambda x:(1 < x) & (x < 2), forward_only=True, vals=[[1.2, 1.2, 1.2, 3.2]])
-
-  def test_or(self):
-    _fp16_test_op(None, lambda x:(x < -1) | (x > 1), forward_only=True,
-                  vals=[[-math.inf, -2., -1., -0., 0., 1., 2., math.inf, math.nan]])
-
-  def test_xor(self):
-    _fp16_test_op(None, lambda x:(x < 0) ^ (x > 1), forward_only=True,
-                  vals=[[-math.inf, -2., -1., -0., 0., 1., 2., math.inf, math.nan]])
 
   test_isclose_scalar = _test_ops.TestOps.test_isclose_scalar
 

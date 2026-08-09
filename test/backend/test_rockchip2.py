@@ -540,6 +540,32 @@ class TestRockchipBitwiseOps(_base.TestRockchipBitwiseOps):
     np.testing.assert_array_equal((~Tensor(booleans).flip(1)).realize().numpy(), np.logical_not(booleans[:,::-1]))
     self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (2,2))
 
+  def test_bitwise_binary_exact_bytes(self):
+    lhs = np.array([0x00000000, 0xffffffff, 0x80000000, 0x7fffffff, 0x00ff00ff, 0xff00ff00,
+                    0x01020304, 0x10204080, 0xaaaaaaaa, 0x55555555, 0xdeadbeef, 0x12345678], dtype=np.uint32).view(np.int32).reshape(3,4)
+    rhs = np.array([0xffffffff, 0x00000000, 0x7fffffff, 0x80000000, 0xff00ff00, 0x00ff00ff,
+                    0x80706050, 0x01020408, 0x55555555, 0xaaaaaaaa, 0x0f0f0f0f, 0x87654321], dtype=np.uint32).view(np.int32).reshape(3,4)
+    before = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
+    for tinygrad_op,numpy_op in ((Tensor.bitwise_and, np.bitwise_and), (Tensor.bitwise_or, np.bitwise_or),
+                                 (Tensor.bitwise_xor, np.bitwise_xor)):
+      np.testing.assert_array_equal(tinygrad_op(Tensor(lhs).permute(1,0), Tensor(rhs).permute(1,0)).realize().numpy(),
+                                    numpy_op(lhs.T, rhs.T))
+    self.assertEqual((Device["ROCKCHIP"].submit_count-before[0], Device["ROCKCHIP"].task_count-before[1]), (3,284))
+
+@_only_local_tests
+@unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
+class TestRockchipLogicalPredicateOps(_base.TestRockchipLogicalPredicateOps):
+  def test_logical_and(self):
+    _fp16_test_op(None, lambda x:(1 < x) & (x < 2), forward_only=True, vals=[[1.2, 1.2, 1.2, 3.2]])
+
+  def test_logical_or(self):
+    _fp16_test_op(None, lambda x:(x < -1) | (x > 1), forward_only=True,
+                  vals=[[-math.inf, -2., -1., -0., 0., 1., 2., math.inf, math.nan]])
+
+  def test_logical_xor(self):
+    _fp16_test_op(None, lambda x:(x < 0) ^ (x > 1), forward_only=True,
+                  vals=[[-math.inf, -2., -1., -0., 0., 1., 2., math.inf, math.nan]])
+
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipInt16EWOps(_base.TestRockchipInt16EWOps):
