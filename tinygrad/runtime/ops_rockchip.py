@@ -175,6 +175,24 @@ class RockchipProgram(Program['RockchipDevice']):
         self.dev.reset_npu()
         bodies.clear()
         continue
+      if op.int16_input and op.int32_output:
+        if op.int16_output or op.int32_input: raise RuntimeError("conflicting INT16→INT32 EW precision")
+        if op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
+          raise RuntimeError("INT32 argument output must be terminal")
+        if bodies:
+          self._submit_pcchain(bodies)
+          bodies.clear()
+        stages = []
+        for start in range(0, op.count, 8):
+          count = min(8, op.count-start)
+          stages.append(patch_stage(emit_ew_stage(
+            RKArg(op.dst.kind, op.dst.index, op.dst.addend+start*4),
+            RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+start*2),
+            RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+start*2), count, op.ew_cfg,
+            stateful=True, int32_output=True, int16_input=True), address))
+        self._submit_pcchain(stages)
+        body_precision = 0
+        continue
       if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
         precision = 16 if op.int16_input else 32
         if bodies and body_precision != precision:

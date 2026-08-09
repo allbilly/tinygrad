@@ -492,7 +492,9 @@ class TestRockchipGatherOps(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipMaskedSelectOps(unittest.TestCase):
-  """Forward-only FP16 selection with source-derived and broadcast predicates."""
+  """Forward-only bounded FP16 and INT32 selection through DPU masks and raw-byte gathers."""
+
+  test_masked_select_size = _test_ops.TestOps.test_masked_select_size
 
   def test_dynamic_threshold(self):
     _fp16_test_op([(32,10)], lambda x:x.masked_select(x>0.5), lambda x:x.masked_select(x>0.5), forward_only=True)
@@ -848,11 +850,11 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 class TestRockchipInt16EWOps(unittest.TestCase):
   """Bounded signed INT16 arithmetic on the native DPU integer EW pipeline."""
 
-  def _check(self, expected, op, *values):
+  def _check(self, expected, op, *values, output_dtype=np.int16):
     before = Device["ROCKCHIP"].submit_count
     got = op(*(Tensor(np.asarray(value, dtype=np.int16)) for value in values)).realize().numpy()
-    self.assertEqual(got.dtype, np.int16)
-    np.testing.assert_array_equal(got, np.asarray(expected, dtype=np.int16))
+    self.assertEqual(got.dtype, output_dtype)
+    np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
   def test_add_sub(self):
@@ -883,6 +885,13 @@ class TestRockchipInt16EWOps(unittest.TestCase):
   def test_broadcast_chain(self):
     a = [[-8,-4,0,4], [8,12,16,20]]
     self._check([[-9,-9,5,17], [17,17,37,49]], lambda x,y:(x+y).maximum(-3)*2-3, a, [2,-2,4,6])
+
+  def test_int32_writeback(self):
+    a = [-30000,-1200,-7,-1,0,1,1200,30000]
+    b = [1000,-30,2,-1,1,2,-30,1000]
+    self._check([-29000,-1230,-5,-2,1,3,1170,31000], lambda x,y:(x+y).cast(dtypes.int32), a, b,
+                output_dtype=np.int32)
+    self._check(a, lambda x:x.cast(dtypes.int32), a, output_dtype=np.int32)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDotOps(unittest.TestCase):

@@ -3489,3 +3489,33 @@ constants, and statically proven gather addresses. Dynamic FP16 comparison, pred
 histogram/index normalization, equality, and raw FP16 selection execute on DPU EW. Python reads only the DPU-computed
 scalar required by Tinygrad's dynamic-output API; it does not compute a tensor value. There is no host numeric
 evaluator, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact INT32 MaskedSelect through native INT16 EW
+
+The exact upstream `test_masked_select_size` method now passes on Rockchip. This milestone builds on the public bounded
+INT16 DPU EW path from `c359841b5`, rather than adding another FP16 exact-integer encoding. Following
+`~/rk3588/examples/elementwise_int.py`, RKImage and the runtime now support native INT16 input/process followed by
+terminal INT32 writeback. Exact regressions cover both an arithmetic result and a bare INT16-to-INT32 cast; each uses
+one submit ioctl.
+
+Tinygrad's external bool prefix is widened from opaque bytes into zeroed INT16 lanes and accumulated exactly on DPU.
+The fixed selector compares each of the four bytes of arbitrary external INT32 indexes with native INT16 SUB/ABS/MIN,
+reduces the equality matrix, applies the DPU-computed bool count for pad/truncate validity, and moves the four selected
+value bytes back to the external INT32 output. Values do not need to fit INT16: only their individual unsigned bytes
+enter the integer ALU.
+
+- Exact upstream `test_masked_select_size`: **1 passed in 5.18 s**, covering output sizes 0/2/4/8, `-1` padding,
+  truncation, empty INT32 fill, and float dtype preservation.
+- All five Rockchip MaskedSelect methods pass individually in **5.18–12.74 s**; all four adjacent fixed Nonzero
+  methods pass in **2.91–7.09 s**. No case crosses the 30-second profiling threshold.
+- The native INT16 arithmetic/saturation/broadcast/writeback regression set passes, including exact direct cast.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the focused runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **452 tests**.
+- `sz.py`: renderer/runtime **4,194/325 executable lines**, total **29,574**.
+
+The CPU-cheat audit found no runtime value inspection or Tinygrad-core change. Renderer logic proves only UOp structure,
+static bounds, and gather addresses. Dynamic bool accumulation, INT32-index byte equality, selection, padding, and
+INT16-to-INT32 conversion all execute on DPU EW. Runtime only submits stages and copies opaque bytes. There is no host
+numeric evaluator, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
