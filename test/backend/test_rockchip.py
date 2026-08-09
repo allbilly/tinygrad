@@ -997,6 +997,11 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     np.testing.assert_array_equal(got, expected)
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
 
+  def test_reduce_extrema_loop(self):
+    values = np.arange(40*257, dtype=np.uint16).view(np.int16).reshape(40, 257)
+    self._check(values.max(1), lambda x:x.max(1), values, expected_tasks=256)
+    self._check(values.min(1), lambda x:x.min(1), values, expected_tasks=256)
+
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipDotOps(unittest.TestCase):
   """FP16 dot, batched dot, and matvec compositions lowered through DPU EW."""

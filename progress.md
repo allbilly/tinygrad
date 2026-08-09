@@ -3879,3 +3879,36 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only 
 emits native MIN/MUL/ADD UOps. All input-dependent activation work executes on DPU INT16 EW. NumPy is used only for the
 test oracle, never by the backend. There is no host classification or selection, unproven integer PReLU mode, LUT, CMAC,
 tolerance relaxation, or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — exact INT16 extrema loops on DPU
+
+Signed-INT16 MAX/MIN reductions now continue past Tinygrad's 256-element unroll boundary. At 257 elements Tinygrad
+switches to a local accumulator loop; the renderer recognizes the exact initialized MAX loop, including Tinygrad's
+portable bitwise-complement form for signed MIN, materializes its static source layout, and emits a balanced native
+INT16 extrema tree. The terminal DPU task writes the INT16 result directly.
+
+The shared scalar-reduction arena no longer assumes that an output row fits in 64 bytes. Its block stride is derived as
+`max(64, rows*2)`, and gather spacing, task addresses, and scratch size all use that same value. The focused 40x257 case
+therefore uses `257 * 80 = 20,560` scratch bytes instead of overlapping rows above the old implicit 32-row limit.
+
+`~/rk3588/examples/elementwise_int.py` supplies the hardware reference for signed INT16 MAX/MIN. No branch contains a
+more complete INT16 loop-reduction implementation. INT16 SUM is intentionally not claimed: Tinygrad promotes it to
+INT32, whereas the native INT16 ADD path saturates, so an INT16 reduction tree would be observably wrong on overflow.
+The existing exact byte-plane INT32 adder combines already materialized INT32 operands and is not a drop-in signed
+INT16 reduction.
+
+- Native 40x257 axis MAX and MIN pass exactly with asserted **256 DPU tasks / 1 ioctl each**; the focused method takes
+  **3.09 s** including startup.
+- The native INT16 class plus existing FP16 scalar min/max checks pass **22/22 in 4.71 s**.
+- The complete physical-NPU Rockchip suite passes serially: **465 passed, 187 subtests passed, 9 skipped in 630.97 s**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** both before and after the complete suite.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **474 tests**.
+- `sz.py`: renderer/runtime **4,738/327 executable lines**, total **30,120**. The native loop matcher plus the shared
+  stride correction add 42 renderer lines and no runtime or Tinygrad-core lines.
+
+The CPU-cheat audit found no runtime or core change. Compile time evaluates only static index expressions and constructs
+gather plans; runtime gathers only rearrange tensor bytes. Every input-dependent comparison and reduction executes in
+native DPU INT16 EW tasks. There is no host extrema calculation, NumPy tensor evaluation, LUT, CMAC, tolerance change,
+or floating input wider than FP16.
