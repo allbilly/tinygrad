@@ -870,12 +870,13 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 class TestRockchipInt16EWOps(unittest.TestCase):
   """Bounded signed INT16 arithmetic and exact comparisons on the native DPU integer EW pipeline."""
 
-  def _check(self, expected, op, *values, output_dtype=np.int16):
-    before = Device["ROCKCHIP"].submit_count
+  def _check(self, expected, op, *values, output_dtype=np.int16, expected_tasks=None):
+    before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
     got = op(*(Tensor(np.asarray(value, dtype=np.int16)) for value in values)).realize().numpy()
     self.assertEqual(got.dtype, output_dtype)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
     self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+    if expected_tasks is not None: self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_bool(self, op, *values, expected=None):
     arrays = tuple(np.asarray(value, dtype=np.int16) for value in values)
@@ -948,6 +949,17 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     b = np.asarray([2,-2,4,6], dtype=np.int16)
     condition = (a < b) & (a != 0)
     self._check(np.where(condition, a+b, a-b), lambda x,y:((x<y)&(x!=0)).where(x+y, x-y), a, b)
+
+  def test_clip(self):
+    values = np.asarray([-32768,-1201,-1200,-1,0,1,1200,1201,32767], dtype=np.int16)
+    self._check(np.clip(values, -1200, 1200), lambda x:x.clip(-1200, 1200), values, expected_tasks=2)
+    self._check(np.maximum(values, -1200), lambda x:x.clip(-1200, None), values, expected_tasks=1)
+    self._check(np.minimum(values, 1200), lambda x:x.clip(None, 1200), values, expected_tasks=1)
+    self._check(np.full_like(values, -100), lambda x:x.clip(100, -100), values, expected_tasks=2)
+
+  def test_relu(self):
+    values = np.asarray([-32768,-1,0,1,32767], dtype=np.int16)
+    self._check(np.maximum(values, 0), lambda x:x.relu(), values, expected_tasks=1)
 
   def test_compare_broadcast_scalar(self):
     a = [[-32768,-1,0,32767], [32767,2,-3,-32768]]

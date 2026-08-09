@@ -4320,6 +4320,10 @@ def _fold_native_int16(x:UOp) -> UOp|None:
   if x.op is Ops.ADD:
     for lhs,rhs in (x.src, x.src[::-1]):
       if rhs.op is Ops.NEG: return UOp(Ops.SUB, x.dtype, src=(lhs, rhs.src[0]))
+  if x.op is Ops.WHERE and x.src[0].op is Ops.CMPLT:
+    lhs, rhs = x.src[0].src
+    if x.src[1].key == lhs.key and x.src[2].key == rhs.key: return UOp(Ops.MAX, x.dtype, src=(lhs, rhs), arg=_NATIVE_MIN)
+    if x.src[1].key == rhs.key and x.src[2].key == lhs.key: return lhs.alu(Ops.MAX, rhs)
   if x.op is Ops.WHERE and (mask:=_native_int16_comparison(x.src[0])) is not None:
     selected = mask.alu(Ops.MUL, x.src[1])
     rejected = UOp.const(1, dtypes.int16).alu(Ops.SUB, mask).alu(Ops.MUL, x.src[2])

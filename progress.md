@@ -3764,3 +3764,30 @@ The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only 
 Predicates, mask inversion, masked products, addition, and branch arithmetic all execute on DPU INT16 EW; runtime only
 submits the existing stages. There is no host selection, NumPy tensor evaluation, LUT, CMAC, tolerance relaxation, or
 floating input wider than FP16.
+
+---
+
+## 2026-08-09 — native INT16 clamp and ReLU on DPU
+
+Signed-INT16 one- and two-sided clips plus ReLU now recover the canonical extrema hidden by Tinygrad's portable WHERE
+form. For `where(lhs<rhs, lhs, rhs)` the renderer emits one native MIN stage; reversing the selected operands emits one
+native MAX stage. Nested two-sided clip therefore needs exactly two DPU tasks instead of expanding each bound through a
+comparison mask, inverse, two masked products, and ADD.
+
+The scheduled UOps were inspected directly before adding the fold. Historical commit `c359841b5` supplies the native
+INT16 pipeline, `~/rk3588/examples/elementwise_int.py` proves signed INT16 MIN/MAX register behavior, and the RKNN
+operator references under `~/npu` list INT16 extrema support. The implementation is a structural renderer rewrite like
+Tinygrad's other hardware-specific canonicalizations; the generic runtime remains unchanged.
+
+- Full-range two-sided, lower-only, upper-only, and reversed-bound clips pass exactly. Task assertions prove **2, 1, 1,
+  and 2 tasks**, respectively, all in one ioctl; the focused method takes **0.19 s** after startup.
+- Full-range INT16 ReLU passes exactly as **one native MAX task / one ioctl** in **0.11 s** after startup.
+- The complete native INT16 class passes **16/16 in 3.53 s**; no case approaches the 30-second profiling threshold.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after the hardware runs.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **470 tests**.
+- `sz.py`: renderer/runtime **4,659/327 executable lines**, total **30,041**; extrema recovery adds four renderer lines
+  and no runtime lines.
+
+The CPU-cheat audit found no runtime or Tinygrad-core change. Compile time only recognizes branch identity in a static
+WHERE/CMPLT graph. Every input-dependent MIN/MAX and nested clamp executes on DPU INT16 EW. There is no host comparison,
+selection, or clipping, no NumPy tensor evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
