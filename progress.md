@@ -4660,3 +4660,36 @@ The CPU-cheat audit found no runtime or Tinygrad-core modification and no tensor
 bytes and compiler-known constants; nibble extraction, partial products, carries, overflow truncation, and output
 reconstruction all execute as native INT16 DPU stages. There is no host result calculation, CPU fallback, LUT, CMAC,
 tolerance change, FP32 input emulation, or wider floating-point input.
+
+---
+
+## 2026-08-10 — exact default FP16 isclose and reset removal
+
+Default FP16 `isclose` now bypasses subnormal tolerance arithmetic with a mathematically equivalent exact IEEE
+equality path. At `rtol<=1e-5` and `atol<=1e-8`, even adjacent FP16 subnormals are farther apart than the tolerance.
+Operands are realized in FP16 first, gathered as opaque bytes, and compared with native INT16 arithmetic. Signed zeros
+are canonicalized, NaNs are classified from exponent/mantissa bytes, and `equal_nan` is preserved. Larger tolerances
+retain the general device arithmetic path and OR exact equality into its result. The byte canonicalization emitter is
+shared with stable sort equality instead of duplicated.
+
+- Full unchanged upstream `test_isclose` passes in **17.02 s**, down from **65.35 s** after the first correctness fix.
+  The intermediate exact-UOp implementation passed in 32.52 s but still paid reset-heavy FP16 comparisons and was
+  replaced. Unchanged upstream `test_isclose_edge_cases` now passes in **3.27 s** and replaces its former packed custom
+  copy in the upstream-only census.
+- Final direct wall decomposition for all ten `test_isclose` realizations: **14.599 s wall**, **0.073 s / 10 renderer
+  calls**, **13.666 s / 10 program calls**, **0.043 s / 140 submit ioctls**, and **13.443 s / 127 resets**. The remaining
+  resets belong to the two explicit `rtol=0.01` general-tolerance graphs; every individual method is below 30 seconds.
+- The full isclose/scalar/edge/local regression plus adjacent signed-zero/infinity sort regression passes **5 tests / 2
+  subtests in 29.67 s**. The backend regression covers both signed zeros, adjacent subnormal/normal bit patterns,
+  maximum finite values, both infinities, and NaNs under both `equal_nan` modes.
+- `test_rockchip.py` collects **353 upstream-only cases** representing **330 unique upstream method names**;
+  `test_rockchip2.py` collects **194 backend-only cases**. The authoritative unselected remainder falls from 92 to
+  **91 of 421**.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing. Repository-wide Tinygrad
+  mypy (**216 files**), Ruff, and `git diff --check`: pass.
+- `sz.py`: renderer/runtime **6,302/352 executable lines**, total **31,709**.
+
+Historical `b85d3c4b0` and `31c07151d` computed isclose predicates in host elementwise layouts and remain rejected. The
+current runtime only moves raw bytes at explicit gather boundaries; FP16 expression realization, zero normalization,
+NaN classification, equality, tolerance evaluation, and bool formation all execute on DPU EW. There is no host result
+calculation, CPU fallback, LUT, CMAC, tolerance relaxation, FP32 input emulation, or wider floating-point input.

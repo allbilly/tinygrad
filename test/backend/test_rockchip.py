@@ -826,16 +826,9 @@ class TestRockchipLogicalPredicateOps(unittest.TestCase):
     _fp16_test_op(None, torch.logical_not, Tensor.logical_not,
                   vals=[[1., 2., 0., 0.5, -0.0, math.inf, -math.inf, math.nan]], forward_only=True)
 
+  test_isclose = _test_ops.TestOps.test_isclose
+  test_isclose_edge_cases = _test_ops.TestOps.test_isclose_edge_cases
   test_isclose_scalar = _test_ops.TestOps.test_isclose_scalar
-
-  def test_isclose_edge_cases(self):
-    values = (math.inf, -math.inf, math.nan, 0.0)
-    lhs, rhs = [a for a in values for _ in values], [b for _ in values for b in values]
-    before = Device["ROCKCHIP"].submit_count
-    for equal_nan in (False, True):
-      _fp16_test_op(None, lambda x,y,equal_nan=equal_nan:x.isclose(y, equal_nan=equal_nan),
-                    vals=[lhs, rhs], forward_only=True)
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 104)
 
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipIntegralRoundingOps(unittest.TestCase):

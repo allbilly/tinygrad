@@ -81,7 +81,7 @@ class RKStage: commands: tuple[int, ...]; relocs: tuple[RKReloc, ...]
 
 def encode_image(image:RKImage) -> bytes:
   gathers = image.gathers + image.mid_gathers + image.post_gathers
-  if image.mid_gathers and not 0 < image.gather_after < len(image.ew_ops): raise ValueError("invalid mid-gather split")
+  if image.mid_gathers and not 0 <= image.gather_after < len(image.ew_ops): raise ValueError("invalid mid-gather split")
   out = bytearray(_HEADER.pack(RKIMAGE_MAGIC, image.version, int(image.target), len(image.scratch), len(gathers),
                                len(image.ew_ops), len(image.constants), len(image.mid_gathers), len(image.post_gathers),
                                image.gather_after, int(image.fill is not None)))
@@ -110,7 +110,7 @@ def encode_image(image:RKImage) -> bytes:
 def decode_image(blob:bytes) -> RKImage:
   magic, version, target, nscratch, ngather, nop, nconst, mid_count, post_count, gather_after, flags = _HEADER.unpack_from(blob)
   if (magic != RKIMAGE_MAGIC or version != RKIMAGE_VERSION or mid_count+post_count > ngather or flags & ~1 or
-      bool(mid_count) != (0 < gather_after < nop)): raise ValueError("invalid RKImage header")
+      (mid_count and not 0 <= gather_after < nop) or (not mid_count and gather_after != 0)): raise ValueError("invalid RKImage header")
   off = _HEADER.size
   scratch = tuple(RKScratch(*_SCRATCH.unpack_from(blob, off+i*_SCRATCH.size)) for i in range(nscratch)); off += nscratch*_SCRATCH.size
   gathers:list[RKGather] = []
@@ -1003,6 +1003,36 @@ def _ew_native_int16_eq_mask(ops:list[RKEWOp], allocate:Callable[[], RKArg], lhs
               RKEWOp(unequal, magnitude, one, lanes, _EW_CFG_MIN, **integer),
               RKEWOp(equal, one, unequal, lanes, _EW_CFG[Ops.SUB], **integer)))
   return equal
+
+def _fp16_high_and_nan(ops:list[RKEWOp], allocate:Callable[[], RKArg], high:RKArg, low:RKArg,
+                       zero:RKArg, one:RKArg, const123:RKArg, const124:RKArg, const127:RKArg, const128:RKArg,
+                       lanes:int) -> tuple[RKArg, RKArg]:
+  """Canonicalize signed zero's FP16 high byte and classify NaNs with native INT16 byte arithmetic."""
+  integer = dict(int16_input=True, int16_output=True)
+  sign_delta, sign_positive, sign, sign_scale, magnitude = (allocate() for _ in range(5))
+  ops.extend((RKEWOp(sign_delta, high, const127, lanes, _EW_CFG[Ops.SUB], **integer),
+              RKEWOp(sign_positive, sign_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
+              RKEWOp(sign, sign_positive, one, lanes, _EW_CFG_MIN, **integer),
+              RKEWOp(sign_scale, sign, const128, lanes, _EW_CFG[Ops.MUL], **integer),
+              RKEWOp(magnitude, high, sign_scale, lanes, _EW_CFG[Ops.SUB], **integer)))
+  high_zero = _ew_native_int16_eq_mask(ops, allocate, magnitude, zero, one, lanes)
+  low_zero = _ew_native_int16_eq_mask(ops, allocate, low, zero, one, lanes)
+  zero_value, zero_sign, canonical = (allocate() for _ in range(3))
+  exponent_delta, exponent_positive, exponent_all = (allocate() for _ in range(3))
+  mantissa_delta, mantissa_positive, mantissa_high, mantissa_low, mantissa, nan = (allocate() for _ in range(6))
+  ops.extend((RKEWOp(zero_value, high_zero, low_zero, lanes, _EW_CFG[Ops.MUL], **integer),
+              RKEWOp(zero_sign, sign_scale, zero_value, lanes, _EW_CFG[Ops.MUL], **integer),
+              RKEWOp(canonical, high, zero_sign, lanes, _EW_CFG[Ops.SUB], **integer),
+              RKEWOp(exponent_delta, magnitude, const123, lanes, _EW_CFG[Ops.SUB], **integer),
+              RKEWOp(exponent_positive, exponent_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
+              RKEWOp(exponent_all, exponent_positive, one, lanes, _EW_CFG_MIN, **integer),
+              RKEWOp(mantissa_delta, magnitude, const124, lanes, _EW_CFG[Ops.SUB], **integer),
+              RKEWOp(mantissa_positive, mantissa_delta, zero, lanes, _EW_CFG[Ops.MAX], **integer),
+              RKEWOp(mantissa_high, mantissa_positive, one, lanes, _EW_CFG_MIN, **integer),
+              RKEWOp(mantissa_low, low, one, lanes, _EW_CFG_MIN, **integer),
+              RKEWOp(mantissa, mantissa_high, mantissa_low, lanes, _EW_CFG[Ops.MAX], **integer),
+              RKEWOp(nan, exponent_all, mantissa, lanes, _EW_CFG[Ops.MUL], **integer)))
+  return canonical, nan
 
 @dataclass(frozen=True)
 class RKByteEquality:
@@ -2728,36 +2758,14 @@ def _weighted_equality_image(out_slot:int, count:int, weight_rows:tuple[tuple[in
                                 dst_stride=2, dst_addend=row*vector_bytes, itemsize=1))
         gathers.append(RKGather(current_slot, currents[byte], count, offsets=tuple(offset*2+byte for offset in current_offsets),
                                 dst_stride=2, dst_addend=row*vector_bytes, itemsize=1))
-    def normalized_high_and_nan(high:RKArg, low:RKArg) -> tuple[RKArg, RKArg]:
-      sign_delta, sign_positive, sign, sign_scale, magnitude = (arg(scratch()) for _ in range(5))
-      exponent_delta, exponent_positive, exponent_all = (arg(scratch()) for _ in range(3))
-      mantissa_delta, mantissa_positive, mantissa_high, mantissa_low, mantissa, nan = (arg(scratch()) for _ in range(6))
-      ops.extend((RKEWOp(sign_delta, high, arg(scratch_127), matrix_lanes, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(sign_positive, sign_delta, arg(zero), matrix_lanes, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(sign, sign_positive, arg(one), matrix_lanes, _EW_CFG_MIN, **integer),
-                  RKEWOp(sign_scale, sign, arg(scratch_128), matrix_lanes, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(magnitude, high, sign_scale, matrix_lanes, _EW_CFG[Ops.SUB], **integer)))
-      high_zero = _ew_native_int16_eq_mask(ops, lambda:arg(scratch()), magnitude, arg(zero), arg(one), matrix_lanes)
-      low_zero = _ew_native_int16_eq_mask(ops, lambda:arg(scratch()), low, arg(zero), arg(one), matrix_lanes)
-      zero_value, zero_sign, canonical = (arg(scratch()) for _ in range(3))
-      ops.extend((RKEWOp(zero_value, high_zero, low_zero, matrix_lanes, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(zero_sign, sign_scale, zero_value, matrix_lanes, _EW_CFG[Ops.MUL], **integer),
-                  RKEWOp(canonical, high, zero_sign, matrix_lanes, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(exponent_delta, magnitude, arg(scratch_123), matrix_lanes, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(exponent_positive, exponent_delta, arg(zero), matrix_lanes, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(exponent_all, exponent_positive, arg(one), matrix_lanes, _EW_CFG_MIN, **integer),
-                  RKEWOp(mantissa_delta, magnitude, arg(scratch_124), matrix_lanes, _EW_CFG[Ops.SUB], **integer),
-                  RKEWOp(mantissa_positive, mantissa_delta, arg(zero), matrix_lanes, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(mantissa_high, mantissa_positive, arg(one), matrix_lanes, _EW_CFG_MIN, **integer),
-                  RKEWOp(mantissa_low, low, arg(one), matrix_lanes, _EW_CFG_MIN, **integer),
-                  RKEWOp(mantissa, mantissa_high, mantissa_low, matrix_lanes, _EW_CFG[Ops.MAX], **integer),
-                  RKEWOp(nan, exponent_all, mantissa, matrix_lanes, _EW_CFG[Ops.MUL], **integer)))
-      return canonical, nan
     scratch_123, scratch_124, scratch_127, scratch_128 = scratch(), scratch(), scratch(), scratch()
     for slot,value in ((scratch_123, 123), (scratch_124, 124), (scratch_127, 127), (scratch_128, 128)):
       gathers.append(RKGather(candidate_slot, slot, matrix_lanes, values=(value,)*matrix_lanes))
-    candidate_high,candidate_nan = normalized_high_and_nan(arg(candidates[1]), arg(candidates[0]))
-    current_high,current_nan = normalized_high_and_nan(arg(currents[1]), arg(currents[0]))
+    def allocation() -> RKArg: return arg(scratch())
+    candidate_high,candidate_nan = _fp16_high_and_nan(ops, allocation, arg(candidates[1]), arg(candidates[0]),
+      arg(zero), arg(one), arg(scratch_123), arg(scratch_124), arg(scratch_127), arg(scratch_128), matrix_lanes)
+    current_high,current_nan = _fp16_high_and_nan(ops, allocation, arg(currents[1]), arg(currents[0]),
+      arg(zero), arg(one), arg(scratch_123), arg(scratch_124), arg(scratch_127), arg(scratch_128), matrix_lanes)
     low_equal = _ew_native_int16_eq_mask(ops, lambda:arg(scratch()), arg(candidates[0]), arg(currents[0]), arg(one), matrix_lanes)
     high_equal = _ew_native_int16_eq_mask(ops, lambda:arg(scratch()), candidate_high, current_high, arg(one), matrix_lanes)
     either_nan, numeric, bits_equal, equal = (arg(scratch()) for _ in range(4))
@@ -5712,6 +5720,91 @@ def _typed_int_image(output:RKOutput, value:UOp, bool_output:bool=False) -> RKIm
                 stateful=True, int32_output=True, bool_output=bool_output))
   return replace(image, scratch=(*image.scratch, RKScratch(_scratch_bytes(count)), RKScratch(_int32_tiles_bytes(count))), ew_ops=ops)
 
+def _isclose_match(root:UOp) -> tuple[UOp, UOp, bool, bool]|None:
+  """Recover isclose's original operands, equal_nan mode, and its exact-equality FP16 tolerance range."""
+  nodes = root.toposort()
+  inverted = {inner.key for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 for inner,marker in (u.src, u.src[::-1])
+              if marker.op is Ops.CONST and marker.dtype.scalar() is dtypes.bool and bool(marker.arg)}
+  pairs = [u for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0].dtype.scalar() is dtypes.half and
+           u.src[1].dtype.scalar() is dtypes.half and u.src[0].key != u.src[1].key and
+           u.key in inverted and not any(x.op is Ops.CONST and math.isinf(float(x.arg)) for x in u.src)]
+  self_nan = [u for u in nodes if u.op is Ops.CMPNE and len(u.src) == 2 and u.src[0].key == u.src[1].key and
+              u.src[0].dtype.scalar() is dtypes.half]
+  self_values = tuple({u.src[0].key:u.src[0] for u in self_nan}.values())
+  operands = pairs[0].src if len(pairs) == 1 else (self_values[0], self_values[0]) if len(self_values) == 1 else ()
+  infinities = {float(u.arg) for u in nodes if u.op is Ops.CONST and u.dtype.scalar() in (dtypes.half, dtypes.float) and
+                math.isinf(float(u.arg))}
+  if root.op is not Ops.OR or len(operands) != 2 or not self_nan or infinities != {-math.inf, math.inf}: return None
+  equal_nan = any(u.op is Ops.AND and len(u.src) == 2 and all(x in self_nan for x in u.src) for u in nodes) or \
+              any(x in self_nan for x in root.src)
+  finite_constants = [abs(float(u.arg)) for u in nodes if u.op is Ops.CONST and
+                      u.dtype.scalar() in (dtypes.half, dtypes.float) and math.isfinite(float(u.arg))]
+  exact = any(math.isclose(value, 1e-5, rel_tol=0.0, abs_tol=1e-9) for value in finite_constants) and \
+          not any(1e-4 < value < .1 for value in finite_constants)
+  return operands[0], operands[1], equal_nan, exact
+
+def _lower_default_fp16_isclose(output:RKOutput) -> RKImage|None:
+  """Evaluate the default FP16 isclose range as exact IEEE equality using raw bytes and native INT16 EW."""
+  _, out_param, count, out_index, root = output
+  if not 1 <= count <= _MAX_EW_ELEMS_FP16 or (match:=_isclose_match(root)) is None or not match[3]: return None
+  lhs, rhs, equal_nan, _ = match
+  source_params = [p for u in (lhs, rhs) for x in u.toposort() if x.op is Ops.LOAD and
+                   (p:=_root_param(x.src[0])) is not None and p.dtype.scalar() is dtypes.half]
+  if not source_params: return None
+  source_slot = source_params[0].arg.slot
+  scratch_sizes:list[int] = []
+  def scratch() -> RKArg:
+    scratch_sizes.append(_scratch_bytes(count)); return RKArg(RKBufferKind.SCRATCH, len(scratch_sizes)-1)
+  gathers:list[RKGather] = []
+  pre_ops:list[RKEWOp] = []
+  values:dict[UOp, RKArg] = {}
+  def emit_value(value:UOp) -> RKArg:
+    if value in values: return values[value]
+    dst = scratch()
+    if value.op is Ops.CONST and value.dtype.scalar() is dtypes.half:
+      gathers.append(RKGather(source_slot, dst.index, count, values=(_fp16_bits(float(value.arg)),)*count))
+    elif (parsed:=_typed_load_offsets(value, dtypes.half, out_index, count, allow_fill=True)) is not None:
+      gathers.append(RKGather(parsed[0].arg.slot, dst.index, count, offsets=parsed[1]))
+    elif value.op is Ops.ADD and len(value.src) == 2:
+      left, right = emit_value(value.src[0]), emit_value(value.src[1])
+      pre_ops.append(RKEWOp(dst, left, right, count, _EW_CFG[Ops.ADD]))
+    else: raise ValueError
+    values[value] = dst
+    return dst
+  try: operands = emit_value(lhs), emit_value(rhs)
+  except ValueError: return None
+
+  raw = tuple((scratch(), scratch()) for _ in range(2))
+  mid = tuple(RKGather(value.index, raw[operand][byte].index, count,
+    offsets=tuple(lane*2+byte for lane in range(count)), dst_stride=2,
+    src_kind=RKBufferKind.SCRATCH, dst_kind=RKBufferKind.SCRATCH, itemsize=1)
+    for operand,value in enumerate(operands) for byte in range(2))
+  zero, one, const123, const124, const127, const128 = (scratch() for _ in range(6))
+  for dst,value in zip((zero, one, const123, const124, const127, const128), (0, 1, 123, 124, 127, 128)):
+    gathers.append(RKGather(source_slot, dst.index, count, values=(value,)*count))
+  integer = dict(int16_input=True, int16_output=True)
+  ops:list[RKEWOp] = []
+  def allocate() -> RKArg: return scratch()
+  lhs_high,lhs_nan = _fp16_high_and_nan(ops, allocate, raw[0][1], raw[0][0], zero, one,
+    const123, const124, const127, const128, count)
+  rhs_high,rhs_nan = _fp16_high_and_nan(ops, allocate, raw[1][1], raw[1][0], zero, one,
+    const123, const124, const127, const128, count)
+  low_equal = _ew_native_int16_eq_mask(ops, allocate, raw[0][0], raw[1][0], one, count)
+  high_equal = _ew_native_int16_eq_mask(ops, allocate, lhs_high, rhs_high, one, count)
+  either_nan, numeric, bits_equal, result = (allocate() for _ in range(4))
+  ops.extend((RKEWOp(either_nan, lhs_nan, rhs_nan, count, _EW_CFG[Ops.MAX], **integer),
+              RKEWOp(numeric, one, either_nan, count, _EW_CFG[Ops.SUB], **integer),
+              RKEWOp(bits_equal, low_equal, high_equal, count, _EW_CFG[Ops.MUL], **integer),
+              RKEWOp(result, bits_equal, numeric, count, _EW_CFG[Ops.MUL], **integer)))
+  if equal_nan:
+    both_nan, accepted = allocate(), allocate()
+    ops.extend((RKEWOp(both_nan, lhs_nan, rhs_nan, count, _EW_CFG[Ops.MUL], **integer),
+                RKEWOp(accepted, result, both_nan, count, _EW_CFG[Ops.MAX], **integer)))
+    result = accepted
+  return RKImage(RKTarget.RK3588, tuple(RKScratch(size) for size in scratch_sizes), gathers=tuple(gathers),
+                 ew_ops=(*pre_ops, *ops), mid_gathers=mid, gather_after=len(pre_ops),
+                 post_gathers=(_int16_low_bytes(result, out_param.arg.slot, count),))
+
 def _ieee_comparison_mask(root:UOp) -> UOp|None:
   """Build an IEEE-correct FP16 comparison mask without evaluating tensor values on the host."""
   one = UOp.const(1.0, dtypes.half)
@@ -5764,7 +5857,19 @@ def _ieee_comparison_mask(root:UOp) -> UOp|None:
       delta = lhs.alu(Ops.SUB, rhs)
       return UOp(Ops.MAX, dtypes.half, src=(delta, delta), arg=_NATIVE_ABS)
     return None
-  return mask(root)
+  result = mask(root)
+  if result is None: return None
+  # The FP16 tolerance product may underflow even when both realized operands are bitwise equal. Tinygrad's isclose
+  # graph always carries its original lhs!=rhs test beside two self-NaN tests and the explicit infinity constants.
+  # OR exact IEEE equality back into that graph; NaN remains unequal unless the original equal_nan branch accepts it.
+  if (isclose:=_isclose_match(root)) is not None and (unequal:=atom(Ops.CMPNE, isclose[0], isclose[1])) is not None:
+    exact = inverse(unequal)
+    if isclose[2]:
+      lhs_nan, rhs_nan = classes(isclose[0])[0], classes(isclose[1])[0]
+      exact = exact.alu(Ops.MAX, _mask_mul(lhs_nan, rhs_nan))
+    if isclose[3]: return exact
+    result = result.alu(Ops.MAX, exact)
+  return result
 
 def _fp16_nonzero_mask(root:UOp) -> UOp|None:
   """Recognize a direct FP16-to-bool cast; ABS then positivity is exact for zero, infinity, and NaN."""
@@ -6107,6 +6212,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if bool_output[4].op is Ops.CONST:
       return RKImage(RKTarget.RK3588, constants=struct.pack("<?", bool(bool_output[4].arg)),
                      fill=RKFill(RKArg(RKBufferKind.ARG, bool_output[1].arg.slot), bool_output[2], 1))
+    if (isclose:=_lower_default_fp16_isclose(bool_output)) is not None: return isclose
     if (byte_not:=_lower_bytewise_not(bool_output, dtypes.bool)) is not None: return byte_not
     if (byte_logic:=_lower_bool_byte_logic(bool_output)) is not None: return byte_logic
     if (bounds_mask:=_lower_int32_bounds_mask(bool_output)) is not None: return bounds_mask

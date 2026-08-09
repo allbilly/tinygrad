@@ -606,6 +606,15 @@ class TestRockchipIntegerProductOps(unittest.TestCase):
 @_only_local_tests
 @unittest.skipUnless(Device.DEFAULT == "ROCKCHIP", "ROCKCHIP device only")
 class TestRockchipLogicalPredicateOps(_base.TestRockchipLogicalPredicateOps):
+  def test_isclose_exact_fp16(self):
+    lhs = np.array([0x0000, 0x8000, 0x0001, 0x03ff, 0x3c00, 0x7bff, 0x7c00, 0xfc00, 0x7e01], dtype=np.uint16).view(np.float16)
+    rhs = np.array([0x8000, 0x0000, 0x0000, 0x03ff, 0x3c01, 0x7bff, 0x7c00, 0xfc00, 0x7e01], dtype=np.uint16).view(np.float16)
+    expected = np.array([True, True, False, True, False, True, True, True, False])
+    before = Device["ROCKCHIP"].submit_count
+    np.testing.assert_array_equal(Tensor(lhs).isclose(Tensor(rhs)).realize().numpy(), expected)
+    np.testing.assert_array_equal(Tensor(lhs).isclose(Tensor(rhs), equal_nan=True).realize().numpy(), expected | np.isnan(lhs) & np.isnan(rhs))
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 2)
+
   def test_logical_and(self):
     _fp16_test_op(None, lambda x:(1 < x) & (x < 2), forward_only=True, vals=[[1.2, 1.2, 1.2, 3.2]])
 
