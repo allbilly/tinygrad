@@ -3202,3 +3202,45 @@ it never reads a dynamic index or FP16 value. Runtime gathers move opaque 1/2/4-
 conversion, positive/negative equality, axis conjunction, FP16-byte selection, reduction, and INT16 writeback all run
 on DPU EW. There is no host fancy indexing or numeric conversion, LUT, CMAC, CNA, PPU fallback, tolerance relaxation,
 or floating input wider than FP16.
+
+---
+
+## 2026-08-09 — native INT16 EW and integer-dimension fancy indexing
+
+The remaining five forward cases from upstream `test_slice_fancy_indexing_dim_collapse_int` now run on Rockchip. They
+cover a collapsed leading integer, a collapsed middle integer, three scalar dimensions, sparse dynamic axes, and a
+mixed static-slice/dynamic-index form. Together with the preceding milestone, the complete Rockchip fancy-index class
+now contains all twelve focused methods and every one passes individually under 30 seconds.
+
+This milestone productizes the integer path proved by `~/rk3588/examples/elementwise_int.py` instead of adding more
+FP16 integer emulation. RKImage v28 records native INT16 input and output independently; command emission configures
+INT16 input/process/output precision, eight-lane geometry, INT16 RDMA precision, two-byte surface grouping, and the
+integer converter mode. Runtime keeps INT16, INT32, and FP16 PC chains precision-homogeneous. An exact signed INT16 ADD
+probe through Tinygrad's RKImage and RKNPU runtime passed eight lanes in one submit ioctl.
+
+Arbitrary external INT32 indices are still compared without narrowing: each is decomposed as four opaque unsigned
+bytes, and native INT16 SUB/ABS/MIN/MUL combines the exact byte equalities. Bounded-index masks, negative-normalized
+linear coordinates, and raw FP16 byte selection now use this shared helper. Only final public INT32 storage is
+regrouped from two-byte results into four-byte lanes; ROCKCHIP's public tensor dtype contract remains FP16.
+
+- Five new integer-dimension cases: **5/5 passed individually**, from **3.39 s** to **12.99 s** pytest time.
+- Complete twelve-method fancy-index class and both Gather regressions: every method passed individually; nonfinite
+  outputs retain exact FP16 bit patterns.
+- Representative largest case: **4.796 s** direct wall time, including **4.788 s** realization and 2.6 ms copyout;
+  **3 submit ioctls / 4,115 DPU tasks / 0 soft resets**. The temporary native-INT32 implementation needed 9.252 s,
+  391 submits, and 45 resets; the earlier FP16-emulation form needed 53.96 s, 1,013 submits, and 444 resets.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** before the complete census and after each timeout
+  investigation. Repository-wide Tinygrad mypy and Ruff plus `git diff --check` pass.
+- Rockchip collection: **408 tests**. A complete serial census reached **151 passed / 7 skipped / 100 subtests passed**
+  before the pre-existing multidimensional Scatter method timed out at `dim=1`. The same isolated method and subtest
+  reproduce unchanged at baseline commit `dd6c694d1` after a passing vendor health check, proving it is not an INT16
+  regression. Focused milestone tests do not time out.
+- `sz.py`: renderer/runtime **3,682/307 executable lines**, total **29,044**. Runtime remains smaller than QCOM's 312
+  executable lines; the renderer is net +219 lines over the preceding milestone for five cases and the reusable
+  native INT16 pipeline.
+
+The CPU-cheat audit found no Tinygrad-core change and no runtime tensor arithmetic. Compile-time code validates UOp
+structure, static coordinates, and bounds. Runtime gathers move opaque bytes according to immutable plans; dynamic
+byte equality, validity masks, weighted coordinates, selection, and reductions execute on DPU EW. There is no typed
+host index/fancy-gather evaluator, LUT, CMAC, CNA, PPU fallback, tolerance relaxation, or floating input wider than
+FP16.

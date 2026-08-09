@@ -565,6 +565,26 @@ class TestRockchipFancyIndexOps(unittest.TestCase):
     _,_,_,d,_,_,_,_,o,_ = self._get_index_randoms()
     _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[...,1,d,None], lambda x:x[...,1,o,None])
 
+  def test_slice_fancy_indexing_dim_collapse_int(self):
+    _,b,c,d,e,_,j,k,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[1,b,c,d,e], lambda x:x[1,j,k,o,p])
+
+  def test_slice_fancy_indexing_dim_collapse_int_middle(self):
+    a,b,_,d,e,i,j,_,o,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,b,3,d,e], lambda x:x[i,j,3,o,p])
+
+  def test_slice_fancy_indexing_dim_collapse_int_scalars(self):
+    _,b,_,d,_,_,j,_,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[1,b,2,d,2], lambda x:x[1,j,2,o,2])
+
+  def test_slice_fancy_indexing_dim_collapse_int_sparse(self):
+    a,_,_,_,e,i,_,_,_,p = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[a,2,2,2,e], lambda x:x[i,2,2,2,p])
+
+  def test_slice_fancy_indexing_dim_collapse_int_sliced(self):
+    _,_,_,d,_,_,_,_,o,_ = self._get_index_randoms()
+    _fp16_test_op([(2,5,6,5,3,4)], lambda x:x[1,:,3:11:2,d,0:2], lambda x:x[1,:,3:11:2,o,0:2])
+
   def test_fancy_indexing_negative_nonfinite_bits(self):
     source = np.array([math.inf, -math.inf, math.nan], dtype=np.float16)
     indices = np.array([-1, -2, -3], dtype=np.int32)

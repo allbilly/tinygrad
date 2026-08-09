@@ -161,10 +161,12 @@ class RockchipProgram(Program['RockchipDevice']):
   def _run_ew_ops(self, address, buffer, ops:tuple[RKEWOp, ...]|None=None) -> None:
     ops = self.image.ew_ops if ops is None else ops
     bodies:list[tuple[int, ...]] = []
+    body_precision = 0
     for i, op in enumerate(ops):
       if op.submit_barrier and bodies:
         self._submit_pcchain(bodies)
         bodies.clear()
+        body_precision = 0
       if op.ew_cfg & _EW_STAGE_FP32_OUT:
         if i != len(ops)-1: raise RuntimeError("FP32 EW output must be terminal")
         if bodies: self._submit_pcchain(bodies)
@@ -173,6 +175,22 @@ class RockchipProgram(Program['RockchipDevice']):
         self.dev.reset_npu()
         bodies.clear()
         continue
+      if op.int16_input and op.int16_output or op.int32_input and op.int32_output:
+        precision = 16 if op.int16_input else 32
+        if bodies and body_precision != precision:
+          self._submit_pcchain(bodies)
+          bodies.clear()
+        body_precision, itemsize = precision, precision//8
+        limit = _MAX_EW_ELEMS_FP16 if precision == 16 else _MAX_EW_ELEMS_FP16//2
+        for start in range(0, op.count, limit):
+          count, offset = min(limit, op.count-start), start*itemsize
+          stage = emit_ew_stage(RKArg(op.dst.kind, op.dst.index, op.dst.addend+offset),
+                                RKArg(op.lhs.kind, op.lhs.index, op.lhs.addend+offset),
+                                RKArg(op.rhs.kind, op.rhs.index, op.rhs.addend+offset), count, op.ew_cfg,
+                                stateful=True, int32_output=precision == 32, int32_input=precision == 32,
+                                int16_output=precision == 16, int16_input=precision == 16)
+          bodies.append(patch_stage(stage, address))
+        continue
       if op.int32_input or op.int32_output:
         if op.int32_output and op.dst.kind is RKBufferKind.ARG and i != len(ops)-1:
           raise RuntimeError("INT32 argument output must be terminal")
@@ -180,7 +198,14 @@ class RockchipProgram(Program['RockchipDevice']):
           self._submit_pcchain(bodies)
           bodies.clear()
         self._run_int32_conversion(op, address, buffer)
+        body_precision = 0
         continue
+      if op.int16_input:
+        raise RuntimeError("mixed INT16 EW conversion is unsupported")
+      if body_precision:
+        self._submit_pcchain(bodies)
+        bodies.clear()
+        body_precision = 0
       if op.compare:
         if bodies:
           self._submit_pcchain(bodies)
