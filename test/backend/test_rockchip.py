@@ -971,12 +971,12 @@ class TestRockchipBroadcastOps(unittest.TestCase):
 class TestRockchipInt16EWOps(unittest.TestCase):
   """Bounded signed INT16 arithmetic and exact comparisons on the native DPU integer EW pipeline."""
 
-  def _check(self, expected, op, *values, output_dtype=np.int16, expected_tasks=None):
+  def _check(self, expected, op, *values, output_dtype=np.int16, expected_tasks=None, expected_submits=1):
     before, before_tasks = Device["ROCKCHIP"].submit_count, Device["ROCKCHIP"].task_count
     got = op(*(Tensor(np.asarray(value, dtype=np.int16)) for value in values)).realize().numpy()
     self.assertEqual(got.dtype, output_dtype)
     np.testing.assert_array_equal(got, np.asarray(expected, dtype=output_dtype))
-    self.assertEqual(Device["ROCKCHIP"].submit_count-before, 1)
+    self.assertEqual(Device["ROCKCHIP"].submit_count-before, expected_submits)
     if expected_tasks is not None: self.assertEqual(Device["ROCKCHIP"].task_count-before_tasks, expected_tasks)
 
   def _check_bool(self, op, *values, expected=None):
@@ -1030,6 +1030,20 @@ class TestRockchipInt16EWOps(unittest.TestCase):
     self._check([-29000,-1230,-5,-2,1,3,1170,31000], lambda x,y:(x+y).cast(dtypes.int32), a, b,
                 output_dtype=np.int32)
     self._check(a, lambda x:x.cast(dtypes.int32), a, output_dtype=np.int32)
+
+  def test_sum_unrolled(self):
+    values = np.asarray([[-32768, 32767, 1], [30000, 2000, -1234]], dtype=np.int16)
+    self._check(values.sum(1, dtype=np.int32), lambda x:x.sum(1), values, output_dtype=np.int32,
+                expected_tasks=6, expected_submits=2)
+    self._check(values.sum(0, dtype=np.int32), lambda x:x.sum(0), values, output_dtype=np.int32,
+                expected_tasks=4, expected_submits=2)
+    self._check(values.sum(dtype=np.int32), lambda x:x.sum(), values, output_dtype=np.int32,
+                expected_tasks=12, expected_submits=2)
+
+  def test_sum_loop(self):
+    values = (np.arange(40*257, dtype=np.uint32)*7919).astype(np.uint16).view(np.int16).reshape(40, 257)
+    self._check(values.sum(1, dtype=np.int32), lambda x:x.sum(1), values, output_dtype=np.int32,
+                expected_tasks=1542, expected_submits=2)
 
   def test_compare_ordering(self):
     a = [-32768,-32768,-30000,-1,0,1,30000,32767]

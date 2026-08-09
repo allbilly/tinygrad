@@ -1171,6 +1171,67 @@ def _lower_raw_int32_layout(output:RKOutput) -> RKImage|None:
   gather = RKGather(source.arg.slot, out_param.arg.slot, count, offsets=offsets, dst_kind=RKBufferKind.ARG, itemsize=4)
   return RKImage(RKTarget.RK3588, gathers=(gather,))
 
+def _int16_sum_image(out_slot:int, count:int, plans:tuple[RKGather, ...]) -> RKImage|None:
+  """Widen gathered INT16 rows and accumulate their sum in native INT32."""
+  if not 1 <= count <= _MAX_EW_ELEMS_FP16//2 or not 2 <= len(plans) <= _RKIMAGE_U16_MAX//2: return None
+  in_stride, out_stride = _reduction_stride(count), round_up(count*4, 64)
+  gathers = tuple(replace(plan, dst_index=0, dst_addend=row*in_stride//2) for row,plan in enumerate(plans))
+  def arg(slot:int, addend:int=0) -> RKArg: return RKArg(RKBufferKind.SCRATCH, slot, addend)
+  ops = [RKEWOp(arg(1, row*out_stride), arg(0, row*in_stride), arg(0, row*in_stride), count,
+                _EW_CFG[Ops.MAX], int16_input=True, int32_output=True) for row in range(len(plans))]
+  total = _reduce_rows(ops, [arg(1, row*out_stride) for row in range(len(plans))], count, _EW_CFG[Ops.ADD], int32=True)
+  ops.append(RKEWOp(RKArg(RKBufferKind.ARG, out_slot), total, total, count, _EW_CFG[Ops.MAX],
+                    int32_input=True, int32_output=True))
+  return RKImage(RKTarget.RK3588, (RKScratch(len(plans)*in_stride), RKScratch(len(plans)*out_stride)),
+                 gathers=gathers, ew_ops=tuple(ops))
+
+def _lower_unrolled_int16_sum(output:RKOutput) -> RKImage|None:
+  """Recognize a statically indexed promoted INT16 sum."""
+  _, out_param, count, out_index, root = output
+  terms = _flatten_binary(root, Ops.ADD)
+  loads = tuple(term.src[0] for term in terms if term.op is Ops.CAST and term.dtype.scalar() is dtypes.int and len(term.src) == 1 and
+                term.src[0].op is Ops.LOAD and term.src[0].dtype.scalar() is dtypes.int16)
+  if len(loads) != len(terms): return None
+  plans = tuple(_typed_gather_plan(load, out_index, count, out_param.arg.slot, dtypes.int16) for load in loads)
+  if any(plan is None for plan in plans): return None
+  concrete = tuple(plan for plan in plans if plan is not None)
+  for load,plan in zip(loads, concrete):
+    source = _root_param(load.src[0])
+    if source is None or source.src[0].op is not Ops.CONST: return None
+    try: _validate_gather_bounds(plan, int(source.src[0].arg))
+    except RuntimeError: return None
+  return _int16_sum_image(out_param.arg.slot, count, concrete)
+
+def _lower_int16_sum_loop(uops:list[UOp], output:RKOutput) -> RKImage|None:
+  """Lower a promoted INT16 register-loop sum with native INT32 accumulation."""
+  store, out_param, _, _, root = output
+  if _local_load(root) is None or (shape:=_loop_reduction_shape(store, out_param, uops)) is None: return None
+  rows, envs, reduce_range, groups = shape
+  local_stores = [u for u in uops if u.op is Ops.STORE and _root_param(u.src[0]) is None]
+  updates = [u for u in local_stores if reduce_range in u.toposort()]
+  initializers = [u for u in local_stores if reduce_range not in u.toposort()]
+  if (len(updates) != 1 or len(initializers) != 1 or len(local_stores) != 2 or
+      initializers[0].src[1].op is not Ops.CONST or initializers[0].src[1].dtype.scalar() is not dtypes.int or
+      int(initializers[0].src[1].arg) != 0): return None
+  update = updates[0].src[1]
+  if update.op is not Ops.ADD or update.dtype.scalar() is not dtypes.int: return None
+  acc = next((x for x in update.src if _local_load(x) is not None), None)
+  term = next((x for x in update.src if x is not acc), None)
+  if (acc is None or term is None or term.op is not Ops.CAST or term.dtype.scalar() is not dtypes.int or len(term.src) != 1 or
+      (load:=term.src[0]).op is not Ops.LOAD or load.dtype.scalar() is not dtypes.int16 or load.src[0].op is not Ops.INDEX): return None
+  source = _root_param(load.src[0])
+  if source is None or source.src[0].op is not Ops.CONST: return None
+  if len(load.src) > 1 and (load.src[1].op is not Ops.CONST or int(load.src[1].arg) != 0): return None
+  try:
+    blocks = tuple(tuple(_eval_int(load.src[0].src[1], {**env, reduce_range:r})
+                         if len(load.src) < 3 or bool(_eval_expr(load.src[2], {**env, reduce_range:r}, {})) else -1
+                         for env in envs) for r in range(groups))
+  except RuntimeError: return None
+  source_count = int(source.src[0].arg)
+  if sorted(offset for block in blocks for offset in block if offset >= 0) != list(range(source_count)): return None
+  return _int16_sum_image(out_param.arg.slot, rows,
+                          tuple(RKGather(source.arg.slot, 0, rows, offsets=block) for block in blocks))
+
 def _lower_fp16_int32_cast(output:RKOutput) -> RKImage|None:
   """Truncate a direct FP16 load on DPU before the terminal INT32 conversion."""
   root = output[4]
@@ -4744,6 +4805,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
   if int_output is not None and not any(u.op is Ops.REDUCE for u in uops):
     if (linear_index:=_lower_normalized_linear_index(int_output)) is not None: return linear_index
     if (fp16_cast:=_lower_fp16_int32_cast(int_output)) is not None: return fp16_cast
+    if (int16_sum:=_lower_unrolled_int16_sum(int_output)) is not None: return int16_sum
     if (bounded_lookup:=_lower_bounded_int32_lookup(int_output)) is not None: return bounded_lookup
     if (byte_add:=_lower_int32_byte_add(int_output)) is not None: return byte_add
     if (int16_prefix:=_lower_unrolled_integer_prefix_count(int_output, dtypes.int16)) is not None: return int16_prefix
@@ -4761,6 +4823,7 @@ def lower_ew(uops:list[UOp]) -> RKImage:
     if (occurrence_count:=_lower_occurrence_count(int_output)) is not None: return occurrence_count
     if (sort_index:=_lower_sort_index_selection(int_output)) is not None: return sort_index
   if int_loop_output is not None:
+    if (loop_int16_sum:=_lower_int16_sum_loop(uops, int_loop_output)) is not None: return loop_int16_sum
     if (loop_predicate_total:=_lower_loop_fp16_predicate_total(uops, int_loop_output)) is not None: return loop_predicate_total
     if (loop_fp16_prefix:=_lower_loop_fp16_prefix_count(uops, int_loop_output)) is not None: return loop_fp16_prefix
     if (loop_occurrence:=_lower_loop_int32_occurrence_count(uops, int_loop_output)) is not None: return loop_occurrence

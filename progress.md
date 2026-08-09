@@ -4208,3 +4208,30 @@ The CPU-cheat audit found no implementation change and no host-dependent layout 
 static address plan at compile time; runtime raw gathers perform every tensor movement on the device-visible buffers.
 There is no host tensor read/result calculation, NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or numeric
 conversion.
+
+---
+
+## 2026-08-09 — exact promoted INT16 sums in native INT32
+
+Signed-INT16 sums now widen each gathered reduction row with the DPU INT16-to-INT32 output path and accumulate the
+rows through native INT32 ADD. Both statically unrolled reductions and Tinygrad's register-loop reduction form are
+covered. The logical image accepts the native 32-bit lane capacity; runtime atomizes INT16 conversion into eight-lane
+tasks while leaving each 40-lane INT32 accumulation stage intact.
+
+No Tinygrad branch, `~/npu`, or `~/rk3588` contains an integrated INT16 reduction implementation. The direct reference
+is `~/rk3588/examples/elementwise_int.py`: it proves native signed-INT16 ADD, INT16-to-INT32 writeback, and native
+INT32 ADD on the same DPU EW pipeline. The new image composes those proven operations with the existing balanced-row
+reduction helper.
+
+- Exact axis-one, axis-zero, and global unrolled sums pass, including `-32768`, `32767`, and results outside INT16.
+- The full **40x257** register-loop reduction passes exactly with **1,542 DPU tasks / 2 submit ioctls**; its warm call
+  takes **0.17 s** and the focused cold method takes **3.33 s**.
+- The complete native INT16 EW class passes **24/24 in 6.22 s**; the existing INT16 max-unpool regression also passes.
+- Vendor `~/rk3588/examples/elementwise.py`: **60/60 probes passed** after physical testing.
+- Repository-wide Tinygrad mypy (**216 files**), Ruff, and `git diff --check`: pass. Rockchip collection: **490 tests**.
+- `sz.py`: renderer/runtime **4,949/331 executable lines**, total **30,335**. Runtime and Tinygrad core are unchanged.
+
+The CPU-cheat audit found no runtime/core change and no tensor-value inspection in the renderer. Compile time validates
+only static reduction shape, source coverage, masks, and buffer bounds. Runtime gathers opaque INT16 rows; widening,
+balanced INT32 accumulation, and final INT32 writeback all execute on DPU. There is no host sum/result calculation,
+NumPy backend evaluation, LUT, CMAC, tolerance relaxation, or floating input wider than FP16.
